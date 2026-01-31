@@ -1,0 +1,17 @@
+.{
+    .name = .zonvie,
+    .version = "0.0.0",
+
+    .fingerprint = 0x27bbe734fac1eb4,
+
+    .minimum_zig_version = "0.15.2",
+
+    .dependencies = .{
+        .@"zig-toml" = .{
+            .url = "git+https://github.com/sam701/zig-toml#zig-0.15",
+            .hash = "toml-0.3.0-bV14BfV7AQD8DkuQI7skP8ekQTaBYKTO0MY_35Cw_EXo",
+        },
+    },
+
+    .paths = .{""},
+}

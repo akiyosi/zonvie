@@ -1,0 +1,444 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AB79DAFF2F1621F7005729E6 /* Config.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DAFE2F1621F7005729E6 /* Config.swift */; };
+		AB79DB012F1621F8005729E6 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DB002F1621F8005729E6 /* TabBarView.swift */; };
+		AB9AE9AD2EF1B8320072639A /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9A72EF1B8320072639A /* AppDelegate.swift */; };
+		AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9AB2EF1B8320072639A /* ViewController.swift */; };
+		AB9AE9AF2EF1B8320072639A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9A82EF1B8320072639A /* Assets.xcassets */; };
+		AB9AE9B42EF1BBED0072639A /* libzonvie_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */; };
+		AB9AE9BD2EF22AED0072639A /* MetalTerminalRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */; };
+		AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */; };
+		AB9AE9C12EF22AED0072639A /* MetalTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */; };
+		AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9BA2EF22AED0072639A /* Shaders.metal */; };
+		AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C42EF236FC0072639A /* MetalTypes.swift */; };
+		AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C72EF23C170072639A /* ZonvieCore.swift */; };
+		AB9AE9CA2EF2A2130072639A /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C92EF2A2130072639A /* main.swift */; };
+		AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */; };
+		AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */; };
+		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
+		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AB79DAFE2F1621F7005729E6 /* Config.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Config.swift; sourceTree = "<group>"; };
+		AB79DB002F1621F8005729E6 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
+		AB9AE9962EF1B6A50072639A /* zonvie.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = zonvie.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AB9AE9A72EF1B8320072639A /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		AB9AE9A82EF1B8320072639A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		AB9AE9AB2EF1B8320072639A /* ViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewController.swift; sourceTree = "<group>"; };
+		AB9AE9B22EF1BAAC0072639A /* Zonvie-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Zonvie-Bridging-Header.h"; sourceTree = "<group>"; };
+		AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libzonvie_core.a; sourceTree = "<group>"; };
+		AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlas.swift; sourceTree = "<group>"; };
+		AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalRenderer.swift; sourceTree = "<group>"; };
+		AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalView.swift; sourceTree = "<group>"; };
+		AB9AE9BA2EF22AED0072639A /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
+		AB9AE9C42EF236FC0072639A /* MetalTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTypes.swift; sourceTree = "<group>"; };
+		AB9AE9C72EF23C170072639A /* ZonvieCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZonvieCore.swift; sourceTree = "<group>"; };
+		AB9AE9C92EF2A2130072639A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = HBFTBridge.c; sourceTree = "<group>"; };
+		AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlasCApi.swift; sourceTree = "<group>"; };
+		AB9AE9D02EF900000072639A /* ExternalGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalGridView.swift; sourceTree = "<group>"; };
+		AB9AE9D22F0000010072639A /* zonvie.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = zonvie.icns; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AB9AE9932EF1B6A40072639A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AB9AE9B42EF1BBED0072639A /* libzonvie_core.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		AB9AE98D2EF1B6A40072639A = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */,
+				AB9AE9AC2EF1B8320072639A /* Sources */,
+				AB9AE9972EF1B6A50072639A /* Products */,
+				AB9AE9B22EF1BAAC0072639A /* Zonvie-Bridging-Header.h */,
+			);
+			sourceTree = "<group>";
+		};
+		AB9AE9972EF1B6A50072639A /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9962EF1B6A50072639A /* zonvie.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		AB9AE9AC2EF1B8320072639A /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				AB79DAFE2F1621F7005729E6 /* Config.swift */,
+				AB79DB002F1621F8005729E6 /* TabBarView.swift */,
+				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
+				AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */,
+				AB9AE9C92EF2A2130072639A /* main.swift */,
+				AB9AE9C72EF23C170072639A /* ZonvieCore.swift */,
+				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
+				AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */,
+				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
+				AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */,
+				AB9AE9D02EF900000072639A /* ExternalGridView.swift */,
+				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
+				AB9AE9A72EF1B8320072639A /* AppDelegate.swift */,
+				AB9AE9A82EF1B8320072639A /* Assets.xcassets */,
+				AB9AE9AB2EF1B8320072639A /* ViewController.swift */,
+				AB9AE9D22F0000010072639A /* zonvie.icns */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AB9AE9952EF1B6A40072639A /* zonvie */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AB9AE9A42EF1B6A60072639A /* Build configuration list for PBXNativeTarget "zonvie" */;
+			buildPhases = (
+				AB9AE9B52EF1BC3C0072639A /* ShellScript */,
+				AB9AE9922EF1B6A40072639A /* Sources */,
+				AB9AE9932EF1B6A40072639A /* Frameworks */,
+				AB9AE9942EF1B6A40072639A /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = zonvie;
+			packageProductDependencies = (
+			);
+			productName = zonvie;
+			productReference = AB9AE9962EF1B6A50072639A /* zonvie.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AB9AE98E2EF1B6A40072639A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2620;
+				LastUpgradeCheck = 2620;
+				TargetAttributes = {
+					AB9AE9952EF1B6A40072639A = {
+						CreatedOnToolsVersion = 26.2;
+					};
+				};
+			};
+			buildConfigurationList = AB9AE9912EF1B6A40072639A /* Build configuration list for PBXProject "zonvie" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = AB9AE98D2EF1B6A40072639A;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = AB9AE9972EF1B6A50072639A /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AB9AE9952EF1B6A40072639A /* zonvie */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AB9AE9942EF1B6A40072639A /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AB9AE9AF2EF1B8320072639A /* Assets.xcassets in Resources */,
+				AB9AE9D12F0000010072639A /* zonvie.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		AB9AE9B52EF1BC3C0072639A /* ShellScript */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\n# Ensure zig is discoverable (Profile/Archive may not inherit shell PATH)\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH\"\n\ncommand -v zig >/dev/null 2>&1 || {\n  echo \"error: zig not found. PATH=$PATH\"\n  exit 1\n}\n\nROOT=\"${SRCROOT}/..\"\nOUT=\"${ROOT}/zig-out/lib\"\nmkdir -p \"${OUT}\"\n\n# Map Xcode configuration -> Zig optimize mode\ncase \"${CONFIGURATION}\" in\n  Debug)\n    ZIG_OPT=Debug\n    ;;\n  Release|Profile)\n    ZIG_OPT=ReleaseSafe\n    ;;\n  *)\n    ZIG_OPT=ReleaseSafe\n    ;;\nesac\n\necho \"Building Zig core (${ZIG_OPT}) for CONFIGURATION=${CONFIGURATION}\"\n\ncd \"${ROOT}\"\n\n# Build per-arch using zig build (includes dependencies from build.zig.zon)\nzig build core -Dtarget=aarch64-macos -Doptimize=\"${ZIG_OPT}\" --prefix \"${ROOT}/zig-out-arm64\"\nzig build core -Dtarget=x86_64-macos -Doptimize=\"${ZIG_OPT}\" --prefix \"${ROOT}/zig-out-x64\"\n\n# Universal static lib\nlipo -create \\\n  \"${ROOT}/zig-out-arm64/lib/libzonvie_core.a\" \\\n  \"${ROOT}/zig-out-x64/lib/libzonvie_core.a\" \\\n  -output \"${OUT}/libzonvie_core.a\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AB9AE9922EF1B6A40072639A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */,
+				AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */,
+				AB9AE9BD2EF22AED0072639A /* MetalTerminalRenderer.swift in Sources */,
+				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
+				AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */,
+				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
+				AB79DAFF2F1621F7005729E6 /* Config.swift in Sources */,
+				AB79DB012F1621F8005729E6 /* TabBarView.swift in Sources */,
+				AB9AE9C12EF22AED0072639A /* MetalTerminalView.swift in Sources */,
+				AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */,
+				AB9AE9CA2EF2A2130072639A /* main.swift in Sources */,
+				AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */,
+				AB9AE9AD2EF1B8320072639A /* AppDelegate.swift in Sources */,
+				AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AB9AE9A22EF1B6A60072639A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		AB9AE9A32EF1B6A60072639A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.7;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		AB9AE9A52EF1B6A60072639A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
+				"HEADER_SEARCH_PATHS[arch=*]" = /opt/homebrew/include/freetype2;
+				INFOPLIST_FILE = Sources/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/../zig-out/lib",
+					"$(PROJECT_DIR)",
+					/opt/homebrew/lib,
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lfreetype",
+					"-lharfbuzz",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.zonvie.zonvie;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/Zonvie-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		AB9AE9A62EF1B6A60072639A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
+				"HEADER_SEARCH_PATHS[arch=*]" = /opt/homebrew/include/freetype2;
+				INFOPLIST_FILE = Sources/Info.plist;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/../zig-out/lib",
+					"$(PROJECT_DIR)",
+					/opt/homebrew/lib,
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-lfreetype",
+					"-lharfbuzz",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.zonvie.zonvie;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/Zonvie-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AB9AE9912EF1B6A40072639A /* Build configuration list for PBXProject "zonvie" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB9AE9A22EF1B6A60072639A /* Debug */,
+				AB9AE9A32EF1B6A60072639A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AB9AE9A42EF1B6A60072639A /* Build configuration list for PBXNativeTarget "zonvie" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB9AE9A52EF1B6A60072639A /* Debug */,
+				AB9AE9A62EF1B6A60072639A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AB9AE98E2EF1B6A40072639A /* Project object */;
+}

@@ -1,0 +1,7 @@
+HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)/../include
+
+// Where the static library is placed (macos/libzonvie_core.a)
+LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)
+
+// Link libzonvie_core.a
+OTHER_LDFLAGS = $(inherited) -lzonvie_core
