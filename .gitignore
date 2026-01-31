@@ -1,0 +1,19 @@
+zig-out/
+zig-out-*/
+.zig-cache/
+macos/.derived/
+macos/libzonvie_core.a
+debug.log
+tmp/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# macOS
+.DS_Store
+
+# Local Claude instructions
+CLAUDE.local.md
