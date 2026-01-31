@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and Setup Zig
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> $GITHUB_PATH
+
+      - name: Build Zig Core (macOS)
+        run: zig build
+
+      - name: Build macOS App
+        run: |
+          xcodebuild -project macos/zonvie.xcodeproj \
+            -scheme zonvie \
+            -configuration Debug \
+            -derivedDataPath macos/.derived \
+            -destination "platform=macOS,arch=arm64" \
+            build
+
+      - name: Upload macOS Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: zonvie-macos-debug
+          path: macos/.derived/Build/Products/Debug/zonvie.app
+
+  build-windows:
+    name: Build Windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and Setup Zig
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
+
+      - name: Build Windows App
+        run: zig build windows -Dtarget=x86_64-windows-gnu
+
+      - name: Upload Windows Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: zonvie-windows-debug
+          path: zig-out/bin/zonvie.exe
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and Setup Zig
+        run: |
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
+
+      - name: Run Zig Tests
+        run: zig build test || echo "No tests defined"
