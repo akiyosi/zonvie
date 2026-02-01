@@ -101,10 +101,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Make window transparent for blur effect (required for CGSSetWindowBackgroundBlurRadius)
         let config = ZonvieConfig.shared
+        // DEBUG: Log blur configuration at window setup
+        ZonvieCore.appLog("[DEBUG-WINDOW-SETUP] blurEnabled=\(config.blurEnabled) window.blur=\(config.window.blur) opacity=\(config.window.opacity) blurRadius=\(config.window.blurRadius)")
+
         if config.blurEnabled {
             win.isOpaque = false
             win.backgroundColor = .clear
-            ZonvieCore.appLog("[Window] Set transparent for blur")
+            ZonvieCore.appLog("[Window] Set transparent for blur: isOpaque=\(win.isOpaque) backgroundColor=\(String(describing: win.backgroundColor))")
         }
         
         // Prevent the window from becoming unreasonably small.
@@ -147,6 +150,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Apply blur effect to window using private macOS API (CGSSetWindowBackgroundBlurRadius)
     /// This provides more control over blur radius than NSVisualEffectView
     private func applyWindowBlur(window: NSWindow, radius: Int) {
+        // DEBUG: Log blur application from AppDelegate
+        ZonvieCore.appLog("[DEBUG-BLUR-APPDELEGATE] applyWindowBlur: window=\(window.windowNumber) radius=\(radius) isOpaque=\(window.isOpaque)")
+
         let connection = CGSMainConnectionID()
         let windowNumber = window.windowNumber  // Already Int (NSInteger)
 

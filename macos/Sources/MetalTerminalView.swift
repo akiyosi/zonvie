@@ -541,6 +541,8 @@ final class MetalTerminalView: MTKView {
 
     override func layout() {
         super.layout()
+        // DEBUG: Track layout changes (window resize/snap)
+        ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
         layoutScrollbar()
     }
@@ -776,7 +778,12 @@ final class MetalTerminalView: MTKView {
         let w = max(1, Int(pw.rounded(.toNearestOrAwayFromZero)))
         let h = max(1, Int(ph.rounded(.toNearestOrAwayFromZero)))
         let newSize = CGSize(width: w, height: h)
-        if drawableSize != newSize { drawableSize = newSize }
+        let oldSize = drawableSize
+        if drawableSize != newSize {
+            drawableSize = newSize
+            // DEBUG: Track drawable size changes (triggers backBuffer resize)
+            ZonvieCore.appLog("[DEBUG-DRAWABLE-RESIZE] oldSize=\(oldSize) newSize=\(newSize) scale=\(scale)")
+        }
 
         maybeResizeCoreGrid()
     }

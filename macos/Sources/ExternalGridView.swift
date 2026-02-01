@@ -139,6 +139,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         self.enableSetNeedsDisplay = true  // Use setNeedsDisplay() like main window
 
         // Configure layer transparency based on blur setting
+        // DEBUG: Log layer configuration with actual layer state
+        let layerExists = self.layer != nil
+        ZonvieCore.appLog("[DEBUG-EXTGRID-INIT] gridId=\(gridId) blurEnabled=\(blurEnabled) layerExists=\(layerExists) ZonvieConfig.blurEnabled=\(ZonvieConfig.shared.blurEnabled)")
+
         if blurEnabled {
             self.layer?.isOpaque = false
             self.layer?.backgroundColor = NSColor.clear.cgColor
@@ -147,6 +151,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             self.layer?.isOpaque = true
             self.layer?.backgroundColor = NSColor.black.cgColor
             ZonvieCore.appLog("[ExternalGridView] layer: isOpaque=true, backgroundColor=black")
+        }
+
+        // DEBUG: Verify layer state after configuration
+        if let layer = self.layer {
+            ZonvieCore.appLog("[DEBUG-EXTGRID-LAYER] gridId=\(gridId) layer.isOpaque=\(layer.isOpaque) layer.backgroundColor=\(String(describing: layer.backgroundColor))")
         }
 
         buildShaderBuffers()
@@ -355,10 +364,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rpd.colorAttachments[0].texture = drawable.texture
             // When blur is enabled, always use .clear to avoid ghosting from semi-transparent backgrounds.
             // Only use .load for non-blur scrolling (preserves previous content for partial update).
+
+            // DEBUG: Detailed loadAction decision for external grid
+            ZonvieCore.appLog("[DEBUG-EXTGRID-LOADACTION] gridId=\(gridId) blurEnabled=\(blurEnabled) hasScrollOffset=\(hasScrollOffset) hasPresentedOnce=\(hasPresentedOnce) gridClearColor.alpha=\(gridClearColor.alpha)")
+
             if !blurEnabled && hasScrollOffset && hasPresentedOnce {
                 rpd.colorAttachments[0].loadAction = .load
+                ZonvieCore.appLog("[DEBUG-EXTGRID-LOADACTION] gridId=\(gridId) -> .load")
             } else {
                 rpd.colorAttachments[0].loadAction = .clear
+                ZonvieCore.appLog("[DEBUG-EXTGRID-LOADACTION] gridId=\(gridId) -> .clear")
             }
             rpd.colorAttachments[0].storeAction = .store
             // Always use gridClearColor (which has appropriate alpha for blur/non-blur modes)

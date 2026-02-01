@@ -46,6 +46,11 @@ final class TabBarView: NSView {
     private var dropTargetIndex: Int? = nil
     private let dragThreshold: CGFloat = 5
 
+    // External drag state (for tab externalization)
+    private var isExternalDrag: Bool = false
+    private var dragPreviewWindow: NSWindow? = nil
+    private let externalDragThreshold: CGFloat = 50  // pixels outside window to trigger external drag
+
     // Tab appearance constants
     private let tabHeight: CGFloat = 32
     private let tabMinWidth: CGFloat = 100
@@ -111,6 +116,7 @@ final class TabBarView: NSView {
     var onTabClosed: ((Int64) -> Void)?
     var onNewTabRequested: (() -> Void)?
     var onTabMoved: ((Int, Int) -> Void)?  // (fromIndex, toIndex)
+    var onTabExternalized: ((Int64, NSPoint) -> Void)?  // (tabHandle, dropScreenPoint)
 
     // Tracking area for mouse hover
     private var trackingArea: NSTrackingArea?
@@ -441,59 +447,163 @@ final class TabBarView: NSView {
 
     /// Track tab drag using event loop to prevent window dragging
     private func trackTabDrag(initialEvent: NSEvent, tabIndex: Int, tabWidth: CGFloat) {
-        guard let window = self.window else { return }
+        ZonvieCore.appLog("[TAB-DRAG] trackTabDrag started for tab \(tabIndex)")
+        guard let window = self.window else {
+            ZonvieCore.appLog("[TAB-DRAG] window is nil, aborting")
+            return
+        }
 
         var isDragging = true
+        isExternalDrag = false
+
         while isDragging {
             guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
                 continue
             }
 
             let location = convert(event.locationInWindow, from: nil)
+            let screenLocation = window.convertPoint(toScreen: event.locationInWindow)
+            let windowFrame = window.frame
+
+            // Check if mouse is outside window bounds (with threshold)
+            let expandedFrame = windowFrame.insetBy(dx: -externalDragThreshold, dy: -externalDragThreshold)
+            let isOutsideWindow = !expandedFrame.contains(screenLocation)
 
             switch event.type {
             case .leftMouseDragged:
-                dragCurrentX = location.x
-
-                // Calculate drop target
-                var targetIdx = 0
-                var tabX = windowControlsWidth
-                for i in 0..<tabs.count {
-                    let tabCenter = tabX + tabWidth / 2
-                    if location.x < tabCenter {
-                        targetIdx = i
-                        break
-                    }
-                    targetIdx = i + 1
-                    tabX += tabWidth + tabSpacing
+                // DEBUG: Log drag position
+                if isOutsideWindow {
+                    ZonvieCore.appLog("[TAB-DRAG] screenLocation=\(screenLocation) windowFrame=\(windowFrame) expandedFrame=\(expandedFrame) isOutside=\(isOutsideWindow)")
                 }
-                dropTargetIndex = min(targetIdx, tabs.count)
+
+                if isOutsideWindow && !isExternalDrag {
+                    // Entering external drag mode
+                    isExternalDrag = true
+                    ZonvieCore.appLog("[TAB-DRAG] Entering external drag mode for tab \(tabIndex)")
+                    createDragPreviewWindow(for: tabIndex, at: screenLocation)
+                } else if !isOutsideWindow && isExternalDrag {
+                    // Returning to normal drag mode
+                    isExternalDrag = false
+                    ZonvieCore.appLog("[TAB-DRAG] Returning to normal drag mode")
+                    destroyDragPreviewWindow()
+                }
+
+                if isExternalDrag {
+                    // Update preview window position
+                    updateDragPreviewPosition(screenLocation)
+                } else {
+                    // Normal in-window drag
+                    dragCurrentX = location.x
+
+                    // Calculate drop target
+                    var targetIdx = 0
+                    var tabX = windowControlsWidth
+                    for i in 0..<tabs.count {
+                        let tabCenter = tabX + tabWidth / 2
+                        if location.x < tabCenter {
+                            targetIdx = i
+                            break
+                        }
+                        targetIdx = i + 1
+                        tabX += tabWidth + tabSpacing
+                    }
+                    dropTargetIndex = min(targetIdx, tabs.count)
+                }
                 needsDisplay = true
 
             case .leftMouseUp:
                 isDragging = false
-                let movedDistance = abs(location.x - dragStartX)
+                ZonvieCore.appLog("[TAB-DRAG] mouseUp isExternalDrag=\(isExternalDrag) screenLocation=\(screenLocation)")
 
-                if movedDistance < dragThreshold {
-                    // Didn't move enough - treat as click (select tab)
+                if isExternalDrag {
+                    // Externalize the tab
                     let tab = tabs[tabIndex]
-                    onTabSelected?(tab.handle)
-                } else if let targetIdx = dropTargetIndex {
-                    // Actually moved - reorder tab
-                    if targetIdx != tabIndex && targetIdx != tabIndex + 1 {
-                        onTabMoved?(tabIndex, targetIdx)
+                    ZonvieCore.appLog("[TAB-DRAG] Externalizing tab handle=\(tab.handle) name=\(tab.name)")
+                    destroyDragPreviewWindow()
+                    onTabExternalized?(tab.handle, screenLocation)
+                } else {
+                    let movedDistance = abs(location.x - dragStartX)
+
+                    if movedDistance < dragThreshold {
+                        // Didn't move enough - treat as click (select tab)
+                        let tab = tabs[tabIndex]
+                        onTabSelected?(tab.handle)
+                    } else if let targetIdx = dropTargetIndex {
+                        // Actually moved - reorder tab
+                        if targetIdx != tabIndex && targetIdx != tabIndex + 1 {
+                            onTabMoved?(tabIndex, targetIdx)
+                        }
                     }
                 }
 
                 // Reset drag state
                 draggingTabIndex = nil
                 dropTargetIndex = nil
+                isExternalDrag = false
                 needsDisplay = true
 
             default:
                 break
             }
         }
+    }
+
+    // MARK: - External Drag Preview Window
+
+    private func createDragPreviewWindow(for tabIndex: Int, at screenPoint: NSPoint) {
+        guard tabIndex < tabs.count else { return }
+        let tab = tabs[tabIndex]
+
+        let previewWidth: CGFloat = 150
+        let previewHeight: CGFloat = 30
+
+        let previewWindow = NSWindow(
+            contentRect: NSRect(
+                x: screenPoint.x - previewWidth / 2,
+                y: screenPoint.y - previewHeight / 2,
+                width: previewWidth,
+                height: previewHeight
+            ),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        previewWindow.isOpaque = false
+        previewWindow.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.95)
+        previewWindow.level = .floating
+        previewWindow.hasShadow = true
+
+        // Round corners
+        previewWindow.contentView?.wantsLayer = true
+        previewWindow.contentView?.layer?.cornerRadius = 8
+        previewWindow.contentView?.layer?.masksToBounds = true
+
+        // Add tab name label
+        let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
+        let label = NSTextField(labelWithString: displayName)
+        label.frame = NSRect(x: 10, y: 5, width: previewWidth - 20, height: 20)
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = NSColor.labelColor
+        label.lineBreakMode = .byTruncatingTail
+        previewWindow.contentView?.addSubview(label)
+
+        previewWindow.orderFront(nil)
+        dragPreviewWindow = previewWindow
+    }
+
+    private func updateDragPreviewPosition(_ screenPoint: NSPoint) {
+        guard let preview = dragPreviewWindow else { return }
+        let previewSize = preview.frame.size
+        preview.setFrameOrigin(NSPoint(
+            x: screenPoint.x - previewSize.width / 2,
+            y: screenPoint.y - previewSize.height / 2
+        ))
+    }
+
+    private func destroyDragPreviewWindow() {
+        dragPreviewWindow?.orderOut(nil)
+        dragPreviewWindow = nil
     }
 
     override func mouseDragged(with event: NSEvent) {

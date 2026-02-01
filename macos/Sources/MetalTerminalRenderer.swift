@@ -312,6 +312,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
 
+        let oldSize = backBufferSize
+        let wasPresented = hasPresentedOnce
+
         let w = max(1, Int(drawableSize.width))
         let h = max(1, Int(drawableSize.height))
 
@@ -329,6 +332,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // After resize, we must clear once (contents undefined).
         hasPresentedOnce = false
+
+        // DEBUG: Track backBuffer resize and hasPresentedOnce reset
+        ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
     }
 
     init?(view: MTKView) {
@@ -764,6 +770,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // - This causes ghosting and gradual opacity buildup, making blur invisible
             // - ExternalGridView uses the same approach (always .clear) and works correctly
             let hasAnyDirtyInRowMode = rowMode && !dirtyRows.isEmpty
+
+            // DEBUG: Detailed loadAction decision logging
+            ZonvieCore.appLog("[DEBUG-LOADACTION] blurEnabled=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) hasAnyDirtyInRowMode=\(hasAnyDirtyInRowMode) mainCount=\(currentMainCount) cursorCount=\(currentCursorCount) backBufferSize=\(backBufferSize)")
+
             if !blurEnabled && hasPresentedOnce && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
                 rpd.colorAttachments[0].loadAction = .load
                 ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
@@ -1002,6 +1012,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
+
+                // DEBUG: Track hasPresentedOnce state change in completion handler
+                ZonvieCore.appLog("[DEBUG-PRESENT] completedHandler: wasFirstPresent=\(wasFirstPresent) hasPresentedOnce=\(self.hasPresentedOnce)")
 
                 // Force shadow recalculation on first present when blur is enabled
                 // Transparent windows (isOpaque=false, backgroundColor=.clear) need this

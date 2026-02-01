@@ -82,6 +82,11 @@ final class ZonvieCore {
 
     /// Apply blur effect to window using private macOS API
     static func applyWindowBlur(window: NSWindow, radius: Int) {
+        // DEBUG: Track blur application with caller info
+        let caller = Thread.callStackSymbols.prefix(5).joined(separator: "\n  ")
+        appLog("[DEBUG-BLUR] applyWindowBlur called: window=\(window.windowNumber) radius=\(radius) isOpaque=\(window.isOpaque) backgroundColor=\(String(describing: window.backgroundColor))")
+        appLog("[DEBUG-BLUR] callStack:\n  \(caller)")
+
         let connection = CGSMainConnectionID()
         let windowNumber = window.windowNumber  // Already Int (NSInteger)
 
@@ -981,6 +986,13 @@ final class ZonvieCore {
         }
     }
 
+    /// Set the position for the next external window created via nvim_win_set_config(external=true).
+    /// This is used by tab externalization to place the window at the mouse cursor position.
+    func setPendingExternalWindowPosition(_ position: NSPoint) {
+        ZonvieCore.appLog("[external_window] setPendingExternalWindowPosition: \(position)")
+        pendingExternalWindowPosition = position
+    }
+
 
     func sendKeyEvent(
         keyCode: UInt32,
@@ -1496,6 +1508,10 @@ final class ZonvieCore {
 
     /// Tracks external windows (grid_id -> NSWindow)
     private var externalWindows: [Int64: NSWindow] = [:]
+
+    /// Pending position for the next regular external window (set by tab externalization)
+    /// When set, the next regular external window will be placed at this position, then this is cleared.
+    private var pendingExternalWindowPosition: NSPoint? = nil
     /// Tracks external grid views (grid_id -> ExternalGridView)
     private var externalGridViews: [Int64: ExternalGridView] = [:]
     /// Tracks external window delegates (grid_id -> ExternalWindowDelegate)
@@ -2016,6 +2032,16 @@ final class ZonvieCore {
                 }
 
                 windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+            } else if let pendingPos = self.pendingExternalWindowPosition {
+                // Tab externalization: use the pending position (mouse drop point)
+                styleMask = [.titled, .closable, .resizable]
+                // Position so the mouse is at the center of the title bar
+                let titleBarHeight: CGFloat = 28  // Standard macOS title bar height
+                let x = pendingPos.x - windowWidth / 2  // Center horizontally
+                let y = pendingPos.y - windowHeight - titleBarHeight / 2  // Title bar center at mouse Y
+                windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
+                self.pendingExternalWindowPosition = nil  // Clear after use
             } else if startRow >= 0 && startCol >= 0 {
                 // Position relative to main window using win_pos
                 styleMask = [.titled, .closable, .resizable]
@@ -2103,6 +2129,10 @@ final class ZonvieCore {
                 return
             }
 
+            // DEBUG: Log blurEnabled value before creating ExternalGridView
+            let blurEnabledForGrid = ZonvieConfig.shared.blurEnabled
+            ZonvieCore.appLog("[DEBUG-EXTGRID-CREATE] gridId=\(gridId) isSpecialWindow=\(isSpecialWindow) blurEnabled=\(blurEnabledForGrid) backgroundAlpha=\(ZonvieConfig.shared.backgroundAlpha) window.blur=\(ZonvieConfig.shared.window.blur)")
+
             guard let gridView = ExternalGridView(
                 gridId: gridId,
                 device: renderer.metalDevice,
@@ -2111,7 +2141,7 @@ final class ZonvieCore {
                 sharedBackgroundPipeline: renderer.sharedBackgroundPipeline,
                 sharedGlyphPipeline: renderer.sharedGlyphPipeline,
                 sharedSampler: sharedSampler,
-                blurEnabled: ZonvieConfig.shared.blurEnabled,
+                blurEnabled: blurEnabledForGrid,
                 isCmdline: isSpecialWindow  // Treat popupmenu same as cmdline for rendering
             ) else {
                 ZonvieCore.appLog("[external_window] failed to create ExternalGridView")
@@ -2309,7 +2339,9 @@ final class ZonvieCore {
             }
 
             // Refresh main window's blur effect after external window is shown
+            // DEBUG: This may cause blur to become stronger when external windows are shown
             if ZonvieConfig.shared.blurEnabled, let mainWindow = self.terminalView?.window {
+                ZonvieCore.appLog("[DEBUG-BLUR-REFRESH] Re-applying blur to main window after external window shown")
                 Self.applyWindowBlur(window: mainWindow, radius: ZonvieConfig.shared.window.blurRadius)
             }
         }
