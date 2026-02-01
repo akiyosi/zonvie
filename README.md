@@ -99,6 +99,12 @@ Configuration file location:
 ```toml
 [neovim]
 path = "nvim"
+wsl = false
+wsl_distro = "Ubuntu"
+ssh = false
+ssh_host = "user@example.com"
+ssh_port = 22
+ssh_identity = "~/.ssh/id_rsa"
 
 [font]
 family = "JetBrains Mono"
@@ -110,6 +116,12 @@ blur = true
 opacity = 0.85
 blur_radius = 20
 
+[scrollbar]
+enabled = true
+show_mode = "scroll"  # "always", "hover", "scroll", or combinations like "hover,scroll"
+opacity = 0.7
+delay = 1.0
+
 [cmdline]
 external = true
 
@@ -118,6 +130,46 @@ external = true
 
 [messages]
 external = true
+msg_pos = { ext-float = "window", mini = "grid" }  # display, window, or grid
+
+# Message routing rules (processed in order, first match wins)
+[[messages.routes]]
+event = "msg_show"
+kind = ["emsg", "echoerr", "lua_error", "rpc_error"]
+view = "ext-float"
+timeout = 0  # 0 = no auto-hide
+
+[[messages.routes]]
+event = "msg_show"
+kind = ["wmsg"]
+view = "ext-float"
+timeout = 4.0
+
+[[messages.routes]]
+event = "msg_show"
+kind = ["search_count"]
+view = "mini"
+timeout = 2.0
+
+[[messages.routes]]
+event = "msg_show"
+view = "ext-float"  # fallback for other msg_show
+
+[[messages.routes]]
+event = "msg_showmode"
+view = "mini"
+
+[[messages.routes]]
+event = "msg_showcmd"
+view = "mini"
+
+[[messages.routes]]
+event = "msg_ruler"
+view = "mini"
+
+[[messages.routes]]
+event = "msg_history_show"
+view = "split"
 
 [tabline]
 external = true
@@ -127,8 +179,12 @@ enabled = false
 path = "/tmp/zonvie.log"
 
 [performance]
-glyph_cache_ascii_size = 256
-glyph_cache_non_ascii_size = 128
+glyph_cache_ascii_size = 512
+glyph_cache_non_ascii_size = 256
+
+[ime]
+disable_on_activate = false
+disable_on_modechange = false
 ```
 
 ### Configuration Options
@@ -137,6 +193,8 @@ glyph_cache_non_ascii_size = 128
 | Key | Description |
 |-----|-------------|
 | `path` | Path to Neovim executable |
+| `wsl` | Enable WSL mode on Windows (true/false) |
+| `wsl_distro` | WSL distribution name |
 | `ssh` | Enable SSH mode (true/false) |
 | `ssh_host` | SSH host (user@host format) |
 | `ssh_port` | SSH port number |
@@ -155,6 +213,67 @@ glyph_cache_non_ascii_size = 128
 | `blur` | Enable blur effect (true/false) |
 | `opacity` | Background opacity (0.0-1.0, when blur=true) |
 | `blur_radius` | Blur radius (1-100, when blur=true) |
+
+#### [scrollbar]
+| Key | Description |
+|-----|-------------|
+| `enabled` | Show scrollbar (true/false) |
+| `show_mode` | When to show: "always", "hover", "scroll", or combinations like "hover,scroll" |
+| `opacity` | Scrollbar opacity (0.0-1.0) |
+| `delay` | Delay in seconds before hiding (0.1-10.0, for "scroll" mode) |
+
+#### [cmdline]
+| Key | Description |
+|-----|-------------|
+| `external` | Use external command line UI (true/false) |
+
+#### [popup]
+| Key | Description |
+|-----|-------------|
+| `external` | Use external popup menu UI (true/false) |
+
+#### [messages]
+| Key | Description |
+|-----|-------------|
+| `external` | Use external messages UI (true/false) |
+| `msg_pos` | Position anchor for message views: `{ ext-float = "...", mini = "..." }`. Values: "display", "window", "grid" |
+
+##### [[messages.routes]]
+
+Message routing rules are processed in order; first match wins.
+
+| Key | Description |
+|-----|-------------|
+| `event` | Event type: "msg_show", "msg_showmode", "msg_showcmd", "msg_ruler", "msg_history_show" |
+| `kind` | Array of message kinds to match (optional, omit to match all). Kinds: "emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "search_count", "confirm", "confirm_sub", "return_prompt", etc. |
+| `view` | View type: "mini", "ext-float", "confirm", "split", "none", "notification" |
+| `timeout` | Auto-hide timeout in seconds (optional, 0 = no auto-hide) |
+| `min_height` | Minimum line count to match (optional) |
+| `max_height` | Maximum line count to match (optional) |
+| `auto_dismiss` | Auto-dismiss return_prompt by sending \<CR\> (optional, default depends on view) |
+
+#### [tabline]
+| Key | Description |
+|-----|-------------|
+| `external` | Use external tabline UI (true/false) |
+
+#### [log]
+| Key | Description |
+|-----|-------------|
+| `enabled` | Enable logging (true/false) |
+| `path` | Log file path |
+
+#### [performance]
+| Key | Description |
+|-----|-------------|
+| `glyph_cache_ascii_size` | Cache size for ASCII glyphs (min: 128, default: 512) |
+| `glyph_cache_non_ascii_size` | Cache size for non-ASCII glyphs (min: 64, default: 256) |
+
+#### [ime]
+| Key | Description |
+|-----|-------------|
+| `disable_on_activate` | Disable IME when app becomes active (true/false) |
+| `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
 
 ## License
 
