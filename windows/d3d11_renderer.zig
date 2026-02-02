@@ -189,6 +189,12 @@ pub const Renderer = struct {
     atlas_tex: ?*c.ID3D11Texture2D = null,
     atlas_srv: ?*c.ID3D11ShaderResourceView = null,
 
+    // Tabline texture (B8G8R8A8_UNORM) - rendered from GDI bitmap
+    tabline_tex: ?*c.ID3D11Texture2D = null,
+    tabline_srv: ?*c.ID3D11ShaderResourceView = null,
+    tabline_width: u32 = 0,
+    tabline_height: u32 = 0,
+
     // Sizing
     width: u32 = 1,
     height: u32 = 1,
@@ -264,7 +270,10 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         safeRelease(&self.atlas_srv);
         safeRelease(&self.atlas_tex);
-    
+
+        safeRelease(&self.tabline_srv);
+        safeRelease(&self.tabline_tex);
+
         safeRelease(&self.vb);
         safeRelease(&self.rs);
         safeRelease(&self.blend);
@@ -635,32 +644,37 @@ pub const Renderer = struct {
             om_set_blend(ctx, self.blend.?, &blend_factor, 0xFFFFFFFF);
         }
 
-        // ---- Tabbar background (if content_y_offset and tabbar_bg_color are set) ----
+        // ---- Tabbar (if content_y_offset is set) ----
+        // Priority: tabline texture > tabbar_bg_color > nothing
         if (opts.content_y_offset) |y_off| {
-            if (opts.tabbar_bg_color) |bg_color| {
-                const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return;
-                const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return;
+            const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return;
+            const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return;
 
-                // Set full-screen viewport for tabbar drawing
-                var full_vp: c.D3D11_VIEWPORT = .{
-                    .TopLeftX = 0,
-                    .TopLeftY = 0,
-                    .Width = @floatFromInt(self.width),
-                    .Height = @floatFromInt(self.height),
-                    .MinDepth = 0,
-                    .MaxDepth = 1,
-                };
-                rs_set_vp(ctx, 1, &full_vp);
+            // Set full-screen viewport for tabbar drawing
+            var full_vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = 0,
+                .Width = @floatFromInt(self.width),
+                .Height = @floatFromInt(self.height),
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &full_vp);
 
-                // Set full-screen scissor
-                var full_sr: c.D3D11_RECT = .{
-                    .left = 0,
-                    .top = 0,
-                    .right = @intCast(self.width),
-                    .bottom = @intCast(self.height),
-                };
-                rs_set_sc(ctx, 1, &full_sr);
+            // Set full-screen scissor
+            var full_sr: c.D3D11_RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = @intCast(self.width),
+                .bottom = @intCast(self.height),
+            };
+            rs_set_sc(ctx, 1, &full_sr);
 
+            if (self.tabline_srv != null) {
+                // Draw tabline texture (rendered from GDI offscreen)
+                try self.drawTablineTexture();
+            } else if (opts.tabbar_bg_color) |bg_color| {
+                // Fallback: draw solid color background
                 // Generate tabbar background vertices (NDC coordinates)
                 // Top of screen is y=1.0, bottom is y=-1.0
                 const bottom_y: f32 = 1.0 - 2.0 * (@as(f32, @floatFromInt(y_off)) / @as(f32, @floatFromInt(self.height)));
@@ -675,37 +689,37 @@ pub const Renderer = struct {
                     .{ .position = .{ -1.0, bottom_y }, .texCoord = .{ -1.0, 0.0 }, .color = bg_color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
                 };
                 try self.drawVertices(&tabbar_verts);
+            }
 
-                // Restore content viewport
-                var content_vp: c.D3D11_VIEWPORT = .{
-                    .TopLeftX = 0,
-                    .TopLeftY = @floatFromInt(viewport_y_offset),
-                    .Width = @floatFromInt(viewport_width),
-                    .Height = @floatFromInt(viewport_height),
-                    .MinDepth = 0,
-                    .MaxDepth = 1,
+            // Restore content viewport
+            var content_vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = @floatFromInt(viewport_y_offset),
+                .Width = @floatFromInt(viewport_width),
+                .Height = @floatFromInt(viewport_height),
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &content_vp);
+
+            // Restore content scissor
+            if (effective_dirty) |r| {
+                const clamped_right: c.LONG = @min(r.right, @as(c.LONG, @intCast(viewport_width)));
+                var sr: c.D3D11_RECT = .{
+                    .left = r.left,
+                    .top = r.top,
+                    .right = clamped_right,
+                    .bottom = r.bottom,
                 };
-                rs_set_vp(ctx, 1, &content_vp);
-
-                // Restore content scissor
-                if (effective_dirty) |r| {
-                    const clamped_right: c.LONG = @min(r.right, @as(c.LONG, @intCast(viewport_width)));
-                    var sr: c.D3D11_RECT = .{
-                        .left = r.left,
-                        .top = r.top,
-                        .right = clamped_right,
-                        .bottom = r.bottom,
-                    };
-                    rs_set_sc(ctx, 1, &sr);
-                } else {
-                    var sr: c.D3D11_RECT = .{
-                        .left = 0,
-                        .top = 0,
-                        .right = @intCast(viewport_width),
-                        .bottom = @intCast(self.height),
-                    };
-                    rs_set_sc(ctx, 1, &sr);
-                }
+                rs_set_sc(ctx, 1, &sr);
+            } else {
+                var sr: c.D3D11_RECT = .{
+                    .left = 0,
+                    .top = 0,
+                    .right = @intCast(viewport_width),
+                    .bottom = @intCast(self.height),
+                };
+                rs_set_sc(ctx, 1, &sr);
             }
         }
 
@@ -1246,6 +1260,149 @@ pub const Renderer = struct {
     /// Backward-compatible single-rect draw.
     pub fn draw(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex, dirty_rect: ?c.RECT) !void {
         try self.drawEx(main, cursor, dirty_rect, .{});
+    }
+
+    /// Update tabline texture from BGRA pixel data (rendered by GDI offscreen).
+    /// This allows tabline to be composited via D3D11, avoiding DWM GDI/D3D mixing issues.
+    pub fn updateTablineTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {
+        if (width == 0 or height == 0) return;
+
+        const device = self.device orelse return error.NoDevice;
+        const ctx = self.ctx orelse return error.NoContext;
+
+        // Recreate texture if size changed
+        if (self.tabline_tex == null or self.tabline_width != width or self.tabline_height != height) {
+            // Release old resources
+            safeRelease(&self.tabline_srv);
+            safeRelease(&self.tabline_tex);
+
+            // Create new texture
+            var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            tex_desc.Width = width;
+            tex_desc.Height = height;
+            tex_desc.MipLevels = 1;
+            tex_desc.ArraySize = 1;
+            tex_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+            tex_desc.SampleDesc.Count = 1;
+            tex_desc.SampleDesc.Quality = 0;
+            tex_desc.Usage = c.D3D11_USAGE_DEFAULT;
+            tex_desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            tex_desc.CPUAccessFlags = 0;
+            tex_desc.MiscFlags = 0;
+
+            const vtbl = device.*.lpVtbl;
+            const create_tex = vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
+
+            var init_data: c.D3D11_SUBRESOURCE_DATA = std.mem.zeroes(c.D3D11_SUBRESOURCE_DATA);
+            init_data.pSysMem = pixels.ptr;
+            init_data.SysMemPitch = width * 4;
+
+            var tex: ?*c.ID3D11Texture2D = null;
+            var hr = create_tex(device, &tex_desc, &init_data, &tex);
+            if (c.FAILED(hr) or tex == null) {
+                applog.appLog("[d3d] updateTablineTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                return error.CreateTexture2DFailed;
+            }
+
+            // Create SRV
+            var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
+            srv_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+            srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.unnamed_0.Texture2D.MostDetailedMip = 0;
+            srv_desc.unnamed_0.Texture2D.MipLevels = 1;
+
+            const create_srv = vtbl.*.CreateShaderResourceView orelse {
+                safeRelease(&tex);
+                return error.NoCreateSRV;
+            };
+
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
+            if (c.FAILED(hr) or srv == null) {
+                applog.appLog("[d3d] updateTablineTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                safeRelease(&tex);
+                return error.CreateSRVFailed;
+            }
+
+            self.tabline_tex = tex;
+            self.tabline_srv = srv;
+            self.tabline_width = width;
+            self.tabline_height = height;
+
+            applog.appLog("[d3d] updateTablineTexture: created texture {d}x{d}\n", .{ width, height });
+        } else {
+            // Update existing texture
+            const tex = self.tabline_tex orelse return;
+            const ctx_vtbl = ctx.*.lpVtbl;
+            const update_subres = ctx_vtbl.*.UpdateSubresource orelse return error.NoUpdateSubresource;
+
+            var box: c.D3D11_BOX = .{
+                .left = 0,
+                .top = 0,
+                .front = 0,
+                .right = width,
+                .bottom = height,
+                .back = 1,
+            };
+
+            update_subres(ctx, @ptrCast(tex), 0, &box, pixels.ptr, width * 4, 0);
+        }
+    }
+
+    /// Draw tabline texture as a full-width quad at the top of the window.
+    /// Call this after clearing but before drawing main content.
+    pub fn drawTablineTexture(self: *Renderer) !void {
+        const srv = self.tabline_srv orelse return;
+        const ctx = self.ctx orelse return error.NoContext;
+        const width = self.tabline_width;
+        const height = self.tabline_height;
+
+        if (width == 0 or height == 0 or self.width == 0 or self.height == 0) return;
+
+        // Convert pixel coordinates to NDC (-1 to 1)
+        // Top-left is (-1, 1), bottom-right is (1, -1) in NDC
+        const ndc_left: f32 = -1.0;
+        const ndc_right: f32 = 1.0;
+        const ndc_top: f32 = 1.0;
+        // Bottom of tabline in NDC: 1.0 - 2.0 * (height / window_height)
+        const ndc_bottom: f32 = 1.0 - 2.0 * (@as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(self.height)));
+
+        // Special UV format for tabline texture sampling:
+        // uv.x = -5.0 (TABLINE_TEXTURE marker)
+        // uv.y = actual U coordinate (0-1)
+        // deco_phase = actual V coordinate (0-1)
+        const uv_marker: f32 = -5.0;
+
+        // White color (texture provides actual colors)
+        const color: [4]f32 = .{ 1, 1, 1, 1 };
+
+        // Two triangles (6 vertices) in NDC coordinates
+        // UV coords: (marker, U) with V in deco_phase
+        const verts: [6]core.Vertex = .{
+            // Triangle 1: top-left, top-right, bottom-left
+            .{ .position = .{ ndc_left, ndc_top }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            // Triangle 2: top-right, bottom-right, bottom-left
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_bottom }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+        };
+
+        // Save current atlas SRV
+        const ctx_vtbl = ctx.*.lpVtbl;
+
+        // Bind tabline texture
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
+        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+
+        // Draw the quad
+        try self.drawVertices(&verts);
+
+        // Restore atlas texture
+        srvs[0] = self.atlas_srv;
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }
 
     fn dumpInfoQueue(self: *Renderer, tag: []const u8) void {
@@ -1974,9 +2131,42 @@ pub const Renderer = struct {
             \\#define DECO_UNDERDASHED   (1u << 4)
             \\#define DECO_STRIKETHROUGH (1u << 5)
             \\
+            \\// Icon type markers (special uv.x values)
+            \\#define ICON_CIRCLE      (-2.0)
+            \\#define ICON_CHEVRON     (-3.0)
+            \\#define ICON_HANDLE      (-4.0)
+            \\#define TABLINE_TEXTURE  (-5.0)
+            \\
             \\// Premultiply helper for consistent blending
             \\float4 premultiply(float4 c) {
             \\  return float4(c.rgb * c.a, c.a);
+            \\}
+            \\// SDF helper: circle
+            \\float sdCircle(float2 p, float radius) {
+            \\  return length(p) - radius;
+            \\}
+            \\// SDF helper: line segment distance
+            \\float sdSegment(float2 p, float2 a, float2 b) {
+            \\  float2 pa = p - a;
+            \\  float2 ba = b - a;
+            \\  float h = saturate(dot(pa, ba) / dot(ba, ba));
+            \\  return length(pa - ba * h);
+            \\}
+            \\// SDF helper: oriented box (for handle)
+            \\float sdOrientedBox(float2 p, float2 a, float2 b, float th) {
+            \\  float len = length(b - a);
+            \\  if (len < 0.001) return 1000.0;
+            \\  float2 d = (b - a) / len;
+            \\  float2 q = p - (a + b) * 0.5;
+            \\  q = float2(dot(q, float2(d.y, -d.x)), dot(q, d));
+            \\  q = abs(q) - float2(th, len) * 0.5;
+            \\  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+            \\}
+            \\// Render icon with SDF + anti-aliasing
+            \\float4 renderIconSDF(float4 col, float sdf) {
+            \\  float aa = fwidth(sdf) * 1.5;
+            \\  float alpha = col.a * (1.0 - smoothstep(-aa, aa, sdf));
+            \\  return float4(col.rgb * alpha, alpha);
             \\}
             \\// DirectWrite gamma correction (from Windows Terminal)
             \\// Gamma 1.8 ratios
@@ -1994,9 +2184,48 @@ pub const Renderer = struct {
             \\  return k * saturate(dot(c, float3(0.30, 0.59, 0.11) * -4.0) + 3.0);
             \\}
             \\float4 PSMain(VSOut i) : SV_Target {
+            \\  // Tabline texture mode: sample BGRA texture directly
+            \\  if (i.uv.x <= TABLINE_TEXTURE + 0.1 && i.uv.x >= TABLINE_TEXTURE - 0.1) {
+            \\    // UV coordinates stored in (uv.y, deco_phase) for tabline texture
+            \\    float2 tablineUV = float2(i.uv.y, i.deco_phase);
+            \\    float4 tex = atlasTex.Sample(samp0, tablineUV);
+            \\    // BGRA texture: return as-is with premultiplied alpha
+            \\    return float4(tex.rgb * tex.a, tex.a);
+            \\  }
             \\  // Background quads use sentinel uv.x < 0 in current vertexgen.
             \\  // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
             \\  if (i.uv.x < 0.0) {
+            \\    // Icon rendering with SDF (uv.x <= -1.9)
+            \\    // Local UV: uv.y = local_x (0-1), deco_phase = local_y (0-1)
+            \\    if (i.uv.x <= ICON_CIRCLE + 0.1) {
+            \\      float2 localUV = float2(i.uv.y, i.deco_phase);
+            \\      // Circle icon (magnifying glass lens)
+            \\      if (i.uv.x >= ICON_CIRCLE - 0.1) {
+            \\        float2 center = float2(0.42, 0.42);
+            \\        float radius = 0.32;
+            \\        float sdf = sdCircle(localUV - center, radius);
+            \\        return renderIconSDF(i.col, sdf);
+            \\      }
+            \\      // Chevron icon (>)
+            \\      if (i.uv.x >= ICON_CHEVRON - 0.1 && i.uv.x <= ICON_CHEVRON + 0.1) {
+            \\        float2 tip = float2(0.75, 0.5);
+            \\        float2 topLeft = float2(0.25, 0.2);
+            \\        float2 botLeft = float2(0.25, 0.8);
+            \\        float thickness = 0.08;
+            \\        float d1 = sdSegment(localUV, topLeft, tip) - thickness;
+            \\        float d2 = sdSegment(localUV, botLeft, tip) - thickness;
+            \\        float sdf = min(d1, d2);
+            \\        return renderIconSDF(i.col, sdf);
+            \\      }
+            \\      // Handle icon (rotated rectangle)
+            \\      if (i.uv.x >= ICON_HANDLE - 0.1 && i.uv.x <= ICON_HANDLE + 0.1) {
+            \\        float2 start = float2(0.5, 0.5);
+            \\        float2 endpt = float2(0.92, 0.92);
+            \\        float thickness = 0.12;
+            \\        float sdf = sdOrientedBox(localUV, start, endpt, thickness);
+            \\        return renderIconSDF(i.col, sdf);
+            \\      }
+            \\    }
             \\    // Handle decorations
             \\    if (i.deco_flags != 0) {
             \\      // Undercurl: sine wave

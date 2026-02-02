@@ -43,6 +43,7 @@ SamplerState samp0 : register(s0);
 #define ICON_CIRCLE      (-2.0)
 #define ICON_CHEVRON     (-3.0)
 #define ICON_HANDLE      (-4.0)
+#define TABLINE_TEXTURE  (-5.0)  // BGRA texture sampling mode
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -101,6 +102,15 @@ float4 renderIconSDF(float4 col, float sdf) {
 }
 
 float4 PSMain(VSOut i) : SV_Target {
+    // Tabline texture mode: sample BGRA texture directly
+    if (i.uv.x <= TABLINE_TEXTURE + 0.1 && i.uv.x >= TABLINE_TEXTURE - 0.1) {
+        // UV coordinates stored in (uv.y, deco_phase) for tabline texture
+        float2 tablineUV = float2(i.uv.y, i.deco_phase);
+        float4 tex = atlasTex.Sample(samp0, tablineUV);
+        // BGRA texture: return as-is with premultiplied alpha
+        return float4(tex.rgb * tex.a, tex.a);
+    }
+
     // Background quads use sentinel uv.x < 0 in current vertexgen.
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (i.uv.x < 0.0) {
