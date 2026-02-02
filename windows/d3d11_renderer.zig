@@ -723,6 +723,14 @@ pub const Renderer = struct {
             }
         }
 
+        // ---- Ensure atlas SRV is bound before drawing main/cursor ----
+        // This is a safeguard in case drawTablineTexture's restore failed or was skipped.
+        {
+            const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return;
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.atlas_srv };
+            ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+        }
+
         // ---- Draw in two batches ----
         try self.drawVertices(main);
         try self.drawVertices(cursor);

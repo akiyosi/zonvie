@@ -9132,8 +9132,27 @@ export fn WndProc(
                         // Use content_hwnd size when it exists (D3D11 is bound to content_hwnd)
                         var client: c.RECT = undefined;
                         const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-                        const cursor_rc_opt = rectFromCursorVerts(client_hwnd, cursor_verts_snapshot);
                         _ = c.GetClientRect(client_hwnd, &client);
+
+                        // Get cursor rect and transform Y coords to match viewport when ext_tabline is enabled.
+                        // rectFromCursorVerts calculates Y using full window height, but viewport has Y offset
+                        // and reduced height. Transform: new_y = y_off + old_y * (full_h - y_off) / full_h
+                        const cursor_rc_raw = rectFromCursorVerts(client_hwnd, cursor_verts_snapshot);
+                        const cursor_rc_opt: ?c.RECT = if (cursor_rc_raw) |cr| blk: {
+                            const y_off: i32 = if (content_y_offset) |off| @intCast(off) else 0;
+                            if (y_off > 0) {
+                                const full_h: f32 = @floatFromInt(@max(1, client.bottom));
+                                const content_h: f32 = full_h - @as(f32, @floatFromInt(y_off));
+                                break :blk .{
+                                    .left = cr.left,
+                                    .top = y_off + @as(i32, @intFromFloat(@as(f32, @floatFromInt(cr.top)) * content_h / full_h)),
+                                    .right = cr.right,
+                                    .bottom = y_off + @as(i32, @intFromFloat(@ceil(@as(f32, @floatFromInt(cr.bottom)) * content_h / full_h))),
+                                };
+                            } else {
+                                break :blk cr;
+                            }
+                        } else null;
                         
                         const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
                         const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
@@ -9587,6 +9606,7 @@ export fn WndProc(
                                         // Clamp to content width for "always" scrollbar mode
                                         const scissor_right: c.LONG = if (content_width) |cw| @as(c.LONG, @intCast(cw)) else client.right;
                                         if (cursor_rc_opt) |cr| {
+                                            // cursor_rc_opt is already transformed to viewport coords
                                             var sc: c.D3D11_RECT = .{
                                                 .left = cr.left,
                                                 .top = cr.top,
