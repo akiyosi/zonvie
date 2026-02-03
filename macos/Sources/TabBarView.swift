@@ -37,6 +37,7 @@ final class TabBarView: NSView {
     private var currentTab: Int64 = 0
     private var hoveredTabIndex: Int? = nil
     private var hoveredCloseButton: Int? = nil
+    private var hoveredNewTabButton: Bool = false
 
     // Drag state
     private var draggingTabIndex: Int? = nil
@@ -328,8 +329,11 @@ final class TabBarView: NSView {
         let size: CGFloat = 20
         let rect = NSRect(x: origin.x, y: origin.y, width: size, height: size)
 
-        // Background on hover
-        // (could add hover state later)
+        // Background on hover (circular, like close button)
+        if hoveredNewTabButton {
+            NSColor.secondaryLabelColor.withAlphaComponent(0.3).setFill()
+            NSBezierPath(ovalIn: rect).fill()
+        }
 
         NSColor.secondaryLabelColor.setStroke()
         let path = NSBezierPath()
@@ -410,9 +414,8 @@ final class TabBarView: NSView {
 
         if let index = tabIndex(at: location) {
             if isCloseButton(at: location, tabIndex: index) {
-                // Close tab - handle immediately
-                let tab = tabs[index]
-                onTabClosed?(tab.handle)
+                // Close button pressed - track until mouse up
+                trackCloseButtonClick(initialEvent: event, tabIndex: index)
             } else {
                 // Start tab drag - use event tracking loop to prevent window drag
                 let availableWidth = bounds.width - windowControlsWidth - 40
@@ -431,7 +434,8 @@ final class TabBarView: NSView {
                 trackTabDrag(initialEvent: event, tabIndex: index, tabWidth: tabWidth)
             }
         } else if isNewTabButton(at: location) {
-            onNewTabRequested?()
+            // New tab button pressed - track until mouse up
+            trackNewTabButtonClick(initialEvent: event)
         } else {
             // Empty area in titlebar
             if event.clickCount == 2 {
@@ -548,6 +552,80 @@ final class TabBarView: NSView {
         }
     }
 
+    /// Track close button click until mouse up - only close if still over button
+    private func trackCloseButtonClick(initialEvent: NSEvent, tabIndex: Int) {
+        guard let window = self.window else { return }
+        guard tabIndex < tabs.count else { return }
+
+        let tab = tabs[tabIndex]
+        var isTracking = true
+
+        // Visual feedback - highlight close button as pressed
+        hoveredCloseButton = tabIndex
+        needsDisplay = true
+
+        while isTracking {
+            guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
+                continue
+            }
+
+            let location = convert(event.locationInWindow, from: nil)
+
+            switch event.type {
+            case .leftMouseDragged:
+                // Update hover state based on whether mouse is still over close button
+                let isStillOverClose = isCloseButton(at: location, tabIndex: tabIndex)
+                if isStillOverClose != (hoveredCloseButton == tabIndex) {
+                    hoveredCloseButton = isStillOverClose ? tabIndex : nil
+                    needsDisplay = true
+                }
+
+            case .leftMouseUp:
+                isTracking = false
+                // Only close if mouse is still over the close button
+                if isCloseButton(at: location, tabIndex: tabIndex) {
+                    onTabClosed?(tab.handle)
+                }
+                hoveredCloseButton = nil
+                needsDisplay = true
+
+            default:
+                break
+            }
+        }
+    }
+
+    /// Track new tab button click until mouse up - only create tab if still over button
+    private func trackNewTabButtonClick(initialEvent: NSEvent) {
+        guard let window = self.window else { return }
+
+        var isTracking = true
+
+        while isTracking {
+            guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
+                continue
+            }
+
+            let location = convert(event.locationInWindow, from: nil)
+
+            switch event.type {
+            case .leftMouseDragged:
+                // Could add visual feedback here if needed
+                break
+
+            case .leftMouseUp:
+                isTracking = false
+                // Only create new tab if mouse is still over the button
+                if isNewTabButton(at: location) {
+                    onNewTabRequested?()
+                }
+
+            default:
+                break
+            }
+        }
+    }
+
     // MARK: - External Drag Preview Window
 
     private func createDragPreviewWindow(for tabIndex: Int, at screenPoint: NSPoint) {
@@ -625,18 +703,21 @@ final class TabBarView: NSView {
         } else {
             nil
         }
+        let newHoveredNewTab = isNewTabButton(at: location)
 
-        if newHoveredIndex != hoveredTabIndex || newHoveredClose != hoveredCloseButton {
+        if newHoveredIndex != hoveredTabIndex || newHoveredClose != hoveredCloseButton || newHoveredNewTab != hoveredNewTabButton {
             hoveredTabIndex = newHoveredIndex
             hoveredCloseButton = newHoveredClose
+            hoveredNewTabButton = newHoveredNewTab
             needsDisplay = true
         }
     }
 
     override func mouseExited(with event: NSEvent) {
-        if hoveredTabIndex != nil || hoveredCloseButton != nil {
+        if hoveredTabIndex != nil || hoveredCloseButton != nil || hoveredNewTabButton {
             hoveredTabIndex = nil
             hoveredCloseButton = nil
+            hoveredNewTabButton = false
             needsDisplay = true
         }
     }

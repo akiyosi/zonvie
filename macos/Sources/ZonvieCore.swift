@@ -986,11 +986,38 @@ final class ZonvieCore {
         }
     }
 
+    /// Send a command to Neovim via nvim_command RPC (does not show in cmdline).
+    /// Prefer this over sendInput for commands that should not appear in the command line.
+    func sendCommand(_ cmd: String) {
+        guard let core else {
+            ZonvieCore.appLog("[sendCommand] core is nil")
+            return
+        }
+        let data = cmd.data(using: .utf8) ?? Data()
+        ZonvieCore.appLog("[sendCommand] sending \"\(cmd)\" (\(data.count) bytes)")
+        data.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else {
+                ZonvieCore.appLog("[sendCommand] failed to get base address")
+                return
+            }
+            zonvie_core_send_command(core, base, data.count)
+        }
+    }
+
     /// Set the position for the next external window created via nvim_win_set_config(external=true).
     /// This is used by tab externalization to place the window at the mouse cursor position.
+    /// The pending position is automatically cleared after 500ms if not consumed (to prevent stale state).
     func setPendingExternalWindowPosition(_ position: NSPoint) {
         ZonvieCore.appLog("[external_window] setPendingExternalWindowPosition: \(position)")
         pendingExternalWindowPosition = position
+
+        // Clear pending position after timeout to prevent stale state if externalization fails
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            if self?.pendingExternalWindowPosition != nil {
+                ZonvieCore.appLog("[external_window] clearing stale pendingExternalWindowPosition (timeout)")
+                self?.pendingExternalWindowPosition = nil
+            }
+        }
     }
 
 

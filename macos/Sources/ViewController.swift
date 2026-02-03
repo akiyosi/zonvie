@@ -232,26 +232,17 @@ final class ViewController: NSViewController {
         // Set the pending external window position so it appears at the drop point
         core.setPendingExternalWindowPosition(dropPoint)
 
-        // Switch to the target tab first (Ngt command)
+        // Execute single Lua script that does both tab switch and externalization atomically.
+        // This avoids race condition between nvim_input (tab switch) and nvim_command (Lua).
+        // The Lua script:
+        // 1. Switch to the target tab
+        // 2. Check if tab has multiple windows (split) - abort if so
+        // 3. Get current window dimensions
+        // 4. Create new split with empty buffer (so main window isn't empty)
+        // 5. Externalize the original window
         let tabNumber = index + 1
-        ZonvieCore.appLog("[EXTERNALIZE] switching to tab \(tabNumber)")
-        core.sendInput("\u{1b}\(tabNumber)gt")
-
-        // Execute Lua script after a short delay to ensure tab switch completes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.executeExternalizeLua()
-        }
-    }
-
-    private func executeExternalizeLua() {
-        ZonvieCore.appLog("[EXTERNALIZE] executeExternalizeLua called")
-        // Lua script to externalize current window (single line to avoid newline issues):
-        // 1. Check if tab has multiple windows (split) - abort if so
-        // 2. Get current window dimensions
-        // 3. Create new split with empty buffer (so main window isn't empty)
-        // 4. Externalize the original window
-        let luaScript = "lua local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); vim.cmd('vnew'); vim.api.nvim_win_set_config(w,{external=true,width=W,height=H})"
+        let luaScript = "lua vim.cmd('\(tabNumber)tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); vim.cmd('vnew'); vim.api.nvim_win_set_config(w,{external=true,width=W,height=H}); vim.api.nvim_set_current_win(w)"
         ZonvieCore.appLog("[EXTERNALIZE] sending Lua script to nvim: \(luaScript)")
-        core?.sendInput("\u{1b}:" + luaScript + "\r")
+        core.sendCommand(luaScript)
     }
 }

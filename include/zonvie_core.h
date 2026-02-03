@@ -602,6 +602,11 @@ void zonvie_core_stop(zonvie_core *core);
 
 void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int len);
 
+/* Send a command to Neovim via nvim_command RPC (does not show in cmdline).
+   cmd: command string (e.g., "lua vim.notify('hello')")
+   len: length of command string */
+ZONVIE_API void zonvie_core_send_command(zonvie_core *core, const unsigned char *cmd, size_t len);
+
 /* Send raw data to child process stdin (for SSH password input).
    data: raw bytes to send (password + newline)
    len: number of bytes
