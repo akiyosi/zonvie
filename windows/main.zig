@@ -475,6 +475,20 @@ const ExternalWindow = struct {
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
 
+    // Scrollbar state for external windows
+    scrollbar_visible: bool = false,
+    scrollbar_alpha: f32 = 0.0,
+    scrollbar_target_alpha: f32 = 0.0,
+    scrollbar_dragging: bool = false,
+    scrollbar_drag_start_y: i32 = 0,
+    scrollbar_drag_start_topline: i64 = 0,
+    scrollbar_repeat_timer: usize = 0,
+    scrollbar_repeat_dir: i8 = 0,
+    scrollbar_pending_line: i64 = -1,
+    scrollbar_pending_use_bottom: bool = false,
+    scrollbar_hover: bool = false,
+    scrollbar_last_update: i64 = 0, // Timestamp for throttling
+
     fn deinit(self: *ExternalWindow, alloc: std.mem.Allocator) void {
         // Clear user data first to prevent WndProc from accessing App during destruction
         _ = c.SetWindowLongPtrW(self.hwnd, c.GWLP_USERDATA, 0);
@@ -1069,8 +1083,17 @@ fn rectFromVerts(hwnd: c.HWND, verts: []const core.Vertex) ?c.RECT {
 
 fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     const row_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
-    const top_u: u32 = @intCast(@max(0, rc.top));
-    const bot_u: u32 = @intCast(@max(0, rc.bottom));
+
+    // When ext_tabline is enabled (and content_hwnd is not used), the rect coordinates
+    // are in hwnd (main window) coordinate system which includes the tabbar.
+    // We need to subtract the tabbar height to get the correct row number.
+    const y_offset: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+        @intCast(TablineState.TAB_BAR_HEIGHT)
+    else
+        0;
+
+    const top_u: u32 = @intCast(@max(0, rc.top - y_offset));
+    const bot_u: u32 = @intCast(@max(0, rc.bottom - y_offset));
 
     var r0: u32 = top_u / row_h;
     var r1: u32 = (bot_u + (row_h - 1)) / row_h; // ceil
@@ -6340,7 +6363,7 @@ fn ensureExternalWindowClassRegistered() bool {
     wc.style = c.CS_HREDRAW | c.CS_VREDRAW;
     wc.lpfnWndProc = ExternalWndProc;
     wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = null; // Set dynamically; consistent with main window
+    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
     wc.hbrBackground = null;
     wc.lpszClassName = @ptrCast(external_window_class_name.ptr);
 
@@ -6392,7 +6415,14 @@ fn handleMouseWheel(
     // Calculate cell position (include linespace in row height)
     const row_h = cell_h + linespace;
     const col: i32 = if (cell_w > 0) @divTrunc(pt.x, @as(c.LONG, @intCast(cell_w))) else 0;
-    const row: i32 = if (row_h > 0) @divTrunc(pt.y, @as(c.LONG, @intCast(row_h))) else 0;
+    // When ext_tabline is enabled on main window, subtract tabbar height to get content-relative Y coordinate.
+    // External windows (floating windows) don't have a tabbar, so only apply offset for main window.
+    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
+    const content_y: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.content_hwnd == null)
+        pt.y - @as(c.LONG, TablineState.TAB_BAR_HEIGHT)
+    else
+        pt.y;
+    const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;
 
     // Accumulate scroll delta
     scroll_accum.* += delta;
@@ -6451,7 +6481,98 @@ fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) struct
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
+    // When ext_tabline is enabled, scrollbar should start below the tabbar
+    const tabbar_offset: f32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+        @floatFromInt(TablineState.TAB_BAR_HEIGHT)
+    else
+        0;
+
     // Track position (right edge)
+    const track_left = cw - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN;
+    const track_right = cw - SCROLLBAR_MARGIN;
+    const track_top = SCROLLBAR_MARGIN + tabbar_offset;
+    const track_bottom = ch - SCROLLBAR_MARGIN;
+    const track_height = track_bottom - track_top;
+
+    if (!is_scrollable or track_height <= 0) {
+        return .{
+            .track_left = track_left,
+            .track_top = track_top,
+            .track_right = track_right,
+            .track_bottom = track_bottom,
+            .knob_top = track_top,
+            .knob_bottom = track_bottom,
+            .is_scrollable = false,
+        };
+    }
+
+    // Knob size proportional to visible portion
+    const visible_f: f32 = @floatFromInt(visible_lines);
+    const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
+    const knob_proportion = @min(1.0, visible_f / total_f);
+    var knob_height = track_height * knob_proportion;
+    knob_height = @max(SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+
+    // Knob position
+    const scroll_range = total_f - visible_f;
+    const scroll_pos: f32 = if (scroll_range > 0) @as(f32, @floatFromInt(vp.topline)) / scroll_range else 0;
+    const knob_travel = track_height - knob_height;
+    const knob_top = track_top + knob_travel * scroll_pos;
+    const knob_bottom = knob_top + knob_height;
+
+    return .{
+        .track_left = track_left,
+        .track_top = track_top,
+        .track_right = track_right,
+        .track_bottom = track_bottom,
+        .knob_top = knob_top,
+        .knob_bottom = knob_bottom,
+        .is_scrollable = true,
+    };
+}
+
+/// Scrollbar geometry result type
+const ScrollbarGeometry = struct {
+    track_left: f32,
+    track_top: f32,
+    track_right: f32,
+    track_bottom: f32,
+    knob_top: f32,
+    knob_bottom: f32,
+    is_scrollable: bool,
+};
+
+/// Get scrollbar geometry for external window (no tabbar offset)
+fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32) ScrollbarGeometry {
+    const corep = app.corep;
+    if (corep == null) return .{
+        .track_left = 0,
+        .track_top = 0,
+        .track_right = 0,
+        .track_bottom = 0,
+        .knob_top = 0,
+        .knob_bottom = 0,
+        .is_scrollable = false,
+    };
+
+    var vp: core.ViewportInfo = undefined;
+    if (core.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return .{
+        .track_left = 0,
+        .track_top = 0,
+        .track_right = 0,
+        .track_bottom = 0,
+        .knob_top = 0,
+        .knob_bottom = 0,
+        .is_scrollable = false,
+    };
+
+    const visible_lines = vp.botline - vp.topline;
+    const is_scrollable = vp.line_count > visible_lines and visible_lines > 0;
+
+    const cw: f32 = @floatFromInt(client_width);
+    const ch: f32 = @floatFromInt(client_height);
+
+    // Track position (right edge) - no tabbar offset for external windows
     const track_left = cw - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN;
     const track_right = cw - SCROLLBAR_MARGIN;
     const track_top = SCROLLBAR_MARGIN;
@@ -6493,6 +6614,313 @@ fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) struct
         .knob_bottom = knob_bottom,
         .is_scrollable = true,
     };
+}
+
+/// Generate scrollbar vertices for external window
+fn generateScrollbarVerticesForExternal(
+    app: *App,
+    ext_win: *ExternalWindow,
+    grid_id: i64,
+    client_width: i32,
+    client_height: i32,
+    out_verts: *[12]core.Vertex,
+) usize {
+    if (!app.config.scrollbar.enabled) return 0;
+    if (ext_win.scrollbar_alpha <= 0.001) return 0;
+
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height);
+    if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
+
+    const cw: f32 = @floatFromInt(client_width);
+    const ch: f32 = @floatFromInt(client_height);
+
+    // Convert to NDC (-1..1)
+    const to_ndc_x = struct {
+        fn f(px: f32, w: f32) f32 {
+            return (px / w) * 2.0 - 1.0;
+        }
+    }.f;
+    const to_ndc_y = struct {
+        fn f(py: f32, h: f32) f32 {
+            return 1.0 - (py / h) * 2.0; // Y flipped
+        }
+    }.f;
+
+    const alpha = ext_win.scrollbar_alpha * app.config.scrollbar.opacity;
+
+    // Track color
+    const is_always_mode = app.config.scrollbar.isAlways();
+    const track_alpha: f32 = if (is_always_mode) 1.0 else alpha * 0.5;
+    const track_color = [4]f32{ 0.2, 0.2, 0.2, track_alpha };
+    // Knob color
+    const knob_color = [4]f32{ 0.7, 0.7, 0.7, alpha };
+
+    // Track quad (background) - 6 vertices
+    const tl = to_ndc_x(geom.track_left, cw);
+    const tr = to_ndc_x(geom.track_right, cw);
+    const tt = to_ndc_y(geom.track_top, ch);
+    const tb = to_ndc_y(geom.track_bottom, ch);
+
+    // Track Triangle 1
+    out_verts[0] = .{ .position = .{ tl, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[1] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[2] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+
+    // Track Triangle 2
+    out_verts[3] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[4] = .{ .position = .{ tr, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[5] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+
+    // Knob quad - 6 vertices
+    const kl = to_ndc_x(geom.track_left + 1, cw); // Inset by 1px
+    const kr = to_ndc_x(geom.track_right - 1, cw);
+    const kt = to_ndc_y(geom.knob_top, ch);
+    const kb = to_ndc_y(geom.knob_bottom, ch);
+
+    // Knob Triangle 1
+    out_verts[6] = .{ .position = .{ kl, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[7] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[8] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+
+    // Knob Triangle 2
+    out_verts[9] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[10] = .{ .position = .{ kr, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+    out_verts[11] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
+
+    return 12;
+}
+
+/// Hit test scrollbar area for external window
+fn scrollbarHitTestForExternal(
+    app: *App,
+    grid_id: i64,
+    client_width: i32,
+    client_height: i32,
+    mouse_x: i32,
+    mouse_y: i32,
+) enum { none, knob, track_above, track_below } {
+    if (!app.config.scrollbar.enabled) return .none;
+
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height);
+    if (!geom.is_scrollable) return .none;
+
+    const mx: f32 = @floatFromInt(mouse_x);
+    const my: f32 = @floatFromInt(mouse_y);
+
+    // Check if in track area horizontally
+    if (mx < geom.track_left or mx > geom.track_right) return .none;
+
+    // Check vertical position
+    if (my < geom.track_top or my > geom.track_bottom) return .none;
+
+    if (my >= geom.knob_top and my <= geom.knob_bottom) {
+        return .knob;
+    } else if (my < geom.knob_top) {
+        return .track_above;
+    } else {
+        return .track_below;
+    }
+}
+
+/// Show scrollbar for external window
+fn showScrollbarForExternal(hwnd: c.HWND, ext_win: *ExternalWindow) void {
+    ext_win.scrollbar_visible = true;
+    ext_win.scrollbar_target_alpha = 1.0;
+
+    // Start fade animation if not already at target
+    if (ext_win.scrollbar_alpha < 1.0) {
+        _ = c.SetTimer(hwnd, TIMER_SCROLLBAR_FADE, SCROLLBAR_FADE_INTERVAL, null);
+    }
+}
+
+/// Hide scrollbar for external window
+fn hideScrollbarForExternal(hwnd: c.HWND, app: *App, ext_win: *ExternalWindow) void {
+    if (app.config.scrollbar.isAlways()) return; // Never hide in always mode
+    if (ext_win.scrollbar_dragging) return; // Don't hide while dragging
+
+    ext_win.scrollbar_target_alpha = 0.0;
+
+    // Start fade animation if not already at target
+    if (ext_win.scrollbar_alpha > 0.0) {
+        _ = c.SetTimer(hwnd, TIMER_SCROLLBAR_FADE, SCROLLBAR_FADE_INTERVAL, null);
+    }
+}
+
+/// Page scroll for external window
+fn scrollbarPageScrollForExternal(app: *App, grid_id: i64, direction: i8) void {
+    const corep = app.corep orelse return;
+
+    var vp: core.ViewportInfo = undefined;
+    if (core.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return;
+
+    const visible_lines = vp.botline - vp.topline;
+    const steps = @max(1, visible_lines - 2);
+    const dir_str: [*:0]const u8 = if (direction < 0) "up" else "down";
+
+    var i: i64 = 0;
+    while (i < steps) : (i += 1) {
+        core.zonvie_core_send_mouse_scroll(corep, grid_id, 0, 0, dir_str);
+    }
+}
+
+/// Handle scrollbar mouse down for external window
+fn scrollbarMouseDownForExternal(hwnd: c.HWND, app: *App, ext_win: *ExternalWindow, grid_id: i64, mouse_x: i32, mouse_y: i32) bool {
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+
+    const hit = scrollbarHitTestForExternal(app, grid_id, client.right, client.bottom, mouse_x, mouse_y);
+
+    const corep = app.corep orelse return false;
+
+    switch (hit) {
+        .knob => {
+            // Start dragging
+            ext_win.scrollbar_dragging = true;
+            ext_win.scrollbar_drag_start_y = mouse_y;
+
+            var vp: core.ViewportInfo = undefined;
+            if (core.zonvie_core_get_viewport(corep, grid_id, &vp) != 0) {
+                ext_win.scrollbar_drag_start_topline = vp.topline;
+            }
+
+            _ = c.SetCapture(hwnd);
+            return true;
+        },
+        .track_above => {
+            // Page up - execute immediately and start repeat timer
+            scrollbarPageScrollForExternal(app, grid_id, -1);
+            ext_win.scrollbar_repeat_dir = -1;
+            _ = c.SetCapture(hwnd);
+            ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, TIMER_SCROLLBAR_REPEAT, SCROLLBAR_REPEAT_DELAY, null);
+            showScrollbarForExternal(hwnd, ext_win);
+            return true;
+        },
+        .track_below => {
+            // Page down - execute immediately and start repeat timer
+            scrollbarPageScrollForExternal(app, grid_id, 1);
+            ext_win.scrollbar_repeat_dir = 1;
+            _ = c.SetCapture(hwnd);
+            ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, TIMER_SCROLLBAR_REPEAT, SCROLLBAR_REPEAT_DELAY, null);
+            showScrollbarForExternal(hwnd, ext_win);
+            return true;
+        },
+        .none => return false,
+    }
+}
+
+/// Handle scrollbar mouse move (dragging) for external window
+fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *ExternalWindow, grid_id: i64, mouse_y: i32) void {
+    if (!ext_win.scrollbar_dragging) return;
+
+    const corep = app.corep orelse return;
+
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client.right, client.bottom);
+    if (!geom.is_scrollable) return;
+
+    var vp: core.ViewportInfo = undefined;
+    if (core.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return;
+
+    const visible_lines = vp.botline - vp.topline;
+    if (visible_lines <= 0) return;
+
+    // Calculate knob travel range
+    const track_height = geom.track_bottom - geom.track_top;
+    const visible_f: f32 = @floatFromInt(visible_lines);
+    const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
+    const knob_proportion = @min(1.0, visible_f / total_f);
+    var knob_height = track_height * knob_proportion;
+    knob_height = @max(SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+    const knob_travel = track_height - knob_height;
+    if (knob_travel <= 0) return;
+
+    // Calculate target topline from mouse position relative to track
+    const mouse_in_track: f32 = @as(f32, @floatFromInt(mouse_y)) - geom.track_top - knob_height / 2.0;
+    const scroll_ratio = @max(0.0, @min(1.0, mouse_in_track / knob_travel));
+
+    // scroll_range is max topline value (0-based: 0 to line_count - visible_lines)
+    const scroll_range = @max(0, vp.line_count - visible_lines);
+    const target_topline_0based: i64 = @intFromFloat(scroll_ratio * @as(f32, @floatFromInt(scroll_range)));
+
+    // 1-based topline for Neovim
+    const target_topline_1based: i64 = target_topline_0based + 1;
+
+    // Determine scroll mode: top half uses zt (top), bottom half uses zb (bottom)
+    const use_bottom = scroll_ratio >= 0.5;
+    const target_line: i64 = if (use_bottom) blk: {
+        const bottom_line = target_topline_1based + visible_lines - 1;
+        break :blk @min(bottom_line, vp.line_count);
+    } else target_topline_1based;
+
+    // Always store pending position
+    ext_win.scrollbar_pending_line = target_line;
+    ext_win.scrollbar_pending_use_bottom = use_bottom;
+
+    // Throttle: only send RPC if enough time has passed
+    const now: i64 = @intCast(c.GetTickCount64());
+    if (now - ext_win.scrollbar_last_update < SCROLLBAR_THROTTLE_MS) return;
+    ext_win.scrollbar_last_update = now;
+
+    // Send scroll command to Neovim
+    core.zonvie_core_scroll_to_line(corep, target_line, use_bottom);
+
+    ext_win.scrollbar_pending_line = -1;
+}
+
+/// Handle scrollbar mouse up for external window
+fn scrollbarMouseUpForExternal(hwnd: c.HWND, app: *App, ext_win: *ExternalWindow, _: i64) void {
+    if (ext_win.scrollbar_dragging) {
+        ext_win.scrollbar_dragging = false;
+        _ = c.ReleaseCapture();
+
+        // Flush any pending scroll on mouse up
+        if (ext_win.scrollbar_pending_line >= 0) {
+            if (app.corep) |corep| {
+                core.zonvie_core_scroll_to_line(corep, ext_win.scrollbar_pending_line, ext_win.scrollbar_pending_use_bottom);
+            }
+            ext_win.scrollbar_pending_line = -1;
+        }
+    }
+
+    if (ext_win.scrollbar_repeat_timer != 0) {
+        _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
+        ext_win.scrollbar_repeat_timer = 0;
+        ext_win.scrollbar_repeat_dir = 0;
+        _ = c.ReleaseCapture();
+    }
+}
+
+/// Update scrollbar fade animation for external window
+fn updateScrollbarFadeForExternal(hwnd: c.HWND, _: *App, ext_win: *ExternalWindow) void {
+    const delta: f32 = 0.1; // Fade step
+    var changed = false;
+
+    if (ext_win.scrollbar_alpha < ext_win.scrollbar_target_alpha) {
+        ext_win.scrollbar_alpha = @min(ext_win.scrollbar_target_alpha, ext_win.scrollbar_alpha + delta);
+        changed = true;
+    } else if (ext_win.scrollbar_alpha > ext_win.scrollbar_target_alpha) {
+        ext_win.scrollbar_alpha = @max(ext_win.scrollbar_target_alpha, ext_win.scrollbar_alpha - delta);
+        changed = true;
+    }
+
+    if (changed) {
+        _ = c.InvalidateRect(hwnd, null, 0);
+    }
+
+    // Check if we've reached target
+    if (@abs(ext_win.scrollbar_alpha - ext_win.scrollbar_target_alpha) < 0.01) {
+        ext_win.scrollbar_alpha = ext_win.scrollbar_target_alpha;
+        _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_FADE);
+
+        // Force full repaint when scrollbar hidden
+        if (ext_win.scrollbar_alpha <= 0.0) {
+            ext_win.scrollbar_visible = false;
+            ext_win.needs_redraw = true;
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+    }
 }
 
 /// Generate scrollbar vertices for D3D11 rendering
@@ -6620,6 +7048,7 @@ fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) bool 
         },
         .track_above => {
             // Page up - execute immediately and start repeat timer
+            applog.appLog("[scrollbar] track_above: executing page scroll up\n", .{});
             scrollbarPageScroll(app, -1);
             app.scrollbar_repeat_dir = -1;
             _ = c.SetCapture(hwnd);
@@ -6629,6 +7058,7 @@ fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) bool 
         },
         .track_below => {
             // Page down - execute immediately and start repeat timer
+            applog.appLog("[scrollbar] track_below: executing page scroll down\n", .{});
             scrollbarPageScroll(app, 1);
             app.scrollbar_repeat_dir = 1;
             _ = c.SetCapture(hwnd);
@@ -6713,18 +7143,34 @@ fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
 
 /// Execute page scroll in given direction (-1 = up, 1 = down)
 fn scrollbarPageScroll(app: *App, direction: i8) void {
-    const corep = app.corep orelse return;
+    const corep = app.corep orelse {
+        applog.appLog("[scrollbar] scrollbarPageScroll: corep is null\n", .{});
+        return;
+    };
 
     var vp: core.ViewportInfo = undefined;
-    if (core.zonvie_core_get_viewport(corep, -1, &vp) == 0) return;
+    if (core.zonvie_core_get_viewport(corep, -1, &vp) == 0) {
+        applog.appLog("[scrollbar] scrollbarPageScroll: get_viewport failed\n", .{});
+        return;
+    }
 
     const visible_lines = vp.botline - vp.topline;
-    const steps = @max(1, visible_lines - 2);
-    const dir_str: [*:0]const u8 = if (direction < 0) "up" else "down";
+    // Scroll by one page (visible_lines - 2 for overlap)
+    const page_size = @max(1, visible_lines - 2);
 
-    var i: i64 = 0;
-    while (i < steps) : (i += 1) {
-        core.zonvie_core_send_mouse_scroll(corep, -1, 0, 0, dir_str);
+    applog.appLog("[scrollbar] scrollbarPageScroll: direction={d} visible={d} page_size={d} topline={d} botline={d} line_count={d}\n", .{
+        direction, visible_lines, page_size, vp.topline, vp.botline, vp.line_count,
+    });
+
+    if (direction < 0) {
+        // Page up: scroll to topline - page_size
+        const new_topline = @max(1, vp.topline - page_size + 1);
+        core.zonvie_core_scroll_to_line(corep, new_topline, false);
+    } else {
+        // Page down: scroll to topline + page_size
+        const new_topline = @min(vp.line_count - visible_lines + 1, vp.topline + page_size + 1);
+        const target_line = @max(1, new_topline);
+        core.zonvie_core_scroll_to_line(corep, target_line, false);
     }
 }
 
@@ -6848,6 +7294,10 @@ fn updateScrollbarFade(hwnd: c.HWND, app: *App) void {
 
         if (app.scrollbar_alpha <= 0.0) {
             app.scrollbar_visible = false;
+            // Force full repaint to clear the scrollbar area from the back buffer.
+            // This is necessary because the scrollbar may overlap the gutter area
+            // (outside the grid), which is not redrawn by row updates.
+            app.need_full_seed.store(true, .seq_cst);
         }
     }
 
@@ -7189,8 +7639,182 @@ export fn ExternalWndProc(
 
                 if (grid_id != null and ext_window != null) {
                     handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum);
+
+                    // Show scrollbar on scroll if in scroll mode
+                    if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
+                        showScrollbarForExternal(hwnd, ext_window.?);
+                        // Auto-hide after delay
+                        const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
+                        _ = c.SetTimer(hwnd, TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+                    }
                 }
                 return 0;
+            }
+        },
+
+        // --- Scrollbar mouse handling for external windows ---
+        c.WM_LBUTTONDOWN => {
+            if (getApp(hwnd)) |app| {
+                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
+                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+
+                app.mu.lock();
+                var grid_id: ?i64 = null;
+                var ext_window: ?*ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (grid_id != null and ext_window != null) {
+                    if (scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
+                        return 0;
+                    }
+                }
+            }
+        },
+
+        c.WM_LBUTTONUP => {
+            if (getApp(hwnd)) |app| {
+                app.mu.lock();
+                var grid_id: ?i64 = null;
+                var ext_window: ?*ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (grid_id != null and ext_window != null) {
+                    scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
+                }
+            }
+        },
+
+        c.WM_MOUSEMOVE => {
+            if (getApp(hwnd)) |app| {
+                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
+                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+
+                app.mu.lock();
+                var grid_id: ?i64 = null;
+                var ext_window: ?*ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (grid_id != null and ext_window != null) {
+                    const ext_win = ext_window.?;
+
+                    // Handle scrollbar dragging
+                    if (ext_win.scrollbar_dragging) {
+                        scrollbarMouseMoveForExternal(hwnd, app, ext_win, grid_id.?, y);
+                        return 0;
+                    }
+
+                    // Check for scrollbar hover
+                    if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
+                        var client: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client);
+                        const hit = scrollbarHitTestForExternal(app, grid_id.?, client.right, client.bottom, x, y);
+                        if (hit != .none) {
+                            if (!ext_win.scrollbar_hover) {
+                                ext_win.scrollbar_hover = true;
+                                showScrollbarForExternal(hwnd, ext_win);
+                            }
+                        } else {
+                            if (ext_win.scrollbar_hover) {
+                                ext_win.scrollbar_hover = false;
+                                hideScrollbarForExternal(hwnd, app, ext_win);
+                            }
+                        }
+                    }
+
+                    // Track mouse for WM_MOUSELEAVE
+                    var tme: c.TRACKMOUSEEVENT = .{
+                        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+                        .dwFlags = c.TME_LEAVE,
+                        .hwndTrack = hwnd,
+                        .dwHoverTime = 0,
+                    };
+                    _ = c.TrackMouseEvent(&tme);
+                }
+            }
+        },
+
+        c.WM_MOUSELEAVE => {
+            if (getApp(hwnd)) |app| {
+                app.mu.lock();
+                var ext_window: ?*ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (ext_window) |ext_win| {
+                    ext_win.scrollbar_hover = false;
+                    hideScrollbarForExternal(hwnd, app, ext_win);
+                }
+            }
+        },
+
+        c.WM_TIMER => {
+            if (getApp(hwnd)) |app| {
+                const timer_id = wParam;
+
+                app.mu.lock();
+                var grid_id: ?i64 = null;
+                var ext_window: ?*ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (ext_window) |ext_win| {
+                    if (timer_id == TIMER_SCROLLBAR_FADE) {
+                        updateScrollbarFadeForExternal(hwnd, app, ext_win);
+                        return 0;
+                    } else if (timer_id == TIMER_SCROLLBAR_REPEAT) {
+                        if (grid_id != null and ext_win.scrollbar_repeat_dir != 0) {
+                            // Change to faster interval after first fire
+                            if (ext_win.scrollbar_repeat_timer != 0) {
+                                _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
+                                ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, TIMER_SCROLLBAR_REPEAT, SCROLLBAR_REPEAT_INTERVAL, null);
+                            }
+                            scrollbarPageScrollForExternal(app, grid_id.?, ext_win.scrollbar_repeat_dir);
+                        }
+                        return 0;
+                    } else if (timer_id == TIMER_SCROLLBAR_AUTOHIDE) {
+                        // Auto-hide scrollbar after scroll mode timeout
+                        _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_AUTOHIDE);
+                        hideScrollbarForExternal(hwnd, app, ext_win);
+                        return 0;
+                    }
+                }
             }
         },
 
@@ -8118,7 +8742,23 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 };
             }
         } else {
-            // Normal external window: draw vertices as-is
+            // Normal external window (detached grid): draw vertices with optional scrollbar
+            // Get scrollbar vertices if enabled
+            var scrollbar_verts: [12]core.Vertex = undefined;
+            var scrollbar_vert_count: usize = 0;
+
+            // Check if scrollbar should be drawn
+            if (app.config.scrollbar.enabled and ext_win.scrollbar_alpha > 0.001) {
+                scrollbar_vert_count = generateScrollbarVerticesForExternal(
+                    app,
+                    ext_win,
+                    grid_id,
+                    @intCast(g.width),
+                    @intCast(g.height),
+                    &scrollbar_verts,
+                );
+            }
+
             // Filter out cursor vertices if blink state is off
             if (!cursor_blink_visible) {
                 // Count non-cursor vertices
@@ -8129,9 +8769,10 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                     }
                 }
 
-                if (filtered_count < vert_count) {
-                    // Allocate temporary buffer and copy non-cursor vertices
-                    var filtered_verts = app.alloc.alloc(core.Vertex, filtered_count) catch {
+                if (filtered_count < vert_count or scrollbar_vert_count > 0) {
+                    // Allocate temporary buffer for filtered vertices + scrollbar
+                    const total_count = filtered_count + scrollbar_vert_count;
+                    var combined_verts = app.alloc.alloc(core.Vertex, total_count) catch {
                         // Fallback to drawing all vertices
                         g.draw(verts[0..vert_count], &[_]core.Vertex{}, null) catch |e| {
                             applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
@@ -8139,32 +8780,60 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         };
                         return;
                     };
-                    defer app.alloc.free(filtered_verts);
+                    defer app.alloc.free(combined_verts);
 
+                    // Copy non-cursor vertices
                     var idx: usize = 0;
                     for (verts[0..vert_count]) |v| {
                         if ((v.deco_flags & core.DECO_CURSOR) == 0) {
-                            filtered_verts[idx] = v;
+                            combined_verts[idx] = v;
                             idx += 1;
                         }
                     }
 
-                    g.draw(filtered_verts[0..filtered_count], &[_]core.Vertex{}, null) catch |e| {
+                    // Append scrollbar vertices
+                    if (scrollbar_vert_count > 0) {
+                        @memcpy(combined_verts[idx .. idx + scrollbar_vert_count], scrollbar_verts[0..scrollbar_vert_count]);
+                    }
+
+                    g.draw(combined_verts[0..total_count], &[_]core.Vertex{}, null) catch |e| {
                         applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
                         return;
                     };
                 } else {
-                    // No cursor vertices to filter
+                    // No cursor vertices to filter and no scrollbar
                     g.draw(verts[0..vert_count], &[_]core.Vertex{}, null) catch |e| {
                         applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
                         return;
                     };
                 }
             } else {
-                g.draw(verts[0..vert_count], &[_]core.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                    return;
-                };
+                // Cursor is visible - draw all vertices with scrollbar
+                if (scrollbar_vert_count > 0) {
+                    const total_count = vert_count + scrollbar_vert_count;
+                    var combined_verts = app.alloc.alloc(core.Vertex, total_count) catch {
+                        // Fallback to drawing without scrollbar
+                        g.draw(verts[0..vert_count], &[_]core.Vertex{}, null) catch |e| {
+                            applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
+                            return;
+                        };
+                        return;
+                    };
+                    defer app.alloc.free(combined_verts);
+
+                    @memcpy(combined_verts[0..vert_count], verts[0..vert_count]);
+                    @memcpy(combined_verts[vert_count .. vert_count + scrollbar_vert_count], scrollbar_verts[0..scrollbar_vert_count]);
+
+                    g.draw(combined_verts[0..total_count], &[_]core.Vertex{}, null) catch |e| {
+                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
+                        return;
+                    };
+                } else {
+                    g.draw(verts[0..vert_count], &[_]core.Vertex{}, null) catch |e| {
+                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
+                        return;
+                    };
+                }
             }
         }
 
@@ -9176,11 +9845,27 @@ export fn WndProc(
                     const frame_x = c.GetSystemMetrics(c.SM_CXFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
                     const frame_y = c.GetSystemMetrics(c.SM_CYFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
 
+                    // Check if cursor is in the scrollbar area (right edge, below tabbar).
+                    // If so, don't treat it as a resize border - let it be handled as HTCLIENT.
+                    // But keep rightmost 2 pixels for resize detection.
+                    // Only check scrollbar area if scrollbar is enabled.
+                    const tabbar_height_i16: i16 = TablineState.TAB_BAR_HEIGHT;
+                    const resize_edge_width: i32 = 2; // Keep this many pixels at right edge for resize
+                    const in_scrollbar_area = if (app.config.scrollbar.enabled) blk: {
+                        const scrollbar_area_left = window_rect.right - @as(i32, @intFromFloat(SCROLLBAR_WIDTH + SCROLLBAR_MARGIN * 2));
+                        const scrollbar_area_right = window_rect.right - resize_edge_width; // Leave edge for resize
+                        const scrollbar_area_top = window_rect.top + tabbar_height_i16 + @as(i32, @intFromFloat(SCROLLBAR_MARGIN));
+                        const scrollbar_area_bottom = window_rect.bottom - @as(i32, @intFromFloat(SCROLLBAR_MARGIN)) - resize_edge_width;
+                        break :blk x >= scrollbar_area_left and x < scrollbar_area_right and
+                            y >= scrollbar_area_top and y <= scrollbar_area_bottom;
+                    } else false;
+
                     // Check resize borders first
                     const on_left = x < window_rect.left + frame_x;
-                    const on_right = x >= window_rect.right - frame_x;
+                    // Exclude scrollbar area from right-edge resize detection
+                    const on_right = x >= window_rect.right - frame_x and !in_scrollbar_area;
                     const on_top = y < window_rect.top + frame_y;
-                    const on_bottom = y >= window_rect.bottom - frame_y;
+                    const on_bottom = y >= window_rect.bottom - frame_y and !in_scrollbar_area;
 
                     if (on_top) {
                         if (on_left) return c.HTTOPLEFT;
@@ -11566,7 +12251,12 @@ export fn WndProc(
 
                 const row_h = cell_h + linespace;
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                const row: i32 = if (row_h > 0) @divTrunc(@as(i32, y), @as(i32, @intCast(row_h))) else 0;
+                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                else
+                    @as(i32, y);
+                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
                 var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
@@ -11649,7 +12339,12 @@ export fn WndProc(
 
                 const row_h = cell_h + linespace;
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                const row: i32 = if (row_h > 0) @divTrunc(@as(i32, y), @as(i32, @intCast(row_h))) else 0;
+                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                else
+                    @as(i32, y);
+                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
                 var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
@@ -11788,7 +12483,12 @@ export fn WndProc(
 
                 const row_h = cell_h + linespace;
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                const row: i32 = if (row_h > 0) @divTrunc(@as(i32, y), @as(i32, @intCast(row_h))) else 0;
+                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                else
+                    @as(i32, y);
+                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
                 var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
@@ -12314,7 +13014,7 @@ pub fn main() u8 {
     wc.style = c.CS_HREDRAW | c.CS_VREDRAW;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = null;
+    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
     wc.hbrBackground = null;
     wc.lpszClassName = @ptrCast(class_name.ptr);
 

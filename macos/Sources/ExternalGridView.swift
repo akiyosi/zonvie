@@ -77,6 +77,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var cursorBlinkBuffer: MTLBuffer?
     var cursorBlinkState: Bool = true
 
+    // --- Scrollbar ---
+    private lazy var verticalScroller: NSScroller = {
+        let scroller = NSScroller()
+        scroller.scrollerStyle = .legacy
+        scroller.controlSize = .regular
+        scroller.knobProportion = 0.2
+        scroller.isEnabled = true
+        scroller.alphaValue = 0.0
+        scroller.target = self
+        scroller.action = #selector(scrollerDidScroll(_:))
+        return scroller
+    }()
+    private var scrollbarHideTimer: Timer?
+    private var lastViewportTopline: Int64 = -1
+    private var lastViewportLineCount: Int64 = -1
+    private var lastViewportBotline: Int64 = -1
+    private var scrollbarTrackingArea: NSTrackingArea?
+
     // DrawableSize struct matching Shaders.metal
     private struct DrawableSize {
         var width: Float
@@ -187,6 +205,27 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // For cmdline with blur: clearColor is transparent
         if isCmdline && blurEnabled {
             gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        }
+
+        // Add scrollbar (for detached grids, not cmdline/popupmenu)
+        setupScrollbar()
+    }
+
+    private func setupScrollbar() {
+        let scrollbarConfig = ZonvieConfig.shared.scrollbar
+        guard scrollbarConfig.enabled else { return }
+
+        // Don't add scrollbar to cmdline or special grids
+        if isCmdline { return }
+
+        addSubview(verticalScroller)
+
+        if scrollbarConfig.isAlways {
+            verticalScroller.isHidden = false
+            verticalScroller.alphaValue = CGFloat(scrollbarConfig.opacity)
+        } else {
+            verticalScroller.isHidden = true
+            verticalScroller.alphaValue = 0.0
         }
     }
 
@@ -490,6 +529,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             // Mark that we've presented at least once
             hasPresentedOnce = true
+
+            // Update scrollbar after rendering
+            DispatchQueue.main.async { [weak self] in
+                self?.updateScrollbarIfNeeded()
+            }
         }
     }
 
@@ -909,5 +953,199 @@ extension ExternalGridView: NSTextInputClient {
     /// Returns the character index closest to the given point.
     func characterIndex(for point: NSPoint) -> Int {
         return 0
+    }
+
+    // MARK: - Scrollbar
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        let scrollbarConfig = ZonvieConfig.shared.scrollbar
+        guard scrollbarConfig.enabled && !isCmdline else { return }
+
+        // Setup scrollbar based on config
+        if scrollbarConfig.isAlways {
+            verticalScroller.isHidden = false
+            verticalScroller.alphaValue = CGFloat(scrollbarConfig.opacity)
+        }
+
+        // Setup hover tracking for scrollbar (if "hover" mode is enabled)
+        if scrollbarConfig.isHover {
+            setupScrollbarHoverTracking()
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        layoutScrollbar()
+    }
+
+    private func layoutScrollbar() {
+        let scrollbarConfig = ZonvieConfig.shared.scrollbar
+        guard scrollbarConfig.enabled && !isCmdline else { return }
+
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        verticalScroller.frame = NSRect(
+            x: bounds.width - scrollerWidth,
+            y: 0,
+            width: scrollerWidth,
+            height: bounds.height
+        )
+    }
+
+    /// Update scrollbar if viewport has changed (called after rendering)
+    func updateScrollbarIfNeeded() {
+        let scrollbarConfig = ZonvieConfig.shared.scrollbar
+        guard scrollbarConfig.enabled && !isCmdline else { return }
+        guard let main = mainTerminalView, let core = main.core else { return }
+        guard let viewport = core.getViewport(gridId: gridId) else { return }
+
+        let viewportChanged = viewport.topline != lastViewportTopline ||
+                              viewport.lineCount != lastViewportLineCount ||
+                              viewport.botline != lastViewportBotline
+
+        if viewportChanged {
+            lastViewportTopline = viewport.topline
+            lastViewportLineCount = viewport.lineCount
+            lastViewportBotline = viewport.botline
+            updateScrollbar(viewport: viewport)
+
+            // Show scrollbar on scroll if "scroll" mode
+            if scrollbarConfig.isScroll {
+                showScrollbar()
+            }
+        }
+    }
+
+    private func updateScrollbar(viewport: ZonvieCore.ViewportInfo) {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled else { return }
+
+        let visibleLines = viewport.botline - viewport.topline
+        let isScrollable = viewport.lineCount > visibleLines
+
+        if !isScrollable {
+            if config.isAlways {
+                verticalScroller.isHidden = false
+                verticalScroller.doubleValue = 0
+                verticalScroller.knobProportion = 1.0
+            } else {
+                verticalScroller.isHidden = true
+            }
+            return
+        }
+
+        verticalScroller.isHidden = false
+        verticalScroller.doubleValue = viewport.scrollPosition
+        verticalScroller.knobProportion = viewport.knobProportion
+    }
+
+    private func showScrollbar() {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled else { return }
+
+        scrollbarHideTimer?.invalidate()
+
+        let targetAlpha = CGFloat(config.opacity)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            verticalScroller.animator().alphaValue = targetAlpha
+        }
+
+        // Auto-hide after delay (only if "scroll" mode and not "always")
+        if config.isScroll && !config.isAlways {
+            scrollbarHideTimer = Timer.scheduledTimer(withTimeInterval: config.delay, repeats: false) { [weak self] _ in
+                self?.hideScrollbar()
+            }
+        }
+    }
+
+    private func hideScrollbar() {
+        let config = ZonvieConfig.shared.scrollbar
+        if config.isAlways { return }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.3
+            verticalScroller.animator().alphaValue = 0.0
+        }
+    }
+
+    @objc private func scrollerDidScroll(_ sender: NSScroller) {
+        guard let main = mainTerminalView, let core = main.core else { return }
+        guard let viewport = core.getViewport(gridId: gridId) else { return }
+
+        let visibleLines = viewport.botline - viewport.topline
+
+        switch sender.hitPart {
+        case .decrementPage:
+            // Click above knob - page up
+            let newTopline = max(1, viewport.topline - (visibleLines - 2) + 1)
+            core.scrollToLine(newTopline, useBottom: false)
+
+        case .incrementPage:
+            // Click below knob - page down
+            let newTopline = min(viewport.lineCount - visibleLines + 1, viewport.topline + (visibleLines - 2) + 1)
+            let targetLine = max(1, newTopline)
+            core.scrollToLine(targetLine, useBottom: false)
+
+        case .knob, .knobSlot:
+            // Dragging knob
+            let scrollRange = max(1, viewport.lineCount - visibleLines)
+            let targetTopline = Int64(sender.doubleValue * Double(scrollRange)) + 1
+            let clampedTopline = max(1, min(targetTopline, viewport.lineCount - visibleLines + 1))
+            core.scrollToLine(clampedTopline, useBottom: false)
+
+        default:
+            break
+        }
+    }
+
+    private func setupScrollbarHoverTracking() {
+        if let existingArea = scrollbarTrackingArea {
+            removeTrackingArea(existingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        scrollbarTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let config = ZonvieConfig.shared.scrollbar
+        if config.enabled && config.isHover && !isCmdline {
+            let locationInView = convert(event.locationInWindow, from: nil)
+            let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+            if locationInView.x >= bounds.width - scrollerWidth {
+                showScrollbar()
+            }
+        }
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        let config = ZonvieConfig.shared.scrollbar
+        if config.enabled && config.isHover && !isCmdline {
+            hideScrollbar()
+        }
+        super.mouseExited(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let config = ZonvieConfig.shared.scrollbar
+        if config.enabled && config.isHover && !isCmdline {
+            let locationInView = convert(event.locationInWindow, from: nil)
+            let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+            if locationInView.x >= bounds.width - scrollerWidth {
+                showScrollbar()
+            } else {
+                hideScrollbar()
+            }
+        }
+        super.mouseMoved(with: event)
     }
 }
