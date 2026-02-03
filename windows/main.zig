@@ -387,6 +387,9 @@ const TablineState = struct {
     // New tab button pressed state (for proper click handling)
     new_tab_button_pressed: bool = false,
 
+    // Window button pressed state (for proper click handling on min/max/close)
+    pressed_window_btn: ?u8 = null,  // 0=min, 1=max, 2=close
+
     // Tab bar constants
     const TAB_BAR_HEIGHT: c_int = 32;
     const TAB_MIN_WIDTH: c_int = 100;
@@ -414,6 +417,7 @@ const TablineState = struct {
         self.is_external_drag = false;
         self.close_button_pressed = null;
         self.new_tab_button_pressed = false;
+        self.pressed_window_btn = null;
         // Also clear hover states
         self.hovered_tab = null;
         self.hovered_close = null;
@@ -2328,8 +2332,8 @@ fn tablineWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM)
             const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
             if (v != 0) {
                 const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                applog.appLog("[tabline] WM_CAPTURECHANGED: dragging_tab={?} is_external_drag={} close_button_pressed={?} new_tab_button_pressed={}\n", .{ app.tabline_state.dragging_tab, app.tabline_state.is_external_drag, app.tabline_state.close_button_pressed, app.tabline_state.new_tab_button_pressed });
-                if (app.tabline_state.dragging_tab != null or app.tabline_state.close_button_pressed != null or app.tabline_state.new_tab_button_pressed) {
+                applog.appLog("[tabline] WM_CAPTURECHANGED: dragging_tab={?} is_external_drag={} close_button_pressed={?} new_tab_button_pressed={} pressed_window_btn={?}\n", .{ app.tabline_state.dragging_tab, app.tabline_state.is_external_drag, app.tabline_state.close_button_pressed, app.tabline_state.new_tab_button_pressed, app.tabline_state.pressed_window_btn });
+                if (app.tabline_state.dragging_tab != null or app.tabline_state.close_button_pressed != null or app.tabline_state.new_tab_button_pressed or app.tabline_state.pressed_window_btn != null) {
                     applog.appLog("[tabline] WM_CAPTURECHANGED: cancelling drag/button!\n", .{});
                     destroyDragPreviewWindow(app);
                     app.tabline_state.cancelDrag();
@@ -2612,6 +2616,23 @@ fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int) vo
         return;
     }
 
+    // Handle window button pressed state - track if mouse leaves the button
+    if (app.tabline_state.pressed_window_btn) |pressed_btn| {
+        const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
+        const btn_x = btn_start_x + @as(c_int, pressed_btn) * TablineState.WINDOW_BTN_WIDTH;
+        const is_still_over_btn = (x >= btn_x and x < btn_x + TablineState.WINDOW_BTN_WIDTH and
+            y >= 0 and y < TablineState.TAB_BAR_HEIGHT);
+
+        if (!is_still_over_btn) {
+            // Mouse left the window button - cancel the press
+            applog.appLog("[tabline] mouseMove: window button {d} cancelled (mouse left)\n", .{pressed_btn});
+            app.tabline_state.pressed_window_btn = null;
+            _ = c.ReleaseCapture();
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+        return;
+    }
+
     var new_hovered_tab: ?usize = null;
     var new_hovered_close: ?usize = null;
     var new_hovered_window_btn: ?u8 = null;
@@ -2690,10 +2711,15 @@ fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
     // Check window control buttons first
     const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
-    if (x >= btn_start_x) {
-        // Window button area - don't start drag, handle click immediately
-        applog.appLog("[tabline] mouseDown: window button area\n", .{});
-        _ = handleTablineClick(app, x, y);
+    if (x >= btn_start_x and y >= 0 and y < TablineState.TAB_BAR_HEIGHT) {
+        // Window button area - record pressed state, action on mouseUp
+        const btn_idx = @divTrunc(x - btn_start_x, TablineState.WINDOW_BTN_WIDTH);
+        if (btn_idx >= 0 and btn_idx < 3) {
+            applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{btn_idx});
+            app.tabline_state.pressed_window_btn = @intCast(btn_idx);
+            _ = c.SetCapture(hwnd);
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
         return;
     }
 
@@ -2801,6 +2827,33 @@ fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
         if (app.corep) |corep| {
             const cmd = "tabnew";
             core.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    // Handle window button release (min/max/close)
+    // Note: If mouse moved away, pressed_window_btn was already cleared in handleTablineMouseMoveInChild
+    if (app.tabline_state.pressed_window_btn) |pressed_btn| {
+        app.tabline_state.pressed_window_btn = null;
+        _ = c.ReleaseCapture();
+
+        // Execute window button action
+        applog.appLog("[tabline] mouseUp: window button {d} released, executing action\n", .{pressed_btn});
+        const main_hwnd = app.hwnd orelse return;
+        if (pressed_btn == 0) {
+            // Minimize
+            _ = c.ShowWindow(main_hwnd, c.SW_MINIMIZE);
+        } else if (pressed_btn == 1) {
+            // Maximize / Restore
+            if (c.IsZoomed(main_hwnd) != 0) {
+                _ = c.ShowWindow(main_hwnd, c.SW_RESTORE);
+            } else {
+                _ = c.ShowWindow(main_hwnd, c.SW_MAXIMIZE);
+            }
+        } else if (pressed_btn == 2) {
+            // Close
+            _ = c.PostMessageW(main_hwnd, c.WM_CLOSE, 0, 0);
         }
         _ = c.InvalidateRect(hwnd, null, 0);
         return;
