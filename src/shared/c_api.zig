@@ -406,6 +406,9 @@ pub const Callbacks = extern struct {
 
     // IME off notification (for mode change or RPC zonvie_ime_off)
     on_ime_off: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    // Quit request notification (window close with unsaved buffer check)
+    on_quit_requested: ?*const fn (ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -501,6 +504,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, ctx: ?*anyopaque) ?*zonv
 
         // IME off notification
         .on_ime_off = box.cb.on_ime_off,
+
+        // Quit request notification
+        .on_quit_requested = box.cb.on_quit_requested,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);
@@ -541,6 +547,22 @@ pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: 
     if (p == null) return;
     const box = asBox(p.?);
     box.core.requestCommand(cmd[0..len]) catch {};
+}
+
+/// Request graceful quit (called by frontend on window close button).
+/// This checks for unsaved buffers and calls on_quit_requested callback.
+pub export fn zonvie_core_request_quit(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.requestQuit();
+}
+
+/// Confirm quit after user dialog (called after on_quit_requested).
+/// force: if non-zero, use :qa! (discard changes), otherwise :qa
+pub export fn zonvie_core_quit_confirmed(p: ?*zonvie_core, force: c_int) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.quitConfirmed(force != 0);
 }
 
 /// Send raw data to child process stdin (for SSH password input).

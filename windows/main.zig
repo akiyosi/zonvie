@@ -125,6 +125,8 @@ const WM_APP_TRAY: c.UINT = c.WM_APP + 15;
 const WM_APP_UPDATE_CURSOR_BLINK: c.UINT = c.WM_APP + 16;
 const WM_APP_IME_OFF: c.UINT = c.WM_APP + 17;
 const WM_APP_TABLINE_INVALIDATE: c.UINT = c.WM_APP + 18;
+const WM_APP_QUIT_REQUESTED: c.UINT = c.WM_APP + 19;
+const WM_APP_QUIT_TIMEOUT: c.UINT = c.WM_APP + 20;
 
 /// Timer ID for message window auto-hide
 const TIMER_MSG_AUTOHIDE: c.UINT_PTR = 1;
@@ -144,6 +146,10 @@ const TIMER_SCROLLBAR_FADE: c.UINT_PTR = 4;
 const TIMER_SCROLLBAR_REPEAT: c.UINT_PTR = 5;
 /// Timer ID for cursor blink
 const TIMER_CURSOR_BLINK: c.UINT_PTR = 6;
+/// Timer ID for quit request timeout
+const TIMER_QUIT_TIMEOUT: c.UINT_PTR = 7;
+/// Quit timeout in milliseconds (5 seconds)
+const QUIT_TIMEOUT_MS: c.UINT = 5000;
 /// Scrollbar fade animation interval (16ms ~= 60fps)
 const SCROLLBAR_FADE_INTERVAL: c.UINT = 16;
 /// Scrollbar repeat interval (ms) for continuous page scroll
@@ -541,7 +547,16 @@ const App = struct {
     mini_windows: [3]MiniWindowState = .{ .{}, .{}, .{} },
     last_mouse_grid_id: i64 = 1,
 
-    owned_by_hwnd: bool = false, // 
+    owned_by_hwnd: bool = false, //
+
+    // Flag to track if Neovim has exited (to avoid requestQuit after exit)
+    // Atomic to avoid data race between onExit (RPC thread) and WM_CLOSE (UI thread)
+    neovim_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Flag to track if we're waiting for quit response (to handle timeout)
+    quit_pending: bool = false,
+    // Flag to ignore delayed quit responses after timeout fired
+    quit_timeout_fired: bool = false,
 
     // Latest plan snapshot (copied from callback; valid beyond callback)
     bg_spans: std.ArrayListUnmanaged(core.BgSpan) = .{},
@@ -2021,6 +2036,8 @@ fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_exit: code={d}\n", .{exit_code});
+    // Mark Neovim as exited (to skip requestQuit in WM_CLOSE)
+    app.neovim_exited.store(true, .release);
     // Store exit code globally (Nvy style - returned from main instead of ExitProcess)
     g_exit_code.store(@intCast(@as(u32, @bitCast(exit_code)) & 0xFF), .seq_cst);
     if (app.hwnd) |hwnd| {
@@ -2033,6 +2050,16 @@ fn onIMEOff(ctx: ?*anyopaque) callconv(.c) void {
     if (app.hwnd) |hwnd| {
         // Post message to main thread (IME APIs must be called from the window's thread)
         _ = c.PostMessageW(hwnd, WM_APP_IME_OFF, 0, 0);
+    }
+}
+
+fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] onQuitRequested: has_unsaved={d}\n", .{has_unsaved});
+
+    // Post message to main thread to avoid blocking RPC thread
+    if (app.hwnd) |hwnd| {
+        _ = c.PostMessageW(hwnd, WM_APP_QUIT_REQUESTED, @intCast(has_unsaved), 0);
     }
 }
 
@@ -10655,6 +10682,80 @@ export fn WndProc(
             return 0;
         },
 
+        WM_APP_QUIT_REQUESTED => {
+            const has_unsaved: c_int = @intCast(wParam);
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_QUIT_REQUESTED: has_unsaved={d}\n", .{has_unsaved});
+
+            // Ignore delayed response if timeout already fired and user chose to wait
+            if (getApp(hwnd)) |app| {
+                if (app.quit_timeout_fired) {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_APP_QUIT_REQUESTED: ignoring - timeout already fired\n", .{});
+                    return 0;
+                }
+            }
+
+            // Cancel timeout timer - Neovim responded in time
+            _ = c.KillTimer(hwnd, TIMER_QUIT_TIMEOUT);
+            if (getApp(hwnd)) |app| {
+                app.quit_pending = false;
+            }
+
+            if (has_unsaved != 0) {
+                // Show confirmation dialog
+                // Note: MessageBox doesn't support custom button text.
+                // Using MB_OKCANCEL so "Cancel" matches macOS. "OK" means "Discard and Quit".
+                const dialog_msg = std.unicode.utf8ToUtf16LeStringLiteral("You have unsaved changes. Do you want to discard them and quit?");
+                const dialog_title = std.unicode.utf8ToUtf16LeStringLiteral("Unsaved Changes");
+                const result = c.MessageBoxW(
+                    hwnd,
+                    dialog_msg,
+                    dialog_title,
+                    c.MB_OKCANCEL | c.MB_ICONWARNING | c.MB_DEFBUTTON2,
+                );
+
+                if (result == c.IDOK) {
+                    // User confirmed - force quit
+                    if (getApp(hwnd)) |app| {
+                        if (app.corep) |corep| {
+                            core.zonvie_core_quit_confirmed(corep, 1);
+                        }
+                    }
+                }
+                // Cancel - do nothing
+            } else {
+                // No unsaved buffers - proceed with :qa
+                if (getApp(hwnd)) |app| {
+                    if (app.corep) |corep| {
+                        core.zonvie_core_quit_confirmed(corep, 0);
+                    }
+                }
+            }
+            return 0;
+        },
+
+        WM_APP_QUIT_TIMEOUT => {
+            // Neovim not responding - show force quit dialog
+            // Note: quit_timeout_fired was already set in WM_TIMER before posting this message
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_QUIT_TIMEOUT: showing not responding dialog\n", .{});
+
+            const dialog_msg = std.unicode.utf8ToUtf16LeStringLiteral("Neovim is not responding. Do you want to force quit?");
+            const dialog_title = std.unicode.utf8ToUtf16LeStringLiteral("Neovim Not Responding");
+            const result = c.MessageBoxW(
+                hwnd,
+                dialog_msg,
+                dialog_title,
+                c.MB_OKCANCEL | c.MB_ICONERROR | c.MB_DEFBUTTON1,
+            );
+
+            if (result == c.IDOK) {
+                // Force quit - terminate the app
+                if (applog.isEnabled()) applog.appLog("[win] WM_APP_QUIT_TIMEOUT: user chose Force Quit\n", .{});
+                _ = c.DestroyWindow(hwnd);
+            }
+            // Cancel/Wait - do nothing, user can try again later
+            return 0;
+        },
+
         WM_APP_TABLINE_INVALIDATE => {
             if (getApp(hwnd)) |app| {
                 // Tabline is rendered as D3D11 texture via renderTablineToD3D
@@ -10763,6 +10864,18 @@ export fn WndProc(
                         }
                     }
                 }
+            } else if (wParam == TIMER_QUIT_TIMEOUT) {
+                // Neovim not responding to quit request - show force quit dialog
+                applog.appLog("[win] WM_TIMER: quit timeout - Neovim not responding\n", .{});
+                _ = c.KillTimer(hwnd, TIMER_QUIT_TIMEOUT);
+                if (getApp(hwnd)) |app| {
+                    app.quit_pending = false;
+                    // Set flag immediately to ignore any delayed WM_APP_QUIT_REQUESTED
+                    // that may arrive before WM_APP_QUIT_TIMEOUT is processed
+                    app.quit_timeout_fired = true;
+                }
+                // Post message to handle dialog on main thread
+                _ = c.PostMessageW(hwnd, WM_APP_QUIT_TIMEOUT, 0, 0);
             }
             return 0;
         },
@@ -10812,6 +10925,7 @@ export fn WndProc(
                     .on_clipboard_set = onClipboardSet,
                     .on_ssh_auth_prompt = onSSHAuthPrompt,
                     .on_ime_off = onIMEOff,
+                    .on_quit_requested = onQuitRequested,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 
@@ -11707,6 +11821,33 @@ export fn WndProc(
             }
         },
 
+        c.WM_CLOSE => {
+            // Intercept window close to check for unsaved buffers
+            if (getApp(hwnd)) |app| {
+                // If Neovim already exited (e.g., from :qa!), proceed with normal close
+                if (app.neovim_exited.load(.acquire)) {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: neovim already exited, proceeding with close\n", .{});
+                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+                }
+                // If already waiting for quit, don't send another request
+                if (app.quit_pending) {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: quit already pending, ignoring\n", .{});
+                    return 0;
+                }
+                if (app.corep) |corep| {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: requesting quit via core (timeout={}ms)\n", .{QUIT_TIMEOUT_MS});
+                    app.quit_pending = true;
+                    app.quit_timeout_fired = false; // Reset for new quit request
+                    // Start timeout timer
+                    _ = c.SetTimer(hwnd, TIMER_QUIT_TIMEOUT, QUIT_TIMEOUT_MS, null);
+                    core.zonvie_core_request_quit(corep);
+                    return 0; // Don't close yet - wait for quit confirmation
+                }
+            }
+            // If no core, allow normal close
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
         c.WM_NCDESTROY => {
             if (getApp(hwnd)) |app| {
                 // Clear userdata first (prevent access by subsequent messages/re-entry)
@@ -11718,7 +11859,7 @@ export fn WndProc(
 
                     // Safely clean up renderer/core/etc (deinit is robust even with partial init)
                     app.deinit();
-        
+
                     const alloc = app.alloc;
                     alloc.destroy(app);
                 }

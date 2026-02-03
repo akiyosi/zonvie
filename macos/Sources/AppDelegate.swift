@@ -9,7 +9,7 @@ private func CGSSetWindowBackgroundBlurRadius(_ connection: UInt, _ windowNumber
 @_silgen_name("CGSMainConnectionID")
 private func CGSMainConnectionID() -> UInt
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     // OS/UI-specific: persist window geometry across launches.
     private let windowFrameAutosaveName = "zonvie.mainWindow.frame"
@@ -128,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.contentViewController = vc
 
         self.window = win
+        win.delegate = self  // Handle window close with unsaved buffer check
 
         // SSH/devcontainer mode: hide window until auth completes (neovimReadyNotification)
         // Normal mode: show window immediately
@@ -162,6 +163,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             ZonvieCore.appLog("[Blur] Failed to apply blur, error=\(result)")
         }
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Intercept window close to check for unsaved buffers
+        if let vc = sender.contentViewController as? ViewController,
+           let core = vc.core {
+            ZonvieCore.appLog("[windowShouldClose] requesting quit via core")
+            core.requestQuit()
+            return false  // Don't close yet - wait for quit confirmation
+        }
+        // If no core, allow normal close
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

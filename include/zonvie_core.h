@@ -184,6 +184,12 @@ typedef void (*zonvie_on_linespace_fn)(
    May be NULL. */
 typedef void (*zonvie_on_exit_fn)(void* ctx, int32_t exit_code);
 
+/* Called when user-initiated quit is requested (window close button).
+   has_unsaved: non-zero if there are unsaved buffers.
+   Frontend should show a confirmation dialog if has_unsaved is true,
+   then call zonvie_core_quit_confirmed() with the user's choice. */
+typedef void (*zonvie_on_quit_requested_fn)(void* ctx, int has_unsaved);
+
 /* Called when Neovim sets the window title (set_title UI event). */
 typedef void (*zonvie_on_set_title_fn)(
     void* ctx,
@@ -551,6 +557,9 @@ typedef struct zonvie_callbacks {
        Called when IME should be turned off (e.g., on mode change when
        ime.disable_on_modechange is enabled, or via RPC zonvie_ime_off). */
     void (*on_ime_off)(void* ctx);
+
+    /* Quit request callback (window close with unsaved check). */
+    zonvie_on_quit_requested_fn on_quit_requested;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -606,6 +615,14 @@ void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int le
    cmd: command string (e.g., "lua vim.notify('hello')")
    len: length of command string */
 ZONVIE_API void zonvie_core_send_command(zonvie_core *core, const unsigned char *cmd, size_t len);
+
+/* Request graceful quit (called by frontend on window close button).
+   This checks for unsaved buffers and calls on_quit_requested callback. */
+ZONVIE_API void zonvie_core_request_quit(zonvie_core *core);
+
+/* Confirm quit after user dialog (called after on_quit_requested).
+   force: if non-zero, use :qa! (discard changes), otherwise :qa */
+ZONVIE_API void zonvie_core_quit_confirmed(zonvie_core *core, int force);
 
 /* Send raw data to child process stdin (for SSH password input).
    data: raw bytes to send (password + newline)

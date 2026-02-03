@@ -34,6 +34,11 @@ final class ZonvieCore {
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
     private var hasNotifiedReady = false
 
+    // Timeout for quit request (to handle unresponsive Neovim)
+    private var quitTimeoutWorkItem: DispatchWorkItem?
+    private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
+    private static let quitTimeoutSeconds: Double = 5.0
+
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
         let line = "[zonvie] \(message())\n"
@@ -424,6 +429,11 @@ final class ZonvieCore {
                 DispatchQueue.main.async {
                     ZonvieCore.setIMEOff()
                 }
+            },
+            on_quit_requested: { ctx, hasUnsaved in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.onQuitRequested(hasUnsaved: hasUnsaved != 0)
             }
         )
 
@@ -1002,6 +1012,106 @@ final class ZonvieCore {
             }
             zonvie_core_send_command(core, base, data.count)
         }
+    }
+
+    /// Request graceful quit (called by frontend on window close button).
+    /// Checks for unsaved buffers and calls on_quit_requested callback with result.
+    /// Includes a timeout to handle unresponsive Neovim.
+    func requestQuit() {
+        guard let core else {
+            ZonvieCore.appLog("[requestQuit] core is nil")
+            return
+        }
+
+        // Cancel any existing timeout and reset state
+        quitTimeoutWorkItem?.cancel()
+        quitTimeoutFired = false
+
+        // Start timeout timer
+        let timeoutWork = DispatchWorkItem { [weak self] in
+            ZonvieCore.appLog("[requestQuit] timeout - Neovim not responding")
+            self?.quitTimeoutFired = true
+            self?.showNotRespondingDialog()
+        }
+        quitTimeoutWorkItem = timeoutWork
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + ZonvieCore.quitTimeoutSeconds,
+            execute: timeoutWork
+        )
+
+        ZonvieCore.appLog("[requestQuit] requesting quit (timeout=\(ZonvieCore.quitTimeoutSeconds)s)")
+        zonvie_core_request_quit(core)
+    }
+
+    /// Confirm quit after user dialog.
+    /// force: if true, use :qa! (discard changes), otherwise :qa
+    func confirmQuit(force: Bool) {
+        guard let core else {
+            ZonvieCore.appLog("[confirmQuit] core is nil")
+            return
+        }
+        ZonvieCore.appLog("[confirmQuit] confirming quit (force=\(force))")
+        zonvie_core_quit_confirmed(core, force ? 1 : 0)
+    }
+
+    /// Called from on_quit_requested callback when quit is requested.
+    private func onQuitRequested(hasUnsaved: Bool) {
+        ZonvieCore.appLog("[onQuitRequested] hasUnsaved=\(hasUnsaved)")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            // Ignore delayed response if timeout already fired and user chose to wait
+            if self.quitTimeoutFired {
+                ZonvieCore.appLog("[onQuitRequested] ignoring - timeout already fired")
+                return
+            }
+
+            // Cancel timeout - Neovim responded in time
+            self.quitTimeoutWorkItem?.cancel()
+            self.quitTimeoutWorkItem = nil
+
+            if hasUnsaved {
+                self.showUnsavedDialog()
+            } else {
+                // No unsaved buffers - proceed with :qa
+                self.confirmQuit(force: false)
+            }
+        }
+    }
+
+    /// Show native dialog for unsaved buffers confirmation.
+    private func showUnsavedDialog() {
+        let alert = NSAlert()
+        alert.messageText = "Unsaved Changes"
+        alert.informativeText = "You have unsaved changes. Do you want to discard them and quit?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard and Quit")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            confirmQuit(force: true)
+        }
+        // Cancel -> do nothing
+    }
+
+    /// Show dialog when Neovim is not responding to quit request.
+    private func showNotRespondingDialog() {
+        let alert = NSAlert()
+        alert.messageText = "Neovim Not Responding"
+        alert.informativeText = "Neovim is not responding. Do you want to force quit?"
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Force Quit")
+        alert.addButton(withTitle: "Wait")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            // Force quit - terminate the app immediately
+            ZonvieCore.appLog("[showNotRespondingDialog] user chose Force Quit")
+            NSApp.terminate(nil)
+        }
+        // Wait -> do nothing, user can try closing again later
     }
 
     /// Set the position for the next external window created via nvim_win_set_config(external=true).

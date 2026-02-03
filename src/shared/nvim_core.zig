@@ -224,6 +224,10 @@ pub const Callbacks = struct {
     /// Called when IME should be turned off (mode change with ime.disable_on_modechange,
     /// or RPC zonvie_ime_off notification).
     on_ime_off: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    /// Called when user-initiated quit is requested (window close button).
+    /// has_unsaved: non-zero if there are unsaved buffers.
+    on_quit_requested: ?*const fn (ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void = null,
 };
 
 const PipeReader = struct {
@@ -589,6 +593,11 @@ pub const Core = struct {
     // RPC channel ID (extracted from nvim_get_api_info response)
     channel_id: ?i64 = null,
     get_api_info_msgid: ?i64 = null,
+
+    // Quit request msgid (for tracking nvim_exec_lua response)
+    // Atomic to avoid data race between UI thread (requestQuit) and RPC thread (handleRpcResponse)
+    // 0 means no pending request
+    quit_request_msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     // Clipboard setup done flag
     clipboard_setup_done: bool = false,
@@ -1602,6 +1611,70 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_command (id={d}) {s}\n", .{ id, cmd });
+    }
+
+    /// Request graceful quit (called by frontend on window close button).
+    /// Checks for unsaved buffers and calls on_quit_requested callback with result.
+    pub fn requestQuit(self: *Core) void {
+        // Ignore if already in progress (use cmpxchg to atomically check and set)
+        const current = self.quit_request_msgid.load(.acquire);
+        if (current != 0) {
+            self.log.write("requestQuit: already in progress, ignoring\n", .{});
+            return;
+        }
+
+        const id = self.nextMsgId();
+        self.quit_request_msgid.store(id, .release);
+
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_exec_lua") catch |e| {
+            self.log.write("requestQuit sendRequestHeader error: {any}\n", .{e});
+            self.quit_request_msgid.store(0, .release);
+            return;
+        };
+
+        // Lua code to check for unsaved buffers (wrapped in pcall for safety)
+        const lua_code =
+            \\local ok, modified = pcall(vim.fn.getbufinfo, {bufmodified = 1})
+            \\if not ok then return false end
+            \\return #modified > 0
+        ;
+
+        rpc.packArray(&buf, self.alloc, 2) catch |e| {
+            self.log.write("requestQuit packArray error: {any}\n", .{e});
+            self.quit_request_msgid.store(0, .release);
+            return;
+        };
+        rpc.packStr(&buf, self.alloc, lua_code) catch |e| {
+            self.log.write("requestQuit packStr error: {any}\n", .{e});
+            self.quit_request_msgid.store(0, .release);
+            return;
+        };
+        rpc.packArray(&buf, self.alloc, 0) catch |e| {
+            self.log.write("requestQuit packArray(args) error: {any}\n", .{e});
+            self.quit_request_msgid.store(0, .release);
+            return;
+        };
+
+        self.sendRaw(buf.items) catch |e| {
+            self.log.write("requestQuit sendRaw error: {any}\n", .{e});
+            self.quit_request_msgid.store(0, .release);
+            return;
+        };
+
+        self.log.write("rpc send: nvim_exec_lua for quit check (id={d})\n", .{id});
+    }
+
+    /// Confirm quit after user dialog.
+    /// force: if true, use :qa! (discard changes), otherwise :qa
+    pub fn quitConfirmed(self: *Core, force: bool) void {
+        const cmd = if (force) "qa!" else "qa";
+        self.requestCommand(cmd) catch |e| {
+            self.log.write("quitConfirmed error: {any}\n", .{e});
+        };
+        self.log.write("quitConfirmed: sent {s}\n", .{cmd});
     }
 
     /// Execute Lua code in Neovim via nvim_exec_lua.
@@ -3384,6 +3457,15 @@ pub const Core = struct {
 
         if (has_err) {
             self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
+            // Clear quit_request_msgid if this was a failed quit request
+            const pending_quit_id = self.quit_request_msgid.load(.acquire);
+            if (pending_quit_id != 0 and id == pending_quit_id) {
+                self.quit_request_msgid.store(0, .release);
+                // On error, still try to quit (fallback)
+                if (self.cb.on_quit_requested) |cb| {
+                    cb(self.ctx, 0); // Assume no unsaved on error
+                }
+            }
             return;
         }
 
@@ -3400,6 +3482,34 @@ pub const Core = struct {
                     self.setupClipboard();
                 }
             }
+            return;
+        }
+
+        // Check if this is quit request response
+        const pending_quit_id = self.quit_request_msgid.load(.acquire);
+        if (pending_quit_id != 0 and id == pending_quit_id) {
+            self.quit_request_msgid.store(0, .release);
+
+            // Log the response type for debugging
+            self.log.write("quit request response: result type={s}\n", .{@tagName(top[3])});
+
+            // Result is boolean: true if there are unsaved buffers
+            const has_unsaved: bool = switch (top[3]) {
+                .bool => |b| b,
+                .int => |i| i != 0,
+                else => false,
+            };
+
+            self.log.write("quit request response: has_unsaved={}\n", .{has_unsaved});
+
+            // Notify frontend via callback
+            if (self.cb.on_quit_requested) |cb| {
+                cb(self.ctx, if (has_unsaved) 1 else 0);
+            } else {
+                // No callback - proceed with :qa (may fail if unsaved)
+                self.quitConfirmed(false);
+            }
+            return;
         }
     }
 
