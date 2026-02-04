@@ -1956,24 +1956,37 @@ fn onLog(ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) void {
 fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
-    const default_font_name = "Consolas";
+    // Font priority: guifont > config.font.family > OS default (Consolas)
+    const os_default_font = "Consolas";
     const default_font_pt: f32 = 14.0;
 
-    var name: []const u8 = default_font_name;
-    var pt: f32 = default_font_pt;
+    // Get config font (fallback to OS default if empty)
+    const config_font = if (app.config.font.family.len > 0) app.config.font.family else os_default_font;
+    const config_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else default_font_pt;
+
+    var name: []const u8 = "";
+    var pt: f32 = config_pt;
 
     if (bytes != null and len != 0) {
         const s = bytes.?[0..len];
         if (std.mem.indexOfScalar(u8, s, '\t')) |tab| {
             name = s[0..tab];
             const size_str = s[tab + 1 ..];
-            pt = std.fmt.parseFloat(f32, size_str) catch default_font_pt;
+            const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
+            // If size is 0 or invalid, use config size
+            pt = if (parsed_pt > 0) parsed_pt else config_pt;
         } else {
-            // No tab => treat as invalid; fallback.
-            if (applog.isEnabled()) applog.appLog("onGuiFont: invalid payload (no tab), fallback to default", .{});
+            // No tab => treat as invalid; use config font.
+            if (applog.isEnabled()) applog.appLog("onGuiFont: invalid payload (no tab), using config font", .{});
         }
     } else {
-        if (applog.isEnabled()) applog.appLog("onGuiFont: empty payload, fallback to default", .{});
+        if (applog.isEnabled()) applog.appLog("onGuiFont: empty payload, using config font", .{});
+    }
+
+    // If guifont name is empty, use config font
+    if (name.len == 0) {
+        name = config_font;
+        if (applog.isEnabled()) applog.appLog("onGuiFont: guifont empty, using config font '{s}'", .{config_font});
     }
 
     app.mu.lock();
@@ -1986,16 +1999,27 @@ fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c) voi
         if (try_primary) |_| {} else |e| {
             if (applog.isEnabled()) applog.appLog("onGuiFont: setFontUtf8 failed name='{s}' pt={d}: {any}", .{ name, pt, e });
 
-            const fallback_name = "Consolas";
-            const fallback_pt: f32 = pt;
+            // Fallback chain: config font -> OS default
+            const fallback_name = if (std.mem.eql(u8, name, config_font)) os_default_font else config_font;
 
-            const try_fb = a.setFontUtf8(fallback_name, fallback_pt);
+            const try_fb = a.setFontUtf8(fallback_name, pt);
             if (try_fb) |_| {
                 applied_name = fallback_name;
-                applied_pt = fallback_pt;
+                applied_pt = pt;
                 if (applog.isEnabled()) applog.appLog("onGuiFont: fallback applied name='{s}' pt={d}", .{ applied_name, applied_pt });
             } else |e2| {
-                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback setFontUtf8 failed name='{s}' pt={d}: {any}", .{ fallback_name, fallback_pt, e2 });
+                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback setFontUtf8 failed name='{s}' pt={d}: {any}", .{ fallback_name, pt, e2 });
+                // Last resort: try OS default if we haven't already
+                if (!std.mem.eql(u8, fallback_name, os_default_font)) {
+                    const try_os = a.setFontUtf8(os_default_font, pt);
+                    if (try_os) |_| {
+                        applied_name = os_default_font;
+                        applied_pt = pt;
+                        if (applog.isEnabled()) applog.appLog("onGuiFont: OS default applied name='{s}' pt={d}", .{ applied_name, applied_pt });
+                    } else |e3| {
+                        if (applog.isEnabled()) applog.appLog("onGuiFont: OS default setFontUtf8 failed: {any}", .{e3});
+                    }
+                }
             }
         }
 
@@ -11902,8 +11926,13 @@ export fn WndProc(
                 applog.appLog("  renderer create...", .{});
 
                 // 1) Atlas builder (DirectWrite + CPU atlas)
+                // Font priority: config.font.family > OS default (Consolas)
+                const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+                const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
+                applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
+
                 _ = c.QueryPerformanceCounter(&t1);
-                const atlas = dwrite_d2d.Renderer.init(app.alloc, hwnd) catch |e| {
+                const atlas = dwrite_d2d.Renderer.init(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
                     applog.appLog("dwrite_d2d.Renderer.init failed: {any}\n", .{e});
                     app.atlas = null;
                     app.renderer = null;

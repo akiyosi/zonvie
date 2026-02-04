@@ -349,7 +349,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         self.queue = q
 
-        self.atlas = GlyphAtlas(device: dev, fontName: "Menlo", pointSize: 14.0)
+        // Font priority: config.font.family > OS default (Menlo)
+        let initialFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
+        let initialSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
+        ZonvieCore.appLog("[Renderer] init: initial font='\(initialFont)' size=\(initialSize)")
+
+        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize))
         self.blurEnabled = ZonvieConfig.shared.blurEnabled
 
         super.init()

@@ -107,7 +107,7 @@ pub const Renderer = struct {
     // Atlas version - incremented when new glyphs are added (for multi-context sync)
     atlas_version: u64 = 0,
 
-    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND) !Renderer {
+    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         // Timing for init steps
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
@@ -163,9 +163,13 @@ pub const Renderer = struct {
         _ = c.QueryPerformanceCounter(&t1);
         applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
-        // Default font
+        // Initial font (from config or OS default)
         _ = c.QueryPerformanceCounter(&t0);
-        try self.setFontUtf8("Consolas", 14.0);
+        self.setFontUtf8(initial_font, initial_pt) catch |e| {
+            // Fallback to OS default if initial font fails
+            applog.appLog("[d2d] initial font '{s}' failed: {any}, trying Consolas\n", .{ initial_font, e });
+            try self.setFontUtf8("Consolas", 14.0);
+        };
         _ = c.QueryPerformanceCounter(&t1);
         applog.appLog("[d2d] [TIMING] setFontUtf8: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 

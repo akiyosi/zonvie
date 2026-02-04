@@ -1590,11 +1590,24 @@ final class ZonvieCore {
         let data = Data(bytes: bytes, count: max(0, len))
         guard let s = String(data: data, encoding: .utf8) else { return }
 
+        // Font priority: guifont > config.font.family > OS default (Menlo)
+        let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
+        let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
+
         // Expect: "<name>\t<size>"
         let parts = s.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
         if parts.count == 2 {
-            let name = String(parts[0])
-            let size = Double(parts[1]) ?? 14.0
+            var name = String(parts[0])
+            let parsedSize = Double(parts[1]) ?? 0
+            // If size is 0 or invalid, use config size
+            let size = parsedSize > 0 ? parsedSize : configSize
+
+            // If guifont name is empty, use config font
+            if name.isEmpty {
+                name = configFont
+                Self.appLog("[onGuiFont] guifont empty, using config font '\(configFont)' size=\(size)")
+            }
+
             DispatchQueue.main.async { [weak self] in
                 view.applyGuiFont(name: name, pointSize: CGFloat(size))
                 // Notify all external grid views that font has changed and request redraw

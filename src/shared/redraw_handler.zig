@@ -245,10 +245,10 @@ fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontRes
     }
 
     // Trim whitespace around name.
+    // If name is empty, return empty string - frontend will use config/OS default.
     const trimmed = std.mem.trim(u8, name_part, " \t\r\n");
-    const final_name = if (trimmed.len == 0) "Menlo" else trimmed;
 
-    return .{ .name = try arena.dupe(u8, final_name), .point_size = point };
+    return .{ .name = try arena.dupe(u8, trimmed), .point_size = point };
 }
 
 fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
@@ -831,9 +831,9 @@ pub fn handleRedraw(
                     }
 
                     if (raw.len == 0) {
-                        if (log.cb != null) log.write("guifont: empty -> fallback/default\n", .{});
-                        // Emit a sane default in resolved format.
-                        const msg = try std.fmt.allocPrint(arena, "Menlo\t14", .{});
+                        if (log.cb != null) log.write("guifont: empty -> notify frontend\n", .{});
+                        // Notify frontend with empty name and size 0 - it will use config/OS default for both.
+                        const msg = try std.fmt.allocPrint(arena, "\t0", .{});
                         try guifont_fn(opt_ctx, msg);
                         continue;
                     }

@@ -1700,6 +1700,7 @@ extension MetalTerminalView: NSTextInputClient {
         let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
         let rectInWindow = convert(rectInView, to: nil)
         let rectInScreen = win.convertToScreen(rectInWindow)
+        ZonvieCore.appLog("[IME] firstRect: screenRow=\(screenRow) screenCol=\(screenCol) cellW=\(cellW) rowH=\(rowH) bounds=\(bounds) rectInView=\(rectInView) rectInScreen=\(rectInScreen)")
         return rectInScreen
     }
 
