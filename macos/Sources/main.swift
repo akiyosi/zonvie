@@ -2,9 +2,6 @@ import Cocoa
 import Darwin
 import Metal
 
-// C functions for fork/setsid (Swift's Darwin.fork is unavailable)
-@_silgen_name("fork") private func c_fork() -> Int32
-@_silgen_name("setsid") private func c_setsid() -> Int32
 
 // Check for --nofork and --help early (before any other processing)
 let args = CommandLine.arguments
@@ -205,37 +202,152 @@ if !noforkMode && !launchedFromFinder {
     }
 
     if shouldFork {
-        // Default mode: fork and detach from terminal
-        // This allows the terminal prompt to return immediately
-        let pid = c_fork()
-        if pid < 0 {
-            // Fork failed - continue in current process
-            perror("fork")
-        } else if pid > 0 {
-            // Parent process: exit immediately (returns prompt to terminal)
-            exit(0)
+        // Use posix_spawnp instead of fork to avoid macOS GUI/IME issues after fork.
+        // fork() breaks WindowServer/HIToolbox connections needed for IME candidate windows.
+        // posix_spawnp searches PATH for executables without "/" in their name.
+
+        // Resolve path BEFORE chdir, since relative paths won't work after chdir($HOME)
+        let argv0 = CommandLine.arguments[0]
+        let executablePath: String
+        if argv0.hasPrefix("/") {
+            // Absolute path - use as is
+            executablePath = argv0
+        } else if argv0.contains("/") {
+            // Relative path with directory component (e.g., ./zonvie, ../bin/zonvie)
+            // Must resolve to absolute path before chdir
+            let cwd = FileManager.default.currentDirectoryPath
+            executablePath = (cwd as NSString).appendingPathComponent(argv0)
+        } else {
+            // Bare name (e.g., zonvie) - posix_spawnp will search PATH
+            executablePath = argv0
         }
-        // Child process continues below
 
-        // Become session leader (detach from controlling terminal)
-        _ = c_setsid()
-
-        // Redirect standard file descriptors to /dev/null (not close!)
-        // Closing them would make fd 0,1,2 available for reuse, which breaks
-        // child process spawning in Zig (fchdir uses these fd numbers)
-        let devnull = open("/dev/null", O_RDWR)
-        if devnull >= 0 {
-            dup2(devnull, STDIN_FILENO)
-            dup2(devnull, STDOUT_FILENO)
-            dup2(devnull, STDERR_FILENO)
-            if devnull > STDERR_FILENO {
-                close(devnull)
+        // Build new arguments with --nofork to prevent infinite spawn loop
+        var newArgs = ["--nofork"]
+        for i in 1..<args.count {
+            if args[i] != "--nofork" {  // Don't duplicate --nofork
+                newArgs.append(args[i])
             }
         }
 
-        // Change to $HOME since we're detached from terminal
-        if let home = ProcessInfo.processInfo.environment["HOME"] {
-            FileManager.default.changeCurrentDirectoryPath(home)
+        // Convert to C strings for posix_spawnp
+        var cArgs: [UnsafeMutablePointer<CChar>?] = [strdup(executablePath)]
+        for arg in newArgs {
+            cArgs.append(strdup(arg))
+        }
+        cArgs.append(nil)
+
+        // Helper to cleanup cArgs
+        func cleanupCArgs() {
+            for ptr in cArgs where ptr != nil {
+                free(ptr)
+            }
+        }
+
+        // Setup file actions to redirect stdin/stdout/stderr to /dev/null
+        var fileActions: posix_spawn_file_actions_t?
+        var spawnAttr: posix_spawnattr_t?
+        var fileActionsInitialized = false
+        var spawnAttrInitialized = false
+        var setupOk = true
+
+        var err = posix_spawn_file_actions_init(&fileActions)
+        if err != 0 {
+            print("posix_spawn_file_actions_init failed: \(String(cString: strerror(err)))")
+            setupOk = false
+        } else {
+            fileActionsInitialized = true
+        }
+
+        if setupOk {
+            err = posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+            if err != 0 {
+                print("posix_spawn_file_actions_addopen(stdin) failed: \(String(cString: strerror(err)))")
+                setupOk = false
+            }
+        }
+        if setupOk {
+            err = posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+            if err != 0 {
+                print("posix_spawn_file_actions_addopen(stdout) failed: \(String(cString: strerror(err)))")
+                setupOk = false
+            }
+        }
+        if setupOk {
+            err = posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+            if err != 0 {
+                print("posix_spawn_file_actions_addopen(stderr) failed: \(String(cString: strerror(err)))")
+                setupOk = false
+            }
+        }
+
+        // Setup spawn attributes to start new session (like setsid)
+        if setupOk {
+            err = posix_spawnattr_init(&spawnAttr)
+            if err != 0 {
+                print("posix_spawnattr_init failed: \(String(cString: strerror(err)))")
+                setupOk = false
+            } else {
+                spawnAttrInitialized = true
+            }
+        }
+        if setupOk {
+            err = posix_spawnattr_setflags(&spawnAttr, Int16(POSIX_SPAWN_SETSID))
+            if err != 0 {
+                print("posix_spawnattr_setflags failed: \(String(cString: strerror(err)))")
+                setupOk = false
+            }
+        }
+
+        // Helper to cleanup posix_spawn resources
+        func cleanupSpawnResources() {
+            if fileActionsInitialized {
+                let destroyErr = posix_spawn_file_actions_destroy(&fileActions)
+                if destroyErr != 0 {
+                    print("posix_spawn_file_actions_destroy failed: \(String(cString: strerror(destroyErr)))")
+                }
+            }
+            if spawnAttrInitialized {
+                let destroyErr = posix_spawnattr_destroy(&spawnAttr)
+                if destroyErr != 0 {
+                    print("posix_spawnattr_destroy failed: \(String(cString: strerror(destroyErr)))")
+                }
+            }
+        }
+
+        if setupOk {
+            // Save original cwd to restore on failure
+            let originalCwd = FileManager.default.currentDirectoryPath
+
+            // Change to $HOME before spawn
+            if let home = ProcessInfo.processInfo.environment["HOME"] {
+                if !FileManager.default.changeCurrentDirectoryPath(home) {
+                    print("Warning: failed to chdir to $HOME, continuing with current directory")
+                }
+            }
+
+            var pid: pid_t = 0
+            let result = posix_spawnp(&pid, executablePath, &fileActions, &spawnAttr, &cArgs, environ)
+
+            // Cleanup
+            cleanupSpawnResources()
+            cleanupCArgs()
+
+            if result == 0 {
+                // Spawn succeeded - parent exits, new process runs independently
+                exit(0)
+            } else {
+                // Spawn failed - restore original cwd and continue in current process
+                if !FileManager.default.changeCurrentDirectoryPath(originalCwd) {
+                    print("Warning: failed to restore original cwd")
+                }
+                let errorMsg = String(cString: strerror(result))
+                print("posix_spawnp failed: \(errorMsg) (error \(result))")
+            }
+        } else {
+            // Setup failed - cleanup and continue in current process
+            cleanupSpawnResources()
+            cleanupCArgs()
         }
     }
 }
