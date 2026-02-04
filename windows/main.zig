@@ -9297,7 +9297,8 @@ fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
     const linespace = app.linespace_px;
-    const content_hwnd = app.content_hwnd;
+    const ext_tabline_enabled = app.ext_tabline_enabled;
+    const main_hwnd = app.hwnd;
     app.mu.unlock();
 
     if (corep == null) return;
@@ -9331,12 +9332,14 @@ fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     // Candidate window should appear immediately below the overlay (cell_h, not row_h)
     const below_overlay_y: c.LONG = cursor_y + @as(c.LONG, @intCast(cell_h));
 
-    // When ext_tabline is enabled with content_hwnd, convert coordinates from content_hwnd to main window
-    // because IME context is associated with main window (hwnd)
+    // When ext_tabline is enabled on main window, content is rendered below the tabbar.
+    // IME context is associated with main window, so we need to add tabline height
+    // to convert content-relative coordinates to main window coordinates.
+    // External windows don't have a tabbar, so only apply offset for main window.
     var adjusted_cursor_y = cursor_y;
     var adjusted_below_overlay_y = below_overlay_y;
-    if (content_hwnd != null) {
-        // content_hwnd is positioned below tabline, so add tabline height
+    const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
+    if (ext_tabline_enabled and is_main_window) {
         adjusted_cursor_y += TablineState.TAB_BAR_HEIGHT;
         adjusted_below_overlay_y += TablineState.TAB_BAR_HEIGHT;
     }
@@ -9423,6 +9426,8 @@ fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     atlas_ptr = if (app.atlas) |*a| a else null;
     atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
+    const ext_tabline_enabled = app.ext_tabline_enabled;
+    const content_hwnd = app.content_hwnd;
     app.mu.unlock();
 
     // Access atlas without holding app.mu to avoid nested locking
@@ -9559,8 +9564,12 @@ fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
         .y = screen_row * @as(c.LONG, @intCast(row_h)) + cmdline_y_offset,
     };
-    // Use content_hwnd for coordinate conversion when ext_tabline is enabled (content_hwnd is positioned below tabline)
-    const coord_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
+    // Use content_hwnd for coordinate conversion when it exists (content_hwnd is positioned below tabline).
+    // When content_hwnd is null but ext_tabline is enabled on main window, add tabline height manually.
+    const coord_hwnd = if (content_hwnd) |ch| ch else hwnd;
+    if (content_hwnd == null and ext_tabline_enabled and !is_external_window) {
+        pt.y += TablineState.TAB_BAR_HEIGHT;
+    }
     _ = c.ClientToScreen(coord_hwnd, &pt);
 
     applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h });
