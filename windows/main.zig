@@ -127,6 +127,7 @@ const WM_APP_IME_OFF: c.UINT = c.WM_APP + 17;
 const WM_APP_TABLINE_INVALIDATE: c.UINT = c.WM_APP + 18;
 const WM_APP_QUIT_REQUESTED: c.UINT = c.WM_APP + 19;
 const WM_APP_QUIT_TIMEOUT: c.UINT = c.WM_APP + 20;
+const WM_APP_RESIZE_POPUPMENU: c.UINT = c.WM_APP + 21;
 
 /// Timer ID for message window auto-hide
 const TIMER_MSG_AUTOHIDE: c.UINT_PTR = 1;
@@ -474,6 +475,9 @@ const ExternalWindow = struct {
     cols: u32 = 0,
     needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
+    needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
+    pending_window_w: c_int = 0, // Pending window width for deferred resize
+    pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
     scroll_accum: i16 = 0, // Accumulated scroll delta for high-resolution scrolling
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
@@ -1614,9 +1618,48 @@ fn onVerticesRow(
                 ext_win.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
                 ext_win.vert_count = ext_win.verts.items.len;
             }
+
+            // Check if size changed before updating
+            const size_changed = (ext_win.rows != total_rows or ext_win.cols != total_cols);
+
             ext_win.rows = total_rows;
             ext_win.cols = total_cols;
             ext_win.needs_redraw = true;
+
+            // Resize popupmenu window if size changed (keep top-left position)
+            // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
+            if (grid_id == POPUPMENU_GRID_ID and size_changed) {
+                const cell_w = app.cell_w_px;
+                const cell_h = app.cell_h_px;
+                const content_w: c_int = @intCast(total_cols * cell_w);
+                const content_h: c_int = @intCast(total_rows * cell_h);
+
+                // Calculate window size (WS_POPUP has no decorations, so client = window)
+                var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+                _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
+                const window_w: c_int = rect.right - rect.left;
+                const window_h: c_int = rect.bottom - rect.top;
+
+                if (applog.isEnabled()) applog.appLog("[win] on_vertices_row popupmenu resize pending: content=({d},{d}) window=({d},{d})\n", .{ content_w, content_h, window_w, window_h });
+
+                // Store pending resize info and post message to do the actual resize outside of callback
+                ext_win.needs_window_resize = true;
+                ext_win.pending_window_w = window_w;
+                ext_win.pending_window_h = window_h;
+                ext_win.needs_renderer_resize = true;
+
+                // Post message to main window to trigger resize asynchronously (outside of lock)
+                if (app.hwnd) |main_hwnd| {
+                    if (c.PostMessageW(main_hwnd, WM_APP_RESIZE_POPUPMENU, 0, 0) == 0) {
+                        // PostMessage failed, reset flag to avoid stale state
+                        ext_win.needs_window_resize = false;
+                        if (applog.isEnabled()) applog.appLog("[win] on_vertices_row popupmenu PostMessageW failed\n", .{});
+                    }
+                } else {
+                    // No main hwnd, reset flag
+                    ext_win.needs_window_resize = false;
+                }
+            }
 
             // Invalidate window to trigger repaint
             _ = c.InvalidateRect(ext_win.hwnd, null, 0);
@@ -5469,6 +5512,51 @@ fn hideMessageWindow(app: *App) void {
     app.display_messages.clearRetainingCapacity();
 }
 
+/// Resize popupmenu window asynchronously
+/// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler
+fn resizePopupmenuWindow(app: *App) void {
+    // Get pending resize info while mutex is locked
+    app.mu.lock();
+    const ext_win = app.external_windows.getPtr(POPUPMENU_GRID_ID) orelse {
+        app.mu.unlock();
+        return;
+    };
+
+    if (!ext_win.needs_window_resize) {
+        app.mu.unlock();
+        return;
+    }
+
+    const popup_hwnd = ext_win.hwnd;
+    const window_w = ext_win.pending_window_w;
+    const window_h = ext_win.pending_window_h;
+    ext_win.needs_window_resize = false;
+    app.mu.unlock();
+
+    // Get current window rect to preserve top-left position (outside lock)
+    var current_rect: c.RECT = undefined;
+    if (c.GetWindowRect(popup_hwnd, &current_rect) == 0) {
+        // GetWindowRect failed, skip resize
+        if (applog.isEnabled()) applog.appLog("[win] resizePopupmenuWindow: GetWindowRect failed\n", .{});
+        return;
+    }
+    const pos_x = current_rect.left;
+    const pos_y = current_rect.top;
+
+    if (applog.isEnabled()) applog.appLog("[win] resizePopupmenuWindow: window=({d},{d}) at ({d},{d})\n", .{ window_w, window_h, pos_x, pos_y });
+
+    // Resize window while keeping top-left position (outside lock, safe from deadlock)
+    _ = c.SetWindowPos(
+        popup_hwnd,
+        null,
+        pos_x,
+        pos_y,
+        window_w,
+        window_h,
+        c.SWP_NOACTIVATE | c.SWP_NOZORDER,
+    );
+}
+
 /// Update ext-float (msg_show/msg_history) window positions
 /// Called asynchronously via WM_APP_UPDATE_EXT_FLOAT_POS to avoid deadlock
 fn updateExtFloatPositions(app: *App) void {
@@ -5946,12 +6034,17 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
 
                 // Calculate position in pixels from cell coordinates
                 const px_x: c_int = @intCast(@as(i32, @intCast(req.start_col)) * @as(i32, @intCast(cell_w)));
-                const px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)));
+                var px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)));
+
+                // When ext_tabline is enabled, grid coordinates start below the tabbar
+                if (app.ext_tabline_enabled and app.content_hwnd == null) {
+                    px_y += TablineState.TAB_BAR_HEIGHT;
+                }
 
                 pos_x = client_pt.x + px_x;
                 // For popupmenu: position 1 row above the anchor position
                 pos_y = client_pt.y + px_y - if (is_popupmenu) @as(c_int, @intCast(cell_h)) else 0;
-                if (applog.isEnabled()) applog.appLog("[win] external window position from win_pos: ({d},{d}) cell=({d},{d})\n", .{ pos_x, pos_y, req.start_col, req.start_row });
+                if (applog.isEnabled()) applog.appLog("[win] external window position from win_pos: ({d},{d}) cell=({d},{d}) ext_tabline={}\n", .{ pos_x, pos_y, req.start_col, req.start_row, app.ext_tabline_enabled });
             }
         }
     } else if (is_cmdline) {
@@ -11413,6 +11506,14 @@ export fn WndProc(
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_UPDATE_EXT_FLOAT_POS received\n", .{});
             if (getApp(hwnd)) |app| {
                 updateExtFloatPositions(app);
+            }
+            return 0;
+        },
+
+        WM_APP_RESIZE_POPUPMENU => {
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_RESIZE_POPUPMENU received\n", .{});
+            if (getApp(hwnd)) |app| {
+                resizePopupmenuWindow(app);
             }
             return 0;
         },
