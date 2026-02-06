@@ -81,24 +81,64 @@
 		AB9AE9AC2EF1B8320072639A /* Sources */ = {
 			isa = PBXGroup;
 			children = (
-				AB79DAFE2F1621F7005729E6 /* Config.swift */,
-				AB79DB002F1621F8005729E6 /* TabBarView.swift */,
-				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
-				AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */,
-				AB9AE9C92EF2A2130072639A /* main.swift */,
-				AB9AE9C72EF23C170072639A /* ZonvieCore.swift */,
-				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
-				AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */,
-				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
-				AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */,
-				AB9AE9D02EF900000072639A /* ExternalGridView.swift */,
-				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
-				AB9AE9A72EF1B8320072639A /* AppDelegate.swift */,
+				59BE841BDB264A77A0C08593 /* App */,
+				B7ABB327CC604684A7BCD496 /* Core */,
+				7E23AB3F109A417B9381675A /* Font */,
+				BFE2CD494BA742059597991E /* Rendering */,
+				FECDCC9E6A994C2BA7173DF1 /* UI */,
 				AB9AE9A82EF1B8320072639A /* Assets.xcassets */,
-				AB9AE9AB2EF1B8320072639A /* ViewController.swift */,
 				AB9AE9D22F0000010072639A /* zonvie.icns */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		59BE841BDB264A77A0C08593 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9C92EF2A2130072639A /* main.swift */,
+				AB9AE9A72EF1B8320072639A /* AppDelegate.swift */,
+				AB9AE9AB2EF1B8320072639A /* ViewController.swift */,
+				AB79DAFE2F1621F7005729E6 /* Config.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		B7ABB327CC604684A7BCD496 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9C72EF23C170072639A /* ZonvieCore.swift */,
+				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		7E23AB3F109A417B9381675A /* Font */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */,
+				AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */,
+			);
+			path = Font;
+			sourceTree = "<group>";
+		};
+		BFE2CD494BA742059597991E /* Rendering */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */,
+				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
+				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
+				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
+			);
+			path = Rendering;
+			sourceTree = "<group>";
+		};
+		FECDCC9E6A994C2BA7173DF1 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				AB9AE9D02EF900000072639A /* ExternalGridView.swift */,
+				AB79DB002F1621F8005729E6 /* TabBarView.swift */,
+			);
+			path = UI;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */

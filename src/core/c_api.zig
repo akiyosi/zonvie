@@ -2,6 +2,11 @@ const std = @import("std");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
 
+// Re-exports for test access
+pub const nvim_core = core;
+pub const msgpack = @import("msgpack.zig");
+pub const rpc_encode = @import("rpc_encode.zig");
+
 pub const Cell = extern struct {
     scalar: u32,
     fgRGB: u32,

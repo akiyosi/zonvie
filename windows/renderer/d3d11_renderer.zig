@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("zonvie_core");
-const c = @import("win32.zig").c;
-const applog = @import("app_log.zig");
-const compiled_shaders = @import("shaders/compiled_shaders.zig");
+const c = @import("../win32.zig").c;
+const applog = @import("../app_log.zig");
+const compiled_shaders = @import("../shaders/compiled_shaders.zig");
 
 const MaxSwapchainBuffers: usize = 4;
 

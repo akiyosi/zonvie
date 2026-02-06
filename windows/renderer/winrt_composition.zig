@@ -2,8 +2,8 @@
 // Uses Windows.UI.Composition APIs via COM
 
 const std = @import("std");
-const c = @import("win32.zig").c;
-const applog = @import("app_log.zig");
+const c = @import("../win32.zig").c;
+const applog = @import("../app_log.zig");
 
 // WinRT types
 // HSTRING is a handle (pointer) type
