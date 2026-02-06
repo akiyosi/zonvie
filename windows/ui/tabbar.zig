@@ -1,5 +1,5 @@
 const std = @import("std");
-const app_mod = @import("app.zig");
+const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;

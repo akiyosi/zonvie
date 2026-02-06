@@ -1,12 +1,12 @@
 const std = @import("std");
-const app_mod = @import("app.zig");
+const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const scrollbar = @import("scrollbar.zig");
-const input = @import("input.zig");
+const input = @import("../input.zig");
 const messages = @import("messages.zig");
 const core = @import("zonvie_core");
 

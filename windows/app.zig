@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const core = @import("zonvie_core");
-pub const d3d11 = @import("d3d11_renderer.zig");
-pub const dwrite_d2d = @import("dwrite_d2d_renderer.zig");
+pub const d3d11 = @import("renderer/d3d11_renderer.zig");
+pub const dwrite_d2d = @import("renderer/dwrite_d2d_renderer.zig");
 pub const c = @import("win32.zig").c;
 pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");

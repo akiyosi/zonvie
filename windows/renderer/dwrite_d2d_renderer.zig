@@ -1,7 +1,7 @@
 const std = @import("std");
 const core = @import("zonvie_core");
-const c = @import("win32.zig").c;
-const applog = @import("app_log.zig");
+const c = @import("../win32.zig").c;
+const applog = @import("../app_log.zig");
 
 // Move outside Renderer (Zig cannot have const declarations between container fields)
 // NOTE: Reduced from 2048x2048 to 1024x1024 for faster startup (~3ms savings).

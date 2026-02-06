@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) !void {
 
     // Add Windows application icon
     win_exe.addWin32ResourceFile(.{
-        .file = b.path("windows/zonvie.rc"),
+        .file = b.path("windows/resources/zonvie.rc"),
     });
 
     // Win32 GUI basics (GDI).
