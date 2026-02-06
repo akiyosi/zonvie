@@ -125,6 +125,7 @@ const WM_APP_TRAY: c.UINT = c.WM_APP + 15;
 const WM_APP_UPDATE_CURSOR_BLINK: c.UINT = c.WM_APP + 16;
 const WM_APP_IME_OFF: c.UINT = c.WM_APP + 17;
 const WM_APP_TABLINE_INVALIDATE: c.UINT = c.WM_APP + 18;
+const WM_APP_UPDATE_CMDLINE_COLORS: c.UINT = c.WM_APP + 22;
 const WM_APP_QUIT_REQUESTED: c.UINT = c.WM_APP + 19;
 const WM_APP_QUIT_TIMEOUT: c.UINT = c.WM_APP + 20;
 const WM_APP_RESIZE_POPUPMENU: c.UINT = c.WM_APP + 21;
@@ -483,6 +484,14 @@ const ExternalWindow = struct {
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
 
+    // Close state - set when window is scheduled for closing (don't paint or access renderer)
+    is_pending_close: bool = false,
+
+    // Paint reference count - prevents freeing while paint is in progress
+    // DXGI operations can pump Win32 messages, so close could be triggered during paint.
+    // This counter ensures ext_win isn't freed until all paint operations complete.
+    paint_ref_count: u32 = 0,
+
     // Scrollbar state for external windows
     scrollbar_visible: bool = false,
     scrollbar_alpha: f32 = 0.0,
@@ -545,10 +554,6 @@ const App = struct {
 
     // Pending external window creation requests (for UI thread processing)
     pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
-
-    // Pending external window close requests (for UI thread processing)
-    // Stores ExternalWindow structs that need to be destroyed on UI thread
-    pending_close_windows: std.ArrayListUnmanaged(ExternalWindow) = .{},
 
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
@@ -702,6 +707,11 @@ const App = struct {
 
     // ext_cmdline: current firstc character (':', '/', '?', etc.)
     cmdline_firstc: u8 = 0,
+
+    // Cached cmdline UI colors (updated when highlights change, avoids core calls during paint)
+    // Border uses Search highlight bg, icon uses Comment highlight fg
+    cmdline_border_color: [3]f32 = .{ 1.0, 1.0, 0.0 }, // default yellow
+    cmdline_icon_color: [3]f32 = .{ 0.5, 0.5, 0.5 }, // default gray
 
     // ext_cmdline enabled flag (set from --extcmdline command line arg)
     ext_cmdline_enabled: bool = false,
@@ -948,10 +958,6 @@ const App = struct {
         }
         self.external_windows.deinit(self.alloc);
         self.pending_external_windows.deinit(self.alloc);
-        for (self.pending_close_windows.items) |*pcw| {
-            pcw.deinit(self.alloc);
-        }
-        self.pending_close_windows.deinit(self.alloc);
         for (self.pending_external_verts.items) |*pv| {
             pv.deinit(self.alloc);
         }
@@ -1605,6 +1611,9 @@ fn onVerticesRow(
 
         // Try to find existing external window for this grid
         if (app.external_windows.getPtr(grid_id)) |ext_win| {
+            // Skip windows that are pending close
+            if (ext_win.is_pending_close) return;
+
             // Window exists - store vertices
             // Clear verts when row 0 is received (start of new frame)
             if (row_start == 0) {
@@ -1630,7 +1639,7 @@ fn onVerticesRow(
             // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
             if (grid_id == POPUPMENU_GRID_ID and size_changed) {
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
+                const cell_h = app.cell_h_px + app.linespace_px;
                 const content_w: c_int = @intCast(total_cols * cell_w);
                 const content_h: c_int = @intCast(total_rows * cell_h);
 
@@ -1650,7 +1659,7 @@ fn onVerticesRow(
 
                 // Post message to main window to trigger resize asynchronously (outside of lock)
                 if (app.hwnd) |main_hwnd| {
-                    if (c.PostMessageW(main_hwnd, WM_APP_RESIZE_POPUPMENU, 0, 0) == 0) {
+                    if (c.PostMessageW(main_hwnd, WM_APP_RESIZE_POPUPMENU, @bitCast(POPUPMENU_GRID_ID), 0) == 0) {
                         // PostMessage failed, reset flag to avoid stale state
                         ext_win.needs_window_resize = false;
                         if (applog.isEnabled()) applog.appLog("[win] on_vertices_row popupmenu PostMessageW failed\n", .{});
@@ -2104,13 +2113,100 @@ fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         .{ linespace_px, v, app.cell_h_px, app.cell_h_px + v },
     );
 
+    // Collect external window resize info while holding the lock
+    // We must release the lock before calling SetWindowPos to avoid deadlock
+    // (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
+    const ExtResizeInfo = struct {
+        hwnd: c.HWND,
+        window_w: c_int,
+        window_h: c_int,
+        pos_x: c_int,
+        pos_y: c_int,
+    };
+
     app.mu.lock();
     app.linespace_px = v;
     const hwnd = app.hwnd;
     if (hwnd) |h| {
         updateRowsColsFromClientForce(h, app);
     }
+
+    // Allocate resize list based on actual external window count
+    const ext_count = app.external_windows.count();
+    const resize_list = app.alloc.alloc(ExtResizeInfo, ext_count) catch {
+        applog.appLog("[win] onLineSpace: failed to alloc resize_list for {d} windows\n", .{ext_count});
+        app.mu.unlock();
+        return;
+    };
+    defer app.alloc.free(resize_list);
+    var resize_count: usize = 0;
+
+    // Collect resize info for all external windows (skip windows pending close)
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px + v;
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr;
+
+        // Skip windows that are pending close (their hwnd may be invalid soon)
+        if (ext_win.is_pending_close) continue;
+
+        const rows = ext_win.rows;
+        const cols = ext_win.cols;
+
+        // Calculate new content size
+        var content_w: c_int = @intCast(cols * cell_w);
+        var content_h: c_int = @intCast(rows * cell_h);
+
+        // Add padding for special windows
+        const is_cmdline = (grid_id == CMDLINE_GRID_ID);
+        const is_msg_show = (grid_id == MESSAGE_GRID_ID);
+        const is_msg_history = (grid_id == MSG_HISTORY_GRID_ID);
+
+        if (is_cmdline) {
+            const cmdline_icon_total_width: u32 = CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT;
+            const cmdline_total_padding: u32 = CMDLINE_PADDING * 2;
+            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
+            content_h += @as(c_int, @intCast(cmdline_total_padding));
+        } else if (is_msg_show or is_msg_history) {
+            const msg_total_padding: u32 = MSG_PADDING * 2;
+            content_w += @as(c_int, @intCast(msg_total_padding));
+            content_h += @as(c_int, @intCast(msg_total_padding));
+        }
+
+        // Calculate window size
+        const dwStyle: c.DWORD = c.WS_POPUP;
+        const dwExStyle: c.DWORD = c.WS_EX_TOPMOST;
+        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
+        const window_w: c_int = rect.right - rect.left;
+        const window_h: c_int = rect.bottom - rect.top;
+
+        // Get current position to preserve it
+        var current_rect: c.RECT = undefined;
+        if (c.GetWindowRect(ext_win.hwnd, &current_rect) != 0) {
+            if (resize_count < resize_list.len) {
+                resize_list[resize_count] = .{
+                    .hwnd = ext_win.hwnd,
+                    .window_w = window_w,
+                    .window_h = window_h,
+                    .pos_x = current_rect.left,
+                    .pos_y = current_rect.top,
+                };
+                resize_count += 1;
+            }
+            ext_win.needs_renderer_resize = true;
+        }
+    }
+
     app.mu.unlock();
+
+    // Now resize external windows outside the lock to avoid deadlock
+    for (resize_list[0..resize_count]) |info| {
+        if (applog.isEnabled()) applog.appLog("[win] onLineSpace: resizing ext_win to ({d},{d})\n", .{ info.window_w, info.window_h });
+        _ = c.SetWindowPos(info.hwnd, null, info.pos_x, info.pos_y, info.window_w, info.window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
+    }
 
     if (hwnd) |h| {
         updateLayoutToCore(h, app);
@@ -2197,6 +2293,14 @@ fn onCmdlineShow(
     app.mu.lock();
     app.cmdline_firstc = firstc;
     app.mu.unlock();
+
+    // Request UI thread to update cmdline colors from core highlights.
+    // We can't call zonvie_core_get_hl_by_name here (callback context) because
+    // core holds an internal lock during callbacks, causing deadlock.
+    // Post message to UI thread which will call updateCmdlineColors().
+    if (app.hwnd) |hwnd| {
+        _ = c.PostMessageW(hwnd, WM_APP_UPDATE_CMDLINE_COLORS, 0, 0);
+    }
 }
 
 fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
@@ -5323,7 +5427,7 @@ fn showMessageWindowOnUIThread(app: *App, msg: DisplayMessage) void {
     const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
 
     // External window with auto-hide
-    const cell_h = app.cell_h_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
     const padding: c_int = 16;
 
     // Get app window position and size (position relative to app window, not screen)
@@ -5512,42 +5616,55 @@ fn hideMessageWindow(app: *App) void {
     app.display_messages.clearRetainingCapacity();
 }
 
-/// Resize popupmenu window asynchronously
+/// Resize external window (cmdline or popupmenu) asynchronously
 /// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler
-fn resizePopupmenuWindow(app: *App) void {
+fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
     app.mu.lock();
-    const ext_win = app.external_windows.getPtr(POPUPMENU_GRID_ID) orelse {
+    const ext_win = app.external_windows.getPtr(grid_id) orelse {
         app.mu.unlock();
         return;
     };
 
-    if (!ext_win.needs_window_resize) {
+    // Skip if window is pending close or doesn't need resize
+    if (ext_win.is_pending_close or !ext_win.needs_window_resize) {
         app.mu.unlock();
         return;
     }
 
-    const popup_hwnd = ext_win.hwnd;
+    const ext_hwnd = ext_win.hwnd;
     const window_w = ext_win.pending_window_w;
     const window_h = ext_win.pending_window_h;
+    const is_cmdline = (grid_id == CMDLINE_GRID_ID);
     ext_win.needs_window_resize = false;
     app.mu.unlock();
 
-    // Get current window rect to preserve top-left position (outside lock)
+    // Get current window rect (outside lock)
     var current_rect: c.RECT = undefined;
-    if (c.GetWindowRect(popup_hwnd, &current_rect) == 0) {
+    if (c.GetWindowRect(ext_hwnd, &current_rect) == 0) {
         // GetWindowRect failed, skip resize
-        if (applog.isEnabled()) applog.appLog("[win] resizePopupmenuWindow: GetWindowRect failed\n", .{});
+        if (applog.isEnabled()) applog.appLog("[win] resizeExternalWindowDeferred: GetWindowRect failed for grid_id={d}\n", .{grid_id});
         return;
     }
-    const pos_x = current_rect.left;
-    const pos_y = current_rect.top;
 
-    if (applog.isEnabled()) applog.appLog("[win] resizePopupmenuWindow: window=({d},{d}) at ({d},{d})\n", .{ window_w, window_h, pos_x, pos_y });
+    // Calculate position: cmdline keeps center, popupmenu keeps top-left
+    var pos_x: c_int = undefined;
+    var pos_y: c_int = undefined;
+    if (is_cmdline) {
+        const old_center_x = @divTrunc(current_rect.left + current_rect.right, 2);
+        const old_center_y = @divTrunc(current_rect.top + current_rect.bottom, 2);
+        pos_x = old_center_x - @divTrunc(window_w, 2);
+        pos_y = old_center_y - @divTrunc(window_h, 2);
+    } else {
+        pos_x = current_rect.left;
+        pos_y = current_rect.top;
+    }
 
-    // Resize window while keeping top-left position (outside lock, safe from deadlock)
+    if (applog.isEnabled()) applog.appLog("[win] resizeExternalWindowDeferred: grid_id={d} window=({d},{d}) at ({d},{d})\n", .{ grid_id, window_w, window_h, pos_x, pos_y });
+
+    // Resize window (outside lock, safe from deadlock)
     _ = c.SetWindowPos(
-        popup_hwnd,
+        ext_hwnd,
         null,
         pos_x,
         pos_y,
@@ -5565,7 +5682,7 @@ fn updateExtFloatPositions(app: *App) void {
     // Get data while mutex is locked
     app.mu.lock();
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
     const linespace = app.linespace_px;
     const cursor_grid = app.last_cursor_grid;
     const pos_mode = app.config.messages.msg_pos.ext_float;
@@ -5711,7 +5828,7 @@ fn updateMiniWindows(app: *App) void {
     // Get cell dimensions and config
     app.mu.lock();
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
     const linespace = app.linespace_px;
     const mini_pos_mode = app.config.messages.msg_pos.mini;
     const cursor_grid = app.last_cursor_grid;
@@ -5930,8 +6047,9 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
     }
 
     // Get cell dimensions from main atlas
+    // Note: cell_h must include linespace_px to match core's vertex generation
     const cell_w: u32 = app.cell_w_px;
-    const cell_h: u32 = app.cell_h_px;
+    const cell_h: u32 = app.cell_h_px + app.linespace_px;
     const content_w: c_int = @intCast(req.cols * cell_w);
     const content_h: c_int = @intCast(req.rows * cell_h);
 
@@ -6184,8 +6302,19 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
         return;
     };
 
+    // Collect SetWindowPos info while holding the lock, then call SetWindowPos after releasing
+    // to avoid deadlock (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
+    const DeferredSetWindowPos = struct {
+        hwnd: c.HWND,
+        hwnd_insert_after: c.HWND, // non-optional; use null for "no change" with SWP_NOZORDER
+        x: c_int,
+        y: c_int,
+        flags: c.UINT,
+    };
+    var deferred_setpos: ?DeferredSetWindowPos = null;
+    var deferred_setpos_cmdline: ?DeferredSetWindowPos = null;
+
     app.mu.lock();
-    defer app.mu.unlock();
 
     // Store external window
     const ext_window = ExternalWindow{
@@ -6197,6 +6326,7 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
 
     app.external_windows.put(app.alloc, req.grid_id, ext_window) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to store external window: {any}\n", .{e});
+        app.mu.unlock();
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
         _ = c.DestroyWindow(hwnd);
@@ -6213,8 +6343,14 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
                 const target_rect = app.getExtFloatTargetRect();
                 const new_x = target_rect.right - msg_width - 10;
                 const new_y = history_rect.bottom + 4;
-                _ = c.SetWindowPos(msg_win.hwnd, null, new_x, new_y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
-                if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ new_x, new_y });
+                // Defer SetWindowPos to after lock release
+                deferred_setpos = .{
+                    .hwnd = msg_win.hwnd,
+                    .hwnd_insert_after = null,
+                    .x = new_x,
+                    .y = new_y,
+                    .flags = c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                };
             }
         }
     }
@@ -6268,19 +6404,28 @@ fn createExternalWindowOnUIThread(app: *App, req: PendingExternalWindow) void {
                 std.mem.eql(u8, msg_kind, "confirm_sub") or
                 std.mem.eql(u8, msg_kind, "return_prompt");
             if (is_confirm_visible) {
-                // SetWindowPos with cmdline as hwndInsertAfter puts message BELOW cmdline
-                _ = c.SetWindowPos(
-                    msg_win.hwnd,
-                    hwnd, // cmdline hwnd
-                    0,
-                    0,
-                    0,
-                    0,
-                    c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE,
-                );
-                if (applog.isEnabled()) applog.appLog("[win] put message window below cmdline (cmdline created)\n", .{});
+                // Defer SetWindowPos to after lock release
+                deferred_setpos_cmdline = .{
+                    .hwnd = msg_win.hwnd,
+                    .hwnd_insert_after = hwnd, // cmdline hwnd
+                    .x = 0,
+                    .y = 0,
+                    .flags = c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE,
+                };
             }
         }
+    }
+
+    app.mu.unlock();
+
+    // Now call SetWindowPos outside the lock to avoid deadlock
+    if (deferred_setpos) |sp| {
+        _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
+        if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ sp.x, sp.y });
+    }
+    if (deferred_setpos_cmdline) |sp| {
+        _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
+        if (applog.isEnabled()) applog.appLog("[win] put message window below cmdline (cmdline created)\n", .{});
     }
 
     // Activate this external window
@@ -6291,18 +6436,16 @@ fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_external_window_close: grid_id={d}\n", .{grid_id});
 
-    // Remove from external_windows immediately to allow new window creation
-    // Move to pending_close_windows for UI thread to destroy
+    // Mark the window as pending close (don't remove from HashMap yet to avoid use-after-free)
+    // The actual removal and cleanup will happen on the UI thread in closeExternalWindowOnUIThread
     app.mu.lock();
     const main_hwnd = app.hwnd;
-    if (app.external_windows.fetchRemove(grid_id)) |entry| {
-        app.pending_close_windows.append(app.alloc, entry.value) catch {
-            if (applog.isEnabled()) applog.appLog("[win] failed to queue close request for grid_id={d}\n", .{grid_id});
-        };
+    if (app.external_windows.getPtr(grid_id)) |ext_win| {
+        ext_win.is_pending_close = true;
     }
     app.mu.unlock();
 
-    // Post message to UI thread to process pending close windows
+    // Post message to UI thread to do the actual close
     // (DestroyWindow must be called from the thread that created the window)
     if (main_hwnd) |hwnd| {
         _ = c.PostMessageW(hwnd, WM_APP_CLOSE_EXTERNAL_WINDOW, @bitCast(grid_id), 0);
@@ -6310,16 +6453,29 @@ fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
 }
 
 /// Actually close external window (must be called on UI thread)
-/// Processes pending_close_windows queue
+/// Removes from HashMap and destroys the window
 fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: grid_id={d}\n", .{grid_id});
 
-    // Process all pending close windows
+    // Check if paint is in progress - if so, defer the close
+    // DXGI operations can pump messages, so close could be triggered during paint
     app.mu.lock();
-    while (app.pending_close_windows.items.len > 0) {
-        var ext_win = app.pending_close_windows.items[app.pending_close_windows.items.len - 1];
-        app.pending_close_windows.items.len -= 1;
-        app.mu.unlock();
+    if (app.external_windows.getPtr(grid_id)) |ew| {
+        if (ew.paint_ref_count > 0) {
+            // Paint is in progress - just mark as pending and let paint trigger close when done
+            ew.is_pending_close = true;
+            if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: paint in progress (ref={d}), deferring close\n", .{ew.paint_ref_count});
+            app.mu.unlock();
+            return;
+        }
+    }
+
+    // Remove from external_windows HashMap and get the entry
+    const entry = app.external_windows.fetchRemove(grid_id);
+    app.mu.unlock();
+
+    if (entry) |e| {
+        var ext_win = e.value;
 
         // Check if IME overlay was parented to this external window
         // If so, destroy it and reset the handle so main window can create a new one
@@ -6337,10 +6493,7 @@ fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         // deinit handles DestroyWindow and resource cleanup
         ext_win.deinit(app.alloc);
         if (applog.isEnabled()) applog.appLog("[win] destroyed external window hwnd={*}\n", .{ext_win.hwnd});
-
-        app.mu.lock();
     }
-    app.mu.unlock();
 
     // Note: We intentionally do NOT remove pending_external_verts here because
     // the pending verts might belong to a new window with the same grid_id that
@@ -6357,7 +6510,10 @@ fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const core.Vert
     defer app.mu.unlock();
 
     if (app.external_windows.getPtr(grid_id)) |ext_win| {
-        // Check if size changed (for cmdline window resize)
+        // Skip windows that are pending close
+        if (ext_win.is_pending_close) return;
+
+        // Check if size changed (for window resize)
         const size_changed = (ext_win.rows != rows or ext_win.cols != cols);
 
         // Window exists, copy vertices to it
@@ -6372,90 +6528,36 @@ fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const core.Vert
         // Note: Background color adjustment for cmdline is done in paintExternalWindow
         // to ensure both the full-window background quad and grid vertices use the same color.
 
-        // Resize cmdline window if size changed (keep center position)
-        if (grid_id == CMDLINE_GRID_ID and size_changed) {
+        // Mark resize needed for cmdline/popupmenu if size changed
+        // Actual window resize is done via WM_APP_RESIZE_POPUPMENU to avoid deadlock
+        // (SetWindowPos sends WM_SIZE synchronously, and we're holding app.mu here)
+        if ((grid_id == CMDLINE_GRID_ID or grid_id == POPUPMENU_GRID_ID) and size_changed) {
+            ext_win.needs_window_resize = true;
+            ext_win.needs_renderer_resize = true;
+            // Store new size for deferred resize
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px;
-            const content_w: c_int = @intCast(cols * cell_w);
-            const content_h: c_int = @intCast(rows * cell_h);
+            const cell_h = app.cell_h_px + app.linespace_px;
+            var content_w: c_int = @intCast(cols * cell_w);
+            var content_h: c_int = @intCast(rows * cell_h);
 
-            // Add margin and icon area for cmdline
-            const cmdline_icon_total_width: u32 = CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT;
-            const cmdline_total_padding: u32 = CMDLINE_PADDING * 2;
-            const client_w: c_int = content_w + @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
-            const client_h: c_int = content_h + @as(c_int, @intCast(cmdline_total_padding));
+            // Add padding for cmdline
+            if (grid_id == CMDLINE_GRID_ID) {
+                const cmdline_icon_total_width: u32 = CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT;
+                const cmdline_total_padding: u32 = CMDLINE_PADDING * 2;
+                content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
+                content_h += @as(c_int, @intCast(cmdline_total_padding));
+            }
 
-            // Calculate window size (WS_POPUP has no decorations, so client = window)
-            var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-            _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-            const window_w: c_int = rect.right - rect.left;
-            const window_h: c_int = rect.bottom - rect.top;
-
-            // Get current window rect to preserve center position
-            var current_rect: c.RECT = undefined;
-            _ = c.GetWindowRect(ext_win.hwnd, &current_rect);
-            const old_center_x = @divTrunc(current_rect.left + current_rect.right, 2);
-            const old_center_y = @divTrunc(current_rect.top + current_rect.bottom, 2);
-
-            // Calculate new position to keep center
-            const pos_x = old_center_x - @divTrunc(window_w, 2);
-            const pos_y = old_center_y - @divTrunc(window_h, 2);
-
-            if (applog.isEnabled()) applog.appLog("[win] cmdline resize: content=({d},{d}) window=({d},{d}) at ({d},{d})\n", .{ content_w, content_h, window_w, window_h, pos_x, pos_y });
-
-            // Resize window while keeping center position
-            _ = c.SetWindowPos(
-                ext_win.hwnd,
-                null,
-                pos_x,
-                pos_y,
-                window_w,
-                window_h,
-                c.SWP_NOACTIVATE | c.SWP_NOZORDER,
-            );
-
-            // Resize D3D11 swapchain (gets size from window)
-            ext_win.renderer.resize() catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] cmdline renderer resize failed: {any}\n", .{e});
-            };
-        }
-
-        // Resize popupmenu window if size changed (keep top-left position)
-        if (grid_id == POPUPMENU_GRID_ID and size_changed) {
-            const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px;
-            const content_w: c_int = @intCast(cols * cell_w);
-            const content_h: c_int = @intCast(rows * cell_h);
-
-            // Calculate window size (WS_POPUP has no decorations, so client = window)
+            // Calculate window size
             var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
             _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-            const window_w: c_int = rect.right - rect.left;
-            const window_h: c_int = rect.bottom - rect.top;
+            ext_win.pending_window_w = rect.right - rect.left;
+            ext_win.pending_window_h = rect.bottom - rect.top;
 
-            // Get current window rect to preserve top-left position
-            var current_rect: c.RECT = undefined;
-            _ = c.GetWindowRect(ext_win.hwnd, &current_rect);
-            const pos_x = current_rect.left;
-            const pos_y = current_rect.top;
-
-            if (applog.isEnabled()) applog.appLog("[win] popupmenu resize: content=({d},{d}) window=({d},{d}) at ({d},{d})\n", .{ content_w, content_h, window_w, window_h, pos_x, pos_y });
-
-            // Resize window while keeping top-left position
-            _ = c.SetWindowPos(
-                ext_win.hwnd,
-                null,
-                pos_x,
-                pos_y,
-                window_w,
-                window_h,
-                c.SWP_NOACTIVATE | c.SWP_NOZORDER,
-            );
-
-            // Resize D3D11 swapchain (gets size from window)
-            ext_win.renderer.resize() catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] popupmenu renderer resize failed: {any}\n", .{e});
-            };
+            // Post message to resize on UI thread (outside lock)
+            if (app.hwnd) |main_hwnd| {
+                _ = c.PostMessageW(main_hwnd, WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
+            }
         }
 
         // Update msg_show/msg_history window position and size
@@ -6473,7 +6575,7 @@ fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const core.Vert
             }
         }
 
-        // Trigger redraw
+        // Trigger redraw (InvalidateRect is safe to call with lock held)
         _ = c.InvalidateRect(ext_win.hwnd, null, 0);
     } else {
         // Window doesn't exist yet - store vertices as pending
@@ -6789,14 +6891,14 @@ fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, c
 /// Generate scrollbar vertices for external window
 fn generateScrollbarVerticesForExternal(
     app: *App,
-    ext_win: *ExternalWindow,
+    scrollbar_alpha: f32,
     grid_id: i64,
     client_width: i32,
     client_height: i32,
     out_verts: *[12]core.Vertex,
 ) usize {
     if (!app.config.scrollbar.enabled) return 0;
-    if (ext_win.scrollbar_alpha <= 0.001) return 0;
+    if (scrollbar_alpha <= 0.001) return 0;
 
     const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height);
     if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
@@ -6816,7 +6918,7 @@ fn generateScrollbarVerticesForExternal(
         }
     }.f;
 
-    const alpha = ext_win.scrollbar_alpha * app.config.scrollbar.opacity;
+    const alpha = scrollbar_alpha * app.config.scrollbar.opacity;
 
     // Track color
     const is_always_mode = app.config.scrollbar.isAlways();
@@ -8420,6 +8522,81 @@ fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
 }
 
+/// Helper to decrement paint_ref_count and trigger deferred close if needed.
+/// Must be called at all exit points after paint_ref_count was incremented.
+fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
+    app.mu.lock();
+    var should_post_close = false;
+    if (app.external_windows.getPtr(grid_id)) |ew| {
+        if (ew.paint_ref_count > 0) {
+            ew.paint_ref_count -= 1;
+            if (applog.isEnabled()) applog.appLog("[win] finishExternalWindowPaint: paint_ref_count-- -> {d}\n", .{ew.paint_ref_count});
+        }
+        // If paint finished and close was pending, schedule the close via PostMessage.
+        // We must NOT call closeExternalWindowOnUIThread directly here because
+        // this function is called from defer in paintExternalWindow, and EndPaint
+        // hasn't been called yet. DestroyWindow before EndPaint causes undefined behavior.
+        if (ew.paint_ref_count == 0 and ew.is_pending_close) {
+            if (applog.isEnabled()) applog.appLog("[win] finishExternalWindowPaint: scheduling deferred close for grid_id={d}\n", .{grid_id});
+            should_post_close = true;
+        }
+    }
+    app.mu.unlock();
+
+    // Post the close message after unlocking, so it's processed after WM_PAINT completes
+    if (should_post_close) {
+        if (app.hwnd) |hwnd| {
+            const post_result = c.PostMessageW(hwnd, WM_APP_CLOSE_EXTERNAL_WINDOW, @bitCast(grid_id), 0);
+            if (post_result == 0) {
+                // PostMessageW failed. This can happen if the message queue is full or
+                // the window is being destroyed. We cannot call closeExternalWindowOnUIThread
+                // directly here because that would destroy the window before EndPaint completes.
+                // Leave is_pending_close=true; the window will be cleaned up at process exit.
+                applog.appLog("[win] finishExternalWindowPaint: PostMessageW failed for grid_id={d}, deferring to shutdown\n", .{grid_id});
+            }
+        } else {
+            // Main window is gone (shutdown scenario). We cannot PostMessage, and calling
+            // closeExternalWindowOnUIThread directly would destroy the window before EndPaint.
+            // Leave is_pending_close=true; the window will be cleaned up at process exit.
+            applog.appLog("[win] finishExternalWindowPaint: main hwnd is null, deferring close for grid_id={d} to shutdown\n", .{grid_id});
+        }
+    }
+}
+
+/// Update cached border/icon colors for external windows (cmdline, popupmenu).
+/// Must be called from UI thread (not from core callbacks) to avoid deadlock.
+/// Colors are derived from core highlights: Search (border) and Comment (icon).
+fn updateExternalWindowColors(app: *App) void {
+    var border_r: f32 = 1.0;
+    var border_g: f32 = 1.0;
+    var border_b: f32 = 0.0;
+    var icon_r: f32 = 0.5;
+    var icon_g: f32 = 0.5;
+    var icon_b: f32 = 0.5;
+
+    if (app.corep) |corep| {
+        var fg_rgb: u32 = 0;
+        var bg_rgb: u32 = 0;
+        // Border color from Search highlight background
+        if (core.zonvie_core_get_hl_by_name(corep, "Search", &fg_rgb, &bg_rgb) != 0) {
+            border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
+            border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
+            border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
+        }
+        // Icon color from Comment highlight foreground
+        if (core.zonvie_core_get_hl_by_name(corep, "Comment", &fg_rgb, &bg_rgb) != 0) {
+            icon_r = @as(f32, @floatFromInt((fg_rgb >> 16) & 0xFF)) / 255.0;
+            icon_g = @as(f32, @floatFromInt((fg_rgb >> 8) & 0xFF)) / 255.0;
+            icon_b = @as(f32, @floatFromInt(fg_rgb & 0xFF)) / 255.0;
+        }
+    }
+
+    app.mu.lock();
+    app.cmdline_border_color = .{ border_r, border_g, border_b };
+    app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
+    app.mu.unlock();
+}
+
 /// Paint an external window (simpler rendering path than main window)
 fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow start hwnd={*}\n", .{hwnd});
@@ -8456,20 +8633,42 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow found ext_win vert_count={d} grid_id={d} is_cmdline={} is_popupmenu={} is_msg_show={} is_msg_history={}\n", .{ ext_win.vert_count, grid_id, is_cmdline, is_popupmenu, is_msg_show, is_msg_history });
 
+    // Skip painting if window is pending close (renderer may be freed soon)
+    if (ext_win.is_pending_close) {
+        app.mu.unlock();
+        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: is_pending_close=true, skipping\n", .{});
+        return;
+    }
+
     if (ext_win.vert_count == 0) {
         app.mu.unlock();
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: vert_count=0, skipping\n", .{});
         return;
     }
 
+    // Increment paint reference count to prevent ext_win from being freed during paint.
+    // DXGI operations (resize, present) can pump Win32 messages, which could trigger close.
+    // This ensures ext_win remains valid until paint completes.
+    ext_win.paint_ref_count += 1;
+    if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: paint_ref_count++ -> {d}\n", .{ext_win.paint_ref_count});
+
     // Get renderer and atlas
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
-    // Copy vertex data under lock
-    const verts = ext_win.verts.items;
+    // Copy vertex data to local buffer while holding the lock
+    // This is critical: after unlocking, ext_win.verts could be modified by another thread,
+    // invalidating any slice pointing to it. We must copy the data before unlocking.
     const vert_count = ext_win.vert_count;
+    const verts_copy = app.alloc.alloc(core.Vertex, vert_count) catch {
+        ext_win.paint_ref_count -= 1;
+        app.mu.unlock();
+        applog.appLog("[win] paintExternalWindow: failed to alloc verts copy\n", .{});
+        return;
+    };
+    @memcpy(verts_copy, ext_win.verts.items[0..vert_count]);
+
     const cursor_blink_visible = ext_win.cursor_blink_state;
     ext_win.needs_redraw = false;
 
@@ -8482,6 +8681,10 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Get cmdline firstc for icon rendering
     const cmdline_firstc = app.cmdline_firstc;
 
+    // Copy scrollbar_alpha for later use (scrollbar rendering in normal external windows)
+    // This avoids use-after-free if the window is closed while we're painting
+    const scrollbar_alpha = ext_win.scrollbar_alpha;
+
     // Check if we need to upload the full atlas (atlas version changed)
     const current_atlas_version: u64 = if (atlas_ptr) |a| a.atlas_version else 0;
     const need_full_atlas_upload = ext_win.atlas_version < current_atlas_version;
@@ -8491,15 +8694,34 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     app.mu.unlock();
 
+    // Ensure paint_ref_count is decremented when we exit (handles all return paths)
+    defer finishExternalWindowPaint(app, grid_id);
+
+    // Use the copied vertex data (safe to access after unlock)
+    const verts = verts_copy;
+    defer app.alloc.free(verts_copy);
+
     if (gpu_ptr) |g| {
         g.lockContext();
         defer g.unlockContext();
 
         // Perform deferred renderer resize (outside app.mu lock to avoid deadlock)
+        // WARNING: D3D/DXGI operations can pump Win32 messages internally.
+        // This means WM_APP_CLOSE_EXTERNAL_WINDOW could be processed during resize,
+        // freeing ext_win and invalidating our `g` pointer. We must re-validate after resize.
         if (needs_resize) {
             g.resize() catch |e| {
                 applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
             };
+
+            // After resize, DXGI may have pumped messages. Check if ext_win was closed.
+            app.mu.lock();
+            const still_valid = app.external_windows.contains(grid_id);
+            app.mu.unlock();
+            if (!still_valid) {
+                applog.appLog("[win] paintExternalWindow: ext_win was closed during resize, aborting\n", .{});
+                return;
+            }
         }
 
         applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
@@ -8521,14 +8743,21 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             const window_w: f32 = @floatFromInt(g.width);
             const window_h: f32 = @floatFromInt(g.height);
 
-            // Get content size from ext_win (need to re-lock briefly)
+            // Get content size from ext_win (need to re-lock and re-lookup to avoid use-after-free)
             app.mu.lock();
-            const content_rows = ext_win.rows;
-            const content_cols = ext_win.cols;
+            const ext_win_relookup = app.external_windows.getPtr(grid_id);
+            const content_rows = if (ext_win_relookup) |ew| ew.rows else 0;
+            const content_cols = if (ext_win_relookup) |ew| ew.cols else 0;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
             const hide_cursor_for_ime = app.ime_composing;
             app.mu.unlock();
+
+            // If window was closed, skip rendering
+            if (content_rows == 0 or content_cols == 0) {
+                applog.appLog("[win] paintExternalWindow: ext_win removed during paint, skipping\n", .{});
+                return;
+            }
 
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
@@ -8581,19 +8810,25 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
                 // If no background vertex found, use cached color (persists across redraws)
                 // This prevents color flickering when cmdline content changes
+                // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
                 if (!found_bg_vertex) {
                     app.mu.lock();
-                    if (ext_win.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                        applog.appLog("[win] cmdline bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
+                    if (app.external_windows.getPtr(grid_id)) |ew| {
+                        if (ew.cached_bg_color) |cached| {
+                            orig_bg_r = cached[0];
+                            orig_bg_g = cached[1];
+                            orig_bg_b = cached[2];
+                            applog.appLog("[win] cmdline bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
+                        }
                     }
                     app.mu.unlock();
                 } else {
                     // Update cache with new background color
+                    // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
                     app.mu.lock();
-                    ext_win.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                    if (app.external_windows.getPtr(grid_id)) |ew| {
+                        ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                    }
                     app.mu.unlock();
                 }
 
@@ -8604,29 +8839,30 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 const adj_bg_g = adjusted[1];
                 const adj_bg_b = adjusted[2];
 
-                applog.appLog("[win] cmdline bg: adjusted=({d:.3},{d:.3},{d:.3})\n", .{ adj_bg_r, adj_bg_g, adj_bg_b });
-
                 // First, add full-window background quad (drawn first, covers entire window)
                 var bg_idx: usize = 0;
-                const bg_color: [4]f32 = .{ adj_bg_r, adj_bg_g, adj_bg_b, app.config.window.opacity };
+                const opacity = app.config.window.opacity;
+                const bg_color: [4]f32 = .{ adj_bg_r, adj_bg_g, adj_bg_b, opacity };
                 const bg_tex: [2]f32 = .{ -1.0, -1.0 };
                 bg_idx = addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
 
                 // Copy and transform original vertices after background
                 // Make grid cell background vertices transparent (alpha=0) so only full-window bg shows
                 // But preserve cursor vertices (marked with DECO_CURSOR flag)
-                // Use tight tolerance to avoid accidentally making cursor transparent
                 const tolerance: f32 = 0.005;
                 for (verts[0..vert_count], 0..) |v, i| {
-                    cmdline_verts[bg_idx + i] = v;
-                    cmdline_verts[bg_idx + i].position[0] = v.position[0] * scale_x + offset_x;
-                    cmdline_verts[bg_idx + i].position[1] = v.position[1] * scale_y + offset_y;
+                    const dest_idx = bg_idx + i;
+
+                    // Copy vertex data and transform position
+                    cmdline_verts[dest_idx] = v;
+                    cmdline_verts[dest_idx].position[0] = v.position[0] * scale_x + offset_x;
+                    cmdline_verts[dest_idx].position[1] = v.position[1] * scale_y + offset_y;
 
                     // Handle cursor vertices (marked with DECO_CURSOR flag)
                     // When IME is composing, hide cursor by setting alpha to 0
                     if ((v.deco_flags & core.DECO_CURSOR) != 0) {
                         if (hide_cursor_for_ime) {
-                            cmdline_verts[bg_idx + i].color[3] = 0.0;
+                            cmdline_verts[dest_idx].color[3] = 0.0;
                         }
                         continue;
                     }
@@ -8638,39 +8874,25 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                             @abs(v.color[1] - orig_bg_g) < tolerance and
                             @abs(v.color[2] - orig_bg_b) < tolerance;
                         if (matches_bg) {
-                            cmdline_verts[bg_idx + i].color[3] = 0.0;
+                            cmdline_verts[dest_idx].color[3] = 0.0;
                         }
                     }
                 }
                 var extra_idx: usize = bg_idx + vert_count;
 
-                // Get border color from core (Search highlight) or use default yellow
-                var border_r: f32 = 1.0;
-                var border_g: f32 = 1.0;
-                var border_b: f32 = 0.0;
-                if (app.corep) |corep| {
-                    var fg_rgb: u32 = 0;
-                    var bg_rgb: u32 = 0;
-                    if (core.zonvie_core_get_hl_by_name(corep, "Search", &fg_rgb, &bg_rgb) != 0) {
-                        border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
-                        border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
-                        border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
-                    }
-                }
-
-                // Get icon color from core (Comment highlight) or use gray
-                var icon_r: f32 = 0.5;
-                var icon_g: f32 = 0.5;
-                var icon_b: f32 = 0.5;
-                if (app.corep) |corep| {
-                    var fg_rgb: u32 = 0;
-                    var bg_rgb: u32 = 0;
-                    if (core.zonvie_core_get_hl_by_name(corep, "Comment", &fg_rgb, &bg_rgb) != 0) {
-                        icon_r = @as(f32, @floatFromInt((fg_rgb >> 16) & 0xFF)) / 255.0;
-                        icon_g = @as(f32, @floatFromInt((fg_rgb >> 8) & 0xFF)) / 255.0;
-                        icon_b = @as(f32, @floatFromInt(fg_rgb & 0xFF)) / 255.0;
-                    }
-                }
+                // Use cached border/icon colors from app state.
+                // We avoid calling zonvie_core_get_hl_by_name here because it can crash
+                // when called during linespace changes (DXGI message pump triggers WM_PAINT
+                // while core is in an inconsistent state).
+                // The colors are updated via updateCmdlineColors() when highlights change.
+                app.mu.lock();
+                const border_r = app.cmdline_border_color[0];
+                const border_g = app.cmdline_border_color[1];
+                const border_b = app.cmdline_border_color[2];
+                const icon_r = app.cmdline_icon_color[0];
+                const icon_g = app.cmdline_icon_color[1];
+                const icon_b = app.cmdline_icon_color[2];
+                app.mu.unlock();
 
                 // Add border vertices (4 rectangles forming a frame)
                 const border_w_ndc: f32 = @as(f32, @floatFromInt(CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
@@ -8678,14 +8900,10 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
                 const border_tex: [2]f32 = .{ -1.0, -1.0 };
 
-                // Top border
-                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-                // Bottom border
-                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-                // Left border
-                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-                // Right border
-                extra_idx = addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id); // Top
+                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id); // Bottom
+                extra_idx = addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id); // Left
+                extra_idx = addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id); // Right
 
                 // Add icon based on cmdline_firstc
                 const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
@@ -8705,8 +8923,6 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 } else {
                     extra_idx = addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
                 }
-
-                applog.appLog("[win] paintExternalWindow cmdline: total_verts={d} (orig={d} + extra={d})\n", .{ extra_idx, vert_count, extra_idx - vert_count });
 
                 g.draw(cmdline_verts[0..extra_idx], &[_]core.Vertex{}, null) catch |e| {
                     applog.appLog("[win] paintExternalWindow cmdline draw failed: {any}\n", .{e});
@@ -8737,19 +8953,14 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
                 var extra_idx: usize = vert_count;
 
-                // Get border color from core (Search highlight) or use default yellow
-                var border_r: f32 = 1.0;
-                var border_g: f32 = 1.0;
-                var border_b: f32 = 0.0;
-                if (app.corep) |corep| {
-                    var fg_rgb: u32 = 0;
-                    var bg_rgb: u32 = 0;
-                    if (core.zonvie_core_get_hl_by_name(corep, "Search", &fg_rgb, &bg_rgb) != 0) {
-                        border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
-                        border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
-                        border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
-                    }
-                }
+                // Use cached border color (same as cmdline - Search highlight bg)
+                // Avoids calling zonvie_core_get_hl_by_name during paint which can crash
+                // when linespace changes trigger DXGI message pumping
+                app.mu.lock();
+                const border_r = app.cmdline_border_color[0];
+                const border_g = app.cmdline_border_color[1];
+                const border_b = app.cmdline_border_color[2];
+                app.mu.unlock();
 
                 // Add border vertices (4 rectangles forming a frame)
                 const border_w_ndc: f32 = @as(f32, @floatFromInt(CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
@@ -8784,13 +8995,20 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             const window_w: f32 = @floatFromInt(g.width);
             const window_h: f32 = @floatFromInt(g.height);
 
-            // Get content size from ext_win (need to re-lock briefly)
+            // Get content size from ext_win (need to re-lock and re-lookup to avoid use-after-free)
             app.mu.lock();
-            const content_rows = ext_win.rows;
-            const content_cols = ext_win.cols;
+            const ext_win_relookup2 = app.external_windows.getPtr(grid_id);
+            const content_rows = if (ext_win_relookup2) |ew| ew.rows else 0;
+            const content_cols = if (ext_win_relookup2) |ew| ew.cols else 0;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
             app.mu.unlock();
+
+            // If window was closed, skip rendering
+            if (content_rows == 0 or content_cols == 0) {
+                applog.appLog("[win] paintExternalWindow: msg ext_win removed during paint, skipping\n", .{});
+                return;
+            }
 
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
@@ -8840,19 +9058,25 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 applog.appLog("[win] msg bg: found={} orig=({d:.3},{d:.3},{d:.3})\n", .{ found_bg_vertex, orig_bg_r, orig_bg_g, orig_bg_b });
 
                 // If no background vertex found, use cached color (persists across redraws)
+                // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
                 if (!found_bg_vertex) {
                     app.mu.lock();
-                    if (ext_win.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                        applog.appLog("[win] msg bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
+                    if (app.external_windows.getPtr(grid_id)) |ew| {
+                        if (ew.cached_bg_color) |cached| {
+                            orig_bg_r = cached[0];
+                            orig_bg_g = cached[1];
+                            orig_bg_b = cached[2];
+                            applog.appLog("[win] msg bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
+                        }
                     }
                     app.mu.unlock();
                 } else {
                     // Update cache with new background color
+                    // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
                     app.mu.lock();
-                    ext_win.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                    if (app.external_windows.getPtr(grid_id)) |ew| {
+                        ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                    }
                     app.mu.unlock();
                 }
 
@@ -8917,11 +9141,11 @@ fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             var scrollbar_verts: [12]core.Vertex = undefined;
             var scrollbar_vert_count: usize = 0;
 
-            // Check if scrollbar should be drawn
-            if (app.config.scrollbar.enabled and ext_win.scrollbar_alpha > 0.001) {
+            // Check if scrollbar should be drawn (use copied scrollbar_alpha to avoid use-after-free)
+            if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
                 scrollbar_vert_count = generateScrollbarVerticesForExternal(
                     app,
-                    ext_win,
+                    scrollbar_alpha,
                     grid_id,
                     @intCast(g.width),
                     @intCast(g.height),
@@ -11331,6 +11555,10 @@ export fn WndProc(
         WM_APP_CREATE_EXTERNAL_WINDOW => {
             applog.appLog("[win] WM_APP_CREATE_EXTERNAL_WINDOW received\n", .{});
             if (getApp(hwnd)) |app| {
+                // Update external window colors (border/icon) before creating windows
+                // This ensures colors are available for popupmenu even if cmdline wasn't shown
+                updateExternalWindowColors(app);
+
                 // Process all pending external window requests
                 app.mu.lock();
                 const pending = app.pending_external_windows.toOwnedSlice(app.alloc) catch {
@@ -11511,9 +11739,10 @@ export fn WndProc(
         },
 
         WM_APP_RESIZE_POPUPMENU => {
-            if (applog.isEnabled()) applog.appLog("[win] WM_APP_RESIZE_POPUPMENU received\n", .{});
+            const grid_id: i64 = @bitCast(wParam);
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_RESIZE_POPUPMENU received grid_id={d}\n", .{grid_id});
             if (getApp(hwnd)) |app| {
-                resizePopupmenuWindow(app);
+                resizeExternalWindowDeferred(app, grid_id);
             }
             return 0;
         },
@@ -11636,6 +11865,16 @@ export fn WndProc(
                 // Force immediate repaint so tabline updates without waiting for next message
                 _ = c.UpdateWindow(hwnd);
                 _ = app;
+            }
+            return 0;
+        },
+
+        WM_APP_UPDATE_CMDLINE_COLORS => {
+            // Update cmdline border/icon colors from core highlights.
+            // Called from UI thread (via PostMessage from onCmdlineShow) to avoid
+            // deadlock when calling zonvie_core_get_hl_by_name from callback context.
+            if (getApp(hwnd)) |app| {
+                updateExternalWindowColors(app);
             }
             return 0;
         },
