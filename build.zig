@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .root_source_file = b.path("src/shared/c_api.zig"),
+        .root_source_file = b.path("src/core/c_api.zig"),
         .imports = &.{
             .{ .name = "toml", .module = zig_toml.module("toml") },
         },
@@ -91,7 +91,7 @@ pub fn build(b: *std.Build) !void {
     const key_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/shared/key_input_test.zig"),
+        .root_source_file = b.path("src/core/key_input_test.zig"),
         .imports = &.{
             .{ .name = "toml", .module = zig_toml.module("toml") },
         },
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) !void {
     const msgpack_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/shared/msgpack_test.zig"),
+        .root_source_file = b.path("src/core/msgpack_test.zig"),
         .imports = &.{
             .{ .name = "toml", .module = zig_toml.module("toml") },
         },

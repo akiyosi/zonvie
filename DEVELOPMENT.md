@@ -24,7 +24,7 @@ zonvie/
 │   ├── zonvie_core.h       # Core API + callback contracts
 │   └── zonvie_hbft.h       # HarfBuzz/FreeType helper API
 ├── src/
-│   └── shared/             # Zig core (cross-platform)
+│   └── core/               # Zig core (cross-platform)
 │       ├── nvim_core.zig   # Neovim RPC/UI event handling
 │       ├── grid.zig        # Grid state management
 │       ├── redraw_handler.zig
@@ -101,7 +101,7 @@ Zonvie follows a layered architecture with a shared Zig core and platform-specif
                             │ C ABI (include/zonvie_core.h)
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Zig Core (src/shared/)                      │
+│                     Zig Core (src/core/)                         │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
 │  │  nvim_core   │→ │    grid      │→ │     vertexgen        │   │
 │  │  (RPC/MsgPack)  │  (state mgmt)│  │  (GPU vertex gen)    │   │
@@ -119,12 +119,12 @@ Zonvie follows a layered architecture with a shared Zig core and platform-specif
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| **nvim_core** | `src/shared/nvim_core.zig` | Neovim process management, MsgPack RPC, UI event dispatch |
-| **grid** | `src/shared/grid.zig` | Grid state (cells, highlights, cursor position) |
-| **redraw_handler** | `src/shared/redraw_handler.zig` | Parse and apply Neovim `redraw` events to grid state |
-| **vertexgen** | `src/shared/vertexgen.zig` | Convert grid state to GPU-ready vertex buffers |
-| **c_api** | `src/shared/c_api.zig` | C ABI exports for frontend integration |
-| **config** | `src/shared/config.zig` | TOML configuration parsing |
+| **nvim_core** | `src/core/nvim_core.zig` | Neovim process management, MsgPack RPC, UI event dispatch |
+| **grid** | `src/core/grid.zig` | Grid state (cells, highlights, cursor position) |
+| **redraw_handler** | `src/core/redraw_handler.zig` | Parse and apply Neovim `redraw` events to grid state |
+| **vertexgen** | `src/core/vertexgen.zig` | Convert grid state to GPU-ready vertex buffers |
+| **c_api** | `src/core/c_api.zig` | C ABI exports for frontend integration |
+| **config** | `src/core/config.zig` | TOML configuration parsing |
 
 ### Core ↔ Frontend Contract
 

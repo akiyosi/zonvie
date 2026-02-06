@@ -16,8 +16,8 @@ Zonvie is designed around these non-negotiables:
 
 ## Architecture overview
 
-### 1) Zig core (shared)
-- Lives under `src/shared/`.
+### 1) Zig core
+- Lives under `src/core/`.
 - Exposed to frontends as a **C ABI** (headers under `include/`).
 - The frontend calls `zonvie_core_start(...)`, sends input/key events, and notifies layout changes (drawable size + cell metrics).
 - The core calls back into the frontend via `zonvie_callbacks` for:
@@ -41,9 +41,9 @@ Zonvie is designed around these non-negotiables:
 - `include/`
   - `zonvie_core.h`: C ABI for core + callback contracts (authoritative integration spec). :contentReference[oaicite:6]{index=6}
   - `zonvie_hbft.h`: C ABI for HarfBuzz+FreeType helper (shape/rasterize). :contentReference[oaicite:7]{index=7}
-- `src/shared/`
+- `src/core/`
   - `nvim_core.zig`: Neovim RPC/ui event handling, grid state, flush pipeline
-  - `grid.zig`, `redraw_handler.zig`: apply api-ui “redraw” events to internal model
+  - `grid.zig`, `redraw_handler.zig`: apply api-ui "redraw" events to internal model
   - `vertexgen.zig`: convert grid model → GPU-friendly vertices; uses `zonvie_hbft.h`. :contentReference[oaicite:8]{index=8}
   - `c_api.zig`: exported symbols / C ABI glue
 - `macos/`
@@ -109,7 +109,7 @@ When implementing or modifying any redraw handling:
 - Prefer small, composable functions and explicit data flow.
 - Be explicit about units in names:
   - `_px`, `_pt`, `_rows`, `_cols`, `26_6` (for HarfBuzz/FreeType fixed-point).
-- Keep platform conditionals isolated to frontends; do not leak AppKit/Win32 types into shared core.
+- Keep platform conditionals isolated to frontends; do not leak AppKit/Win32 types into core.
 
 ## Zig version and compatibility
 
