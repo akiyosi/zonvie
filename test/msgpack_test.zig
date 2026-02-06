@@ -2,8 +2,8 @@
 // Tests the rpc_encode.zig (pack*) and msgpack.zig (decode) functions.
 
 const std = @import("std");
-const mp = @import("msgpack.zig");
-const rpc = @import("rpc_encode.zig");
+const mp = @import("zonvie_core").msgpack;
+const rpc = @import("zonvie_core").rpc_encode;
 
 // ============================================================================
 // Test Helpers

@@ -91,8 +91,9 @@ pub fn build(b: *std.Build) !void {
     const key_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/core/key_input_test.zig"),
+        .root_source_file = b.path("test/key_input_test.zig"),
         .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
             .{ .name = "toml", .module = zig_toml.module("toml") },
         },
     });
@@ -105,8 +106,9 @@ pub fn build(b: *std.Build) !void {
     const msgpack_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/core/msgpack_test.zig"),
+        .root_source_file = b.path("test/msgpack_test.zig"),
         .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
             .{ .name = "toml", .module = zig_toml.module("toml") },
         },
     });

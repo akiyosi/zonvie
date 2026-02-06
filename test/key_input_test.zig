@@ -2,7 +2,7 @@
 // Tests the pure formatKeyEvent function that converts keycode/mods to Neovim input notation.
 
 const std = @import("std");
-const nvim_core = @import("nvim_core.zig");
+const nvim_core = @import("zonvie_core").nvim_core;
 
 // Modifier bitmask constants (match zonvie_core.h)
 const MOD_CTRL: u32 = 1 << 0;
