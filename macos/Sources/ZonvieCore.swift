@@ -199,42 +199,75 @@ final class ZonvieCore {
                         totalRows: Int(totalRows)
                     )
                 } else {
-                    // External grid - find the view and submit
-                    if let gridView = core.externalGridViews[gridId] {
-                        gridView.submitVerticesRowRaw(
-                            rowStart: Int(rowStart),
-                            rowCount: Int(rowCount),
-                            ptr: verts,
-                            count: Int(vertCount),
-                            totalRows: Int(totalRows),
-                            totalCols: Int(totalCols)
-                        )
+                    // External grid: copy vertex data on RPC thread, then dispatch
+                    // all dictionary access and submission to main thread.
+                    // This ensures externalGridViews is only accessed from main thread.
+                    let vertexArray: [zonvie_vertex]? = if let verts = verts, vertCount > 0 {
+                        Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                    } else {
+                        nil
+                    }
+                    let rs = Int(rowStart)
+                    let rc = Int(rowCount)
+                    let tr = Int(totalRows)
+                    let tc = Int(totalCols)
 
-                        // On first row, configure background color and window layout
-                        if rowStart == 0, let verts = verts, vertCount > 0 {
-                            core.configureExternalGridFromRow(
-                                gridId: gridId,
-                                gridView: gridView,
-                                verts: verts,
-                                vertCount: Int(vertCount),
-                                rows: totalRows,
-                                cols: totalCols
-                            )
-                        }
+                    DispatchQueue.main.async { [weak core] in
+                        guard let core = core else { return }
 
-                        // Request redraw after last row is submitted
-                        if rowStart == totalRows - 1 {
-                            gridView.requestRedraw()
-                        }
-                    } else if let verts = verts, vertCount > 0 {
-                        // GridView not created yet - save vertices for later (per-row)
-                        ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(vertCount) vertices for row \(rowStart)")
-                        let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
-                        if var existing = core.pendingExternalVertices[gridId] {
-                            existing.rowVertices[Int(rowStart)] = vertexArray
-                            core.pendingExternalVertices[gridId] = existing
-                        } else {
-                            core.pendingExternalVertices[gridId] = (rowVertices: [Int(rowStart): vertexArray], rows: totalRows, cols: totalCols)
+                        if let gridView = core.externalGridViews[gridId] {
+                            if let vertexArray = vertexArray {
+                                vertexArray.withUnsafeBufferPointer { buffer in
+                                    gridView.submitVerticesRowRaw(
+                                        rowStart: rs,
+                                        rowCount: rc,
+                                        ptr: buffer.baseAddress,
+                                        count: buffer.count,
+                                        totalRows: tr,
+                                        totalCols: tc
+                                    )
+                                }
+
+                                // On first row, configure background color and window layout
+                                if rs == 0 {
+                                    vertexArray.withUnsafeBufferPointer { buffer in
+                                        if let baseAddr = buffer.baseAddress {
+                                            core.configureExternalGridFromRow(
+                                                gridId: gridId,
+                                                gridView: gridView,
+                                                verts: baseAddr,
+                                                vertCount: buffer.count,
+                                                rows: totalRows,
+                                                cols: totalCols
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                // vertCount==0: submit empty row to clear it
+                                gridView.submitVerticesRowRaw(
+                                    rowStart: rs,
+                                    rowCount: rc,
+                                    ptr: nil,
+                                    count: 0,
+                                    totalRows: tr,
+                                    totalCols: tc
+                                )
+                            }
+
+                            // Request redraw after last row is submitted
+                            if rs == tr - 1 {
+                                gridView.requestRedraw()
+                            }
+                        } else if let vertexArray = vertexArray {
+                            // GridView not created yet - save vertices for later (per-row, non-empty only)
+                            ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(vertexArray.count) vertices for row \(rs)")
+                            if var existing = core.pendingExternalVertices[gridId] {
+                                existing.rowVertices[rs] = vertexArray
+                                core.pendingExternalVertices[gridId] = existing
+                            } else {
+                                core.pendingExternalVertices[gridId] = (rowVertices: [rs: vertexArray], rows: totalRows, cols: totalCols)
+                            }
                         }
                     }
                 }
@@ -1670,6 +1703,9 @@ final class ZonvieCore {
     private var pendingExternalGridConfig: [Int64: (bgColor: NSColor, rows: UInt32, cols: UInt32)] = [:]
     /// Pending vertices for external grids (applied when gridView is created)
     /// Stores vertices per-row to handle row-based vertex submission
+    /// NOTE: All access to externalGridViews, pendingExternalVertices, and
+    /// externalWindows is confined to the main thread. The on_vertices_row callback
+    /// copies vertex data on the RPC thread and dispatches to main for submission.
     private var pendingExternalVertices: [Int64: (rowVertices: [Int: [zonvie_vertex]], rows: UInt32, cols: UInt32)] = [:]
 
     /// Current cmdline firstc character (':', '/', '?', etc.)
@@ -2412,7 +2448,8 @@ final class ZonvieCore {
             ZonvieCore.appLog("[external_window] created \(windowType) window for gridId=\(gridId)")
 
             // Apply any pending vertices that were saved before gridView was created (per-row)
-            if let pendingVerts = self.pendingExternalVertices.removeValue(forKey: gridId) {
+            let pendingVerts = self.pendingExternalVertices.removeValue(forKey: gridId)
+            if let pendingVerts = pendingVerts {
                 let totalVertCount = pendingVerts.rowVertices.values.reduce(0) { $0 + $1.count }
                 ZonvieCore.appLog("[external_window] applying pending vertices for gridId=\(gridId) rows=\(pendingVerts.rowVertices.count) totalVerts=\(totalVertCount)")
 
@@ -3248,19 +3285,25 @@ final class ZonvieCore {
         let firstcChar = firstc > 0 ? String(UnicodeScalar(firstc)) : ""
         ZonvieCore.appLog("[cmdline_show] level=\(level) firstc='\(firstcChar)'(\(firstc)) prompt='\(promptStr)' pos=\(pos) content='\(contentStr)'")
 
-        // Save firstc immediately on Zig thread (before win_external_pos is processed)
-        self.cmdlineFirstc = firstc
+        // Defer cmdlineFirstc write to main thread to avoid data race
+        // (this callback runs on the Zig RPC thread).
+        let capturedFirstc = firstc
         ZonvieCore.appLog("[cmdline_show] set cmdlineFirstc=\(firstc)")
 
         // Update icon if window already exists
         DispatchQueue.main.async { [weak self] in
-            self?.updateCmdlineIcon(firstc: firstc)
+            self?.cmdlineFirstc = capturedFirstc
+            self?.updateCmdlineIcon(firstc: capturedFirstc)
         }
     }
 
     private func onCmdlineHide(level: UInt32) {
         ZonvieCore.appLog("[cmdline_hide] level=\(level)")
-        self.cmdlineFirstc = 0
+        // Defer cmdlineFirstc write to main thread to avoid data race
+        // (this callback runs on the Zig RPC thread).
+        DispatchQueue.main.async { [weak self] in
+            self?.cmdlineFirstc = 0
+        }
     }
 
     /// Updates the cmdline icon based on firstc character

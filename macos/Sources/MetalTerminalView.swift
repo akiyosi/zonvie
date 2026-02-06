@@ -46,6 +46,11 @@ final class MetalTerminalView: MTKView {
     // --- Scroll state for smooth scrolling ---
     // Per-grid accumulated scroll offset in pixels (for sub-cell smooth scrolling)
     private var scrollOffsetPx: [Int64: CGFloat] = [:]
+    // Lock protecting scrollOffsetPx from concurrent access between
+    // the RPC thread (processPendingScrollClears via submitVerticesRowRaw)
+    // and the main thread (handleScrollInput, updateScrollShaderOffset).
+    // Lock order: scrollOffsetLock -> pendingSentScrollLock (never reversed).
+    private let scrollOffsetLock = NSLock()
 
     // Track scroll commands sent to Neovim (to distinguish frontend vs Neovim-initiated scrolls)
     // When we send a scroll, we increment this; when grid_scroll arrives, we decrement.
@@ -1190,6 +1195,7 @@ final class MetalTerminalView: MTKView {
 
         // Prune stale entries: remove gridIds that are no longer visible
         let visibleGridIds = Set(gridInfoMap.keys)
+        scrollOffsetLock.lock()
         let staleKeys = scrollOffsetPx.keys.filter { !visibleGridIds.contains($0) }
         for key in staleKeys {
             scrollOffsetPx.removeValue(forKey: key)
@@ -1222,6 +1228,7 @@ final class MetalTerminalView: MTKView {
                 marginBottom: info.marginBottom
             )
         }
+        scrollOffsetLock.unlock()
 
         renderer.updateScrollOffsets(offsets, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
 
@@ -1235,13 +1242,17 @@ final class MetalTerminalView: MTKView {
 
     /// Clear scroll offset for a specific grid (called when Neovim updates content)
     private func clearScrollOffset(gridId: Int64) {
+        scrollOffsetLock.lock()
         scrollOffsetPx.removeValue(forKey: gridId)
+        scrollOffsetLock.unlock()
         updateScrollShaderOffset()
     }
 
     /// Clear all scroll offsets
     private func clearAllScrollOffsets() {
+        scrollOffsetLock.lock()
         scrollOffsetPx.removeAll()
+        scrollOffsetLock.unlock()
         renderer.clearScrollOffsets()
     }
 
@@ -1292,7 +1303,9 @@ final class MetalTerminalView: MTKView {
             if abs(deltaY) > fastScrollThreshold {
                 effectiveHasPrecise = false
                 // Clear any accumulated offset when switching to fast mode
+                scrollOffsetLock.lock()
                 scrollOffsetPx.removeValue(forKey: gridId)
+                scrollOffsetLock.unlock()
                 pendingSentScrollLock.lock()
                 pendingSentScroll.removeValue(forKey: gridId)
                 pendingSentScrollLock.unlock()
@@ -1302,7 +1315,9 @@ final class MetalTerminalView: MTKView {
         if effectiveHasPrecise {
             // Trackpad: implement sub-cell smooth scrolling for external grids
             let deltaYPx = deltaY * scale
+            scrollOffsetLock.lock()
             let currentOffset = scrollOffsetPx[gridId] ?? 0
+            scrollOffsetLock.unlock()
             var newOffset = currentOffset + deltaYPx
 
             // Limit total pending scrolls to prevent overwhelming Neovim
@@ -1341,7 +1356,9 @@ final class MetalTerminalView: MTKView {
             newOffset = max(-maxOffsetPx, min(maxOffsetPx, newOffset))
 
             // Store full offset (not consumed) to prevent reverse jump
+            scrollOffsetLock.lock()
             scrollOffsetPx[gridId] = newOffset
+            scrollOffsetLock.unlock()
 
             return newOffset
         } else {
@@ -1361,6 +1378,8 @@ final class MetalTerminalView: MTKView {
 
     /// Get the current scroll offset for a grid.
     func getScrollOffset(gridId: Int64) -> CGFloat {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
         return scrollOffsetPx[gridId] ?? 0
     }
 
@@ -1386,6 +1405,7 @@ final class MetalTerminalView: MTKView {
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
 
+        scrollOffsetLock.lock()
         for gridId in pending {
             // Check if this is a response to our scroll command or Neovim-initiated
             pendingSentScrollLock.lock()
@@ -1412,6 +1432,7 @@ final class MetalTerminalView: MTKView {
                 ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) nvim-initiated, clearing offset=\(currentOffset)")
             }
         }
+        scrollOffsetLock.unlock()
         // Note: updateScrollShaderOffset() is called in onPreDraw, not here,
         // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
     }
@@ -1421,7 +1442,9 @@ final class MetalTerminalView: MTKView {
     func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> MetalTerminalRenderer.ScrollOffsetInfo? {
         guard let core else { return nil }
 
+        scrollOffsetLock.lock()
         let offsetPx = scrollOffsetPx[gridId] ?? 0
+        scrollOffsetLock.unlock()
         if abs(offsetPx) < 0.001 { return nil }
 
         // Get grid info for margins

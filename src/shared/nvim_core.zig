@@ -514,7 +514,8 @@ pub const Core = struct {
 
     // Flag to track if we're inside handleRedraw (grid_mu is already held).
     // When true, updateLayoutPx skips locking since the same thread already holds grid_mu.
-    in_handle_redraw: bool = false,
+    // Atomic because it is written by the RPC thread and read by the UI thread.
+    in_handle_redraw: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Tracking for external windows (to detect new/closed external grids)
     known_external_grids: std.AutoHashMapUnmanaged(i64, void) = .{},
@@ -1012,7 +1013,7 @@ pub const Core = struct {
         // If called from within handleRedraw (via callback), grid_mu is already
         // held by the same thread, so we can call the locked version directly.
         // This ensures cell dimensions are updated BEFORE the flush generates vertices.
-        if (self.in_handle_redraw) {
+        if (self.in_handle_redraw.load(.seq_cst)) {
             self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
             return;
         }
@@ -3739,9 +3740,13 @@ pub const Core = struct {
 
         if (std.mem.eql(u8, method, "redraw")) {
             // Set flag before acquiring lock to detect re-entrant updateLayoutPx calls.
-            self.in_handle_redraw = true;
+            self.in_handle_redraw.store(true, .seq_cst);
 
             // Lock grid_mu to prevent concurrent access from UI thread during redraw.
+            // NOTE: All frontend callbacks invoked below (on_vertices_*, on_guifont,
+            // on_linespace, on_external_window*, on_ime_off, on_cursor_grid_changed)
+            // execute while grid_mu is held. Callbacks MUST NOT call
+            // zonvie_core_get_* or other APIs that acquire grid_mu.
             self.grid_mu.lock();
 
             var fctx = FlushCtx{ .core = self };
@@ -3793,7 +3798,7 @@ pub const Core = struct {
             }
 
             self.grid_mu.unlock();
-            self.in_handle_redraw = false;
+            self.in_handle_redraw.store(false, .seq_cst);
         } else if (std.mem.eql(u8, method, "zonvie_ime_off")) {
             // Custom RPC notification for IME off (user-invokable)
             if (self.cb.on_ime_off) |cb| {
@@ -3865,6 +3870,13 @@ pub const Core = struct {
     /// Generate and send vertices for external grids.
     /// force_render: if true, render regardless of dirty flags
     /// only_grid_id: if non-null, only update this specific grid (for scroll optimization)
+    ///
+    /// WARNING: This function invokes frontend callbacks (on_vertices_row,
+    /// on_cursor_grid_changed) while grid_mu is held. Frontend callbacks
+    /// MUST NOT call zonvie_core_get_* APIs (which acquire grid_mu), as
+    /// this would cause deadlock. Use PostMessage (Windows) or
+    /// DispatchQueue.main.async (macOS) to defer any work that requires
+    /// grid state access.
     fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_grid_id: ?i64) void {
         self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d} force={} only_grid={?d}\n", .{ self.known_external_grids.count(), force_render, only_grid_id });
 
