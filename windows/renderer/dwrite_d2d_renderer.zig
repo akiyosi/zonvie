@@ -106,6 +106,9 @@ pub const Renderer = struct {
 
     // Atlas version - incremented when new glyphs are added (for multi-context sync)
     atlas_version: u64 = 0,
+    // Set when atlas is reset; signals the UI thread to request a full re-seed
+    // so stale UV coordinates in cached row vertices are refreshed.
+    atlas_reset_pending: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         // Timing for init steps
@@ -228,6 +231,8 @@ pub const Renderer = struct {
         if (self.atlas_cpu.items.len > 0) {
             @memset(self.atlas_cpu.items, 0);
         }
+
+        self.atlas_reset_pending = true;
     }
 
     pub const BgSpan = extern struct {
@@ -254,10 +259,8 @@ pub const Renderer = struct {
         bgRGB: u32,
     };
 
-    fn recreateRenderTarget(self: *Renderer) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
+    /// Recreate the D2D render target. Caller must hold self.mu.
+    fn recreateRenderTargetLocked(self: *Renderer) !void {
         // Timing for sub-steps
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
@@ -322,6 +325,13 @@ pub const Renderer = struct {
         try self.createAtlasResources();
         _ = c.QueryPerformanceCounter(&t1);
         applog.appLog("[d2d] [TIMING]   createAtlasResources: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+    }
+
+    /// Public wrapper that acquires self.mu before recreating the render target.
+    fn recreateRenderTarget(self: *Renderer) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.recreateRenderTargetLocked();
     }
 
     fn createAtlasResources(self: *Renderer) !void {
@@ -1143,9 +1153,9 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         self.mu.lock();
         defer self.mu.unlock();
     
-        // Ensure RT exists
+        // Ensure RT exists (already holding self.mu)
         if (self.rt == null) {
-            try self.recreateRenderTarget();
+            try self.recreateRenderTargetLocked();
         }
     
         // IMPORTANT: Upload pending atlas dirty rects BEFORE BeginDraw.
@@ -1196,7 +1206,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
             // D2DERR_RECREATE_TARGET (0x8899000C or 0x88990001)
             if (hr_u == 0x8899000C or hr_u == 0x88990001) {
-                _ = self.recreateRenderTarget() catch {};
+                _ = self.recreateRenderTargetLocked() catch {};
                 return;
             }
             return error.D2DEndDrawFailed;
@@ -1488,6 +1498,9 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     pub fn descentPx(self: *Renderer) f32 { return self.descent_px; }
 
     pub fn onResize(self: *Renderer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         if (self.rt == null) return;
 
         const hwnd: c.HWND = self.hwnd;
@@ -1502,12 +1515,12 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const vtbl = rt.lpVtbl.*;
         if (vtbl.Resize) |resize_fn| {
             const hr = resize_fn(rt, &size);
-        
+
             // D2DERR_RECREATE_TARGET (0x8899000C)
             const hr_u: u32 = @bitCast(hr);
             if (hr_u == 0x8899000C) {
-                // Recreate RT using the new client rect size.
-                _ = self.recreateRenderTarget() catch {};
+                // Recreate RT using the new client rect size (already holding self.mu).
+                _ = self.recreateRenderTargetLocked() catch {};
             }
         }
     }

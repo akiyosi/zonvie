@@ -362,8 +362,12 @@ pub export fn WndProc(
         
                     // Ensure we get a paint covering the whole surface.
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                    app.paint_full = true;
-                    app.paint_rects.clearRetainingCapacity();
+                    {
+                        app.mu.lock();
+                        app.paint_full = true;
+                        app.paint_rects.clearRetainingCapacity();
+                        app.mu.unlock();
+                    }
                 }
         
                 // Note: row_mode/rows/main_verts length are logged after snapshotting under lock.
@@ -391,16 +395,29 @@ pub export fn WndProc(
                 var gpu_ptr: ?*d3d11.Renderer = null;
                 if (app.atlas) |*a| atlas_ptr = a;
                 if (app.renderer) |*g| gpu_ptr = g;
-        
+
+                // If the glyph atlas was reset, all cached row vertex UVs are stale.
+                // Request a full re-seed so the core regenerates every row.
+                // Guard with renderer mutex (resetAtlas sets the flag under a.mu).
+                if (atlas_ptr) |a| {
+                    a.mu.lock();
+                    const reset_pending = a.atlas_reset_pending;
+                    if (reset_pending) a.atlas_reset_pending = false;
+                    a.mu.unlock();
+                    if (reset_pending) {
+                        app.need_full_seed.store(true, .seq_cst);
+                        app.paint_full = true;
+                        app.paint_rects.clearRetainingCapacity();
+                    }
+                }
+
                 var dirty_row_keys: std.ArrayListUnmanaged(u32) = .{};
                 defer dirty_row_keys.deinit(app.alloc);
 
                 if (row_mode) {
-                    // Pre-allocate capacity based on dirty_rows count
-                    dirty_row_keys.ensureTotalCapacity(app.alloc, app.dirty_rows.count()) catch {};
                     var it = app.dirty_rows.keyIterator();
                     while (it.next()) |k| {
-                        dirty_row_keys.appendAssumeCapacity(k.*);
+                        dirty_row_keys.append(app.alloc, k.*) catch break;
                     }
                 }
                 // Clear dirty rows set now (we have the snapshot).
@@ -419,8 +436,7 @@ pub export fn WndProc(
 
                 var paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .{};
                 defer paint_rects_snapshot.deinit(app.alloc);
-                paint_rects_snapshot.ensureTotalCapacity(app.alloc, app.paint_rects.items.len) catch {};
-                paint_rects_snapshot.appendSliceAssumeCapacity(app.paint_rects.items);
+                paint_rects_snapshot.appendSlice(app.alloc, app.paint_rects.items) catch {};
                 app.paint_rects.clearRetainingCapacity();
                 
                 const paint_full_snapshot = app.paint_full;
@@ -467,6 +483,7 @@ pub export fn WndProc(
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                 }
         
+                var render_ok = false;
                 if (gpu_ptr) |g| {
                     // Lock D3D context for thread-safe rendering
                     g.lockContext();
@@ -511,9 +528,11 @@ pub export fn WndProc(
                             const main_verts_now = app.main_verts.items;
                             // Only include cursor verts if blink state is visible
                             const cursor_verts_now = if (app.cursor_blink_state) app.cursor_verts.items else &[_]core.Vertex{};
-                            g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .tabbar_bg_color = tabbar_bg_color }) catch |e| {
+                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .tabbar_bg_color = tabbar_bg_color })) {
+                                render_ok = true;
+                            } else |e| {
                                 applog.appLog("gpu.draw failed: {any}\n", .{e});
-                            };
+                            }
                         } else {
                             // Row-mode flipped mid-frame; skip and let the next paint handle it.
                             applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
@@ -548,11 +567,11 @@ pub export fn WndProc(
                             var irow: u32 = 0;
                             const n: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                             while (irow < n) : (irow += 1) {
-                                rows_to_draw.appendAssumeCapacity(irow);
+                                rows_to_draw.append(app.alloc, irow) catch break;
                             }
                         } else if (dirty_row_keys.items.len != 0) {
                             // Normal path: use explicit dirty rows
-                            rows_to_draw.appendSliceAssumeCapacity(dirty_row_keys.items);
+                            rows_to_draw.appendSlice(app.alloc, dirty_row_keys.items) catch {};
                         } else {
                             // Nothing to draw
                         }
@@ -1312,15 +1331,17 @@ pub export fn WndProc(
                             const present_rects_slice: []const c.RECT =
                                 if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
-                            g.presentFromBackRectsWithCursorNoResize(
+                            if (g.presentFromBackRectsWithCursorNoResize(
                                 present_rects_slice,
                                 app.cursor_vb,
                                 cursor_verts_snapshot.len,
                                 cursor_rc_opt,
                                 force_full_present,
-                            ) catch |e| {
+                            )) {
+                                render_ok = true;
+                            } else |e| {
                                 applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
-                            };
+                            }
 
                             if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
                                 app.mu.lock();
@@ -1379,6 +1400,15 @@ pub export fn WndProc(
                             );
                         }
                     }
+                }
+
+                // Recover dirty state if rendering failed, so the next
+                // WM_PAINT will retry a full redraw instead of showing stale content.
+                if (!render_ok) {
+                    app.mu.lock();
+                    app.paint_full = true;
+                    app.mu.unlock();
+                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
                 }
 
                 // Update IME preedit overlay (separate popup window)
@@ -1444,12 +1474,12 @@ pub export fn WndProc(
                 if (app.renderer) |*g| {
                     g.resize() catch {};
                 }
+                app.paint_full = true;
+                app.paint_rects.clearRetainingCapacity();
                 app.mu.unlock();
 
                 // 5) repaint
                 _ = c.InvalidateRect(hwnd, null, 0);
-                app.paint_full = true;
-                app.paint_rects.clearRetainingCapacity();
             }
             return 0;
         },

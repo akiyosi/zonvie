@@ -261,12 +261,18 @@ pub fn onVertices(
     app.main_verts.clearRetainingCapacity();
     app.cursor_verts.clearRetainingCapacity();
 
-    // Pre-allocate capacity to avoid allocation failures
-    app.main_verts.ensureTotalCapacity(app.alloc, main_count) catch {};
-    app.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count) catch {};
-
-    app.main_verts.appendSliceAssumeCapacity(main_ptr[0..main_count]);
-    app.cursor_verts.appendSliceAssumeCapacity(cursor_ptr[0..cursor_count]);
+    // On OOM, skip ALL vertex copies (all-or-nothing to avoid drawing
+    // cursor-only frames) but still fall through to InvalidateRect
+    // so the screen can retry on the next frame.
+    const main_ok = if (app.main_verts.ensureTotalCapacity(app.alloc, main_count)) true else |_| false;
+    const cursor_ok = if (main_ok)
+        (if (app.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count)) true else |_| false)
+    else
+        false;
+    if (main_ok and cursor_ok) {
+        app.main_verts.appendSliceAssumeCapacity(main_ptr[0..main_count]);
+        app.cursor_verts.appendSliceAssumeCapacity(cursor_ptr[0..cursor_count]);
+    }
 
     if (app.row_mode) {
         app.row_mode = false;
@@ -315,8 +321,7 @@ pub fn onVerticesPartial(
 
         app.main_verts.clearRetainingCapacity();
         if (main_ptr != null and main_count != 0) {
-            app.main_verts.ensureTotalCapacity(app.alloc, main_count) catch {};
-            app.main_verts.appendSliceAssumeCapacity(main_ptr.?[0..main_count]);
+            app.main_verts.appendSlice(app.alloc, main_ptr.?[0..main_count]) catch {};
         }
 
         // Non-row-mode: main update implies screen update; invalidate whole client.
@@ -347,8 +352,7 @@ pub fn onVerticesPartial(
                     .{ v0.position[0], v0.position[1], v0.color[0], v0.color[1], v0.color[2], v0.color[3] },
                 );
             }
-            app.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count) catch {};
-            app.cursor_verts.appendSliceAssumeCapacity(slice);
+            app.cursor_verts.appendSlice(app.alloc, slice) catch {};
 
             if (app.hwnd) |hwnd| {
                 // Use content_hwnd for cursor rect calculation when ext_tabline is enabled
@@ -830,7 +834,8 @@ pub fn onVerticesRow(
     }
 
 
-    if (row_count != 0) {
+    if (row_count == 1) {
+        // Single-row path (normal case): store vertices for this row.
         const row: u32 = row_start;
 
         // Extra safety: if rows is known, do not store beyond it.
@@ -851,20 +856,34 @@ pub fn onVerticesRow(
         }
 
         rv.gen +%= 1;
+    } else if (row_count > 1) {
+        // Multi-row path: the vertex array covers multiple rows but we cannot
+        // split it per-row (no per-row vertex boundaries in the API).
+        // Do NOT store the combined vertices — they would render garbled at
+        // row_start while other rows show stale content.
+        // Instead, keep existing row vertices intact and request a full re-seed
+        // so the core resends each row individually.
+        //
+        // NOTE: This relies on Core's flush loop responding to need_full_seed
+        // by iterating per-row with row_count=1 (see src/core/flush.zig).
+        // If a future Core change sends row_count>1 even for re-seed responses,
+        // the API contract must be extended with per-row vertex counts.
+        if (applog.isEnabled()) applog.appLog(
+            "[win] on_vertices_row row_count>1 ({d}) row_start={d} -> requesting re-seed\n",
+            .{ row_count, row_start },
+        );
+        app.need_full_seed.store(true, .seq_cst);
     }
 
-
-    if (app.rows != 0) {
-        r = row_start;
-        while (r < end_row) : (r += 1) {
-            const idx: usize = @intCast(r);
-            if (idx < app.row_valid.bit_length and !app.row_valid.isSet(idx)) {
-                app.row_valid.set(idx);
-                app.row_valid_count += 1;
-            }
+    // Mark the row valid only when we have exact single-row vertex data.
+    if (app.rows != 0 and row_count == 1) {
+        const idx: usize = @intCast(row_start);
+        if (idx < app.row_valid.bit_length and !app.row_valid.isSet(idx)) {
+            app.row_valid.set(idx);
+            app.row_valid_count += 1;
         }
         if (app.row_valid_count == app.rows) {
-            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{ app.rows });
+            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{app.rows});
         }
     }
 
@@ -922,7 +941,14 @@ pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.Gly
         }
     }
 
-    if (app.atlas) |*a| {
+    // Synchronize read of app.atlas to avoid data race with UI thread initialization.
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
         const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
             if (applog.isEnabled()) applog.appLog("atlasEnsureGlyph: atlasEnsureGlyphEntry ERROR scalar=0x{x} err={any}", .{ scalar, err });
             return 0;
@@ -983,7 +1009,14 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
 
     log_styled_glyph_calls += 1;
 
-    if (app.atlas) |*a| {
+    // Synchronize read of app.atlas to avoid data race with UI thread initialization.
+    var atlas_ptr_s: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr_s = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr_s) |a| {
         const e = a.atlasEnsureGlyphEntryStyled(scalar, style_flags) catch |err| {
             log_styled_glyph_fail += 1;
             if (applog.isEnabled()) applog.appLog("atlasEnsureGlyphStyled: ERROR scalar=0x{x} style=0x{x} err={any}", .{ scalar, style_flags, err });
@@ -1472,11 +1505,24 @@ pub fn onSSHAuthPrompt(
 
     // Post message to UI thread to show password dialog
     const hwnd = app.hwnd orelse return;
-    // Store prompt temporarily (prompt_len bytes)
-    app.ssh_prompt_ptr = prompt;
-    app.ssh_prompt_len = prompt_len;
+
+    // Copy prompt data into owned buffer (core may free original after callback returns)
+    const owned = app.alloc.alloc(u8, prompt_len) catch {
+        if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt: OOM copying prompt\n", .{});
+        return;
+    };
+    @memcpy(owned, prompt[0..prompt_len]);
+
+    // Free any previous owned prompt that was not consumed
+    if (app.ssh_prompt_owned) |old| {
+        app.alloc.free(old);
+    }
+    app.ssh_prompt_owned = owned;
 
     if (c.PostMessageW(hwnd, app_mod.WM_APP_SSH_AUTH_PROMPT, 0, 0) == 0) {
         if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt: PostMessageW failed\n", .{});
+        // UI thread will never consume this prompt, free it now.
+        app.alloc.free(owned);
+        app.ssh_prompt_owned = null;
     }
 }

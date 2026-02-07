@@ -305,9 +305,17 @@ pub const Renderer = struct {
         self.bb_rtv = null;
         self.bb_tex = null;
     
+        safeRelease(&self.dcomp_visual);
+        safeRelease(&self.dcomp_target);
+        safeRelease(&self.dcomp_device);
+
         safeRelease(&self.swapchain);
         safeRelease(&self.swapchain1);
         safeRelease(&self.swapchain3);
+
+        safeRelease(&self.infoq);
+        safeRelease(&self.dbg);
+
         safeRelease(&self.ctx);
         safeRelease(&self.device);
     
@@ -816,9 +824,8 @@ pub const Renderer = struct {
                     if (applog.isEnabled()) {
                         applog.appLog("[d3d] Present ok\n", .{});
                     }
+                    self.has_presented_once = true;
                 }
-        
-                self.has_presented_once = true;
         
                 if (applog.isEnabled()) {
                     self.dumpInfoQueue("after Present");
@@ -1917,6 +1924,9 @@ pub const Renderer = struct {
                 return error.D3DCreateFailed;
             }
             dbgLog("[d3d] init: fallback swapchain ok sc=0x{x}\n", .{ if (sc_fallback) |p| @intFromPtr(p) else 0 });
+            // Release original device/context before overwriting to avoid COM leak.
+            safeRelease(&dev);
+            safeRelease(&ctx);
             dev = dev2;
             ctx = ctx2;
             sc0 = sc_fallback;

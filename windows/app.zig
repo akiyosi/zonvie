@@ -758,9 +758,8 @@ pub const App = struct {
     clipboard_set_data: ?[*]const u8 = null,
     clipboard_set_len: usize = 0,
 
-    // SSH auth prompt state
-    ssh_prompt_ptr: ?[*]const u8 = null,
-    ssh_prompt_len: usize = 0,
+    // SSH auth prompt state (owned copy - core frees original after callback)
+    ssh_prompt_owned: ?[]u8 = null,
 
     // Pending glyphs queue: glyphs requested before atlas was ready
     // (for parallel nvim spawn + renderer init)
@@ -975,6 +974,10 @@ pub const App = struct {
         }
 
         // SSH cleanup
+        if (self.ssh_prompt_owned) |buf| {
+            self.alloc.free(buf);
+            self.ssh_prompt_owned = null;
+        }
         if (self.ssh_password) |password| {
             // Clear password from memory
             @memset(@constCast(password), 0);

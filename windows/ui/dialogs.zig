@@ -63,8 +63,8 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
 
     // Write prompt to console
     var written: c.DWORD = 0;
-    if (app.ssh_prompt_ptr != null and app.ssh_prompt_len > 0) {
-        _ = c.WriteConsoleA(hConsoleOut, app.ssh_prompt_ptr, @intCast(app.ssh_prompt_len), &written, null);
+    if (app.ssh_prompt_owned) |buf| {
+        _ = c.WriteConsoleA(hConsoleOut, buf.ptr, @intCast(buf.len), &written, null);
         _ = c.WriteConsoleA(hConsoleOut, " ", 1, &written, null);
     }
 
@@ -89,6 +89,12 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     // Send password to stdin via core
     if (read > 0 and app.corep != null) {
         app_mod.zonvie_core_send_stdin_data(app.corep, &password_buf, @intCast(read));
+    }
+
+    // Free the owned prompt buffer (no longer needed)
+    if (app.ssh_prompt_owned) |buf| {
+        app.alloc.free(buf);
+        app.ssh_prompt_owned = null;
     }
 
     // Hide console after password entry
