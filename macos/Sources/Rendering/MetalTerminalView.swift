@@ -810,11 +810,19 @@ final class MetalTerminalView: MTKView {
             cellH: UInt32(cellHi)
         )
 
-        // Set screen width in cells for cmdline max width
+        // Set screen width in cells for cmdline max width.
+        // Must match the contentWidth constraint in resizeCmdlineWindow
+        // to keep NDC viewport == drawable size.
+        // TODO: Use window?.screen instead of NSScreen.main for multi-display correctness.
+        //       All cmdline NSScreen.main usage (here and in ZonvieCore.swift) should be
+        //       migrated to window?.screen in a coordinated change.
         if let screen = NSScreen.main {
             let scale = window?.backingScaleFactor ?? 2.0
-            let screenWidthPx = screen.frame.width * scale
-            let screenCols = UInt32(screenWidthPx / CGFloat(cellWi))
+            let cmdlinePad = ZonvieConfig.cmdlinePadding
+            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + ZonvieConfig.cmdlineScreenMargin
+            let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
+            let availableWidthPx = availableWidthPt * scale
+            let screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))
             core.setScreenCols(screenCols)
         }
     }

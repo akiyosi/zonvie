@@ -381,3 +381,21 @@ extension ZonvieConfig {
     /// Blending mode (fixed value)
     var blendingMode: NSVisualEffectView.BlendingMode { .behindWindow }
 }
+
+// MARK: - Cmdline layout constants
+
+extension ZonvieConfig {
+    /// Cmdline inner padding (constant regardless of blur setting).
+    static let cmdlinePadding: CGFloat = 12.0
+
+    /// Cmdline icon size in points.
+    static let cmdlineIconSize: CGFloat = 18.0
+    /// Cmdline icon left margin in points.
+    static let cmdlineIconMarginLeft: CGFloat = 12.0
+    /// Cmdline icon right margin in points.
+    static let cmdlineIconMarginRight: CGFloat = 2.0
+    /// Total width occupied by the cmdline icon area.
+    static let cmdlineIconTotalWidth: CGFloat = cmdlineIconMarginLeft + cmdlineIconSize + cmdlineIconMarginRight
+    /// Extra margin around the cmdline window for screen-width constraint.
+    static let cmdlineScreenMargin: CGFloat = 40.0
+}

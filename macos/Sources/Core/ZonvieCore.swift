@@ -2055,23 +2055,18 @@ final class ZonvieCore {
 
             let isSpecialWindow = isCmdline || isPopupmenu || isMsgShow || isMsgHistory
 
-            // Padding for cmdline window
-            // NOTE: When blur is enabled, use 0 padding so gridView covers entire area
-            // This ensures consistent background color (Zig's default_bg with alpha)
-            let cmdlinePadding: CGFloat = isCmdline ? (ZonvieConfig.shared.blurEnabled ? 0.0 : 12.0) : 0.0
+            // Padding for cmdline window (from ZonvieConfig)
+            let cmdlinePadding: CGFloat = isCmdline ? ZonvieConfig.cmdlinePadding : 0.0
             // Padding for msg_show/msg_history windows
             let msgPadding: CGFloat = (isMsgShow || isMsgHistory) ? 8.0 : 0.0
             // Shadow margin for cmdline window (allows shadow to extend beyond content)
             let shadowMargin: CGFloat = isCmdline ? 150.0 : 0.0
-            // Icon settings for cmdline window
-            let cmdlineIconSize: CGFloat = 18.0
-            let cmdlineIconMarginLeft: CGFloat = 12.0
-            let cmdlineIconMarginRight: CGFloat = 2.0
-            let cmdlineIconTotalWidth: CGFloat = isCmdline ? (cmdlineIconMarginLeft + cmdlineIconSize + cmdlineIconMarginRight) : 0.0
+            // Icon area width for cmdline window
+            let cmdlineIconTotalWidth: CGFloat = isCmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
 
             // Constrain cmdline width to screen width
             if isCmdline, let screen = NSScreen.main {
-                let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - 40 // 40px margin
+                let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
                 contentWidth = min(contentWidth, maxContentWidth)
             }
 
@@ -2361,10 +2356,10 @@ final class ZonvieCore {
                 // Add icon view for cmdline window
                 if isCmdline {
                     let iconView = NSImageView(frame: NSRect(
-                        x: cmdlineIconMarginLeft,
-                        y: (containerHeight - cmdlineIconSize) / 2,
-                        width: cmdlineIconSize,
-                        height: cmdlineIconSize
+                        x: ZonvieConfig.cmdlineIconMarginLeft,
+                        y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
+                        width: ZonvieConfig.cmdlineIconSize,
+                        height: ZonvieConfig.cmdlineIconSize
                     ))
                     iconView.imageScaling = .scaleProportionallyUpOrDown
 
@@ -2544,6 +2539,7 @@ final class ZonvieCore {
         rows: UInt32,
         cols: UInt32
     ) {
+        precondition(Thread.isMainThread, "configureExternalGridFromRow must be called on the main thread")
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) vertCount=\(vertCount) rows=\(rows) cols=\(cols)")
 
         // Extract background color from first background vertex
@@ -2572,31 +2568,29 @@ final class ZonvieCore {
             return
         }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else {
-                ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) self is nil")
-                return
-            }
-            guard let window = self.externalWindows[gridId],
-                  let containerView = window.contentView else {
-                // Window not created yet - save pending config to apply later
-                ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) window not found, saving pending config")
-                self.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: rows, cols: cols)
-                return
-            }
-
-            ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) applying bg color=\(bgColor) isSpecial=\(isSpecialGrid)")
-
-            self.applyExternalGridConfig(
-                gridId: gridId,
-                window: window,
-                containerView: containerView,
-                gridView: gridView,
-                bgColor: bgColor,
-                rows: rows,
-                cols: cols
-            )
+        // Apply directly - this function is always called from the main thread
+        // (via on_vertices_row → DispatchQueue.main.async). Avoiding nested async
+        // ensures resize completes before requestRedraw(), keeping drawable size
+        // in sync with NDC viewport.
+        guard let window = self.externalWindows[gridId],
+              let containerView = window.contentView else {
+            // Window not created yet - save pending config to apply later
+            ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) window not found, saving pending config")
+            self.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: rows, cols: cols)
+            return
         }
+
+        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) applying bg color=\(bgColor) isSpecial=\(isSpecialGrid)")
+
+        self.applyExternalGridConfig(
+            gridId: gridId,
+            window: window,
+            containerView: containerView,
+            gridView: gridView,
+            bgColor: bgColor,
+            rows: rows,
+            cols: cols
+        )
     }
 
     /// Apply background color and layout configuration to an external grid.
@@ -2655,17 +2649,15 @@ final class ZonvieCore {
         containerView.layer?.borderColor = borderColor.cgColor
         containerView.layer?.borderWidth = 1.0
 
-        let cmdlinePadding: CGFloat = 12.0
-        let cmdlineIconSize: CGFloat = 18.0
-        let cmdlineIconMarginLeft: CGFloat = 12.0
-        let cmdlineIconMarginRight: CGFloat = 2.0
-        let cmdlineIconTotalWidth: CGFloat = cmdlineIconMarginLeft + cmdlineIconSize + cmdlineIconMarginRight
+        let cmdlinePadding = ZonvieConfig.cmdlinePadding
+        let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
 
         var contentWidth = CGFloat(cols) * cellW / scale
         let contentHeight = CGFloat(rows) * cellH / scale
 
+        // TODO: Use window.screen instead of NSScreen.main for multi-display correctness.
         if let screen = NSScreen.main {
-            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - 40
+            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
             contentWidth = min(contentWidth, maxContentWidth)
         }
 
@@ -2677,10 +2669,10 @@ final class ZonvieCore {
 
         if let iconView = self.cmdlineIconView {
             iconView.frame = NSRect(
-                x: cmdlineIconMarginLeft,
-                y: (containerHeight - cmdlineIconSize) / 2,
-                width: cmdlineIconSize,
-                height: cmdlineIconSize
+                x: ZonvieConfig.cmdlineIconMarginLeft,
+                y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
+                width: ZonvieConfig.cmdlineIconSize,
+                height: ZonvieConfig.cmdlineIconSize
             )
         }
 
@@ -2954,19 +2946,15 @@ final class ZonvieCore {
                 let cellH = CGFloat(renderer.cellHeightPx)
                 let scale = mainView.window?.backingScaleFactor ?? 1.0
 
-                let cmdlinePadding: CGFloat = 12.0
-                // Icon settings (must match values in onExternalWindow)
-                let cmdlineIconSize: CGFloat = 18.0
-                let cmdlineIconMarginLeft: CGFloat = 12.0
-                let cmdlineIconMarginRight: CGFloat = 2.0
-                let cmdlineIconTotalWidth: CGFloat = cmdlineIconMarginLeft + cmdlineIconSize + cmdlineIconMarginRight
+                let cmdlinePadding = ZonvieConfig.cmdlinePadding
+                let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
 
                 var contentWidth = CGFloat(cols) * cellW / scale
                 let contentHeight = CGFloat(rows) * cellH / scale
 
                 // Constrain width to screen width
                 if let screen = NSScreen.main {
-                    let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - 40
+                    let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
                     contentWidth = min(contentWidth, maxContentWidth)
                 }
 
@@ -2982,10 +2970,10 @@ final class ZonvieCore {
                 // Update icon view position (vertically centered)
                 if let iconView = self.cmdlineIconView {
                     iconView.frame = NSRect(
-                        x: cmdlineIconMarginLeft,
-                        y: (containerHeight - cmdlineIconSize) / 2,
-                        width: cmdlineIconSize,
-                        height: cmdlineIconSize
+                        x: ZonvieConfig.cmdlineIconMarginLeft,
+                        y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
+                        width: ZonvieConfig.cmdlineIconSize,
+                        height: ZonvieConfig.cmdlineIconSize
                     )
                 }
 
