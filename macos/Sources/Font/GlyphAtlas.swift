@@ -80,8 +80,13 @@ final class GlyphAtlas {
     private var fallbackFacesByURL: [String: HbFtFace] = [:]
 
     // Cache for CTFontCreateForString results to avoid expensive per-glyph lookups.
-    // Maps scalar → fallback CTFont. Cleared when font settings change.
-    private var fallbackFontCache: [UInt32: CTFont] = [:]
+    // Keyed by (base font pointer, scalar) to avoid returning a bold fallback
+    // for a non-bold request (or vice versa).
+    private struct FallbackCacheKey: Hashable {
+        let baseFont: UInt   // pointer address of the base CTFont
+        let scalar: UInt32
+    }
+    private var fallbackFontCache: [FallbackCacheKey: CTFont] = [:]
 
     // Cache for scalars that failed glyph lookup (to avoid repeated expensive failures).
     // Key: (scalar, styleFlags). Cleared when font settings change.
@@ -575,8 +580,13 @@ final class GlyphAtlas {
     }
 
     private func ctFontForScalarFallback(base: CTFont, scalar: UInt32) -> CTFont? {
+        let cacheKey = FallbackCacheKey(
+            baseFont: UInt(bitPattern: Unmanaged.passUnretained(base as AnyObject).toOpaque()),
+            scalar: scalar
+        )
+
         // Check cache first to avoid expensive CTFontCreateForString calls
-        if let cached = fallbackFontCache[scalar] {
+        if let cached = fallbackFontCache[cacheKey] {
             return cached
         }
 
@@ -593,7 +603,7 @@ final class GlyphAtlas {
         }
 
         // Cache the result for future lookups
-        fallbackFontCache[scalar] = fb
+        fallbackFontCache[cacheKey] = fb
         return fb
     }
 

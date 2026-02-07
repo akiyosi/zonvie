@@ -1459,9 +1459,19 @@ pub const FlushCtx = struct {
                                 var ge: c_api.GlyphEntry = undefined;
                                 var glyph_ok = false;
 
-                                // Get glyph entry from atlas
-                                if (ensure_styled) |styled_fn| {
-                                    glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, 0, &ge) != 0;
+                                // Resolve style_flags for the cell under the cursor
+                                const cursor_style: u8 = ctx.core.hl.getWithStyles(cursor_cell.hl).style_flags;
+                                const cursor_style_mask = cursor_style & (STYLE_BOLD | STYLE_ITALIC);
+                                const cursor_c_style: u32 =
+                                    @as(u32, if (cursor_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+
+                                // Get glyph entry from atlas using actual style
+                                // Matches main rendering path: styled for bold/italic, base otherwise
+                                if (cursor_style_mask != 0 and ensure_styled != null) {
+                                    if (ensure_styled) |styled_fn| {
+                                        glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, cursor_c_style, &ge) != 0;
+                                    }
                                 } else if (ensure_base) |base_fn| {
                                     glyph_ok = base_fn(ctx.core.ctx, cursor_cp, &ge) != 0;
                                 }
@@ -2357,8 +2367,18 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                 var glyph_entry: c_api.GlyphEntry = undefined;
                                 var glyph_ok: c_int = -1;
 
-                                if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
-                                    glyph_ok = styled_fn(self.ctx, cursor_cell.cp, 0, &glyph_entry);
+                                // Resolve style_flags for the cell under the cursor
+                                const ext_cursor_resolved = self.hl.getWithStyles(cursor_cell.hl);
+                                const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                                const ext_cursor_c_style: u32 =
+                                    @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+
+                                // Matches main rendering path: styled for bold/italic, base otherwise
+                                if (ext_cursor_style != 0 and self.cb.on_atlas_ensure_glyph_styled != null) {
+                                    if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
+                                        glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
+                                    }
                                 } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
                                     glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
                                 }
