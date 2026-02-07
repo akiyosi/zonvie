@@ -502,18 +502,21 @@ final class MetalTerminalView: MTKView {
 
         // For drag events, use cached grid info to prevent oscillation during separator dragging
         if action == "drag", let cache = dragGridCache {
-            // Calculate coordinates using cached grid position
+            // Calculate coordinates using cached grid position.
+            // Use integer-rounded cell dimensions to match core grid math.
             let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-            let cellW = CGFloat(renderer.cellWidthPx)
-            let cellH = CGFloat(renderer.cellHeightPx)
 
-            guard cellW > 0 && cellH > 0 else { return }
+            guard renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return }
+
+            let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
+            let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+            let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
 
             let pointPx: CGPoint
             if isFlipped {
                 pointPx = CGPoint(x: location.x * scale, y: location.y * scale)
             } else {
-                pointPx = CGPoint(x: location.x * scale, y: (bounds.height - location.y) * scale)
+                pointPx = CGPoint(x: location.x * scale, y: drawableH - location.y * scale)
             }
 
             let globalCol = Int32(pointPx.x / cellW)
@@ -1479,18 +1482,28 @@ final class MetalTerminalView: MTKView {
         guard let core else { return (1, 0, 0) }
 
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let cellW = CGFloat(renderer.cellWidthPx)
-        let cellH = CGFloat(renderer.cellHeightPx)
 
-        guard cellW > 0 && cellH > 0 else { return (1, 0, 0) }
+        // Early return when renderer is uninitialized (cellMetrics not yet available).
+        guard renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return (1, 0, 0) }
 
-        // Convert point to drawable pixel coordinates (top-origin)
+        // Use integer-rounded cell dimensions to match core grid math exactly.
+        // The core receives these rounded values via updateLayoutPx and uses them
+        // for row/col computation and vertex positioning.
+        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
+        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+
+        // Compute integer drawable height from current bounds (same formula as
+        // updateDrawableSizeIfPossible). This avoids depending on the stored
+        // drawableSize property which may lag behind bounds during resize.
+        let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
+
+        // Convert point to drawable pixel coordinates (top-origin).
         let pointPx: CGPoint
         if isFlipped {
             pointPx = CGPoint(x: point.x * scale, y: point.y * scale)
         } else {
             // NSView is bottom-origin, convert to top-origin
-            pointPx = CGPoint(x: point.x * scale, y: (bounds.height - point.y) * scale)
+            pointPx = CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
         }
 
         // Calculate cell position in global grid coordinates
