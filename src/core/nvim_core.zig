@@ -380,6 +380,14 @@ pub const Core = struct {
     glyph_cache_ascii_size: u32 = 512, // default: 128 ASCII × 4 styles
     glyph_cache_non_ascii_size: u32 = 256, // default: 256 entries hash table
 
+    // Highlight cache size for flush vertex generation (configurable via [performance] in config.toml)
+    hl_cache_size: u32 = 512,
+
+    // Heap-allocated highlight cache buffers (sized by hl_cache_size, allocated on first flush)
+    hl_cache_buf: ?[]highlight.ResolvedAttrWithStyles = null,
+    hl_valid_buf: ?[]bool = null,
+    hl_cache_initialized: bool = false,
+
     // Dynamic glyph caches (allocated on first use, reallocated if size changes)
     glyph_cache_ascii: ?[]c_api.GlyphEntry = null,
     glyph_valid_ascii: ?[]bool = null,
@@ -487,7 +495,8 @@ pub const Core = struct {
             self.nvim_path_owned = null;
         }
 
-        // Free glyph caches
+        // Free caches
+        self.deinitHlCache();
         self.deinitGlyphCache();
     }
 
@@ -544,6 +553,34 @@ pub const Core = struct {
             const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
             @memset(buf, INVALID_KEY);
         }
+    }
+
+    // --- Highlight cache (heap-allocated, used by flush vertex generation) ---
+
+    /// Initialize highlight cache buffers based on hl_cache_size.
+    /// Called lazily on first flush.
+    pub fn initHlCache(self: *Core) !void {
+        if (self.hl_cache_initialized) return;
+        const size = self.hl_cache_size;
+        self.hl_cache_buf = try self.alloc.alloc(highlight.ResolvedAttrWithStyles, size);
+        self.hl_valid_buf = try self.alloc.alloc(bool, size);
+        @memset(self.hl_valid_buf.?, false);
+        self.hl_cache_initialized = true;
+    }
+
+    /// Free highlight cache buffers.
+    fn deinitHlCache(self: *Core) void {
+        if (self.hl_cache_buf) |buf| self.alloc.free(buf);
+        if (self.hl_valid_buf) |buf| self.alloc.free(buf);
+        self.hl_cache_buf = null;
+        self.hl_valid_buf = null;
+        self.hl_cache_initialized = false;
+    }
+
+    /// Reinitialize highlight cache with new size (called when config changes).
+    pub fn reinitHlCache(self: *Core) void {
+        self.deinitHlCache();
+        // Will be lazily re-allocated on next flush
     }
 
     // --- Phase 2: Core-managed atlas ---

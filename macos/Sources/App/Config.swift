@@ -92,6 +92,10 @@ struct ZonvieConfig {
         /// Glyph cache size for non-ASCII characters (hash table)
         /// Default: 256, Minimum: 64
         var glyphCacheNonAsciiSize: Int = 256
+
+        /// Highlight attribute cache size for flush vertex generation
+        /// Default: 512, Range: 64-2048
+        var hlCacheSize: Int = 512
     }
 
     struct IMEConfig {
@@ -296,6 +300,10 @@ struct ZonvieConfig {
             case "glyph_cache_non_ascii_size":
                 if let size = Int(value), size >= 64 {
                     performance.glyphCacheNonAsciiSize = size
+                }
+            case "hl_cache_size":
+                if let size = Int(value), size >= 64, size <= 2048 {
+                    performance.hlCacheSize = size
                 }
             default:
                 ZonvieCore.appLog("[Config] Unknown key: performance.\(key)")

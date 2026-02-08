@@ -181,6 +181,7 @@ path = "/tmp/zonvie.log"
 [performance]
 glyph_cache_ascii_size = 512
 glyph_cache_non_ascii_size = 256
+hl_cache_size = 512
 
 [ime]
 disable_on_activate = false
@@ -268,6 +269,7 @@ Message routing rules are processed in order; first match wins.
 |-----|-------------|
 | `glyph_cache_ascii_size` | Cache size for ASCII glyphs (min: 128, default: 512) |
 | `glyph_cache_non_ascii_size` | Cache size for non-ASCII glyphs (min: 64, default: 256) |
+| `hl_cache_size` | Highlight attribute cache size for vertex generation (range: 64-2048, default: 512) |
 
 #### [ime]
 | Key | Description |

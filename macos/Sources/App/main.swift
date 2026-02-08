@@ -163,6 +163,7 @@ if args.contains("--help") || args.contains("-h") {
             [performance]
                 glyph_cache_ascii_size      ASCII glyph cache size (min: 128)
                 glyph_cache_non_ascii_size  Non-ASCII glyph cache size (min: 64)
+                hl_cache_size               Highlight cache size (64-2048, default: 512)
 
         For more information, visit: https://github.com/akiyosi/zonvie
         """

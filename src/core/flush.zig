@@ -77,12 +77,13 @@ pub const MsgCachedLine = struct {
 
 /// Cache for highlight and glyph lookups during vertex generation.
 /// Shared across all rows in a single flush to maximize cache hits.
+/// Cache for highlight and glyph lookups during vertex generation.
+/// hl_cache_buf / hl_valid_buf are heap-allocated by NvimCore and passed as slices
+/// to avoid large fixed-size arrays on the stack.
 pub const FlushCache = struct {
-    const HL_CACHE_SIZE = 64;
-
-    // Highlight cache: direct-index for O(1) lookup (hl_id is typically < 64)
-    hl_cache: [HL_CACHE_SIZE]ResolvedAttrWithStyles = undefined,
-    hl_valid: [HL_CACHE_SIZE]bool = [_]bool{false} ** HL_CACHE_SIZE,
+    // Slices into heap-allocated buffers owned by NvimCore
+    hl_cache_buf: []ResolvedAttrWithStyles,
+    hl_valid_buf: []bool,
 
     // Performance counters
     perf_hl_cache_hits: u32 = 0,
@@ -94,25 +95,25 @@ pub const FlushCache = struct {
 
     /// Get resolved attribute with caching.
     pub fn getAttr(self: *FlushCache, hl: *Highlights, hl_id: u32) ResolvedAttrWithStyles {
-        if (hl_id < HL_CACHE_SIZE) {
-            if (self.hl_valid[hl_id]) {
+        if (hl_id < self.hl_valid_buf.len) {
+            if (self.hl_valid_buf[hl_id]) {
                 self.perf_hl_cache_hits += 1;
-                return self.hl_cache[hl_id];
+                return self.hl_cache_buf[hl_id];
             }
             self.perf_hl_cache_misses += 1;
             const resolved = hl.getWithStyles(hl_id);
-            self.hl_cache[hl_id] = resolved;
-            self.hl_valid[hl_id] = true;
+            self.hl_cache_buf[hl_id] = resolved;
+            self.hl_valid_buf[hl_id] = true;
             return resolved;
         }
-        // Fallback for hl_id >= 64 (rare)
+        // Fallback for hl_id >= cache size
         self.perf_hl_cache_misses += 1;
         return hl.getWithStyles(hl_id);
     }
 
-    /// Reset cache for a new flush.
+    /// Reset cache for a new flush (clear valid flags and counters).
     pub fn reset(self: *FlushCache) void {
-        @memset(&self.hl_valid, false);
+        @memset(self.hl_valid_buf, false);
         self.perf_hl_cache_hits = 0;
         self.perf_hl_cache_misses = 0;
         self.perf_glyph_ascii_hits = 0;
@@ -467,12 +468,20 @@ pub const FlushCtx = struct {
                         t_rows_start_ns = std.time.nanoTimestamp();
                     }
 
-                    // HL cache: direct-index for O(1) lookup (hl_id is typically < 64)
-                    // Placed outside row loop - initialized once per flush, shared across all rows
-                    // ResolvedAttrWithStyles now includes pre-computed style_flags
-                    const HL_CACHE_SIZE = 64;
-                    var hl_cache: [HL_CACHE_SIZE]highlight.ResolvedAttrWithStyles = undefined;
-                    var hl_valid: [HL_CACHE_SIZE]bool = [_]bool{false} ** HL_CACHE_SIZE;
+                    // Initialize dynamic caches if not already done
+                    ctx.core.initHlCache() catch {
+                        ctx.core.log.write("[flush] Failed to initialize hl cache\n", .{});
+                    };
+                    ctx.core.initGlyphCache() catch {
+                        ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
+                    };
+
+                    // HL cache: direct-index for O(1) lookup
+                    // Uses heap-allocated buffers from NvimCore (sized by hl_cache_size config)
+                    const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
+                    const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
+                    const hl_cache_limit: u32 = @intCast(hl_valid.len);
+                    @memset(hl_valid, false);
 
                     // Performance counters for cache statistics
                     var perf_hl_cache_hits: u32 = 0;
@@ -481,11 +490,6 @@ pub const FlushCtx = struct {
                     var perf_glyph_ascii_misses: u32 = 0;
                     var perf_glyph_nonascii_hits: u32 = 0;
                     var perf_glyph_nonascii_misses: u32 = 0;
-
-                    // Initialize dynamic glyph caches if not already done
-                    ctx.core.initGlyphCache() catch {
-                        ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
-                    };
                     // Glyph cache is persistent across flushes.
                     // It is only reset on font changes (see onGuifont).
                     // NOTE: Do NOT call resetGlyphCacheFlags() here. With Phase 2
@@ -561,7 +565,7 @@ pub const FlushCtx = struct {
 
                                 // Get resolved attributes once for the entire run
                                 const a = blk: {
-                                    if (run_hl < HL_CACHE_SIZE) {
+                                    if (run_hl < hl_cache_limit) {
                                         if (hl_valid[run_hl]) {
                                             perf_hl_cache_hits += 1;
                                             break :blk hl_cache[run_hl];
@@ -572,7 +576,7 @@ pub const FlushCtx = struct {
                                         hl_valid[run_hl] = true;
                                         break :blk resolved;
                                     }
-                                    // Fallback for hl_id >= 64 (rare)
+                                    // Fallback for hl_id >= hl_cache_limit
                                     perf_hl_cache_misses += 1;
                                     break :blk ctx.core.hl.getWithStyles(run_hl);
                                 };
@@ -615,7 +619,7 @@ pub const FlushCtx = struct {
                                     const cell = csg.cells[src_i];
                                     // Use HL cache with direct index for O(1) access
                                     const a2 = blk2: {
-                                        if (cell.hl < HL_CACHE_SIZE) {
+                                        if (cell.hl < hl_cache_limit) {
                                             if (hl_valid[cell.hl]) {
                                                 perf_hl_cache_hits += 1;
                                                 break :blk2 hl_cache[cell.hl];
@@ -626,7 +630,7 @@ pub const FlushCtx = struct {
                                             hl_valid[cell.hl] = true;
                                             break :blk2 resolved;
                                         }
-                                        // Fallback for hl_id >= 64 (rare)
+                                        // Fallback for hl_id >= hl_cache_limit
                                         perf_hl_cache_misses += 1;
                                         break :blk2 ctx.core.hl.getWithStyles(cell.hl);
                                     };
@@ -1778,12 +1782,18 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Default background for blur transparency
     const default_bg = self.hl.default_bg;
 
-    // Initialize FlushCache for hl_cache optimization
-    var cache = FlushCache{};
-
-    // Initialize glyph cache (same as row_mode)
+    // Initialize dynamic caches (same as row_mode)
+    self.initHlCache() catch {
+        self.log.write("[ext_grid] Failed to initialize hl cache\n", .{});
+    };
     self.initGlyphCache() catch {
         self.log.write("[ext_grid] Failed to initialize glyph cache\n", .{});
+    };
+
+    // Initialize FlushCache for hl_cache optimization (uses heap buffers from NvimCore)
+    var cache = FlushCache{
+        .hl_cache_buf = self.hl_cache_buf orelse &.{},
+        .hl_valid_buf = self.hl_valid_buf orelse &.{},
     };
     // Glyph cache is persistent across flushes (same as row_mode path).
 
