@@ -1049,6 +1049,63 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
 }
 
 // =========================================================================
+// Phase 2: Core-managed atlas callbacks
+// =========================================================================
+
+pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *app_mod.GlyphBitmap) callconv(.c) c_int {
+    const ctxp = ctx orelse return 0;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return 0;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+        return 1;
+    }
+    return 0;
+}
+
+pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const app_mod.GlyphBitmap) callconv(.c) void {
+    const ctxp = ctx orelse return;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        a.uploadAtlasRegion(dest_x, dest_y, width, height, bitmap) catch {};
+    }
+}
+
+pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+    const ctxp = ctx orelse return;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        a.recreateAtlasTexture(atlas_w, atlas_h);
+    }
+}
+
+// =========================================================================
 // Logging callback
 // =========================================================================
 
@@ -1147,6 +1204,55 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     if (hwnd) |h| {
         app_mod.updateRowsColsFromClientForce(h, app);
     }
+
+    // Calculate pending resize for all external windows (same as onLineSpace)
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr;
+
+        if (ext_win.is_pending_close) continue;
+
+        const rows = ext_win.rows;
+        const cols = ext_win.cols;
+
+        var content_w: c_int = @intCast(cols * cell_w);
+        var content_h: c_int = @intCast(rows * cell_h);
+
+        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
+        const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
+        const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
+
+        if (is_cmdline) {
+            const cmdline_icon_total_width: u32 = app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
+            const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
+            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
+            content_h += @as(c_int, @intCast(cmdline_total_padding));
+        } else if (is_msg_show or is_msg_history) {
+            const msg_total_padding: u32 = app_mod.MSG_PADDING * 2;
+            content_w += @as(c_int, @intCast(msg_total_padding));
+            content_h += @as(c_int, @intCast(msg_total_padding));
+        }
+
+        const dwStyle: c.DWORD = c.WS_POPUP;
+        const dwExStyle: c.DWORD = c.WS_EX_TOPMOST;
+        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
+
+        ext_win.pending_window_w = rect.right - rect.left;
+        ext_win.pending_window_h = rect.bottom - rect.top;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+
+        if (applog.isEnabled()) applog.appLog("onGuiFont: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
+
+        if (hwnd) |mh| {
+            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
+        }
+    }
+
     app.mu.unlock();
 
     if (hwnd) |h| {
@@ -1174,17 +1280,9 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         .{ linespace_px, v, app.cell_h_px, app.cell_h_px + v },
     );
 
-    // Collect external window resize info while holding the lock
-    // We must release the lock before calling SetWindowPos to avoid deadlock
-    // (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
-    const ExtResizeInfo = struct {
-        hwnd: c.HWND,
-        window_w: c_int,
-        window_h: c_int,
-        pos_x: c_int,
-        pos_y: c_int,
-    };
-
+    // Defer external window resizes via PostMessage to avoid deadlock.
+    // SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler calls
+    // zonvie_core_try_resize_grid which needs core locks held by the flush path.
     app.mu.lock();
     app.linespace_px = v;
     const hwnd = app.hwnd;
@@ -1192,17 +1290,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         app_mod.updateRowsColsFromClientForce(h, app);
     }
 
-    // Allocate resize list based on actual external window count
-    const ext_count = app.external_windows.count();
-    const resize_list = app.alloc.alloc(ExtResizeInfo, ext_count) catch {
-        applog.appLog("[win] onLineSpace: failed to alloc resize_list for {d} windows\n", .{ext_count});
-        app.mu.unlock();
-        return;
-    };
-    defer app.alloc.free(resize_list);
-    var resize_count: usize = 0;
-
-    // Collect resize info for all external windows (skip windows pending close)
+    // Calculate pending resize for all external windows
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + v;
     var ext_it = app.external_windows.iterator();
@@ -1210,17 +1298,14 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         const grid_id = entry.key_ptr.*;
         const ext_win = entry.value_ptr;
 
-        // Skip windows that are pending close (their hwnd may be invalid soon)
         if (ext_win.is_pending_close) continue;
 
         const rows = ext_win.rows;
         const cols = ext_win.cols;
 
-        // Calculate new content size
         var content_w: c_int = @intCast(cols * cell_w);
         var content_h: c_int = @intCast(rows * cell_h);
 
-        // Add padding for special windows
         const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
         const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
         const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
@@ -1236,38 +1321,25 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
             content_h += @as(c_int, @intCast(msg_total_padding));
         }
 
-        // Calculate window size
         const dwStyle: c.DWORD = c.WS_POPUP;
         const dwExStyle: c.DWORD = c.WS_EX_TOPMOST;
         var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
         _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-        const window_w: c_int = rect.right - rect.left;
-        const window_h: c_int = rect.bottom - rect.top;
 
-        // Get current position to preserve it
-        var current_rect: c.RECT = undefined;
-        if (c.GetWindowRect(ext_win.hwnd, &current_rect) != 0) {
-            if (resize_count < resize_list.len) {
-                resize_list[resize_count] = .{
-                    .hwnd = ext_win.hwnd,
-                    .window_w = window_w,
-                    .window_h = window_h,
-                    .pos_x = current_rect.left,
-                    .pos_y = current_rect.top,
-                };
-                resize_count += 1;
-            }
-            ext_win.needs_renderer_resize = true;
+        ext_win.pending_window_w = rect.right - rect.left;
+        ext_win.pending_window_h = rect.bottom - rect.top;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+
+        if (applog.isEnabled()) applog.appLog("[win] onLineSpace: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
+
+        // PostMessageW does not block, so it's safe to call while holding the lock.
+        if (hwnd) |mh| {
+            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
         }
     }
 
     app.mu.unlock();
-
-    // Now resize external windows outside the lock to avoid deadlock
-    for (resize_list[0..resize_count]) |info| {
-        if (applog.isEnabled()) applog.appLog("[win] onLineSpace: resizing ext_win to ({d},{d})\n", .{ info.window_w, info.window_h });
-        _ = c.SetWindowPos(info.hwnd, null, info.pos_x, info.pos_y, info.window_w, info.window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
-    }
 
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);

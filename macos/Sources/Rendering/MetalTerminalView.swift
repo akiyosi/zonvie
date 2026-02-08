@@ -4,6 +4,9 @@ import MetalKit
 final class MetalTerminalView: MTKView {
     var renderer: MetalTerminalRenderer!
 
+    /// Expose drawable size without requiring MetalKit import at call site.
+    var currentDrawableSize: CGSize { drawableSize }
+
     weak var core: ZonvieCore? {
         didSet {
             // Set up cursor blink redraw callback when core is assigned
@@ -190,7 +193,7 @@ final class MetalTerminalView: MTKView {
         dirtyLog("didDrawFrame: redrawPending reset to false")
     }
 
-    private func requestRedraw(_ rect: NSRect? = nil) {
+    func requestRedraw(_ rect: NSRect? = nil) {
         redrawLock.lock()
 
         dirtyLog("requestRedraw(in): rect=\(String(describing: rect)) bounds=\(bounds) isFlipped=\(isFlipped) windowScale=\(window?.backingScaleFactor ?? -1) drawableSize=\(drawableSize) redrawPending=\(redrawPending)")

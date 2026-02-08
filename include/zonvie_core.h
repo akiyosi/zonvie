@@ -24,6 +24,55 @@ typedef struct zonvie_glyph_entry {
     float descent_px;
 } zonvie_glyph_entry;
 
+/* Phase 2: Core-managed atlas - bitmap descriptor returned by frontend rasterizer.
+   The pixels pointer is valid until the next on_rasterize_glyph call on the same
+   font handle, or until a font change. Core calls on_atlas_upload immediately
+   after on_rasterize_glyph, so the pointer is always valid during upload. */
+typedef struct zonvie_glyph_bitmap {
+    const uint8_t* pixels;      /* rasterized bitmap data */
+    uint32_t width;              /* bitmap width in pixels (0 = whitespace) */
+    uint32_t height;             /* bitmap height in pixels */
+    int32_t  pitch;              /* bytes per row (may differ from width) */
+    int32_t  bearing_x;          /* horizontal bearing: pen to left edge (pixels) */
+    int32_t  bearing_y;          /* vertical bearing: baseline to top edge (pixels, positive=up) */
+    int32_t  advance_26_6;       /* horizontal advance in 26.6 fixed-point */
+    float    ascent_px;          /* font ascent in pixels */
+    float    descent_px;         /* font descent in pixels */
+    uint32_t bytes_per_pixel;    /* 1=grayscale (R8), 3=ClearType RGB, 4=RGBA */
+} zonvie_glyph_bitmap;
+
+/* Phase 2: Rasterize a glyph without packing or uploading.
+   Frontend fills out_bitmap with bitmap data and metrics.
+   Returns 1 on success, 0 on failure. */
+typedef int (*zonvie_rasterize_glyph_fn)(
+    void* ctx,
+    uint32_t scalar,
+    uint32_t style_flags,        /* ZONVIE_STYLE_BOLD | ZONVIE_STYLE_ITALIC */
+    zonvie_glyph_bitmap* out_bitmap
+);
+
+/* Phase 2: Upload a glyph bitmap to the atlas texture at specified coordinates.
+   The bitmap pointer is the same one returned by the most recent on_rasterize_glyph.
+   Frontend must upload the glyph pixels at (dest_x, dest_y) with size (width x height). */
+typedef void (*zonvie_atlas_upload_fn)(
+    void* ctx,
+    uint32_t dest_x,
+    uint32_t dest_y,
+    uint32_t width,
+    uint32_t height,
+    const zonvie_glyph_bitmap* bitmap
+);
+
+/* Phase 2: Create or recreate the atlas texture at the given dimensions.
+   Called once at init (lazily) and whenever the atlas is full.
+   Frontend should destroy any existing atlas texture and create a new one,
+   cleared to zero (for padding). */
+typedef void (*zonvie_atlas_create_fn)(
+    void* ctx,
+    uint32_t atlas_w,
+    uint32_t atlas_h
+);
+
 typedef int (*zonvie_atlas_ensure_glyph_fn)(
     void* ctx,
     uint32_t scalar,
@@ -560,6 +609,14 @@ typedef struct zonvie_callbacks {
 
     /* Quit request callback (window close with unsaved check). */
     zonvie_on_quit_requested_fn on_quit_requested;
+
+    /* Phase 2: Core-managed atlas callbacks.
+       When all three are non-NULL, core owns shelf packing and UV computation.
+       The old on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled are not called.
+       When any is NULL, falls back to Phase 1 (frontend-managed atlas). */
+    zonvie_rasterize_glyph_fn on_rasterize_glyph;
+    zonvie_atlas_upload_fn on_atlas_upload;
+    zonvie_atlas_create_fn on_atlas_create;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -603,7 +660,13 @@ void zonvie_core_set_inherit_cwd(zonvie_core *core, int enabled);
  * Should be called before zonvie_core_start() for best results. */
 void zonvie_core_set_glyph_cache_size(zonvie_core *core, unsigned ascii_size, unsigned non_ascii_size);
 
-zonvie_core *zonvie_core_create(zonvie_callbacks *cb, void *ctx);
+/* Create a new core instance.
+   cb:             pointer to callback struct (may be NULL).
+   callbacks_size: sizeof(zonvie_callbacks) as seen by the caller.
+                   Allows the core to safely handle callers compiled
+                   against an older (smaller) struct layout.
+   ctx:            opaque frontend context forwarded to all callbacks. */
+zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
 void zonvie_core_destroy(zonvie_core *core);
 
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);

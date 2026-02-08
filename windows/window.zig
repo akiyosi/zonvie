@@ -2002,12 +2002,15 @@ pub export fn WndProc(
                     .on_ssh_auth_prompt = callbacks.onSSHAuthPrompt,
                     .on_ime_off = callbacks.onIMEOff,
                     .on_quit_requested = callbacks.onQuitRequested,
+                    .on_rasterize_glyph = callbacks.onRasterizeGlyph,
+                    .on_atlas_upload = callbacks.onAtlasUpload,
+                    .on_atlas_create = callbacks.onAtlasCreate,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 
                 applog.appLog("  core_create callbacks ptr ctx(app)={*}", .{app});
                 _ = c.QueryPerformanceCounter(&t1);
-                app.corep = core.zonvie_core_create(&cb, app);
+                app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
                 _ = c.QueryPerformanceCounter(&t2);
                 const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
                 applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});

@@ -4,10 +4,9 @@ const c = @import("../win32.zig").c;
 const applog = @import("../app_log.zig");
 
 // Move outside Renderer (Zig cannot have const declarations between container fields)
-// NOTE: Reduced from 2048x2048 to 1024x1024 for faster startup (~3ms savings).
-// 1024x1024 is sufficient for most use cases; dynamic expansion can be added if needed.
-const AtlasW: u32 = 1024;
-const AtlasH: u32 = 1024;
+// Must match core's atlas_w/atlas_h (nvim_core.zig) for Phase 2 UV consistency.
+const AtlasW: u32 = 2048;
+const AtlasH: u32 = 2048;
 
 const GUID = extern struct {
     Data1: u32,
@@ -1147,7 +1146,187 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         };
     }
 
+    // --- Phase 2: Core-managed atlas ---
 
+    /// Phase 2: Rasterize glyph via DWrite without atlas packing.
+    /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
+    pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        // Select font face based on style_flags
+        const face: *c.IDWriteFontFace = blk: {
+            if (style_flags != 0) {
+                self.ensureStyledFontFaces();
+                const is_bold = (style_flags & STYLE_BOLD) != 0;
+                const is_italic = (style_flags & STYLE_ITALIC) != 0;
+                if (is_bold and is_italic) {
+                    break :blk self.bold_italic_font_face orelse self.bold_font_face orelse self.italic_font_face orelse self.font_face orelse return error.NoFont;
+                } else if (is_bold) {
+                    break :blk self.bold_font_face orelse self.font_face orelse return error.NoFont;
+                } else if (is_italic) {
+                    break :blk self.italic_font_face orelse self.font_face orelse return error.NoFont;
+                } else {
+                    break :blk self.font_face orelse return error.NoFont;
+                }
+            } else {
+                break :blk self.font_face orelse return error.NoFont;
+            }
+        };
+
+        const fvtbl = face.lpVtbl.*;
+
+        // scalar -> glyph_index
+        var codepoints: [1]c.UINT32 = .{@as(c.UINT32, @intCast(scalar))};
+        var glyph_index: c.UINT16 = 0;
+        const get_glyph_indices_fn = fvtbl.GetGlyphIndicesW orelse return error.DWriteFontFaceMissingGetGlyphIndicesW;
+        const hr_gi = get_glyph_indices_fn(face, codepoints[0..].ptr, 1, &glyph_index);
+        if (c.FAILED(hr_gi)) return error.DWriteGetGlyphIndicesFailed;
+
+        // glyph run analysis
+        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
+        glyph_run.fontFace = face;
+        glyph_run.fontEmSize = self.font_em_size;
+        glyph_run.glyphCount = 1;
+        var gi_arr: [1]c.UINT16 = .{glyph_index};
+        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
+        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
+        glyph_run.glyphIndices = gi_arr[0..].ptr;
+        glyph_run.glyphAdvances = adv_arr[0..].ptr;
+        glyph_run.glyphOffsets = off_arr[0..].ptr;
+
+        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
+        const dwtbl = dw.lpVtbl.*;
+        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
+        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
+        const hr_cgra = create_analysis_fn(dw, &glyph_run, 1.0, null, c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, c.DWRITE_MEASURING_MODE_NATURAL, 0.0, 0.0, &analysis);
+        if (c.FAILED(hr_cgra) or analysis == null) return error.DWriteCreateGlyphRunAnalysisFailed;
+
+        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
+        defer _ = rel_fn(analysis.?);
+
+        // Get alpha texture bounds
+        var bounds: c.RECT = std.mem.zeroes(c.RECT);
+        const atbl = analysis.?.lpVtbl.*;
+        const get_bounds_fn = atbl.GetAlphaTextureBounds orelse return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
+        const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
+        if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
+
+        const bw_i32: i32 = bounds.right - bounds.left;
+        const bh_i32: i32 = bounds.bottom - bounds.top;
+        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+
+        // Fill common metrics
+        out_bitmap.bearing_x = bounds.left;
+        out_bitmap.bearing_y = @as(i32, -bounds.top); // DWrite top -> FreeType bearing_y
+        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
+        out_bitmap.ascent_px = self.ascent_px;
+        out_bitmap.descent_px = self.descent_px;
+        out_bitmap.bytes_per_pixel = 3; // ClearType RGB
+
+        if (bw == 0 or bh == 0) {
+            // Empty glyph (space etc.)
+            out_bitmap.pixels = null;
+            out_bitmap.width = 0;
+            out_bitmap.height = 0;
+            out_bitmap.pitch = 0;
+            return;
+        }
+
+        // Fetch ClearType 3x1 texture (RGB, 3 bytes per pixel)
+        const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
+        try self.glyph_tmp.resize(self.alloc, buf_size);
+
+        const create_alpha_fn = atbl.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
+        const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+        if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+        out_bitmap.pixels = self.glyph_tmp.items.ptr;
+        out_bitmap.width = bw;
+        out_bitmap.height = bh;
+        out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+    }
+
+    /// Phase 2: Upload glyph bitmap to atlas_cpu at (dest_x, dest_y).
+    /// Handles ClearType RGB 3bpp -> RGBA 4bpp conversion.
+    pub fn uploadAtlasRegion(self: *Renderer, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const core.GlyphBitmap) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const pixels = bitmap.pixels orelse return;
+        const bpp = bitmap.bytes_per_pixel;
+        const pitch: usize = if (bitmap.pitch >= 0) @as(usize, @intCast(bitmap.pitch)) else @as(usize, @intCast(-bitmap.pitch));
+
+        // Write to atlas_cpu (RGBA 4bpp)
+        var y: u32 = 0;
+        while (y < height) : (y += 1) {
+            const src_row: usize = if (bitmap.pitch >= 0) @as(usize, y) else @as(usize, height - 1 - y);
+            var x: u32 = 0;
+            while (x < width) : (x += 1) {
+                const dst_off = ((@as(usize, dest_y + y) * @as(usize, AtlasW)) + @as(usize, dest_x + x)) * 4;
+
+                if (bpp == 3) {
+                    // ClearType RGB -> RGBA
+                    const src_off = src_row * pitch + @as(usize, x) * 3;
+                    const r = pixels[src_off];
+                    const g = pixels[src_off + 1];
+                    const b = pixels[src_off + 2];
+                    self.atlas_cpu.items[dst_off + 0] = r;
+                    self.atlas_cpu.items[dst_off + 1] = g;
+                    self.atlas_cpu.items[dst_off + 2] = b;
+                    self.atlas_cpu.items[dst_off + 3] = @max(r, @max(g, b));
+                } else {
+                    // Grayscale or other: replicate to RGBA
+                    const src_off = src_row * pitch + @as(usize, x) * bpp;
+                    const v = pixels[src_off];
+                    self.atlas_cpu.items[dst_off + 0] = v;
+                    self.atlas_cpu.items[dst_off + 1] = v;
+                    self.atlas_cpu.items[dst_off + 2] = v;
+                    self.atlas_cpu.items[dst_off + 3] = v;
+                }
+            }
+        }
+
+        // Mark dirty rect for GPU upload
+        try self.pending_uploads.append(self.alloc, c.D2D1_RECT_U{
+            .left = dest_x,
+            .top = dest_y,
+            .right = dest_x + width,
+            .bottom = dest_y + height,
+        });
+        self.atlas_version +%= 1;
+    }
+
+    /// Phase 2: Recreate atlas texture with given dimensions.
+    pub fn recreateAtlasTexture(self: *Renderer, atlas_w: u32, atlas_h: u32) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        // Core's atlas dimensions must match our compile-time constants.
+        // If this fires, update AtlasW/AtlasH to match core's atlas_w/atlas_h.
+        std.debug.assert(atlas_w == AtlasW);
+        std.debug.assert(atlas_h == AtlasH);
+
+        // Clear caches
+        self.glyph_map.clearRetainingCapacity();
+        self.styled_glyph_map.clearRetainingCapacity();
+
+        // Reset packer
+        self.atlas_next_x = 1;
+        self.atlas_next_y = 1;
+        self.atlas_row_h = 0;
+
+        // Clear pending uploads
+        self.pending_uploads.clearRetainingCapacity();
+
+        // Clear CPU atlas
+        if (self.atlas_cpu.items.len > 0) {
+            @memset(self.atlas_cpu.items, 0);
+        }
+
+        self.atlas_reset_pending = true;
+    }
 
     pub fn renderVertices(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex) !void {
         self.mu.lock();

@@ -19,6 +19,10 @@ final class ViewController: NSViewController {
     override func loadView() {
         self.view = NSView()
         self.view.wantsLayer = true
+        if ZonvieConfig.shared.blurEnabled {
+            self.view.layer?.isOpaque = false
+            self.view.layer?.backgroundColor = NSColor.clear.cgColor
+        }
     }
 
     override func viewDidLoad() {

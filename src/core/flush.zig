@@ -486,8 +486,12 @@ pub const FlushCtx = struct {
                     ctx.core.initGlyphCache() catch {
                         ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
                     };
-                    // Reset glyph cache valid flags for this flush
-                    ctx.core.resetGlyphCacheFlags();
+                    // Glyph cache is persistent across flushes.
+                    // It is only reset on font changes (see onGuifont).
+                    // NOTE: Do NOT call resetGlyphCacheFlags() here. With Phase 2
+                    // (core-managed atlas), clearing the cache every flush causes
+                    // every glyph to be re-rasterized every frame, filling the atlas
+                    // and triggering constant atlas resets.
 
                     // Get dynamic cache references (fallback to empty if not initialized)
                     const glyph_cache_ascii = ctx.core.glyph_cache_ascii;
@@ -821,9 +825,17 @@ pub const FlushCtx = struct {
                                                         ge = glyph_cache_ascii.?[cache_key];
                                                         break :blk true;
                                                     }
-                                                    // Cache miss: call Swift callback
+                                                    // Cache miss: call callback
                                                     perf_glyph_ascii_misses += 1;
-                                                    const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                                                    const ok = if (ctx.core.isPhase2Atlas()) cb: {
+                                                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                        if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                                            ge = entry;
+                                                            break :cb true;
+                                                        }
+                                                        break :cb false;
+                                                    } else if (style_mask != 0 and ensure_styled != null) cb: {
                                                         const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                                             @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                         break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
@@ -848,9 +860,17 @@ pub const FlushCtx = struct {
                                                     ge = glyph_cache_non_ascii.?[hash_idx];
                                                     break :blk true;
                                                 }
-                                                // Cache miss: call Swift callback
+                                                // Cache miss: call callback
                                                 perf_glyph_nonascii_misses += 1;
-                                                const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                                                const ok = if (ctx.core.isPhase2Atlas()) cb: {
+                                                    const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                        @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                    if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                                        ge = entry;
+                                                        break :cb true;
+                                                    }
+                                                    break :cb false;
+                                                } else if (style_mask != 0 and ensure_styled != null) cb: {
                                                     const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                                         @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                     break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
@@ -863,8 +883,16 @@ pub const FlushCtx = struct {
                                                 }
                                                 break :blk ok;
                                             }
-                                            // No cache available: call Swift callback directly
-                                            const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                                            // No cache available: call callback directly
+                                            const ok = if (ctx.core.isPhase2Atlas()) cb: {
+                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                                    ge = entry;
+                                                    break :cb true;
+                                                }
+                                                break :cb false;
+                                            } else if (style_mask != 0 and ensure_styled != null) cb: {
                                                 const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                                     @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
@@ -972,9 +1000,10 @@ pub const FlushCtx = struct {
                     }
 
                     ctx.core.grid.clearDirty();
-                    if (had_glyph_miss) {
+                    if (had_glyph_miss or ctx.core.atlas_reset_during_flush) {
                         ctx.core.grid.markAllDirty();
                     }
+                    ctx.core.atlas_reset_during_flush = false;
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
                         const t_rows_done_ns: i128 = std.time.nanoTimestamp();
@@ -1198,7 +1227,7 @@ pub const FlushCtx = struct {
                     // 3) Glyphs: run-length by (fg,bg,grid_id) and skip "all spaces"
                     const ensure_base_full = ctx.core.cb.on_atlas_ensure_glyph;
                     const ensure_styled_full = ctx.core.cb.on_atlas_ensure_glyph_styled;
-                    if (ensure_base_full != null or ensure_styled_full != null) {
+                    if (ctx.core.isPhase2Atlas() or ensure_base_full != null or ensure_styled_full != null) {
                         r = 0;
                         while (r < rows) : (r += 1) {
                             const row_start: usize = @as(usize, r) * @as(usize, cols);
@@ -1241,8 +1270,15 @@ pub const FlushCtx = struct {
                                         // Use styled callback for bold/italic if available
                                         const style_mask = cell.style_flags & (STYLE_BOLD | STYLE_ITALIC);
                                         const glyph_ok = blk: {
-                                            if (style_mask != 0 and ensure_styled_full != null) {
-                                                // Convert to C API style flags
+                                            if (ctx.core.isPhase2Atlas()) {
+                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                                    ge = entry;
+                                                    break :blk true;
+                                                }
+                                                break :blk false;
+                                            } else if (style_mask != 0 and ensure_styled_full != null) {
                                                 const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                                     @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 break :blk ensure_styled_full.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
@@ -1455,7 +1491,7 @@ pub const FlushCtx = struct {
                             const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
                             const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
 
-                            if (ensure_base != null or ensure_styled != null) {
+                            if (ctx.core.isPhase2Atlas() or ensure_base != null or ensure_styled != null) {
                                 var ge: c_api.GlyphEntry = undefined;
                                 var glyph_ok = false;
 
@@ -1467,8 +1503,12 @@ pub const FlushCtx = struct {
                                     @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
                                 // Get glyph entry from atlas using actual style
-                                // Matches main rendering path: styled for bold/italic, base otherwise
-                                if (cursor_style_mask != 0 and ensure_styled != null) {
+                                if (ctx.core.isPhase2Atlas()) {
+                                    if (ctx.core.ensureGlyphPhase2(cursor_cp, cursor_c_style)) |entry| {
+                                        ge = entry;
+                                        glyph_ok = true;
+                                    }
+                                } else if (cursor_style_mask != 0 and ensure_styled != null) {
                                     if (ensure_styled) |styled_fn| {
                                         glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, cursor_c_style, &ge) != 0;
                                     }
@@ -1513,6 +1553,14 @@ pub const FlushCtx = struct {
 
                 // Mark cursor as sent
                 ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
+            }
+
+            // If atlas was reset during vertex generation, mark grid dirty
+            // for re-render next flush (current frame may have stale UVs
+            // for vertices generated before the reset).
+            if (ctx.core.atlas_reset_during_flush) {
+                ctx.core.grid.markAllDirty();
+                ctx.core.atlas_reset_during_flush = false;
             }
 
             // ----------------------------
@@ -1560,6 +1608,14 @@ pub const FlushCtx = struct {
     }
 
     pub fn onGuifont(ctx: *FlushCtx, font: []const u8) !void {
+        // Invalidate caches BEFORE emitting callback: the callback may
+        // trigger vertex generation (e.g., Windows' updateLayoutToCore
+        // calls sendExternalGridVertices when cell dimensions change).
+        // Clearing first ensures those vertices use fresh cache lookups.
+        ctx.core.resetGlyphCacheFlags();
+        if (ctx.core.isPhase2Atlas()) {
+            ctx.core.resetCoreAtlas();
+        }
         ctx.core.emitGuiFont(font);
     }
 
@@ -1729,7 +1785,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     self.initGlyphCache() catch {
         self.log.write("[ext_grid] Failed to initialize glyph cache\n", .{});
     };
-    self.resetGlyphCacheFlags();
+    // Glyph cache is persistent across flushes (same as row_mode path).
 
     // Get glyph cache references
     const glyph_cache_ascii = self.glyph_cache_ascii;
@@ -2179,7 +2235,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             }
                             // Cache miss: call callback
                             cache.perf_glyph_ascii_misses += 1;
-                            const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                            const ok = if (self.isPhase2Atlas()) cb: {
+                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                    ge = entry;
+                                    break :cb true;
+                                }
+                                break :cb false;
+                            } else if (style_mask != 0 and ensure_styled != null) cb: {
                                 const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                 break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
@@ -2205,7 +2269,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         }
                         // Cache miss: call callback
                         cache.perf_glyph_nonascii_misses += 1;
-                        const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                        const ok = if (self.isPhase2Atlas()) cb: {
+                            const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                            if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                                ge = entry;
+                                break :cb true;
+                            }
+                            break :cb false;
+                        } else if (style_mask != 0 and ensure_styled != null) cb: {
                             const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                 @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                             break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
@@ -2219,7 +2291,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         break :blk ok;
                     }
                     // No cache: call callback directly
-                    const ok = if (style_mask != 0 and ensure_styled != null) cb: {
+                    const ok = if (self.isPhase2Atlas()) cb: {
+                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                        if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
+                            ge = entry;
+                            break :cb true;
+                        }
+                        break :cb false;
+                    } else if (style_mask != 0 and ensure_styled != null) cb: {
                         const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                             @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                         break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
@@ -2374,8 +2454,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
-                                // Matches main rendering path: styled for bold/italic, base otherwise
-                                if (ext_cursor_style != 0 and self.cb.on_atlas_ensure_glyph_styled != null) {
+                                // Matches main rendering path: Phase 2 → styled → base
+                                if (self.isPhase2Atlas()) {
+                                    if (self.ensureGlyphPhase2(cursor_cell.cp, ext_cursor_c_style)) |entry| {
+                                        glyph_entry = entry;
+                                        glyph_ok = 1;
+                                    }
+                                } else if (ext_cursor_style != 0 and self.cb.on_atlas_ensure_glyph_styled != null) {
                                     if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
                                         glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
                                     }
@@ -2441,6 +2526,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         // Clear dirty flags after sending (both dirty and dirty_rows)
         sg.clearDirty();
+        // If atlas was reset during this grid's rendering, re-mark dirty
+        // so it gets re-rendered with correct UVs next flush.
+        if (self.atlas_reset_during_flush) {
+            sg.dirty = true;
+            self.atlas_reset_during_flush = false;
+        }
     }
 }
 

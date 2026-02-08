@@ -109,6 +109,10 @@ final class GlyphAtlas {
 
     private var scratch: [UInt8] = []
 
+    /// Separate scratch buffer for rasterizeOnly (Phase 2).
+    /// Must not share with `scratch` which is used by uploadRegion.
+    private var rasterizeScratch: [UInt8] = []
+
     /// Maximum scratch buffer size (64KB - sufficient for large glyphs/emoji)
     private let maxScratchSize: Int = 64 * 1024
 
@@ -774,5 +778,172 @@ final class GlyphAtlas {
         )
     }
 
+    // MARK: - Phase 2: Core-managed atlas
+
+    /// Resolve font and glyph ID for a given scalar + style.
+    /// Must be called with mu locked.
+    private func resolveHbftAndGlyph_locked(scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer, glyphID: UInt32)? {
+        let failKey = (UInt64(styleFlags) << 32) | UInt64(scalar)
+        if failedScalarCache.contains(failKey) {
+            return nil
+        }
+
+        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
+        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
+
+        let (selectedFont, selectedHbft): (CTFont?, OpaquePointer?) = {
+            if styleFlags == 0 {
+                return (font, hbftFont)
+            } else if isBold && isItalic {
+                return (boldItalicFont ?? boldFont ?? italicFont, hbftBoldItalic ?? hbftBold ?? hbftItalic)
+            } else if isBold {
+                return (boldFont, hbftBold)
+            } else if isItalic {
+                return (italicFont, hbftItalic)
+            } else {
+                return (font, hbftFont)
+            }
+        }()
+
+        let fontToUse = selectedFont ?? font
+        let hbftToUse = selectedHbft ?? hbftFont
+
+        guard let hbft = hbftToUse else {
+            failedScalarCache.insert(failKey)
+            return nil
+        }
+
+        if let gid = glyphID(in: fontToUse, scalar: scalar) {
+            return (hbft: hbft, glyphID: gid)
+        }
+
+        if fontToUse !== font, let baseHbft = hbftFont, let gid = glyphID(in: font, scalar: scalar) {
+            return (hbft: baseHbft, glyphID: gid)
+        }
+
+        guard let fbCT = ctFontForScalarFallback(base: fontToUse, scalar: scalar) else {
+            failedScalarCache.insert(failKey)
+            return nil
+        }
+        guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
+            failedScalarCache.insert(failKey)
+            return nil
+        }
+        guard let face = ensureHbFtFace_locked(for: fbCT) else {
+            failedScalarCache.insert(failKey)
+            return nil
+        }
+
+        return (hbft: face.hbft, glyphID: fbGid)
+    }
+
+    /// Phase 2: Rasterize a glyph without atlas packing.
+    /// Fills outBitmap with the FreeType bitmap data.
+    /// The pixel pointer is valid until the next rasterize call.
+    func rasterizeOnly(scalar: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        guard let resolved = resolveHbftAndGlyph_locked(scalar: scalar, styleFlags: styleFlags) else {
+            return false
+        }
+
+        var bufPtr: UnsafePointer<UInt8>?
+        var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+        var left: Int32 = 0, top: Int32 = 0, adv26_6: Int32 = 0
+
+        let r = zonvie_ft_render_glyph(
+            resolved.hbft, resolved.glyphID,
+            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6
+        )
+
+        outBitmap.pointee.bearing_x = left
+        outBitmap.pointee.bearing_y = top
+        outBitmap.pointee.advance_26_6 = adv26_6
+        outBitmap.pointee.ascent_px = ascentPx
+        outBitmap.pointee.descent_px = descentPx
+        outBitmap.pointee.bytes_per_pixel = 1 // grayscale
+
+        if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
+            outBitmap.pointee.pixels = nil
+            outBitmap.pointee.width = 0
+            outBitmap.pointee.height = 0
+        } else {
+            // Copy bitmap data to stable buffer while under lock.
+            // This prevents use-after-free if main thread destroys FreeType font
+            // (via setBackingScale/rebuildFont_locked) between rasterizeOnly and uploadRegion.
+            let needed = Int(w) * Int(h)
+            if rasterizeScratch.count < needed {
+                rasterizeScratch = Array(repeating: 0, count: needed)
+            }
+            let absPitch = abs(Int(pitch))
+            rasterizeScratch.withUnsafeMutableBufferPointer { dst in
+                guard let base = dst.baseAddress else { return }
+                for row in 0..<Int(h) {
+                    let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
+                    let src = bufPtr!.advanced(by: srcRow * absPitch)
+                    memcpy(base.advanced(by: row * Int(w)), src, Int(w))
+                }
+            }
+            rasterizeScratch.withUnsafeBufferPointer { buf in
+                outBitmap.pointee.pixels = buf.baseAddress
+            }
+            outBitmap.pointee.width = UInt32(w)
+            outBitmap.pointee.height = UInt32(h)
+            outBitmap.pointee.pitch = Int32(w)  // contiguous: pitch = width
+        }
+
+        return true
+    }
+
+    /// Phase 2: Upload glyph bitmap data to atlas texture at the specified position.
+    func uploadRegion(destX: Int, destY: Int, width: Int, height: Int, bitmap: UnsafePointer<zonvie_glyph_bitmap>) {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        guard let tex = texture, let pixels = bitmap.pointee.pixels else { return }
+        let pitch = Int(bitmap.pointee.pitch)
+        let absPitch = abs(pitch)
+        let needed = width * height
+        if needed <= 0 { return }
+
+        if scratch.count < needed {
+            scratch = Array<UInt8>(repeating: 0, count: needed)
+        } else {
+            scratch.withUnsafeMutableBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                memset(base, 0, needed)
+            }
+        }
+
+        scratch.withUnsafeMutableBufferPointer { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            for row in 0..<height {
+                let srcRow = pitch >= 0 ? row : (height - 1 - row)
+                let src = pixels.advanced(by: srcRow * absPitch)
+                memcpy(dstBase.advanced(by: row * width), src, min(width, Int(bitmap.pointee.width)))
+            }
+        }
+
+        scratch.withUnsafeBytes { raw in
+            guard let baseAddr = raw.baseAddress else { return }
+            let region = MTLRegionMake2D(destX, destY, width, height)
+            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: width)
+        }
+    }
+
+    /// Phase 2: Recreate atlas texture with the given dimensions.
+    func recreateTexture(width: Int, height: Int) {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        texture = makeTexture(device: device, w: width, h: height)
+        // Reset local packer state (core manages packing in Phase 2)
+        nextX = 1
+        nextY = 1
+        rowH = 0
+        map.removeAll(keepingCapacity: true)
+        failedScalarCache.removeAll(keepingCapacity: true)
+    }
 
 }

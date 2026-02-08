@@ -148,6 +148,42 @@ pub const AtlasEnsureGlyphStyledFn = *const fn (
     out_entry: *GlyphEntry,
 ) callconv(.c) c_int;
 
+// Phase 2: Core-managed atlas types
+pub const GlyphBitmap = extern struct {
+    pixels: ?[*]const u8,
+    width: u32,
+    height: u32,
+    pitch: i32,
+    bearing_x: i32,
+    bearing_y: i32,
+    advance_26_6: i32,
+    ascent_px: f32,
+    descent_px: f32,
+    bytes_per_pixel: u32,
+};
+
+pub const RasterizeGlyphFn = *const fn (
+    ctx: ?*anyopaque,
+    scalar: u32,
+    style_flags: u32,
+    out_bitmap: *GlyphBitmap,
+) callconv(.c) c_int;
+
+pub const AtlasUploadFn = *const fn (
+    ctx: ?*anyopaque,
+    dest_x: u32,
+    dest_y: u32,
+    width: u32,
+    height: u32,
+    bitmap: *const GlyphBitmap,
+) callconv(.c) void;
+
+pub const AtlasCreateFn = *const fn (
+    ctx: ?*anyopaque,
+    atlas_w: u32,
+    atlas_h: u32,
+) callconv(.c) void;
+
 pub const OnVerticesFn = *const fn (
     ctx: ?*anyopaque,
     main_verts: [*]const Vertex,
@@ -414,6 +450,11 @@ pub const Callbacks = extern struct {
 
     // Quit request notification (window close with unsaved buffer check)
     on_quit_requested: ?*const fn (ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void = null,
+
+    // Phase 2: Core-managed atlas callbacks
+    on_rasterize_glyph: ?RasterizeGlyphFn = null,
+    on_atlas_upload: ?AtlasUploadFn = null,
+    on_atlas_create: ?AtlasCreateFn = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -440,14 +481,26 @@ fn asBox(p: *zonvie_core) *CoreBox {
     return @ptrCast(@alignCast(p));
 }
 
-pub export fn zonvie_core_create(cb: ?*const Callbacks, ctx: ?*anyopaque) ?*zonvie_core {
+pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, ctx: ?*anyopaque) ?*zonvie_core {
     const box = std.heap.c_allocator.create(CoreBox) catch return null;
 
     // Initialize box state.
     box.* = .{
         .gpa = .{},
         .core = undefined,
-        .cb = if (cb) |p| p.* else .{},
+        .cb = if (cb) |p| blk: {
+            var result: Callbacks = .{}; // zero-init: all callbacks null
+            if (callbacks_size == 0 or callbacks_size >= @sizeOf(Callbacks)) {
+                // Current version or unspecified: copy whole struct
+                result = p.*;
+            } else {
+                // Older version with fewer fields: copy only what they provided
+                const src = @as([*]const u8, @ptrCast(p));
+                const dst = @as([*]u8, @ptrCast(&result));
+                @memcpy(dst[0..callbacks_size], src[0..callbacks_size]);
+            }
+            break :blk result;
+        } else .{},
         .ctx = ctx,
     };
 
@@ -512,6 +565,11 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, ctx: ?*anyopaque) ?*zonv
 
         // Quit request notification
         .on_quit_requested = box.cb.on_quit_requested,
+
+        // Phase 2: Core-managed atlas
+        .on_rasterize_glyph = box.cb.on_rasterize_glyph,
+        .on_atlas_upload = box.cb.on_atlas_upload,
+        .on_atlas_create = box.cb.on_atlas_create,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);

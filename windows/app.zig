@@ -18,6 +18,7 @@ pub const BgSpan = core.BgSpan;
 pub const TextRun = core.TextRun;
 pub const Cursor = core.Cursor;
 pub const GlyphEntry = core.GlyphEntry;
+pub const GlyphBitmap = core.GlyphBitmap;
 pub const MsgChunk = core.MsgChunk;
 pub const zonvie_msg_view_type = core.zonvie_msg_view_type;
 pub const ViewportInfo = core.ViewportInfo;

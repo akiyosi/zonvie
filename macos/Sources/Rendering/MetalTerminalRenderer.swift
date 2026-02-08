@@ -253,6 +253,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return atlas.entry(for: scalar, styleFlags: styleFlags)
     }
 
+    // Phase 2: Core-managed atlas pass-through
+
+    func rasterizeGlyphOnly(scalar: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+        return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, outBitmap: outBitmap)
+    }
+
+    func uploadAtlasRegion(destX: UInt32, destY: UInt32, width: UInt32, height: UInt32, bitmap: UnsafePointer<zonvie_glyph_bitmap>) {
+        atlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
+    }
+
+    func recreateAtlasTexture(width: UInt32, height: UInt32) {
+        atlas.recreateTexture(width: Int(width), height: Int(height))
+    }
+
     private var vertexBuffer: MTLBuffer?
     private var vertexBufferCapacity: Int = 0
 

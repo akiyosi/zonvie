@@ -12,6 +12,7 @@ const Logger = @import("log.zig").Logger;
 const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
+const shelf_packer = @import("shelf_packer.zig");
 
 pub const Callbacks = struct {
     on_vertices: ?*const fn (
@@ -230,6 +231,11 @@ pub const Callbacks = struct {
     /// Called when user-initiated quit is requested (window close button).
     /// has_unsaved: non-zero if there are unsaved buffers.
     on_quit_requested: ?*const fn (ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void = null,
+
+    // Phase 2: Core-managed atlas callbacks
+    on_rasterize_glyph: ?c_api.RasterizeGlyphFn = null,
+    on_atlas_upload: ?c_api.AtlasUploadFn = null,
+    on_atlas_create: ?c_api.AtlasCreateFn = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -381,6 +387,13 @@ pub const Core = struct {
     glyph_keys_non_ascii: ?[]u64 = null,
     glyph_cache_initialized: bool = false,
 
+    // Phase 2: Core-managed atlas
+    atlas_packer: ?shelf_packer.ShelfPacker = null,
+    atlas_w: u32 = 2048,
+    atlas_h: u32 = 2048,
+    atlas_initialized: bool = false,
+    atlas_reset_during_flush: bool = false,
+
     // Owned copy of nvim path (kept alive for runLoop thread)
     nvim_path_owned: ?[]const u8 = null,
 
@@ -520,7 +533,9 @@ pub const Core = struct {
         self.glyph_cache_initialized = true;
     }
 
-    /// Reset glyph cache valid flags (call at start of each flush)
+    /// Reset glyph cache valid flags.
+    /// Called when the frontend atlas is invalidated (e.g. guifont change),
+    /// so that the next flush re-queries all glyphs via callbacks.
     pub fn resetGlyphCacheFlags(self: *Core) void {
         if (self.glyph_valid_ascii) |buf| {
             @memset(buf, false);
@@ -529,6 +544,107 @@ pub const Core = struct {
             const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
             @memset(buf, INVALID_KEY);
         }
+    }
+
+    // --- Phase 2: Core-managed atlas ---
+
+    /// Returns true if all three Phase 2 callbacks are registered.
+    /// When true, the core drives atlas packing/UV instead of the frontend.
+    pub fn isPhase2Atlas(self: *const Core) bool {
+        return self.cb.on_rasterize_glyph != null and
+            self.cb.on_atlas_upload != null and
+            self.cb.on_atlas_create != null;
+    }
+
+    /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
+    /// Returns null on unrecoverable failure (rasterize callback returned 0).
+    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+        // Lazy atlas init
+        if (!self.atlas_initialized) {
+            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
+            if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
+            self.atlas_initialized = true;
+        }
+
+        // Ask frontend to rasterize (no packing / UV)
+        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
+        if (ok == 0) return null; // rasterize failed
+
+        // Whitespace / zero-size glyph → return entry with zero UVs
+        if (bm.width == 0 or bm.height == 0) {
+            const adv: f32 = @as(f32, @floatFromInt(bm.advance_26_6)) / 64.0;
+            return c_api.GlyphEntry{
+                .uv_min = .{ 0, 0 },
+                .uv_max = .{ 0, 0 },
+                .bbox_origin_px = .{ 0, 0 },
+                .bbox_size_px = .{ 0, 0 },
+                .advance_px = adv,
+                .ascent_px = bm.ascent_px,
+                .descent_px = bm.descent_px,
+            };
+        }
+
+        // Reject glyphs larger than the atlas (can never fit)
+        const pad2 = self.atlas_packer.?.padding * 2;
+        if (bm.width + pad2 > self.atlas_w or bm.height + pad2 > self.atlas_h) {
+            return null;
+        }
+
+        // Try to pack
+        var packer = &(self.atlas_packer.?);
+        var rect = packer.alloc(bm.width, bm.height);
+
+        // Atlas full → reset and retry once.
+        // Flag the reset so the flush loop knows earlier rows have stale UVs.
+        if (rect == null) {
+            self.atlas_reset_during_flush = true;
+            self.resetCoreAtlas();
+            packer = &(self.atlas_packer.?);
+            rect = packer.alloc(bm.width, bm.height);
+            if (rect == null) return null; // still can't fit, give up
+        }
+
+        const r = rect.?;
+
+        // Upload glyph bitmap at (rect.x + padding, rect.y + padding)
+        if (self.cb.on_atlas_upload) |f| {
+            f(self.ctx, r.x + packer.padding, r.y + packer.padding, bm.width, bm.height, &bm);
+        }
+
+        // Compute UVs (excluding padding)
+        const uvs = packer.computeUV(r.x, r.y, bm.width, bm.height);
+
+        // Build GlyphEntry
+        const adv: f32 = @as(f32, @floatFromInt(bm.advance_26_6)) / 64.0;
+        const bearing_x_f: f32 = @floatFromInt(bm.bearing_x);
+        const bearing_y_f: f32 = @floatFromInt(bm.bearing_y);
+        const bm_h_f: f32 = @floatFromInt(bm.height);
+        const bm_w_f: f32 = @floatFromInt(bm.width);
+
+        return c_api.GlyphEntry{
+            .uv_min = .{ uvs[0], uvs[1] },
+            .uv_max = .{ uvs[2], uvs[3] },
+            .bbox_origin_px = .{ bearing_x_f, bearing_y_f - bm_h_f },
+            .bbox_size_px = .{ bm_w_f, bm_h_f },
+            .advance_px = adv,
+            .ascent_px = bm.ascent_px,
+            .descent_px = bm.descent_px,
+        };
+    }
+
+    /// Reset core atlas: clear packer, invalidate cache, recreate texture.
+    pub fn resetCoreAtlas(self: *Core) void {
+        if (self.atlas_packer) |*p| {
+            p.reset();
+        } else {
+            // Packer not yet created (e.g. onGuifont before first glyph render).
+            // Create it now so atlas_initialized=true is safe.
+            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
+        }
+        self.resetGlyphCacheFlags();
+        self.atlas_initialized = true;
+        if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
     }
 
     /// Set glyph cache sizes (must be called before start or during stop)

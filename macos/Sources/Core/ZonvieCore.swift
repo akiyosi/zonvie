@@ -24,7 +24,13 @@ final class ZonvieCore {
     private var isDevcontainerMode: Bool = false
 
     // Wire this from ViewController.
-    weak var terminalView: MetalTerminalView?
+    weak var terminalView: MetalTerminalView? {
+        didSet {
+            if terminalView != nil {
+                processPendingExternalWindows()
+            }
+        }
+    }
 
     static var appLogEnabled = false
     static var appLogFilePath: String? = nil
@@ -467,10 +473,20 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onQuitRequested(hasUnsaved: hasUnsaved != 0)
+            },
+
+            on_rasterize_glyph: { ctx, scalar, styleFlags, outBitmap in
+                return zonvie_macos_rasterize_glyph(ctx, scalar, styleFlags, outBitmap)
+            },
+            on_atlas_upload: { ctx, destX, destY, width, height, bitmap in
+                zonvie_macos_atlas_upload(ctx, destX, destY, width, height, bitmap)
+            },
+            on_atlas_create: { ctx, atlasW, atlasH in
+                zonvie_macos_atlas_create(ctx, atlasW, atlasH)
             }
         )
 
-        self.core = zonvie_core_create(&cb, self.ctxPtr)
+        self.core = zonvie_core_create(&cb, MemoryLayout<zonvie_callbacks>.size, self.ctxPtr)
 
         // Setup SSH authentication notification observer
         setupSSHNotificationObserver()
@@ -1641,9 +1657,25 @@ final class ZonvieCore {
                 Self.appLog("[onGuiFont] guifont empty, using config font '\(configFont)' size=\(size)")
             }
 
+            // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
+            // the same flush's vertex generation) uses the new font immediately.
+            // atlas.setFont() is thread-safe (protected by os_unfair_lock).
+            view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size))
+
+            // Notify core of new cell dimensions so vertex positions match
+            // the new glyph metrics. updateLayoutPx detects in_handle_redraw
+            // and takes the lock-free path (grid_mu already held by flush).
+            let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+            let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+            let ds = view.currentDrawableSize
+            let dw = max(1, Int(ds.width))
+            let dh = max(1, Int(ds.height))
+            updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
+                           cellW: UInt32(cw), cellH: UInt32(ch))
+
+            // GUI-only updates (redraw, external window notify) can be async.
             DispatchQueue.main.async { [weak self] in
-                view.applyGuiFont(name: name, pointSize: CGFloat(size))
-                // Notify all external grid views that font has changed and request redraw
+                view.requestRedraw()
                 self?.externalGridViews.values.forEach {
                     $0.notifyFontChanged()
                     $0.requestRedraw()
@@ -1655,8 +1687,22 @@ final class ZonvieCore {
 
     private func onLineSpace(px: Int32) {
         guard let view = terminalView else { return }
+
+        // Apply linespace synchronously so cell height is correct for
+        // vertex generation in the current flush.
+        view.renderer.setLineSpace(px: px)
+
+        // Notify core of new cell dimensions (cell height includes linespace).
+        let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+        let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let ds = view.currentDrawableSize
+        let dw = max(1, Int(ds.width))
+        let dh = max(1, Int(ds.height))
+        updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
+                       cellW: UInt32(cw), cellH: UInt32(ch))
+
         DispatchQueue.main.async {
-            view.applyLineSpace(px: px)
+            view.requestRedraw(nil)
         }
     }
 
@@ -1707,6 +1753,17 @@ final class ZonvieCore {
     /// externalWindows is confined to the main thread. The on_vertices_row callback
     /// copies vertex data on the RPC thread and dispatches to main for submission.
     private var pendingExternalVertices: [Int64: (rowVertices: [Int: [zonvie_vertex]], rows: UInt32, cols: UInt32)] = [:]
+
+    /// Pending external window requests (queued when terminalView or pipeline is not ready yet)
+    private struct PendingExternalWindowRequest {
+        let gridId: Int64
+        let win: Int64
+        let rows: UInt32
+        let cols: UInt32
+        let startRow: Int32
+        let startCol: Int32
+    }
+    private var pendingExternalWindowRequests: [PendingExternalWindowRequest] = []
 
     /// Current cmdline firstc character (':', '/', '?', etc.)
     private var cmdlineFirstc: UInt8 = 0
@@ -1915,7 +1972,10 @@ final class ZonvieCore {
 
             // Get cell dimensions and shared resources from the main terminal view
             guard let mainView = self.terminalView else {
-                ZonvieCore.appLog("[external_window] no terminalView, cannot get cell dimensions")
+                ZonvieCore.appLog("[external_window] no terminalView, queuing request for gridId=\(gridId)")
+                self.pendingExternalWindowRequests.append(PendingExternalWindowRequest(
+                    gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol
+                ))
                 return
             }
 
@@ -2306,7 +2366,14 @@ final class ZonvieCore {
 
             guard let sharedPipeline = renderer.sharedPipeline,
                   let sharedSampler = renderer.sharedSampler else {
-                ZonvieCore.appLog("[external_window] renderer pipelines not ready")
+                ZonvieCore.appLog("[external_window] renderer pipelines not ready, queuing request for gridId=\(gridId)")
+                self.pendingExternalWindowRequests.append(PendingExternalWindowRequest(
+                    gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol
+                ))
+                // Retry after a short delay (pipeline may become ready after first draw)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.processPendingExternalWindows()
+                }
                 return
             }
 
@@ -2526,6 +2593,18 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[DEBUG-BLUR-REFRESH] Re-applying blur to main window after external window shown")
                 Self.applyWindowBlur(window: mainWindow, radius: ZonvieConfig.shared.window.blurRadius)
             }
+        }
+    }
+
+    /// Process any pending external window requests that were queued when
+    /// terminalView or pipeline was not ready.
+    private func processPendingExternalWindows() {
+        guard !pendingExternalWindowRequests.isEmpty else { return }
+        let requests = pendingExternalWindowRequests
+        pendingExternalWindowRequests.removeAll()
+        ZonvieCore.appLog("[external_window] processing \(requests.count) pending request(s)")
+        for req in requests {
+            onExternalWindow(gridId: req.gridId, win: req.win, rows: req.rows, cols: req.cols, startRow: req.startRow, startCol: req.startCol)
         }
     }
 

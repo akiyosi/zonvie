@@ -251,7 +251,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     /// Notify that font has changed - reset state to force clear on next frame
     func notifyFontChanged() {
+        lock.lock()
+        defer { lock.unlock() }
         hasPresentedOnce = false
+        // Clear all row vertex counts so stale rows from the old font are not drawn
+        for i in 0..<rowVertexCounts.count {
+            rowVertexCounts[i] = 0
+        }
     }
 
     /// Submit vertices for rendering. Called from the Zig core callback.
@@ -294,6 +300,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rowVertexBuffers.append(nil)
             rowVertexBufferCaps.append(0)
             rowVertexCounts.append(0)
+        }
+
+        // Clear counts for rows beyond the current grid size (grid shrank, e.g. after guifont)
+        for i in totalRows..<rowVertexCounts.count {
+            rowVertexCounts[i] = 0
         }
 
         guard rowCount > 0, rowStart >= 0, rowStart < maxRowBuffers else { return }
