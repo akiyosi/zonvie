@@ -544,14 +544,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Calculate content bounds in NDC
             // Grid top is info.gridTopYNDC
             // Content starts after margin_top rows (going down = lower Y in NDC)
-            // Subtract a small epsilon to ensure boundary vertices (at exactly marginTop row edge)
-            // are NOT scrolled. Without this, the margin area's background quad bottom edge
-            // would be scrolled, causing the quad to deform.
-            let epsilon: Float = 0.001 * cellHeightNDC
-            let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC - epsilon
-            // Content ends before margin_bottom rows
-            // Add epsilon to ensure boundary vertices at bottom margin edge are NOT scrolled
-            let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC + epsilon
+            // Content bounds for fragment shader clipping (exact boundaries).
+            // Scroll decision is now flag-based (DECO_SCROLLABLE in vertex data),
+            // so these bounds only control fragment-level clipping of scrolled content
+            // that ends up in margin areas.
+            let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC
+            let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
 
             ZonvieCore.appLog("[renderer] scroll offset: gridId=\(info.gridId) offsetYPx=\(info.offsetYPx) ndc=\(ndc) contentTop=\(contentTopY) contentBottom=\(contentBottomY)")
             return ScrollOffset(
@@ -616,11 +614,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let cellHeightNDC: Float = cellHeightPx * scale
         let ndc = -info.offsetYPx * scale
 
-        // Calculate content bounds in NDC
-        // Subtract a small epsilon to ensure boundary vertices at margin edge are NOT scrolled
-        let epsilon: Float = 0.001 * cellHeightNDC
-        let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC - epsilon
-        let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC + epsilon
+        // Content bounds for fragment shader clipping (exact boundaries).
+        let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC
+        let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
 
         return ScrollOffset(
             grid_id: Int32(truncatingIfNeeded: info.gridId),

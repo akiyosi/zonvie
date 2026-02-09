@@ -9,6 +9,7 @@ using namespace metal;
 #define DECO_UNDERDASHED   (1u << 4)
 #define DECO_STRIKETHROUGH (1u << 5)
 #define DECO_CURSOR        (1u << 6)
+#define DECO_SCROLLABLE    (1u << 7)
 
 struct VertexIn {
     float2 position [[attribute(0)]];
@@ -55,23 +56,47 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
     o.content_bottom_y = -2.0; // Below screen
     o.was_content = 0.0;
 
-    // Apply scroll offset for matching grid_id, only if within scrollable content area
+    // Apply scroll offset for matching grid_id, using DECO_SCROLLABLE flag
+    // instead of position-based bounds. The flag is set by the Zig core during
+    // vertex generation for content rows (not margin rows like tabline/statusline).
+    // This avoids quad deformation when glyph vertices extend beyond cell boundaries.
     for (uint i = 0; i < scrollOffsetCount; i++) {
         if (scrollOffsets[i].grid_id == in.grid_id) {
-            // Check if vertex is in scrollable content area (between margin top and bottom)
-            // In NDC: top is higher Y, bottom is lower Y
-            float content_top = scrollOffsets[i].content_top_y;
-            float content_bottom = scrollOffsets[i].content_bottom_y;
-
             // Pass content bounds to fragment shader for clipping
-            o.content_top_y = content_top;
-            o.content_bottom_y = content_bottom;
+            o.content_top_y = scrollOffsets[i].content_top_y;
+            o.content_bottom_y = scrollOffsets[i].content_bottom_y;
 
-            // Only scroll if within content area (not in margins)
-            // Use <= for top boundary to include vertices at exactly content_top (row 0)
-            if (pos.y <= content_top && pos.y >= content_bottom) {
-                pos.y += scrollOffsets[i].offset_y;
-                o.was_content = 1.0; // Mark as content (may need clipping after scroll)
+            // Only scroll vertices flagged as scrollable (content area, not margins)
+            if (in.deco_flags & DECO_SCROLLABLE) {
+                float offset = scrollOffsets[i].offset_y;
+
+                // Check if this is a plain background quad (uv.x < 0, no deco/cursor flags).
+                // Bits 0-6 cover all non-SCROLLABLE flags; if none set → plain background.
+                bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & 0x7Fu) == 0);
+
+                if (is_plain_bg) {
+                    // Background quads at content area edges: keep the boundary vertex
+                    // pinned so the edge row stretches to fill the gap left by scrolling.
+                    // This prevents transparent gaps at top/bottom during smooth scroll.
+                    // Glyph/decoration vertices always scroll uniformly (no deformation).
+                    if (offset > 0.0) {
+                        // Scrolling up: gap at bottom → pin bottom-boundary vertex
+                        bool at_bottom = abs(pos.y - scrollOffsets[i].content_bottom_y) < 0.001;
+                        if (!at_bottom) {
+                            pos.y += offset;
+                        }
+                    } else if (offset < 0.0) {
+                        // Scrolling down: gap at top → pin top-boundary vertex
+                        bool at_top = abs(pos.y - scrollOffsets[i].content_top_y) < 0.001;
+                        if (!at_top) {
+                            pos.y += offset;
+                        }
+                    }
+                } else {
+                    // Glyph/decoration: uniform scroll (no deformation)
+                    pos.y += offset;
+                }
+                o.was_content = 1.0;
             }
             break;
         }
@@ -113,7 +138,9 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (in.uv.x < 0.0) {
         // Handle decorations (keep full alpha for decorations like underlines)
-        if (in.deco_flags != 0) {
+        // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag,
+        // not a visual decoration.
+        if ((in.deco_flags & 0x7Fu) != 0) {
             // Undercurl: sine wave
             if (in.deco_flags & DECO_UNDERCURL) {
                 float wave_freq = 3.14159265 * 2.0;  // One full wave per cell
@@ -224,8 +251,9 @@ fragment float4 ps_background(VSOut in [[stage_in]],
         }
     }
 
-    // Only process background quads (uv.x < 0 and no decoration flags)
-    if (in.uv.x >= 0.0 || in.deco_flags != 0) {
+    // Only process background quads (uv.x < 0 and no visual decoration flags)
+    // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag.
+    if (in.uv.x >= 0.0 || (in.deco_flags & 0x7Fu) != 0) {
         discard_fragment();
     }
 
@@ -268,7 +296,8 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
     }
 
     // Handle decorations (underlines, undercurl, etc.)
-    if (in.uv.x < 0.0 && in.deco_flags != 0) {
+    // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag.
+    if (in.uv.x < 0.0 && (in.deco_flags & 0x7Fu) != 0) {
         // Undercurl: sine wave
         if (in.deco_flags & DECO_UNDERCURL) {
             float wave_freq = 3.14159265 * 2.0;

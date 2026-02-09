@@ -142,6 +142,7 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_UNDERDASHED   (1u << 4)
 #define ZONVIE_DECO_STRIKETHROUGH (1u << 5)
 #define ZONVIE_DECO_CURSOR        (1u << 6)  /* Marker for cursor vertices (not a decoration) */
+#define ZONVIE_DECO_SCROLLABLE    (1u << 7)  /* Vertex is in scrollable content area (not margin) */
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];

@@ -32,6 +32,8 @@ pub const CachedSubgrid = struct {
     sg_cols: u32,
     sg_rows: u32,
     cells: [*]const grid_mod.Cell, // pointer to subgrid cells
+    margin_top: u32, // viewport margin rows at top (not scrollable)
+    margin_bottom: u32, // viewport margin rows at bottom (not scrollable)
 };
 
 // Style flags for RenderCell (bit positions)
@@ -293,6 +295,7 @@ pub const FlushCtx = struct {
                     col: [4]f32,
                     vw: f32, vh: f32,
                     grid_id: i64,
+                    base_deco_flags: u32,
                 ) !void {
                     const p0 = ndc(x0, y0, vw, vh);
                     const p1 = ndc(x1, y0, vw, vh);
@@ -302,13 +305,13 @@ pub const FlushCtx = struct {
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
-                    v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
+                    v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
 
-                    v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
+                    v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
                 }
 
                 fn pushGlyphQuad(
@@ -319,6 +322,7 @@ pub const FlushCtx = struct {
                     col: [4]f32,
                     vw: f32, vh: f32,
                     grid_id: i64,
+                    base_deco_flags: u32,
                 ) !void {
                     const p0 = ndc(x0, y0, vw, vh);
                     const p1 = ndc(x1, y0, vw, vh);
@@ -328,13 +332,13 @@ pub const FlushCtx = struct {
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
-                    v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
+                    v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
 
-                    v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
-                    v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 };
+                    v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
                 }
 
                 fn pushDecoQuad(
@@ -371,6 +375,27 @@ pub const FlushCtx = struct {
                     v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+                }
+
+                /// Compute DECO_SCROLLABLE flag for a cell at main grid row `r` with the given grid_id.
+                /// For grid_id=1, uses the pre-computed main_scrollable flag.
+                /// For sub-grids, checks the sub-grid's own viewport margins.
+                fn computeScrollFlag(
+                    r: u32,
+                    run_grid_id: i64,
+                    main_scrollable: u32,
+                    cached_sgs: []const CachedSubgrid,
+                ) u32 {
+                    if (run_grid_id == 1) return main_scrollable;
+                    for (cached_sgs) |csg| {
+                        if (csg.grid_id == run_grid_id) {
+                            const internal_row = r -| csg.row_start;
+                            if (internal_row >= csg.margin_top and internal_row < csg.sg_rows -| csg.margin_bottom)
+                                return c_api.DECO_SCROLLABLE;
+                            return 0;
+                        }
+                    }
+                    return c_api.DECO_SCROLLABLE; // Unknown grid: default scrollable
                 }
             };
 
@@ -431,6 +456,35 @@ pub const FlushCtx = struct {
                             ctx.core.grid_entries.items[k] = key;
                         }
                     }
+                }
+
+                // Pre-compute subgrid info (shared by row-mode and non-row-mode paths).
+                // Caches win_pos/sub_grids lookups and viewport margins to avoid
+                // per-row hash map access during vertex generation.
+                var cached_subgrids: [MAX_CACHED_SUBGRIDS]CachedSubgrid = undefined;
+                var cached_subgrid_count: usize = 0;
+                for (ctx.core.grid_entries.items) |ent| {
+                    if (cached_subgrid_count >= MAX_CACHED_SUBGRIDS) break;
+                    const subgrid_id = ent.grid_id;
+                    const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
+                    const sg = ctx.core.grid.sub_grids.get(subgrid_id) orelse continue;
+
+                    // Skip float windows anchored to external grids
+                    if (pos.anchor_grid != 1 and ctx.core.grid.external_grids.contains(pos.anchor_grid)) continue;
+
+                    const sg_margins = ctx.core.grid.getViewportMargins(subgrid_id);
+                    cached_subgrids[cached_subgrid_count] = .{
+                        .grid_id = subgrid_id,
+                        .row_start = pos.row,
+                        .row_end = pos.row + sg.rows,
+                        .col_start = pos.col,
+                        .sg_cols = sg.cols,
+                        .sg_rows = sg.rows,
+                        .cells = sg.cells.ptr,
+                        .margin_top = sg_margins.top,
+                        .margin_bottom = sg_margins.bottom,
+                    };
+                    cached_subgrid_count += 1;
                 }
 
                 // -------------------------------------------------
@@ -505,36 +559,17 @@ pub const FlushCtx = struct {
                     const GLYPH_CACHE_ASCII_SIZE = ctx.core.glyph_cache_ascii_size;
                     const GLYPH_CACHE_NON_ASCII_SIZE = ctx.core.glyph_cache_non_ascii_size;
 
-                    // Pre-compute subgrid info to avoid per-row hash map lookups
-                    // This is a major optimization for full-screen redraws with many subgrids
-                    var cached_subgrids: [MAX_CACHED_SUBGRIDS]CachedSubgrid = undefined;
-                    var cached_subgrid_count: usize = 0;
-                    for (ctx.core.grid_entries.items) |ent| {
-                        if (cached_subgrid_count >= MAX_CACHED_SUBGRIDS) break;
-                        const subgrid_id = ent.grid_id;
-                        const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
-                        const sg = ctx.core.grid.sub_grids.get(subgrid_id) orelse continue;
-
-                        // Skip float windows anchored to external grids
-                        if (pos.anchor_grid != 1 and ctx.core.grid.external_grids.contains(pos.anchor_grid)) continue;
-
-                        cached_subgrids[cached_subgrid_count] = .{
-                            .grid_id = subgrid_id,
-                            .row_start = pos.row,
-                            .row_end = pos.row + sg.rows,
-                            .col_start = pos.col,
-                            .sg_cols = sg.cols,
-                            .sg_rows = sg.rows,
-                            .cells = sg.cells.ptr,
-                        };
-                        cached_subgrid_count += 1;
-                    }
+                    // Get viewport margins for scrollable row detection
+                    const main_margins = ctx.core.grid.getViewportMargins(1);
 
                     var r: u32 = 0;
                     while (r < rows) : (r += 1) {
                         if (!rebuild_all) {
                             if (!ctx.core.grid.dirty_rows.isSet(@as(usize, r))) continue;
                         }
+
+                        // Compute scrollable flag for this row: content rows get DECO_SCROLLABLE, margin rows (tabline/statusline) do not
+                        const main_scrollable: u32 = if (r >= main_margins.top and r < rows -| main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
                         var out = &ctx.core.row_verts;
                         out.clearRetainingCapacity();
@@ -679,7 +714,8 @@ pub const FlushCtx = struct {
                                     (if (ctx.core.blur_enabled) 0.5 else ctx.core.background_opacity)
                                 else
                                     1.0;
-                                try Helpers.pushSolidQuad(out, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id);
+                                const scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                try Helpers.pushSolidQuad(out, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id, scroll_flag);
                                 c = end;
                             }
                         }
@@ -718,6 +754,7 @@ pub const FlushCtx = struct {
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                const deco_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
 
                                 const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                                 const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
@@ -727,7 +764,7 @@ pub const FlushCtx = struct {
                                 if (run_flags & STYLE_UNDERLINE != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
                                 }
 
                                 // Underdouble: 2 lines at bottom with clear gap
@@ -736,8 +773,8 @@ pub const FlushCtx = struct {
                                     const y1_1 = y0_1 + 1.0;
                                     const y0_2 = row_y + cellH - 2.0;
                                     const y1_2 = y0_2 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
                                 }
 
                                 // Undercurl: wavy line (shader-based)
@@ -745,21 +782,21 @@ pub const FlushCtx = struct {
                                     const y0 = row_y + cellH - 4.0;
                                     const y1 = row_y + cellH;
                                     const phase: f32 = @floatFromInt(run_start);
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL, phase);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL | deco_scroll_flag, phase);
                                 }
 
                                 // Underdotted: dotted line (shader-based)
                                 if (run_flags & STYLE_UNDERDOTTED != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED, 0);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED | deco_scroll_flag, 0);
                                 }
 
                                 // Underdashed: dashed line (shader-based)
                                 if (run_flags & STYLE_UNDERDASHED != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED, 0);
+                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED | deco_scroll_flag, 0);
                                 }
 
                                 c = run_end;
@@ -931,7 +968,8 @@ pub const FlushCtx = struct {
                                         const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            try Helpers.pushGlyphQuad(out, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id);
+                                            const glyph_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                            try Helpers.pushGlyphQuad(out, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
                                         }
 
                                         penX += cellW;
@@ -972,13 +1010,14 @@ pub const FlushCtx = struct {
                                 }
 
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                const strike_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
                                 const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                                 const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
                                 const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
 
                                 const y0 = row_y + cellH * 0.5 - 0.5;
                                 const y1 = y0 + 1.0;
-                                try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH, 0);
+                                try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH | strike_scroll_flag, 0);
 
                                 c = run_end;
                             }
@@ -1095,13 +1134,14 @@ pub const FlushCtx = struct {
                     const est_cells: usize = @as(usize, rows) * @as(usize, cols);
                     _ = main.ensureTotalCapacity(ctx.core.alloc, est_cells * 12) catch {};
 
+                    // Get viewport margins for scrollable row detection (non-row-mode path)
+                    const nr_main_margins = ctx.core.grid.getViewportMargins(1);
+
                     // 1) Background: run-length by bgRGB and grid_id per row
                     var r: u32 = 0;
 
-
-
-
                     while (r < rows) : (r += 1) {
+                        const nr_main_scrollable: u32 = if (r >= nr_main_margins.top and r < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
                         const row_start: usize = @as(usize, r) * @as(usize, cols);
 
                         var c: u32 = 0;
@@ -1127,7 +1167,8 @@ pub const FlushCtx = struct {
                                 (if (ctx.core.blur_enabled) 0.0 else ctx.core.background_opacity)
                             else
                                 1.0;
-                            try Helpers.pushSolidQuad(main, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id);
+                            const nr_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                            try Helpers.pushSolidQuad(main, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id, nr_scroll_flag);
                             c = end;
                         }
                     }
@@ -1144,6 +1185,7 @@ pub const FlushCtx = struct {
                         var r2: u32 = 0;
                         while (r2 < rows) : (r2 += 1) {
                             const row_start: usize = @as(usize, r2) * @as(usize, cols);
+                            const nr_r2_scrollable: u32 = if (r2 >= nr_main_margins.top and r2 < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
                             var c: u32 = 0;
                             while (c < cols) {
@@ -1170,6 +1212,7 @@ pub const FlushCtx = struct {
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                const nr_deco_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_r2_scrollable, cached_subgrids[0..cached_subgrid_count]);
 
                                 const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                                 const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
@@ -1179,7 +1222,7 @@ pub const FlushCtx = struct {
                                 if (run_flags & STYLE_UNDERLINE != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
                                 }
 
                                 // Underdouble: 2 lines at bottom with clear gap
@@ -1190,8 +1233,8 @@ pub const FlushCtx = struct {
                                     // Second line: 2px from bottom (4px gap between lines)
                                     const y0_2 = row_y + cellH - 2.0;
                                     const y1_2 = y0_2 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE, 0);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
                                 }
 
                                 // Undercurl: wavy line (shader-based)
@@ -1199,21 +1242,21 @@ pub const FlushCtx = struct {
                                     const y0 = row_y + cellH - 4.0;
                                     const y1 = row_y + cellH;
                                     const phase: f32 = @floatFromInt(run_start);
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL, phase);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL | nr_deco_scroll, phase);
                                 }
 
                                 // Underdotted: dotted line (shader-based)
                                 if (run_flags & STYLE_UNDERDOTTED != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED, 0);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED | nr_deco_scroll, 0);
                                 }
 
                                 // Underdashed: dashed line (shader-based)
                                 if (run_flags & STYLE_UNDERDASHED != 0) {
                                     const y0 = row_y + cellH - 2.0;
                                     const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED, 0);
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED | nr_deco_scroll, 0);
                                 }
 
                                 c = run_end;
@@ -1235,6 +1278,7 @@ pub const FlushCtx = struct {
                         r = 0;
                         while (r < rows) : (r += 1) {
                             const row_start: usize = @as(usize, r) * @as(usize, cols);
+                            const nr_glyph_scrollable: u32 = if (r >= nr_main_margins.top and r < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
                             var c: u32 = 0;
                             while (c < cols) {
@@ -1310,7 +1354,8 @@ pub const FlushCtx = struct {
                                         const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id);
+                                            const nr_glyph_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                            try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, nr_glyph_scroll);
                                         }
 
                                         // Monospace cell model: advance by cellW
@@ -1335,6 +1380,7 @@ pub const FlushCtx = struct {
                         var r2: u32 = 0;
                         while (r2 < rows) : (r2 += 1) {
                             const row_start: usize = @as(usize, r2) * @as(usize, cols);
+                            const nr_strike_scrollable: u32 = if (r2 >= nr_main_margins.top and r2 < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
                             var c: u32 = 0;
                             while (c < cols) {
@@ -1359,6 +1405,7 @@ pub const FlushCtx = struct {
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                const nr_strike_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_strike_scrollable, cached_subgrids[0..cached_subgrid_count]);
 
                                 const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                                 const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
@@ -1367,7 +1414,7 @@ pub const FlushCtx = struct {
                                 // Strikethrough: line through middle
                                 const y0 = row_y + cellH * 0.5 - 0.5;
                                 const y1 = y0 + 1.0;
-                                try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH, 0);
+                                try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH | nr_strike_scroll, 0);
 
                                 c = run_end;
                             }
@@ -1481,12 +1528,12 @@ pub const FlushCtx = struct {
                             const solid_uv = Helpers.solid_uv;
 
                             try cursor.ensureUnusedCapacity(ctx.core.alloc, 6);
-                            cursor.appendAssumeCapacity(.{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            cursor.appendAssumeCapacity(.{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                         }
 
                         // Render cursor text (character under cursor) with inverted color
@@ -1548,6 +1595,7 @@ pub const FlushCtx = struct {
                                         fg,
                                         dw, dh,
                                         cursor_grid_id, // cursor belongs to its actual grid
+                                        c_api.DECO_SCROLLABLE, // cursor is always in content area
                                     );
                                 }
                             }
@@ -1991,6 +2039,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         // Row-based vertex generation: process each row independently
         // This matches the main window's row-based approach for better partial updates
+        const ext_margins = self.grid.getViewportMargins(grid_id);
+
         const cursor_row: ?u32 = if (self.grid.cursor_grid == grid_id and self.grid.cursor_valid and self.grid.cursor_visible)
             self.grid.cursor_row
         else
@@ -2000,6 +2050,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         for (0..sg.rows) |row_idx| {
             const row: u32 = @intCast(row_idx);
+
+            // Compute scrollable flag for this row in the external grid
+            const ext_scrollable: u32 = if (row >= ext_margins.top and row < sg.rows -| ext_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
             // Skip clean rows unless full redraw needed or cursor is on this row
             const is_cursor_row = if (cursor_row) |cr| cr == row else false;
@@ -2073,12 +2126,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const bl = Helpers.ndc(x0, y1, grid_w, grid_h);
                     const br = Helpers.ndc(x1, y1, grid_w, grid_h);
 
-                    ext_verts.appendAssumeCapacity(.{ .position = tl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = br, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = tl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = br, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
 
                     c = end;
                 }
@@ -2118,12 +2171,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
                         const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
                         const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                     }
 
                     // Underdouble
@@ -2137,23 +2190,23 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         var utr = Helpers.ndc(x1, uy0_1, grid_w, grid_h);
                         var ubl = Helpers.ndc(x0, uy1_1, grid_w, grid_h);
                         var ubr = Helpers.ndc(x1, uy1_1, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         // Second line
                         utl = Helpers.ndc(x0, uy0_2, grid_w, grid_h);
                         utr = Helpers.ndc(x1, uy0_2, grid_w, grid_h);
                         ubl = Helpers.ndc(x0, uy1_2, grid_w, grid_h);
                         ubr = Helpers.ndc(x1, uy1_2, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                     }
 
                     // Undercurl
@@ -2165,12 +2218,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
                         const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
                         const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
                     }
 
                     // Underdotted
@@ -2181,12 +2234,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
                         const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
                         const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
                     }
 
                     // Underdashed
@@ -2197,12 +2250,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
                         const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
                         const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
+                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
                     }
 
                     c = run_end;
@@ -2340,12 +2393,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const uv_x1 = ge.uv_max[0];
                     const uv_y1 = ge.uv_max[1];
 
-                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
                 } else {
                     glyph_fail_count += 1;
                 }
@@ -2383,12 +2436,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const sbl = Helpers.ndc(x0, sy1, grid_w, grid_h);
                     const sbr = Helpers.ndc(x1, sy1, grid_w, grid_h);
 
-                    ext_verts.appendAssumeCapacity(.{ .position = stl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = stl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = sbr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
 
                     c = run_end;
                 }
@@ -2441,12 +2494,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const cbl = Helpers.ndc(crx0, cry1, grid_w, grid_h);
                     const cbr = Helpers.ndc(crx1, cry1, grid_w, grid_h);
 
-                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
 
                     // Cursor text for block cursor
                     if (self.grid.cursor_shape == .block) {
@@ -2502,12 +2555,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     const gbl = Helpers.ndc(gx0, gy1, grid_w, grid_h);
                                     const gbr = Helpers.ndc(gx1, gy1, grid_w, grid_h);
 
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = 0, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                                 }
                             }
                         }

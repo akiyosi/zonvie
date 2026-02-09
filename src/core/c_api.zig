@@ -76,6 +76,7 @@ pub const DECO_UNDERDOTTED: u32 = 1 << 3;
 pub const DECO_UNDERDASHED: u32 = 1 << 4;
 pub const DECO_STRIKETHROUGH: u32 = 1 << 5;
 pub const DECO_CURSOR: u32 = 1 << 6; // Marker for cursor vertices (not a decoration, used to preserve cursor from transparency)
+pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area (not margin)
 
 pub const Vertex = extern struct {
     position: [2]f32,
