@@ -456,6 +456,10 @@ pub const Callbacks = extern struct {
     on_rasterize_glyph: ?RasterizeGlyphFn = null,
     on_atlas_upload: ?AtlasUploadFn = null,
     on_atlas_create: ?AtlasCreateFn = null,
+
+    // Flush bracketing (for GPU buffer management)
+    on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+    on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -571,6 +575,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_rasterize_glyph = box.cb.on_rasterize_glyph,
         .on_atlas_upload = box.cb.on_atlas_upload,
         .on_atlas_create = box.cb.on_atlas_create,
+
+        // Flush bracketing (for GPU buffer management)
+        .on_flush_begin = box.cb.on_flush_begin,
+        .on_flush_end = box.cb.on_flush_end,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);

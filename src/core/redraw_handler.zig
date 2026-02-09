@@ -450,6 +450,7 @@ pub fn handleRedraw(
                 const grid_id = t[0].int;
                 const startrow = @as(u32, @intCast(t[2].int));
                 const startcol = @as(u32, @intCast(t[3].int));
+                log.write("[win_pos] grid_id={d} startrow={d} startcol={d}\n", .{ grid_id, startrow, startcol });
                 try grid.setWinPos(grid_id, startrow, startcol);
             }
 
@@ -499,6 +500,7 @@ pub fn handleRedraw(
                 const left = if (t[4] == .int) @as(u32, @intCast(t[4].int)) else 0;
                 const right = if (t[5] == .int) @as(u32, @intCast(t[5].int)) else 0;
 
+                log.write("[win_viewport_margins] grid_id={d} top={d} bottom={d} left={d} right={d}\n", .{ grid_id, top, bottom, left, right });
                 try grid.setViewportMargins(grid_id, top, bottom, left, right);
             }
 

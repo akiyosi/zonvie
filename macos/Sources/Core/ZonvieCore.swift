@@ -483,6 +483,16 @@ final class ZonvieCore {
             },
             on_atlas_create: { ctx, atlasW, atlasH in
                 zonvie_macos_atlas_create(ctx, atlasW, atlasH)
+            },
+            on_flush_begin: { ctx in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.terminalView?.renderer.beginFlush()
+            },
+            on_flush_end: { ctx in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.terminalView?.renderer.commitFlush()
             }
         )
 

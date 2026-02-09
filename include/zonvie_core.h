@@ -618,6 +618,13 @@ typedef struct zonvie_callbacks {
     zonvie_rasterize_glyph_fn on_rasterize_glyph;
     zonvie_atlas_upload_fn on_atlas_upload;
     zonvie_atlas_create_fn on_atlas_create;
+
+    /* Flush bracketing callbacks (for GPU buffer management).
+       on_flush_begin: called before vertex generation starts.
+       on_flush_end: called after all vertices (rows + cursor + external grids) are submitted.
+       Frontend can use these to implement triple buffering / atomic commit. */
+    void (*on_flush_begin)(void* ctx);
+    void (*on_flush_end)(void* ctx);
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

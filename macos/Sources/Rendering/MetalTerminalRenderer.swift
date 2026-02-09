@@ -182,10 +182,37 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     private let lock = NSLock()
 
-    private var pendingMainCount: Int? = nil
-    private var pendingCursorCount: Int? = nil
-    private var currentMainCount: Int = 0
-    private var currentCursorCount: Int = 0
+    // MARK: - Triple Buffering
+
+    /// Independent buffer set owning all vertex data for one frame.
+    /// Three sets exist: at most 2 are GPU in-flight, and 1 is available for writing.
+    /// Class (reference type) to avoid Swift Array copy-on-write races when
+    /// different threads access different buffer sets concurrently.
+    private class BufferSet {
+        // Row-based vertex buffers (row-mode)
+        var rowVertexBuffers: [MTLBuffer?] = []
+        var rowVertexBufferCaps: [Int] = []     // bytes capacity per row buffer
+        var rowVertexCounts: [Int] = []         // vertex count per row
+
+        // Main / cursor vertex buffers (non-row-mode and partial updates)
+        var mainVertexBuffer: MTLBuffer?
+        var mainVertexBufferCap: Int = 0
+        var mainVertexCount: Int = 0
+        var cursorVertexBuffer: MTLBuffer?
+        var cursorVertexBufferCap: Int = 0
+        var cursorVertexCount: Int = 0
+
+        var usingRowBuffers: Bool = false
+    }
+
+    private let bufferSets: [BufferSet] = [BufferSet(), BufferSet(), BufferSet()]
+    private var writeSetIndex: Int = 0       // Core thread only
+    private var committedSetIndex: Int = 0   // Protected by lock
+    private var isInFlush: Bool = false       // Core thread only
+    private let inflightSemaphore = DispatchSemaphore(value: 2)  // Max 2 GPU in-flight
+    private var commitRevision: UInt64 = 0   // Protected by lock
+    private var lastDrawnRevision: UInt64 = 0 // Render thread only
+    private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
 
     private var pendingFont: (name: String, size: CGFloat)?
     private var linespacePx: Int32 = 0
@@ -267,11 +294,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         atlas.recreateTexture(width: Int(width), height: Int(height))
     }
 
-    private var vertexBuffer: MTLBuffer?
-    private var vertexBufferCapacity: Int = 0
-
-    private var cursorVertexBuffer: MTLBuffer?
-    private var cursorVertexBufferCapacity: Int = 0
+    // (vertexBuffer/cursorVertexBuffer moved into BufferSet for triple buffering)
 
     /// Cursor blink state (true = visible, false = hidden during blink)
     var cursorBlinkState: Bool = true
@@ -279,8 +302,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var lastRenderedBlinkState: Bool = true
 
     // --- Scroll offset for smooth scrolling ---
-    private var scrollOffsetBuffer: MTLBuffer?
-    private var scrollOffsetCountBuffer: MTLBuffer?
+    // Stored as value-type array under lock; passed to GPU via setVertexBytes
+    // to avoid shared MTLBuffer GPU/CPU race during smooth scrolling.
+    private var scrollOffsetData: [ScrollOffset] = []
     private var hasActiveScrollOffset: Bool = false  // true when smooth scrolling is active
 
     // ScrollOffset struct matching Shaders.metal
@@ -296,13 +320,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var width: Float
         var height: Float
     }
-    private var drawableSizeBuffer: MTLBuffer?
 
-    // Row-based vertex buffers for partial updates
-    private var rowVertexBuffers: [MTLBuffer?] = []
-    private var rowVertexBufferCaps: [Int] = []     // bytes capacity per row buffer
-    private var rowVertexCounts: [Int] = []         // vertex count per row
-    private var usingRowBuffers: Bool = false
+    // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
 
     /// Maximum row buffer count to prevent unbounded memory growth (1000 rows = ~40KB overhead)
     private let maxRowBuffers: Int = 1000
@@ -380,7 +399,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         self.viewForPipeline = view
         self.pipelineNeedsBuilding = true
         buildSampler()
-        buildScrollOffsetBuffers()
 
         // Create background alpha buffer for shader
         backgroundAlphaBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
@@ -398,19 +416,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func buildScrollOffsetBuffers() {
-        // Initialize scroll offset count buffer with zero
-        scrollOffsetCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared)
-        if let countBuf = scrollOffsetCountBuffer {
-            var zero: UInt32 = 0
-            memcpy(countBuf.contents(), &zero, MemoryLayout<UInt32>.size)
-        }
-        // Initialize scroll offset buffer (will grow as needed)
-        scrollOffsetBuffer = device.makeBuffer(length: 256, options: .storageModeShared)
-
-        // Initialize drawable size buffer for fragment shader clipping
-        drawableSizeBuffer = device.makeBuffer(length: MemoryLayout<DrawableSize>.size, options: .storageModeShared)
-    }
+    // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
 
     /// Ensure pipeline is ready for use by external grid views.
     /// Called before creating ExternalGridView to guarantee shared pipeline availability.
@@ -423,41 +429,167 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // MARK: - Triple Buffer Flush Bracket
+
+    /// Called from on_flush_begin callback (core thread).
+    /// Deep-copies committed data into write set so partial updates overwrite cleanly.
+    /// Picks a buffer set that is not committed and not GPU in-flight.
+    func beginFlush() {
+        isInFlush = true
+
+        // Under lock: read committed index + gpuInFlight to pick a safe write set
+        let srcIdx: Int
+        lock.lock()
+        srcIdx = committedSetIndex
+        // Find a set that is not committed and not GPU in-flight
+        var picked = -1
+        for i in 0..<3 {
+            if i != srcIdx && gpuInFlightCount[i] == 0 {
+                picked = i
+                break
+            }
+        }
+        if picked == -1 {
+            // All non-committed sets are GPU in-flight (rare edge case).
+            // Drop this flush entirely to avoid GPU/CPU race on shared buffers.
+            // The next flush will retry once a GPU frame completes.
+            lock.unlock()
+            isInFlush = false
+            ZonvieCore.appLog("[WARNING] beginFlush: no free buffer set, dropping flush")
+            return
+        }
+        writeSetIndex = picked
+        lock.unlock()
+
+        let src = bufferSets[srcIdx]
+        let dst = bufferSets[picked]
+
+        // Deep copy row buffer contents: committed → write set
+        let srcRowCount = src.rowVertexBuffers.count
+        // Ensure dst arrays are large enough
+        if dst.rowVertexBuffers.count < srcRowCount {
+            let grow = srcRowCount - dst.rowVertexBuffers.count
+            dst.rowVertexBuffers.append(contentsOf: Array(repeating: nil, count: grow))
+            dst.rowVertexBufferCaps.append(contentsOf: Array(repeating: 0, count: grow))
+            dst.rowVertexCounts.append(contentsOf: Array(repeating: 0, count: grow))
+        }
+
+        for i in 0..<srcRowCount {
+            let srcCount = src.rowVertexCounts[i]
+            guard srcCount > 0, let srcBuf = src.rowVertexBuffers[i] else {
+                dst.rowVertexCounts[i] = 0
+                continue
+            }
+            let neededBytes = srcCount * MemoryLayout<Vertex>.stride
+            // Grow dst buffer if needed (lazy, never shrinks)
+            if dst.rowVertexBuffers[i] == nil || dst.rowVertexBufferCaps[i] < neededBytes {
+                let cap = max(neededBytes, dst.rowVertexBufferCaps[i] * 2, 4096)
+                dst.rowVertexBuffers[i] = device.makeBuffer(length: cap, options: .storageModeShared)
+                dst.rowVertexBufferCaps[i] = cap
+            }
+            if let dstBuf = dst.rowVertexBuffers[i] {
+                memcpy(dstBuf.contents(), srcBuf.contents(), neededBytes)
+                dst.rowVertexCounts[i] = srcCount
+            }
+        }
+
+        // Zero out stale rows beyond src count (prevents drawing old data after grid shrink)
+        let dstRowCount = dst.rowVertexBuffers.count
+        if dstRowCount > srcRowCount {
+            for i in srcRowCount..<dstRowCount {
+                dst.rowVertexCounts[i] = 0
+            }
+        }
+
+        // Deep copy main buffer
+        if let srcMain = src.mainVertexBuffer, src.mainVertexCount > 0 {
+            let bytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
+            if dst.mainVertexBuffer == nil || dst.mainVertexBufferCap < bytes {
+                let cap = max(bytes, dst.mainVertexBufferCap * 2, 4096)
+                dst.mainVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
+                dst.mainVertexBufferCap = cap
+            }
+            if let dstBuf = dst.mainVertexBuffer {
+                memcpy(dstBuf.contents(), srcMain.contents(), bytes)
+            }
+            dst.mainVertexCount = src.mainVertexCount
+        } else {
+            dst.mainVertexCount = src.mainVertexCount
+        }
+
+        // Deep copy cursor buffer
+        if let srcCursor = src.cursorVertexBuffer, src.cursorVertexCount > 0 {
+            let bytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
+            if dst.cursorVertexBuffer == nil || dst.cursorVertexBufferCap < bytes {
+                let cap = max(bytes, dst.cursorVertexBufferCap * 2, 4096)
+                dst.cursorVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
+                dst.cursorVertexBufferCap = cap
+            }
+            if let dstBuf = dst.cursorVertexBuffer {
+                memcpy(dstBuf.contents(), srcCursor.contents(), bytes)
+            }
+            dst.cursorVertexCount = src.cursorVertexCount
+        } else {
+            dst.cursorVertexCount = src.cursorVertexCount
+        }
+
+        dst.usingRowBuffers = src.usingRowBuffers
+    }
+
+    /// Called from on_flush_end callback (core thread).
+    /// Atomically makes the write set the new committed set for draw().
+    func commitFlush() {
+        guard isInFlush else { return }  // Flush was dropped by beginFlush
+        lock.lock()
+        committedSetIndex = writeSetIndex
+        commitRevision &+= 1
+        lock.unlock()
+        isInFlush = false
+    }
+
     func submitVerticesRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
         cursorPtr: UnsafeRawPointer?, cursorCount: Int
     ) {
-        lock.lock()
-        defer { lock.unlock() }
+        guard isInFlush else {
+            ZonvieCore.appLog("[WARNING] submitVerticesRaw called outside flush bracket")
+            return
+        }
+        // Write to write set (called during flush, no lock needed for vertex data)
+        let s = writeSetIndex
 
-        usingRowBuffers = false
+        bufferSets[s].usingRowBuffers = false
+
+        // Clear dirty tracking under lock
+        lock.lock()
         pendingDirtyRows.removeAll()
         pendingDirtyRectPx = nil
-    
+        lock.unlock()
+
         // main (always updated)
         if mainCount > 0, let mainPtr {
-            ensureVertexBufferCapacity(mainCount)
-            if let vb = vertexBuffer {
+            ensureMainBufferInSet(s, vertexCount: mainCount)
+            if let vb = bufferSets[s].mainVertexBuffer {
                 memcpy(vb.contents(), mainPtr, mainCount * MemoryLayout<Vertex>.stride)
-                pendingMainCount = mainCount
+                bufferSets[s].mainVertexCount = mainCount
             } else {
-                pendingMainCount = 0
+                bufferSets[s].mainVertexCount = 0
             }
         } else {
-            pendingMainCount = 0
+            bufferSets[s].mainVertexCount = 0
         }
-    
+
         // cursor (always updated)
         if cursorCount > 0, let cursorPtr {
-            ensureCursorVertexBufferCapacity(cursorCount)
-            if let cvb = cursorVertexBuffer {
+            ensureCursorBufferInSet(s, vertexCount: cursorCount)
+            if let cvb = bufferSets[s].cursorVertexBuffer {
                 memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                pendingCursorCount = cursorCount
+                bufferSets[s].cursorVertexCount = cursorCount
             } else {
-                pendingCursorCount = 0
+                bufferSets[s].cursorVertexCount = 0
             }
         } else {
-            pendingCursorCount = 0
+            bufferSets[s].cursorVertexCount = 0
         }
     }
 
@@ -467,40 +599,40 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         updateMain: Bool,
         updateCursor: Bool
     ) {
-        lock.lock()
-        defer { lock.unlock() }
-    
+        guard isInFlush else {
+            ZonvieCore.appLog("[WARNING] submitVerticesPartialRaw called outside flush bracket")
+            return
+        }
+        // Write to write set (called during flush, no lock needed for vertex data)
+        let s = writeSetIndex
+
         if updateMain {
             if mainCount > 0, let mainPtr {
-                ensureVertexBufferCapacity(mainCount)
-                if let vb = vertexBuffer {
+                ensureMainBufferInSet(s, vertexCount: mainCount)
+                if let vb = bufferSets[s].mainVertexBuffer {
                     memcpy(vb.contents(), mainPtr, mainCount * MemoryLayout<Vertex>.stride)
-                    pendingMainCount = mainCount
+                    bufferSets[s].mainVertexCount = mainCount
                 } else {
-                    pendingMainCount = 0
+                    bufferSets[s].mainVertexCount = 0
                 }
             } else {
-                // explicit "clear main"
-                pendingMainCount = 0
+                bufferSets[s].mainVertexCount = 0
             }
         }
-        // When updateMain == false, don't touch pendingMainCount (keep as nil)
 
         if updateCursor {
             if cursorCount > 0, let cursorPtr {
-                ensureCursorVertexBufferCapacity(cursorCount)
-                if let cvb = cursorVertexBuffer {
+                ensureCursorBufferInSet(s, vertexCount: cursorCount)
+                if let cvb = bufferSets[s].cursorVertexBuffer {
                     memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                    pendingCursorCount = cursorCount
+                    bufferSets[s].cursorVertexCount = cursorCount
                 } else {
-                    pendingCursorCount = 0
+                    bufferSets[s].cursorVertexCount = 0
                 }
             } else {
-                // explicit "clear cursor"
-                pendingCursorCount = 0
+                bufferSets[s].cursorVertexCount = 0
             }
         }
-        // When updateCursor == false, don't touch pendingCursorCount (keep as nil)
     }
 
     func setGuiFont(name: String, pointSize: CGFloat) {
@@ -566,28 +698,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        if count > 0 {
-            let neededBytes = count * MemoryLayout<ScrollOffset>.stride
-            if let existingBuf = scrollOffsetBuffer, existingBuf.length >= neededBytes {
-                // Buffer is large enough, reuse it
-            } else {
-                scrollOffsetBuffer = device.makeBuffer(length: max(neededBytes, 256), options: .storageModeShared)
-            }
-            if let buf = scrollOffsetBuffer {
-                scrollOffsets.withUnsafeMutableBytes { ptr in
-                    guard let baseAddr = ptr.baseAddress else { return }
-                    memcpy(buf.contents(), baseAddr, neededBytes)
-                }
-            }
-        }
-
-        // Update count buffer
-        if let countBuf = scrollOffsetCountBuffer {
-            var countVal = UInt32(count)
-            memcpy(countBuf.contents(), &countVal, MemoryLayout<UInt32>.size)
-        }
-
-        // Track whether we have active scroll offsets
+        // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
+        // This eliminates the GPU/CPU race on shared MTLBuffers.
+        scrollOffsetData = scrollOffsets
         hasActiveScrollOffset = count > 0
     }
 
@@ -596,10 +709,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        if let countBuf = scrollOffsetCountBuffer {
-            var zero: UInt32 = 0
-            memcpy(countBuf.contents(), &zero, MemoryLayout<UInt32>.size)
-        }
+        scrollOffsetData = []
         hasActiveScrollOffset = false
     }
 
@@ -670,34 +780,53 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_lock_start = CFAbsoluteTimeGetCurrent()
             }
 
-            // --- fetch pending state under lock ---
-            let (newMainCountOpt, newCursorCountOpt, fontChg, dirtyRectPxOpt, dirtyRows, rowMode, smoothScrolling, rowBuffersSnapshot, rowCountsSnapshot): (Int?, Int?, (name: String, size: CGFloat)?, CGRect?, [Int], Bool, Bool, [MTLBuffer?], [Int]) = {
-                lock.lock()
-                defer { lock.unlock() }
+            // --- Single lock: read committed index + pending state + mark GPU in-flight ---
+            // This prevents beginFlush() from picking our committed set as its write target.
+            let csi: Int
+            let currentCommitRevision: UInt64
+            let fontChg: (name: String, size: CGFloat)?
+            let dirtyRectPxOpt: CGRect?
+            let dirtyRows: [Int]
+            let smoothScrolling: Bool
+            let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
 
-                let mainCount = pendingMainCount
-                let cursorCount = pendingCursorCount
-                pendingMainCount = nil
-                pendingCursorCount = nil
+            lock.lock()
+            csi = committedSetIndex
+            currentCommitRevision = commitRevision
+            gpuInFlightCount[csi] += 1  // Prevent beginFlush from using this set
 
-                let font = pendingFont
-                pendingFont = nil
+            fontChg = pendingFont
+            pendingFont = nil
+            dirtyRectPxOpt = pendingDirtyRectPx
+            dirtyRows = Array(pendingDirtyRows)
+            pendingDirtyRectPx = nil
+            pendingDirtyRows.removeAll()
+            smoothScrolling = hasActiveScrollOffset
+            scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            lock.unlock()
 
-                // Take dirty info for this frame
-                let dirtyRect = pendingDirtyRectPx
-                let rows = Array(pendingDirtyRows)
-                pendingDirtyRectPx = nil
-                pendingDirtyRows.removeAll()
+            // Safety defer: decrement gpuInFlight + signal semaphore on early return.
+            // On normal GPU submission, the completion handler handles cleanup instead.
+            var semaphoreAcquired = false
+            var gpuSubmitted = false
+            defer {
+                if !gpuSubmitted {
+                    if semaphoreAcquired {
+                        inflightSemaphore.signal()
+                    }
+                    lock.lock()
+                    gpuInFlightCount[csi] -= 1
+                    lock.unlock()
+                }
+            }
 
-                let rowModeVal = usingRowBuffers
-                let smoothScrollingVal = hasActiveScrollOffset
-
-                // Snapshot row buffers to avoid race condition with submitVerticesRowRaw
-                let buffersSnap = rowVertexBuffers
-                let countsSnap = rowVertexCounts
-
-                return (mainCount, cursorCount, font, dirtyRect, rows, rowModeVal, smoothScrollingVal, buffersSnap, countsSnap)
-            }()
+            // Now safe to read from committed set (protected by gpuInFlight)
+            let committed = bufferSets[csi]
+            let rowBuffersSnapshot = committed.rowVertexBuffers
+            let rowCountsSnapshot = committed.rowVertexCounts
+            let rowMode = committed.usingRowBuffers
+            let committedMainCount = committed.mainVertexCount
+            let committedCursorCount = committed.cursorVertexCount
 
             // === PERF LOG: lock取得終了 ===
             if ZonvieCore.appLogEnabled {
@@ -706,13 +835,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 ZonvieCore.appLog("[perf] draw_lock_fetch us=\(String(format: "%.1f", lock_us))")
             }
 
-            // INSERT right after lock.unlock() in draw(in:)
-            ZonvieCore.appLog("draw(fetch): rowMode=\(rowMode) newMainCountOpt=\(String(describing: newMainCountOpt)) newCursorCountOpt=\(String(describing: newCursorCountOpt)) dirtyRectPxOpt=\(String(describing: dirtyRectPxOpt)) dirtyRowsCount=\(dirtyRows.count) hasPresentedOnce=\(hasPresentedOnce) drawableSize=\(view.drawableSize)")
+            ZonvieCore.appLog("draw(fetch): rowMode=\(rowMode) mainCount=\(committedMainCount) cursorCount=\(committedCursorCount) dirtyRectPxOpt=\(String(describing: dirtyRectPxOpt)) dirtyRowsCount=\(dirtyRows.count) hasPresentedOnce=\(hasPresentedOnce) drawableSize=\(view.drawableSize)")
 
             if let fontChg {
                 atlas.setFont(name: fontChg.name, pointSize: fontChg.size)
             }
-    
+
             let cw = atlas.cellWidthPx
             let ch = atlas.cellHeightPx + Float(linespacePx)
             if cw != lastCellWidthPx || ch != lastCellHeightPx {
@@ -722,15 +850,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     DispatchQueue.main.async { cb(cw, ch) }
                 }
             }
-    
-            // reflect counts (nil means "no update" => keep previous)
-            if let newMainCount = newMainCountOpt {
-                currentMainCount = newMainCount
-            }
-            if let newCursorCount = newCursorCountOpt {
-                currentCursorCount = newCursorCount
-            }
-    
+
+            // With triple buffering, counts come directly from committed set
+            let currentMainCount = committedMainCount
+            let currentCursorCount = committedCursorCount
+
             // If rowMode, we may not have a single "currentMainCount"; rows drive it.
             if !rowMode && currentMainCount <= 0 && currentCursorCount <= 0 {
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -740,12 +864,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Check if cursor blink state changed
             let blinkStateChanged = cursorBlinkState != lastRenderedBlinkState
 
+            // Check if committed data changed since last draw
+            let hasNewCommit = currentCommitRevision != lastDrawnRevision
+
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             if hasPresentedOnce,
                fontChg == nil,
-               newMainCountOpt == nil,
-               newCursorCountOpt == nil,
+               !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
                !smoothScrolling,
@@ -756,10 +882,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             // In rowMode with no vertex updates and no dirty rows, skip rendering
-            if rowMode && dirtyRows.isEmpty && newMainCountOpt == nil && newCursorCountOpt == nil && !smoothScrolling && !blinkStateChanged && hasPresentedOnce {
+            if rowMode && dirtyRows.isEmpty && !hasNewCommit && !smoothScrolling && !blinkStateChanged && hasPresentedOnce {
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
+
+            // Track that we've consumed this revision
+            lastDrawnRevision = currentCommitRevision
 
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
@@ -806,8 +935,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
 
-            guard let cmd = queue.makeCommandBuffer() else { return }
-            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+            // Limit GPU in-flight frames to 2 (triple buffering safety).
+            // Ensures the write set picked by beginFlush() is never GPU in-flight.
+            inflightSemaphore.wait()
+            semaphoreAcquired = true
+
+            guard let cmd = queue.makeCommandBuffer() else {
+                // defer handles: semaphore.signal() + gpuInFlight decrement
+                return
+            }
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+                // defer handles: semaphore.signal() + gpuInFlight decrement
+                return
+            }
             // Safe to force unwrap: guard at top of draw() ensures pipeline/sampler are non-nil
             enc.setRenderPipelineState(pipeline!)
 
@@ -817,22 +957,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             enc.setFragmentSamplerState(sampler!, index: 0)
 
-            // Bind scroll offset buffers for smooth scrolling
-            if let scrollBuf = scrollOffsetBuffer {
-                enc.setVertexBuffer(scrollBuf, offset: 0, index: 1)
+            // Bind scroll offset data. Use setVertexBytes for small data (≤4KB),
+            // fall back to a temporary MTLBuffer for larger payloads.
+            let maxSetVertexBytesSize = 4096
+            var effectiveScrollCount = UInt32(scrollSnapshot.count)
+            if !scrollSnapshot.isEmpty {
+                scrollSnapshot.withUnsafeBytes { ptr in
+                    if ptr.count <= maxSetVertexBytesSize {
+                        enc.setVertexBytes(ptr.baseAddress!, length: ptr.count, index: 1)
+                    } else if let buf = device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared) {
+                        enc.setVertexBuffer(buf, offset: 0, index: 1)
+                    } else {
+                        // makeBuffer failed: bind dummy and disable scroll in shader
+                        var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                        enc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
+                        effectiveScrollCount = 0
+                    }
+                }
+            } else {
+                var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                enc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
             }
-            if let countBuf = scrollOffsetCountBuffer {
-                enc.setVertexBuffer(countBuf, offset: 0, index: 2)
+            do {
+                enc.setVertexBytes(&effectiveScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
             }
 
-            // Update and bind drawable size buffer for fragment shader clipping
-            if let sizeBuf = drawableSizeBuffer {
+            // Bind drawable size via setFragmentBytes (avoids shared buffer race
+            // when inflightSemaphore allows 2 concurrent draw() calls).
+            do {
                 var size = DrawableSize(
                     width: Float(view.drawableSize.width),
                     height: Float(view.drawableSize.height)
                 )
-                memcpy(sizeBuf.contents(), &size, MemoryLayout<DrawableSize>.size)
-                enc.setFragmentBuffer(sizeBuf, offset: 0, index: 0)
+                enc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
             }
 
             // Bind background alpha buffer for blur transparency
@@ -919,14 +1076,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // 2-Pass rendering for blur
                     // Pass 1: Background (overwrite blending)
                     enc.setRenderPipelineState(backgroundPipeline!)
-                    if currentMainCount > 0, let vb = vertexBuffer {
+                    if currentMainCount > 0, let vb = committed.mainVertexBuffer {
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentMainCount)
                     }
 
                     // Pass 2: Glyphs (standard alpha blending)
                     enc.setRenderPipelineState(glyphPipeline!)
-                    if currentMainCount > 0, let vb = vertexBuffer {
+                    if currentMainCount > 0, let vb = committed.mainVertexBuffer {
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentMainCount)
                     }
@@ -942,7 +1099,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         }
                     }
 
-                    if currentMainCount > 0, let vb = vertexBuffer {
+                    if currentMainCount > 0, let vb = committed.mainVertexBuffer {
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentMainCount)
                     }
@@ -969,7 +1126,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             // Only draw cursor if blink state is visible
             ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkState) cursorCount=\(currentCursorCount)")
-            if cursorBlinkState, currentCursorCount > 0, let cvb = cursorVertexBuffer {
+            if cursorBlinkState, currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
                 enc.setVertexBuffer(cvb, offset: 0, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
             }
@@ -1025,6 +1182,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             cmd.present(drawable)
             cmd.addCompletedHandler { [weak self, weak view] _ in
                 guard let self = self else { return }
+                // Release GPU in-flight mark + semaphore for this buffer set
+                self.lock.lock()
+                self.gpuInFlightCount[csi] -= 1
+                self.lock.unlock()
+                self.inflightSemaphore.signal()
+
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
 
@@ -1050,6 +1213,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
             cmd.commit()
+            gpuSubmitted = true  // Completion handler handles cleanup; prevent defer
 
             // === PERF LOG: draw終了 ===
             if ZonvieCore.appLogEnabled {
@@ -1502,68 +1666,56 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return next
     }
     
-    private func ensureVertexBufferCapacity(_ vertexCount: Int) {
+    /// Ensure main vertex buffer in the specified buffer set has sufficient capacity.
+    private func ensureMainBufferInSet(_ setIdx: Int, vertexCount: Int) {
         let vc = max(0, vertexCount)
-    
-        guard let needed = safeNeededBytes(vertexCount: vc) else {
-            // Drop this update defensively (untrusted vertexCount from C-ABI).
-            pendingMainCount = 0
-            return
-        }
-    
-        if vertexBuffer == nil || needed > vertexBufferCapacity {
-            guard let nextCap = growCapacity(current: vertexBufferCapacity, needed: max(1, needed)) else {
-                pendingMainCount = 0
-                return
-            }
-            vertexBufferCapacity = nextCap
-            vertexBuffer = device.makeBuffer(length: vertexBufferCapacity, options: .storageModeShared)
-            // If allocation failed, avoid keeping a huge capacity that will overflow again.
-            if vertexBuffer == nil {
-                vertexBufferCapacity = 0
-                pendingMainCount = 0
-            }
-        }
-    }
-    
-    private func ensureCursorVertexBufferCapacity(_ vertexCount: Int) {
-        let vc = max(0, vertexCount)
-    
-        guard let needed = safeNeededBytes(vertexCount: vc) else {
-            // Drop this update defensively (untrusted vertexCount from C-ABI).
-            pendingCursorCount = 0
-            return
-        }
-    
-        if cursorVertexBuffer == nil || needed > cursorVertexBufferCapacity {
-            guard let nextCap = growCapacity(current: cursorVertexBufferCapacity, needed: max(1, needed)) else {
-                pendingCursorCount = 0
-                return
-            }
-            cursorVertexBufferCapacity = nextCap
-            cursorVertexBuffer = device.makeBuffer(length: cursorVertexBufferCapacity, options: .storageModeShared)
-            if cursorVertexBuffer == nil {
-                cursorVertexBufferCapacity = 0
-                pendingCursorCount = 0
+        guard let needed = safeNeededBytes(vertexCount: vc) else { return }
+
+        if bufferSets[setIdx].mainVertexBuffer == nil || needed > bufferSets[setIdx].mainVertexBufferCap {
+            guard let nextCap = growCapacity(current: bufferSets[setIdx].mainVertexBufferCap, needed: max(1, needed)) else { return }
+            bufferSets[setIdx].mainVertexBufferCap = nextCap
+            bufferSets[setIdx].mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bufferSets[setIdx].mainVertexBuffer == nil {
+                bufferSets[setIdx].mainVertexBufferCap = 0
             }
         }
     }
 
-    private func ensureRowStorage(_ row: Int) {
+    /// Ensure cursor vertex buffer in the specified buffer set has sufficient capacity.
+    private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
+        let vc = max(0, vertexCount)
+        guard let needed = safeNeededBytes(vertexCount: vc) else { return }
+
+        if bufferSets[setIdx].cursorVertexBuffer == nil || needed > bufferSets[setIdx].cursorVertexBufferCap {
+            guard let nextCap = growCapacity(current: bufferSets[setIdx].cursorVertexBufferCap, needed: max(1, needed)) else { return }
+            bufferSets[setIdx].cursorVertexBufferCap = nextCap
+            bufferSets[setIdx].cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bufferSets[setIdx].cursorVertexBuffer == nil {
+                bufferSets[setIdx].cursorVertexBufferCap = 0
+            }
+        }
+    }
+
+    /// Ensure row storage arrays in the specified buffer set cover at least `row + 1` entries.
+    private func ensureRowStorageInSet(_ setIdx: Int, _ row: Int) {
         if row < 0 { return }
-        // Enforce maximum row limit to prevent unbounded memory growth
         if row >= maxRowBuffers {
             ZonvieCore.appLog("[Renderer] Row \(row) exceeds maxRowBuffers (\(maxRowBuffers))")
             return
         }
-        if row < rowVertexBuffers.count { return }
+        if row < bufferSets[setIdx].rowVertexBuffers.count { return }
         let newCount = row + 1
-        rowVertexBuffers.append(contentsOf: Array(repeating: nil, count: newCount - rowVertexBuffers.count))
-        rowVertexBufferCaps.append(contentsOf: Array(repeating: 0, count: newCount - rowVertexBufferCaps.count))
-        rowVertexCounts.append(contentsOf: Array(repeating: 0, count: newCount - rowVertexCounts.count))
+        let grow = newCount - bufferSets[setIdx].rowVertexBuffers.count
+        bufferSets[setIdx].rowVertexBuffers.append(contentsOf: Array(repeating: nil, count: grow))
+        bufferSets[setIdx].rowVertexBufferCaps.append(contentsOf: Array(repeating: 0, count: grow))
+        bufferSets[setIdx].rowVertexCounts.append(contentsOf: Array(repeating: 0, count: grow))
     }
 
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0) {
+        guard isInFlush else {
+            ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
+            return
+        }
         // === PERF LOG: submitVerticesRowRaw開始 ===
         var t_start: CFAbsoluteTime = 0
         if ZonvieCore.appLogEnabled {
@@ -1577,24 +1729,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        lock.lock()
-        defer { lock.unlock() }
+        // Write to write set (called during flush, no lock needed for vertex data).
+        // The write set is exclusively owned by the core thread during flush.
+        let s = writeSetIndex
 
         // Switch to row-buffer mode.
-        usingRowBuffers = true
+        bufferSets[s].usingRowBuffers = true
 
         // Handle grid resize: if totalRows is smaller than current row storage,
         // shrink arrays to free memory (when significantly oversized).
-        if totalRows > 0 && totalRows < rowVertexBuffers.count {
-            // Shrink if arrays are more than 2x the needed size
-            if rowVertexBuffers.count > totalRows * 2 {
-                rowVertexBuffers.removeSubrange(totalRows...)
-                rowVertexBufferCaps.removeSubrange(totalRows...)
-                rowVertexCounts.removeSubrange(totalRows...)
+        if totalRows > 0 && totalRows < bufferSets[s].rowVertexBuffers.count {
+            if bufferSets[s].rowVertexBuffers.count > totalRows * 2 {
+                bufferSets[s].rowVertexBuffers.removeSubrange(totalRows...)
+                bufferSets[s].rowVertexBufferCaps.removeSubrange(totalRows...)
+                bufferSets[s].rowVertexCounts.removeSubrange(totalRows...)
             } else {
-                // Just clear counts for excess rows
-                for r in totalRows..<rowVertexBuffers.count {
-                    rowVertexCounts[r] = 0
+                for r in totalRows..<bufferSets[s].rowVertexBuffers.count {
+                    bufferSets[s].rowVertexCounts[r] = 0
                 }
             }
         }
@@ -1606,42 +1757,42 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Skip rows beyond the limit
         guard row >= 0 && row < maxRowBuffers else { return }
 
-        ensureRowStorage(row)
+        ensureRowStorageInSet(s, row)
 
         // Ensure storage was actually allocated
-        guard row < rowVertexBuffers.count else { return }
+        guard row < bufferSets[s].rowVertexBuffers.count else { return }
 
         guard count > 0, let validPtr = ptr else {
-            rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexCounts[row] = 0
             return
         }
-    
+
         // bytes needed
         guard let neededBytes = safeNeededBytes(vertexCount: count) else {
-            rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexCounts[row] = 0
             return
         }
-    
-        if rowVertexBuffers[row] == nil || neededBytes > rowVertexBufferCaps[row] {
-            guard let nextCap = growCapacity(current: rowVertexBufferCaps[row], needed: max(1, neededBytes)) else {
-                rowVertexCounts[row] = 0
+
+        if bufferSets[s].rowVertexBuffers[row] == nil || neededBytes > bufferSets[s].rowVertexBufferCaps[row] {
+            guard let nextCap = growCapacity(current: bufferSets[s].rowVertexBufferCaps[row], needed: max(1, neededBytes)) else {
+                bufferSets[s].rowVertexCounts[row] = 0
                 return
             }
-            rowVertexBufferCaps[row] = nextCap
-            rowVertexBuffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if rowVertexBuffers[row] == nil {
-                rowVertexBufferCaps[row] = 0
-                rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexBufferCaps[row] = nextCap
+            bufferSets[s].rowVertexBuffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bufferSets[s].rowVertexBuffers[row] == nil {
+                bufferSets[s].rowVertexBufferCaps[row] = 0
+                bufferSets[s].rowVertexCounts[row] = 0
                 return
             }
         }
-    
+
         // Copy vertices
-        if let vb = rowVertexBuffers[row] {
+        if let vb = bufferSets[s].rowVertexBuffers[row] {
             memcpy(vb.contents(), validPtr, count * MemoryLayout<Vertex>.stride)
-            rowVertexCounts[row] = count
+            bufferSets[s].rowVertexCounts[row] = count
         } else {
-            rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexCounts[row] = 0
         }
     }
 
@@ -1681,7 +1832,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        let rowCount = rowVertexBuffers.count
+        let rowCount = bufferSets[committedSetIndex].rowVertexBuffers.count
         if rowCount > 0 {
             pendingDirtyRows.insert(integersIn: 0..<rowCount)
         }

@@ -1140,6 +1140,7 @@ pub const Grid = struct {
             } else {
                 self.markAllDirty();
             }
+
             // Record scroll event for frontend notification (pixel offset clearing)
             self.recordScrolledGrid(grid_id);
         }

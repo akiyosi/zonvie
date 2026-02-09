@@ -63,10 +63,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var pendingDirtyRows: Set<Int> = []
     private let maxRowBuffers = 512
 
-    // Shader required buffers (even if unused for external grids)
-    private var scrollOffsetBuffer: MTLBuffer?
-    private var scrollOffsetCountBuffer: MTLBuffer?
-    private var drawableSizeBuffer: MTLBuffer?
+    // Scroll offset data stored as value-type; passed to GPU via setVertexBytes
+    // to avoid shared MTLBuffer GPU/CPU race.
+    private var scrollOffsetData: MetalTerminalRenderer.ScrollOffset?
+    private var scrollOffsetActive: Bool = false
 
     // Blur transparency support
     private let blurEnabled: Bool
@@ -230,17 +230,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     private func buildShaderBuffers() {
-        // Initialize scroll offset count buffer with zero (no scroll offsets)
-        scrollOffsetCountBuffer = mtlDevice.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared)
-        if let countBuf = scrollOffsetCountBuffer {
-            var zero: UInt32 = 0
-            memcpy(countBuf.contents(), &zero, MemoryLayout<UInt32>.size)
-        }
-        // Initialize scroll offset buffer (empty, but shader needs it bound)
-        scrollOffsetBuffer = mtlDevice.makeBuffer(length: 64, options: .storageModeShared)
-
-        // Initialize drawable size buffer
-        drawableSizeBuffer = mtlDevice.makeBuffer(length: MemoryLayout<DrawableSize>.size, options: .storageModeShared)
+        // (scroll offset / drawable size buffers removed: now passed via setVertexBytes/setFragmentBytes)
     }
 
     required init(coder: NSCoder) {
@@ -440,22 +430,30 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             enc.setFragmentSamplerState(sampler, index: 0)
 
-            // Bind scroll offset buffers (required by shader, even if count is 0)
-            if let scrollBuf = scrollOffsetBuffer {
-                enc.setVertexBuffer(scrollBuf, offset: 0, index: 1)
-            }
-            if let countBuf = scrollOffsetCountBuffer {
-                enc.setVertexBuffer(countBuf, offset: 0, index: 2)
+            // Bind scroll offset data via setVertexBytes (no GPU/CPU race)
+            lock.lock()
+            let scrollSnap = scrollOffsetData
+            let scrollActive = scrollOffsetActive
+            lock.unlock()
+
+            if scrollActive, var so = scrollSnap {
+                enc.setVertexBytes(&so, length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride, index: 1)
+                var count: UInt32 = 1
+                enc.setVertexBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
+            } else {
+                var dummy = MetalTerminalRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                enc.setVertexBytes(&dummy, length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride, index: 1)
+                var count: UInt32 = 0
+                enc.setVertexBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
             }
 
-            // Update and bind drawable size buffer for fragment shader
-            if let sizeBuf = drawableSizeBuffer {
+            // Bind drawable size via setFragmentBytes (no shared buffer race)
+            do {
                 var size = DrawableSize(
                     width: Float(view.drawableSize.width),
                     height: Float(view.drawableSize.height)
                 )
-                memcpy(sizeBuf.contents(), &size, MemoryLayout<DrawableSize>.size)
-                enc.setFragmentBuffer(sizeBuf, offset: 0, index: 0)
+                enc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
             }
 
             // Bind background alpha buffer for blur transparency
@@ -576,7 +574,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Get scroll offset info from main view (includes margin data from core)
         if var info = main.getScrollOffsetInfo(gridId: gridId, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx) {
             // Clamp visual offset to prevent showing empty areas (black cracks) during scrolling
-            let maxOffsetPx = cellHeightPx * 1.2
+            let maxOffsetPx = cellHeightPx * 2.0
             info.offsetYPx = max(-maxOffsetPx, min(maxOffsetPx, info.offsetYPx))
 
             // External window: grid always starts at top (Y = 1.0 in NDC)
@@ -593,24 +591,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             lock.lock()
             defer { lock.unlock() }
 
-            if let buf = scrollOffsetBuffer {
-                memcpy(buf.contents(), &scrollOffset, MemoryLayout<MetalTerminalRenderer.ScrollOffset>.size)
-            }
-
-            if let countBuf = scrollOffsetCountBuffer {
-                var count: UInt32 = 1
-                memcpy(countBuf.contents(), &count, MemoryLayout<UInt32>.size)
-            }
+            scrollOffsetData = scrollOffset
+            scrollOffsetActive = true
             return true  // Scroll offset is active
         } else {
-            // No offset, set count to 0
+            // No offset
             lock.lock()
             defer { lock.unlock() }
 
-            if let countBuf = scrollOffsetCountBuffer {
-                var count: UInt32 = 0
-                memcpy(countBuf.contents(), &count, MemoryLayout<UInt32>.size)
-            }
+            scrollOffsetData = nil
+            scrollOffsetActive = false
             return false  // No scroll offset
         }
     }

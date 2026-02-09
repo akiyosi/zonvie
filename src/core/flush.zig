@@ -158,6 +158,17 @@ pub const FlushCtx = struct {
         }
         ctx.core.grid.clearScrolledGrids();
 
+        // Notify frontend: flush begins (for triple buffer write-set preparation)
+        if (ctx.core.cb.on_flush_begin) |cb| {
+            cb(ctx.core.ctx);
+        }
+        // Ensure on_flush_end is called on all exit paths (atomic commit point)
+        defer {
+            if (ctx.core.cb.on_flush_end) |cb| {
+                cb(ctx.core.ctx);
+            }
+        }
+
         // Check msg_show throttle timeout for external commands
         ctx.core.checkMsgShowThrottleTimeout();
 

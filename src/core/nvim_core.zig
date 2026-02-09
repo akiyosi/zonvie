@@ -236,6 +236,10 @@ pub const Callbacks = struct {
     on_rasterize_glyph: ?c_api.RasterizeGlyphFn = null,
     on_atlas_upload: ?c_api.AtlasUploadFn = null,
     on_atlas_create: ?c_api.AtlasCreateFn = null,
+
+    // Flush bracketing (for GPU buffer management)
+    on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+    on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 };
 
 const PipeReader = rpc_session.PipeReader;

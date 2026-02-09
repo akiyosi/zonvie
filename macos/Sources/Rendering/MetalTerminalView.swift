@@ -62,8 +62,14 @@ final class MetalTerminalView: MTKView {
     private let pendingSentScrollLock = NSLock()
 
     // Thread-safe pending scroll clear set (for grid_scroll events from Zig thread)
-    private var pendingScrollClear = Set<Int64>()
+    private var pendingScrollClear = [Int64: Int]()  // gridId → count of grid_scroll events
     private let pendingScrollClearLock = NSLock()
+
+    // Stale scroll detection: tracks frames since last grid_scroll per grid.
+    // When pendingSentScroll > 0 but no grid_scroll arrives for several frames,
+    // the scroll likely hit a buffer boundary (Neovim can't scroll further).
+    // In that case, we decay the offset to prevent it from getting stuck.
+    private var scrollStaleFrameCount: [Int64: Int] = [:]
 
     // --- Scrollbar ---
     private lazy var verticalScroller: NSScroller = {
@@ -322,6 +328,9 @@ final class MetalTerminalView: MTKView {
             // This ensures scroll offsets are cleared before vertices are drawn,
             // preventing double-shift glitches in split windows.
             self?.processPendingScrollClears()
+            // Decay stale scroll offsets (pending scrolls that never got grid_scroll response,
+            // e.g. when Neovim is at buffer boundary and can't scroll further).
+            self?.decayStaleScrollOffsets()
             // Update shader with current scroll offsets (safe to call here on main thread).
             self?.updateScrollShaderOffset()
             // Update cursor blink state for rendering
@@ -523,7 +532,16 @@ final class MetalTerminalView: MTKView {
             }
 
             let globalCol = Int32(pointPx.x / cellW)
-            let globalRow = Int32(pointPx.y / cellH)
+            var globalRow = Int32(pointPx.y / cellH)
+
+            // Adjust for smooth scroll offset (same logic as hitTestGrid)
+            scrollOffsetLock.lock()
+            let dragOffsetPx = scrollOffsetPx[cache.gridId] ?? 0
+            scrollOffsetLock.unlock()
+            if abs(dragOffsetPx) > 0.001 {
+                let adjustedPxY = pointPx.y - CGFloat(dragOffsetPx)
+                globalRow = Int32(adjustedPxY / cellH)
+            }
 
             // Use cached startRow/startCol for consistent coordinate conversion
             let localRow = globalRow - cache.startRow
@@ -1218,8 +1236,11 @@ final class MetalTerminalView: MTKView {
         // NDC scale: 2.0 / drawableHeight (top = 1.0, bottom = -1.0)
         let ndcScale: Float = 2.0 / drawableHeight
 
-        // Clamp visual offset to prevent showing empty areas during fast scrolling
-        let maxOffsetPx = cellHeightPx * 1.2
+        // Clamp visual offset to prevent showing empty areas.
+        // With immediate consumption in handleScrollInput, offset is normally
+        // bounded to ±rowHeightPx. This wider safety clamp handles edge cases
+        // when canSendMore is false (pending scrolls saturated).
+        let maxOffsetPx = cellHeightPx * 2.0
 
         let offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
             guard let info = gridInfoMap[gridId] else { return nil }
@@ -1319,6 +1340,7 @@ final class MetalTerminalView: MTKView {
                 // Clear any accumulated offset when switching to fast mode
                 scrollOffsetLock.lock()
                 scrollOffsetPx.removeValue(forKey: gridId)
+                scrollStaleFrameCount.removeValue(forKey: gridId)
                 scrollOffsetLock.unlock()
                 pendingSentScrollLock.lock()
                 pendingSentScroll.removeValue(forKey: gridId)
@@ -1329,12 +1351,8 @@ final class MetalTerminalView: MTKView {
         if effectiveHasPrecise {
             // Trackpad: implement sub-cell smooth scrolling for external grids
             let deltaYPx = deltaY * scale
-            scrollOffsetLock.lock()
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
-            scrollOffsetLock.unlock()
-            var newOffset = currentOffset + deltaYPx
 
-            // Limit total pending scrolls to prevent overwhelming Neovim
+            // Read pending scroll count OUTSIDE scrollOffsetLock to avoid deadlock
             pendingSentScrollLock.lock()
             let alreadyPending = pendingSentScroll[gridId] ?? 0
             pendingSentScrollLock.unlock()
@@ -1342,8 +1360,17 @@ final class MetalTerminalView: MTKView {
             let maxTotalPending = 8
             let canSendMore = alreadyPending < maxTotalPending
 
-            // When accumulated offset reaches row height, emit nvim_input_mouse
-            // Don't consume offset here - wait for grid_scroll to prevent reverse jump
+            // Hold scrollOffsetLock for entire read-modify-write (TOCTOU fix).
+            // processPendingScrollClears also acquires this lock, but it runs on the
+            // core thread during flush, not concurrently with main-thread scroll input.
+            scrollOffsetLock.lock()
+            let currentOffset = scrollOffsetPx[gridId] ?? 0
+            var newOffset = currentOffset + deltaYPx
+
+            // When accumulated offset reaches row height, emit nvim_input_mouse.
+            // Don't consume offset here — wait for grid_scroll response in
+            // processPendingScrollClears to keep visual offset synchronized
+            // with actual content movement (prevents flickering).
             var scrollCount = 0
             var checkOffset = newOffset
             while abs(checkOffset) >= rowHeightPx && canSendMore && scrollCount < 3 {
@@ -1358,21 +1385,26 @@ final class MetalTerminalView: MTKView {
                 }
             }
 
-            // Track how many scroll commands we sent
+            // Clamp offset: allow up to (pending + 1) rows of accumulation.
+            // This prevents unbounded growth while preserving enough headroom
+            // for grid_scroll responses to consume without over-correction.
+            let totalPending = alreadyPending + scrollCount
+            let maxOffsetPx = rowHeightPx * CGFloat(totalPending + 1) + rowHeightPx * 0.5
+            newOffset = max(-maxOffsetPx, min(maxOffsetPx, newOffset))
+
+            // Store final offset (atomic with read above — no TOCTOU gap)
+            scrollOffsetPx[gridId] = newOffset
+            // Reset stale counter — user is actively scrolling.
+            // This prevents decayStaleScrollOffsets from fighting active user input.
+            scrollStaleFrameCount[gridId] = 0
+            scrollOffsetLock.unlock()
+
+            // Track how many scroll commands we sent (outside scrollOffsetLock)
             if scrollCount > 0 {
                 pendingSentScrollLock.lock()
                 pendingSentScroll[gridId, default: 0] += scrollCount
                 pendingSentScrollLock.unlock()
             }
-
-            // Clamp offset to reasonable range to prevent unbounded growth
-            let maxOffsetPx = rowHeightPx * CGFloat(maxTotalPending + 2)
-            newOffset = max(-maxOffsetPx, min(maxOffsetPx, newOffset))
-
-            // Store full offset (not consumed) to prevent reverse jump
-            scrollOffsetLock.lock()
-            scrollOffsetPx[gridId] = newOffset
-            scrollOffsetLock.unlock()
 
             return newOffset
         } else {
@@ -1399,10 +1431,60 @@ final class MetalTerminalView: MTKView {
 
     /// Mark a grid for scroll offset clearing (thread-safe, can be called from any thread).
     /// Called from ZonvieCore when Neovim sends grid_scroll event.
+    /// Each call increments the count so multiple grid_scroll events are not collapsed.
     func clearScrollOffsetForGrid(_ gridId: Int64) {
         pendingScrollClearLock.lock()
-        pendingScrollClear.insert(gridId)
+        pendingScrollClear[gridId, default: 0] += 1
         pendingScrollClearLock.unlock()
+    }
+
+    /// Decay stale scroll offsets. Called every frame from onPreDraw.
+    /// When pendingSentScroll > 0 but no grid_scroll response arrives for several
+    /// frames, the scroll likely hit a buffer boundary (Neovim can't scroll further).
+    /// Decay the offset toward 0 over several frames to prevent it from getting stuck.
+    private func decayStaleScrollOffsets() {
+        let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        guard rowHeightPx > 0 else { return }
+
+        // Threshold: ~10 frames at 60fps ≈ 166ms without grid_scroll response
+        let staleThreshold = 10
+
+        pendingSentScrollLock.lock()
+        let pendingSnapshot = pendingSentScroll
+        pendingSentScrollLock.unlock()
+
+        // Only process grids that have pending sent scrolls
+        guard !pendingSnapshot.isEmpty else {
+            scrollStaleFrameCount.removeAll()
+            return
+        }
+
+        scrollOffsetLock.lock()
+        for (gridId, pendingCount) in pendingSnapshot {
+            guard pendingCount > 0 else { continue }
+
+            scrollStaleFrameCount[gridId, default: 0] += 1
+            let staleFrames = scrollStaleFrameCount[gridId]!
+
+            if staleFrames >= staleThreshold {
+                let currentOffset = scrollOffsetPx[gridId] ?? 0
+                if abs(currentOffset) < 1.0 {
+                    // Close enough to 0 — clear everything
+                    scrollOffsetPx.removeValue(forKey: gridId)
+                    scrollStaleFrameCount.removeValue(forKey: gridId)
+                    pendingSentScrollLock.lock()
+                    pendingSentScroll.removeValue(forKey: gridId)
+                    pendingSentScrollLock.unlock()
+                    ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) cleared (offset was \(currentOffset))")
+                } else {
+                    // Decay: reduce offset by ~30% per frame (converges in ~5 frames)
+                    let decayed = currentOffset * 0.7
+                    scrollOffsetPx[gridId] = decayed
+                    ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) decay offset=\(currentOffset) -> \(decayed) pending=\(pendingCount) staleFrames=\(staleFrames)")
+                }
+            }
+        }
+        scrollOffsetLock.unlock()
     }
 
     /// Process pending scroll clears (can be called from any thread).
@@ -1420,30 +1502,42 @@ final class MetalTerminalView: MTKView {
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
 
         scrollOffsetLock.lock()
-        for gridId in pending {
+        for (gridId, scrollEventCount) in pending {
+            // grid_scroll received — reset stale counter for this grid
+            scrollStaleFrameCount.removeValue(forKey: gridId)
+
             // Check if this is a response to our scroll command or Neovim-initiated
             pendingSentScrollLock.lock()
             let sentCount = pendingSentScroll[gridId] ?? 0
             let currentOffset = scrollOffsetPx[gridId] ?? 0
             if sentCount > 0 {
-                // This is a response to our scroll command - consume one cell height from offset
-                pendingSentScroll[gridId] = sentCount - 1
+                // Consume as many events as we have pending sent scrolls
+                let toConsume = min(sentCount, scrollEventCount)
+                pendingSentScroll[gridId] = sentCount - toConsume
                 pendingSentScrollLock.unlock()
 
-                // Consume the offset now that new vertices have arrived
+                // Consume rowHeightPx per grid_scroll event from stored offset.
+                // This synchronizes visual offset reduction with actual content movement.
                 var newOffset = currentOffset
-                if newOffset > 0 {
-                    newOffset -= rowHeightPx
-                } else if newOffset < 0 {
-                    newOffset += rowHeightPx
+                for _ in 0..<toConsume {
+                    if newOffset > 0 {
+                        newOffset -= rowHeightPx
+                    } else if newOffset < 0 {
+                        newOffset += rowHeightPx
+                    }
+                }
+                // If there were more scroll events than sent scrolls,
+                // the remaining are Neovim-initiated - clear offset
+                if scrollEventCount > toConsume {
+                    newOffset = 0
                 }
                 scrollOffsetPx[gridId] = newOffset
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) sentCount=\(sentCount) offset=\(currentOffset) -> \(newOffset)")
+                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) sentCount=\(sentCount) consumed=\(toConsume) offset=\(currentOffset) -> \(newOffset)")
             } else {
                 pendingSentScrollLock.unlock()
                 // Neovim-initiated scroll (j/k keys, etc.) - clear offset
                 scrollOffsetPx.removeValue(forKey: gridId)
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) nvim-initiated, clearing offset=\(currentOffset)")
+                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) nvim-initiated, clearing offset=\(currentOffset)")
             }
         }
         scrollOffsetLock.unlock()
@@ -1518,7 +1612,7 @@ final class MetalTerminalView: MTKView {
 
         ZonvieCore.appLog("[hitTest] point=\(point) pointPx=\(pointPx) globalRow=\(globalRow) globalCol=\(globalCol) gridsCount=\(grids.count)")
         for grid in grids {
-            ZonvieCore.appLog("[hitTest]   grid: id=\(grid.gridId) zindex=\(grid.zindex) startRow=\(grid.startRow) startCol=\(grid.startCol) rows=\(grid.rows) cols=\(grid.cols)")
+            ZonvieCore.appLog("[hitTest]   grid: id=\(grid.gridId) zindex=\(grid.zindex) startRow=\(grid.startRow) startCol=\(grid.startCol) rows=\(grid.rows) cols=\(grid.cols) marginTop=\(grid.marginTop) marginBottom=\(grid.marginBottom)")
         }
 
         // Find grid with highest zindex containing this point
@@ -1544,7 +1638,29 @@ final class MetalTerminalView: MTKView {
             }
         }
 
-        ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol)")
+        // Adjust for smooth scroll offset: during scrolling, content rows are
+        // visually shifted by scrollOffsetPx. Without this adjustment, clicking
+        // on visually-shifted content selects the wrong row.
+        scrollOffsetLock.lock()
+        let offsetPx = scrollOffsetPx[bestGridId] ?? 0
+        scrollOffsetLock.unlock()
+
+        if abs(offsetPx) > 0.001, let grid = grids.first(where: { $0.gridId == bestGridId }) {
+            // Content at static pixel Y is displayed at visual pixel Y + scrollOffsetPx.
+            // Reverse: static Y = visual Y - scrollOffsetPx.
+            let adjustedPxY = pointPx.y - CGFloat(offsetPx)
+            let adjustedGlobalRow = Int32(adjustedPxY / cellH)
+            let adjustedLocalRow = adjustedGlobalRow - grid.startRow
+
+            // Only apply adjustment within the scrollable content area (not margins)
+            let contentTop = grid.marginTop
+            let contentBottom = grid.rows - grid.marginBottom
+            if adjustedLocalRow >= contentTop && adjustedLocalRow < contentBottom {
+                localRow = adjustedLocalRow
+            }
+        }
+
+        ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol) scrollOffset=\(offsetPx)")
         return (bestGridId, localRow, localCol)
     }
 }
