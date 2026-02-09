@@ -619,6 +619,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         sendMouseEvent(button: "left", action: "release", event: event)
     }
 
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        sendMouseEvent(button: "left", action: "drag", event: event)
+    }
+
     override func rightMouseDown(with event: NSEvent) {
         super.rightMouseDown(with: event)
         window?.makeFirstResponder(self)
@@ -628,6 +633,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     override func rightMouseUp(with event: NSEvent) {
         super.rightMouseUp(with: event)
         sendMouseEvent(button: "right", action: "release", event: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        super.rightMouseDragged(with: event)
+        sendMouseEvent(button: "right", action: "drag", event: event)
     }
 
     private func sendMouseEvent(button: String, action: String, event: NSEvent) {
