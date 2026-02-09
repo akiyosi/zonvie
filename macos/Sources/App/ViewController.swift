@@ -180,10 +180,9 @@ final class ViewController: NSViewController {
         guard let index = currentTabs.firstIndex(where: { $0.handle == handle }) else {
             return
         }
-        // Neovim uses 1-based tab indices
-        // Use Ngt (go to tab N) which doesn't show cmdline
+        // Use nvim_command API so it works even in terminal mode
         let tabNumber = index + 1
-        core?.sendInput("\u{1b}\(tabNumber)gt")
+        core?.sendCommand("\(tabNumber)tabnext")
     }
 
     private func closeTab(handle: Int64) {
@@ -191,14 +190,14 @@ final class ViewController: NSViewController {
         guard let index = currentTabs.firstIndex(where: { $0.handle == handle }) else {
             return
         }
-        // Must use command for close
+        // Use nvim_command API so it works even in terminal mode
         let tabNumber = index + 1
-        core?.sendInput("\u{1b}:\(tabNumber)tabclose\r")
+        core?.sendCommand("\(tabNumber)tabclose")
     }
 
     private func createNewTab() {
-        // Must use command for new tab
-        core?.sendInput("\u{1b}:tabnew\r")
+        // Use nvim_command API so it works even in terminal mode
+        core?.sendCommand("tabnew")
     }
 
     private func moveTab(from fromIndex: Int, to toIndex: Int) {

@@ -624,10 +624,11 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
                 app.tabline_state.drop_target_index = i;
 
                 // Select the tab being dragged so :tabmove works on it
+                // Use nvim_command API so it works even in terminal mode
                 if (app.corep) |corep| {
                     var cmd_buf: [16]u8 = undefined;
-                    const cmd = std.fmt.bufPrint(&cmd_buf, "\x1b{d}gt", .{i + 1}) catch return;
-                    app_mod.zonvie_core_send_input(corep, cmd.ptr, cmd.len);
+                    const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{i + 1}) catch return;
+                    app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
                 }
 
                 _ = c.SetCapture(hwnd);
@@ -1700,11 +1701,11 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
                 return true;
             }
 
-            // Select this tab - use Ngt (go to tab N) which doesn't show cmdline
+            // Select this tab - use nvim_command API so it works even in terminal mode
             if (app.corep) |corep| {
                 var cmd_buf: [16]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "\x1b{d}gt", .{i + 1}) catch return true;
-                app_mod.zonvie_core_send_input(corep, cmd.ptr, cmd.len);
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{i + 1}) catch return true;
+                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
             }
             // Force immediate repaint
             _ = c.InvalidateRect(main_hwnd, null, 0);
