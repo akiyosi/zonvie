@@ -1421,6 +1421,11 @@ pub export fn WndProc(
         },
 
         c.WM_SIZE => {
+            // SIZE_MINIMIZED: skip resize to avoid sending tiny rows/cols to Neovim,
+            // which would destroy split window proportions.
+            const SIZE_MINIMIZED = 1;
+            if (wParam == SIZE_MINIMIZED) return 0;
+
             if (getApp(hwnd)) |app| {
                 // 1) GPU state transition must not race with WM_PAINT (which holds app.mu).
                 app.mu.lock();
