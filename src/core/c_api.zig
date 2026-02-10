@@ -807,6 +807,22 @@ pub export fn zonvie_core_get_visible_grids(
     return box.core.getVisibleGrids(out_grids.?[0..max_count]);
 }
 
+/// Non-blocking version of zonvie_core_get_visible_grids.
+/// Returns grid count on success, or -1 if the lock could not be acquired.
+/// Use this from the UI thread to avoid blocking when the core is in handleRedraw.
+pub export fn zonvie_core_try_get_visible_grids(
+    p: ?*zonvie_core,
+    out_grids: ?[*]GridInfo,
+    max_count: usize,
+) callconv(.c) i32 {
+    if (p == null or out_grids == null or max_count == 0) return -1;
+    const box = asBox(p.?);
+    if (box.core.tryGetVisibleGrids(out_grids.?[0..max_count])) |count| {
+        return @intCast(count);
+    }
+    return -1;
+}
+
 /// Get viewport info for a specific grid (for scrollbar rendering).
 /// Returns 1 if found, 0 if not found.
 pub export fn zonvie_core_get_viewport(

@@ -1419,17 +1419,18 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
-    // Copy vertex data to local buffer while holding the lock
-    // This is critical: after unlocking, ext_win.verts could be modified by another thread,
-    // invalidating any slice pointing to it. We must copy the data before unlocking.
+    // Copy vertex data to per-window scratch buffer while holding the lock.
+    // Per-window (not shared) to avoid re-entrancy corruption when DXGI Present
+    // pumps Win32 messages and triggers another external window's WM_PAINT.
     const vert_count = ext_win.vert_count;
-    const verts_copy = app.alloc.alloc(app_mod.Vertex, vert_count) catch {
+    ext_win.paint_scratch.clearRetainingCapacity();
+    ext_win.paint_scratch.ensureTotalCapacity(app.alloc, vert_count) catch {
         ext_win.paint_ref_count -= 1;
         app.mu.unlock();
-        applog.appLog("[win] paintExternalWindow: failed to alloc verts copy\n", .{});
+        applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
         return;
     };
-    @memcpy(verts_copy, ext_win.verts.items[0..vert_count]);
+    ext_win.paint_scratch.appendSliceAssumeCapacity(ext_win.verts.items[0..vert_count]);
 
     const cursor_blink_visible = ext_win.cursor_blink_state;
     ext_win.needs_redraw = false;
@@ -1459,9 +1460,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
 
-    // Use the copied vertex data (safe to access after unlock)
-    const verts = verts_copy;
-    defer app.alloc.free(verts_copy);
+    // Use the per-window scratch buffer (safe: each window has its own)
+    const verts = ext_win.paint_scratch.items;
 
     if (gpu_ptr) |g| {
         g.lockContext();

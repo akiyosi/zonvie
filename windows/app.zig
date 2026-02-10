@@ -36,6 +36,7 @@ pub const zonvie_core_resize = core.zonvie_core_resize;
 pub const zonvie_core_try_resize_grid = core.zonvie_core_try_resize_grid;
 pub const zonvie_core_get_viewport = core.zonvie_core_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
+pub const zonvie_core_try_get_visible_grids = core.zonvie_core_try_get_visible_grids;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
 pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
@@ -490,6 +491,10 @@ pub const ExternalWindow = struct {
     scrollbar_hover: bool = false,
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
 
+    // Scratch buffer for vertex copy during paint (avoids per-frame alloc).
+    // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
+    paint_scratch: std.ArrayListUnmanaged(Vertex) = .{},
+
     pub fn deinit(self: *ExternalWindow, alloc: std.mem.Allocator) void {
         // Clear user data first to prevent WndProc from accessing App during destruction
         _ = c.SetWindowLongPtrW(self.hwnd, c.GWLP_USERDATA, 0);
@@ -498,6 +503,7 @@ pub const ExternalWindow = struct {
         _ = c.DestroyWindow(self.hwnd);
 
         // Now safe to release D3D resources
+        self.paint_scratch.deinit(alloc);
         self.verts.deinit(alloc);
         if (self.vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
@@ -769,6 +775,12 @@ pub const App = struct {
     // (for parallel nvim spawn + renderer init)
     pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .{},
 
+    // Cached visible grids for non-blocking UI queries (UI thread only).
+    // Updated on successful tryLock; stale data used when grid_mu is contended.
+    cached_visible_grids: [16]GridInfo = undefined,
+    cached_visible_grids_count: usize = 0,
+
+
     // Tray icon for OS notification (balloon notification)
     tray_icon: ?TrayIcon = null,
 
@@ -809,6 +821,22 @@ pub const App = struct {
             self.row_verts.shrinkRetainingCapacity(needed);
             if (applog.isEnabled()) applog.appLog("[win] shrunk row_verts from {d} to {d}\n", .{ self.row_verts.items.len + (self.row_verts.items.len - needed), needed });
         }
+    }
+
+    /// Non-blocking visible grids query with cache fallback (UI thread only).
+    /// Attempts tryLock on grid_mu; on success updates cached_visible_grids.
+    /// On failure returns the previously cached data.
+    pub fn getVisibleGridsCached(self: *App, corep: *zonvie_core) struct { grids: [16]GridInfo, count: usize } {
+        var buf: [16]GridInfo = undefined;
+        const result = zonvie_core_try_get_visible_grids(corep, &buf, 16);
+        if (result >= 0) {
+            const count: usize = @intCast(result);
+            @memcpy(self.cached_visible_grids[0..count], buf[0..count]);
+            self.cached_visible_grids_count = count;
+            return .{ .grids = self.cached_visible_grids, .count = count };
+        }
+        // tryLock failed — return stale cache
+        return .{ .grids = self.cached_visible_grids, .count = self.cached_visible_grids_count };
     }
 
     /// Get target rectangle for ext-float (msg_show/msg_history) positioning

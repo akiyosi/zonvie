@@ -324,10 +324,11 @@ pub const Core = struct {
     pending_resize_valid: bool = false,
     missing_glyph_log_count: u32 = 0,
 
-    // Flag to track if we're inside handleRedraw (grid_mu is already held).
-    // When true, updateLayoutPx skips locking since the same thread already holds grid_mu.
-    // Atomic because it is written by the RPC thread and read by the UI thread.
-    in_handle_redraw: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Thread ID of the thread currently inside handleRedraw (grid_mu is already held).
+    // When updateLayoutPx is called from the SAME thread, it skips locking since
+    // that thread already holds grid_mu. Using thread ID instead of a bool prevents
+    // the UI thread from incorrectly skipping the lock when the RPC thread is in redraw.
+    redraw_thread_id: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // Tracking for external windows (to detect new/closed external grids)
     known_external_grids: std.AutoHashMapUnmanaged(i64, void) = .{},
@@ -791,10 +792,21 @@ pub const Core = struct {
     /// Get list of visible grids for hit-testing.
     /// Returns number of grids written (up to out.len).
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
-        // Lock grid_mu to prevent concurrent modification from RPC thread.
         self.grid_mu.lock();
         defer self.grid_mu.unlock();
+        return self.getVisibleGridsLocked(out);
+    }
 
+    /// Non-blocking version of getVisibleGrids.
+    /// Returns null if grid_mu could not be acquired (another thread holds it).
+    pub fn tryGetVisibleGrids(self: *Core, out: []c_api.GridInfo) ?usize {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock();
+        return self.getVisibleGridsLocked(out);
+    }
+
+    /// Internal: get visible grids assuming grid_mu is already held.
+    fn getVisibleGridsLocked(self: *Core, out: []c_api.GridInfo) usize {
         var count: usize = 0;
 
         // Always include main grid first
@@ -970,10 +982,14 @@ pub const Core = struct {
         cell_w_px: u32,
         cell_h_px: u32,
     ) void {
-        // If called from within handleRedraw (via callback), grid_mu is already
-        // held by the same thread, so we can call the locked version directly.
+        // If called from within handleRedraw (via callback) on the SAME thread,
+        // grid_mu is already held, so we can call the locked version directly.
         // This ensures cell dimensions are updated BEFORE the flush generates vertices.
-        if (self.in_handle_redraw.load(.seq_cst)) {
+        // We compare thread IDs to avoid the UI thread incorrectly skipping the lock
+        // when the RPC thread is in handleRedraw (which would cause a data race).
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
+        if (redraw_tid != 0 and redraw_tid == current_tid) {
             self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
             return;
         }

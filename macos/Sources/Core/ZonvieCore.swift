@@ -1335,6 +1335,54 @@ final class ZonvieCore {
         }
     }
 
+    /// Cached visible grids for non-blocking UI queries (main thread only).
+    /// Pre-reserved to 16 elements to avoid reallocation in steady state.
+    private var cachedVisibleGrids: [GridInfo] = {
+        var arr = [GridInfo]()
+        arr.reserveCapacity(16)
+        return arr
+    }()
+
+    /// Non-blocking version of getVisibleGrids with cache fallback.
+    /// Attempts tryLock on grid_mu; on success updates cache in-place.
+    /// On failure returns previously cached data to avoid blocking the UI thread.
+    /// Allocation-free in steady state (after initial cache population).
+    func getVisibleGridsCached() -> [GridInfo] {
+        guard let core else { return cachedVisibleGrids }
+
+        // Stack-allocated C buffer via withUnsafeTemporaryAllocation (no heap)
+        withUnsafeTemporaryAllocation(of: zonvie_grid_info.self, capacity: 16) { buffer in
+            let result = zonvie_core_try_get_visible_grids(core, buffer.baseAddress!, 16)
+            guard result >= 0 else { return }
+
+            let count = Int(result)
+            // Update cached array in-place (no heap alloc when capacity is sufficient)
+            while cachedVisibleGrids.count > count { cachedVisibleGrids.removeLast() }
+            for i in 0..<count {
+                let g = buffer[i]
+                let info = GridInfo(
+                    gridId: g.grid_id,
+                    zindex: g.zindex,
+                    startRow: g.start_row,
+                    startCol: g.start_col,
+                    rows: g.rows,
+                    cols: g.cols,
+                    marginTop: g.margin_top,
+                    marginBottom: g.margin_bottom,
+                    marginLeft: g.margin_left,
+                    marginRight: g.margin_right
+                )
+                if i < cachedVisibleGrids.count {
+                    cachedVisibleGrids[i] = info
+                } else {
+                    cachedVisibleGrids.append(info)
+                }
+            }
+        }
+
+        return cachedVisibleGrids
+    }
+
     /// Viewport info for scrollbar rendering (Swift-friendly wrapper)
     struct ViewportInfo {
         var gridId: Int64
@@ -4068,7 +4116,7 @@ final class ZonvieCore {
             // Grid-based: bottom-right of the grid where cursor is
             let cursorPos = getCursorPosition()
             let cursorGridId = cursorPos.gridId
-            let grids = getVisibleGrids()
+            let grids = getVisibleGridsCached()
             var targetGrid: GridInfo?
 
             for grid in grids {
@@ -4196,7 +4244,7 @@ final class ZonvieCore {
 
             let cursorPos = getCursorPosition()
             let cursorGridId = cursorPos.gridId
-            let grids = getVisibleGrids()
+            let grids = getVisibleGridsCached()
             var targetGrid: GridInfo?
 
             for grid in grids {

@@ -645,10 +645,9 @@ pub fn updateExtFloatPositions(app: *App) void {
                 var grid_bottom_px: c_int = client_rect.bottom;
 
                 if (corep) |cp| {
-                    var grids: [16]core.GridInfo = undefined;
-                    const count = app_mod.zonvie_core_get_visible_grids(cp, &grids, 16);
-                    if (count > 0) {
-                        for (grids[0..count]) |grid| {
+                    const cached = app.getVisibleGridsCached(cp);
+                    if (cached.count > 0) {
+                        for (cached.grids[0..cached.count]) |grid| {
                             if (grid.grid_id == cursor_grid) {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
@@ -798,12 +797,11 @@ pub fn updateMiniWindows(app: *App) void {
                     anchor_y = client_origin.y + grid_bottom_px;
                 }
             } else {
-                // Try to get grid bounds from core
+                // Try to get grid bounds from core (non-blocking)
                 if (app.corep) |corep| {
-                    var grids: [16]core.GridInfo = undefined;
-                    const count = app_mod.zonvie_core_get_visible_grids(corep, &grids, 16);
-                    if (count > 0) {
-                        for (grids[0..count]) |grid| {
+                    const cached = app.getVisibleGridsCached(corep);
+                    if (cached.count > 0) {
+                        for (cached.grids[0..cached.count]) |grid| {
                             if (grid.grid_id == cursor_grid) {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));

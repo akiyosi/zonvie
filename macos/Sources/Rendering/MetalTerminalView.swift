@@ -427,7 +427,7 @@ final class MetalTerminalView: MTKView {
         // Cache grid info at drag start
         let location = convert(event.locationInWindow, from: nil)
         let (gridId, _, _) = hitTestGrid(at: location)
-        if let grid = core?.getVisibleGrids().first(where: { $0.gridId == gridId }) {
+        if let grid = core?.getVisibleGridsCached().first(where: { $0.gridId == gridId }) {
             dragGridCache = DragGridCache(
                 gridId: grid.gridId,
                 startRow: grid.startRow,
@@ -1224,8 +1224,8 @@ final class MetalTerminalView: MTKView {
         let cellHeightPx = Float(renderer.cellHeightPx)
         guard drawableHeight > 0 && cellHeightPx > 0 else { return }
 
-        // Get grid info to look up margins and positions
-        let grids = core.getVisibleGrids()
+        // Get grid info to look up margins and positions (non-blocking)
+        let grids = core.getVisibleGridsCached()
         let gridInfoMap = Dictionary(uniqueKeysWithValues: grids.map { ($0.gridId, $0) })
 
         // Prune stale entries: remove gridIds that are no longer visible
@@ -1558,8 +1558,8 @@ final class MetalTerminalView: MTKView {
         scrollOffsetLock.unlock()
         if abs(offsetPx) < 0.001 { return nil }
 
-        // Get grid info for margins
-        let grids = core.getVisibleGrids()
+        // Get grid info for margins (non-blocking)
+        let grids = core.getVisibleGridsCached()
         guard let info = grids.first(where: { $0.gridId == gridId }) else { return nil }
 
         // Calculate grid's top Y in NDC
@@ -1610,8 +1610,8 @@ final class MetalTerminalView: MTKView {
         let globalCol = Int32(pointPx.x / cellW)
         let globalRow = Int32(pointPx.y / cellH)
 
-        // Get visible grids from core
-        let grids = core.getVisibleGrids()
+        // Get visible grids from core (non-blocking)
+        let grids = core.getVisibleGridsCached()
 
         ZonvieCore.appLog("[hitTest] point=\(point) pointPx=\(pointPx) globalRow=\(globalRow) globalCol=\(globalCol) gridsCount=\(grids.count)")
         for grid in grids {
@@ -1762,8 +1762,8 @@ extension MetalTerminalView: NSTextInputClient {
                 var screenRow = Int(cursor.row)
                 var screenCol = Int(cursor.col)
 
-                // Find the grid and add its startRow/startCol for screen position
-                let grids = core.getVisibleGrids()
+                // Find the grid and add its startRow/startCol for screen position (non-blocking)
+                let grids = core.getVisibleGridsCached()
                 for grid in grids {
                     if grid.gridId == cursor.gridId {
                         screenRow = Int(grid.startRow) + Int(cursor.row)
@@ -1846,8 +1846,8 @@ extension MetalTerminalView: NSTextInputClient {
                 screenRow = Int(cursor.row)
                 screenCol = Int(cursor.col)
 
-                // Find the grid and add its startRow/startCol for screen position
-                let grids = core.getVisibleGrids()
+                // Find the grid and add its startRow/startCol for screen position (non-blocking)
+                let grids = core.getVisibleGridsCached()
                 for grid in grids {
                     if grid.gridId == cursor.gridId {
                         screenRow = Int(grid.startRow) + Int(cursor.row)

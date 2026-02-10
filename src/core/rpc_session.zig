@@ -490,8 +490,8 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
     const params = top[2].arr;
 
     if (std.mem.eql(u8, method, "redraw")) {
-        // Set flag before acquiring lock to detect re-entrant updateLayoutPx calls.
-        self.in_handle_redraw.store(true, .seq_cst);
+        // Store current thread ID to detect re-entrant updateLayoutPx calls from this thread.
+        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
 
         // Lock grid_mu to prevent concurrent access from UI thread during redraw.
         // NOTE: All frontend callbacks invoked below (on_vertices_*, on_guifont,
@@ -549,7 +549,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
 
         self.grid_mu.unlock();
-        self.in_handle_redraw.store(false, .seq_cst);
+        self.redraw_thread_id.store(0, .seq_cst);
     } else if (std.mem.eql(u8, method, "zonvie_ime_off")) {
         // Custom RPC notification for IME off (user-invokable)
         if (self.cb.on_ime_off) |cb| {

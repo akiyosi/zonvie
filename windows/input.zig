@@ -194,14 +194,13 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     var col: i32 = 0;
     const grid_id = app_mod.zonvie_core_get_cursor_position(corep, &row, &col);
 
-    var grids: [16]core.GridInfo = undefined;
-    const grid_count = app_mod.zonvie_core_get_visible_grids(corep, &grids, 16);
+    const cached = app.getVisibleGridsCached(corep.?);
 
     var screen_row: i32 = row;
     var screen_col: i32 = col;
 
     // Find the grid and add startRow/startCol
-    for (grids[0..grid_count]) |grid| {
+    for (cached.grids[0..cached.count]) |grid| {
         if (grid.grid_id == grid_id) {
             screen_row = grid.start_row + row;
             screen_col = grid.start_col + col;
@@ -366,11 +365,10 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // For external windows, use grid-local coordinates directly
     // For main window, add start_row/start_col to get screen position
     if (!is_external_window) {
-        // Get grid info to calculate screen position
-        var grids: [16]core.GridInfo = undefined;
-        const grid_count = app_mod.zonvie_core_get_visible_grids(corep, &grids, 16);
+        // Get grid info to calculate screen position (non-blocking)
+        const cached = app.getVisibleGridsCached(corep.?);
 
-        for (grids[0..grid_count]) |grid| {
+        for (cached.grids[0..cached.count]) |grid| {
             if (grid.grid_id == grid_id) {
                 screen_row = grid.start_row + row;
                 screen_col = grid.start_col + col;

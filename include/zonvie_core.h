@@ -762,6 +762,14 @@ ZONVIE_API size_t zonvie_core_get_visible_grids(
     size_t max_count
 );
 
+/* Non-blocking version of zonvie_core_get_visible_grids.
+   Returns grid count on success, or -1 if the lock could not be acquired. */
+ZONVIE_API int32_t zonvie_core_try_get_visible_grids(
+    zonvie_core *core,
+    zonvie_grid_info *out_grids,
+    size_t max_count
+);
+
 /* Get current cursor position.
    Returns cursor row and column (0-based) in out_row and out_col.
    Returns the grid_id of the cursor (1 = main grid). */
