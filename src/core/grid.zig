@@ -685,6 +685,9 @@ pub const Grid = struct {
     sub_grids: std.AutoHashMapUnmanaged(i64, GridBuf) = .{},
     win_pos: std.AutoHashMapUnmanaged(i64, GridPos) = .{},
 
+    // grid_id -> Neovim window handle (from win_pos/win_float_pos/win_external_pos events)
+    grid_win_ids: std.AutoHashMapUnmanaged(i64, i64) = .{},
+
     grid_metrics: std.AutoHashMapUnmanaged(i64, CellMetricsPx) = .{},
 
     // Viewport info per grid (from win_viewport / win_viewport_margins)
@@ -760,6 +763,7 @@ pub const Grid = struct {
         }
         self.sub_grids.deinit(self.alloc);
         self.win_pos.deinit(self.alloc);
+        self.grid_win_ids.deinit(self.alloc);
         self.win_layer.deinit(self.alloc);
         self.external_grids.deinit(self.alloc);
         self.grid_metrics.deinit(self.alloc);
@@ -1193,6 +1197,7 @@ pub const Grid = struct {
             buf.deinit(self.alloc);
         }
         _ = self.win_pos.remove(grid_id);
+        _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
         self.markAllDirty();
 
@@ -1202,9 +1207,12 @@ pub const Grid = struct {
         }
     }
 
-    pub fn setWinPos(self: *Grid, grid_id: i64, row: u32, col: u32) !void {
+    pub fn setWinPos(self: *Grid, grid_id: i64, win_id: i64, row: u32, col: u32) !void {
         // Positions are only meaningful for sub-grids (windows)
         if (grid_id == 1) return;
+
+        // Store grid_id -> winid mapping
+        try self.grid_win_ids.put(self.alloc, grid_id, win_id);
 
         // If this grid was external, remove it from external_grids.
         // This allows a grid to transition from external back to normal window.
@@ -1221,7 +1229,7 @@ pub const Grid = struct {
             const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
             self.markDirtyRect(old_pos.row, old_pos.row + h_old);
         }
-    
+
         try self.win_pos.put(self.alloc, grid_id, .{ .row = row, .col = col });
 
         // Dirty the new range
@@ -1242,6 +1250,7 @@ pub const Grid = struct {
     pub fn setWinFloatPos(
         self: *Grid,
         grid_id: i64,
+        win_id: i64,
         row: u32,
         col: u32,
         zindex: i64,
@@ -1253,6 +1262,11 @@ pub const Grid = struct {
         // try self.win_layer.put(self.alloc, grid_id, .{ .zindex = zindex, .compindex = compindex });
 
         if (grid_id == 1) return;
+
+        // Store grid_id -> winid mapping (skip for grids without a real window, e.g. msg_set_pos)
+        if (win_id > 0) {
+            try self.grid_win_ids.put(self.alloc, grid_id, win_id);
+        }
 
         // If this grid was external, remove it from external_grids.
         // This allows a grid to transition from external back to float.
@@ -1290,6 +1304,7 @@ pub const Grid = struct {
             self.content_rev +%= 1;
         }
         _ = self.win_pos.remove(grid_id);
+        _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
         _ = self.external_grids.remove(grid_id);
         if (self.cursor_grid == grid_id) {
@@ -1302,6 +1317,9 @@ pub const Grid = struct {
     /// Returns true if this is a new external grid, false if it was already external.
     pub fn setWinExternalPos(self: *Grid, grid_id: i64, win: i64) !bool {
         if (grid_id == 1) return false; // Main grid cannot be external
+
+        // Store grid_id -> winid mapping
+        try self.grid_win_ids.put(self.alloc, grid_id, win);
 
         // Check if already external
         if (self.external_grids.contains(grid_id)) {
@@ -1414,6 +1432,14 @@ pub const Grid = struct {
     pub fn getViewport(self: *const Grid, grid_id: i64) ?Viewport {
         const effective_id = if (grid_id == -1) self.cursor_grid else grid_id;
         return self.viewport.get(effective_id);
+    }
+
+    /// Get Neovim window handle (winid) for a grid.
+    /// If grid_id is -1, returns winid for the cursor's current grid.
+    /// Returns null if the mapping is not available.
+    pub fn getWinId(self: *const Grid, grid_id: i64) ?i64 {
+        const effective_id = if (grid_id == -1) self.cursor_grid else grid_id;
+        return self.grid_win_ids.get(effective_id);
     }
 
     // =========================================================================

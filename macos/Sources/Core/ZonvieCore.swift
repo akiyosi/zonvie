@@ -1621,6 +1621,13 @@ final class ZonvieCore {
         zonvie_core_scroll_to_line(core, line, useBottom)
     }
 
+    /// Scroll a window by one page (Neovim's <C-f>/<C-b>).
+    /// gridId: target grid (-1 for cursor grid / current window).
+    func pageScroll(gridId: Int64, forward: Bool) {
+        guard let core else { return }
+        zonvie_core_page_scroll(core, gridId, forward)
+    }
+
     /// Send mouse input event to Neovim (click, drag, release)
     func sendMouseInput(button: String, action: String, modifier: String, gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return }

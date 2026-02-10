@@ -918,6 +918,19 @@ pub export fn zonvie_core_scroll_to_line(
     box.core.scrollToLine(line, use_bottom);
 }
 
+/// Scroll a window by one page (Neovim's <C-f>/<C-b>).
+/// grid_id: target grid (-1 for cursor grid / current window).
+/// forward: true for page down, false for page up.
+pub export fn zonvie_core_page_scroll(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    forward: bool,
+) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.pageScroll(grid_id, forward);
+}
+
 /// Process pending message scroll update (for throttled scroll).
 /// Call this after scroll events stop to ensure final position is rendered.
 pub export fn zonvie_core_process_pending_msg_scroll(

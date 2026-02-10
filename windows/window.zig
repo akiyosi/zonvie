@@ -78,10 +78,6 @@ const QUIT_TIMEOUT_MS = app_mod.QUIT_TIMEOUT_MS;
 const SCROLLBAR_FADE_INTERVAL = app_mod.SCROLLBAR_FADE_INTERVAL;
 const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
 const SCROLLBAR_REPEAT_INTERVAL = app_mod.SCROLLBAR_REPEAT_INTERVAL;
-const SCROLLBAR_WIDTH = app_mod.SCROLLBAR_WIDTH;
-const SCROLLBAR_MARGIN = app_mod.SCROLLBAR_MARGIN;
-const SCROLLBAR_MIN_KNOB_HEIGHT = app_mod.SCROLLBAR_MIN_KNOB_HEIGHT;
-const SCROLLBAR_CORNER_RADIUS = app_mod.SCROLLBAR_CORNER_RADIUS;
 
 // Win32 DPI API (Windows 10 v1607+)
 extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
@@ -193,10 +189,10 @@ pub export fn WndProc(
                     const tabbar_height_i16: i16 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                     const resize_edge_width: i32 = 2; // Keep this many pixels at right edge for resize
                     const in_scrollbar_area = if (app.config.scrollbar.enabled) blk: {
-                        const scrollbar_area_left = window_rect.right - @as(i32, @intFromFloat(SCROLLBAR_WIDTH + SCROLLBAR_MARGIN * 2));
+                        const scrollbar_area_left = window_rect.right - @as(i32, @intFromFloat(app_mod.scrollbarReservedWidth(app.dpi_scale)));
                         const scrollbar_area_right = window_rect.right - resize_edge_width; // Leave edge for resize
-                        const scrollbar_area_top = window_rect.top + tabbar_height_i16 + @as(i32, @intFromFloat(SCROLLBAR_MARGIN));
-                        const scrollbar_area_bottom = window_rect.bottom - @as(i32, @intFromFloat(SCROLLBAR_MARGIN)) - resize_edge_width;
+                        const scrollbar_area_top = window_rect.top + tabbar_height_i16 + @as(i32, @intFromFloat(app_mod.scrollbarMargin(app.dpi_scale)));
+                        const scrollbar_area_bottom = window_rect.bottom - @as(i32, @intFromFloat(app_mod.scrollbarMargin(app.dpi_scale))) - resize_edge_width;
                         break :blk x >= scrollbar_area_left and x < scrollbar_area_right and
                             y >= scrollbar_area_top and y <= scrollbar_area_bottom;
                     } else false;

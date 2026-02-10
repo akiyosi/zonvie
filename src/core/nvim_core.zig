@@ -757,7 +757,9 @@ pub const Core = struct {
             self.handleMsgGridScroll(direction);
             return;
         }
-        self.requestMouseScroll(grid_id, row, col, direction) catch |e| {
+        // Resolve grid_id -1 to cursor_grid so Neovim receives a valid grid ID
+        const effective_id = if (grid_id == -1) self.grid.cursor_grid else grid_id;
+        self.requestMouseScroll(effective_id, row, col, direction) catch |e| {
             self.log.write("sendMouseScroll err: {any}\n", .{e});
         };
     }
@@ -786,6 +788,15 @@ pub const Core = struct {
     pub fn scrollToLine(self: *Core, line: i64, use_bottom: bool) void {
         self.requestScrollToLine(line, use_bottom) catch |e| {
             self.log.write("scrollToLine err: {any}\n", .{e});
+        };
+    }
+
+    /// Scroll a window by one page using Neovim's native <C-f>/<C-b>.
+    /// grid_id: target grid (-1 for cursor grid / current window).
+    /// forward: true = page down, false = page up.
+    pub fn pageScroll(self: *Core, grid_id: i64, forward: bool) void {
+        self.requestPageScroll(grid_id, forward) catch |e| {
+            self.log.write("pageScroll err: {any}\n", .{e});
         };
     }
 
@@ -1840,6 +1851,64 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_exec_lua scrollToLine (id={d}) line={d} bottom={any}\n", .{ id, line, use_bottom });
+    }
+
+    /// Send page scroll via nvim_exec_lua using winsaveview/winrestview API.
+    /// Resolves grid_id to a Neovim winid and uses nvim_win_call for explicit
+    /// window targeting. Uses winsaveview to preserve full view state (topfill,
+    /// skipcol, etc.), modifies topline, and adjusts cursor only when it would
+    /// fall outside the new visible range. Works for all buffer types including
+    /// terminal buffers. No normal! or key mappings involved.
+    fn requestPageScroll(self: *Core, grid_id: i64, forward: bool) !void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_exec_lua");
+
+        // Resolve grid_id -> Neovim winid (requires grid_mu)
+        const winid: i64 = blk: {
+            self.grid_mu.lock();
+            defer self.grid_mu.unlock();
+            break :blk self.grid.getWinId(grid_id) orelse 0;
+        };
+
+        const lua_code =
+            \\local fwd, winid = ...
+            \\local win = winid > 0 and winid or vim.api.nvim_get_current_win()
+            \\vim.api.nvim_win_call(win, function()
+            \\  if vim.fn.mode() == 't' then
+            \\    vim.cmd('stopinsert')
+            \\  end
+            \\  local view = vim.fn.winsaveview()
+            \\  local h = vim.api.nvim_win_get_height(win)
+            \\  local lc = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win))
+            \\  local amt = math.max(1, h - 2)
+            \\  if fwd then
+            \\    view.topline = math.min(lc, view.topline + amt)
+            \\  else
+            \\    view.topline = math.max(1, view.topline - amt)
+            \\  end
+            \\  local bot = math.min(lc, view.topline + h - 1)
+            \\  if view.lnum < view.topline then
+            \\    view.lnum = view.topline
+            \\  elseif view.lnum > bot then
+            \\    view.lnum = bot
+            \\  end
+            \\  vim.fn.winrestview(view)
+            \\end)
+        ;
+
+        // nvim_exec_lua(code, args) - args: [forward, winid]
+        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packStr(&buf, self.alloc, lua_code);
+        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packBool(&buf, self.alloc, forward);
+        try rpc.packInt(&buf, self.alloc, winid);
+
+        try self.sendRaw(buf.items);
+
+        self.log.write("rpc send: nvim_exec_lua pageScroll (id={d}) grid={d} winid={d} forward={any}\n", .{ id, grid_id, winid, forward });
     }
 
     /// Send nvim_input_mouse RPC for scroll events.

@@ -445,13 +445,14 @@ pub fn handleRedraw(
                 if (tv != .arr) continue;
                 const t = tv.arr;
                 if (t.len < 6) continue;
-                if (t[0] != .int or t[2] != .int or t[3] != .int) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
 
                 const grid_id = t[0].int;
+                const win_id = t[1].int;
                 const startrow = @as(u32, @intCast(t[2].int));
                 const startcol = @as(u32, @intCast(t[3].int));
-                log.write("[win_pos] grid_id={d} startrow={d} startcol={d}\n", .{ grid_id, startrow, startcol });
-                try grid.setWinPos(grid_id, startrow, startcol);
+                log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
+                try grid.setWinPos(grid_id, win_id, startrow, startcol);
             }
 
         } else if (std.mem.eql(u8, name, "win_hide") or std.mem.eql(u8, name, "win_close")) {
@@ -520,10 +521,11 @@ pub fn handleRedraw(
                 // Need at least: grid..zindex (len >= 8)
                 if (t.len < 8) continue;
 
-                // grid_id and zindex are required for both forms.
-                if (t[0] != .int or t[7] != .int) continue;
+                // grid_id, win, and zindex are required for both forms.
+                if (t[0] != .int or t[1] != .int or t[7] != .int) continue;
 
                 const grid_id = t[0].int;
+                const win_id = t[1].int;
                 const zindex = t[7].int;
 
                 // Optional fields (newer form)
@@ -642,6 +644,7 @@ pub fn handleRedraw(
 
                 try grid.setWinFloatPos(
                     grid_id,
+                    win_id,
                     @as(u32, @intCast(row_i64)),
                     @as(u32, @intCast(col_i64)),
                     zindex,
@@ -700,8 +703,8 @@ pub fn handleRedraw(
 
                 const row = @as(u32, @intCast(row_i));
                 const col: u32 = 0;
-                // win_pos doesn't have anchor_grid, default to 1 (main grid)
-                try grid.setWinFloatPos(grid_id, row, col, zindex, compindex, 1);
+                // msg_set_pos has no win handle; pass 0 (no window mapping stored)
+                try grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1);
 
             }
 

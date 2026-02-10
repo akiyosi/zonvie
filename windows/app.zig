@@ -43,6 +43,7 @@ pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
 pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
 pub const zonvie_core_send_mouse_scroll = core.zonvie_core_send_mouse_scroll;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
+pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
 pub const zonvie_core_send_mouse_input = core.zonvie_core_send_mouse_input;
 pub const zonvie_core_update_layout_px = core.zonvie_core_update_layout_px;
@@ -134,11 +135,28 @@ pub const SCROLLBAR_FADE_INTERVAL: c.UINT = 16;
 /// Scrollbar repeat interval (ms) for continuous page scroll
 pub const SCROLLBAR_REPEAT_DELAY: c.UINT = 400; // Initial delay before repeat
 pub const SCROLLBAR_REPEAT_INTERVAL: c.UINT = 100; // Interval during repeat
-/// Custom scrollbar constants
-pub const SCROLLBAR_WIDTH: f32 = 12.0; // Width in pixels
-pub const SCROLLBAR_MARGIN: f32 = 2.0; // Margin from edge
-pub const SCROLLBAR_MIN_KNOB_HEIGHT: f32 = 20.0; // Minimum knob height
-pub const SCROLLBAR_CORNER_RADIUS: f32 = 4.0; // Corner radius (cosmetic, not implemented yet)
+/// Custom scrollbar constants (logical pixels, multiply by dpi_scale for device pixels)
+pub const SCROLLBAR_WIDTH: f32 = 12.0;
+pub const SCROLLBAR_MARGIN: f32 = 2.0;
+pub const SCROLLBAR_MIN_KNOB_HEIGHT: f32 = 20.0;
+pub const SCROLLBAR_CORNER_RADIUS: f32 = 4.0;
+
+/// DPI-scaled scrollbar dimensions
+pub fn scrollbarWidth(dpi_scale: f32) f32 {
+    return SCROLLBAR_WIDTH * dpi_scale;
+}
+pub fn scrollbarMargin(dpi_scale: f32) f32 {
+    return SCROLLBAR_MARGIN * dpi_scale;
+}
+pub fn scrollbarMinKnobHeight(dpi_scale: f32) f32 {
+    return SCROLLBAR_MIN_KNOB_HEIGHT * dpi_scale;
+}
+pub fn scrollbarCornerRadius(dpi_scale: f32) f32 {
+    return SCROLLBAR_CORNER_RADIUS * dpi_scale;
+}
+pub fn scrollbarReservedWidth(dpi_scale: f32) f32 {
+    return scrollbarWidth(dpi_scale) + scrollbarMargin(dpi_scale) * 2;
+}
 
 // =========================================================================
 // Grid ID constants
@@ -1272,7 +1290,7 @@ pub fn addChevronIconVerts(
 /// Get effective content width (subtracts scrollbar width in "always" mode)
 pub fn getEffectiveContentWidth(app: *App, client_width: u32) u32 {
     if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways()) {
-        const scrollbar_reserved: u32 = @intFromFloat(SCROLLBAR_WIDTH + SCROLLBAR_MARGIN * 2);
+        const scrollbar_reserved: u32 = @intFromFloat(scrollbarReservedWidth(app.dpi_scale));
         if (client_width > scrollbar_reserved) {
             return client_width - scrollbar_reserved;
         }

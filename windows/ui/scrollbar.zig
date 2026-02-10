@@ -47,11 +47,17 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
     else
         0;
 
+    // DPI-scaled scrollbar dimensions
+    const dpi = app.dpi_scale;
+    const sb_width = app_mod.scrollbarWidth(dpi);
+    const sb_margin = app_mod.scrollbarMargin(dpi);
+    const sb_min_knob = app_mod.scrollbarMinKnobHeight(dpi);
+
     // Track position (right edge)
-    const track_left = cw - app_mod.SCROLLBAR_WIDTH - app_mod.SCROLLBAR_MARGIN;
-    const track_right = cw - app_mod.SCROLLBAR_MARGIN;
-    const track_top = app_mod.SCROLLBAR_MARGIN + tabbar_offset;
-    const track_bottom = ch - app_mod.SCROLLBAR_MARGIN;
+    const track_left = cw - sb_width - sb_margin;
+    const track_right = cw - sb_margin;
+    const track_top = sb_margin + tabbar_offset;
+    const track_bottom = ch - sb_margin;
     const track_height = track_bottom - track_top;
 
     if (!is_scrollable or track_height <= 0) {
@@ -71,7 +77,7 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+    knob_height = @max(sb_min_knob, knob_height);
 
     // Knob position
     const scroll_range = total_f - visible_f;
@@ -120,11 +126,17 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
+    // DPI-scaled scrollbar dimensions
+    const dpi = app.dpi_scale;
+    const sb_width = app_mod.scrollbarWidth(dpi);
+    const sb_margin = app_mod.scrollbarMargin(dpi);
+    const sb_min_knob = app_mod.scrollbarMinKnobHeight(dpi);
+
     // Track position (right edge) - no tabbar offset for external windows
-    const track_left = cw - app_mod.SCROLLBAR_WIDTH - app_mod.SCROLLBAR_MARGIN;
-    const track_right = cw - app_mod.SCROLLBAR_MARGIN;
-    const track_top = app_mod.SCROLLBAR_MARGIN;
-    const track_bottom = ch - app_mod.SCROLLBAR_MARGIN;
+    const track_left = cw - sb_width - sb_margin;
+    const track_right = cw - sb_margin;
+    const track_top = sb_margin;
+    const track_bottom = ch - sb_margin;
     const track_height = track_bottom - track_top;
 
     if (!is_scrollable or track_height <= 0) {
@@ -144,7 +156,7 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+    knob_height = @max(sb_min_knob, knob_height);
 
     // Knob position
     const scroll_range = total_f - visible_f;
@@ -298,17 +310,8 @@ pub fn hideScrollbarForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.Exter
 pub fn scrollbarPageScrollForExternal(app: *App, grid_id: i64, direction: i8) void {
     const corep = app.corep orelse return;
 
-    var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return;
-
-    const visible_lines = vp.botline - vp.topline;
-    const steps = @max(1, visible_lines - 2);
-    const dir_str: [*:0]const u8 = if (direction < 0) "up" else "down";
-
-    var i: i64 = 0;
-    while (i < steps) : (i += 1) {
-        app_mod.zonvie_core_send_mouse_scroll(corep, grid_id, 0, 0, dir_str);
-    }
+    // Single RPC call targeting the specific grid's window via winid.
+    app_mod.zonvie_core_page_scroll(corep, grid_id, direction > 0);
 }
 
 /// Handle scrollbar mouse down for external window
@@ -380,7 +383,7 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+    knob_height = @max(app_mod.scrollbarMinKnobHeight(app.dpi_scale), knob_height);
     const knob_travel = track_height - knob_height;
     if (knob_travel <= 0) return;
 
@@ -641,7 +644,7 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.SCROLLBAR_MIN_KNOB_HEIGHT, knob_height);
+    knob_height = @max(app_mod.scrollbarMinKnobHeight(app.dpi_scale), knob_height);
     const knob_travel = track_height - knob_height;
     if (knob_travel <= 0) return;
 
@@ -692,30 +695,11 @@ pub fn scrollbarPageScroll(app: *App, direction: i8) void {
         return;
     };
 
-    var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) == 0) {
-        applog.appLog("[scrollbar] scrollbarPageScroll: get_viewport failed\n", .{});
-        return;
-    }
+    applog.appLog("[scrollbar] scrollbarPageScroll: direction={d}\n", .{direction});
 
-    const visible_lines = vp.botline - vp.topline;
-    // Scroll by one page (visible_lines - 2 for overlap)
-    const page_size = @max(1, visible_lines - 2);
-
-    applog.appLog("[scrollbar] scrollbarPageScroll: direction={d} visible={d} page_size={d} topline={d} botline={d} line_count={d}\n", .{
-        direction, visible_lines, page_size, vp.topline, vp.botline, vp.line_count,
-    });
-
-    if (direction < 0) {
-        // Page up: scroll to topline - page_size
-        const new_topline = @max(1, vp.topline - page_size + 1);
-        app_mod.zonvie_core_scroll_to_line(corep, new_topline, false);
-    } else {
-        // Page down: scroll to topline + page_size
-        const new_topline = @min(vp.line_count - visible_lines + 1, vp.topline + page_size + 1);
-        const target_line = @max(1, new_topline);
-        app_mod.zonvie_core_scroll_to_line(corep, target_line, false);
-    }
+    // Single RPC call using Neovim's native <C-f>/<C-b> for exact page scroll.
+    // grid_id=-1: target the cursor grid (current window).
+    app_mod.zonvie_core_page_scroll(corep, -1, direction > 0);
 }
 
 /// Handle scrollbar mouse up

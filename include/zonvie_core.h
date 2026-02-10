@@ -821,6 +821,15 @@ ZONVIE_API void zonvie_core_scroll_to_line(
     bool use_bottom
 );
 
+/* Scroll a window by one page using Neovim's native <C-f>/<C-b>.
+   grid_id: target grid (-1 for cursor grid / current window).
+   forward: true for page down, false for page up. */
+ZONVIE_API void zonvie_core_page_scroll(
+    zonvie_core *core,
+    int64_t grid_id,
+    bool forward
+);
+
 /* Process pending message scroll update (for throttled scroll).
    Call this after scroll events stop to ensure final position is rendered. */
 ZONVIE_API void zonvie_core_process_pending_msg_scroll(

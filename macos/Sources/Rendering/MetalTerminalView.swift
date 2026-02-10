@@ -92,6 +92,10 @@ final class MetalTerminalView: MTKView {
     private var lastScrollbarDragTime: CFAbsoluteTime = 0
     private var pendingScrollLine: Int64 = -1
     private var pendingScrollUseBottom: Bool = false
+    // Page scroll knob guard: prevent updateScrollbarIfNeeded from reverting
+    // the estimated knob position before viewport actually updates
+    private var pageScrollTime: CFAbsoluteTime = 0
+    private static let pageScrollGuardInterval: TimeInterval = 0.5
 
     // --- Input throttling to prevent event accumulation during slow rendering ---
     private var pendingInput: String? = nil
@@ -659,7 +663,18 @@ final class MetalTerminalView: MTKView {
                               viewport.botline != lastViewportBotline ||
                               lastViewportTopline == -1
 
+        // After page scroll, skip knob updates until viewport actually changes.
+        // This prevents the display link from reverting the estimated knob position
+        // before Neovim sends updated viewport data.
+        if !viewportChanged {
+            let elapsed = CFAbsoluteTimeGetCurrent() - pageScrollTime
+            if elapsed < Self.pageScrollGuardInterval {
+                return
+            }
+        }
+
         if viewportChanged {
+            pageScrollTime = 0  // Clear guard on real viewport update
             lastViewportTopline = viewport.topline
             lastViewportLineCount = viewport.lineCount
             lastViewportBotline = viewport.botline
@@ -731,27 +746,41 @@ final class MetalTerminalView: MTKView {
 
     /// Handle scrollbar interaction
     @objc private func scrollerDidScroll(_ sender: NSScroller) {
-        guard let core, let viewport = core.getViewport(gridId: -1) else { return }
+        guard let core else { return }
 
-        let visibleLines = viewport.botline - viewport.topline
+        // Viewport may be nil if Neovim hasn't sent win_viewport for the cursor grid yet
+        // (e.g., after window split with no content change). pageScroll doesn't need viewport.
+        let viewport = core.getViewport(gridId: -1)
 
         switch sender.hitPart {
         case .decrementPage:
-            // Click above knob - page up
-            let steps = max(1, visibleLines - 2)  // Page scroll (keep 2 lines overlap)
-            for _ in 0..<steps {
-                core.sendMouseScroll(gridId: -1, row: 0, col: 0, direction: "up")
+            // Click above knob - page up (single RPC, Neovim-native <C-b>)
+            core.pageScroll(gridId: -1, forward: false)
+            // Update knob position immediately (estimated) and guard against revert
+            if let viewport {
+                let visibleLines = viewport.botline - viewport.topline
+                let upScrollRange = max(1, viewport.lineCount - visibleLines)
+                let upNewTopline = max(1, viewport.topline - max(1, visibleLines - 2))
+                verticalScroller.doubleValue = max(0, Double(upNewTopline - 1) / Double(upScrollRange))
             }
+            pageScrollTime = CFAbsoluteTimeGetCurrent()
 
         case .incrementPage:
-            // Click below knob - page down
-            let steps = max(1, visibleLines - 2)  // Page scroll (keep 2 lines overlap)
-            for _ in 0..<steps {
-                core.sendMouseScroll(gridId: -1, row: 0, col: 0, direction: "down")
+            // Click below knob - page down (single RPC, Neovim-native <C-f>)
+            core.pageScroll(gridId: -1, forward: true)
+            // Update knob position immediately (estimated) and guard against revert
+            if let viewport {
+                let visibleLines = viewport.botline - viewport.topline
+                let downScrollRange = max(1, viewport.lineCount - visibleLines)
+                let downNewTopline = min(viewport.lineCount - visibleLines + 1, viewport.topline + max(1, visibleLines - 2))
+                verticalScroller.doubleValue = min(1.0, max(0, Double(downNewTopline - 1) / Double(downScrollRange)))
             }
+            pageScrollTime = CFAbsoluteTimeGetCurrent()
 
         case .knob:
-            // Dragging knob - jump directly to target line
+            // Dragging knob - jump directly to target line (requires viewport data)
+            guard let viewport else { break }
+            let visibleLines = viewport.botline - viewport.topline
             let scrollRatio = sender.doubleValue
             let scrollRange = max(1, viewport.lineCount - visibleLines)
             let targetLine0based = Int64(scrollRatio * Double(scrollRange))
