@@ -1276,6 +1276,19 @@ pub const Grid = struct {
     }
 
     pub fn hideWin(self: *Grid, grid_id: i64) void {
+        // Mark the rows this grid was covering as dirty before removal,
+        // so they get recomposed with the underlying grid=1 content
+        // (e.g., window separators that were previously overlaid).
+        // Only bump content_rev when win_pos existed (grid was composited);
+        // external-only grids don't affect main grid composition.
+        if (self.win_pos.get(grid_id)) |pos| {
+            if (self.sub_grids.get(grid_id)) |sg| {
+                self.markDirtyRect(pos.row, pos.row + sg.rows);
+            } else {
+                self.markAllDirty();
+            }
+            self.content_rev +%= 1;
+        }
         _ = self.win_pos.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
         _ = self.external_grids.remove(grid_id);
@@ -1299,12 +1312,19 @@ pub const Grid = struct {
             return false;
         }
 
-        // Save position before removing from win_pos (for external window placement)
+        // Save position and mark covered rows dirty before removal.
+        // Only bump content_rev when win_pos existed (grid was composited).
         var start_row: i32 = -1;
         var start_col: i32 = -1;
         if (self.win_pos.get(grid_id)) |pos| {
             start_row = @intCast(pos.row);
             start_col = @intCast(pos.col);
+            if (self.sub_grids.get(grid_id)) |sg| {
+                self.markDirtyRect(pos.row, pos.row + sg.rows);
+            } else {
+                self.markAllDirty();
+            }
+            self.content_rev +%= 1;
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)
@@ -1317,7 +1337,6 @@ pub const Grid = struct {
             .start_row = start_row,
             .start_col = start_col,
         });
-        self.content_rev +%= 1;
 
         // If cursor is on this grid, increment cursor_rev to trigger main grid cursor clear
         if (self.cursor_grid == grid_id) {
