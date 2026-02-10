@@ -562,12 +562,15 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         }
     }
 
-    // Update the layered window
+    // Update the layered window.
+    // AlphaFormat = 0 (not AC_SRC_ALPHA): ignore per-pixel alpha channel.
+    // GDI text rendering destroys alpha on 32-bit DIBs, but with AlphaFormat=0
+    // only SourceConstantAlpha (255 = fully opaque) is used, so that's harmless.
     var blend: c.BLENDFUNCTION = .{
         .BlendOp = c.AC_SRC_OVER,
         .BlendFlags = 0,
         .SourceConstantAlpha = 255,
-        .AlphaFormat = c.AC_SRC_ALPHA,
+        .AlphaFormat = 0,
     };
 
     var src_pt: c.POINT = .{ .x = 0, .y = 0 };
