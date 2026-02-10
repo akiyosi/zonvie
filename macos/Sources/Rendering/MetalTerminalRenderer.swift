@@ -459,6 +459,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return
         }
         writeSetIndex = picked
+        if ZonvieCore.appLogEnabled {
+            let inf = gpuInFlightCount
+            ZonvieCore.appLog("[scroll_debug] beginFlush committed=\(srcIdx) write=\(picked) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+        }
         lock.unlock()
 
         let src = bufferSets[srcIdx]
@@ -540,11 +544,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Atomically makes the write set the new committed set for draw().
     func commitFlush() {
         guard isInFlush else { return }  // Flush was dropped by beginFlush
+        let ws = writeSetIndex
         lock.lock()
         committedSetIndex = writeSetIndex
         commitRevision &+= 1
+        let rev = commitRevision
         lock.unlock()
         isInFlush = false
+        if ZonvieCore.appLogEnabled {
+            let rowCount = bufferSets[ws].rowVertexBuffers.count
+            var totalVerts = 0
+            for i in 0..<rowCount {
+                totalVerts += bufferSets[ws].rowVertexCounts[i]
+            }
+            ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
+        }
     }
 
     func submitVerticesRaw(
@@ -827,6 +841,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let rowMode = committed.usingRowBuffers
             let committedMainCount = committed.mainVertexCount
             let committedCursorCount = committed.cursorVertexCount
+
+            // All values below (csi, currentCommitRevision, scrollSnapshot, dirtyRows)
+            // are local snapshots taken under lock above, so they form a consistent set.
+            // committed.* fields are safe because gpuInFlightCount protects the buffer set.
+            if smoothScrolling && ZonvieCore.appLogEnabled {
+                let scrollDesc = scrollSnapshot.map { "g\($0.grid_id):ndc=\(String(format: "%.4f", $0.offset_y))" }.joined(separator: ",")
+                ZonvieCore.appLog("[scroll_debug] draw set=\(csi) rev=\(currentCommitRevision) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) scroll=[\(scrollDesc)]")
+            }
 
             // === PERF LOG: lock取得終了 ===
             if ZonvieCore.appLogEnabled {

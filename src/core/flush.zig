@@ -151,8 +151,14 @@ pub const FlushCtx = struct {
         // Notify frontend about scrolled grids BEFORE vertex generation.
         // This allows Swift to clear pixel offsets before new vertices are rendered,
         // preventing double-shift glitches in split windows.
+        const scrolled_count = ctx.core.grid.scrolled_grid_count;
+        if (perf_enabled and scrolled_count > 0) {
+            ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} content_rev={d} dirty_all={any}\n", .{
+                scrolled_count, ctx.core.grid.content_rev, ctx.core.grid.dirty_all,
+            });
+        }
         if (ctx.core.cb.on_grid_scroll) |cb| {
-            for (ctx.core.grid.scrolled_grid_ids[0..ctx.core.grid.scrolled_grid_count]) |grid_id| {
+            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
                 cb(ctx.core.ctx, grid_id);
             }
         }
@@ -1049,6 +1055,22 @@ pub const FlushCtx = struct {
                             );
                         }
 
+                        // Anomaly detection: warn if row has non-space cells but 0 glyph vertices
+                        // (could indicate atlas/cache corruption causing all glyphs to fail)
+                        if (log_enabled and scrolled_count > 0 and out.items.len == 0) {
+                            // Check if this row actually has visible content
+                            var has_visible: bool = false;
+                            for (row_cells.items[0..cols]) |rc| {
+                                if (rc.scalar != 0 and rc.scalar != 32) {
+                                    has_visible = true;
+                                    break;
+                                }
+                            }
+                            if (has_visible) {
+                                ctx.core.log.write("[scroll_debug] ANOMALY row={d} has_visible_content=true vert_count=0\n", .{r});
+                            }
+                        }
+
                         // Contract: row_count == 1, grid_id == 1 for main window
                         row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
                     }
@@ -1056,6 +1078,11 @@ pub const FlushCtx = struct {
                     ctx.core.grid.clearDirty();
                     if (had_glyph_miss or ctx.core.atlas_reset_during_flush) {
                         ctx.core.grid.markAllDirty();
+                        if (log_enabled) {
+                            ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss={any} atlas_reset={any} scrolled={d}\n", .{
+                                had_glyph_miss, ctx.core.atlas_reset_during_flush, scrolled_count,
+                            });
+                        }
                     }
                     ctx.core.atlas_reset_during_flush = false;
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;

@@ -640,6 +640,7 @@ pub const Core = struct {
         // Flag the reset so the flush loop knows earlier rows have stale UVs.
         if (rect == null) {
             self.atlas_reset_during_flush = true;
+            self.log.write("[scroll_debug] atlas_full_reset scalar=0x{x} style={d} bm={d}x{d}\n", .{ scalar, style_flags, bm.width, bm.height });
             self.resetCoreAtlas();
             packer = &(self.atlas_packer.?);
             rect = packer.alloc(bm.width, bm.height);
