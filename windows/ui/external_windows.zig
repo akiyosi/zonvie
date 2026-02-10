@@ -67,14 +67,14 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // For cmdline: add margin and icon area
     // Total width = icon_margin_left + icon_size + icon_margin_right + content + padding*2
-    const cmdline_icon_total_width: u32 = if (is_cmdline) app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT else 0;
-    const cmdline_total_padding: u32 = if (is_cmdline) app_mod.CMDLINE_PADDING * 2 else 0;
+    const cmdline_icon_total_width: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
+    const cmdline_total_padding: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_PADDING * 2) else 0;
 
-    // For msg_show/msg_history: add margin around content
-    const msg_total_padding: u32 = if (is_msg_show or is_msg_history) app_mod.MSG_PADDING * 2 else 0;
+    // For msg_show/msg_history: add margin around content (DPI-scaled)
+    const scaled_msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
 
-    const client_w: c_int = content_w + @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding + msg_total_padding));
-    const client_h: c_int = content_h + @as(c_int, @intCast(cmdline_total_padding + msg_total_padding));
+    const client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding;
+    const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
 
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
@@ -1777,8 +1777,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
             if (window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0) {
                 // Content area position in pixels (centered with padding)
-                const content_left: f32 = @floatFromInt(app_mod.MSG_PADDING);
-                const content_top: f32 = @floatFromInt(app_mod.MSG_PADDING);
+                const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+                const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
 
                 // Convert content area bounds to NDC
                 const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;

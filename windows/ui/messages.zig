@@ -321,7 +321,7 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage) void 
 
     // External window with auto-hide
     const cell_h = app.cell_h_px + app.linespace_px;
-    const padding: c_int = 16;
+    const padding: c_int = app.scalePx(16);
 
     // Get app window position and size (position relative to app window, not screen)
     var app_rect: c.RECT = undefined;
@@ -333,21 +333,21 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage) void 
     // Calculate window size based on message type
     var window_width: c_int = undefined;
     var window_height: c_int = undefined;
-    const line_height: c_int = @intCast(cell_h + 4);
+    const line_height: c_int = @as(c_int, @intCast(cell_h)) + app.scalePx(4);
 
     if (is_confirm) {
         // For confirm dialogs (like E325), use larger fixed width and calculate height
         // based on line count. The text will be word-wrapped.
-        window_width = @min(800, app_width - 40);  // Up to 800px or app width - 40
+        window_width = @max(app.scalePx(100), @min(app.scalePx(800), app_width - app.scalePx(40)));
         // Height: line_count * line_height + padding, but at least 200px for readability
         const calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
-        window_height = @max(200, @min(calc_height, app_height - 100));
+        window_height = @max(app.scalePx(200), @min(calc_height, app_height - app.scalePx(100)));
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog: line_count={d} calc_height={d} window_height={d}\n", .{ line_count, calc_height, window_height });
     } else {
         // For regular messages, use text-based width calculation
         const text_len_int: c_int = @intCast(combined_len);
         const estimated_width: c_int = @intCast(@as(u32, @intCast(text_len_int)) * (cell_h / 2) + @as(u32, @intCast(padding * 2)));
-        window_width = @max(100, @min(estimated_width, 600));
+        window_width = @max(app.scalePx(100), @min(estimated_width, app.scalePx(600)));
         window_height = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
     }
 
@@ -365,24 +365,24 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage) void 
         } else {
             // ext-cmdline=false: position above the cmdline row (last row)
             // Leave space for cmdline at bottom (1 row + some margin)
-            const cmdline_reserve: c_int = @intCast(cell_h + 8);
+            const cmdline_reserve: c_int = @as(c_int, @intCast(cell_h)) + app.scalePx(8);
             const available_height = app_height - cmdline_reserve;
             window_y = app_rect.top + @divTrunc(available_height - window_height, 2);
             // Ensure it doesn't go above app window
-            if (window_y < app_rect.top + 10) {
-                window_y = app_rect.top + 10;
+            if (window_y < app_rect.top + app.scalePx(10)) {
+                window_y = app_rect.top + app.scalePx(10);
             }
         }
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog position: x={d} y={d} ext_cmdline={}\n", .{ window_x, window_y, app.ext_cmdline_enabled });
     } else if (is_prompt) {
         // Bottom center for other prompts (relative to app window)
         window_x = app_rect.left + @divTrunc(app_width - window_width, 2);
-        window_y = app_rect.bottom - window_height - 40;
+        window_y = app_rect.bottom - window_height - app.scalePx(40);
     } else {
         // Top-right for regular messages (screen coordinates like msg_history/macOS)
         const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-        window_x = screen_w - window_width - 10;
-        window_y = 10;
+        window_x = screen_w - window_width - app.scalePx(10);
+        window_y = app.scalePx(10);
     }
 
     // Check if this is a return_prompt (preserve layout from confirm dialog)
@@ -671,20 +671,22 @@ pub fn updateExtFloatPositions(app: *App) void {
     }
 
     // Update msg_history position first (if exists)
-    var history_bottom: c_int = target_rect.top + 10;
+    const float_margin = app.scalePx(10);
+    var history_bottom: c_int = target_rect.top + float_margin;
     if (msg_history_hwnd) |hwnd| {
         const content_w: c_int = @intCast(msg_history_cols * cell_w);
         const content_h: c_int = @intCast(msg_history_rows * cell_h);
-        const client_w: c_int = content_w + @as(c_int, @intCast(app_mod.MSG_PADDING * 2));
-        const client_h: c_int = content_h + @as(c_int, @intCast(app_mod.MSG_PADDING * 2));
+        const scaled_msg_padding = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
+        const client_w: c_int = content_w + scaled_msg_padding * 2;
+        const client_h: c_int = content_h + scaled_msg_padding * 2;
 
         var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
         _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
         const window_w: c_int = rect.right - rect.left;
         const window_h: c_int = rect.bottom - rect.top;
 
-        const pos_x = target_rect.right - window_w - 10;
-        const pos_y: c_int = target_rect.top + 10;
+        const pos_x = target_rect.right - window_w - float_margin;
+        const pos_y: c_int = target_rect.top + float_margin;
         history_bottom = pos_y + window_h;
 
         _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
@@ -696,17 +698,18 @@ pub fn updateExtFloatPositions(app: *App) void {
     if (msg_show_hwnd) |hwnd| {
         const content_w: c_int = @intCast(msg_show_cols * cell_w);
         const content_h: c_int = @intCast(msg_show_rows * cell_h);
-        const client_w: c_int = content_w + @as(c_int, @intCast(app_mod.MSG_PADDING * 2));
-        const client_h: c_int = content_h + @as(c_int, @intCast(app_mod.MSG_PADDING * 2));
+        const scaled_msg_padding2 = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
+        const client_w: c_int = content_w + scaled_msg_padding2 * 2;
+        const client_h: c_int = content_h + scaled_msg_padding2 * 2;
 
         var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
         _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
         const window_w: c_int = rect.right - rect.left;
         const window_h: c_int = rect.bottom - rect.top;
 
-        const pos_x = target_rect.right - window_w - 10;
+        const pos_x = target_rect.right - window_w - float_margin;
         // If msg_history exists, position below it; otherwise at top
-        const pos_y: c_int = if (msg_history_hwnd != null) history_bottom + 4 else target_rect.top + 10;
+        const pos_y: c_int = if (msg_history_hwnd != null) history_bottom + app.scalePx(4) else target_rect.top + float_margin;
 
         _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
         _ = c.InvalidateRect(hwnd, null, 0);
@@ -839,9 +842,10 @@ pub fn updateMiniWindows(app: *App) void {
 
         if (applog.isEnabled()) applog.appLog("[win] updateMiniWindows: idx={d} text=\"{s}\"\n", .{ idx, text_buf[0..text_len] });
 
-        // Calculate width based on text (approximate: 8px per char + padding)
-        const text_width: c_int = @intCast(text_len * 8 + 16);
-        const window_width: c_int = @max(50, text_width);
+        // Calculate width based on text (use cell_w for DPI-aware char width + scaled padding)
+        const text_len_i: c_int = @intCast(text_len);
+        const text_width: c_int = text_len_i * @as(c_int, @intCast(cell_w)) + app.scalePx(16);
+        const window_width: c_int = @max(app.scalePx(50), text_width);
 
         // Position: right edge of target area, stacking upward from bottom
         const window_x = anchor_x - window_width;
@@ -998,7 +1002,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     }
 
     // Draw text with padding
-    const padding: c_int = 12;
+    const padding: c_int = app.scalePx(12);
     var text_rect = c.RECT{
         .left = rect.left + padding,
         .top = rect.top + padding,
@@ -1115,10 +1119,11 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     }
 
     // Draw text centered
+    const mini_pad = app.scalePx(4);
     var text_rect = c.RECT{
-        .left = rect.left + 4,
+        .left = rect.left + mini_pad,
         .top = rect.top,
-        .right = rect.right - 4,
+        .right = rect.right - mini_pad,
         .bottom = rect.bottom,
     };
 

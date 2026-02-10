@@ -1231,9 +1231,9 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
             content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
             content_h += @as(c_int, @intCast(cmdline_total_padding));
         } else if (is_msg_show or is_msg_history) {
-            const msg_total_padding: u32 = app_mod.MSG_PADDING * 2;
-            content_w += @as(c_int, @intCast(msg_total_padding));
-            content_h += @as(c_int, @intCast(msg_total_padding));
+            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
+            content_w += scaled_msg_pad;
+            content_h += scaled_msg_pad;
         }
 
         const dwStyle: c.DWORD = c.WS_POPUP;
@@ -1316,9 +1316,9 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
             content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
             content_h += @as(c_int, @intCast(cmdline_total_padding));
         } else if (is_msg_show or is_msg_history) {
-            const msg_total_padding: u32 = app_mod.MSG_PADDING * 2;
-            content_w += @as(c_int, @intCast(msg_total_padding));
-            content_h += @as(c_int, @intCast(msg_total_padding));
+            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
+            content_w += scaled_msg_pad;
+            content_h += scaled_msg_pad;
         }
 
         const dwStyle: c.DWORD = c.WS_POPUP;
