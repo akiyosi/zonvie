@@ -243,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Open each file in Neovim with :tabe
         for filename in pendingFilesToOpen {
-            let escapedPath = escapeForNeovim(filename)
+            let escapedPath = escapePathForNeovim(filename)
             let input = "\u{1b}:tabe \(escapedPath)\r"
             core.sendInput(input)
             ZonvieCore.appLog("zonvie: sent :tabe \(escapedPath)")
@@ -252,27 +252,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         pendingFilesToOpen = []
     }
 
-    /// Escape file path for Neovim command line
-    private func escapeForNeovim(_ path: String) -> String {
-        var result = ""
-        for char in path {
-            switch char {
-            case "\\": result += "\\\\"
-            case " ": result += "\\ "
-            case "%": result += "\\%"
-            case "#": result += "\\#"
-            case "|": result += "\\|"
-            case "\"": result += "\\\""
-            case "'": result += "\\'"
-            case "[": result += "\\["
-            case "]": result += "\\]"
-            case "{": result += "\\{"
-            case "}": result += "\\}"
-            case "$": result += "\\$"
-            case "`": result += "\\`"
-            default: result.append(char)
-            }
+}
+
+/// Escape file path for Neovim command line.
+/// Shared across AppDelegate (Finder open) and MetalTerminalView (drag & drop).
+func escapePathForNeovim(_ path: String) -> String {
+    var result = ""
+    for char in path {
+        switch char {
+        case "\\": result += "\\\\"
+        case " ": result += "\\ "
+        case "%": result += "\\%"
+        case "#": result += "\\#"
+        case "|": result += "\\|"
+        case "\"": result += "\\\""
+        case "'": result += "\\'"
+        case "[": result += "\\["
+        case "]": result += "\\]"
+        case "{": result += "\\{"
+        case "}": result += "\\}"
+        case "$": result += "\\$"
+        case "`": result += "\\`"
+        default: result.append(char)
         }
-        return result
     }
+    return result
 }

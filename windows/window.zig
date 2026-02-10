@@ -307,6 +307,9 @@ pub export fn WndProc(
                     tray.add();
                 }
 
+                // Accept file drops via drag & drop
+                c.DragAcceptFiles(hwnd, 1);
+
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
 
@@ -2923,6 +2926,101 @@ pub export fn WndProc(
 
                 return 0;
             }
+        },
+
+        c.WM_DROPFILES => {
+            const hDrop: c.HDROP = @ptrFromInt(@as(usize, wParam));
+            defer c.DragFinish(hDrop);
+
+            if (getApp(hwnd)) |app| {
+                const corep = app.corep orelse return 0;
+                const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
+
+                var i: c.UINT = 0;
+                while (i < file_count) : (i += 1) {
+                    // Query required buffer length (excluding null terminator)
+                    const required_len = c.DragQueryFileW(hDrop, i, null, 0);
+                    if (required_len == 0) continue;
+
+                    const buf_len = required_len + 1; // +1 for null terminator
+
+                    // Use stack buffer for typical paths, heap for long paths
+                    var stack_buf: [c.MAX_PATH + 1]c.WCHAR = undefined;
+                    const heap_buf = if (buf_len > stack_buf.len)
+                        std.heap.page_allocator.alloc(c.WCHAR, buf_len) catch continue
+                    else
+                        null;
+                    defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+                    const path_buf = if (heap_buf) |hb| hb.ptr else &stack_buf;
+
+                    const len = c.DragQueryFileW(hDrop, i, path_buf, @intCast(buf_len));
+                    if (len == 0) continue;
+
+                    const wide_slice: []const u16 = @as([*]const u16, @ptrCast(path_buf))[0..len];
+
+                    // UTF-16 -> UTF-8 conversion (worst case: 4 bytes per code unit)
+                    const utf8_max = len * 4;
+                    var utf8_stack: [c.MAX_PATH * 4]u8 = undefined;
+                    const utf8_heap = if (utf8_max > utf8_stack.len)
+                        std.heap.page_allocator.alloc(u8, utf8_max) catch continue
+                    else
+                        null;
+                    defer if (utf8_heap) |hb| std.heap.page_allocator.free(hb);
+
+                    const utf8_dest = if (utf8_heap) |hb| hb else &utf8_stack;
+                    const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
+                    const utf8_path = utf8_dest[0..utf8_len];
+
+                    // Build "drop <escaped_path>" command
+                    // Worst case: each byte escapes to 2 bytes + "drop " prefix
+                    const cmd_max = 5 + utf8_len * 2;
+                    var cmd_stack: [c.MAX_PATH * 4 + 8]u8 = undefined;
+                    const cmd_heap = if (cmd_max > cmd_stack.len)
+                        std.heap.page_allocator.alloc(u8, cmd_max) catch continue
+                    else
+                        null;
+                    defer if (cmd_heap) |hb| std.heap.page_allocator.free(hb);
+
+                    const cmd_buf = if (cmd_heap) |hb| hb else &cmd_stack;
+                    var pos: usize = 0;
+
+                    const prefix = "drop ";
+                    @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
+                    pos += prefix.len;
+
+                    // Escape special characters for Neovim
+                    for (utf8_path) |ch| {
+                        const escaped: ?[]const u8 = switch (ch) {
+                            '\\' => "\\\\",
+                            ' ' => "\\ ",
+                            '%' => "\\%",
+                            '#' => "\\#",
+                            '|' => "\\|",
+                            '"' => "\\\"",
+                            '\'' => "\\'",
+                            '[' => "\\[",
+                            ']' => "\\]",
+                            '{' => "\\{",
+                            '}' => "\\}",
+                            '$' => "\\$",
+                            '`' => "\\`",
+                            else => null,
+                        };
+
+                        if (escaped) |esc| {
+                            @memcpy(cmd_buf[pos..][0..esc.len], esc);
+                            pos += esc.len;
+                        } else {
+                            cmd_buf[pos] = ch;
+                            pos += 1;
+                        }
+                    }
+
+                    app_mod.zonvie_core_send_command(corep, cmd_buf.ptr, pos);
+                }
+            }
+            return 0;
         },
 
         c.WM_CLOSE => {

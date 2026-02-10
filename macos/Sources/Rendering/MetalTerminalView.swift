@@ -358,6 +358,9 @@ final class MetalTerminalView: MTKView {
 
         // Add vertical scrollbar
         addSubview(verticalScroller)
+
+        // Accept file drops via drag & drop
+        registerForDraggedTypes([.fileURL])
     }
 
     override func viewDidMoveToWindow() {
@@ -2072,5 +2075,34 @@ final class PreeditOverlayView: NSView {
         }
 
         return 1
+    }
+}
+
+// MARK: - Drag & Drop (file opening)
+extension MetalTerminalView {
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self],
+                                                      options: [.urlReadingFileURLsOnly: true]) else {
+            return []
+        }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] else {
+            return false
+        }
+
+        guard !urls.isEmpty, let core = core else { return false }
+
+        for url in urls {
+            let escapedPath = escapePathForNeovim(url.path)
+            core.sendCommand("drop \(escapedPath)")
+        }
+        return true
     }
 }
