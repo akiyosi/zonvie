@@ -216,7 +216,8 @@ final class ViewController: NSViewController {
                 newPos = toIndex - 1
             }
         }
-        core?.sendInput("\u{1b}:tabmove \(newPos)\r")
+        // Use nvim_command API so it works even in terminal mode
+        core?.sendCommand("tabmove \(newPos)")
     }
 
     private func externalizeTab(handle: Int64, dropPoint: NSPoint) {
