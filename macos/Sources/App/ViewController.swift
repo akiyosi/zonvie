@@ -7,7 +7,7 @@ final class ViewController: NSViewController {
     private var tabBarView: TabBarView?
 
     // Height of the Chrome-style tab bar
-    private let tabBarHeight: CGFloat = 38
+    private let tabBarHeight: CGFloat = 36
 
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?

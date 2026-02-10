@@ -53,7 +53,7 @@ final class TabBarView: NSView {
     private let externalDragThreshold: CGFloat = 50  // pixels outside window to trigger external drag
 
     // Tab appearance constants
-    private let tabHeight: CGFloat = 32
+    private let tabHeight: CGFloat = 30
     private let tabMinWidth: CGFloat = 100
     private let tabMaxWidth: CGFloat = 200
     private let tabSpacing: CGFloat = 1
@@ -194,14 +194,14 @@ final class TabBarView: NSView {
             let isHovered = hoveredTabIndex == index && !isSelected
             let isBeingDragged = isDragging && draggingTabIndex == index
 
-            let tabRect = NSRect(x: x, y: 4, width: tabWidth, height: tabHeight - 4)
+            let tabRect = NSRect(x: x, y: 6, width: tabWidth, height: tabHeight - 6)
             drawTab(tab, in: tabRect, isSelected: isSelected, isHovered: isHovered, isBeingDragged: isBeingDragged, index: index)
 
             x += tabWidth + tabSpacing
         }
 
         // Draw new tab button (+)
-        drawNewTabButton(at: NSPoint(x: x + 8, y: 8))
+        drawNewTabButton(at: NSPoint(x: x + 8, y: 10))
 
         // Draw drop indicator when dragging
         if isDragging, let targetIdx = dropTargetIndex, let dragIdx = draggingTabIndex {
@@ -209,13 +209,13 @@ final class TabBarView: NSView {
             if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
                 let indicatorX = windowControlsWidth + CGFloat(targetIdx) * (tabWidth + tabSpacing)
                 NSColor.controlAccentColor.setFill()
-                NSRect(x: indicatorX - 1, y: 2, width: 2, height: tabHeight - 4).fill()
+                NSRect(x: indicatorX - 1, y: 4, width: 2, height: tabHeight - 6).fill()
             }
 
             // Draw floating tab at cursor position
             let tab = tabs[dragIdx]
             let floatX = dragCurrentX - dragOffsetX
-            let floatRect = NSRect(x: floatX, y: 4, width: tabWidth, height: tabHeight - 4)
+            let floatRect = NSRect(x: floatX, y: 6, width: tabWidth, height: tabHeight - 6)
             let floatPath = NSBezierPath(roundedRect: floatRect, xRadius: tabCornerRadius, yRadius: tabCornerRadius)
 
             // Light blue background with border
@@ -234,7 +234,7 @@ final class TabBarView: NSView {
             ]
             let textRect = NSRect(
                 x: floatX + tabPadding,
-                y: 4 + (tabHeight - 4 - 16) / 2,
+                y: 6 + (tabHeight - 6 - 16) / 2,
                 width: tabWidth - tabPadding * 2,
                 height: 16
             )
@@ -359,7 +359,7 @@ final class TabBarView: NSView {
         var x = windowControlsWidth
 
         for index in 0..<tabs.count {
-            let tabRect = NSRect(x: x, y: 4, width: tabWidth, height: tabHeight - 4)
+            let tabRect = NSRect(x: x, y: 6, width: tabWidth, height: tabHeight - 6)
             if tabRect.contains(point) {
                 return index
             }
@@ -383,7 +383,7 @@ final class TabBarView: NSView {
         let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
 
         let tabX = windowControlsWidth + CGFloat(tabIndex) * (tabWidth + tabSpacing)
-        let tabRect = NSRect(x: tabX, y: 4, width: tabWidth, height: tabHeight - 4)
+        let tabRect = NSRect(x: tabX, y: 6, width: tabWidth, height: tabHeight - 6)
 
         let closeRect = NSRect(
             x: tabRect.maxX - tabCloseButtonSize - 8,
@@ -402,7 +402,7 @@ final class TabBarView: NSView {
         let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
 
         let x = windowControlsWidth + CGFloat(tabs.count) * (tabWidth + tabSpacing) + 8
-        let rect = NSRect(x: x, y: 8, width: 20, height: 20)
+        let rect = NSRect(x: x, y: 10, width: 20, height: 20)
 
         return rect.contains(point)
     }
