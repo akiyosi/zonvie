@@ -47,7 +47,7 @@ pub fn createTablineWindow(parent_hwnd: c.HWND, app: *App) ?c.HWND {
         0,
         0,
         parent_rect.right,
-        TablineState.TAB_BAR_HEIGHT,
+        app.scalePx(TablineState.TAB_BAR_HEIGHT),
         parent_hwnd,
         null,
         c.GetModuleHandleW(null),
@@ -90,8 +90,15 @@ pub fn tablineWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
                 _ = c.GetClientRect(hwnd, &rect);
                 const client_width = rect.right - rect.left;
 
+                // DPI-scaled constants
+                const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+                const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+                const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+                const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+                const plus_space = app.scalePx(40);
+
                 // Check window control buttons (right side) - handle in this window
-                const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
+                const btn_start_x = client_width - btns_total;
                 if (x >= btn_start_x) {
                     return c.HTCLIENT;
                 }
@@ -103,24 +110,24 @@ pub fn tablineWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
 
                 if (tab_count > 0) {
                     // Calculate tab dimensions (same as handleTablineMouseDown)
-                    const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+                    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
                     const count_i32: i32 = @intCast(tab_count);
                     const ideal_width = @divTrunc(available_width, count_i32);
-                    const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+                    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
                     // Check if on a tab
-                    var tab_x: i32 = TablineState.WINDOW_CONTROLS_WIDTH;
+                    var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
                     for (0..tab_count) |_| {
-                        if (x >= tab_x and x < tab_x + tab_width and y >= 0 and y < TablineState.TAB_BAR_HEIGHT) {
+                        if (x >= tab_x and x < tab_x + tab_width and y >= 0 and y < bar_height) {
                             return c.HTCLIENT;
                         }
                         tab_x += tab_width + 1;
                     }
 
                     // Check + button (after last tab)
-                    const plus_x = tab_x + 8;
-                    const plus_size: i32 = 24;
-                    if (x >= plus_x and x < plus_x + plus_size) {
+                    const plus_x = tab_x + app.scalePx(8);
+                    const scaled_plus_size = app.scalePx(24);
+                    if (x >= plus_x and x < plus_x + scaled_plus_size) {
                         return c.HTCLIENT;
                     }
                 }
@@ -265,7 +272,7 @@ pub fn createContentWindow(parent_hwnd: c.HWND, app: *App) ?c.HWND {
     var parent_rect: c.RECT = undefined;
     _ = c.GetClientRect(parent_hwnd, &parent_rect);
 
-    const tabbar_height = TablineState.TAB_BAR_HEIGHT;
+    const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     const hwnd = c.CreateWindowExW(
         0,
         @ptrCast(content_class_name.ptr),
@@ -348,6 +355,19 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     _ = c.GetClientRect(hwnd, &rect);
     const client_width = rect.right;
 
+    // DPI-scaled constants
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
+    const ext_drag_threshold = app.scalePx(TablineState.EXTERNAL_DRAG_THRESHOLD);
+    const plus_space = app.scalePx(40);
+    const close_margin = app.scalePx(6);
+    const plus_offset = app.scalePx(8);
+    const plus_btn_size = app.scalePx(20);
+
     // Handle dragging
     if (app.tabline_state.dragging_tab) |drag_idx| {
         app.tabline_state.drag_current_x = x;
@@ -362,7 +382,7 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
                 _ = c.ClientToScreen(hwnd, &screen_pt);
 
                 // Expand window rect by threshold
-                const threshold = TablineState.EXTERNAL_DRAG_THRESHOLD;
+                const threshold = ext_drag_threshold;
                 const expanded_left = window_rect.left - threshold;
                 const expanded_top = window_rect.top - threshold;
                 const expanded_right = window_rect.right + threshold;
@@ -392,15 +412,15 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
         // Normal in-window drag: calculate drop target
         if (!app.tabline_state.is_external_drag) {
-            const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+            const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
             const tab_count: c_int = @intCast(app.tabline_state.tab_count);
             if (tab_count > 0) {
                 const ideal_width = @divTrunc(available_width, tab_count);
-                const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+                const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
                 // Find which slot the mouse is over
                 var target_idx: usize = 0;
-                var tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+                var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
                 for (0..app.tabline_state.tab_count) |i| {
                     const tab_center = tab_x + @divTrunc(tab_width, 2);
                     if (x < tab_center) {
@@ -430,18 +450,18 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle close button pressed state - track if mouse leaves the button
     if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
-        const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0 and pressed_tab_idx < app.tabline_state.tab_count) {
             const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
-            const tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH + @as(c_int, @intCast(pressed_tab_idx)) * (tab_width + 1);
-            const close_x = tab_x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-            const close_y = @divTrunc(TablineState.TAB_BAR_HEIGHT - TablineState.TAB_CLOSE_SIZE, 2);
+            const tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(pressed_tab_idx)) * (tab_width + 1);
+            const close_x = tab_x + tab_width - close_size - close_margin;
+            const close_y = @divTrunc(bar_height - close_size, 2);
 
-            const is_still_over_close = (x >= close_x and x < close_x + TablineState.TAB_CLOSE_SIZE and
-                y >= close_y and y < close_y + TablineState.TAB_CLOSE_SIZE);
+            const is_still_over_close = (x >= close_x and x < close_x + close_size and
+                y >= close_y and y < close_y + close_size);
 
             if (!is_still_over_close) {
                 // Mouse left the close button - cancel the press
@@ -461,14 +481,15 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle new tab button pressed state - track if mouse leaves the button
     if (app.tabline_state.new_tab_button_pressed) {
-        const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0) {
             const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
-            const plus_x = TablineState.WINDOW_CONTROLS_WIDTH + tab_count * (tab_width + 1) + 8;
+            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+            const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count * (tab_width + 1) + plus_offset;
 
-            const is_still_over_plus = (x >= plus_x and x < plus_x + 20 and y >= 8 and y < 8 + 20);
+            const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
+            const is_still_over_plus = (x >= plus_x and x < plus_x + plus_btn_size and y >= plus_top and y < plus_top + plus_btn_size);
 
             if (!is_still_over_plus) {
                 // Mouse left the + button - cancel the press
@@ -484,10 +505,10 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle window button pressed state - track if mouse leaves the button
     if (app.tabline_state.pressed_window_btn) |pressed_btn| {
-        const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
-        const btn_x = btn_start_x + @as(c_int, pressed_btn) * TablineState.WINDOW_BTN_WIDTH;
-        const is_still_over_btn = (x >= btn_x and x < btn_x + TablineState.WINDOW_BTN_WIDTH and
-            y >= 0 and y < TablineState.TAB_BAR_HEIGHT);
+        const btn_start_x = client_width - btns_total;
+        const btn_x = btn_start_x + @as(c_int, pressed_btn) * btn_w;
+        const is_still_over_btn = (x >= btn_x and x < btn_x + btn_w and
+            y >= 0 and y < bar_height);
 
         if (!is_still_over_btn) {
             // Mouse left the window button - cancel the press
@@ -504,30 +525,30 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     var new_hovered_window_btn: ?u8 = null;
 
     // Check window control buttons first (they're on the right)
-    const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
-    if (x >= btn_start_x and y >= 0 and y < TablineState.TAB_BAR_HEIGHT) {
-        const btn_idx = @divTrunc(x - btn_start_x, TablineState.WINDOW_BTN_WIDTH);
+    const btn_start_x = client_width - btns_total;
+    if (x >= btn_start_x and y >= 0 and y < bar_height) {
+        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
         if (btn_idx >= 0 and btn_idx < 3) {
             new_hovered_window_btn = @intCast(btn_idx);
         }
     } else {
         // Check tabs
-        const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0) {
             const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
-            var tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+            var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
             for (0..app.tabline_state.tab_count) |i| {
                 if (x >= tab_x and x < tab_x + tab_width) {
                     new_hovered_tab = i;
 
                     // Check close button
-                    const close_x = tab_x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-                    const close_y = @divTrunc(TablineState.TAB_BAR_HEIGHT - TablineState.TAB_CLOSE_SIZE, 2);
-                    if (x >= close_x and x < close_x + TablineState.TAB_CLOSE_SIZE and
-                        y >= close_y and y < close_y + TablineState.TAB_CLOSE_SIZE)
+                    const close_x = tab_x + tab_width - close_size - close_margin;
+                    const close_y = @divTrunc(bar_height - close_size, 2);
+                    if (x >= close_x and x < close_x + close_size and
+                        y >= close_y and y < close_y + close_size)
                     {
                         new_hovered_close = i;
                     }
@@ -541,14 +562,15 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     // Check + button hover
     var new_hovered_new_tab_btn: bool = false;
     {
-        const available_width_for_plus = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+        const available_width_for_plus = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count_for_plus > 0) {
             const ideal_width_for_plus = @divTrunc(available_width_for_plus, tab_count_for_plus);
-            const tab_width_for_plus = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width_for_plus));
-            const plus_x = TablineState.WINDOW_CONTROLS_WIDTH + tab_count_for_plus * (tab_width_for_plus + 1) + 8;
+            const tab_width_for_plus = @min(tab_max_w, @max(tab_min_w, ideal_width_for_plus));
+            const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count_for_plus * (tab_width_for_plus + 1) + plus_offset;
 
-            if (x >= plus_x and x < plus_x + 20 and y >= 8 and y < 8 + 20) {
+            const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
+            if (x >= plus_x and x < plus_x + plus_btn_size and y >= plus_top and y < plus_top + plus_btn_size) {
                 new_hovered_new_tab_btn = true;
             }
         }
@@ -571,15 +593,27 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     applog.appLog("[tabline] mouseDown: x={d} y={d}\n", .{ x, y });
 
+    // DPI-scaled constants
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
+    const plus_space = app.scalePx(40);
+    const close_margin = app.scalePx(6);
+    const plus_offset = app.scalePx(8);
+    const plus_btn_size = app.scalePx(20);
+
     var rect: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &rect);
     const client_width = rect.right;
 
     // Check window control buttons first
-    const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
-    if (x >= btn_start_x and y >= 0 and y < TablineState.TAB_BAR_HEIGHT) {
+    const btn_start_x = client_width - btns_total;
+    if (x >= btn_start_x and y >= 0 and y < bar_height) {
         // Window button area - record pressed state, action on mouseUp
-        const btn_idx = @divTrunc(x - btn_start_x, TablineState.WINDOW_BTN_WIDTH);
+        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
         if (btn_idx >= 0 and btn_idx < 3) {
             applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{btn_idx});
             app.tabline_state.pressed_window_btn = @intCast(btn_idx);
@@ -590,22 +624,22 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     }
 
     // Check close button on tabs
-    const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     if (tab_count > 0) {
         const ideal_width = @divTrunc(available_width, tab_count);
-        const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+        const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
         applog.appLog("[tabline] mouseDown: tab_count={d} tab_width={d}\n", .{ tab_count, tab_width });
 
-        var tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+        var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
         for (0..app.tabline_state.tab_count) |i| {
             if (x >= tab_x and x < tab_x + tab_width) {
                 // Check if on close button
-                const close_x = tab_x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-                const close_y = @divTrunc(TablineState.TAB_BAR_HEIGHT - TablineState.TAB_CLOSE_SIZE, 2);
-                if (x >= close_x and x < close_x + TablineState.TAB_CLOSE_SIZE and
-                    y >= close_y and y < close_y + TablineState.TAB_CLOSE_SIZE)
+                const close_x = tab_x + tab_width - close_size - close_margin;
+                const close_y = @divTrunc(bar_height - close_size, 2);
+                if (x >= close_x and x < close_x + close_size and
+                    y >= close_y and y < close_y + close_size)
                 {
                     // Close button - record pressed state, action on mouseUp
                     applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
@@ -639,14 +673,14 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     }
 
     // Check + button
-    const available_width_for_plus = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+    const available_width_for_plus = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
     if (tab_count_for_plus > 0) {
         const ideal_width_for_plus = @divTrunc(available_width_for_plus, tab_count_for_plus);
-        const tab_width_for_plus = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width_for_plus));
-        const plus_x = TablineState.WINDOW_CONTROLS_WIDTH + tab_count_for_plus * (tab_width_for_plus + 1) + 8;
+        const tab_width_for_plus = @min(tab_max_w, @max(tab_min_w, ideal_width_for_plus));
+        const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count_for_plus * (tab_width_for_plus + 1) + plus_offset;
 
-        if (x >= plus_x and x < plus_x + 20) {
+        if (x >= plus_x and x < plus_x + plus_btn_size) {
             // New tab button pressed - record state, action on mouseUp
             applog.appLog("[tabline] mouseDown: new tab button pressed\n", .{});
             app.tabline_state.new_tab_button_pressed = true;
@@ -755,9 +789,10 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
         else
             drag_start - x;
 
-        applog.appLog("[tabline] mouseUp: drag_idx={d} moved_distance={d} threshold={d}\n", .{ drag_idx, moved_distance, TablineState.DRAG_THRESHOLD });
+        const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
+        applog.appLog("[tabline] mouseUp: drag_idx={d} moved_distance={d} threshold={d}\n", .{ drag_idx, moved_distance, drag_threshold });
 
-        if (moved_distance < TablineState.DRAG_THRESHOLD) {
+        if (moved_distance < drag_threshold) {
             // Didn't move enough - treat as click (select tab)
             // Tab was already selected on mouseDown, nothing more to do
         } else if (drop_target_opt) |target_idx| {
@@ -1078,7 +1113,21 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         return;
     }
 
-    const bar_height = TablineState.TAB_BAR_HEIGHT;
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const tab_padding = app.scalePx(TablineState.TAB_PADDING);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
+    const plus_space = app.scalePx(40);
+    const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
+    const close_margin = app.scalePx(6);
+    const close_inset = app.scalePx(3);
+    const top_padding = app.scalePx(4);
+    const plus_offset = app.scalePx(8);
+    const plus_btn_size = app.scalePx(20);
+    const plus_icon_inset = app.scalePx(5);
     const is_dragging = app.tabline_state.dragging_tab != null;
 
     // Background
@@ -1093,10 +1142,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     _ = c.FillRect(hdc, &bar_rect, bg_brush);
 
     // Calculate tab width
-    const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
     // Brushes
     const selected_brush = c.CreateSolidBrush(c.RGB(255, 255, 255));
@@ -1112,7 +1161,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
     // Font
     const font = c.CreateFontW(
-        -12, 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
+        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
         c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
         c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
     );
@@ -1128,10 +1177,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             app.tabline_state.drag_current_x - app.tabline_state.drag_start_x
         else
             app.tabline_state.drag_start_x - app.tabline_state.drag_current_x;
-        break :blk moved_distance >= TablineState.DRAG_THRESHOLD;
+        break :blk moved_distance >= drag_threshold;
     } else false;
 
-    var x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+    var x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
 
     // First pass: draw all tabs (with placeholder for dragged tab)
     for (0..app.tabline_state.tab_count) |i| {
@@ -1142,7 +1191,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         var tab_rect = c.RECT{
             .left = x + 1,
-            .top = 4,
+            .top = top_padding,
             .right = x + tab_width - 1,
             .bottom = bar_height,
         };
@@ -1165,9 +1214,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         _ = c.SetTextColor(hdc, if (is_selected) c.RGB(0, 0, 0) else c.RGB(80, 80, 80));
 
         var text_rect = c.RECT{
-            .left = x + TablineState.TAB_PADDING,
-            .top = 4,
-            .right = x + tab_width - TablineState.TAB_PADDING - TablineState.TAB_CLOSE_SIZE - 4,
+            .left = x + tab_padding,
+            .top = top_padding,
+            .right = x + tab_width - tab_padding - close_size - top_padding,
             .bottom = bar_height,
         };
 
@@ -1199,8 +1248,8 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Close button (X) - show on selected or hovered tabs
         if (is_selected or is_hovered) {
-            const close_x = x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-            const close_y = @divTrunc(bar_height - TablineState.TAB_CLOSE_SIZE, 2);
+            const close_x = x + tab_width - close_size - close_margin;
+            const close_y = @divTrunc(bar_height - close_size, 2);
 
             // Highlight if close button hovered
             if (app.tabline_state.hovered_close == i) {
@@ -1208,8 +1257,8 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
                 var close_rect = c.RECT{
                     .left = close_x,
                     .top = close_y,
-                    .right = close_x + TablineState.TAB_CLOSE_SIZE,
-                    .bottom = close_y + TablineState.TAB_CLOSE_SIZE,
+                    .right = close_x + close_size,
+                    .bottom = close_y + close_size,
                 };
                 _ = c.FillRect(hdc, &close_rect, highlight_brush);
                 _ = c.DeleteObject(highlight_brush);
@@ -1218,11 +1267,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Draw X
             const pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(100, 100, 100));
             const old_pen = c.SelectObject(hdc, pen);
-            const inset: c_int = 3;
-            _ = c.MoveToEx(hdc, close_x + inset, close_y + inset, null);
-            _ = c.LineTo(hdc, close_x + TablineState.TAB_CLOSE_SIZE - inset, close_y + TablineState.TAB_CLOSE_SIZE - inset);
-            _ = c.MoveToEx(hdc, close_x + TablineState.TAB_CLOSE_SIZE - inset, close_y + inset, null);
-            _ = c.LineTo(hdc, close_x + inset, close_y + TablineState.TAB_CLOSE_SIZE - inset);
+            _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
+            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
             _ = c.SelectObject(hdc, old_pen);
             _ = c.DeleteObject(pen);
         }
@@ -1231,9 +1279,8 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     }
 
     // Draw new tab button (+)
-    const plus_x = x + 8;
-    const plus_y = @divTrunc(bar_height - 20, 2);
-    const plus_size: c_int = 20;
+    const plus_x = x + plus_offset;
+    const plus_y = @divTrunc(bar_height - plus_btn_size, 2);
     {
         // Draw hover background (circular) if hovered
         if (app.tabline_state.hovered_new_tab_btn) {
@@ -1241,7 +1288,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             _ = c.SelectObject(hdc, plus_hover_brush);
             const null_pen = c.GetStockObject(c.NULL_PEN);
             const old_pen_hover = c.SelectObject(hdc, null_pen);
-            _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_size, plus_y + plus_size);
+            _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_size);
             _ = c.SelectObject(hdc, old_pen_hover);
             _ = c.DeleteObject(plus_hover_brush);
         }
@@ -1249,18 +1296,21 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // Draw + icon
         const pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(100, 100, 100));
         const old_pen = c.SelectObject(hdc, pen);
-        const icon_inset: c_int = 5;
-        _ = c.MoveToEx(hdc, plus_x + @divTrunc(plus_size, 2), plus_y + icon_inset, null);
-        _ = c.LineTo(hdc, plus_x + @divTrunc(plus_size, 2), plus_y + plus_size - icon_inset);
-        _ = c.MoveToEx(hdc, plus_x + icon_inset, plus_y + @divTrunc(plus_size, 2), null);
-        _ = c.LineTo(hdc, plus_x + plus_size - icon_inset, plus_y + @divTrunc(plus_size, 2));
+        _ = c.MoveToEx(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_icon_inset, null);
+        _ = c.LineTo(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_btn_size - plus_icon_inset);
+        _ = c.MoveToEx(hdc, plus_x + plus_icon_inset, plus_y + @divTrunc(plus_btn_size, 2), null);
+        _ = c.LineTo(hdc, plus_x + plus_btn_size - plus_icon_inset, plus_y + @divTrunc(plus_btn_size, 2));
         _ = c.SelectObject(hdc, old_pen);
         _ = c.DeleteObject(pen);
     }
 
     // Draw window control buttons (min, max, close) on the right
-    const btn_w = TablineState.WINDOW_BTN_WIDTH;
-    const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
+    const btn_start_x = client_width - btns_total;
+
+    // DPI-scaled icon geometry (icon is 10px at 96 DPI, centered in btn_w)
+    const wbtn_icon_size = app.scalePx(10);
+    const wbtn_icon_inset = @divTrunc(btn_w - wbtn_icon_size, 2);
+    const wbtn_pen_width: c_int = @max(1, app.scalePx(1));
 
     // Check hover states
     const hovered_btn = app.tabline_state.hovered_window_btn;
@@ -1278,11 +1328,11 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         }
 
         // Draw minimize icon (horizontal line)
-        const min_icon_pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(50, 50, 50));
+        const min_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, c.RGB(50, 50, 50));
         const old_min_icon_pen = c.SelectObject(hdc, min_icon_pen);
         const icon_y = @divTrunc(bar_height, 2);
-        _ = c.MoveToEx(hdc, btn_x + 18, icon_y, null);
-        _ = c.LineTo(hdc, btn_x + 28, icon_y);
+        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, icon_y, null);
+        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, icon_y);
         _ = c.SelectObject(hdc, old_min_icon_pen);
         _ = c.DeleteObject(min_icon_pen);
     }
@@ -1300,12 +1350,12 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         }
 
         // Draw maximize icon (rectangle)
-        const max_icon_pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(50, 50, 50));
+        const max_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, c.RGB(50, 50, 50));
         const old_max_icon_pen = c.SelectObject(hdc, max_icon_pen);
         const max_null_brush = c.GetStockObject(c.NULL_BRUSH);
         const old_max_brush = c.SelectObject(hdc, max_null_brush);
-        const max_icon_top = @divTrunc(bar_height - 10, 2);
-        _ = c.Rectangle(hdc, btn_x + 18, max_icon_top, btn_x + 28, max_icon_top + 10);
+        const max_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
+        _ = c.Rectangle(hdc, btn_x + wbtn_icon_inset, max_icon_top, btn_x + wbtn_icon_inset + wbtn_icon_size, max_icon_top + wbtn_icon_size);
         _ = c.SelectObject(hdc, old_max_brush);
         _ = c.SelectObject(hdc, old_max_icon_pen);
         _ = c.DeleteObject(max_icon_pen);
@@ -1325,13 +1375,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Draw X icon
         const close_icon_color = if (hovered_btn == 2) c.RGB(255, 255, 255) else c.RGB(50, 50, 50);
-        const close_icon_pen = c.CreatePen(c.PS_SOLID, 1, close_icon_color);
+        const close_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, close_icon_color);
         const old_close_icon_pen = c.SelectObject(hdc, close_icon_pen);
-        const close_icon_top = @divTrunc(bar_height - 10, 2);
-        _ = c.MoveToEx(hdc, btn_x + 18, close_icon_top, null);
-        _ = c.LineTo(hdc, btn_x + 28, close_icon_top + 10);
-        _ = c.MoveToEx(hdc, btn_x + 28, close_icon_top, null);
-        _ = c.LineTo(hdc, btn_x + 18, close_icon_top + 10);
+        const close_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
+        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, close_icon_top, null);
+        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, close_icon_top + wbtn_icon_size);
+        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, close_icon_top, null);
+        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset, close_icon_top + wbtn_icon_size);
         _ = c.SelectObject(hdc, old_close_icon_pen);
         _ = c.DeleteObject(close_icon_pen);
     }
@@ -1342,7 +1392,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             const drag_idx = app.tabline_state.dragging_tab orelse 0;
             // Only show indicator if target is different from current position
             if (target_idx != drag_idx and target_idx != drag_idx + 1) {
-                const indicator_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH + @as(c_int, @intCast(target_idx)) * (tab_width + 1);
+                const indicator_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(target_idx)) * (tab_width + 1);
                 const indicator_pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(0, 120, 215));  // Blue indicator
                 const old_indicator_pen = c.SelectObject(hdc, indicator_pen);
                 _ = c.MoveToEx(hdc, indicator_x, 2, null);
@@ -1360,7 +1410,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             const float_x = app.tabline_state.drag_current_x - app.tabline_state.drag_offset_x;
             var float_rect = c.RECT{
                 .left = float_x + 1,
-                .top = 4,
+                .top = top_padding,
                 .right = float_x + tab_width - 1,
                 .bottom = bar_height,
             };
@@ -1383,9 +1433,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Draw tab name on floating tab
             _ = c.SetTextColor(hdc, c.RGB(0, 0, 0));
             var float_text_rect = c.RECT{
-                .left = float_x + TablineState.TAB_PADDING,
-                .top = 4,
-                .right = float_x + tab_width - TablineState.TAB_PADDING,
+                .left = float_x + tab_padding,
+                .top = top_padding,
+                .right = float_x + tab_width - tab_padding,
                 .bottom = bar_height,
             };
 
@@ -1482,7 +1532,18 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
         client_width,
     });
 
-    const bar_height = TablineState.TAB_BAR_HEIGHT;
+    // DPI-scaled constants
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const tab_padding = app.scalePx(TablineState.TAB_PADDING);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const plus_space = app.scalePx(40);
+    const close_margin = app.scalePx(6);
+    const close_inset = app.scalePx(3);
+    const top_padding = app.scalePx(4);
+    const plus_offset = app.scalePx(8);
 
     // Background
     const bg_brush = c.CreateSolidBrush(c.RGB(240, 240, 240));
@@ -1496,10 +1557,10 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
     _ = c.FillRect(hdc, &bar_rect, bg_brush);
 
     // Calculate tab width
-    const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;  // 40 for new tab button
+    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;  // plus_space for new tab button
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
     // Brushes
     const selected_brush = c.CreateSolidBrush(c.RGB(255, 255, 255));
@@ -1513,7 +1574,7 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 
     // Font
     const font = c.CreateFontW(
-        -12, 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
+        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
         c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
         c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
     );
@@ -1523,7 +1584,7 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
-    var x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+    var x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
 
     for (0..app.tabline_state.tab_count) |i| {
         const tab = &app.tabline_state.tabs[i];
@@ -1532,7 +1593,7 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         var tab_rect = c.RECT{
             .left = x + 1,
-            .top = 4,
+            .top = top_padding,
             .right = x + tab_width - 1,
             .bottom = bar_height,
         };
@@ -1545,9 +1606,9 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
         _ = c.SetTextColor(hdc, if (is_selected) c.RGB(0, 0, 0) else c.RGB(80, 80, 80));
 
         var text_rect = c.RECT{
-            .left = x + TablineState.TAB_PADDING,
-            .top = 4,
-            .right = x + tab_width - TablineState.TAB_PADDING - TablineState.TAB_CLOSE_SIZE - 4,
+            .left = x + tab_padding,
+            .top = top_padding,
+            .right = x + tab_width - tab_padding - close_size - top_padding,
             .bottom = bar_height,
         };
 
@@ -1579,8 +1640,8 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Close button (X) - show on selected or hovered tabs
         if (is_selected or is_hovered) {
-            const close_x = x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-            const close_y = @divTrunc(bar_height - TablineState.TAB_CLOSE_SIZE, 2);
+            const close_x = x + tab_width - close_size - close_margin;
+            const close_y = @divTrunc(bar_height - close_size, 2);
             const is_close_hovered = app.tabline_state.hovered_close == i;
 
             if (is_close_hovered) {
@@ -1588,8 +1649,8 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
                 var close_rect = c.RECT{
                     .left = close_x,
                     .top = close_y,
-                    .right = close_x + TablineState.TAB_CLOSE_SIZE,
-                    .bottom = close_y + TablineState.TAB_CLOSE_SIZE,
+                    .right = close_x + close_size,
+                    .bottom = close_y + close_size,
                 };
                 _ = c.FillRect(hdc, &close_rect, close_bg);
                 _ = c.DeleteObject(close_bg);
@@ -1598,11 +1659,10 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Draw X
             const pen = c.CreatePen(c.PS_SOLID, 1, if (is_close_hovered) c.RGB(0, 0, 0) else c.RGB(100, 100, 100));
             const old_pen = c.SelectObject(hdc, pen);
-            const inset: c_int = 3;
-            _ = c.MoveToEx(hdc, close_x + inset, close_y + inset, null);
-            _ = c.LineTo(hdc, close_x + TablineState.TAB_CLOSE_SIZE - inset, close_y + TablineState.TAB_CLOSE_SIZE - inset);
-            _ = c.MoveToEx(hdc, close_x + TablineState.TAB_CLOSE_SIZE - inset, close_y + inset, null);
-            _ = c.LineTo(hdc, close_x + inset, close_y + TablineState.TAB_CLOSE_SIZE - inset);
+            _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
+            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
             _ = c.SelectObject(hdc, old_pen);
             _ = c.DeleteObject(pen);
         }
@@ -1611,14 +1671,16 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
     }
 
     // Draw + button
-    const plus_x = x + 8;
-    const plus_y = @divTrunc(bar_height - 16, 2);
+    const plus_btn_size = app.scalePx(16);
+    const plus_x = x + plus_offset;
+    const plus_y = @divTrunc(bar_height - plus_btn_size, 2);
     const plus_pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(100, 100, 100));
     const old_pen = c.SelectObject(hdc, plus_pen);
-    _ = c.MoveToEx(hdc, plus_x + 8, plus_y, null);
-    _ = c.LineTo(hdc, plus_x + 8, plus_y + 16);
-    _ = c.MoveToEx(hdc, plus_x, plus_y + 8, null);
-    _ = c.LineTo(hdc, plus_x + 16, plus_y + 8);
+    const plus_half = @divTrunc(plus_btn_size, 2);
+    _ = c.MoveToEx(hdc, plus_x + plus_half, plus_y, null);
+    _ = c.LineTo(hdc, plus_x + plus_half, plus_y + plus_btn_size);
+    _ = c.MoveToEx(hdc, plus_x, plus_y + plus_half, null);
+    _ = c.LineTo(hdc, plus_x + plus_btn_size, plus_y + plus_half);
     _ = c.SelectObject(hdc, old_pen);
     _ = c.DeleteObject(plus_pen);
 }
@@ -1626,7 +1688,20 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 /// Handle tabline mouse click
 pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
     if (!app.ext_tabline_enabled or !app.tabline_state.visible) return false;
-    if (y >= TablineState.TAB_BAR_HEIGHT) return false;  // Below tab bar
+
+    // DPI-scaled constants
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
+    const plus_space = app.scalePx(40);
+    const close_margin = app.scalePx(6);
+    const plus_offset = app.scalePx(8);
+    const plus_btn_size = app.scalePx(20);
+
+    if (y >= bar_height) return false;  // Below tab bar
 
     // Get client width
     var rect: c.RECT = undefined;
@@ -1635,9 +1710,9 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
     const client_width = rect.right;
 
     // Check window control buttons first (right side)
-    const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
+    const btn_start_x = client_width - btns_total;
     if (x >= btn_start_x) {
-        const btn_idx = @divTrunc(x - btn_start_x, TablineState.WINDOW_BTN_WIDTH);
+        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
         if (btn_idx == 0) {
             // Minimize
             _ = c.ShowWindow(main_hwnd, c.SW_MINIMIZE);
@@ -1658,15 +1733,15 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
     }
 
     // Calculate tab width
-    const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     if (tab_count == 0) return false;
     const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
     // Check + button
-    const plus_x = TablineState.WINDOW_CONTROLS_WIDTH + tab_count * (tab_width + 1) + 8;
-    if (x >= plus_x and x < plus_x + 20) {
+    const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count * (tab_width + 1) + plus_offset;
+    if (x >= plus_x and x < plus_x + plus_btn_size) {
         // New tab - use nvim_command API to avoid showing in cmdline
         if (app.corep) |corep| {
             const cmd = "tabnew";
@@ -1679,15 +1754,15 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
     }
 
     // Check tabs
-    var tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+    var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
     for (0..app.tabline_state.tab_count) |i| {
         if (x >= tab_x and x < tab_x + tab_width) {
             // Check close button
-            const close_x = tab_x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-            const close_y = @divTrunc(TablineState.TAB_BAR_HEIGHT - TablineState.TAB_CLOSE_SIZE, 2);
+            const close_x = tab_x + tab_width - close_size - close_margin;
+            const close_y = @divTrunc(bar_height - close_size, 2);
 
-            if (x >= close_x and x < close_x + TablineState.TAB_CLOSE_SIZE and
-                y >= close_y and y < close_y + TablineState.TAB_CLOSE_SIZE)
+            if (x >= close_x and x < close_x + close_size and
+                y >= close_y and y < close_y + close_size)
             {
                 // Close this tab - use nvim_command API to avoid showing in cmdline
                 if (app.corep) |corep| {
@@ -1722,10 +1797,19 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
 pub fn handleTablineMouseMove(app: *App, x: c_int, y: c_int) void {
     if (!app.ext_tabline_enabled or !app.tabline_state.visible) return;
 
+    // DPI-scaled constants
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
+    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const plus_space = app.scalePx(40);
+    const close_margin = app.scalePx(6);
+
     var new_hovered_tab: ?usize = null;
     var new_hovered_close: ?usize = null;
 
-    if (y < TablineState.TAB_BAR_HEIGHT) {
+    if (y < bar_height) {
         var rect: c.RECT = undefined;
         if (app.hwnd) |hwnd| {
             _ = c.GetClientRect(hwnd, &rect);
@@ -1734,22 +1818,22 @@ pub fn handleTablineMouseMove(app: *App, x: c_int, y: c_int) void {
         }
         const client_width = rect.right;
 
-        const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0) {
             const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
-            var tab_x: c_int = TablineState.WINDOW_CONTROLS_WIDTH;
+            var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
             for (0..app.tabline_state.tab_count) |i| {
                 if (x >= tab_x and x < tab_x + tab_width) {
                     new_hovered_tab = i;
 
                     // Check close button
-                    const close_x = tab_x + tab_width - TablineState.TAB_CLOSE_SIZE - 6;
-                    const close_y = @divTrunc(TablineState.TAB_BAR_HEIGHT - TablineState.TAB_CLOSE_SIZE, 2);
-                    if (x >= close_x and x < close_x + TablineState.TAB_CLOSE_SIZE and
-                        y >= close_y and y < close_y + TablineState.TAB_CLOSE_SIZE)
+                    const close_x = tab_x + tab_width - close_size - close_margin;
+                    const close_y = @divTrunc(bar_height - close_size, 2);
+                    if (x >= close_x and x < close_x + close_size and
+                        y >= close_y and y < close_y + close_size)
                     {
                         new_hovered_close = i;
                     }
@@ -1770,10 +1854,10 @@ pub fn handleTablineMouseMove(app: *App, x: c_int, y: c_int) void {
                 .left = 0,
                 .top = 0,
                 .right = 0,
-                .bottom = TablineState.TAB_BAR_HEIGHT,
+                .bottom = bar_height,
             };
             _ = c.GetClientRect(hwnd, &tab_rect);
-            tab_rect.bottom = TablineState.TAB_BAR_HEIGHT;
+            tab_rect.bottom = bar_height;
             _ = c.InvalidateRect(hwnd, &tab_rect, 0);
         }
     }

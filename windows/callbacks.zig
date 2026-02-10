@@ -124,7 +124,7 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     // are in hwnd (main window) coordinate system which includes the tabbar.
     // We need to subtract the tabbar height to get the correct row number.
     const y_offset: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-        @intCast(app_mod.TablineState.TAB_BAR_HEIGHT)
+        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
     else
         0;
 

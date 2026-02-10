@@ -2426,7 +2426,7 @@ pub const Renderer = struct {
             const create_samp = dev_vtbl.*.CreateSamplerState orelse return error.D3DCreateSamplerFailed;
     
             var sd: c.D3D11_SAMPLER_DESC = std.mem.zeroes(c.D3D11_SAMPLER_DESC);
-            sd.Filter = c.D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.Filter = c.D3D11_FILTER_MIN_MAG_MIP_POINT;
             sd.AddressU = c.D3D11_TEXTURE_ADDRESS_CLAMP;
             sd.AddressV = c.D3D11_TEXTURE_ADDRESS_CLAMP;
             sd.AddressW = c.D3D11_TEXTURE_ADDRESS_CLAMP;

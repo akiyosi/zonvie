@@ -43,7 +43,7 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
 
     // When ext_tabline is enabled, scrollbar should start below the tabbar
     const tabbar_offset: f32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-        @floatFromInt(app_mod.TablineState.TAB_BAR_HEIGHT)
+        @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         0;
 

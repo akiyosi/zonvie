@@ -162,7 +162,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
                 // When ext_tabline is enabled, grid coordinates start below the tabbar
                 if (app.ext_tabline_enabled and app.content_hwnd == null) {
-                    px_y += app_mod.TablineState.TAB_BAR_HEIGHT;
+                    px_y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
                 }
 
                 pos_x = client_pt.x + px_x;
@@ -696,7 +696,7 @@ pub fn handleMouseWheel(
     // External windows (floating windows) don't have a tabbar, so only apply offset for main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
     const content_y: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.content_hwnd == null)
-        pt.y - @as(c.LONG, app_mod.TablineState.TAB_BAR_HEIGHT)
+        pt.y - @as(c.LONG, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         pt.y;
     const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;

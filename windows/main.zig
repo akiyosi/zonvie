@@ -105,7 +105,14 @@ fn printStackTraceAddresses(trace: *std.builtin.StackTrace) void {
     }
 }
 
+// DPI functions (Windows 10 v1607+, user32.dll)
+extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.winapi) c.BOOL;
+
 pub fn main() u8 {
+    // Enable Per-Monitor DPI Awareness V2 before any window creation.
+    // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    _ = SetProcessDpiAwarenessContext(@ptrFromInt(@as(usize, @bitCast(@as(isize, -4)))));
+
     // Check for askpass mode via environment variable (SSH_ASKPASS helper)
     // SSH calls the program specified in SSH_ASKPASS, so we detect mode via env var
     const ATTACH_PARENT_PROCESS: c.DWORD = 0xFFFFFFFF;

@@ -8,6 +8,9 @@ const applog = @import("../app_log.zig");
 const AtlasW: u32 = 2048;
 const AtlasH: u32 = 2048;
 
+// DPI function (Windows 10 v1607+)
+extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
+
 const GUID = extern struct {
     Data1: u32,
     Data2: u16,
@@ -49,6 +52,8 @@ pub const Renderer = struct {
     bold_italic_font_face: ?*c.IDWriteFontFace = null,
     styled_fonts_initialized: bool = false,
     font_em_size: f32 = 14.0,
+    base_point_size: f32 = 14.0, // original point size before DPI scaling
+    dpi: u32 = 96,
     ascent_px: f32 = 0.0,
     descent_px: f32 = 0.0,
     font_name: [64]u16 = [_]u16{0} ** 64, // UTF-16 font family name for IME overlay
@@ -164,6 +169,11 @@ pub const Renderer = struct {
         errdefer safeRelease(self.rt);
         _ = c.QueryPerformanceCounter(&t1);
         applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        // Get DPI for the window (Per-Monitor DPI Aware V2)
+        const window_dpi = GetDpiForWindow(hwnd);
+        self.dpi = if (window_dpi > 0) window_dpi else 96;
+        applog.appLog("[d2d] window DPI: {d}\n", .{self.dpi});
 
         // Initial font (from config or OS default)
         _ = c.QueryPerformanceCounter(&t0);
@@ -1709,24 +1719,28 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         defer self.mu.unlock();
 
         if (self.dwrite_factory == null) return error.NotInitialized;
-    
+
+        // DPI scaling: scale point size to physical pixels
+        const dpi_scale: f32 = @as(f32, @floatFromInt(self.dpi)) / 96.0;
+        const scaled_size: f32 = point_size * dpi_scale;
+
         const name_w = try utf8ToUtf16Alloc(self.alloc, name_utf8);
         defer self.alloc.free(name_w);
-    
+
         const factory = self.dwrite_factory orelse return error.NotInitialized;
-    
+
         // --- build new resources into locals first (transaction) ---
         var new_fmt: ?*c.IDWriteTextFormat = null;
         var new_face: ?*c.IDWriteFontFace = null;
-    
+
         // If we fail after creating something, release locals.
         errdefer safeRelease(new_fmt);
         errdefer safeRelease(new_face);
-    
-        // CreateTextFormat
+
+        // CreateTextFormat (scaled for DPI)
         const vtbl = factory.lpVtbl.*;
         const create_fn = vtbl.CreateTextFormat orelse return error.DWriteFactoryMissingCreateTextFormat;
-    
+
         const hr = create_fn(
             factory,
             @ptrCast(name_w.ptr),
@@ -1734,7 +1748,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
             c.DWRITE_FONT_WEIGHT_NORMAL,
             c.DWRITE_FONT_STYLE_NORMAL,
             c.DWRITE_FONT_STRETCH_NORMAL,
-            point_size,
+            scaled_size,
             @ptrCast(L("en-us")),
             &new_fmt,
         );
@@ -1796,10 +1810,10 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     
         const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
         if (du_per_em > 0.0) {
-            new_ascent_px = point_size * (@as(f32, @floatFromInt(fm.ascent)) / du_per_em);
-            new_descent_px = point_size * (@as(f32, @floatFromInt(fm.descent)) / du_per_em);
+            new_ascent_px = scaled_size * (@as(f32, @floatFromInt(fm.ascent)) / du_per_em);
+            new_descent_px = scaled_size * (@as(f32, @floatFromInt(fm.descent)) / du_per_em);
         }
-    
+
         // --- commit (only here we touch self.*) ---
         safeRelease(self.text_format);
         safeRelease(self.font_face);
@@ -1816,8 +1830,9 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.styled_fonts_initialized = false;
         new_fmt = null;
         new_face = null;
-    
-        self.font_em_size = point_size;
+
+        self.font_em_size = scaled_size;
+        self.base_point_size = point_size;
         self.ascent_px = new_ascent_px;
         self.descent_px = new_descent_px;
 
@@ -1988,7 +2003,71 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         return self.cell_h_px;
     }
 
+    /// Update DPI and re-apply font with new scaling.
+    /// Called from WM_DPICHANGED handler.
+    pub fn updateDpi(self: *Renderer, new_dpi: u32) void {
+        if (new_dpi == self.dpi) return;
 
+        const old_dpi = self.dpi;
+        self.dpi = new_dpi;
+        applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
+
+        // Re-scale font_em_size and metrics proportionally
+        const scale: f32 = @as(f32, @floatFromInt(new_dpi)) / @as(f32, @floatFromInt(old_dpi));
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        self.font_em_size *= scale;
+        self.ascent_px *= scale;
+        self.descent_px *= scale;
+
+        // Re-create TextFormat with new scaled size (needed for cell metrics)
+        if (self.dwrite_factory != null and self.font_name[0] != 0) {
+            safeRelease(self.text_format);
+            self.text_format = null;
+
+            const factory = self.dwrite_factory.?;
+            const vtbl = factory.lpVtbl.*;
+            if (vtbl.CreateTextFormat) |create_fn| {
+                const dpi_scale: f32 = @as(f32, @floatFromInt(new_dpi)) / 96.0;
+                const new_font_size: f32 = self.base_point_size * dpi_scale;
+                var new_fmt: ?*c.IDWriteTextFormat = null;
+                const hr = create_fn(
+                    factory,
+                    @ptrCast(&self.font_name),
+                    null,
+                    c.DWRITE_FONT_WEIGHT_NORMAL,
+                    c.DWRITE_FONT_STYLE_NORMAL,
+                    c.DWRITE_FONT_STRETCH_NORMAL,
+                    new_font_size,
+                    @ptrCast(L("en-us")),
+                    &new_fmt,
+                );
+                if (hr == 0 and new_fmt != null) {
+                    self.text_format = new_fmt;
+                }
+            }
+        }
+
+        // Re-compute cell metrics with new TextFormat
+        self.recomputeCellMetrics() catch {};
+
+        // Clear glyph cache (old glyphs rasterized at wrong DPI)
+        self.glyph_map.clearRetainingCapacity();
+        self.styled_glyph_map.clearRetainingCapacity();
+        self.atlas_next_x = 1;
+        self.atlas_next_y = 1;
+        self.atlas_row_h = 0;
+
+        // Reset styled font faces (will be lazy-reloaded)
+        safeRelease(self.bold_font_face);
+        safeRelease(self.italic_font_face);
+        safeRelease(self.bold_italic_font_face);
+        self.bold_font_face = null;
+        self.italic_font_face = null;
+        self.bold_italic_font_face = null;
+        self.styled_fonts_initialized = false;
+    }
 };
 
 fn safeRelease(p: anytype) void {

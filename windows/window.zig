@@ -83,6 +83,9 @@ const SCROLLBAR_MARGIN = app_mod.SCROLLBAR_MARGIN;
 const SCROLLBAR_MIN_KNOB_HEIGHT = app_mod.SCROLLBAR_MIN_KNOB_HEIGHT;
 const SCROLLBAR_CORNER_RADIUS = app_mod.SCROLLBAR_CORNER_RADIUS;
 
+// Win32 DPI API (Windows 10 v1607+)
+extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
+
 // Grid ID constants
 const CMDLINE_GRID_ID = app_mod.CMDLINE_GRID_ID;
 const POPUPMENU_GRID_ID = app_mod.POPUPMENU_GRID_ID;
@@ -187,7 +190,7 @@ pub export fn WndProc(
                     // If so, don't treat it as a resize border - let it be handled as HTCLIENT.
                     // But keep rightmost 2 pixels for resize detection.
                     // Only check scrollbar area if scrollbar is enabled.
-                    const tabbar_height_i16: i16 = TablineState.TAB_BAR_HEIGHT;
+                    const tabbar_height_i16: i16 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                     const resize_edge_width: i32 = 2; // Keep this many pixels at right edge for resize
                     const in_scrollbar_area = if (app.config.scrollbar.enabled) blk: {
                         const scrollbar_area_left = window_rect.right - @as(i32, @intFromFloat(SCROLLBAR_WIDTH + SCROLLBAR_MARGIN * 2));
@@ -219,14 +222,14 @@ pub export fn WndProc(
                     if (on_right) return c.HTRIGHT;
 
                     // Check if in tabbar area (custom caption)
-                    const tabbar_height = TablineState.TAB_BAR_HEIGHT;
+                    const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
                     if (y < window_rect.top + tabbar_height) {
                         // In tabbar area - check if clicking on interactive elements or empty space
                         const client_x = x - window_rect.left;
                         const client_width = window_rect.right - window_rect.left;
 
                         // Check window control buttons (min/max/close) on the right
-                        const btn_start_x = client_width - TablineState.WINDOW_BTNS_TOTAL;
+                        const btn_start_x = client_width - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
                         if (client_x >= btn_start_x) {
                             // On window buttons - return HTCLIENT so our click handler works
                             return c.HTCLIENT;
@@ -239,11 +242,11 @@ pub export fn WndProc(
 
                         if (tab_count > 0) {
                             // Calculate tab positions using same logic as drawTablineContent
-                            const available_width = client_width - TablineState.WINDOW_CONTROLS_WIDTH - 40 - TablineState.WINDOW_BTNS_TOTAL;
+                            const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - app.scalePx(40) - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
                             const ideal_width = @divTrunc(available_width, @as(i32, @intCast(tab_count)));
-                            const tab_width = @min(TablineState.TAB_MAX_WIDTH, @max(TablineState.TAB_MIN_WIDTH, ideal_width));
+                            const tab_width = @min(app.scalePx(TablineState.TAB_MAX_WIDTH), @max(app.scalePx(TablineState.TAB_MIN_WIDTH), ideal_width));
 
-                            var tab_x: i32 = TablineState.WINDOW_CONTROLS_WIDTH;
+                            var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
                             for (0..tab_count) |_| {
                                 if (client_x >= tab_x and client_x < tab_x + tab_width) {
                                     // On a tab - return HTCLIENT so clicks go to the app
@@ -253,8 +256,8 @@ pub export fn WndProc(
                             }
 
                             // Check + button area
-                            const plus_x = tab_x + 8;
-                            if (client_x >= plus_x and client_x < plus_x + 20) {
+                            const plus_x = tab_x + app.scalePx(8);
+                            if (client_x >= plus_x and client_x < plus_x + app.scalePx(24)) {
                                 return c.HTCLIENT;
                             }
                         }
@@ -280,6 +283,15 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 app.hwnd = hwnd;
                 app.ui_thread_id = c.GetCurrentThreadId();
+
+                // Set DPI scale early so that any scalePx() calls before
+                // WM_APP_DEFERRED_INIT (e.g. WM_NCHITTEST, initial layout)
+                // use the correct value.
+                const initial_dpi = GetDpiForWindow(hwnd);
+                if (initial_dpi > 0) {
+                    app.dpi_scale = @as(f32, @floatFromInt(initial_dpi)) / 96.0;
+                    applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
+                }
 
                 // DWM custom titlebar: trigger frame recalculation
                 if (app.ext_tabline_enabled) {
@@ -506,7 +518,7 @@ pub export fn WndProc(
                     // Content Y offset for ext_tabline (pushes content down below tabbar)
                     // When using content_hwnd (child window for D3D11), offset is 0 because D3D11 renders in child window starting at y=0
                     const content_y_offset: ?u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-                        @intCast(TablineState.TAB_BAR_HEIGHT)
+                        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
                     else
                         null;
 
@@ -520,7 +532,7 @@ pub export fn WndProc(
                     // This avoids DWM composition issues by keeping GDI rendering offscreen
                     if (app.ext_tabline_enabled and app.tabline_state.tab_count > 0) {
                         const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
-                        const tabline_height: u32 = TablineState.TAB_BAR_HEIGHT;
+                        const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                         tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
                     }
 
@@ -1423,6 +1435,62 @@ pub export fn WndProc(
             return 0;
         },
 
+        // Per-Monitor DPI change (e.g. moving window between monitors)
+        0x02E0 => { // WM_DPICHANGED
+            if (getApp(hwnd)) |app| {
+                const new_dpi: u32 = @as(u32, @intCast(wParam & 0xFFFF)); // LOWORD
+                applog.appLog("[win] WM_DPICHANGED: new_dpi={d}\n", .{new_dpi});
+
+                // Update app-level DPI scale
+                app.dpi_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
+
+                // Update renderer DPI (re-scales font, clears glyph cache).
+                // Get atlas pointer under app.mu, then release before calling
+                // updateDpi to maintain consistent lock ordering (avoid holding
+                // app.mu while acquiring renderer.mu inside updateDpi).
+                var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+                app.mu.lock();
+                if (app.atlas) |*a| atlas_ptr = a;
+                app.mu.unlock();
+
+                if (atlas_ptr) |a| {
+                    a.updateDpi(new_dpi);
+                }
+
+                // Update app-level state under app.mu
+                app.mu.lock();
+                if (atlas_ptr) |a| {
+                    app.cell_w_px = a.cellW();
+                    app.cell_h_px = a.cellH();
+                }
+                app.need_full_seed.store(true, .seq_cst);
+                app.seed_pending = true;
+                app.seed_clear_pending = true;
+                app.row_valid_count = 0;
+                if (app.row_valid.bit_length != 0) {
+                    app.row_valid.unsetAll();
+                }
+                app.mu.unlock();
+
+                // Resize window to the suggested rect from WM_DPICHANGED
+                const suggested: *const c.RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                _ = c.SetWindowPos(
+                    hwnd,
+                    null,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+                );
+
+                // Layout update to core (SetWindowPos triggers WM_SIZE which handles this,
+                // but ensure it's done)
+                updateLayoutToCore(hwnd, app);
+            }
+            return 0;
+        },
+
         c.WM_SIZE => {
             // SIZE_MINIMIZED: skip resize to avoid sending tiny rows/cols to Neovim,
             // which would destroy split window proportions.
@@ -1471,7 +1539,7 @@ pub export fn WndProc(
                         0,
                         0,
                         rc.right,
-                        TablineState.TAB_BAR_HEIGHT,
+                        app.scalePx(TablineState.TAB_BAR_HEIGHT),
                         0,  // No SWP_NOZORDER - explicitly set Z-order
                     );
                 }
@@ -2258,6 +2326,10 @@ pub export fn WndProc(
                 const dwrite_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
                 applog.appLog("  [TIMING] dwrite_d2d.Renderer.init: {d}ms", .{dwrite_ms});
 
+                // Set initial DPI scale from renderer
+                app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
+                applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
+
                 // 2) GPU renderer (D3D11)
                 // When ext_tabline is enabled, use content child window for D3D11 rendering
                 const render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
@@ -2615,7 +2687,7 @@ pub export fn WndProc(
 
                 // Check tabline area first (left button only, when ext_tabline enabled)
                 if (msg == c.WM_LBUTTONDOWN and app.ext_tabline_enabled) {
-                    if (y < TablineState.TAB_BAR_HEIGHT) {
+                    if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
                         tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
                         return 0; // Handled by tabline
                     }
@@ -2660,7 +2732,7 @@ pub export fn WndProc(
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
                 // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
                 const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
@@ -2708,7 +2780,7 @@ pub export fn WndProc(
 
                 // Check tabline drag end or tabline area click (left button only)
                 if (msg == c.WM_LBUTTONUP and app.ext_tabline_enabled) {
-                    if (app.tabline_state.dragging_tab != null or y_up < TablineState.TAB_BAR_HEIGHT) {
+                    if (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
                         tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                         return 0; // Handled by tabline
                     }
@@ -2748,7 +2820,7 @@ pub export fn WndProc(
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
                 // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
                 const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
@@ -2803,7 +2875,7 @@ pub export fn WndProc(
                             .left = 0,
                             .top = 0,
                             .right = 4096,
-                            .bottom = TablineState.TAB_BAR_HEIGHT,
+                            .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
                         };
                         _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                     }
@@ -2820,7 +2892,7 @@ pub export fn WndProc(
 
                 // Handle tabline drag or hover (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
-                    if (app.tabline_state.dragging_tab != null or y < TablineState.TAB_BAR_HEIGHT) {
+                    if (app.tabline_state.dragging_tab != null or y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
                         tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
                         // If dragging, consume the message; otherwise let other handlers process too
                         if (app.tabline_state.dragging_tab != null) return 0;
@@ -2840,7 +2912,7 @@ pub export fn WndProc(
                                 .left = 0,
                                 .top = 0,
                                 .right = 4096,
-                                .bottom = TablineState.TAB_BAR_HEIGHT,
+                                .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
                             };
                             _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                         }
@@ -2892,7 +2964,7 @@ pub export fn WndProc(
                 const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
                 // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
                 const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, TablineState.TAB_BAR_HEIGHT)
+                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
@@ -3155,7 +3227,7 @@ pub export fn WndProc(
                         .left = 0,
                         .top = 0,
                         .right = 4096,
-                        .bottom = TablineState.TAB_BAR_HEIGHT,
+                        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
                     };
                     var client_rect: c.RECT = undefined;
                     if (c.GetClientRect(hwnd, &client_rect) != 0) {

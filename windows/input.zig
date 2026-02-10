@@ -224,8 +224,9 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     var adjusted_below_overlay_y = below_overlay_y;
     const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
     if (ext_tabline_enabled and is_main_window) {
-        adjusted_cursor_y += app_mod.TablineState.TAB_BAR_HEIGHT;
-        adjusted_below_overlay_y += app_mod.TablineState.TAB_BAR_HEIGHT;
+        const tab_h = app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
+        adjusted_cursor_y += tab_h;
+        adjusted_below_overlay_y += tab_h;
     }
 
     // Set composition window position (at cursor)
@@ -455,7 +456,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // When content_hwnd is null but ext_tabline is enabled on main window, add tabline height manually.
     const coord_hwnd = if (content_hwnd) |ch| ch else hwnd;
     if (content_hwnd == null and ext_tabline_enabled and !is_external_window) {
-        pt.y += app_mod.TablineState.TAB_BAR_HEIGHT;
+        pt.y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
     }
     _ = c.ClientToScreen(coord_hwnd, &pt);
 

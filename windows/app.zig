@@ -656,6 +656,9 @@ pub const App = struct {
 
     linespace_px: u32 = 0,
 
+    // DPI scaling factor (e.g. 1.0 at 96 DPI, 2.0 at 192 DPI)
+    dpi_scale: f32 = 1.0,
+
     // cell metrics used for layout->core_update_layout_px
     cell_w_px: u32 = 9,
     cell_h_px: u32 = 18,
@@ -894,6 +897,11 @@ pub const App = struct {
                 return c.RECT{ .left = 0, .top = 0, .right = screen_w, .bottom = screen_h };
             },
         }
+    }
+
+    /// Scale a pixel value by the current DPI factor.
+    pub fn scalePx(self: *const App, base_px: c_int) c_int {
+        return @intFromFloat(@round(@as(f32, @floatFromInt(base_px)) * self.dpi_scale));
     }
 
     pub fn deinit(self: *App) void {
@@ -1262,7 +1270,7 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     // so subtract tabbar height to get the actual content area for Neovim.
     // When using content_hwnd, it already has the correct size (excludes tabbar).
     const tabbar_height: u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-        @intCast(TablineState.TAB_BAR_HEIGHT)
+        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
     else
         0;
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
@@ -1305,7 +1313,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     // Subtract tabbar height when ext_tabline is enabled but content_hwnd doesn't exist
     // When using content_hwnd, it already has the correct size (excludes tabbar).
     const tabbar_height: u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-        @intCast(TablineState.TAB_BAR_HEIGHT)
+        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
     else
         0;
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
