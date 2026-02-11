@@ -648,6 +648,10 @@ void zonvie_core_set_ext_messages(zonvie_core *core, int enabled);
  * for Chrome-style tab rendering in titlebar. */
 void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
 
+/* Enable ext_windows UI extension (must call before zonvie_core_start).
+ * When enabled, Neovim external windows are rendered as separate OS windows. */
+ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
+
 /* Check if msg_show throttle timeout has expired and process pending messages.
  * Frontend should call this periodically (e.g., every frame or 16ms) to ensure
  * messages are displayed even when Neovim is waiting for user input. */

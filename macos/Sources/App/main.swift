@@ -14,7 +14,7 @@ let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") }
 // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
 // zonvie-specific arguments:
 //   --nofork, --log <path>, --extcmdline, --extpopup, --extpopupmenu,
-//   --extmessages, --exttabline, --ssh=*, --ssh-identity=*,
+//   --extmessages, --exttabline, --extwindows, --ssh=*, --ssh-identity=*,
 //   --devcontainer=*, --devcontainer-config=*, --devcontainer-rebuild,
 //   --help, -h
 // After "--", all remaining arguments are passed to nvim
@@ -41,7 +41,8 @@ do {
         // Check for zonvie-specific arguments
         if arg == "--nofork" || arg == "--help" || arg == "-h" ||
            arg == "--extcmdline" || arg == "--extpopup" || arg == "--extpopupmenu" ||
-           arg == "--extmessages" || arg == "--exttabline" || arg == "--devcontainer-rebuild" {
+           arg == "--extmessages" || arg == "--exttabline" || arg == "--extwindows" ||
+           arg == "--devcontainer-rebuild" {
             // Skip this argument (it's zonvie-specific)
             i += 1
         } else if arg == "--log" {
@@ -118,6 +119,7 @@ if args.contains("--help") || args.contains("-h") {
             --extpopup, --extpopupmenu    Enable external popup menu UI
             --extmessages                 Enable external messages UI
             --exttabline                  Enable external tabline UI (Chrome-style tabs)
+            --extwindows                  Enable external windows (each Neovim window as OS window)
             --ssh=<user@host[:port]>      Connect to remote host via SSH
             --ssh-identity=<path>         Path to SSH private key file
             --devcontainer=<workspace>    Run inside a devcontainer
@@ -155,6 +157,12 @@ if args.contains("--help") || args.contains("-h") {
 
             [messages]
                 external        Enable external messages UI
+
+            [tabline]
+                external        Enable external tabline UI
+
+            [windows]
+                external        Enable external windows
 
             [log]
                 enabled         Enable logging (true/false)

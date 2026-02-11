@@ -2122,6 +2122,10 @@ pub export fn WndProc(
                     // D3D11 renders on top of GDI child windows
                     // We'll draw tabline using GDI after D3D11 Present instead
                 }
+                if (app.ext_windows_enabled) {
+                    applog.appLog("[win] enabling ext_windows\n", .{});
+                    core.zonvie_core_set_ext_windows(app.corep, 1);
+                }
                 core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
                 applog.appLog("[win] set opacity={d:.2}\n", .{app.config.window.opacity});
                 core.zonvie_core_set_glyph_cache_size(

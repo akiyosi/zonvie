@@ -545,6 +545,13 @@ final class ZonvieCore {
         ZonvieCore.appLog("[ZonvieCore] setExtTabline(\(enabled))")
     }
 
+    /// Enable ext_windows UI extension. Must be called before start().
+    func setExtWindows(_ enabled: Bool) {
+        guard let core else { return }
+        zonvie_core_set_ext_windows(core, enabled ? 1 : 0)
+        ZonvieCore.appLog("[ZonvieCore] setExtWindows(\(enabled))")
+    }
+
     /// Enable blur transparency for background. Must be called before start().
     func setBlurEnabled(_ enabled: Bool) {
         guard let core else { return }
@@ -615,6 +622,15 @@ final class ZonvieCore {
         if hasExtTabline {
             ZonvieCore.appLog("[start] enabling ext_tabline")
             setExtTabline(true)
+        }
+
+        // ext_windows: CLI flag or config file
+        let hasExtWindows = args.contains("--extwindows") || ZonvieConfig.shared.windows.external
+        ZonvieCore.appLog("[start] hasExtWindows = \(hasExtWindows) (cli=\(args.contains("--extwindows")), config=\(ZonvieConfig.shared.windows.external))")
+
+        if hasExtWindows {
+            ZonvieCore.appLog("[start] enabling ext_windows")
+            setExtWindows(true)
         }
 
         // Parse SSH arguments from CLI: --ssh=user@host[:port], --ssh-identity=path

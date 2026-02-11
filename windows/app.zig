@@ -753,6 +753,9 @@ pub const App = struct {
     // ext_tabline enabled flag (set from --exttabline command line arg)
     ext_tabline_enabled: bool = false,
 
+    // ext_windows enabled flag (set from --extwindows command line arg or config)
+    ext_windows_enabled: bool = false,
+
     // WSL mode flags (set from --wsl command line arg or config)
     wsl_mode: bool = false,
     wsl_distro: ?[]const u8 = null,

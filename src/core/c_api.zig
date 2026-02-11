@@ -766,6 +766,14 @@ pub export fn zonvie_core_set_ext_tabline(p: ?*zonvie_core, enabled: i32) callco
     box.core.log.write("[c_api] zonvie_core_set_ext_tabline: enabled={any}\n", .{box.core.ext_tabline_enabled});
 }
 
+/// Enable ext_windows UI extension. Must be called before zonvie_core_start().
+pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.ext_windows_enabled = (enabled != 0);
+    box.core.log.write("[c_api] zonvie_core_set_ext_windows: enabled={any}\n", .{box.core.ext_windows_enabled});
+}
+
 /// Check if msg_show throttle timeout has expired and process pending messages.
 /// Frontend should call this periodically (e.g., every frame or 16ms) to ensure
 /// messages are displayed even when Neovim is waiting for user input.

@@ -345,6 +345,8 @@ pub const Core = struct {
     // ext_tabline UI extension flag (set before start)
     ext_tabline_enabled: bool = false,
 
+    // ext_windows UI extension flag (set before start)
+    ext_windows_enabled: bool = false,
 
     // Throttle for msg_show (noice.nvim-style): delay display to accumulate messages
     // noice.nvim uses 1000/30 = ~33ms throttle by default
@@ -1495,8 +1497,9 @@ pub const Core = struct {
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, ext_hlstate, ext_windows, rgb + (optional ext_cmdline) + (optional ext_popupmenu) + (optional ext_messages) + (optional ext_tabline)
-        var opt_count: u32 = 4;
+        // Option count: ext_multigrid, ext_hlstate, rgb (always) + optional ext_*
+        var opt_count: u32 = 3;
+        if (self.ext_windows_enabled) opt_count += 1;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
         if (self.ext_messages_enabled) opt_count += 1;
@@ -1506,10 +1509,13 @@ pub const Core = struct {
         try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "ext_hlstate");
         try rpc.packBool(&buf, self.alloc, true);
-        try rpc.packStr(&buf, self.alloc, "ext_windows");
-        try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "rgb");
         try rpc.packBool(&buf, self.alloc, true);
+
+        if (self.ext_windows_enabled) {
+            try rpc.packStr(&buf, self.alloc, "ext_windows");
+            try rpc.packBool(&buf, self.alloc, true);
+        }
 
         if (self.ext_cmdline_enabled) {
             try rpc.packStr(&buf, self.alloc, "ext_cmdline");
@@ -1533,7 +1539,7 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows=true)\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled });
+        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {

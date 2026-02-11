@@ -138,6 +138,7 @@ pub const Config = struct {
     popup: PopupConfig = .{},
     messages: MessagesConfig = .{},
     tabline: TablineConfig = .{},
+    windows: WindowsConfig = .{},
     log: LogConfig = .{},
     performance: PerformanceConfig = .{},
     ime: IMEConfig = .{},
@@ -216,6 +217,10 @@ pub const Config = struct {
     };
 
     pub const TablineConfig = struct {
+        external: bool = false,
+    };
+
+    pub const WindowsConfig = struct {
         external: bool = false,
     };
 
@@ -359,6 +364,10 @@ pub const Config = struct {
             if (t.external) |e| self.tabline.external = e;
         }
 
+        if (cfg.windows) |w| {
+            if (w.external) |e| self.windows.external = e;
+        }
+
         if (cfg.log) |l| {
             if (l.enabled) |e| self.log.enabled = e;
             if (l.path) |p| self.log.path = alloc.dupe(u8, p) catch null;
@@ -468,6 +477,7 @@ const TomlConfig = struct {
     popup: ?TomlPopup = null,
     messages: ?TomlMessages = null,
     tabline: ?TomlTabline = null,
+    windows: ?TomlWindows = null,
     log: ?TomlLog = null,
     performance: ?TomlPerformance = null,
     ime: ?TomlIME = null,
@@ -531,6 +541,10 @@ const TomlRoute = struct {
 };
 
 const TomlTabline = struct {
+    external: ?bool = null,
+};
+
+const TomlWindows = struct {
     external: ?bool = null,
 };
 
