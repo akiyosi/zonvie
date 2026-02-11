@@ -531,6 +531,62 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Handle tabline changes (ext_tabline)
         self.notifyTablineChanges();
 
+        // ext_windows: ensure grid 2 (default editor window) is composited.
+        // With ext_windows, Neovim may not send win_pos for the default window.
+        // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
+        // auto-position it at (0,0) so it gets rendered in the main window.
+        if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
+            self.grid.setWinPos(2, 1000, 0, 0) catch {};
+        }
+
+        // Process pending ext_windows grid resizes (from win_resize events).
+        // Only send resize for NEW grids (not yet known to frontend).
+        // For existing external windows, the frontend owns the actual window size
+        // and reports it back via tryResizeGrid on windowDidResize.
+        // Sending Neovim's proposed size for existing windows would override the
+        // actual window dimensions, causing size mismatch and stretched glyphs.
+        for (self.grid.pending_grid_resizes.items) |resize| {
+            if (!self.known_external_grids.contains(resize.grid_id)) {
+                // Use a reasonable initial size for new external windows.
+                // Neovim's proposed size is based on terminal layout (e.g. height=2)
+                // which is too small for an OS window. Use half the main window.
+                const init_rows = @max(resize.height, self.grid.rows / 2);
+                const init_cols = @max(resize.width, self.grid.cols / 2);
+                self.requestTryResizeGrid(resize.grid_id, init_rows, init_cols);
+
+                // Mark grid as pending initial resize. Window creation will be
+                // deferred in notifyExternalWindowChanges until Neovim responds
+                // with grid_resize matching the requested dimensions.
+                self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
+                    .grid_id = resize.grid_id,
+                    .width = init_cols,
+                    .height = init_rows,
+                }) catch {};
+            }
+        }
+        self.grid.pending_grid_resizes.clearRetainingCapacity();
+
+        // ext_windows: if Neovim changed an external grid's dimensions
+        // (via grid_resize) to something different from our target, re-send
+        // tryResizeGrid to keep the grid at the window's actual size.
+        // This prevents NDC/drawable mismatch that causes scaled rendering.
+        {
+            var target_it = self.grid.external_grid_target_sizes.iterator();
+            while (target_it.next()) |entry| {
+                const gid = entry.key_ptr.*;
+                const target = entry.value_ptr.*;
+                if (!self.known_external_grids.contains(gid)) continue;
+                if (self.grid.sub_grids.get(gid)) |sg| {
+                    if (sg.rows != target.rows or sg.cols != target.cols) {
+                        self.log.write("[ext_windows] grid {d} resized to {d}x{d} but target is {d}x{d}, re-sending tryResizeGrid\n", .{
+                            gid, sg.cols, sg.rows, target.cols, target.rows,
+                        });
+                        self.requestTryResizeGrid(gid, target.rows, target.cols);
+                    }
+                }
+            }
+        }
+
         // Check for external window changes and notify frontend
         const new_ext_grids = self.notifyExternalWindowChanges();
 

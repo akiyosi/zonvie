@@ -493,6 +493,11 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.terminalView?.renderer.commitFlush()
+                // Pass Neovim default background to renderer for viewport-edge clear color
+                if let corePtr = me.core {
+                    let bg = zonvie_core_get_default_bg(corePtr)
+                    me.terminalView?.renderer.updateDefaultBgColor(bg)
+                }
             }
         )
 
@@ -1841,6 +1846,8 @@ final class ZonvieCore {
         let gridId: Int64
         var cellWidthPx: CGFloat
         var cellHeightPx: CGFloat
+        /// When true, suppress tryResizeGrid in windowDidResize (programmatic resize from grid_resize).
+        var suppressResizeCallback = false
 
         init(core: ZonvieCore, gridId: Int64, cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
             self.core = core
@@ -1851,6 +1858,10 @@ final class ZonvieCore {
         }
 
         func windowDidResize(_ notification: Notification) {
+            // Skip resize callback when window is being resized programmatically
+            // (from Neovim grid_resize). Only report back on user-initiated resizes.
+            if suppressResizeCallback { return }
+
             guard let window = notification.object as? NSWindow,
                   let core = core else { return }
 
@@ -2782,6 +2793,17 @@ final class ZonvieCore {
         } else if gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId {
             self.resizeMessageWindow(window: window, containerView: containerView, gridView: gridView, gridId: gridId,
                                      rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale)
+        } else {
+            // Regular ext_windows grid: no window resize needed here.
+            // The Zig core handles grid size management by sending tryResizeGrid
+            // to keep Neovim's grid dimensions matching the window's actual size.
+
+            // Set clear color so viewport-edge pixels match the grid background.
+            // For blur: use backgroundAlpha so edges match the semi-transparent content.
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+            let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
+            gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
         }
     }
 

@@ -212,7 +212,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let inflightSemaphore = DispatchSemaphore(value: 2)  // Max 2 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
+    private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
+    private var defaultBgRGB: UInt32 = 0               // Protected by lock
 
     private var pendingFont: (name: String, size: CGFloat)?
     private var linespacePx: Int32 = 0
@@ -561,6 +563,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Update the default Neovim background color (for clear color in viewport edges).
+    /// Called from core thread during flush.
+    func updateDefaultBgColor(_ rgb: UInt32) {
+        lock.lock()
+        defaultBgRGB = rgb
+        lock.unlock()
+    }
+
     func submitVerticesRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
         cursorPtr: UnsafeRawPointer?, cursorCount: Int
@@ -804,6 +814,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let smoothScrolling: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
 
+            let snappedBgRGB: UInt32
+
             lock.lock()
             csi = committedSetIndex
             currentCommitRevision = commitRevision
@@ -817,6 +829,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             pendingDirtyRows.removeAll()
             smoothScrolling = hasActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            snappedBgRGB = defaultBgRGB
             lock.unlock()
 
             // Safety defer: decrement gpuInFlight + signal semaphore on early return.
@@ -889,6 +902,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Check if committed data changed since last draw
             let hasNewCommit = currentCommitRevision != lastDrawnRevision
 
+            // Check if drawable size changed since last render (window resize).
+            // Must re-render with current viewport even if vertices haven't changed,
+            // otherwise macOS stretches the old frame to the new window size.
+            let drawableSizeChanged = view.drawableSize != lastDrawnDrawableSize
+
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             if hasPresentedOnce,
@@ -897,20 +915,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
                !smoothScrolling,
-               !blinkStateChanged {
+               !blinkStateChanged,
+               !drawableSizeChanged {
                 // Still reset redrawPending so future redraws are not blocked.
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
 
             // In rowMode with no vertex updates and no dirty rows, skip rendering
-            if rowMode && dirtyRows.isEmpty && !hasNewCommit && !smoothScrolling && !blinkStateChanged && hasPresentedOnce {
+            if rowMode && dirtyRows.isEmpty && !hasNewCommit && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce {
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
 
-            // Track that we've consumed this revision
+            // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision
+            lastDrawnDrawableSize = view.drawableSize
 
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
@@ -940,15 +960,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // DEBUG: Detailed loadAction decision logging
             ZonvieCore.appLog("[DEBUG-LOADACTION] blurEnabled=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) hasAnyDirtyInRowMode=\(hasAnyDirtyInRowMode) mainCount=\(currentMainCount) cursorCount=\(currentCursorCount) backBufferSize=\(backBufferSize)")
 
-            if !blurEnabled && hasPresentedOnce && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
+            if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
                 rpd.colorAttachments[0].loadAction = .load
                 ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
             } else {
                 rpd.colorAttachments[0].loadAction = .clear
-                // Use transparent clear color when blur is enabled
-                let clearAlpha: Double = blurEnabled ? 0.0 : 1.0
-                rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: clearAlpha)
-                ZonvieCore.appLog("[draw] loadAction=.clear clearAlpha=\(clearAlpha) (blur=\(blurEnabled))")
+                // Use Neovim default background as clear color so viewport edges
+                // and smooth-scroll gaps between rows blend in naturally.
+                // For blur: use backgroundAlpha (not 0) so gaps match the semi-transparent content.
+                let clearAlpha: Double = blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
+                let bgR = Double((snappedBgRGB >> 16) & 0xFF) / 255.0
+                let bgG = Double((snappedBgRGB >> 8) & 0xFF) / 255.0
+                let bgB = Double(snappedBgRGB & 0xFF) / 255.0
+                rpd.colorAttachments[0].clearColor = MTLClearColor(red: bgR, green: bgG, blue: bgB, alpha: clearAlpha)
+                ZonvieCore.appLog("[draw] loadAction=.clear bg=\(String(format: "0x%06X", snappedBgRGB)) alpha=\(clearAlpha)")
             }
             
             // === PERF LOG: Metalエンコード開始 ===
@@ -970,6 +995,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // defer handles: semaphore.signal() + gpuInFlight decrement
                 return
             }
+
+            // Set viewport to exact grid pixel dimensions to prevent sub-cell stretching.
+            // Must match Zig core's NDC computation: cols = drawableW / cellW, grid_w = cols * cellW.
+            // Uses integer division to match Zig's u32 arithmetic exactly.
+            let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
+            let cellHi = max(1, UInt32(ch.rounded(.toNearestOrAwayFromZero)))
+            let drawableWi = max(1, UInt32(view.drawableSize.width))
+            let drawableHi = max(1, UInt32(view.drawableSize.height))
+            let vpWidth = Double((drawableWi / cellWi) * cellWi)
+            let vpHeight = Double((drawableHi / cellHi) * cellHi)
+            if vpWidth > 0 && vpHeight > 0 {
+                enc.setViewport(MTLViewport(originX: 0, originY: 0, width: vpWidth, height: vpHeight, znear: 0, zfar: 1))
+            }
+
             // Safe to force unwrap: guard at top of draw() ensures pipeline/sampler are non-nil
             enc.setRenderPipelineState(pipeline!)
 
@@ -1006,11 +1045,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // Bind drawable size via setFragmentBytes (avoids shared buffer race
             // when inflightSemaphore allows 2 concurrent draw() calls).
+            // Use viewport dimensions so the fragment shader's position→NDC conversion
+            // matches the Metal viewport (not the full drawable).
             do {
-                var size = DrawableSize(
-                    width: Float(view.drawableSize.width),
-                    height: Float(view.drawableSize.height)
-                )
+                let dsW = vpWidth > 0 ? Float(vpWidth) : Float(view.drawableSize.width)
+                let dsH = vpHeight > 0 ? Float(vpHeight) : Float(view.drawableSize.height)
+                var size = DrawableSize(width: dsW, height: dsH)
                 enc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
             }
 

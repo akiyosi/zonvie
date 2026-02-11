@@ -202,9 +202,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
         }
 
-        // For cmdline with blur: clearColor is transparent
+        // Set initial clear color alpha to match blur transparency.
+        // The RGB will be updated from vertex data via configureExternalGridFromRow.
         if isCmdline && blurEnabled {
             gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        } else if blurEnabled {
+            let opacity = Double(ZonvieConfig.shared.backgroundAlpha)
+            gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: opacity)
         }
 
         // Add scrollbar (for detached grids, not cmdline/popupmenu)
@@ -359,7 +363,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // Fetch pending state under lock
-            let (vertexCount, rowMode, rowBuffersSnapshot, rowCountsSnapshot, dirtyRows): (Int, Bool, [MTLBuffer?], [Int], [Int]) = {
+            let (vertexCount, rowMode, rowBuffersSnapshot, rowCountsSnapshot, dirtyRows, snapGridRows, snapGridCols): (Int, Bool, [MTLBuffer?], [Int], [Int], UInt32, UInt32) = {
                 lock.lock()
                 defer { lock.unlock() }
 
@@ -368,13 +372,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let counts = rowVertexCounts
                     let dirty = Array(pendingDirtyRows)
                     pendingDirtyRows.removeAll()
-                    return (0, true, buffers, counts, dirty)
+                    return (0, true, buffers, counts, dirty, gridRows, gridCols)
                 } else {
                     if let pending = pendingVertexCount {
                         currentVertexCount = pending
                         pendingVertexCount = nil
                     }
-                    return (currentVertexCount, false, [], [], [])
+                    return (currentVertexCount, false, [], [], [], gridRows, gridCols)
                 }
             }()
 
@@ -422,6 +426,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             guard let cmd = queue.makeCommandBuffer() else { return }
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
+            // Set viewport to exact grid pixel dimensions to prevent sub-cell stretching.
+            // NDC [-1, 1] maps to exactly (cols * cellW) x (rows * cellH) pixels.
+            // The remaining sub-cell pixels at edges are filled by the clear color.
+            let cellW = Double(mainTerminalView?.renderer.cellWidthPx ?? 0)
+            let cellH = Double(mainTerminalView?.renderer.cellHeightPx ?? 0)
+            let vpWidth = Double(snapGridCols) * cellW
+            let vpHeight = Double(snapGridRows) * cellH
+            if vpWidth > 0 && vpHeight > 0 {
+                enc.setViewport(MTLViewport(originX: 0, originY: 0, width: vpWidth, height: vpHeight, znear: 0, zfar: 1))
+            }
+
             // Bind atlas texture
             if let atlas = sharedAtlas, let tex = atlas.texture {
                 enc.setFragmentTexture(tex, index: 0)
@@ -448,11 +463,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // Bind drawable size via setFragmentBytes (no shared buffer race)
+            // Use viewport dimensions (grid pixel area) instead of full drawable size,
+            // since the fragment shader converts position.y → NDC using this value,
+            // and position.y is in viewport coordinates.
             do {
-                var size = DrawableSize(
-                    width: Float(view.drawableSize.width),
-                    height: Float(view.drawableSize.height)
-                )
+                let dsW = vpWidth > 0 ? Float(vpWidth) : Float(view.drawableSize.width)
+                let dsH = vpHeight > 0 ? Float(vpHeight) : Float(view.drawableSize.height)
+                var size = DrawableSize(width: dsW, height: dsH)
                 enc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
             }
 

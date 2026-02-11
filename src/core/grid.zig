@@ -633,6 +633,16 @@ pub const ExternalGridInfo = struct {
     start_col: i32,
 };
 
+/// Pending grid resize request from ext_windows win_resize event.
+pub const PendingGridResize = struct {
+    grid_id: i64,
+    width: u32,
+    height: u32,
+};
+
+/// Target (desired) grid dimensions for external windows.
+pub const GridSize = struct { rows: u32, cols: u32 };
+
 pub const WinLayer = struct {
     zindex: i64 = 0,
     compindex: i64 = 0,
@@ -724,6 +734,23 @@ pub const Grid = struct {
     // Maps grid_id -> win handle (Neovim window handle, for reference)
     external_grids: std.AutoHashMapUnmanaged(i64, ExternalGridInfo) = .{},
 
+    // ext_windows: pending grid resize requests (processed by core after redraw)
+    pending_grid_resizes: std.ArrayListUnmanaged(PendingGridResize) = .{},
+
+    // ext_windows: grids awaiting initial resize response from Neovim.
+    // Window creation is deferred until grid_resize provides adequate dimensions.
+    pending_ext_window_grids: std.AutoHashMapUnmanaged(i64, PendingGridResize) = .{},
+
+    // ext_windows: grids that were created by win_split (persistently tracked).
+    // Survives win_hide (tab switch) so win_pos can re-register them as external.
+    // Only removed on win_close (permanent close).
+    ext_windows_grids: std.AutoHashMapUnmanaged(i64, i64) = .{}, // grid_id -> win_id
+
+    // ext_windows: target (desired) grid dimensions for each external grid.
+    // Set when tryResizeGrid is sent. If Neovim's grid_resize doesn't match,
+    // tryResizeGrid is re-sent to keep the grid at the window's size.
+    external_grid_target_sizes: std.AutoHashMapUnmanaged(i64, GridSize) = .{},
+
     // ext_cmdline state
     cmdline_states: std.AutoHashMapUnmanaged(u32, CmdlineState) = .{}, // level -> state
     cmdline_block: CmdlineBlock = .{},
@@ -766,6 +793,10 @@ pub const Grid = struct {
         self.grid_win_ids.deinit(self.alloc);
         self.win_layer.deinit(self.alloc);
         self.external_grids.deinit(self.alloc);
+        self.pending_grid_resizes.deinit(self.alloc);
+        self.pending_ext_window_grids.deinit(self.alloc);
+        self.ext_windows_grids.deinit(self.alloc);
+        self.external_grid_target_sizes.deinit(self.alloc);
         self.grid_metrics.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
@@ -1214,9 +1245,10 @@ pub const Grid = struct {
         // Store grid_id -> winid mapping
         try self.grid_win_ids.put(self.alloc, grid_id, win_id);
 
-        // If this grid was external, remove it from external_grids.
-        // This allows a grid to transition from external back to normal window.
-        _ = self.external_grids.remove(grid_id);
+        // If this grid is external (ext_windows split), keep it external.
+        // win_pos events still arrive for external grids but should not
+        // pull them back into the composited layout.
+        if (self.external_grids.contains(grid_id)) return;
 
         const old_pos_opt = self.win_pos.get(grid_id);
         if (old_pos_opt) |old_pos| {

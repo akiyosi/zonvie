@@ -273,10 +273,17 @@ pub const FlushCtx = struct {
             var main = &ctx.core.main_verts;
             var cursor = &ctx.core.cursor_verts;
 
-            const dw: f32 = @floatFromInt(ctx.core.drawable_w_px);
-            const dh: f32 = @floatFromInt(ctx.core.drawable_h_px);
             const cellW: f32 = @floatFromInt(ctx.core.cell_w_px);
             const cellH: f32 = @floatFromInt(ctx.core.cell_h_px);
+
+            // NDC viewport: use grid-based dimensions (cols * cellW, rows * cellH)
+            // instead of raw drawable dimensions. This prevents sub-cell stretching
+            // when the drawable changes by less than one cell (the Metal viewport
+            // on the frontend is set to match these exact pixel dimensions).
+            const grid_cols = @max(@as(u32, 1), ctx.core.drawable_w_px / ctx.core.cell_w_px);
+            const grid_rows = @max(@as(u32, 1), ctx.core.drawable_h_px / ctx.core.cell_h_px);
+            const dw: f32 = @as(f32, @floatFromInt(grid_cols)) * cellW;
+            const dh: f32 = @as(f32, @floatFromInt(grid_rows)) * cellH;
 
             const lineSpacePx: u32 = ctx.core.linespace_px;
             const topPadPx: u32 = lineSpacePx / 2;
@@ -1763,6 +1770,23 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
                 cols = sg.cols;
             }
 
+            // Skip 0x0 grids - wait until grid_resize provides valid dimensions
+            if (rows == 0 or cols == 0) continue;
+
+            // For ext_windows grids awaiting initial resize response from Neovim,
+            // defer window creation until the grid reaches the requested size.
+            // Neovim may send an intermediate small grid_resize (e.g. rows=1)
+            // before the actual resize, and creating the window at that size
+            // produces a tiny window.
+            if (self.grid.pending_ext_window_grids.get(grid_id)) |pending| {
+                if (rows < pending.height or cols < pending.width) {
+                    // Grid hasn't reached requested size yet - wait
+                    continue;
+                }
+                // Grid is now large enough, remove from pending
+                _ = self.grid.pending_ext_window_grids.remove(grid_id);
+            }
+
             // Notify frontend with position info
             if (self.cb.on_external_window) |cb| {
                 cb(self.ctx, grid_id, info.win, rows, cols, info.start_row, info.start_col);
@@ -1929,9 +1953,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Check if we need full redraw or can use dirty_rows
         const need_full_redraw = force_render or force_redraw_this or cursor_affected or cursor_moved_within;
 
-        // Calculate viewport size for this grid
-        const grid_w: f32 = @as(f32, @floatFromInt(sg.cols)) * cellW;
-        const grid_h: f32 = @as(f32, @floatFromInt(sg.rows)) * cellH;
+        // NDC viewport: use target dimensions (= window's actual size) instead of
+        // grid data dimensions. Neovim may temporarily resize the grid via grid_resize
+        // (e.g. when main window resizes), but the external window hasn't changed.
+        // Using target dimensions ensures NDC always matches the Metal drawable.
+        const target = self.grid.external_grid_target_sizes.get(grid_id);
+        const viewport_cols = if (target) |t| t.cols else sg.cols;
+        const viewport_rows = if (target) |t| t.rows else sg.rows;
+        const grid_w: f32 = @as(f32, @floatFromInt(viewport_cols)) * cellW;
+        const grid_h: f32 = @as(f32, @floatFromInt(viewport_rows)) * cellH;
 
         // Debug: count non-space cells
         var non_space_count: u32 = 0;
@@ -2607,8 +2637,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             }
 
             // Send this row's vertices
+            // Pass viewport dimensions (target size) instead of sg dimensions so that
+            // the frontend's scroll offset calculation matches the NDC viewport used here.
             if (ext_verts.items.len > 0) {
-                row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, sg.rows, sg.cols);
+                row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
             }
         }
 

@@ -345,6 +345,7 @@ pub const Core = struct {
     // ext_tabline UI extension flag (set before start)
     ext_tabline_enabled: bool = false,
 
+
     // Throttle for msg_show (noice.nvim-style): delay display to accumulate messages
     // noice.nvim uses 1000/30 = ~33ms throttle by default
     msg_show_pending_since: ?i128 = null, // nanos timestamp when first msg_dirty was set
@@ -1494,8 +1495,8 @@ pub const Core = struct {
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, ext_hlstate, rgb + (optional ext_cmdline) + (optional ext_popupmenu) + (optional ext_messages) + (optional ext_tabline)
-        var opt_count: u32 = 3;
+        // Option count: ext_multigrid, ext_hlstate, ext_windows, rgb + (optional ext_cmdline) + (optional ext_popupmenu) + (optional ext_messages) + (optional ext_tabline)
+        var opt_count: u32 = 4;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
         if (self.ext_messages_enabled) opt_count += 1;
@@ -1504,6 +1505,8 @@ pub const Core = struct {
         try rpc.packStr(&buf, self.alloc, "ext_multigrid");
         try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "ext_hlstate");
+        try rpc.packBool(&buf, self.alloc, true);
+        try rpc.packStr(&buf, self.alloc, "ext_windows");
         try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "rgb");
         try rpc.packBool(&buf, self.alloc, true);
@@ -1530,7 +1533,7 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled });
+        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows=true)\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled });
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {
@@ -1551,6 +1554,9 @@ pub const Core = struct {
 
     /// Request resize of a specific grid (for external windows).
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
+        // Track the target size for external grids so we can re-send
+        // if Neovim overrides our size via grid_resize.
+        self.grid.external_grid_target_sizes.put(self.alloc, grid_id, .{ .rows = rows, .cols = cols }) catch {};
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
         };

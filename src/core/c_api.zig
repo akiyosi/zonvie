@@ -976,6 +976,15 @@ pub export fn zonvie_core_get_hl_by_name(
     return if (result.found) 1 else 0;
 }
 
+/// Return the Neovim default background color as 0x00RRGGBB.
+/// Safe to call from within callbacks (grid_mu already held) and from
+/// any other thread (u32 read is atomic on arm64/x86_64).
+pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.hl.default_bg;
+}
+
 // ========================================================================
 // Message routing API
 // ========================================================================

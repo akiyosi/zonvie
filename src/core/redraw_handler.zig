@@ -439,6 +439,69 @@ pub fn handleRedraw(
                 grid.destroyGrid(grid_id);
             }
 
+        } else if (std.mem.eql(u8, name, "win_split")) {
+            // win_split (ext_windows): [win1, grid1, win2, grid2, flags]
+            // win1/grid1 = source window, win2/grid2 = new window
+            // flags: 0=below, 1=above, 2=right, 3=left
+            for (tuples) |tv| {
+                if (tv != .arr) continue;
+                const t = tv.arr;
+                if (t.len < 5) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int) continue;
+
+                const win1 = t[0].int;
+                const grid1 = t[1].int;
+                const win2 = t[2].int;
+                const grid2 = t[3].int;
+                const flags = t[4].int;
+                log.write("[win_split] win1={d} grid1={d} win2={d} grid2={d} flags={d}\n", .{ win1, grid1, win2, grid2, flags });
+
+                // Only register the NEW window (grid2/win2) as external.
+                // The source window (grid1/win1) stays where it is (main grid or already external).
+                _ = grid.setWinExternalPos(grid2, win2) catch |e| {
+                    log.write("[win_split] setWinExternalPos grid2={d} failed: {any}\n", .{ grid2, e });
+                };
+
+                // Persistently track only the NEW window as an ext_windows grid.
+                // This survives win_hide (tab switch) so win_pos can re-register it.
+                // Do NOT track grid1 (source) - it may be the main editor grid (grid 2)
+                // which should remain composited in the main window.
+                grid.ext_windows_grids.put(grid.alloc, grid2, win2) catch {};
+            }
+
+        } else if (std.mem.eql(u8, name, "win_resize")) {
+            // win_resize (ext_windows): [win, grid, width, height]
+            for (tuples) |tv| {
+                if (tv != .arr) continue;
+                const t = tv.arr;
+                if (t.len < 4) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
+
+                const win_id = t[0].int;
+                const grid_id = t[1].int;
+                const width = @as(u32, @intCast(t[2].int));
+                const height = @as(u32, @intCast(t[3].int));
+                log.write("[win_resize] win={d} grid={d} width={d} height={d}\n", .{ win_id, grid_id, width, height });
+
+                // Re-register grid as external if it was removed (e.g. tab switch).
+                // When switching back to a tab, Neovim sends win_resize (not win_split)
+                // for windows that already exist in its model.
+                if (!grid.external_grids.contains(grid_id)) {
+                    _ = grid.setWinExternalPos(grid_id, win_id) catch |e| {
+                        log.write("[win_resize] setWinExternalPos grid={d} failed: {any}\n", .{ grid_id, e });
+                    };
+                }
+
+                // Queue a grid resize request for core to send after redraw
+                grid.pending_grid_resizes.append(grid.alloc, .{
+                    .grid_id = grid_id,
+                    .width = width,
+                    .height = height,
+                }) catch |e| {
+                    log.write("[win_resize] pending_grid_resizes.append failed: {any}\n", .{e});
+                };
+            }
+
         } else if (std.mem.eql(u8, name, "win_pos")) {
             // win_pos: [grid, win, startrow, startcol, width, height]
             for (tuples) |tv| {
@@ -452,17 +515,38 @@ pub fn handleRedraw(
                 const startrow = @as(u32, @intCast(t[2].int));
                 const startcol = @as(u32, @intCast(t[3].int));
                 log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
-                try grid.setWinPos(grid_id, win_id, startrow, startcol);
+
+                // If this grid is tracked as an ext_windows grid (created by win_split),
+                // re-register it as external instead of compositing. This happens when
+                // switching back to a tab - Neovim sends win_pos for all windows but
+                // may not send win_resize/win_split for all of them.
+                if (grid.ext_windows_grids.contains(grid_id)) {
+                    if (!grid.external_grids.contains(grid_id)) {
+                        _ = grid.setWinExternalPos(grid_id, win_id) catch |e| {
+                            log.write("[win_pos] re-register ext_windows grid={d} failed: {any}\n", .{ grid_id, e });
+                        };
+                        log.write("[win_pos] re-registered ext_windows grid={d} as external\n", .{grid_id});
+                    }
+                } else {
+                    try grid.setWinPos(grid_id, win_id, startrow, startcol);
+                }
             }
 
         } else if (std.mem.eql(u8, name, "win_hide") or std.mem.eql(u8, name, "win_close")) {
             // win_hide/win_close: [grid]
+            const is_close = std.mem.eql(u8, name, "win_close");
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
                 if (t.len < 1 or t[0] != .int) continue;
                 const grid_id = t[0].int;
                 grid.hideWin(grid_id);
+                // On permanent close, remove from ext_windows tracking.
+                // On hide (tab switch), keep tracking so win_pos can restore.
+                if (is_close) {
+                    _ = grid.ext_windows_grids.remove(grid_id);
+                    _ = grid.external_grid_target_sizes.remove(grid_id);
+                }
             }
 
         } else if (std.mem.eql(u8, name, "win_viewport")) {
