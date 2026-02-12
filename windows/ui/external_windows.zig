@@ -285,12 +285,16 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     // Create window using external window class
-    const title_buf: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("External Grid");
+    var title_utf8: [64]u8 = undefined;
+    const title_str = std.fmt.bufPrint(&title_utf8, "Window {d}", .{req.win}) catch "Window";
+    var title_wide: [65]u16 = undefined; // +1 for null terminator
+    const title_len = std.unicode.utf8ToUtf16Le(&title_wide, title_str) catch 0;
+    title_wide[title_len] = 0; // null terminate
 
     const hwnd = c.CreateWindowExW(
         dwExStyle,
-        @ptrCast(external_window_class_name.ptr),
-        @ptrCast(title_buf.ptr),
+        external_window_class_name.ptr,
+        @ptrCast(title_wide[0..title_len :0].ptr),
         dwStyle, // No WS_VISIBLE - show with SW_SHOWNA to avoid activation
         pos_x,
         pos_y,

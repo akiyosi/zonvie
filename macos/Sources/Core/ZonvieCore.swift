@@ -2465,7 +2465,7 @@ final class ZonvieCore {
                 window.backgroundColor = .clear  // Required for window transparency
                 window.hidesOnDeactivate = true  // Hide when app loses focus
             } else {
-                window.title = "External Grid \(gridId)"
+                window.title = "Window \(win)"
             }
             window.isReleasedWhenClosed = false
 
@@ -2797,7 +2797,7 @@ final class ZonvieCore {
         let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
                              gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
 
-        // Update background color on the containerView
+        // Update background color on the containerView and gridClearColor
         if isSpecialGrid {
             let adjustedBg = bgColor.adjustedForCmdlineBackground()
 
@@ -2809,6 +2809,17 @@ final class ZonvieCore {
                 containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(1.0).cgColor
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
                 adjustedBg.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
+            }
+        } else {
+            // Regular ext_windows grid: set clear color from vertex background.
+            // For regular grids, window.contentView = gridView (no separate containerView).
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+            if ZonvieConfig.shared.blurEnabled {
+                let opacity = Double(ZonvieConfig.shared.backgroundAlpha)
+                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: opacity)
+            } else {
                 gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
             }
         }
