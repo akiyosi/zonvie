@@ -396,6 +396,15 @@ pub fn handleRedraw(
                 const width = @as(u32, @intCast(t[1].int));
                 const height = @as(u32, @intCast(t[2].int));
                 try grid.resizeGrid(grid_id, height, width);
+
+                // Update external grid target size so NDC viewport matches the actual grid.
+                // Neovim controls grid dimensions (<C-w>+, :resize, etc.) and the
+                // frontend resizes the OS window to match.
+                if (grid.external_grid_target_sizes.getPtr(grid_id)) |target| {
+                    target.rows = height;
+                    target.cols = width;
+                }
+
                 if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });
             }
 
@@ -522,10 +531,18 @@ pub fn handleRedraw(
                 // may not send win_resize/win_split for all of them.
                 if (grid.ext_windows_grids.contains(grid_id)) {
                     if (!grid.external_grids.contains(grid_id)) {
+                        // Tab switch: store position in win_pos map first so
+                        // setWinExternalPos can extract it (it reads from win_pos).
+                        try grid.win_pos.put(grid.alloc, grid_id, .{ .row = startrow, .col = startcol });
                         _ = grid.setWinExternalPos(grid_id, win_id) catch |e| {
                             log.write("[win_pos] re-register ext_windows grid={d} failed: {any}\n", .{ grid_id, e });
                         };
-                        log.write("[win_pos] re-registered ext_windows grid={d} as external\n", .{grid_id});
+                        log.write("[win_pos] re-registered ext_windows grid={d} as external at ({d},{d})\n", .{ grid_id, startrow, startcol });
+                    } else {
+                        // Already external (e.g. win_pos after win_split in same
+                        // redraw batch): update position directly.
+                        grid.updateExternalGridPos(grid_id, startrow, startcol);
+                        log.write("[win_pos] updated ext_windows grid={d} position to ({d},{d})\n", .{ grid_id, startrow, startcol });
                     }
                 } else {
                     try grid.setWinPos(grid_id, win_id, startrow, startcol);

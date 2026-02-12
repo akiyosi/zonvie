@@ -540,14 +540,11 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
 
         // Process pending ext_windows grid resizes (from win_resize events).
-        // Only send resize for NEW grids (not yet known to frontend).
-        // For existing external windows, the frontend owns the actual window size
-        // and reports it back via tryResizeGrid on windowDidResize.
-        // Sending Neovim's proposed size for existing windows would override the
-        // actual window dimensions, causing size mismatch and stretched glyphs.
+        // win_resize is Neovim's request to the UI. The UI decides the actual
+        // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
         for (self.grid.pending_grid_resizes.items) |resize| {
             if (!self.known_external_grids.contains(resize.grid_id)) {
-                // Use a reasonable initial size for new external windows.
+                // NEW grid: Use a reasonable initial size for new external windows.
                 // Neovim's proposed size is based on terminal layout (e.g. height=2)
                 // which is too small for an OS window. Use half the main window.
                 const init_rows = @max(resize.height, self.grid.rows / 2);
@@ -562,30 +559,13 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                     .width = init_cols,
                     .height = init_rows,
                 }) catch {};
+            } else {
+                // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
+                // Honor the request by calling try_resize_grid with Neovim's values.
+                self.requestTryResizeGrid(resize.grid_id, resize.height, resize.width);
             }
         }
         self.grid.pending_grid_resizes.clearRetainingCapacity();
-
-        // ext_windows: if Neovim changed an external grid's dimensions
-        // (via grid_resize) to something different from our target, re-send
-        // tryResizeGrid to keep the grid at the window's actual size.
-        // This prevents NDC/drawable mismatch that causes scaled rendering.
-        {
-            var target_it = self.grid.external_grid_target_sizes.iterator();
-            while (target_it.next()) |entry| {
-                const gid = entry.key_ptr.*;
-                const target = entry.value_ptr.*;
-                if (!self.known_external_grids.contains(gid)) continue;
-                if (self.grid.sub_grids.get(gid)) |sg| {
-                    if (sg.rows != target.rows or sg.cols != target.cols) {
-                        self.log.write("[ext_windows] grid {d} resized to {d}x{d} but target is {d}x{d}, re-sending tryResizeGrid\n", .{
-                            gid, sg.cols, sg.rows, target.cols, target.rows,
-                        });
-                        self.requestTryResizeGrid(gid, target.rows, target.cols);
-                    }
-                }
-            }
-        }
 
         // Check for external window changes and notify frontend
         const new_ext_grids = self.notifyExternalWindowChanges();

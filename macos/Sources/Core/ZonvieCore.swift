@@ -1827,6 +1827,10 @@ final class ZonvieCore {
     /// Pending position for the next regular external window (set by tab externalization)
     /// When set, the next regular external window will be placed at this position, then this is cleared.
     private var pendingExternalWindowPosition: NSPoint? = nil
+    /// Saved positions for external windows (grid_id -> origin).
+    /// When a window is hidden (e.g. tab switch), its position is saved here.
+    /// On recreation, the saved position is used instead of Neovim's coordinates.
+    private var savedExternalWindowPositions: [Int64: NSPoint] = [:]
     /// Tracks external grid views (grid_id -> ExternalGridView)
     private var externalGridViews: [Int64: ExternalGridView] = [:]
     /// Tracks external window delegates (grid_id -> ExternalWindowDelegate)
@@ -1864,6 +1868,9 @@ final class ZonvieCore {
         var cellHeightPx: CGFloat
         /// When true, suppress tryResizeGrid in windowDidResize (programmatic resize from grid_resize).
         var suppressResizeCallback = false
+        /// Last grid rows/cols set by applyExternalGridConfig (for exact change detection).
+        var lastGridRows: UInt32 = 0
+        var lastGridCols: UInt32 = 0
 
         init(core: ZonvieCore, gridId: Int64, cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
             self.core = core
@@ -1890,6 +1897,13 @@ final class ZonvieCore {
 
             let cols = UInt32(widthPx / cellWidthPx)
             let rows = UInt32(heightPx / cellHeightPx)
+
+            ZonvieCore.appLog("[external_window] windowDidResize gridId=\(gridId) contentSize=\(contentSize) scale=\(scale) cellH=\(cellHeightPx) cellW=\(cellWidthPx) heightPx=\(heightPx) widthPx=\(widthPx) rows=\(rows) cols=\(cols) lastGridRows=\(lastGridRows) lastGridCols=\(lastGridCols) suppress=\(suppressResizeCallback)")
+
+            // Skip if rows/cols match the last programmatic resize (from grid_resize).
+            // windowDidResize can fire asynchronously after suppressResizeCallback
+            // is cleared, so this check prevents overriding Neovim's grid dimensions.
+            if rows == lastGridRows && cols == lastGridCols { return }
 
             // Only resize if we have valid dimensions
             if rows > 0 && cols > 0 {
@@ -2365,6 +2379,11 @@ final class ZonvieCore {
                 }
 
                 windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+            } else if let savedOrigin = self.savedExternalWindowPositions[gridId] {
+                // Restore saved position from previous tab switch
+                styleMask = [.titled, .closable, .resizable]
+                windowRect = NSRect(x: savedOrigin.x, y: savedOrigin.y, width: windowWidth, height: windowHeight)
+                ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(savedOrigin)")
             } else if let pendingPos = self.pendingExternalWindowPosition {
                 // Tab externalization: use the pending position (mouse drop point)
                 styleMask = [.titled, .closable, .resizable]
@@ -2810,9 +2829,45 @@ final class ZonvieCore {
             self.resizeMessageWindow(window: window, containerView: containerView, gridView: gridView, gridId: gridId,
                                      rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale)
         } else {
-            // Regular ext_windows grid: no window resize needed here.
-            // The Zig core handles grid size management by sending tryResizeGrid
-            // to keep Neovim's grid dimensions matching the window's actual size.
+            // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
+            // Resize the OS window to match the grid size.
+
+            let contentWidth = CGFloat(cols) * cellW / scale
+            let contentHeight = CGFloat(rows) * cellH / scale
+
+            // Compare using row/col counts stored on the delegate to avoid floating-point drift.
+            // The delegate tracks the last-set rows/cols, so this is an exact integer comparison.
+            let delegate = window.delegate as? ExternalWindowDelegate
+            let lastRows = delegate?.lastGridRows ?? 0
+            let lastCols = delegate?.lastGridCols ?? 0
+            if rows != lastRows || cols != lastCols {
+                // Track the rows/cols we're about to set BEFORE setFrame, because
+                // setFrame may trigger windowDidResize synchronously or via RunLoop.
+                // The lastGridRows/lastGridCols check in windowDidResize prevents
+                // the callback from calling tryResizeGrid with stale window dimensions.
+                delegate?.lastGridRows = rows
+                delegate?.lastGridCols = cols
+                delegate?.suppressResizeCallback = true
+
+                // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
+                let oldFrame = window.frame
+                let oldTop = oldFrame.origin.y + oldFrame.height
+
+                // Use setContentSize approach: compute new frame from desired content rect
+                let contentRect = NSRect(x: oldFrame.origin.x, y: 0,
+                                         width: contentWidth, height: contentHeight)
+                let frameRect = window.frameRect(forContentRect: contentRect)
+                let newFrame = NSRect(x: oldFrame.origin.x, y: oldTop - frameRect.height,
+                                      width: frameRect.width, height: frameRect.height)
+                window.setFrame(newFrame, display: true)
+
+                // Update gridView frame to fill the new content area
+                gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
+
+                delegate?.suppressResizeCallback = false
+
+                ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
+            }
 
             // Set clear color so viewport-edge pixels match the grid background.
             // For blur: use backgroundAlpha so edges match the semi-transparent content.
@@ -2937,6 +2992,9 @@ final class ZonvieCore {
             self.externalWindowDelegates.removeValue(forKey: gridId)
             self.externalGridViews.removeValue(forKey: gridId)
             if let window = self.externalWindows.removeValue(forKey: gridId) {
+                // Save window position for restoration on tab switch back
+                self.savedExternalWindowPositions[gridId] = window.frame.origin
+                ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
                 window.delegate = nil
                 window.close()
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")

@@ -1774,16 +1774,16 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
             if (rows == 0 or cols == 0) continue;
 
             // For ext_windows grids awaiting initial resize response from Neovim,
-            // defer window creation until the grid reaches the requested size.
+            // defer window creation until the grid has a reasonable size.
             // Neovim may send an intermediate small grid_resize (e.g. rows=1)
             // before the actual resize, and creating the window at that size
             // produces a tiny window.
-            if (self.grid.pending_ext_window_grids.get(grid_id)) |pending| {
-                if (rows < pending.height or cols < pending.width) {
-                    // Grid hasn't reached requested size yet - wait
+            if (self.grid.pending_ext_window_grids.contains(grid_id)) {
+                if (rows < 2 or cols < 2) {
+                    // Grid is still at intermediate tiny size - wait
                     continue;
                 }
-                // Grid is now large enough, remove from pending
+                // Grid has reasonable dimensions, proceed with window creation
                 _ = self.grid.pending_ext_window_grids.remove(grid_id);
             }
 
@@ -1953,10 +1953,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Check if we need full redraw or can use dirty_rows
         const need_full_redraw = force_render or force_redraw_this or cursor_affected or cursor_moved_within;
 
-        // NDC viewport: use target dimensions (= window's actual size) instead of
-        // grid data dimensions. Neovim may temporarily resize the grid via grid_resize
-        // (e.g. when main window resizes), but the external window hasn't changed.
-        // Using target dimensions ensures NDC always matches the Metal drawable.
+        // NDC viewport: use target dimensions which are kept in sync with grid_resize.
+        // This ensures NDC always matches the actual grid data dimensions.
         const target = self.grid.external_grid_target_sizes.get(grid_id);
         const viewport_cols = if (target) |t| t.cols else sg.cols;
         const viewport_rows = if (target) |t| t.rows else sg.rows;

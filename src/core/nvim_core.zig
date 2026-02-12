@@ -707,6 +707,7 @@ pub const Core = struct {
     }
 
     pub fn sendInput(self: *Core, keys: []const u8) void {
+        self.log.write("[input] sendInput: \"{s}\"\n", .{keys});
         // Escape '<' as '<lt>' for Neovim input notation
         var needs_escape = false;
         for (keys) |c| {
@@ -1080,6 +1081,7 @@ pub const Core = struct {
     // ---- Key event encoding (OS trap -> Zig common encode) ----
     fn emitInputString(self: *Core, s: []const u8) void {
         if (s.len == 0) return;
+        self.log.write("[input] nvim_input: \"{s}\"\n", .{s});
         self.requestInput(s) catch |e| self.log.write("emitInputString err: {any}\n", .{e});
     }
 
@@ -1559,16 +1561,16 @@ pub const Core = struct {
     }
 
     /// Request resize of a specific grid (for external windows).
+    /// Sets the initial target size for NDC viewport calculation.
+    /// The target is later updated by grid_resize events to match Neovim's actual size.
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
-        // Track the target size for external grids so we can re-send
-        // if Neovim overrides our size via grid_resize.
         self.grid.external_grid_target_sizes.put(self.alloc, grid_id, .{ .rows = rows, .cols = cols }) catch {};
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
         };
     }
 
-    fn requestTryResizeGridInternal(self: *Core, grid_id: i64, rows: u32, cols: u32) !void {
+    pub fn requestTryResizeGridInternal(self: *Core, grid_id: i64, rows: u32, cols: u32) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
@@ -1583,6 +1585,34 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_try_resize_grid (id={d}, grid={d}, rows={d}, cols={d})\n", .{ id, grid_id, rows, cols });
+    }
+
+    /// Sync Neovim's internal window height to match the grid height.
+    fn requestWinSetHeight(self: *Core, win_id: i64, height: u32) void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_win_set_height") catch return;
+        rpc.packArray(&buf, self.alloc, 2) catch return;
+        rpc.packInt(&buf, self.alloc, win_id) catch return;
+        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(height))) catch return;
+
+        self.sendRaw(buf.items) catch return;
+    }
+
+    /// Sync Neovim's internal window width to match the grid width.
+    fn requestWinSetWidth(self: *Core, win_id: i64, width: u32) void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_win_set_width") catch return;
+        rpc.packArray(&buf, self.alloc, 2) catch return;
+        rpc.packInt(&buf, self.alloc, win_id) catch return;
+        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(width))) catch return;
+
+        self.sendRaw(buf.items) catch return;
     }
 
     pub fn requestInput(self: *Core, keys: []const u8) !void {

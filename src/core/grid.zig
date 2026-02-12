@@ -641,7 +641,11 @@ pub const PendingGridResize = struct {
 };
 
 /// Target (desired) grid dimensions for external windows.
-pub const GridSize = struct { rows: u32, cols: u32 };
+/// Updated by grid_resize events so NDC viewport always matches the actual grid.
+pub const GridSize = struct {
+    rows: u32,
+    cols: u32,
+};
 
 pub const WinLayer = struct {
     zindex: i64 = 0,
@@ -746,9 +750,9 @@ pub const Grid = struct {
     // Only removed on win_close (permanent close).
     ext_windows_grids: std.AutoHashMapUnmanaged(i64, i64) = .{}, // grid_id -> win_id
 
-    // ext_windows: target (desired) grid dimensions for each external grid.
-    // Set when tryResizeGrid is sent. If Neovim's grid_resize doesn't match,
-    // tryResizeGrid is re-sent to keep the grid at the window's size.
+    // ext_windows: actual grid dimensions for each external grid.
+    // Updated on grid_resize so NDC viewport always matches the grid data.
+    // Also set initially by tryResizeGrid for new windows.
     external_grid_target_sizes: std.AutoHashMapUnmanaged(i64, GridSize) = .{},
 
     // ext_cmdline state
@@ -1394,6 +1398,15 @@ pub const Grid = struct {
         }
 
         return true;
+    }
+
+    /// Update position for a grid that is already external.
+    /// Called when win_pos arrives after the grid was registered by win_split.
+    pub fn updateExternalGridPos(self: *Grid, grid_id: i64, row: u32, col: u32) void {
+        if (self.external_grids.getPtr(grid_id)) |info| {
+            info.start_row = @intCast(row);
+            info.start_col = @intCast(col);
+        }
     }
 
     /// Check if a grid is external.

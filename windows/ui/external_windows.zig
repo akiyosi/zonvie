@@ -101,6 +101,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     var pos_x: c_int = c.CW_USEDEFAULT;
     var pos_y: c_int = c.CW_USEDEFAULT;
 
+    // Restore saved position from previous tab switch (only for regular external windows)
+    if (!is_special_window) {
+        if (app.saved_external_window_positions.get(req.grid_id)) |saved| {
+            pos_x = saved.x;
+            pos_y = saved.y;
+            if (applog.isEnabled()) applog.appLog("[win] restored saved position for grid_id={d}: ({d},{d})\n", .{ req.grid_id, pos_x, pos_y });
+        }
+    }
+
     // Tab externalization: use pending position if set (only for regular external windows, not special windows)
     // Also check timeout (500ms) to prevent stale position from affecting unrelated windows.
     const pending_timeout_ms: i64 = 500;
@@ -476,6 +485,20 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         }
     }
 
+    // Save window position before removing (for tab switch restoration)
+    if (app.external_windows.getPtr(grid_id)) |ew| {
+        if (ew.hwnd) |hwnd| {
+            var rect: c.RECT = undefined;
+            if (c.GetWindowRect(hwnd, &rect) != 0) {
+                app.saved_external_window_positions.put(app.alloc, grid_id, .{
+                    .x = rect.left,
+                    .y = rect.top,
+                }) catch {};
+                if (applog.isEnabled()) applog.appLog("[win] saved position for grid_id={d}: ({d},{d})\n", .{ grid_id, rect.left, rect.top });
+            }
+        }
+    }
+
     // Remove from external_windows HashMap and get the entry
     const entry = app.external_windows.fetchRemove(grid_id);
     app.mu.unlock();
@@ -578,6 +601,33 @@ pub fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const app_m
             // Post message to update position asynchronously (outside of callback context)
             if (app.hwnd) |main_hwnd| {
                 _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_UPDATE_EXT_FLOAT_POS, 0, 0);
+            }
+        }
+
+        // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
+        // Resize the OS window to match the grid size via deferred message.
+        const is_special = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID or
+            grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID);
+        if (!is_special and size_changed) {
+            ext_win.needs_window_resize = true;
+            ext_win.needs_renderer_resize = true;
+            ext_win.suppress_resize_callback = true;
+            const cell_w = app.cell_w_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
+            const content_w: c_int = @intCast(cols * cell_w);
+            const content_h: c_int = @intCast(rows * cell_h);
+
+            // Calculate window size from content size
+            var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+            _ = c.AdjustWindowRectEx(&rect, c.WS_OVERLAPPEDWINDOW, 0, 0);
+            ext_win.pending_window_w = rect.right - rect.left;
+            ext_win.pending_window_h = rect.bottom - rect.top;
+
+            if (applog.isEnabled()) applog.appLog("[win] ext_windows grid_id={d} size changed -> pending resize {d}x{d}\n", .{ grid_id, content_w, content_h });
+
+            // Post message to resize on UI thread (outside lock)
+            if (app.hwnd) |main_hwnd| {
+                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
             }
         }
 
@@ -856,12 +906,14 @@ pub export fn ExternalWndProc(
 
                 app.mu.lock();
 
-                // Find grid_id for this hwnd
+                // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
+                var suppress = false;
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.hwnd == hwnd) {
                         grid_id = entry.key_ptr.*;
+                        suppress = entry.value_ptr.suppress_resize_callback;
                         break;
                     }
                 }
@@ -871,6 +923,10 @@ pub export fn ExternalWndProc(
                 const corep = app.corep;
 
                 app.mu.unlock();
+
+                // Skip tryResizeGrid when window is being resized programmatically
+                // (from Neovim grid_resize). Only report back on user-initiated resizes.
+                if (suppress) return 0;
 
                 if (grid_id) |gid| {
                     if (cell_w > 0 and cell_h > 0) {

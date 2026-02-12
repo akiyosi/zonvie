@@ -487,6 +487,9 @@ pub const ExternalWindow = struct {
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
 
+    // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
+    suppress_resize_callback: bool = false,
+
     // Close state - set when window is scheduled for closing (don't paint or access renderer)
     is_pending_close: bool = false,
 
@@ -581,6 +584,9 @@ pub const App = struct {
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
     pending_external_window_position_time: i64 = 0, // Timestamp when position was set (for timeout)
+
+    // Saved positions for external windows (restored on tab switch back)
+    saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int }) = .{},
 
     // Pending vertices for external windows that haven't been created yet
     pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .{},
@@ -1015,6 +1021,7 @@ pub const App = struct {
             pv.deinit(self.alloc);
         }
         self.pending_external_verts.deinit(self.alloc);
+        self.saved_external_window_positions.deinit(self.alloc);
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;
