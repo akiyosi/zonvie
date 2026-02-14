@@ -281,6 +281,8 @@ pub fn handleRpcRequest(self: *Core, arena: std.mem.Allocator, top: []mp.Value) 
         handleClipboardGet(self, msgid, top[3]);
     } else if (std.mem.eql(u8, method, "zonvie.set_clipboard")) {
         handleClipboardSet(self, msgid, top[3]);
+    } else if (std.mem.eql(u8, method, "win_move_cursor")) {
+        handleWinMoveCursor(self, msgid, top[3]);
     } else {
         // Unknown method - send error response
         sendRpcErrorResponse(self, msgid, "Unknown method") catch |e| {
@@ -395,6 +397,44 @@ pub fn sendRpcBoolResponse(self: *Core, msgid: i64, value: bool) !void {
 
     try self.sendRaw(buf.items);
     self.log.write("rpc bool response sent: msgid={d} value={}\n", .{ msgid, value });
+}
+
+pub fn handleWinMoveCursor(self: *Core, msgid: i64, params: mp.Value) void {
+    // params: [direction, count]
+    // direction: 0=down, 1=up, 2=right, 3=left
+    // Returns: Integer (Neovim window handle of target window)
+    var direction: i32 = 0;
+    var count: i32 = 1;
+
+    if (params == .arr and params.arr.len >= 2) {
+        if (params.arr[0] == .int) direction = @intCast(params.arr[0].int);
+        if (params.arr[1] == .int) count = @intCast(params.arr[1].int);
+    }
+
+    self.log.write("[win_move_cursor] direction={d} count={d}\n", .{ direction, count });
+
+    var target_win: i64 = 0;
+    if (self.cb.on_win_move_cursor) |cb| {
+        target_win = cb(self.ctx, direction, count);
+    }
+
+    sendRpcIntResponse(self, msgid, target_win) catch |e| {
+        self.log.write("sendRpcIntResponse failed: {any}\n", .{e});
+    };
+}
+
+pub fn sendRpcIntResponse(self: *Core, msgid: i64, value: i64) !void {
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(self.alloc);
+
+    try rpc.packArray(&buf, self.alloc, 4);
+    try rpc.packInt(&buf, self.alloc, 1); // type=1 (response)
+    try rpc.packInt(&buf, self.alloc, msgid);
+    try rpc.packNil(&buf, self.alloc); // no error
+    try rpc.packInt(&buf, self.alloc, value); // result
+
+    try self.sendRaw(buf.items);
+    self.log.write("rpc int response sent: msgid={d} value={d}\n", .{ msgid, value });
 }
 
 pub fn sendClipboardGetResponse(self: *Core, msgid: i64, content: []const u8) !void {
@@ -566,6 +606,28 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
         self.grid.pending_grid_resizes.clearRetainingCapacity();
+
+        // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
+        // These are deferred to the end of the redraw batch (not immediate) because they
+        // depend on grid state that may be updated earlier in the same batch.
+        // The frontend callbacks run synchronously here on the core thread.
+        for (self.grid.pending_win_ops.items) |op| {
+            switch (op.op) {
+                .move => {
+                    if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
+                },
+                .exchange => {
+                    if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
+                },
+                .rotate => {
+                    if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
+                },
+                .resize_equal => {
+                    if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
+                },
+            }
+        }
+        self.grid.pending_win_ops.clearRetainingCapacity();
 
         // Check for external window changes and notify frontend
         const new_ext_grids = self.notifyExternalWindowChanges();

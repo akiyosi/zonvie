@@ -2077,6 +2077,11 @@ pub export fn WndProc(
                     .on_rasterize_glyph = callbacks.onRasterizeGlyph,
                     .on_atlas_upload = callbacks.onAtlasUpload,
                     .on_atlas_create = callbacks.onAtlasCreate,
+                    .on_win_move = external_windows.onWinMove,
+                    .on_win_exchange = external_windows.onWinExchange,
+                    .on_win_rotate = external_windows.onWinRotate,
+                    .on_win_resize_equal = external_windows.onWinResizeEqual,
+                    .on_win_move_cursor = external_windows.onWinMoveCursor,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 

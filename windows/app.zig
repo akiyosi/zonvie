@@ -38,6 +38,7 @@ pub const zonvie_core_get_viewport = core.zonvie_core_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
 pub const zonvie_core_try_get_visible_grids = core.zonvie_core_try_get_visible_grids;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
+pub const zonvie_core_get_win_id = core.zonvie_core_get_win_id;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
 pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
 pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
@@ -470,6 +471,7 @@ pub const RowVerts = struct {
 /// External window state for win_external_pos grids
 pub const ExternalWindow = struct {
     hwnd: c.HWND,
+    win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
     verts: std.ArrayListUnmanaged(Vertex) = .{},
     vb: ?*c.ID3D11Buffer = null,

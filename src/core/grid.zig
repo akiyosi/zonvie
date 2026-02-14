@@ -640,6 +640,18 @@ pub const PendingGridResize = struct {
     height: u32,
 };
 
+/// ext_windows layout operation type.
+pub const WinOpType = enum { move, exchange, rotate, resize_equal };
+
+/// Pending ext_windows layout operation (win_move, win_exchange, win_rotate, win_resize_equal).
+pub const PendingWinOp = struct {
+    op: WinOpType,
+    win: i64 = 0,
+    grid_id: i64 = 0,
+    flags_or_direction: i32 = 0, // win_move: flags, win_rotate: direction
+    count: i32 = 0, // win_exchange: count, win_rotate: count
+};
+
 /// Target (desired) grid dimensions for external windows.
 /// Updated by grid_resize events so NDC viewport always matches the actual grid.
 pub const GridSize = struct {
@@ -741,6 +753,9 @@ pub const Grid = struct {
     // ext_windows: pending grid resize requests (processed by core after redraw)
     pending_grid_resizes: std.ArrayListUnmanaged(PendingGridResize) = .{},
 
+    // ext_windows: pending layout operations (win_move, win_exchange, etc.)
+    pending_win_ops: std.ArrayListUnmanaged(PendingWinOp) = .{},
+
     // ext_windows: grids awaiting initial resize response from Neovim.
     // Window creation is deferred until grid_resize provides adequate dimensions.
     pending_ext_window_grids: std.AutoHashMapUnmanaged(i64, PendingGridResize) = .{},
@@ -798,6 +813,7 @@ pub const Grid = struct {
         self.win_layer.deinit(self.alloc);
         self.external_grids.deinit(self.alloc);
         self.pending_grid_resizes.deinit(self.alloc);
+        self.pending_win_ops.deinit(self.alloc);
         self.pending_ext_window_grids.deinit(self.alloc);
         self.ext_windows_grids.deinit(self.alloc);
         self.external_grid_target_sizes.deinit(self.alloc);

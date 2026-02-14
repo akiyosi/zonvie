@@ -460,6 +460,13 @@ pub const Callbacks = extern struct {
     // Flush bracketing (for GPU buffer management)
     on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    // ext_windows layout operation callbacks
+    on_win_move: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void = null,
+    on_win_exchange: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void = null,
+    on_win_rotate: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void = null,
+    on_win_resize_equal: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+    on_win_move_cursor: ?*const fn (ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -579,6 +586,13 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Flush bracketing (for GPU buffer management)
         .on_flush_begin = box.cb.on_flush_begin,
         .on_flush_end = box.cb.on_flush_end,
+
+        // ext_windows layout operation callbacks
+        .on_win_move = box.cb.on_win_move,
+        .on_win_exchange = box.cb.on_win_exchange,
+        .on_win_rotate = box.cb.on_win_rotate,
+        .on_win_resize_equal = box.cb.on_win_resize_equal,
+        .on_win_move_cursor = box.cb.on_win_move_cursor,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);
@@ -856,6 +870,17 @@ pub export fn zonvie_core_get_cursor_position(
     if (out_row) |r| r.* = cursor.row;
     if (out_col) |c| c.* = cursor.col;
     return cursor.grid_id;
+}
+
+/// Get Neovim window handle (winid) for a grid.
+/// Pass grid_id=-1 to get the winid for the cursor's current grid.
+/// Returns 0 if the mapping is not available.
+pub export fn zonvie_core_get_win_id(p: ?*zonvie_core, grid_id: i64) callconv(.c) i64 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    box.core.grid_mu.lock();
+    defer box.core.grid_mu.unlock();
+    return box.core.grid.getWinId(grid_id) orelse 0;
 }
 
 /// Get current mode name (e.g., "normal", "insert", "terminal").

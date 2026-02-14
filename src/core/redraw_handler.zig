@@ -511,6 +511,89 @@ pub fn handleRedraw(
                 };
             }
 
+        } else if (std.mem.eql(u8, name, "win_move")) {
+            // win_move (ext_windows): [win, grid, flags]
+            // flags: 0=below, 1=above, 2=right, 3=left
+            for (tuples) |tv| {
+                if (tv != .arr) continue;
+                const t = tv.arr;
+                if (t.len < 3) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+
+                const win_id = t[0].int;
+                const grid_id = t[1].int;
+                const flags = @as(i32, @intCast(t[2].int));
+                log.write("[win_move] win={d} grid={d} flags={d}\n", .{ win_id, grid_id, flags });
+
+                grid.pending_win_ops.append(grid.alloc, .{
+                    .op = .move,
+                    .win = win_id,
+                    .grid_id = grid_id,
+                    .flags_or_direction = flags,
+                }) catch |e| {
+                    log.write("[win_move] pending_win_ops.append failed: {any}\n", .{e});
+                };
+            }
+
+        } else if (std.mem.eql(u8, name, "win_exchange")) {
+            // win_exchange (ext_windows): [win, grid, count]
+            for (tuples) |tv| {
+                if (tv != .arr) continue;
+                const t = tv.arr;
+                if (t.len < 3) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+
+                const win_id = t[0].int;
+                const grid_id = t[1].int;
+                const count = @as(i32, @intCast(t[2].int));
+                log.write("[win_exchange] win={d} grid={d} count={d}\n", .{ win_id, grid_id, count });
+
+                grid.pending_win_ops.append(grid.alloc, .{
+                    .op = .exchange,
+                    .win = win_id,
+                    .grid_id = grid_id,
+                    .count = count,
+                }) catch |e| {
+                    log.write("[win_exchange] pending_win_ops.append failed: {any}\n", .{e});
+                };
+            }
+
+        } else if (std.mem.eql(u8, name, "win_rotate")) {
+            // win_rotate (ext_windows): [win, grid, direction, count]
+            // direction: 0=downward, 1=upward
+            for (tuples) |tv| {
+                if (tv != .arr) continue;
+                const t = tv.arr;
+                if (t.len < 4) continue;
+                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
+
+                const win_id = t[0].int;
+                const grid_id = t[1].int;
+                const direction = @as(i32, @intCast(t[2].int));
+                const count = @as(i32, @intCast(t[3].int));
+                log.write("[win_rotate] win={d} grid={d} direction={d} count={d}\n", .{ win_id, grid_id, direction, count });
+
+                grid.pending_win_ops.append(grid.alloc, .{
+                    .op = .rotate,
+                    .win = win_id,
+                    .grid_id = grid_id,
+                    .flags_or_direction = direction,
+                    .count = count,
+                }) catch |e| {
+                    log.write("[win_rotate] pending_win_ops.append failed: {any}\n", .{e});
+                };
+            }
+
+        } else if (std.mem.eql(u8, name, "win_resize_equal")) {
+            // win_resize_equal (ext_windows): no parameters
+            log.write("[win_resize_equal]\n", .{});
+
+            grid.pending_win_ops.append(grid.alloc, .{
+                .op = .resize_equal,
+            }) catch |e| {
+                log.write("[win_resize_equal] pending_win_ops.append failed: {any}\n", .{e});
+            };
+
         } else if (std.mem.eql(u8, name, "win_pos")) {
             // win_pos: [grid, win, startrow, startcol, width, height]
             for (tuples) |tv| {

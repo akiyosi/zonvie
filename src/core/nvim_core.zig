@@ -240,6 +240,13 @@ pub const Callbacks = struct {
     // Flush bracketing (for GPU buffer management)
     on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    // ext_windows layout operation callbacks
+    on_win_move: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void = null,
+    on_win_exchange: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void = null,
+    on_win_rotate: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void = null,
+    on_win_resize_equal: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+    on_win_move_cursor: ?*const fn (ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
