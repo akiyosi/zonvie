@@ -243,6 +243,7 @@ pub fn main() u8 {
     var ext_popup_enabled = config.popup.external;
     var ext_messages_enabled = config.messages.external;
     var ext_tabline_enabled = config.tabline.external;
+    var ext_windows_enabled = config.windows.external;
     var cli_log_path: ?[]const u8 = null;
     var wsl_mode: bool = config.neovim.wsl;
     var wsl_distro: ?[]const u8 = config.neovim.wsl_distro;
@@ -276,6 +277,7 @@ pub fn main() u8 {
                     \\    --extpopup                    Enable external popup menu UI
                     \\    --extmessages                 Enable external messages UI
                     \\    --exttabline                  Enable external tabline UI (Chrome-style tabs)
+                    \\    --extwindows                  Enable external windows UI
                     \\    --wsl                         Run Neovim inside WSL (default distro)
                     \\    --wsl=<distro>                Run Neovim inside specified WSL distro
                     \\    --ssh=<user@host[:port]>      Connect to remote host via SSH
@@ -367,6 +369,9 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, arg, "--exttabline")) {
             ext_tabline_enabled = true;
             applog.appLog("[win] --exttabline flag detected (override config)\n", .{});
+        } else if (std.mem.eql(u8, arg, "--extwindows")) {
+            ext_windows_enabled = true;
+            applog.appLog("[win] --extwindows flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--log")) {
             if (i + 1 < args.len) {
                 cli_log_path = args[i + 1];
@@ -473,6 +478,7 @@ pub fn main() u8 {
         .ext_cmdline_enabled = ext_cmdline_enabled,
         .ext_messages_enabled = ext_messages_enabled,
         .ext_tabline_enabled = ext_tabline_enabled,
+        .ext_windows_enabled = ext_windows_enabled,
         .wsl_mode = wsl_mode,
         .wsl_distro = wsl_distro,
         .ssh_mode = ssh_mode,

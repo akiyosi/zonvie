@@ -240,6 +240,13 @@ pub const Callbacks = struct {
     // Flush bracketing (for GPU buffer management)
     on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    // ext_windows layout operation callbacks
+    on_win_move: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void = null,
+    on_win_exchange: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void = null,
+    on_win_rotate: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void = null,
+    on_win_resize_equal: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+    on_win_move_cursor: ?*const fn (ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -344,6 +351,9 @@ pub const Core = struct {
 
     // ext_tabline UI extension flag (set before start)
     ext_tabline_enabled: bool = false,
+
+    // ext_windows UI extension flag (set before start)
+    ext_windows_enabled: bool = false,
 
     // Throttle for msg_show (noice.nvim-style): delay display to accumulate messages
     // noice.nvim uses 1000/30 = ~33ms throttle by default
@@ -704,6 +714,7 @@ pub const Core = struct {
     }
 
     pub fn sendInput(self: *Core, keys: []const u8) void {
+        self.log.write("[input] sendInput: \"{s}\"\n", .{keys});
         // Escape '<' as '<lt>' for Neovim input notation
         var needs_escape = false;
         for (keys) |c| {
@@ -1077,6 +1088,7 @@ pub const Core = struct {
     // ---- Key event encoding (OS trap -> Zig common encode) ----
     fn emitInputString(self: *Core, s: []const u8) void {
         if (s.len == 0) return;
+        self.log.write("[input] nvim_input: \"{s}\"\n", .{s});
         self.requestInput(s) catch |e| self.log.write("emitInputString err: {any}\n", .{e});
     }
 
@@ -1494,8 +1506,9 @@ pub const Core = struct {
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, ext_hlstate, rgb + (optional ext_cmdline) + (optional ext_popupmenu) + (optional ext_messages) + (optional ext_tabline)
+        // Option count: ext_multigrid, ext_hlstate, rgb (always) + optional ext_*
         var opt_count: u32 = 3;
+        if (self.ext_windows_enabled) opt_count += 1;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
         if (self.ext_messages_enabled) opt_count += 1;
@@ -1507,6 +1520,11 @@ pub const Core = struct {
         try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "rgb");
         try rpc.packBool(&buf, self.alloc, true);
+
+        if (self.ext_windows_enabled) {
+            try rpc.packStr(&buf, self.alloc, "ext_windows");
+            try rpc.packBool(&buf, self.alloc, true);
+        }
 
         if (self.ext_cmdline_enabled) {
             try rpc.packStr(&buf, self.alloc, "ext_cmdline");
@@ -1530,7 +1548,7 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled });
+        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {
@@ -1550,13 +1568,16 @@ pub const Core = struct {
     }
 
     /// Request resize of a specific grid (for external windows).
+    /// Sets the initial target size for NDC viewport calculation.
+    /// The target is later updated by grid_resize events to match Neovim's actual size.
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
+        self.grid.external_grid_target_sizes.put(self.alloc, grid_id, .{ .rows = rows, .cols = cols }) catch {};
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
         };
     }
 
-    fn requestTryResizeGridInternal(self: *Core, grid_id: i64, rows: u32, cols: u32) !void {
+    pub fn requestTryResizeGridInternal(self: *Core, grid_id: i64, rows: u32, cols: u32) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
@@ -1571,6 +1592,34 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_try_resize_grid (id={d}, grid={d}, rows={d}, cols={d})\n", .{ id, grid_id, rows, cols });
+    }
+
+    /// Sync Neovim's internal window height to match the grid height.
+    fn requestWinSetHeight(self: *Core, win_id: i64, height: u32) void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_win_set_height") catch return;
+        rpc.packArray(&buf, self.alloc, 2) catch return;
+        rpc.packInt(&buf, self.alloc, win_id) catch return;
+        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(height))) catch return;
+
+        self.sendRaw(buf.items) catch return;
+    }
+
+    /// Sync Neovim's internal window width to match the grid width.
+    fn requestWinSetWidth(self: *Core, win_id: i64, width: u32) void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_win_set_width") catch return;
+        rpc.packArray(&buf, self.alloc, 2) catch return;
+        rpc.packInt(&buf, self.alloc, win_id) catch return;
+        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(width))) catch return;
+
+        self.sendRaw(buf.items) catch return;
     }
 
     pub fn requestInput(self: *Core, keys: []const u8) !void {

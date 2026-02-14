@@ -509,8 +509,9 @@ pub fn hideMessageWindow(app: *App) void {
     app.display_messages.clearRetainingCapacity();
 }
 
-/// Resize external window (cmdline or popupmenu) asynchronously
-/// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler
+/// Resize external window asynchronously.
+/// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler.
+/// Handles cmdline (keep center), popupmenu (keep top-left), and regular ext_windows (keep top-left).
 pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
     app.mu.lock();
@@ -540,7 +541,7 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         return;
     }
 
-    // Calculate position: cmdline keeps center, popupmenu keeps top-left
+    // Calculate position: cmdline keeps center, others keep top-left
     var pos_x: c_int = undefined;
     var pos_y: c_int = undefined;
     if (is_cmdline) {
@@ -555,7 +556,8 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
 
     if (applog.isEnabled()) applog.appLog("[win] resizeExternalWindowDeferred: grid_id={d} window=({d},{d}) at ({d},{d})\n", .{ grid_id, window_w, window_h, pos_x, pos_y });
 
-    // Resize window (outside lock, safe from deadlock)
+    // Resize window (outside lock, safe from deadlock).
+    // SetWindowPos sends WM_SIZE synchronously - suppress_resize_callback prevents feedback loop.
     _ = c.SetWindowPos(
         ext_hwnd,
         null,
@@ -565,6 +567,14 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         window_h,
         c.SWP_NOACTIVATE | c.SWP_NOZORDER,
     );
+
+    // Clear suppress_resize_callback after SetWindowPos completes.
+    // (SetWindowPos sends WM_SIZE synchronously, so by this point it's already handled.)
+    app.mu.lock();
+    if (app.external_windows.getPtr(grid_id)) |ew| {
+        ew.suppress_resize_callback = false;
+    }
+    app.mu.unlock();
 }
 
 /// Update ext-float (msg_show/msg_history) window positions

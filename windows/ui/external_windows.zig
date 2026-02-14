@@ -101,6 +101,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     var pos_x: c_int = c.CW_USEDEFAULT;
     var pos_y: c_int = c.CW_USEDEFAULT;
 
+    // Restore saved position from previous tab switch (only for regular external windows)
+    if (!is_special_window) {
+        if (app.saved_external_window_positions.get(req.grid_id)) |saved| {
+            pos_x = saved.x;
+            pos_y = saved.y;
+            if (applog.isEnabled()) applog.appLog("[win] restored saved position for grid_id={d}: ({d},{d})\n", .{ req.grid_id, pos_x, pos_y });
+        }
+    }
+
     // Tab externalization: use pending position if set (only for regular external windows, not special windows)
     // Also check timeout (500ms) to prevent stale position from affecting unrelated windows.
     const pending_timeout_ms: i64 = 500;
@@ -276,12 +285,16 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     // Create window using external window class
-    const title_buf: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("External Grid");
+    var title_utf8: [64]u8 = undefined;
+    const title_str = std.fmt.bufPrint(&title_utf8, "Window {d}", .{req.win}) catch "Window";
+    var title_wide: [65]u16 = undefined; // +1 for null terminator
+    const title_len = std.unicode.utf8ToUtf16Le(&title_wide, title_str) catch 0;
+    title_wide[title_len] = 0; // null terminate
 
     const hwnd = c.CreateWindowExW(
         dwExStyle,
-        @ptrCast(external_window_class_name.ptr),
-        @ptrCast(title_buf.ptr),
+        external_window_class_name.ptr,
+        @ptrCast(title_wide[0..title_len :0].ptr),
         dwStyle, // No WS_VISIBLE - show with SW_SHOWNA to avoid activation
         pos_x,
         pos_y,
@@ -325,6 +338,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Store external window
     const ext_window = app_mod.ExternalWindow{
         .hwnd = hwnd.?,
+        .win_id = req.win,
         .renderer = renderer,
         .rows = req.rows,
         .cols = req.cols,
@@ -476,6 +490,20 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         }
     }
 
+    // Save window position before removing (for tab switch restoration)
+    if (app.external_windows.getPtr(grid_id)) |ew| {
+        if (ew.hwnd) |hwnd| {
+            var rect: c.RECT = undefined;
+            if (c.GetWindowRect(hwnd, &rect) != 0) {
+                app.saved_external_window_positions.put(app.alloc, grid_id, .{
+                    .x = rect.left,
+                    .y = rect.top,
+                }) catch {};
+                if (applog.isEnabled()) applog.appLog("[win] saved position for grid_id={d}: ({d},{d})\n", .{ grid_id, rect.left, rect.top });
+            }
+        }
+    }
+
     // Remove from external_windows HashMap and get the entry
     const entry = app.external_windows.fetchRemove(grid_id);
     app.mu.unlock();
@@ -578,6 +606,33 @@ pub fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const app_m
             // Post message to update position asynchronously (outside of callback context)
             if (app.hwnd) |main_hwnd| {
                 _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_UPDATE_EXT_FLOAT_POS, 0, 0);
+            }
+        }
+
+        // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
+        // Resize the OS window to match the grid size via deferred message.
+        const is_special = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID or
+            grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID);
+        if (!is_special and size_changed) {
+            ext_win.needs_window_resize = true;
+            ext_win.needs_renderer_resize = true;
+            ext_win.suppress_resize_callback = true;
+            const cell_w = app.cell_w_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
+            const content_w: c_int = @intCast(cols * cell_w);
+            const content_h: c_int = @intCast(rows * cell_h);
+
+            // Calculate window size from content size
+            var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+            _ = c.AdjustWindowRectEx(&rect, c.WS_OVERLAPPEDWINDOW, 0, 0);
+            ext_win.pending_window_w = rect.right - rect.left;
+            ext_win.pending_window_h = rect.bottom - rect.top;
+
+            if (applog.isEnabled()) applog.appLog("[win] ext_windows grid_id={d} size changed -> pending resize {d}x{d}\n", .{ grid_id, content_w, content_h });
+
+            // Post message to resize on UI thread (outside lock)
+            if (app.hwnd) |main_hwnd| {
+                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
             }
         }
 
@@ -856,12 +911,14 @@ pub export fn ExternalWndProc(
 
                 app.mu.lock();
 
-                // Find grid_id for this hwnd
+                // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
+                var suppress = false;
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.hwnd == hwnd) {
                         grid_id = entry.key_ptr.*;
+                        suppress = entry.value_ptr.suppress_resize_callback;
                         break;
                     }
                 }
@@ -871,6 +928,10 @@ pub export fn ExternalWndProc(
                 const corep = app.corep;
 
                 app.mu.unlock();
+
+                // Skip tryResizeGrid when window is being resized programmatically
+                // (from Neovim grid_resize). Only report back on user-initiated resizes.
+                if (suppress) return 0;
 
                 if (grid_id) |gid| {
                     if (cell_w > 0 and cell_h > 0) {
@@ -2005,4 +2066,319 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     } else {
         applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
     }
+}
+
+// --- ext_windows layout operation callbacks ---
+
+const WindowInfo = struct {
+    grid_id: i64,
+    win_id: i64,
+    rect: c.RECT,
+    hwnd: c.HWND,
+};
+
+const MAX_WIN_INFOS = 32;
+
+/// Collect layout info for all visible windows. Caller must hold app.mu.
+/// `include_main`: all ext_windows operations pass true. Parameter retained for future use.
+/// Main window is registered as grid 2 (Neovim's default editor grid).
+/// Called from the core thread; GetWindowRect/SetWindowPos are thread-safe Win32 APIs,
+/// and app.mu serializes access against concurrent window operations.
+fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_INFOS]WindowInfo, count: usize } {
+    var result: [MAX_WIN_INFOS]WindowInfo = undefined;
+    var count: usize = 0;
+
+    // Main window (grid 2)
+    if (include_main) {
+        if (app.hwnd) |main_hwnd| {
+            var rect: c.RECT = std.mem.zeroes(c.RECT);
+            _ = c.GetWindowRect(main_hwnd, &rect);
+            const main_win_id = if (app.corep) |cp| app_mod.zonvie_core_get_win_id(cp, 2) else 0;
+            result[count] = .{ .grid_id = 2, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
+            count += 1;
+        }
+    }
+
+    // External windows (skip special, pending-close, and hidden windows)
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        if (count >= MAX_WIN_INFOS) {
+            if (applog.isEnabled()) applog.appLog("[win] collectWindowInfos: MAX_WIN_INFOS ({d}) reached, some windows omitted\n", .{MAX_WIN_INFOS});
+            break;
+        }
+        const grid_id = entry.key_ptr.*;
+        if (grid_id < 0) continue; // Skip special windows (cmdline, popupmenu, etc.)
+        const ext = entry.value_ptr;
+        if (ext.is_pending_close) continue;
+        if (c.IsWindowVisible(ext.hwnd) == 0) continue; // Skip hidden windows
+        var rect: c.RECT = std.mem.zeroes(c.RECT);
+        _ = c.GetWindowRect(ext.hwnd, &rect);
+        result[count] = .{ .grid_id = grid_id, .win_id = ext.win_id, .rect = rect, .hwnd = ext.hwnd };
+        count += 1;
+    }
+
+    return .{ .infos = result, .count = count };
+}
+
+/// Find nearest window in direction. Returns matching WindowInfo or null.
+/// direction: 0=down, 1=up, 2=right, 3=left
+/// Falls back to the nearest window overall when no candidate is found in the strict direction
+/// (e.g. when window centers align on the checked axis).
+fn findInDirection(infos: []const WindowInfo, ref_grid: i64, direction: i32, count: i32) ?WindowInfo {
+    // Find reference
+    var ref_cx: i32 = 0;
+    var ref_cy: i32 = 0;
+    var found_ref = false;
+    for (infos) |info| {
+        if (info.grid_id == ref_grid) {
+            ref_cx = @divTrunc(info.rect.left + info.rect.right, 2);
+            ref_cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
+            found_ref = true;
+            break;
+        }
+    }
+    if (!found_ref) return null;
+
+    // Collect directional candidates
+    var candidates: [MAX_WIN_INFOS]WindowInfo = undefined;
+    var distances: [MAX_WIN_INFOS]i32 = undefined;
+    var cand_count: usize = 0;
+
+    for (infos) |info| {
+        if (info.grid_id == ref_grid) continue;
+        const cx = @divTrunc(info.rect.left + info.rect.right, 2);
+        const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
+
+        const match = switch (direction) {
+            0 => cy > ref_cy, // down (Win32: higher Y = lower on screen)
+            1 => cy < ref_cy, // up
+            2 => cx > ref_cx, // right
+            3 => cx < ref_cx, // left
+            else => false,
+        };
+        if (match) {
+            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
+            candidates[cand_count] = info;
+            distances[cand_count] = dist;
+            cand_count += 1;
+        }
+    }
+
+    // Fallback: if no directional candidates, collect all other windows
+    if (cand_count == 0) {
+        for (infos) |info| {
+            if (info.grid_id == ref_grid) continue;
+            const cx = @divTrunc(info.rect.left + info.rect.right, 2);
+            const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
+            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
+            candidates[cand_count] = info;
+            distances[cand_count] = dist;
+            cand_count += 1;
+        }
+    }
+
+    if (cand_count == 0) return null;
+
+    // Sort by distance (simple selection sort)
+    for (0..cand_count) |i| {
+        var min_idx = i;
+        for (i + 1..cand_count) |j| {
+            if (distances[j] < distances[min_idx]) min_idx = j;
+        }
+        if (min_idx != i) {
+            std.mem.swap(WindowInfo, &candidates[i], &candidates[min_idx]);
+            std.mem.swap(i32, &distances[i], &distances[min_idx]);
+        }
+    }
+
+    const idx: usize = if (count > 0) @intCast(count - 1) else 0;
+    return if (idx < cand_count) candidates[idx] else candidates[0];
+}
+
+fn absI32(v: i32) i32 {
+    return if (v < 0) -v else v;
+}
+
+/// Swap positions of two windows by HWND, keeping each window's own size.
+fn swapWindowPositions(hwnd_a: c.HWND, rect_a: c.RECT, hwnd_b: c.HWND, rect_b: c.RECT) void {
+    const w_a = rect_a.right - rect_a.left;
+    const h_a = rect_a.bottom - rect_a.top;
+    const w_b = rect_b.right - rect_b.left;
+    const h_b = rect_b.bottom - rect_b.top;
+    // A moves to B's position but keeps A's size
+    _ = c.SetWindowPos(hwnd_a, null, rect_b.left, rect_b.top, w_a, h_a, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    // B moves to A's position but keeps B's size
+    _ = c.SetWindowPos(hwnd_b, null, rect_a.left, rect_a.top, w_b, h_b, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+}
+
+/// Sort window infos spatially: top-to-bottom, left-to-right.
+fn sortSpatially(infos: []WindowInfo) void {
+    for (0..infos.len) |i| {
+        var min_idx = i;
+        for (i + 1..infos.len) |j| {
+            const a_cy = @divTrunc(infos[min_idx].rect.top + infos[min_idx].rect.bottom, 2);
+            const b_cy = @divTrunc(infos[j].rect.top + infos[j].rect.bottom, 2);
+            const a_cx = @divTrunc(infos[min_idx].rect.left + infos[min_idx].rect.right, 2);
+            const b_cx = @divTrunc(infos[j].rect.left + infos[j].rect.right, 2);
+            if (b_cy < a_cy or (b_cy == a_cy and b_cx < a_cx)) {
+                min_idx = j;
+            }
+        }
+        if (min_idx != i) std.mem.swap(WindowInfo, &infos[i], &infos[min_idx]);
+    }
+}
+
+pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
+    _ = win;
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] on_win_move: grid={d} flags={d}\n", .{ grid_id, flags });
+
+    app.mu.lock();
+    const coll = collectWindowInfos(app, true);
+    app.mu.unlock();
+
+    const infos = coll.infos[0..coll.count];
+    if (findInDirection(infos, grid_id, flags, 1)) |target| {
+        // Find source rect
+        for (infos) |info| {
+            if (info.grid_id == grid_id) {
+                swapWindowPositions(info.hwnd, info.rect, target.hwnd, target.rect);
+                break;
+            }
+        }
+    }
+}
+
+pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
+    _ = win;
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: grid={d} count={d}\n", .{ grid_id, count });
+
+    app.mu.lock();
+    const coll = collectWindowInfos(app, true);
+    app.mu.unlock();
+
+    if (coll.count < 2) return;
+    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
+    sortSpatially(sorted[0..coll.count]);
+
+    // Find source index
+    var src_idx: ?usize = null;
+    for (sorted[0..coll.count], 0..) |info, i| {
+        if (info.grid_id == grid_id) { src_idx = i; break; }
+    }
+    const si = src_idx orelse return;
+
+    // count=0 means "next window" (default for <C-w>x without count prefix)
+    const effective_count: i32 = if (count == 0) 1 else count;
+    const n: i32 = @intCast(coll.count);
+    var dst: i32 = @as(i32, @intCast(si)) + effective_count;
+    dst = @mod(dst, n);
+    if (dst < 0) dst += n;
+    const di: usize = @intCast(dst);
+    if (di == si) return;
+
+    swapWindowPositions(sorted[si].hwnd, sorted[si].rect, sorted[di].hwnd, sorted[di].rect);
+}
+
+pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
+    _ = grid_id;
+    _ = win;
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: direction={d} count={d}\n", .{ direction, count });
+
+    app.mu.lock();
+    const coll = collectWindowInfos(app, true);
+    app.mu.unlock();
+
+    if (coll.count < 2) return;
+    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
+    sortSpatially(sorted[0..coll.count]);
+
+    // Save original positions (left, top) only — each window keeps its own size
+    var lefts: [MAX_WIN_INFOS]c.LONG = undefined;
+    var tops: [MAX_WIN_INFOS]c.LONG = undefined;
+    for (0..coll.count) |i| {
+        lefts[i] = sorted[i].rect.left;
+        tops[i] = sorted[i].rect.top;
+    }
+
+    // count=0 means "rotate once" (default for <C-w>r without count prefix)
+    const effective_count: usize = if (count == 0) 1 else @intCast(count);
+    const n = coll.count;
+    for (0..effective_count) |_| {
+        if (direction == 0) {
+            // Downward rotation
+            const last_left = lefts[n - 1];
+            const last_top = tops[n - 1];
+            var i: usize = n - 1;
+            while (i > 0) : (i -= 1) {
+                lefts[i] = lefts[i - 1];
+                tops[i] = tops[i - 1];
+            }
+            lefts[0] = last_left;
+            tops[0] = last_top;
+        } else {
+            // Upward rotation
+            const first_left = lefts[0];
+            const first_top = tops[0];
+            for (0..n - 1) |i| {
+                lefts[i] = lefts[i + 1];
+                tops[i] = tops[i + 1];
+            }
+            lefts[n - 1] = first_left;
+            tops[n - 1] = first_top;
+        }
+    }
+
+    for (0..n) |i| {
+        const w = sorted[i].rect.right - sorted[i].rect.left;
+        const h = sorted[i].rect.bottom - sorted[i].rect.top;
+        _ = c.SetWindowPos(sorted[i].hwnd, null, lefts[i], tops[i], w, h, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    }
+}
+
+/// Make all windows equal size (including main window).
+pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
+
+    app.mu.lock();
+    const coll = collectWindowInfos(app, true);
+    app.mu.unlock();
+
+    if (coll.count < 2) return;
+    const infos = coll.infos[0..coll.count];
+
+    // Calculate average size
+    var total_w: i32 = 0;
+    var total_h: i32 = 0;
+    for (infos) |info| {
+        total_w += info.rect.right - info.rect.left;
+        total_h += info.rect.bottom - info.rect.top;
+    }
+    const n: i32 = @intCast(coll.count);
+    const avg_w = @divTrunc(total_w, n);
+    const avg_h = @divTrunc(total_h, n);
+
+    for (infos) |info| {
+        _ = c.SetWindowPos(info.hwnd, null, info.rect.left, info.rect.top, avg_w, avg_h, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    }
+}
+
+pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: direction={d} count={d}\n", .{ direction, count });
+
+    app.mu.lock();
+    const cursor_grid = app.last_cursor_grid;
+    const coll = collectWindowInfos(app, true);
+    app.mu.unlock();
+
+    const infos = coll.infos[0..coll.count];
+    if (findInDirection(infos, cursor_grid, direction, count)) |target| {
+        if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{target.win_id});
+        return target.win_id;
+    }
+    return 0;
 }

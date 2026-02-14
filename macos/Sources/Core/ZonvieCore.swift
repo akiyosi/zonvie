@@ -493,6 +493,43 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.terminalView?.renderer.commitFlush()
+                // Pass Neovim default background to renderer for viewport-edge clear color
+                if let corePtr = me.core {
+                    let bg = zonvie_core_get_default_bg(corePtr)
+                    me.terminalView?.renderer.updateDefaultBgColor(bg)
+                }
+            },
+
+            // ext_windows layout operation callbacks
+            on_win_move: { ctx, gridId, win, flags in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                ZonvieCore.appLog("[ext_win] on_win_move: grid=\(gridId) win=\(win) flags=\(flags)")
+                DispatchQueue.main.async { me.handleWinMove(gridId: gridId, flags: flags) }
+            },
+            on_win_exchange: { ctx, gridId, win, count in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                ZonvieCore.appLog("[ext_win] on_win_exchange: grid=\(gridId) win=\(win) count=\(count)")
+                DispatchQueue.main.async { me.handleWinExchange(gridId: gridId, count: count) }
+            },
+            on_win_rotate: { ctx, gridId, win, direction, count in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                ZonvieCore.appLog("[ext_win] on_win_rotate: grid=\(gridId) win=\(win) direction=\(direction) count=\(count)")
+                DispatchQueue.main.async { me.handleWinRotate(direction: direction, count: count) }
+            },
+            on_win_resize_equal: { ctx in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                ZonvieCore.appLog("[ext_win] on_win_resize_equal")
+                DispatchQueue.main.async { me.handleWinResizeEqual() }
+            },
+            on_win_move_cursor: { ctx, direction, count in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                ZonvieCore.appLog("[ext_win] on_win_move_cursor: direction=\(direction) count=\(count)")
+                return me.handleWinMoveCursor(direction: direction, count: count)
             }
         )
 
@@ -538,6 +575,13 @@ final class ZonvieCore {
         guard let core else { return }
         zonvie_core_set_ext_tabline(core, enabled ? 1 : 0)
         ZonvieCore.appLog("[ZonvieCore] setExtTabline(\(enabled))")
+    }
+
+    /// Enable ext_windows UI extension. Must be called before start().
+    func setExtWindows(_ enabled: Bool) {
+        guard let core else { return }
+        zonvie_core_set_ext_windows(core, enabled ? 1 : 0)
+        ZonvieCore.appLog("[ZonvieCore] setExtWindows(\(enabled))")
     }
 
     /// Enable blur transparency for background. Must be called before start().
@@ -610,6 +654,15 @@ final class ZonvieCore {
         if hasExtTabline {
             ZonvieCore.appLog("[start] enabling ext_tabline")
             setExtTabline(true)
+        }
+
+        // ext_windows: CLI flag or config file
+        let hasExtWindows = args.contains("--extwindows") || ZonvieConfig.shared.windows.external
+        ZonvieCore.appLog("[start] hasExtWindows = \(hasExtWindows) (cli=\(args.contains("--extwindows")), config=\(ZonvieConfig.shared.windows.external))")
+
+        if hasExtWindows {
+            ZonvieCore.appLog("[start] enabling ext_windows")
+            setExtWindows(true)
         }
 
         // Parse SSH arguments from CLI: --ssh=user@host[:port], --ssh-identity=path
@@ -1802,10 +1855,16 @@ final class ZonvieCore {
 
     /// Tracks external windows (grid_id -> NSWindow)
     private var externalWindows: [Int64: NSWindow] = [:]
+    /// Tracks grid_id -> Neovim window handle for external windows
+    private var externalWindowWinIds: [Int64: Int64] = [:]
 
     /// Pending position for the next regular external window (set by tab externalization)
     /// When set, the next regular external window will be placed at this position, then this is cleared.
     private var pendingExternalWindowPosition: NSPoint? = nil
+    /// Saved positions for external windows (grid_id -> origin).
+    /// When a window is hidden (e.g. tab switch), its position is saved here.
+    /// On recreation, the saved position is used instead of Neovim's coordinates.
+    private var savedExternalWindowPositions: [Int64: NSPoint] = [:]
     /// Tracks external grid views (grid_id -> ExternalGridView)
     private var externalGridViews: [Int64: ExternalGridView] = [:]
     /// Tracks external window delegates (grid_id -> ExternalWindowDelegate)
@@ -1841,6 +1900,11 @@ final class ZonvieCore {
         let gridId: Int64
         var cellWidthPx: CGFloat
         var cellHeightPx: CGFloat
+        /// When true, suppress tryResizeGrid in windowDidResize (programmatic resize from grid_resize).
+        var suppressResizeCallback = false
+        /// Last grid rows/cols set by applyExternalGridConfig (for exact change detection).
+        var lastGridRows: UInt32 = 0
+        var lastGridCols: UInt32 = 0
 
         init(core: ZonvieCore, gridId: Int64, cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
             self.core = core
@@ -1851,6 +1915,10 @@ final class ZonvieCore {
         }
 
         func windowDidResize(_ notification: Notification) {
+            // Skip resize callback when window is being resized programmatically
+            // (from Neovim grid_resize). Only report back on user-initiated resizes.
+            if suppressResizeCallback { return }
+
             guard let window = notification.object as? NSWindow,
                   let core = core else { return }
 
@@ -1863,6 +1931,13 @@ final class ZonvieCore {
 
             let cols = UInt32(widthPx / cellWidthPx)
             let rows = UInt32(heightPx / cellHeightPx)
+
+            ZonvieCore.appLog("[external_window] windowDidResize gridId=\(gridId) contentSize=\(contentSize) scale=\(scale) cellH=\(cellHeightPx) cellW=\(cellWidthPx) heightPx=\(heightPx) widthPx=\(widthPx) rows=\(rows) cols=\(cols) lastGridRows=\(lastGridRows) lastGridCols=\(lastGridCols) suppress=\(suppressResizeCallback)")
+
+            // Skip if rows/cols match the last programmatic resize (from grid_resize).
+            // windowDidResize can fire asynchronously after suppressResizeCallback
+            // is cleared, so this check prevents overriding Neovim's grid dimensions.
+            if rows == lastGridRows && cols == lastGridCols { return }
 
             // Only resize if we have valid dimensions
             if rows > 0 && cols > 0 {
@@ -2034,6 +2109,7 @@ final class ZonvieCore {
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.externalWindowWinIds[gridId] = win
 
             // Get cell dimensions and shared resources from the main terminal view
             guard let mainView = self.terminalView else {
@@ -2338,6 +2414,11 @@ final class ZonvieCore {
                 }
 
                 windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+            } else if let savedOrigin = self.savedExternalWindowPositions[gridId] {
+                // Restore saved position from previous tab switch
+                styleMask = [.titled, .closable, .resizable]
+                windowRect = NSRect(x: savedOrigin.x, y: savedOrigin.y, width: windowWidth, height: windowHeight)
+                ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(savedOrigin)")
             } else if let pendingPos = self.pendingExternalWindowPosition {
                 // Tab externalization: use the pending position (mouse drop point)
                 styleMask = [.titled, .closable, .resizable]
@@ -2419,7 +2500,7 @@ final class ZonvieCore {
                 window.backgroundColor = .clear  // Required for window transparency
                 window.hidesOnDeactivate = true  // Hide when app loses focus
             } else {
-                window.title = "External Grid \(gridId)"
+                window.title = "Window \(win)"
             }
             window.isReleasedWhenClosed = false
 
@@ -2751,7 +2832,7 @@ final class ZonvieCore {
         let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
                              gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
 
-        // Update background color on the containerView
+        // Update background color on the containerView and gridClearColor
         if isSpecialGrid {
             let adjustedBg = bgColor.adjustedForCmdlineBackground()
 
@@ -2763,6 +2844,17 @@ final class ZonvieCore {
                 containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(1.0).cgColor
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
                 adjustedBg.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
+            }
+        } else {
+            // Regular ext_windows grid: set clear color from vertex background.
+            // For regular grids, window.contentView = gridView (no separate containerView).
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+            if ZonvieConfig.shared.blurEnabled {
+                let opacity = Double(ZonvieConfig.shared.backgroundAlpha)
+                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: opacity)
+            } else {
                 gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
             }
         }
@@ -2782,6 +2874,53 @@ final class ZonvieCore {
         } else if gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId {
             self.resizeMessageWindow(window: window, containerView: containerView, gridView: gridView, gridId: gridId,
                                      rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale)
+        } else {
+            // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
+            // Resize the OS window to match the grid size.
+
+            let contentWidth = CGFloat(cols) * cellW / scale
+            let contentHeight = CGFloat(rows) * cellH / scale
+
+            // Compare using row/col counts stored on the delegate to avoid floating-point drift.
+            // The delegate tracks the last-set rows/cols, so this is an exact integer comparison.
+            let delegate = window.delegate as? ExternalWindowDelegate
+            let lastRows = delegate?.lastGridRows ?? 0
+            let lastCols = delegate?.lastGridCols ?? 0
+            if rows != lastRows || cols != lastCols {
+                // Track the rows/cols we're about to set BEFORE setFrame, because
+                // setFrame may trigger windowDidResize synchronously or via RunLoop.
+                // The lastGridRows/lastGridCols check in windowDidResize prevents
+                // the callback from calling tryResizeGrid with stale window dimensions.
+                delegate?.lastGridRows = rows
+                delegate?.lastGridCols = cols
+                delegate?.suppressResizeCallback = true
+
+                // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
+                let oldFrame = window.frame
+                let oldTop = oldFrame.origin.y + oldFrame.height
+
+                // Use setContentSize approach: compute new frame from desired content rect
+                let contentRect = NSRect(x: oldFrame.origin.x, y: 0,
+                                         width: contentWidth, height: contentHeight)
+                let frameRect = window.frameRect(forContentRect: contentRect)
+                let newFrame = NSRect(x: oldFrame.origin.x, y: oldTop - frameRect.height,
+                                      width: frameRect.width, height: frameRect.height)
+                window.setFrame(newFrame, display: true)
+
+                // Update gridView frame to fill the new content area
+                gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
+
+                delegate?.suppressResizeCallback = false
+
+                ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
+            }
+
+            // Set clear color so viewport-edge pixels match the grid background.
+            // For blur: use backgroundAlpha so edges match the semi-transparent content.
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+            let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
+            gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
         }
     }
 
@@ -2898,7 +3037,11 @@ final class ZonvieCore {
 
             self.externalWindowDelegates.removeValue(forKey: gridId)
             self.externalGridViews.removeValue(forKey: gridId)
+            self.externalWindowWinIds.removeValue(forKey: gridId)
             if let window = self.externalWindows.removeValue(forKey: gridId) {
+                // Save window position for restoration on tab switch back
+                self.savedExternalWindowPositions[gridId] = window.frame.origin
+                ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
                 window.delegate = nil
                 window.close()
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
@@ -2920,6 +3063,272 @@ final class ZonvieCore {
                 }
             }
         }
+    }
+
+    // MARK: - ext_windows Layout Operations
+
+    /// Info about a window (main or external) for layout operations.
+    private struct WindowLayoutInfo {
+        let gridId: Int64
+        let winId: Int64
+        let frame: NSRect
+        let window: NSWindow
+    }
+
+    /// Collect layout info for all visible windows. Must be called on main thread.
+    /// `includeMainWindow`: all ext_windows operations pass true. Parameter retained for future use.
+    /// Main window is registered as grid 2 (Neovim's default editor grid).
+    private func allWindowLayoutInfos(includeMainWindow: Bool = true) -> [WindowLayoutInfo] {
+        var result: [WindowLayoutInfo] = []
+
+        // Main window uses grid 2 (the default editor grid), not grid 1 (Neovim's global grid)
+        if includeMainWindow, let mainWindow = terminalView?.window {
+            let mainWinId: Int64 = (core != nil) ? zonvie_core_get_win_id(core, 2) : 0
+            result.append(WindowLayoutInfo(gridId: 2, winId: mainWinId, frame: mainWindow.frame, window: mainWindow))
+        }
+
+        // External windows (skip special windows like cmdline/popupmenu/msg and hidden windows)
+        for (gridId, window) in externalWindows {
+            if gridId < 0 { continue }  // Skip special windows (cmdline=-100, popupmenu=-101, etc.)
+            if !window.isVisible { continue }  // Skip hidden windows
+            let winId = externalWindowWinIds[gridId] ?? 0
+            result.append(WindowLayoutInfo(gridId: gridId, winId: winId, frame: window.frame, window: window))
+        }
+
+        return result
+    }
+
+    /// Find the nearest window in the given direction from a reference frame.
+    /// direction: 0=down, 1=up, 2=right, 3=left
+    /// macOS coordinate system: Y increases upward.
+    /// Falls back to the nearest window overall when no candidate is found in the strict direction
+    /// (e.g. when window centers align on the checked axis).
+    private func findWindowInDirection(
+        from refFrame: NSRect,
+        refGridId: Int64,
+        direction: Int32,
+        count: Int32,
+        infos: [WindowLayoutInfo]
+    ) -> WindowLayoutInfo? {
+        let refCenterX = refFrame.midX
+        let refCenterY = refFrame.midY
+
+        let others = infos.filter { $0.gridId != refGridId }
+        if others.isEmpty { return nil }
+
+        // Filter candidates by direction
+        let candidates = others.filter { info in
+            let cx = info.frame.midX
+            let cy = info.frame.midY
+            switch direction {
+            case 0: return cy < refCenterY  // down (macOS: lower Y)
+            case 1: return cy > refCenterY  // up (macOS: higher Y)
+            case 2: return cx > refCenterX  // right
+            case 3: return cx < refCenterX  // left
+            default: return false
+            }
+        }
+
+        // Use directional candidates if available, otherwise fall back to all other windows
+        let pool = candidates.isEmpty ? others : candidates
+
+        // Sort by distance
+        let sorted = pool.sorted { a, b in
+            let distA = abs(a.frame.midX - refCenterX) + abs(a.frame.midY - refCenterY)
+            let distB = abs(b.frame.midX - refCenterX) + abs(b.frame.midY - refCenterY)
+            return distA < distB
+        }
+
+        let idx = Int(count) - 1
+        return (idx >= 0 && idx < sorted.count) ? sorted[idx] : sorted.first
+    }
+
+    /// Handle win_move: swap this window's position with the nearest window in direction.
+    private func handleWinMove(gridId: Int64, flags: Int32) {
+        let infos = allWindowLayoutInfos(includeMainWindow: true)
+        ZonvieCore.appLog("[ext_win] handleWinMove: grid=\(gridId) flags=\(flags) infos=\(infos.map { "grid=\($0.gridId) frame=\($0.frame)" })")
+        guard let source = infos.first(where: { $0.gridId == gridId }) else {
+            ZonvieCore.appLog("[ext_win] handleWinMove: source grid=\(gridId) not found in \(infos.count) windows")
+            return
+        }
+        guard let target = findWindowInDirection(from: source.frame, refGridId: gridId, direction: flags, count: 1, infos: infos) else {
+            ZonvieCore.appLog("[ext_win] handleWinMove: no target found for grid=\(gridId) direction=\(flags)")
+            return
+        }
+
+        // Swap top-left positions (keep each window's size)
+        // macOS origin is bottom-left; top-left Y = origin.y + height
+        let sourceTopLeftY = source.frame.origin.y + source.frame.height
+        let targetTopLeftY = target.frame.origin.y + target.frame.height
+        var newSourceFrame = source.frame
+        newSourceFrame.origin.x = target.frame.origin.x
+        newSourceFrame.origin.y = targetTopLeftY - source.frame.height
+        var newTargetFrame = target.frame
+        newTargetFrame.origin.x = source.frame.origin.x
+        newTargetFrame.origin.y = sourceTopLeftY - target.frame.height
+        source.window.setFrame(newSourceFrame, display: true)
+        target.window.setFrame(newTargetFrame, display: true)
+        ZonvieCore.appLog("[ext_win] handleWinMove: swapped grid=\(gridId) with grid=\(target.gridId)")
+    }
+
+    /// Handle win_exchange: swap with the count-th window in spatial order.
+    private func handleWinExchange(gridId: Int64, count: Int32) {
+        let infos = allWindowLayoutInfos(includeMainWindow: true)
+        guard infos.count >= 2 else {
+            ZonvieCore.appLog("[ext_win] handleWinExchange: only \(infos.count) windows, need >= 2")
+            return
+        }
+
+        // Sort by position: top-to-bottom, left-to-right (macOS: high Y first, then low X)
+        let sorted = infos.sorted { a, b in
+            if abs(a.frame.midY - b.frame.midY) > 20 { return a.frame.midY > b.frame.midY }
+            return a.frame.midX < b.frame.midX
+        }
+
+        guard let srcIdx = sorted.firstIndex(where: { $0.gridId == gridId }) else {
+            ZonvieCore.appLog("[ext_win] handleWinExchange: source grid=\(gridId) not found")
+            return
+        }
+
+        // count=0 means "next window" (default for <C-w>x without count prefix)
+        let effectiveCount = (count == 0) ? 1 : Int(count)
+        let dstIdx = (srcIdx + effectiveCount) % sorted.count
+        let adjustedDst = dstIdx < 0 ? dstIdx + sorted.count : dstIdx
+        guard adjustedDst != srcIdx, adjustedDst >= 0, adjustedDst < sorted.count else { return }
+
+        // Swap top-left positions (keep each window's size)
+        // macOS origin is bottom-left; top-left Y = origin.y + height
+        let srcTopLeftY = sorted[srcIdx].frame.origin.y + sorted[srcIdx].frame.height
+        let dstTopLeftY = sorted[adjustedDst].frame.origin.y + sorted[adjustedDst].frame.height
+        var newSrcFrame = sorted[srcIdx].frame
+        newSrcFrame.origin.x = sorted[adjustedDst].frame.origin.x
+        newSrcFrame.origin.y = dstTopLeftY - sorted[srcIdx].frame.height
+        var newDstFrame = sorted[adjustedDst].frame
+        newDstFrame.origin.x = sorted[srcIdx].frame.origin.x
+        newDstFrame.origin.y = srcTopLeftY - sorted[adjustedDst].frame.height
+        sorted[srcIdx].window.setFrame(newSrcFrame, display: true)
+        sorted[adjustedDst].window.setFrame(newDstFrame, display: true)
+        ZonvieCore.appLog("[ext_win] handleWinExchange: swapped grid=\(gridId) with grid=\(sorted[adjustedDst].gridId)")
+    }
+
+    /// Handle win_rotate: cycle all window positions.
+    private func handleWinRotate(direction: Int32, count: Int32) {
+        let infos = allWindowLayoutInfos(includeMainWindow: true)
+        guard infos.count >= 2 else {
+            ZonvieCore.appLog("[ext_win] handleWinRotate: only \(infos.count) windows, need >= 2")
+            return
+        }
+
+        // Sort spatially
+        let sorted = infos.sorted { a, b in
+            if abs(a.frame.midY - b.frame.midY) > 20 { return a.frame.midY > b.frame.midY }
+            return a.frame.midX < b.frame.midX
+        }
+
+        // Rotate top-left positions only (keep each window's size)
+        // macOS origin is bottom-left; top-left = (origin.x, origin.y + height)
+        var topLeftXs = sorted.map { $0.frame.origin.x }
+        var topLeftYs = sorted.map { $0.frame.origin.y + $0.frame.height }
+        let n = topLeftXs.count
+
+        // count=0 means "rotate once" (default for <C-w>r without count prefix)
+        let effectiveCount = (count == 0) ? 1 : Int(count)
+
+        for _ in 0..<effectiveCount {
+            if direction == 0 {
+                // Downward: each window gets the next window's position
+                let lastX = topLeftXs[n - 1]
+                let lastY = topLeftYs[n - 1]
+                for i in stride(from: n - 1, through: 1, by: -1) {
+                    topLeftXs[i] = topLeftXs[i - 1]
+                    topLeftYs[i] = topLeftYs[i - 1]
+                }
+                topLeftXs[0] = lastX
+                topLeftYs[0] = lastY
+            } else {
+                // Upward: each window gets the previous window's position
+                let firstX = topLeftXs[0]
+                let firstY = topLeftYs[0]
+                for i in 0..<(n - 1) {
+                    topLeftXs[i] = topLeftXs[i + 1]
+                    topLeftYs[i] = topLeftYs[i + 1]
+                }
+                topLeftXs[n - 1] = firstX
+                topLeftYs[n - 1] = firstY
+            }
+        }
+
+        // Apply: convert top-left back to macOS origin (bottom-left)
+        for (i, info) in sorted.enumerated() {
+            var newFrame = info.frame
+            newFrame.origin.x = topLeftXs[i]
+            newFrame.origin.y = topLeftYs[i] - info.frame.height
+            info.window.setFrame(newFrame, display: true)
+        }
+        ZonvieCore.appLog("[ext_win] handleWinRotate: rotated \(sorted.count) windows direction=\(direction) count=\(count)")
+    }
+
+    /// Handle win_resize_equal: make all windows equal size (including main window).
+    private func handleWinResizeEqual() {
+        let infos = allWindowLayoutInfos(includeMainWindow: true)
+        guard infos.count >= 2 else { return }
+
+        // Calculate average size
+        let totalWidth = infos.reduce(CGFloat(0)) { $0 + $1.frame.width }
+        let totalHeight = infos.reduce(CGFloat(0)) { $0 + $1.frame.height }
+        let avgWidth = totalWidth / CGFloat(infos.count)
+        let avgHeight = totalHeight / CGFloat(infos.count)
+
+        for info in infos {
+            var newFrame = info.frame
+            newFrame.size = NSSize(width: avgWidth, height: avgHeight)
+            info.window.setFrame(newFrame, display: true)
+        }
+        ZonvieCore.appLog("[ext_win] handleWinResizeEqual: equalized \(infos.count) windows to \(avgWidth)x\(avgHeight)")
+    }
+
+    /// Handle win_move_cursor: find window in direction and return its win_id. Synchronous.
+    private func handleWinMoveCursor(direction: Int32, count: Int32) -> Int64 {
+        var targetWin: Int64 = 0
+
+        let work = { [self] in
+            let infos = allWindowLayoutInfos(includeMainWindow: true)
+
+            // Find current cursor grid
+            var cursorRow: Int32 = 0
+            var cursorCol: Int32 = 0
+            let cursorGrid = (core != nil) ? zonvie_core_get_cursor_position(core, &cursorRow, &cursorCol) : Int64(1)
+
+            ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) direction=\(direction) count=\(count) infos=\(infos.map { "grid=\($0.gridId) win=\($0.winId) frame=\($0.frame)" })")
+
+            guard let current = infos.first(where: { $0.gridId == cursorGrid }) else {
+                ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) not found in infos, fallback to main")
+                // Fallback: use main window (grid 2)
+                if let main = infos.first(where: { $0.gridId == 2 }) {
+                    if let target = findWindowInDirection(from: main.frame, refGridId: 2, direction: direction, count: count, infos: infos) {
+                        targetWin = target.winId
+                    }
+                }
+                return
+            }
+
+            if let target = findWindowInDirection(from: current.frame, refGridId: cursorGrid, direction: direction, count: count, infos: infos) {
+                targetWin = target.winId
+                ZonvieCore.appLog("[ext_win] handleWinMoveCursor: found target grid=\(target.gridId) win=\(target.winId) frame=\(target.frame)")
+            } else {
+                ZonvieCore.appLog("[ext_win] handleWinMoveCursor: no target found for direction=\(direction)")
+            }
+        }
+
+        // Avoid deadlock: if already on main thread, execute directly
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.sync { work() }
+        }
+
+        ZonvieCore.appLog("[ext_win] handleWinMoveCursor: direction=\(direction) count=\(count) -> win=\(targetWin)")
+        return targetWin
     }
 
     /// Called to update vertices for an external grid.

@@ -38,6 +38,7 @@ pub const zonvie_core_get_viewport = core.zonvie_core_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
 pub const zonvie_core_try_get_visible_grids = core.zonvie_core_try_get_visible_grids;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
+pub const zonvie_core_get_win_id = core.zonvie_core_get_win_id;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
 pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
 pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
@@ -470,6 +471,7 @@ pub const RowVerts = struct {
 /// External window state for win_external_pos grids
 pub const ExternalWindow = struct {
     hwnd: c.HWND,
+    win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
     verts: std.ArrayListUnmanaged(Vertex) = .{},
     vb: ?*c.ID3D11Buffer = null,
@@ -486,6 +488,9 @@ pub const ExternalWindow = struct {
     scroll_accum: i16 = 0, // Accumulated scroll delta for high-resolution scrolling
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
+
+    // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
+    suppress_resize_callback: bool = false,
 
     // Close state - set when window is scheduled for closing (don't paint or access renderer)
     is_pending_close: bool = false,
@@ -581,6 +586,9 @@ pub const App = struct {
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
     pending_external_window_position_time: i64 = 0, // Timestamp when position was set (for timeout)
+
+    // Saved positions for external windows (restored on tab switch back)
+    saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int }) = .{},
 
     // Pending vertices for external windows that haven't been created yet
     pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .{},
@@ -752,6 +760,9 @@ pub const App = struct {
 
     // ext_tabline enabled flag (set from --exttabline command line arg)
     ext_tabline_enabled: bool = false,
+
+    // ext_windows enabled flag (set from --extwindows command line arg or config)
+    ext_windows_enabled: bool = false,
 
     // WSL mode flags (set from --wsl command line arg or config)
     wsl_mode: bool = false,
@@ -1012,6 +1023,7 @@ pub const App = struct {
             pv.deinit(self.alloc);
         }
         self.pending_external_verts.deinit(self.alloc);
+        self.saved_external_window_positions.deinit(self.alloc);
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;

@@ -10,6 +10,7 @@ struct ZonvieConfig {
     var popup: PopupConfig = PopupConfig()
     var messages: MessagesConfig = MessagesConfig()
     var tabline: TablineConfig = TablineConfig()
+    var windows: WindowsConfig = WindowsConfig()
     var log: LogConfig = LogConfig()
     var performance: PerformanceConfig = PerformanceConfig()
     var ime: IMEConfig = IMEConfig()
@@ -76,6 +77,10 @@ struct ZonvieConfig {
     }
 
     struct TablineConfig {
+        var external: Bool = false
+    }
+
+    struct WindowsConfig {
         var external: Bool = false
     }
 
@@ -279,6 +284,14 @@ struct ZonvieConfig {
                 tabline.external = (value == "true")
             default:
                 ZonvieCore.appLog("[Config] Unknown key: tabline.\(key)")
+            }
+
+        case "windows":
+            switch key {
+            case "external":
+                windows.external = (value == "true")
+            default:
+                ZonvieCore.appLog("[Config] Unknown key: windows.\(key)")
             }
 
         case "log":

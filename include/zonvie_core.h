@@ -282,6 +282,51 @@ typedef void (*zonvie_on_external_vertices_fn)(
     uint32_t cols
 );
 
+/* --- ext_windows layout operation callbacks --- */
+
+/* Called when Neovim requests moving a window in a direction.
+   flags: 0=below, 1=above, 2=right, 3=left */
+typedef void (*zonvie_on_win_move_fn)(
+    void* ctx,
+    int64_t grid_id,
+    int64_t win,
+    int32_t flags
+);
+
+/* Called when Neovim requests exchanging a window with another.
+   count: number of positions to exchange */
+typedef void (*zonvie_on_win_exchange_fn)(
+    void* ctx,
+    int64_t grid_id,
+    int64_t win,
+    int32_t count
+);
+
+/* Called when Neovim requests rotating windows.
+   direction: 0=downward, 1=upward
+   count: number of rotations */
+typedef void (*zonvie_on_win_rotate_fn)(
+    void* ctx,
+    int64_t grid_id,
+    int64_t win,
+    int32_t direction,
+    int32_t count
+);
+
+/* Called when Neovim requests equal-sizing all windows. */
+typedef void (*zonvie_on_win_resize_equal_fn)(void* ctx);
+
+/* Called when Neovim asks which window is in a given direction.
+   direction: 0=down, 1=up, 2=right, 3=left
+   count: how many windows to traverse
+   Returns: Neovim window handle of the target window, or 0 if none.
+   NOTE: Synchronous - Neovim blocks until response is sent. */
+typedef int64_t (*zonvie_on_win_move_cursor_fn)(
+    void* ctx,
+    int32_t direction,
+    int32_t count
+);
+
 /* --- ext_cmdline types --- */
 
 /* A single highlighted chunk in cmdline content */
@@ -625,6 +670,13 @@ typedef struct zonvie_callbacks {
        Frontend can use these to implement triple buffering / atomic commit. */
     void (*on_flush_begin)(void* ctx);
     void (*on_flush_end)(void* ctx);
+
+    /* ext_windows layout operation callbacks */
+    zonvie_on_win_move_fn on_win_move;
+    zonvie_on_win_exchange_fn on_win_exchange;
+    zonvie_on_win_rotate_fn on_win_rotate;
+    zonvie_on_win_resize_equal_fn on_win_resize_equal;
+    zonvie_on_win_move_cursor_fn on_win_move_cursor;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -647,6 +699,10 @@ void zonvie_core_set_ext_messages(zonvie_core *core, int enabled);
  * When enabled, tabline_update events are sent to frontend callbacks
  * for Chrome-style tab rendering in titlebar. */
 void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
+
+/* Enable ext_windows UI extension (must call before zonvie_core_start).
+ * When enabled, Neovim external windows are rendered as separate OS windows. */
+ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
 /* Check if msg_show throttle timeout has expired and process pending messages.
  * Frontend should call this periodically (e.g., every frame or 16ms) to ensure
@@ -779,6 +835,11 @@ ZONVIE_API int64_t zonvie_core_get_cursor_position(
     int32_t *out_col
 );
 
+/* Get Neovim window handle (winid) for a grid.
+   Pass grid_id=-1 to get the winid for the cursor's current grid.
+   Returns 0 if the mapping is not available. */
+ZONVIE_API int64_t zonvie_core_get_win_id(zonvie_core *core, int64_t grid_id);
+
 /* Get current mode name (e.g., "normal", "insert", "terminal").
    Returns pointer to null-terminated string. Do not free.
    Returns empty string if core is null. */
@@ -875,6 +936,10 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
     uint32_t* fg_rgb,
     uint32_t* bg_rgb
 );
+
+// Return Neovim default background color as 0x00RRGGBB.
+// Safe to call from within callbacks (no lock acquisition).
+ZONVIE_API uint32_t zonvie_core_get_default_bg(zonvie_core *core);
 
 // ========================================================================
 // Message routing API
