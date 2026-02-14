@@ -145,11 +145,16 @@ final class MetalTerminalView: MTKView {
     private func displayLinkFired() {
         // Flush pending input on main thread
         DispatchQueue.main.async { [weak self] in
-            self?.flushPendingInput()
+            guard let self else { return }
+            // Skip all work when minimized: the Zig core's grid state
+            // must not be queried while the window is in the Dock.
+            if self.window?.isMiniaturized == true { return }
+
+            self.flushPendingInput()
             // Check msg_show throttle timeout (noice.nvim-style)
-            self?.core?.tickMsgThrottle()
+            self.core?.tickMsgThrottle()
             // Update scrollbar if viewport changed
-            self?.updateScrollbarIfNeeded()
+            self.updateScrollbarIfNeeded()
         }
     }
 
@@ -231,6 +236,14 @@ final class MetalTerminalView: MTKView {
         let doSetNeedsDisplay: () -> Void = { [weak self] in
             guard let self else { return }
             if self.window == nil { return }
+            // Skip redraw for minimized windows to avoid drawable access issues.
+            // Reset redrawPending so future requests are not permanently blocked.
+            if self.window?.isMiniaturized == true {
+                self.redrawLock.lock()
+                self.redrawPending = false
+                self.redrawLock.unlock()
+                return
+            }
 
             self.redrawLock.lock()
             let r = self.pendingRedrawRect  // ★ Don't clear here

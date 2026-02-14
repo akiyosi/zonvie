@@ -85,9 +85,33 @@ final class ViewController: NSViewController {
     }
 
 
+    /// Trigger a full redraw of the terminal view (e.g. after deminiaturize).
+    func requestFullRedraw() {
+        terminalView?.requestRedraw(nil)
+    }
+
     override func viewWillDisappear() {
         super.viewWillDisappear()
-        core?.stop()
+
+        // Do NOT call core.stop() here.
+        //
+        // On macOS 15+, viewWillDisappear is called during window minimize
+        // (before isMiniaturized becomes true). Calling core.stop() frees
+        // Grid HashMaps (viewport, viewport_margins) while the display link
+        // and MTKView draw callbacks still reference them → use-after-free.
+        //
+        // core.stop() is unnecessary for all termination paths:
+        //   - Normal close: windowShouldClose → requestQuit → Neovim exits
+        //     → onExitFromNvim → Darwin.exit() (process terminates).
+        //   - Timeout: showNotRespondingDialog → confirmQuit → Darwin.exit().
+        //   - No core: windowShouldClose returns true, nothing to stop.
+        //
+        // ASSUMPTION: The current UI uses a single main window with one
+        // ViewController. The view is never removed from its window except
+        // at app termination. If a future design introduces multiple windows,
+        // tab-based ViewController swapping, or view detachment, a new
+        // explicit stop point (e.g. windowWillClose or a dedicated cleanup
+        // method) must be added for the detached ViewController's core.
 
         // Remove notification observers
         if let observer = tablineUpdateObserver {

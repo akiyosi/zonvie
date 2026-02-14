@@ -763,6 +763,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        // Skip all rendering for minimized windows.
+        // Metal's currentDrawable blocks/crashes when the window is in the
+        // Dock, and onPreDraw accesses the Zig core (unnecessary CPU work).
+        if let window = view.window, window.isMiniaturized {
+            (view as? MetalTerminalView)?.didDrawFrame()
+            return
+        }
+
         // Process pending scroll clears before rendering
         onPreDraw?()
 
@@ -794,7 +802,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
-    
+
             // Update atlas backing scale outside lock (atlas has its own internal lock)
             atlas.setBackingScale(backingScale)
 

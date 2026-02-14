@@ -179,6 +179,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
+    func windowDidDeminiaturize(_ notification: Notification) {
+        // Trigger a full redraw so the window content is up-to-date after restore.
+        let win = notification.object as? NSWindow ?? window
+        if let vc = win?.contentViewController as? ViewController {
+            vc.requestFullRedraw()
+        }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }

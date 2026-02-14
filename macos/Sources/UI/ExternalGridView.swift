@@ -362,6 +362,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 return
             }
 
+            // Skip rendering for minimized windows.
+            // No frame-completion notification is needed here: unlike
+            // MetalTerminalView (which uses redrawPending/didDrawFrame to
+            // gate future redraws), ExternalGridView is driven directly
+            // by setNeedsDisplay with no coalescing gate.
+            if let window = view.window, window.isMiniaturized {
+                return
+            }
+
             // Fetch pending state under lock
             let (vertexCount, rowMode, rowBuffersSnapshot, rowCountsSnapshot, dirtyRows, snapGridRows, snapGridCols): (Int, Bool, [MTLBuffer?], [Int], [Int], UInt32, UInt32) = {
                 lock.lock()
