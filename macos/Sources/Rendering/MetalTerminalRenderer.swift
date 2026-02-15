@@ -216,6 +216,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var defaultBgRGB: UInt32 = 0               // Protected by lock
 
+    // Drawable size from the most recent committed flush.
+    // Set by commitFlush() (core thread, grid_mu held) by reading the core's
+    // layout directly — this guarantees the values match the NDC coordinates
+    // baked into the committed vertices.
+    // draw() uses these to set the Metal viewport, preventing stretching when
+    // drawableSize changes between flushes.
+    private var committedDrawableW: UInt32 = 0 // Protected by lock
+    private var committedDrawableH: UInt32 = 0 // Protected by lock
+
     private var pendingFont: (name: String, size: CGFloat)?
     private var linespacePx: Int32 = 0
 
@@ -232,8 +241,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func setBackingScale(_ s: CGFloat) {
         lock.lock()
-        defer { lock.unlock() }
         backingScale = s
+        lock.unlock()
+        // Eagerly update atlas so that cellWidthPx/cellHeightPx reflect the
+        // new scale immediately (before the next draw() call). This ensures
+        // maybeResizeCoreGrid() sends correct cell metrics to the core and
+        // prevents the initial grid being sized with @1x metrics while the
+        // drawable uses @2x pixel dimensions.
+        atlas.setBackingScale(s)
     }
 
     /// Cell width in drawable pixel coordinates.
@@ -542,13 +557,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         dst.usingRowBuffers = src.usingRowBuffers
     }
 
-    /// Called from on_flush_end callback (core thread).
+    /// Called from on_flush_end callback (core thread, grid_mu held).
     /// Atomically makes the write set the new committed set for draw().
-    func commitFlush() {
+    /// drawableW/drawableH are the core's layout at flush time, read via
+    /// zonvie_core_get_layout while grid_mu is still held — this guarantees
+    /// the values match the NDC coordinates in the committed vertices.
+    func commitFlush(drawableW: UInt32, drawableH: UInt32) {
         guard isInFlush else { return }  // Flush was dropped by beginFlush
         let ws = writeSetIndex
         lock.lock()
         committedSetIndex = writeSetIndex
+        committedDrawableW = drawableW
+        committedDrawableH = drawableH
         commitRevision &+= 1
         let rev = commitRevision
         lock.unlock()
@@ -823,6 +843,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
 
             let snappedBgRGB: UInt32
+            let snappedCommittedDrawableW: UInt32
+            let snappedCommittedDrawableH: UInt32
 
             lock.lock()
             csi = committedSetIndex
@@ -838,6 +860,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             smoothScrolling = hasActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
             snappedBgRGB = defaultBgRGB
+            snappedCommittedDrawableW = committedDrawableW
+            snappedCommittedDrawableH = committedDrawableH
             lock.unlock()
 
             // Safety defer: decrement gpuInFlight + signal semaphore on early return.
@@ -1009,8 +1033,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Uses integer division to match Zig's u32 arithmetic exactly.
             let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
             let cellHi = max(1, UInt32(ch.rounded(.toNearestOrAwayFromZero)))
-            let drawableWi = max(1, UInt32(view.drawableSize.width))
-            let drawableHi = max(1, UInt32(view.drawableSize.height))
+            // Use the drawable size from the last committed flush so the Metal
+            // viewport matches the NDC coordinates baked into the vertices.
+            // Falls back to view.drawableSize before the first flush completes.
+            let drawableWi: UInt32
+            let drawableHi: UInt32
+            if snappedCommittedDrawableW > 0 && snappedCommittedDrawableH > 0 {
+                drawableWi = snappedCommittedDrawableW
+                drawableHi = snappedCommittedDrawableH
+            } else {
+                drawableWi = max(1, UInt32(view.drawableSize.width))
+                drawableHi = max(1, UInt32(view.drawableSize.height))
+            }
             let vpWidth = Double((drawableWi / cellWi) * cellWi)
             let vpHeight = Double((drawableHi / cellHi) * cellHi)
             if vpWidth > 0 && vpHeight > 0 {

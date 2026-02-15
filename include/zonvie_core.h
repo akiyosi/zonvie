@@ -947,6 +947,18 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
 // Safe to call from within callbacks (no lock acquisition).
 ZONVIE_API uint32_t zonvie_core_get_default_bg(zonvie_core *core);
 
+// Read the current drawable/cell layout stored in core.
+// Intended for use from on_flush_end callback (grid_mu is held, so the
+// returned values match exactly what was used for the flush's NDC computation).
+// Any output pointer may be NULL if the caller does not need that value.
+ZONVIE_API void zonvie_core_get_layout(
+    zonvie_core *core,
+    uint32_t *out_drawable_w_px,
+    uint32_t *out_drawable_h_px,
+    uint32_t *out_cell_w_px,
+    uint32_t *out_cell_h_px
+);
+
 // ========================================================================
 // Message routing API
 // ========================================================================

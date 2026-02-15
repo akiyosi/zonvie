@@ -495,7 +495,14 @@ final class ZonvieCore {
             on_flush_end: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.terminalView?.renderer.commitFlush()
+                // Read drawable size from core while grid_mu is still held.
+                // These values match exactly what the flush used for NDC computation.
+                var dw: UInt32 = 0
+                var dh: UInt32 = 0
+                if let corePtr = me.core {
+                    zonvie_core_get_layout(corePtr, &dw, &dh, nil, nil)
+                }
+                me.terminalView?.renderer.commitFlush(drawableW: dw, drawableH: dh)
                 // Pass Neovim default background to renderer for viewport-edge clear color
                 if let corePtr = me.core {
                     let bg = zonvie_core_get_default_bg(corePtr)

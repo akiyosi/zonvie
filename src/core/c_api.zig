@@ -1024,6 +1024,30 @@ pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
     return box.core.hl.default_bg;
 }
 
+/// Read the current drawable/cell layout stored in core.
+/// Intended for use from on_flush_end callback (grid_mu is held, so the
+/// returned values match exactly what was used for the flush's NDC computation).
+pub export fn zonvie_core_get_layout(
+    p: ?*zonvie_core,
+    out_dw: ?*u32,
+    out_dh: ?*u32,
+    out_cw: ?*u32,
+    out_ch: ?*u32,
+) callconv(.c) void {
+    if (p == null) {
+        if (out_dw) |ptr| ptr.* = 0;
+        if (out_dh) |ptr| ptr.* = 0;
+        if (out_cw) |ptr| ptr.* = 0;
+        if (out_ch) |ptr| ptr.* = 0;
+        return;
+    }
+    const box = asBox(p.?);
+    if (out_dw) |ptr| ptr.* = box.core.drawable_w_px;
+    if (out_dh) |ptr| ptr.* = box.core.drawable_h_px;
+    if (out_cw) |ptr| ptr.* = box.core.cell_w_px;
+    if (out_ch) |ptr| ptr.* = box.core.cell_h_px;
+}
+
 // ========================================================================
 // Message routing API
 // ========================================================================
