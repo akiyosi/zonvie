@@ -983,6 +983,66 @@ ZONVIE_API zonvie_route_result zonvie_core_route_message(
     unsigned line_count
 );
 
+// ========================================================================
+// Standalone config API (independent of zonvie_core)
+// ========================================================================
+
+typedef struct zonvie_config zonvie_config;
+
+typedef struct zonvie_config_values {
+    // font
+    const char* font_family;
+    float font_size;
+    int32_t font_linespace;
+    // window
+    bool window_blur;
+    float window_opacity;
+    int32_t window_blur_radius;
+    // scrollbar
+    bool scrollbar_enabled;
+    const char* scrollbar_show_mode;
+    float scrollbar_opacity;
+    float scrollbar_delay;
+    // ext features
+    bool cmdline_external;
+    bool popup_external;
+    bool messages_external;
+    int32_t messages_ext_float_pos; // 0=window, 1=grid, 2=display
+    int32_t messages_mini_pos;      // 0=window, 1=grid, 2=display
+    bool tabline_external;
+    const char* tabline_style;
+    const char* tabline_sidebar_position;
+    int32_t tabline_sidebar_width;
+    bool windows_external;
+    // neovim
+    const char* neovim_path;
+    bool neovim_ssh;
+    const char* neovim_ssh_host;      /* NULL if not set */
+    int32_t neovim_ssh_port;          /* 0 if not set */
+    const char* neovim_ssh_identity;  /* NULL if not set */
+    // log
+    bool log_enabled;
+    const char* log_path;             /* NULL if not set */
+    // performance
+    int32_t perf_glyph_cache_ascii;
+    int32_t perf_glyph_cache_non_ascii;
+    int32_t perf_hl_cache_size;
+    // ime
+    bool ime_disable_on_activate;
+    bool ime_disable_on_modechange;
+} zonvie_config_values;
+
+/* Load config from TOML file. path may be NULL for defaults only.
+   Returns opaque handle; call zonvie_config_destroy when done.
+   Strings in zonvie_config_values are valid until zonvie_config_destroy. */
+ZONVIE_API zonvie_config* zonvie_config_load(const char* path);
+
+/* Get flat config values from handle. */
+ZONVIE_API zonvie_config_values zonvie_config_get_values(const zonvie_config* config);
+
+/* Free config handle and all associated memory. */
+ZONVIE_API void zonvie_config_destroy(zonvie_config* config);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1130,3 +1130,156 @@ pub export fn zonvie_core_route_message(
         .timeout = route_result.timeout,
     };
 }
+
+// ========================================================================
+// Standalone config API (independent of zonvie_core)
+// ========================================================================
+
+pub const zonvie_config = opaque {};
+
+pub const zonvie_config_values = extern struct {
+    // font
+    font_family: [*:0]const u8 = "",
+    font_size: f32 = 14.0,
+    font_linespace: i32 = 0,
+    // window
+    window_blur: bool = false,
+    window_opacity: f32 = 1.0,
+    window_blur_radius: i32 = 20,
+    // scrollbar
+    scrollbar_enabled: bool = true,
+    scrollbar_show_mode: [*:0]const u8 = "scroll",
+    scrollbar_opacity: f32 = 0.7,
+    scrollbar_delay: f32 = 1.0,
+    // ext features
+    cmdline_external: bool = false,
+    popup_external: bool = false,
+    messages_external: bool = false,
+    messages_ext_float_pos: i32 = 0, // 0=window, 1=grid, 2=display
+    messages_mini_pos: i32 = 1, // 0=window, 1=grid, 2=display
+    tabline_external: bool = false,
+    tabline_style: [*:0]const u8 = "titlebar",
+    tabline_sidebar_position: [*:0]const u8 = "left",
+    tabline_sidebar_width: i32 = 200,
+    windows_external: bool = false,
+    // neovim
+    neovim_path: [*:0]const u8 = "nvim",
+    neovim_ssh: bool = false,
+    neovim_ssh_host: ?[*:0]const u8 = null,
+    neovim_ssh_port: i32 = 0,
+    neovim_ssh_identity: ?[*:0]const u8 = null,
+    // log
+    log_enabled: bool = false,
+    log_path: ?[*:0]const u8 = null,
+    // performance
+    perf_glyph_cache_ascii: i32 = 512,
+    perf_glyph_cache_non_ascii: i32 = 256,
+    perf_hl_cache_size: i32 = 512,
+    // ime
+    ime_disable_on_activate: bool = false,
+    ime_disable_on_modechange: bool = false,
+};
+
+const ConfigHandle = struct {
+    arena: std.heap.ArenaAllocator,
+    cfg: config.Config,
+    values: zonvie_config_values,
+};
+
+fn dupeZForC(alloc: std.mem.Allocator, s: []const u8, fallback: [*:0]const u8) [*:0]const u8 {
+    const z = alloc.dupeZ(u8, s) catch return fallback;
+    return z.ptr;
+}
+
+fn dupeZForCOpt(alloc: std.mem.Allocator, s: ?[]const u8) ?[*:0]const u8 {
+    const str = s orelse return null;
+    const z = alloc.dupeZ(u8, str) catch return null;
+    return z.ptr;
+}
+
+fn msgPosToInt(pos: config.MsgPosition) i32 {
+    return switch (pos) {
+        .window => 0,
+        .grid => 1,
+        .display => 2,
+    };
+}
+
+fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie_config_values {
+    return .{
+        // font
+        .font_family = dupeZForC(alloc, cfg.font.family, "Menlo"),
+        .font_size = cfg.font.size,
+        .font_linespace = cfg.font.linespace,
+        // window
+        .window_blur = cfg.window.blur,
+        .window_opacity = cfg.window.opacity,
+        .window_blur_radius = cfg.window.blur_radius,
+        // scrollbar
+        .scrollbar_enabled = cfg.scrollbar.enabled,
+        .scrollbar_show_mode = dupeZForC(alloc, cfg.scrollbar.show_mode, "scroll"),
+        .scrollbar_opacity = cfg.scrollbar.opacity,
+        .scrollbar_delay = cfg.scrollbar.delay,
+        // ext features
+        .cmdline_external = cfg.cmdline.external,
+        .popup_external = cfg.popup.external,
+        .messages_external = cfg.messages.external,
+        .messages_ext_float_pos = msgPosToInt(cfg.messages.msg_pos.ext_float),
+        .messages_mini_pos = msgPosToInt(cfg.messages.msg_pos.mini),
+        .tabline_external = cfg.tabline.external,
+        .tabline_style = dupeZForC(alloc, cfg.tabline.style, "titlebar"),
+        .tabline_sidebar_position = dupeZForC(alloc, cfg.tabline.sidebar_position, "left"),
+        .tabline_sidebar_width = @intCast(cfg.tabline.sidebar_width),
+        .windows_external = cfg.windows.external,
+        // neovim
+        .neovim_path = dupeZForC(alloc, cfg.neovim.path, "nvim"),
+        .neovim_ssh = cfg.neovim.ssh,
+        .neovim_ssh_host = dupeZForCOpt(alloc, cfg.neovim.ssh_host),
+        .neovim_ssh_port = if (cfg.neovim.ssh_port) |p| @as(i32, @intCast(p)) else 0,
+        .neovim_ssh_identity = dupeZForCOpt(alloc, cfg.neovim.ssh_identity),
+        // log
+        .log_enabled = cfg.log.enabled,
+        .log_path = dupeZForCOpt(alloc, cfg.log.path),
+        // performance
+        .perf_glyph_cache_ascii = @intCast(cfg.performance.glyph_cache_ascii_size),
+        .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),
+        .perf_hl_cache_size = @intCast(cfg.performance.hl_cache_size),
+        // ime
+        .ime_disable_on_activate = cfg.ime.disable_on_activate,
+        .ime_disable_on_modechange = cfg.ime.disable_on_modechange,
+    };
+}
+
+/// Load config from TOML file. path may be NULL for defaults only.
+/// Returns opaque handle; call zonvie_config_destroy when done.
+pub export fn zonvie_config_load(path: ?[*:0]const u8) callconv(.c) ?*zonvie_config {
+    const handle = std.heap.page_allocator.create(ConfigHandle) catch return null;
+    handle.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const arena_alloc = handle.arena.allocator();
+
+    if (path) |p| {
+        const path_str = std.mem.span(p);
+        handle.cfg = config.Config.loadFromPath(arena_alloc, path_str);
+    } else {
+        handle.cfg = config.Config{};
+    }
+    handle.cfg.alloc = arena_alloc;
+
+    handle.values = buildConfigValues(arena_alloc, &handle.cfg);
+    return @ptrCast(handle);
+}
+
+/// Get flat config values from handle.
+pub export fn zonvie_config_get_values(p: ?*const zonvie_config) callconv(.c) zonvie_config_values {
+    if (p == null) return zonvie_config_values{};
+    const handle: *const ConfigHandle = @ptrCast(@alignCast(p.?));
+    return handle.values;
+}
+
+/// Free config handle and all associated memory.
+pub export fn zonvie_config_destroy(p: ?*zonvie_config) callconv(.c) void {
+    if (p == null) return;
+    const handle: *ConfigHandle = @ptrCast(@alignCast(p.?));
+    handle.arena.deinit();
+    std.heap.page_allocator.destroy(handle);
+}

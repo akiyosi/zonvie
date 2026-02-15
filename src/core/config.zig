@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const toml = @import("toml");
 
 /// Message event types for routing
@@ -148,7 +149,7 @@ pub const Config = struct {
     routes_allocated: bool = false,
 
     pub const NeovimConfig = struct {
-        path: []const u8 = "nvim",
+        path: []const u8 = if (builtin.os.tag == .macos) "/usr/local/bin/nvim" else "nvim",
         wsl: bool = false,
         wsl_distro: ?[]const u8 = null,
         ssh: bool = false,
@@ -158,14 +159,14 @@ pub const Config = struct {
     };
 
     pub const FontConfig = struct {
-        family: []const u8 = "Consolas",
+        family: []const u8 = if (builtin.os.tag == .macos) "Menlo" else "Consolas",
         size: f32 = 14.0,
         linespace: i32 = 0,
     };
 
     pub const WindowConfig = struct {
-        opacity: f32 = 1.0,
-        blur: bool = false,
+        opacity: f32 = if (builtin.os.tag == .macos) 0.5 else 1.0,
+        blur: bool = if (builtin.os.tag == .macos) true else false,
         blur_radius: i32 = 20,
     };
 
@@ -218,6 +219,9 @@ pub const Config = struct {
 
     pub const TablineConfig = struct {
         external: bool = false,
+        style: []const u8 = "titlebar",
+        sidebar_position: []const u8 = "left",
+        sidebar_width: u32 = 200,
     };
 
     pub const WindowsConfig = struct {
@@ -362,6 +366,17 @@ pub const Config = struct {
 
         if (cfg.tabline) |t| {
             if (t.external) |e| self.tabline.external = e;
+            if (t.style) |s| {
+                if (std.mem.eql(u8, s, "titlebar") or std.mem.eql(u8, s, "menu") or std.mem.eql(u8, s, "sidebar")) {
+                    self.tabline.style = alloc.dupe(u8, s) catch self.tabline.style;
+                }
+            }
+            if (t.sidebar_position) |s| {
+                if (std.mem.eql(u8, s, "left") or std.mem.eql(u8, s, "right")) {
+                    self.tabline.sidebar_position = alloc.dupe(u8, s) catch self.tabline.sidebar_position;
+                }
+            }
+            if (t.sidebar_width) |w| self.tabline.sidebar_width = @max(100, @min(500, w));
         }
 
         if (cfg.windows) |w| {
@@ -445,6 +460,14 @@ pub const Config = struct {
         // Free duplicated scrollbar.show_mode
         if (self.scrollbar.show_mode.ptr != default.scrollbar.show_mode.ptr) {
             alloc.free(self.scrollbar.show_mode);
+        }
+
+        // Free duplicated tabline strings
+        if (self.tabline.style.ptr != default.tabline.style.ptr) {
+            alloc.free(self.tabline.style);
+        }
+        if (self.tabline.sidebar_position.ptr != default.tabline.sidebar_position.ptr) {
+            alloc.free(self.tabline.sidebar_position);
         }
 
         // Free duplicated log.path
@@ -542,6 +565,9 @@ const TomlRoute = struct {
 
 const TomlTabline = struct {
     external: ?bool = null,
+    style: ?[]const u8 = null,
+    sidebar_position: ?[]const u8 = null,
+    sidebar_width: ?u32 = null,
 };
 
 const TomlWindows = struct {

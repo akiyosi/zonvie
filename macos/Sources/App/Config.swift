@@ -140,290 +140,86 @@ struct ZonvieConfig {
     static func load() -> ZonvieConfig {
         var config = ZonvieConfig()
 
-        let configPath = configFilePath
-        guard FileManager.default.fileExists(atPath: configPath.path) else {
+        let configPath = configFilePath.path
+
+        // Use Zig core TOML parser via C API
+        let handle: OpaquePointer? = configPath.withCString { cPath in
+            return zonvie_config_load(cPath)
+        }
+
+        guard let handle = handle else {
             return config
         }
 
-        guard let content = try? String(contentsOf: configPath, encoding: .utf8) else {
-            return config
-        }
+        let v = zonvie_config_get_values(handle)
 
-        config.parse(content)
+        // Font
+        if let s = v.font_family { config.font.family = String(cString: s) }
+        config.font.size = Double(v.font_size)
+        config.font.linespace = Int(v.font_linespace)
+
+        // Window
+        config.window.blur = v.window_blur
+        config.window.opacity = Double(v.window_opacity)
+        config.window.blurRadius = Int(v.window_blur_radius)
+
+        // Scrollbar
+        config.scrollbar.enabled = v.scrollbar_enabled
+        if let s = v.scrollbar_show_mode { config.scrollbar.showMode = String(cString: s) }
+        config.scrollbar.opacity = Double(v.scrollbar_opacity)
+        config.scrollbar.delay = Double(v.scrollbar_delay)
+
+        // Ext features
+        config.cmdline.external = v.cmdline_external
+        config.popup.external = v.popup_external
+        config.messages.external = v.messages_external
+        config.messages.extFloatPos = MsgPosition.from(int: v.messages_ext_float_pos)
+        config.messages.miniPos = MsgPosition.from(int: v.messages_mini_pos)
+        config.tabline.external = v.tabline_external
+        if let s = v.tabline_style { config.tabline.style = String(cString: s) }
+        if let s = v.tabline_sidebar_position { config.tabline.sidebarPosition = String(cString: s) }
+        config.tabline.sidebarWidth = Int(v.tabline_sidebar_width)
+        config.windows.external = v.windows_external
+
+        // Neovim
+        if let s = v.neovim_path { config.neovim.path = String(cString: s) }
+        config.neovim.ssh = v.neovim_ssh
+        if let s = v.neovim_ssh_host { config.neovim.sshHost = String(cString: s) }
+        config.neovim.sshPort = v.neovim_ssh_port > 0 ? Int(v.neovim_ssh_port) : nil
+        if let s = v.neovim_ssh_identity { config.neovim.sshIdentity = String(cString: s) }
+
+        // Log
+        config.log.enabled = v.log_enabled
+        if let s = v.log_path { config.log.path = String(cString: s) }
+
+        // Performance
+        config.performance.glyphCacheAsciiSize = Int(v.perf_glyph_cache_ascii)
+        config.performance.glyphCacheNonAsciiSize = Int(v.perf_glyph_cache_non_ascii)
+        config.performance.hlCacheSize = Int(v.perf_hl_cache_size)
+
+        // IME
+        config.ime.disableOnActivate = v.ime_disable_on_activate
+        config.ime.disableOnModechange = v.ime_disable_on_modechange
+
+        zonvie_config_destroy(handle)
+
         return config
     }
 
-    /// Simple TOML parser for key = value format
-    mutating func parse(_ content: String) {
-        var currentSection = ""
-        let lines = content.components(separatedBy: .newlines)
+}
 
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+// MARK: - MsgPosition C API helper
 
-            // Skip empty lines and comments
-            if trimmed.isEmpty || trimmed.hasPrefix("#") {
-                continue
-            }
-
-            // Section header: [section]
-            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
-                currentSection = String(trimmed.dropFirst().dropLast())
-                continue
-            }
-
-            // Key = value pair
-            guard let eqIndex = trimmed.firstIndex(of: "=") else {
-                continue
-            }
-
-            let key = trimmed[..<eqIndex].trimmingCharacters(in: .whitespaces)
-            var value = trimmed[trimmed.index(after: eqIndex)...].trimmingCharacters(in: .whitespaces)
-
-            // Handle quoted strings and inline comments
-            if value.hasPrefix("\"") {
-                // Quoted string: extract content between first pair of quotes
-                let afterOpenQuote = value.index(after: value.startIndex)
-                if let closeQuoteIndex = value[afterOpenQuote...].firstIndex(of: "\"") {
-                    value = String(value[afterOpenQuote..<closeQuoteIndex])
-                } else {
-                    // No closing quote found - strip opening quote
-                    value = String(value.dropFirst())
-                }
-            } else if value.hasPrefix("{") {
-                // Inline table: keep as-is (e.g. msg_pos = { ... })
-            } else {
-                // Unquoted value: strip inline comment.
-                // A '#' preceded by whitespace is treated as a comment start.
-                // Bare '#' without leading space is kept (e.g. #rrggbb would
-                // need quoting in TOML, but we tolerate it here).
-                if let range = value.range(of: " #") {
-                    value = value[..<range.lowerBound].trimmingCharacters(in: .whitespaces)
-                }
-            }
-
-            applyValue(section: currentSection, key: key, value: value)
+extension ZonvieConfig.MsgPosition {
+    /// Convert C API int value to MsgPosition enum
+    static func from(int value: Int32) -> ZonvieConfig.MsgPosition {
+        switch value {
+        case 0: return .window
+        case 1: return .grid
+        case 2: return .display
+        default: return .window
         }
     }
-
-    /// Apply parsed value to configuration
-    private mutating func applyValue(section: String, key: String, value: String) {
-        switch section {
-        case "neovim":
-            switch key {
-            case "path":
-                neovim.path = value
-            case "ssh":
-                neovim.ssh = (value == "true")
-            case "ssh_host":
-                neovim.sshHost = value.isEmpty ? nil : value
-            case "ssh_port":
-                if let port = Int(value), port > 0, port <= 65535 {
-                    neovim.sshPort = port
-                }
-            case "ssh_identity":
-                neovim.sshIdentity = value.isEmpty ? nil : value
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: neovim.\(key)")
-            }
-
-        case "font":
-            switch key {
-            case "family":
-                font.family = value
-            case "size":
-                if let size = Double(value) {
-                    font.size = size
-                }
-            case "linespace":
-                if let ls = Int(value) {
-                    font.linespace = ls
-                }
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: font.\(key)")
-            }
-
-        case "window":
-            switch key {
-            case "blur":
-                window.blur = (value == "true")
-            case "opacity":
-                if let opacity = Double(value) {
-                    window.opacity = max(0.0, min(1.0, opacity))
-                }
-            case "blur_radius":
-                if let radius = Int(value) {
-                    window.blurRadius = max(1, min(100, radius))
-                }
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: window.\(key)")
-            }
-
-        case "scrollbar":
-            switch key {
-            case "enabled":
-                scrollbar.enabled = (value == "true")
-            case "show_mode":
-                // Allow single values or combinations like "hover,scroll"
-                scrollbar.showMode = value
-            case "opacity":
-                if let opacity = Double(value) {
-                    scrollbar.opacity = max(0.0, min(1.0, opacity))
-                }
-            case "delay":
-                if let d = Double(value) {
-                    scrollbar.delay = max(0.1, min(10.0, d))
-                }
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: scrollbar.\(key)")
-            }
-
-        case "cmdline":
-            switch key {
-            case "external":
-                cmdline.external = (value == "true")
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: cmdline.\(key)")
-            }
-
-        case "popup":
-            switch key {
-            case "external":
-                popup.external = (value == "true")
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: popup.\(key)")
-            }
-
-        case "messages":
-            switch key {
-            case "external":
-                messages.external = (value == "true")
-            case "msg_pos":
-                // Parse inline table: { ext-float = "display", mini = "grid" }
-                parseInlineMsgPos(value)
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: messages.\(key)")
-            }
-
-        case "tabline":
-            switch key {
-            case "external":
-                tabline.external = (value == "true")
-            case "style":
-                if ["titlebar", "menu", "sidebar"].contains(value) {
-                    tabline.style = value
-                } else {
-                    ZonvieCore.appLog("[Config] Invalid tabline.style: \(value) (expected: titlebar, menu, sidebar)")
-                }
-            case "sidebar_position":
-                if ["left", "right"].contains(value) {
-                    tabline.sidebarPosition = value
-                } else {
-                    ZonvieCore.appLog("[Config] Invalid tabline.sidebar_position: \(value) (expected: left, right)")
-                }
-            case "sidebar_width":
-                if let w = Int(value), w >= 100, w <= 500 {
-                    tabline.sidebarWidth = w
-                } else {
-                    ZonvieCore.appLog("[Config] Invalid tabline.sidebar_width: \(value) (expected: 100-500)")
-                }
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: tabline.\(key)")
-            }
-
-        case "windows":
-            switch key {
-            case "external":
-                windows.external = (value == "true")
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: windows.\(key)")
-            }
-
-        case "log":
-            switch key {
-            case "enabled":
-                log.enabled = (value == "true")
-            case "path":
-                log.path = value.isEmpty ? nil : value
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: log.\(key)")
-            }
-
-        case "performance":
-            switch key {
-            case "glyph_cache_ascii_size":
-                if let size = Int(value), size >= 128 {
-                    performance.glyphCacheAsciiSize = size
-                }
-            case "glyph_cache_non_ascii_size":
-                if let size = Int(value), size >= 64 {
-                    performance.glyphCacheNonAsciiSize = size
-                }
-            case "hl_cache_size":
-                if let size = Int(value), size >= 64, size <= 2048 {
-                    performance.hlCacheSize = size
-                }
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: performance.\(key)")
-            }
-
-        case "ime":
-            switch key {
-            case "disable_on_activate":
-                ime.disableOnActivate = (value == "true")
-            case "disable_on_modechange":
-                ime.disableOnModechange = (value == "true")
-            default:
-                ZonvieCore.appLog("[Config] Unknown key: ime.\(key)")
-            }
-
-        default:
-            if !section.isEmpty {
-                ZonvieCore.appLog("[Config] Unknown section: [\(section)]")
-            }
-        }
-    }
-
-    /// Parse inline table for msg_pos: { ext-float = "display", mini = "grid" }
-    private mutating func parseInlineMsgPos(_ value: String) {
-        ZonvieCore.appLog("[Config] parseInlineMsgPos: input='\(value)'")
-        // Remove braces and split by comma
-        var content = value.trimmingCharacters(in: .whitespaces)
-        if content.hasPrefix("{") { content = String(content.dropFirst()) }
-        if content.hasSuffix("}") { content = String(content.dropLast()) }
-
-        let pairs = content.components(separatedBy: ",")
-        for pair in pairs {
-            guard let eqIndex = pair.firstIndex(of: "=") else { continue }
-
-            let key = pair[..<eqIndex].trimmingCharacters(in: .whitespaces)
-            var val = pair[pair.index(after: eqIndex)...].trimmingCharacters(in: .whitespaces)
-
-            // Remove quotes
-            if val.hasPrefix("\"") && val.hasSuffix("\"") && val.count >= 2 {
-                val = String(val.dropFirst().dropLast())
-            }
-
-            ZonvieCore.appLog("[Config] parseInlineMsgPos: key='\(key)' val='\(val)'")
-
-            guard let pos = MsgPosition(rawValue: val) else {
-                ZonvieCore.appLog("[Config] Invalid msg_pos value for '\(key)': \(val) (expected: display, window, grid)")
-                continue
-            }
-
-            switch key {
-            case "ext-float":
-                messages.extFloatPos = pos
-                ZonvieCore.appLog("[Config] set extFloatPos=\(pos)")
-            case "mini":
-                messages.miniPos = pos
-                ZonvieCore.appLog("[Config] set miniPos=\(pos)")
-            default:
-                ZonvieCore.appLog("[Config] Unknown msg_pos key: \(key)")
-            }
-        }
-    }
-
 }
 
 // MARK: - Tabline style accessor
