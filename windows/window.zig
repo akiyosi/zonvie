@@ -524,6 +524,20 @@ pub export fn WndProc(
                     else
                         null;
 
+                    // Snap viewport height to cell boundaries to match core's NDC calculation.
+                    // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
+                    // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
+                    // misalignment between vertex positions and scissor rects (which causes stripes).
+                    const content_height: u32 = blk: {
+                        const cell_total_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
+                        const client_h: u32 = @intCast(@max(1, client_for_content.bottom - client_for_content.top));
+                        const y_off: u32 = content_y_offset orelse 0;
+                        const drawable_h: u32 = if (client_h > y_off) client_h - y_off else 0;
+                        const snapped: u32 = (drawable_h / cell_total_h) * cell_total_h;
+                        // Match core's @max(1, grid_rows) guarantee: at least 1 row tall
+                        break :blk @max(snapped, cell_total_h);
+                    };
+
                     // Update tabline texture (rendered via GDI offscreen -> D3D11 texture)
                     // This avoids DWM composition issues by keeping GDI rendering offscreen
                     if (app.ext_tabline_enabled and app.tabline_state.tab_count > 0) {
@@ -539,7 +553,7 @@ pub export fn WndProc(
                             const main_verts_now = app.main_verts.items;
                             // Only include cursor verts if blink state is visible
                             const cursor_verts_now = if (app.cursor_blink_state) app.cursor_verts.items else &[_]core.Vertex{};
-                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .tabbar_bg_color = tabbar_bg_color })) {
+                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
                                 render_ok = true;
                             } else |e| {
                                 applog.appLog("gpu.draw failed: {any}\n", .{e});
@@ -975,6 +989,7 @@ pub export fn WndProc(
                                 .preserve_on_null_dirty = preserve_back,
                                 .content_width = content_width,
                                 .content_y_offset = content_y_offset,
+                                .content_height = content_height,
                                 .tabbar_bg_color = tabbar_bg_color,
                             },
                         ) catch |e| {

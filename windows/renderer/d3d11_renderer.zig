@@ -484,6 +484,11 @@ pub const Renderer = struct {
         // If null, uses 0.
         content_y_offset: ?u32 = null,
 
+        // Content height for viewport, snapped to cell boundaries.
+        // Must match the core's NDC viewport calculation (grid_rows * cell_h).
+        // If null, uses (self.height - content_y_offset).
+        content_height: ?u32 = null,
+
         // Tabbar background color (RGBA, premultiplied alpha).
         // If non-null and content_y_offset is set, draws a solid rect in the tabbar area.
         tabbar_bg_color: ?[4]f32 = null,
@@ -574,7 +579,8 @@ pub const Renderer = struct {
         // Use content_y_offset if specified (for tabline)
         const viewport_width = opts.content_width orelse self.width;
         const viewport_y_offset = opts.content_y_offset orelse 0;
-        const viewport_height = if (self.height > viewport_y_offset) self.height - viewport_y_offset else self.height;
+        const viewport_height = opts.content_height orelse
+            (if (self.height > viewport_y_offset) self.height - viewport_y_offset else self.height);
         {
             var vp: c.D3D11_VIEWPORT = .{
                 .TopLeftX = 0,
