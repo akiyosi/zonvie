@@ -2093,7 +2093,11 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
         if (app.hwnd) |main_hwnd| {
             var rect: c.RECT = std.mem.zeroes(c.RECT);
             _ = c.GetWindowRect(main_hwnd, &rect);
-            const main_win_id = if (app.corep) |cp| app_mod.zonvie_core_get_win_id(cp, 2) else 0;
+            // Do NOT call zonvie_core_get_win_id here — this function may run
+            // during redraw callbacks where grid_mu is already held, and
+            // zonvie_core_get_win_id would re-acquire grid_mu causing deadlock.
+            // Callers that need win_id must resolve it separately.
+            const main_win_id: i64 = 0;
             result[count] = .{ .grid_id = 2, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
             count += 1;
         }
@@ -2373,12 +2377,22 @@ pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c
     app.mu.lock();
     const cursor_grid = app.last_cursor_grid;
     const coll = collectWindowInfos(app, true);
+    const corep = app.corep;
     app.mu.unlock();
 
     const infos = coll.infos[0..coll.count];
     if (findInDirection(infos, cursor_grid, direction, count)) |target| {
-        if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{target.win_id});
-        return target.win_id;
+        // collectWindowInfos sets win_id=0 for grid 2 (main window) to avoid
+        // calling zonvie_core_get_win_id while grid_mu might be held.
+        // Resolve it here where app.mu is released and grid_mu is not held.
+        var win_id = target.win_id;
+        if (win_id == 0 and target.grid_id == 2) {
+            if (corep) |cp| {
+                win_id = app_mod.zonvie_core_get_win_id(cp, 2);
+            }
+        }
+        if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
+        return win_id;
     }
     return 0;
 }
