@@ -671,6 +671,12 @@ typedef struct zonvie_callbacks {
     void (*on_flush_begin)(void* ctx);
     void (*on_flush_end)(void* ctx);
 
+    /* Neovim default_colors_set notification.
+       Called when Neovim sends a default_colors_set redraw event (colorscheme change).
+       fg/bg are 24-bit RGB (0x00RRGGBB), or 0xFFFFFFFF if not set.
+       Runs on the core/redraw thread with grid_mu held. */
+    void (*on_default_colors_set)(void* ctx, uint32_t fg, uint32_t bg);
+
     /* ext_windows layout operation callbacks */
     zonvie_on_win_move_fn on_win_move;
     zonvie_on_win_exchange_fn on_win_exchange;

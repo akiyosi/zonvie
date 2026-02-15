@@ -467,25 +467,26 @@ final class TabBarView: NSView {
 
             let location = convert(event.locationInWindow, from: nil)
             let screenLocation = window.convertPoint(toScreen: event.locationInWindow)
-            let windowFrame = window.frame
 
-            // Check if mouse is outside window bounds (with threshold)
-            let expandedFrame = windowFrame.insetBy(dx: -externalDragThreshold, dy: -externalDragThreshold)
-            let isOutsideWindow = !expandedFrame.contains(screenLocation)
+            // Check if mouse is outside tab bar bounds (with threshold)
+            let tabBarBoundsInWindow = self.convert(self.bounds, to: nil)
+            let tabBarScreenRect = window.convertToScreen(tabBarBoundsInWindow)
+            let expandedTabBarRect = tabBarScreenRect.insetBy(dx: -externalDragThreshold, dy: -externalDragThreshold)
+            let isOutsideTabBar = !expandedTabBarRect.contains(screenLocation)
 
             switch event.type {
             case .leftMouseDragged:
                 // DEBUG: Log drag position
-                if isOutsideWindow {
-                    ZonvieCore.appLog("[TAB-DRAG] screenLocation=\(screenLocation) windowFrame=\(windowFrame) expandedFrame=\(expandedFrame) isOutside=\(isOutsideWindow)")
+                if isOutsideTabBar {
+                    ZonvieCore.appLog("[TAB-DRAG] screenLocation=\(screenLocation) tabBarScreenRect=\(tabBarScreenRect) expandedTabBarRect=\(expandedTabBarRect) isOutside=\(isOutsideTabBar)")
                 }
 
-                if isOutsideWindow && !isExternalDrag {
+                if isOutsideTabBar && !isExternalDrag {
                     // Entering external drag mode
                     isExternalDrag = true
                     ZonvieCore.appLog("[TAB-DRAG] Entering external drag mode for tab \(tabIndex)")
                     createDragPreviewWindow(for: tabIndex, at: screenLocation)
-                } else if !isOutsideWindow && isExternalDrag {
+                } else if !isOutsideTabBar && isExternalDrag {
                     // Returning to normal drag mode
                     isExternalDrag = false
                     ZonvieCore.appLog("[TAB-DRAG] Returning to normal drag mode")
@@ -698,10 +699,11 @@ final class TabBarView: NSView {
         let location = convert(event.locationInWindow, from: nil)
 
         let newHoveredIndex = tabIndex(at: location)
-        let newHoveredClose: Int? = if let index = newHoveredIndex, isCloseButton(at: location, tabIndex: index) {
-            index
+        let newHoveredClose: Int?
+        if let index = newHoveredIndex, isCloseButton(at: location, tabIndex: index) {
+            newHoveredClose = index
         } else {
-            nil
+            newHoveredClose = nil
         }
         let newHoveredNewTab = isNewTabButton(at: location)
 

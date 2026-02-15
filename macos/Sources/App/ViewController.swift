@@ -5,6 +5,7 @@ final class ViewController: NSViewController {
     private var terminalView: MetalTerminalView!
     private(set) var core: ZonvieCore!
     private var tabBarView: TabBarView?
+    private var sidebarView: TabSidebarView?
 
     // Height of the Chrome-style tab bar
     private let tabBarHeight: CGFloat = 36
@@ -19,10 +20,6 @@ final class ViewController: NSViewController {
     override func loadView() {
         self.view = NSView()
         self.view.wantsLayer = true
-        if ZonvieConfig.shared.blurEnabled {
-            self.view.layer?.isOpaque = false
-            self.view.layer?.backgroundColor = NSColor.clear.cgColor
-        }
     }
 
     override func viewDidLoad() {
@@ -30,18 +27,26 @@ final class ViewController: NSViewController {
 
         let config = ZonvieConfig.shared
 
-        // When blur is enabled, we use CGSSetWindowBackgroundBlurRadius (private API)
-        // instead of NSVisualEffectView for better control over blur radius.
-        // The window must be transparent for blur to show through.
+        // Configure root view layer for transparency.
+        // Must be done here (not in loadView) because the layer may not exist yet.
+        if config.blurEnabled {
+            view.layer?.isOpaque = false
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+            ZonvieCore.appLog("[ViewController] root view layer: exists=\(view.layer != nil) isOpaque=\(view.layer?.isOpaque ?? true)")
+        }
 
         terminalView = MetalTerminalView(frame: .zero, device: MTLCreateSystemDefaultDevice())
         terminalView.translatesAutoresizingMaskIntoConstraints = false
 
         view.addSubview(terminalView)
 
-        // Setup Chrome-style tab bar if ext_tabline is enabled (config file OR CLI flag)
-        let hasExtTabline = config.tabline.external || CommandLine.arguments.contains("--exttabline")
-        if hasExtTabline {
+        ZonvieCore.appLog("[ViewController] terminalView.layer exists=\(terminalView.layer != nil) isOpaque=\(terminalView.layer?.isOpaque ?? true)")
+
+        let tablineStyle = config.effectiveTablineStyle
+        ZonvieCore.appLog("[ViewController] effectiveTablineStyle=\(String(describing: tablineStyle)) tabline.external=\(config.tabline.external) tabline.style=\(config.tabline.style)")
+
+        switch tablineStyle {
+        case .titlebar:
             setupTabBar()
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -49,7 +54,24 @@ final class ViewController: NSViewController {
                 terminalView.topAnchor.constraint(equalTo: view.topAnchor, constant: tabBarHeight),
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
-        } else {
+
+        case .sidebar:
+            setupSidebar()
+            // Constraints are set up inside setupSidebar()
+
+        case .menu:
+            // Menu mode: no tab UI in the window, full-size terminal.
+            // Notification observers are set up for currentTabs tracking.
+            setupTablineNotificationObservers()
+            NSLayoutConstraint.activate([
+                terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
+
+        case nil:
+            // No ext_tabline: full-size terminal
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -122,7 +144,44 @@ final class ViewController: NSViewController {
         }
     }
 
-    // MARK: - Tab Bar
+    // MARK: - Tabline Notification Observers (shared across modes)
+
+    private func setupTablineNotificationObservers() {
+        tablineUpdateObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.tablineUpdateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let tabs = notification.userInfo?["tabs"] as? [(handle: Int64, name: String)],
+                  let currentTab = notification.userInfo?["currentTab"] as? Int64 else {
+                return
+            }
+            self?.handleTablineUpdate(tabs: tabs, currentTab: currentTab)
+        }
+
+        tablineHideObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.tablineHideNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleTablineHide()
+        }
+    }
+
+    private func handleTablineUpdate(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
+        self.currentTabs = tabs
+        tabBarView?.isHidden = false
+        sidebarView?.isHidden = false
+        tabBarView?.updateTabs(tabs, currentTab: currentTab)
+        sidebarView?.updateTabs(tabs, currentTab: currentTab)
+    }
+
+    private func handleTablineHide() {
+        tabBarView?.isHidden = true
+        sidebarView?.isHidden = true
+    }
+
+    // MARK: - Tab Bar (titlebar mode)
 
     private func setupTabBar() {
         let tabBar = TabBarView(frame: NSRect(x: 0, y: 0, width: view.bounds.width, height: tabBarHeight))
@@ -159,27 +218,64 @@ final class ViewController: NSViewController {
 
         self.tabBarView = tabBar
 
-        // Setup notification observers for tabline updates
-        tablineUpdateObserver = NotificationCenter.default.addObserver(
-            forName: ZonvieCore.tablineUpdateNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let tabs = notification.userInfo?["tabs"] as? [(handle: Int64, name: String)],
-                  let currentTab = notification.userInfo?["currentTab"] as? Int64 else {
-                return
-            }
-            self?.updateTabBar(tabs: tabs, currentTab: currentTab)
+        setupTablineNotificationObservers()
+    }
+
+    // MARK: - Sidebar (sidebar mode)
+
+    private func setupSidebar() {
+        let config = ZonvieConfig.shared
+        let sidebarWidth = CGFloat(config.tabline.sidebarWidth)
+        let isRight = config.tabline.sidebarPosition == "right"
+
+        let sidebar = TabSidebarView(frame: .zero)
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.isRightSide = isRight
+        view.addSubview(sidebar)
+
+        // Debug: log layer transparency chain
+        ZonvieCore.appLog("[Sidebar] blur=\(config.blurEnabled) sidebar.layer exists=\(sidebar.layer != nil) sidebar.layer.isOpaque=\(sidebar.layer?.isOpaque ?? true) sidebar.isOpaque=\(sidebar.isOpaque) view.layer.isOpaque=\(view.layer?.isOpaque ?? true)")
+
+        // Wire callbacks
+        sidebar.onTabSelected = { [weak self] handle in self?.selectTab(handle: handle) }
+        sidebar.onTabClosed = { [weak self] handle in self?.closeTab(handle: handle) }
+        sidebar.onNewTabRequested = { [weak self] in self?.createNewTab() }
+        sidebar.onTabExternalized = { [weak self] handle, dropPoint in
+            self?.externalizeTab(handle: handle, dropPoint: dropPoint)
         }
 
-        tablineHideObserver = NotificationCenter.default.addObserver(
-            forName: ZonvieCore.tablineHideNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.hideTabBar()
+        self.sidebarView = sidebar
+
+        if isRight {
+            NSLayoutConstraint.activate([
+                sidebar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                sidebar.topAnchor.constraint(equalTo: view.topAnchor),
+                sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+                sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
+
+                terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                terminalView.trailingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                sidebar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                sidebar.topAnchor.constraint(equalTo: view.topAnchor),
+                sidebar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+                sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
+
+                terminalView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+                terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                terminalView.topAnchor.constraint(equalTo: view.topAnchor),
+                terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
         }
+
+        setupTablineNotificationObservers()
     }
+
+    // MARK: - Public Tab Bar Control
 
     /// Update tab bar with new tab list
     func updateTabBar(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
@@ -199,7 +295,7 @@ final class ViewController: NSViewController {
 
     // MARK: - Tab Actions
 
-    private func selectTab(handle: Int64) {
+    func selectTab(handle: Int64) {
         // Find the tab index (1-based for Neovim)
         guard let index = currentTabs.firstIndex(where: { $0.handle == handle }) else {
             return
@@ -209,7 +305,7 @@ final class ViewController: NSViewController {
         core?.sendCommand("\(tabNumber)tabnext")
     }
 
-    private func closeTab(handle: Int64) {
+    func closeTab(handle: Int64) {
         // Find the tab index (1-based for Neovim)
         guard let index = currentTabs.firstIndex(where: { $0.handle == handle }) else {
             return
@@ -219,7 +315,7 @@ final class ViewController: NSViewController {
         core?.sendCommand("\(tabNumber)tabclose")
     }
 
-    private func createNewTab() {
+    func createNewTab() {
         // Use nvim_command API so it works even in terminal mode
         core?.sendCommand("tabnew")
     }

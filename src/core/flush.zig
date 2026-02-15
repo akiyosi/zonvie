@@ -1726,6 +1726,10 @@ pub const FlushCtx = struct {
     pub fn onSetTitle(ctx: *FlushCtx, title: []const u8) !void {
         ctx.core.emitSetTitle(title);
     }
+
+    pub fn onDefaultColors(ctx: *FlushCtx, fg: u32, bg: u32) !void {
+        ctx.core.emitDefaultColors(fg, bg);
+    }
 };
 
 pub fn notifyExternalWindowChanges(self: *Core) bool {

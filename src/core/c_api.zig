@@ -461,6 +461,9 @@ pub const Callbacks = extern struct {
     on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
+    // Neovim default_colors_set notification
+    on_default_colors_set: ?*const fn (ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void = null,
+
     // ext_windows layout operation callbacks
     on_win_move: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void = null,
     on_win_exchange: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void = null,
@@ -586,6 +589,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Flush bracketing (for GPU buffer management)
         .on_flush_begin = box.cb.on_flush_begin,
         .on_flush_end = box.cb.on_flush_end,
+
+        // Neovim default_colors_set notification
+        .on_default_colors_set = box.cb.on_default_colors_set,
 
         // ext_windows layout operation callbacks
         .on_win_move = box.cb.on_win_move,

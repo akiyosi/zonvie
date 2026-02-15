@@ -17,6 +17,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Files to open from Finder (queued until Neovim is ready)
     private var pendingFilesToOpen: [String] = []
 
+    // Tab menu manager (for "menu" tabline style)
+    private var tabMenuManager: TabMenuManager?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = ZonvieConfig.shared
         ZonvieCore.appLog("zonvie: applicationDidFinishLaunching")
@@ -42,7 +45,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         NSApp.setActivationPolicy(.regular)
+
+        // Setup application menu (includes Tab menu for "menu" tabline style)
+        setupApplicationMenu()
+
         createAndShowWindow()
+    }
+
+    // MARK: - Application Menu
+
+    private func setupApplicationMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu (About, Quit)
+        let appMenuItem = NSMenuItem(title: "zonvie", action: nil, keyEquivalent: "")
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About zonvie", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit zonvie", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Tab menu (only for "menu" tabline style)
+        if ZonvieConfig.shared.effectiveTablineStyle == .menu {
+            let tabMenuItem = NSMenuItem(title: "Tab", action: nil, keyEquivalent: "")
+            let tabMenu = NSMenu(title: "Tab")
+            tabMenuItem.submenu = tabMenu
+            mainMenu.addItem(tabMenuItem)
+
+            // TabMenuManager will populate the menu and observe notifications.
+            // It needs ViewController reference, which is set up after createAndShowWindow().
+            // Store the menu reference and defer TabMenuManager creation.
+            self.deferredTabMenu = tabMenu
+        }
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    // Deferred tab menu setup (needs ViewController)
+    private var deferredTabMenu: NSMenu?
+
+    private func finalizeTabMenuSetup() {
+        guard let tabMenu = deferredTabMenu,
+              let vc = window?.contentViewController as? ViewController else {
+            return
+        }
+        tabMenuManager = TabMenuManager(menu: tabMenu, viewController: vc)
+        deferredTabMenu = nil
     }
 
     private func createAndShowWindow() {
@@ -75,15 +124,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         var style: NSWindow.StyleMask = [.titled, .closable, .resizable, .miniaturizable]
 
-        // Add fullSizeContentView for Chrome-style tabs in titlebar
-        let hasExtTabline = config.tabline.external || CommandLine.arguments.contains("--exttabline")
-        if hasExtTabline {
+        let tablineStyle = ZonvieConfig.shared.effectiveTablineStyle
+        ZonvieCore.appLog("[AppDelegate] effectiveTablineStyle=\(String(describing: tablineStyle)) tabline.style=\(ZonvieConfig.shared.tabline.style)")
+
+        // Only titlebar mode needs fullSizeContentView and TabBarWindow
+        if tablineStyle == .titlebar {
             style.insert(.fullSizeContentView)
         }
 
-        // Use TabBarWindow for ext_tabline to handle mouse events properly
         let win: NSWindow
-        if hasExtTabline {
+        if tablineStyle == .titlebar {
             win = TabBarWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
         } else {
             win = NSWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
@@ -91,8 +141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         win.title = "zonvie"
         win.isReleasedWhenClosed = false
 
-        // Configure titlebar for Chrome-style tabs
-        if hasExtTabline {
+        // Configure titlebar for Chrome-style tabs (titlebar mode only)
+        if tablineStyle == .titlebar {
             win.titlebarAppearsTransparent = true
             win.titleVisibility = .hidden
             win.isMovableByWindowBackground = false
@@ -109,13 +159,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             win.backgroundColor = .clear
             ZonvieCore.appLog("[Window] Set transparent for blur: isOpaque=\(win.isOpaque) backgroundColor=\(String(describing: win.backgroundColor))")
         }
-        
+
         // Prevent the window from becoming unreasonably small.
-        win.contentMinSize = NSSize(width: 400, height: 300)
-        
+        // Add sidebar width to minimum if sidebar mode is active.
+        var minWidth: CGFloat = 400
+        if tablineStyle == .sidebar {
+            minWidth += CGFloat(config.tabline.sidebarWidth)
+        }
+        win.contentMinSize = NSSize(width: minWidth, height: 300)
+
         // Persist/restore window geometry (AppKit feature).
         win.setFrameAutosaveName(windowFrameAutosaveName)
-        
+
         // If there is a saved frame from the last session, use it.
         // Otherwise keep the computed default rect (centered 800x600-ish).
         if win.setFrameUsingName(windowFrameAutosaveName) {
@@ -123,12 +178,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             win.center()
         }
-        
+
         let vc = ViewController()
         win.contentViewController = vc
 
         self.window = win
         win.delegate = self  // Handle window close with unsaved buffer check
+
+        // Finalize tab menu setup now that ViewController exists
+        finalizeTabMenuSetup()
 
         // SSH/devcontainer mode: hide window until auth completes (neovimReadyNotification)
         // Normal mode: show window immediately

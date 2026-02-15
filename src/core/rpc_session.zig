@@ -554,6 +554,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             &fctx,
             flush.FlushCtx.onLinespace,
             flush.FlushCtx.onSetTitle,
+            flush.FlushCtx.onDefaultColors,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
         };

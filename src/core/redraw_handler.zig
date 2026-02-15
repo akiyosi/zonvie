@@ -360,6 +360,7 @@ pub fn handleRedraw(
     linespace_ctx: anytype,
     linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
     set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
+    default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
 ) !void {
 
     for (params) |ev| {
@@ -982,6 +983,10 @@ pub fn handleRedraw(
                 const bg = if (t[1] == .int) toRgbOpt(t[1].int) else null;
                 const sp = if (t.len >= 3 and t[2] == .int) toRgbOpt(t[2].int) else null;
                 hl.setDefaults(fg, bg, sp);
+
+                if (default_colors_fn) |dcf| {
+                    try dcf(opt_ctx, fg orelse 0xFFFFFFFF, bg orelse 0xFFFFFFFF);
+                }
             }
 
         } else if (std.mem.eql(u8, name, "option_set")) {

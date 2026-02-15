@@ -15,6 +15,13 @@ struct ZonvieConfig {
     var performance: PerformanceConfig = PerformanceConfig()
     var ime: IMEConfig = IMEConfig()
 
+    /// Tabline display style
+    enum TablineStyle: String {
+        case titlebar = "titlebar"   // Chrome-style tabs in titlebar
+        case menu = "menu"           // NSMenu dropdown in macOS menu bar
+        case sidebar = "sidebar"     // Sidebar panel with tab list
+    }
+
     /// Position anchor for message views
     enum MsgPosition: String {
         case display = "display" // Display-based, independent of Neovim window
@@ -78,6 +85,9 @@ struct ZonvieConfig {
 
     struct TablineConfig {
         var external: Bool = false
+        var style: String = "titlebar"       // "titlebar", "menu", "sidebar"
+        var sidebarPosition: String = "left" // "left" or "right"
+        var sidebarWidth: Int = 200          // 100-500 pixels
     }
 
     struct WindowsConfig {
@@ -170,9 +180,26 @@ struct ZonvieConfig {
             let key = trimmed[..<eqIndex].trimmingCharacters(in: .whitespaces)
             var value = trimmed[trimmed.index(after: eqIndex)...].trimmingCharacters(in: .whitespaces)
 
-            // Remove quotes from string values
-            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
-                value = String(value.dropFirst().dropLast())
+            // Handle quoted strings and inline comments
+            if value.hasPrefix("\"") {
+                // Quoted string: extract content between first pair of quotes
+                let afterOpenQuote = value.index(after: value.startIndex)
+                if let closeQuoteIndex = value[afterOpenQuote...].firstIndex(of: "\"") {
+                    value = String(value[afterOpenQuote..<closeQuoteIndex])
+                } else {
+                    // No closing quote found - strip opening quote
+                    value = String(value.dropFirst())
+                }
+            } else if value.hasPrefix("{") {
+                // Inline table: keep as-is (e.g. msg_pos = { ... })
+            } else {
+                // Unquoted value: strip inline comment.
+                // A '#' preceded by whitespace is treated as a comment start.
+                // Bare '#' without leading space is kept (e.g. #rrggbb would
+                // need quoting in TOML, but we tolerate it here).
+                if let range = value.range(of: " #") {
+                    value = value[..<range.lowerBound].trimmingCharacters(in: .whitespaces)
+                }
             }
 
             applyValue(section: currentSection, key: key, value: value)
@@ -282,6 +309,24 @@ struct ZonvieConfig {
             switch key {
             case "external":
                 tabline.external = (value == "true")
+            case "style":
+                if ["titlebar", "menu", "sidebar"].contains(value) {
+                    tabline.style = value
+                } else {
+                    ZonvieCore.appLog("[Config] Invalid tabline.style: \(value) (expected: titlebar, menu, sidebar)")
+                }
+            case "sidebar_position":
+                if ["left", "right"].contains(value) {
+                    tabline.sidebarPosition = value
+                } else {
+                    ZonvieCore.appLog("[Config] Invalid tabline.sidebar_position: \(value) (expected: left, right)")
+                }
+            case "sidebar_width":
+                if let w = Int(value), w >= 100, w <= 500 {
+                    tabline.sidebarWidth = w
+                } else {
+                    ZonvieCore.appLog("[Config] Invalid tabline.sidebar_width: \(value) (expected: 100-500)")
+                }
             default:
                 ZonvieCore.appLog("[Config] Unknown key: tabline.\(key)")
             }
@@ -379,6 +424,18 @@ struct ZonvieConfig {
         }
     }
 
+}
+
+// MARK: - Tabline style accessor
+
+extension ZonvieConfig {
+    /// Resolved tabline style. Returns nil if ext_tabline is not enabled.
+    var effectiveTablineStyle: TablineStyle? {
+        guard tabline.external || CommandLine.arguments.contains("--exttabline") else {
+            return nil
+        }
+        return TablineStyle(rawValue: tabline.style) ?? .titlebar
+    }
 }
 
 // MARK: - Convenience accessors for backward compatibility with BlurConfig

@@ -159,7 +159,10 @@ if args.contains("--help") || args.contains("-h") {
                 external        Enable external messages UI
 
             [tabline]
-                external        Enable external tabline UI
+                external            Enable external tabline UI
+                style               Display style: "titlebar", "menu", "sidebar" (default: "titlebar")
+                sidebar_position    Sidebar position: "left" or "right" (default: "left")
+                sidebar_width       Sidebar width in pixels (100-500, default: 200)
 
             [windows]
                 external        Enable external windows

@@ -40,6 +40,9 @@ final class ZonvieCore {
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
     private var hasNotifiedReady = false
 
+    // Notification posted when colorscheme (default bg/fg) changes
+    static let colorschemeDidChangeNotification = NSNotification.Name("ZonvieColorschemeDidChange")
+
     // Timeout for quit request (to handle unresponsive Neovim)
     private var quitTimeoutWorkItem: DispatchWorkItem?
     private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
@@ -497,6 +500,20 @@ final class ZonvieCore {
                 if let corePtr = me.core {
                     let bg = zonvie_core_get_default_bg(corePtr)
                     me.terminalView?.renderer.updateDefaultBgColor(bg)
+                }
+            },
+
+            // Colorscheme change notification (from default_colors_set redraw event).
+            // Runs on core thread with grid_mu held — dispatch to main for UI update.
+            on_default_colors_set: { ctx, fg, bg in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: ZonvieCore.colorschemeDidChangeNotification,
+                        object: nil,
+                        userInfo: ["bgRGB": bg, "fgRGB": fg]
+                    )
                 }
             },
 

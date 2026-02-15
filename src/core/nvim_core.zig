@@ -241,6 +241,10 @@ pub const Callbacks = struct {
     on_flush_begin: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_flush_end: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
+    // Neovim default_colors_set notification (colorscheme change).
+    // fg/bg are 24-bit RGB (0x00RRGGBB) or 0xFFFFFFFF if not set.
+    on_default_colors_set: ?*const fn (ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void = null,
+
     // ext_windows layout operation callbacks
     on_win_move: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void = null,
     on_win_exchange: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void = null,
@@ -1422,6 +1426,12 @@ pub const Core = struct {
         self.log.write("[core] emitSetTitle: len={d} cb={any}\n", .{ title.len, self.cb.on_set_title != null });
         if (self.cb.on_set_title) |f| {
             f(self.ctx, title.ptr, title.len);
+        }
+    }
+
+    pub fn emitDefaultColors(self: *Core, fg: u32, bg: u32) void {
+        if (self.cb.on_default_colors_set) |f| {
+            f(self.ctx, fg, bg);
         }
     }
 

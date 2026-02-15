@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		AB79DAFF2F1621F7005729E6 /* Config.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DAFE2F1621F7005729E6 /* Config.swift */; };
 		AB79DB012F1621F8005729E6 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DB002F1621F8005729E6 /* TabBarView.swift */; };
+		AB79DB032F1621F9005729E6 /* TabSidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DB022F1621F9005729E6 /* TabSidebarView.swift */; };
+		AB79DB052F1621FA005729E6 /* TabMenuManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB79DB042F1621FA005729E6 /* TabMenuManager.swift */; };
 		AB9AE9AD2EF1B8320072639A /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9A72EF1B8320072639A /* AppDelegate.swift */; };
 		AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9AB2EF1B8320072639A /* ViewController.swift */; };
 		AB9AE9AF2EF1B8320072639A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9A82EF1B8320072639A /* Assets.xcassets */; };
@@ -29,6 +31,8 @@
 /* Begin PBXFileReference section */
 		AB79DAFE2F1621F7005729E6 /* Config.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Config.swift; sourceTree = "<group>"; };
 		AB79DB002F1621F8005729E6 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
+		AB79DB022F1621F9005729E6 /* TabSidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabSidebarView.swift; sourceTree = "<group>"; };
+		AB79DB042F1621FA005729E6 /* TabMenuManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabMenuManager.swift; sourceTree = "<group>"; };
 		AB9AE9962EF1B6A50072639A /* zonvie.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = zonvie.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB9AE9A72EF1B8320072639A /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		AB9AE9A82EF1B8320072639A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -137,6 +141,8 @@
 			children = (
 				AB9AE9D02EF900000072639A /* ExternalGridView.swift */,
 				AB79DB002F1621F8005729E6 /* TabBarView.swift */,
+				AB79DB022F1621F9005729E6 /* TabSidebarView.swift */,
+				AB79DB042F1621FA005729E6 /* TabMenuManager.swift */,
 			);
 			path = UI;
 			sourceTree = "<group>";
@@ -243,6 +249,8 @@
 				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
 				AB79DAFF2F1621F7005729E6 /* Config.swift in Sources */,
 				AB79DB012F1621F8005729E6 /* TabBarView.swift in Sources */,
+				AB79DB032F1621F9005729E6 /* TabSidebarView.swift in Sources */,
+				AB79DB052F1621FA005729E6 /* TabMenuManager.swift in Sources */,
 				AB9AE9C12EF22AED0072639A /* MetalTerminalView.swift in Sources */,
 				AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */,
 				AB9AE9CA2EF2A2130072639A /* main.swift in Sources */,
