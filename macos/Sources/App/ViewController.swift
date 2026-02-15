@@ -357,15 +357,16 @@ final class ViewController: NSViewController {
         core.setPendingExternalWindowPosition(dropPoint)
 
         // Execute single Lua script that does both tab switch and externalization atomically.
-        // This avoids race condition between nvim_input (tab switch) and nvim_command (Lua).
+        // Uses nvim_open_win to create a new external window instead of vnew + nvim_win_set_config.
+        // In ext_windows mode, vnew would trigger win_split which creates another external window.
         // The Lua script:
         // 1. Switch to the target tab
         // 2. Check if tab has multiple windows (split) - abort if so
-        // 3. Get current window dimensions
-        // 4. Create new split with empty buffer (so main window isn't empty)
-        // 5. Externalize the original window
+        // 3. Get the window's buffer, cursor position, and dimensions
+        // 4. Create a new external window with nvim_open_win showing the same buffer
+        // 5. Replace the original window's buffer with a scratch buffer
         let tabNumber = index + 1
-        let luaScript = "lua vim.cmd('\(tabNumber)tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); vim.cmd('vnew'); vim.api.nvim_win_set_config(w,{external=true,width=W,height=H}); vim.api.nvim_set_current_win(w)"
+        let luaScript = "lua vim.cmd('\(tabNumber)tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local buf=vim.api.nvim_win_get_buf(w); local cur=vim.api.nvim_win_get_cursor(w); local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); local ew=vim.api.nvim_open_win(buf,true,{external=true,width=W,height=H}); vim.api.nvim_win_set_cursor(ew,cur); vim.api.nvim_win_set_buf(w,vim.api.nvim_create_buf(true,true))"
         ZonvieCore.appLog("[EXTERNALIZE] sending Lua script to nvim: \(luaScript)")
         core.sendCommand(luaScript)
     }
