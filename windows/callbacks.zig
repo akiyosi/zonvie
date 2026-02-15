@@ -25,50 +25,55 @@ var log_styled_glyph_last_report_ns: i128 = 0;
 // Helper functions used by callbacks
 // =========================================================================
 
-pub fn rectFromCursorVerts(hwnd: c.HWND, verts: []const app_mod.Vertex) ?c.RECT {
+/// Convert NDC cursor vertices to a pixel RECT using the D3D11 viewport
+/// dimensions. The viewport is snapped to cell boundaries (content_height),
+/// which is typically smaller than the full client area. Using the client
+/// rect directly would cause cumulative position drift toward the bottom.
+pub fn cursorRectInViewport(
+    verts: []const app_mod.Vertex,
+    vp_x: u32,
+    vp_y: u32,
+    vp_w: u32,
+    vp_h: u32,
+    clamp_right: i32,
+    clamp_bottom: i32,
+) ?c.RECT {
     if (verts.len == 0) return null;
 
-    var client: c.RECT = undefined;
-    _ = c.GetClientRect(hwnd, &client);
-
-    const w_f: f32 = @floatFromInt(@max(1, client.right - client.left));
-    const h_f: f32 = @floatFromInt(@max(1, client.bottom - client.top));
-
     var minx: f32 = verts[0].position[0];
-    var maxx: f32 = verts[0].position[0];
+    var maxx: f32 = minx;
     var miny: f32 = verts[0].position[1];
-    var maxy: f32 = verts[0].position[1];
+    var maxy: f32 = miny;
 
     for (verts) |v| {
-        const x = v.position[0];
-        const y = v.position[1];
-        if (x < minx) minx = x;
-        if (x > maxx) maxx = x;
-        if (y < miny) miny = y;
-        if (y > maxy) maxy = y;
+        if (v.position[0] < minx) minx = v.position[0];
+        if (v.position[0] > maxx) maxx = v.position[0];
+        if (v.position[1] < miny) miny = v.position[1];
+        if (v.position[1] > maxy) maxy = v.position[1];
     }
 
-    // NDC -> pixel
-    // x_px = (x_ndc + 1) * 0.5 * w
-    // y_px = (1 - y_ndc) * 0.5 * h   (y-down)
-    const l_f = (minx + 1.0) * 0.5 * w_f;
-    const r_f = (maxx + 1.0) * 0.5 * w_f;
-    const t_f = (1.0 - maxy) * 0.5 * h_f;
-    const b_f = (1.0 - miny) * 0.5 * h_f;
+    const w_f: f32 = @floatFromInt(vp_w);
+    const h_f: f32 = @floatFromInt(vp_h);
+    const x_off_f: f32 = @floatFromInt(vp_x);
+    const y_off_f: f32 = @floatFromInt(vp_y);
+
+    // NDC -> viewport pixel (absolute coords)
+    const l_f = x_off_f + (minx + 1.0) * 0.5 * w_f;
+    const r_f = x_off_f + (maxx + 1.0) * 0.5 * w_f;
+    const t_f = y_off_f + (1.0 - maxy) * 0.5 * h_f;
+    const b_f = y_off_f + (1.0 - miny) * 0.5 * h_f;
 
     var l: i32 = @intFromFloat(@floor(l_f));
     var r: i32 = @intFromFloat(@ceil(r_f));
     var t: i32 = @intFromFloat(@floor(t_f));
     var b: i32 = @intFromFloat(@ceil(b_f));
 
-    // clamp
     if (l < 0) l = 0;
     if (t < 0) t = 0;
-    if (r > client.right) r = client.right;
-    if (b > client.bottom) b = client.bottom;
+    if (r > clamp_right) r = clamp_right;
+    if (b > clamp_bottom) b = clamp_bottom;
 
     if (r <= l or b <= t) return null;
-
     return .{ .left = l, .top = t, .right = r, .bottom = b };
 }
 
@@ -355,9 +360,35 @@ pub fn onVerticesPartial(
             app.cursor_verts.appendSlice(app.alloc, slice) catch {};
 
             if (app.hwnd) |hwnd| {
-                // Use content_hwnd for cursor rect calculation when ext_tabline is enabled
+                // Compute viewport-aware cursor rect matching D3D11 viewport.
                 const rect_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-                const new_rc = rectFromCursorVerts(rect_hwnd, slice);
+                var rect_client: c.RECT = undefined;
+                _ = c.GetClientRect(rect_hwnd, &rect_client);
+
+                const vp_y: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+                    @intCast(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
+                else
+                    0;
+                const vp_x: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    0;
+                const sidebar_r: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+                    @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    0;
+                const client_w: u32 = @intCast(@max(1, rect_client.right));
+                const client_h: u32 = @intCast(@max(1, rect_client.bottom));
+                const base_w: u32 = if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+                    app_mod.getEffectiveContentWidth(app, client_w)
+                else
+                    client_w;
+                const vp_w: u32 = if (base_w > vp_x + sidebar_r) base_w - vp_x - sidebar_r else 1;
+                const cell_total_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
+                const drawable_h: u32 = if (client_h > vp_y) client_h - vp_y else 0;
+                const vp_h: u32 = @max((drawable_h / cell_total_h) * cell_total_h, cell_total_h);
+
+                const new_rc = cursorRectInViewport(slice, vp_x, vp_y, vp_w, vp_h, rect_client.right, rect_client.bottom);
                 app.last_cursor_rect_px = new_rc;
 
                 // Row-mode: cursor move should only invalidate cursor rects.

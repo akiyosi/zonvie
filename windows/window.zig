@@ -710,28 +710,53 @@ pub export fn WndProc(
                         const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
                         _ = c.GetClientRect(client_hwnd, &client);
 
-                        // Get cursor rect and transform coords to match viewport when ext_tabline/sidebar is enabled.
-                        // rectFromCursorVerts calculates using full window size, but viewport has X/Y offset
-                        // and reduced size. Transform: new_coord = offset + old_coord * content_size / full_size
-                        const cursor_rc_raw = callbacks.rectFromCursorVerts(client_hwnd, cursor_verts_snapshot);
-                        const cursor_rc_opt: ?c.RECT = if (cursor_rc_raw) |cr| blk: {
-                            const y_off: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                            const x_off: i32 = if (content_x_offset) |off| @intCast(off) else 0;
-                            const right_w: i32 = if (sidebar_right_width) |sw| @intCast(sw) else 0;
-                            if (y_off > 0 or x_off > 0 or right_w > 0) {
-                                const full_h: f32 = @floatFromInt(@max(1, client.bottom));
-                                const full_w: f32 = @floatFromInt(@max(1, client.right));
-                                const content_h: f32 = full_h - @as(f32, @floatFromInt(y_off));
-                                const content_w: f32 = full_w - @as(f32, @floatFromInt(x_off)) - @as(f32, @floatFromInt(right_w));
-                                break :blk .{
-                                    .left = x_off + @as(i32, @intFromFloat(@as(f32, @floatFromInt(cr.left)) * content_w / full_w)),
-                                    .top = y_off + @as(i32, @intFromFloat(@as(f32, @floatFromInt(cr.top)) * content_h / full_h)),
-                                    .right = x_off + @as(i32, @intFromFloat(@ceil(@as(f32, @floatFromInt(cr.right)) * content_w / full_w))),
-                                    .bottom = y_off + @as(i32, @intFromFloat(@ceil(@as(f32, @floatFromInt(cr.bottom)) * content_h / full_h))),
-                                };
-                            } else {
-                                break :blk cr;
+                        // Compute cursor rect directly from NDC vertices using viewport
+                        // dimensions (content_height etc.) to match the D3D11 viewport's
+                        // NDC-to-pixel mapping. Using the client rect (as rectFromCursorVerts
+                        // does) causes cumulative position drift because the viewport is
+                        // snapped to cell boundaries, which is smaller than the client area.
+                        const cursor_rc_opt: ?c.RECT = if (cursor_verts_snapshot.len != 0) blk: {
+                            var minx: f32 = cursor_verts_snapshot[0].position[0];
+                            var maxx: f32 = minx;
+                            var miny: f32 = cursor_verts_snapshot[0].position[1];
+                            var maxy: f32 = miny;
+                            for (cursor_verts_snapshot) |v| {
+                                if (v.position[0] < minx) minx = v.position[0];
+                                if (v.position[0] > maxx) maxx = v.position[0];
+                                if (v.position[1] < miny) miny = v.position[1];
+                                if (v.position[1] > maxy) maxy = v.position[1];
                             }
+                            // Mirror the D3D11 viewport calculation from drawEx:
+                            //   viewport = (x_offset, y_offset, viewport_width, content_height)
+                            const vp_x: u32 = content_x_offset orelse 0;
+                            const vp_y: u32 = content_y_offset orelse 0;
+                            const base_w: u32 = content_width orelse @intCast(@max(1, client.right));
+                            const sidebar_w: u32 = sidebar_right_width orelse 0;
+                            const vp_w: u32 = if (base_w > vp_x + sidebar_w) base_w - vp_x - sidebar_w else 1;
+                            const vp_h: u32 = content_height;
+
+                            const w_f: f32 = @floatFromInt(vp_w);
+                            const h_f: f32 = @floatFromInt(vp_h);
+                            const x_off_f: f32 = @floatFromInt(vp_x);
+                            const y_off_f: f32 = @floatFromInt(vp_y);
+
+                            const l_f = x_off_f + (minx + 1.0) * 0.5 * w_f;
+                            const r_f = x_off_f + (maxx + 1.0) * 0.5 * w_f;
+                            const t_f = y_off_f + (1.0 - maxy) * 0.5 * h_f;
+                            const b_f = y_off_f + (1.0 - miny) * 0.5 * h_f;
+
+                            var l: i32 = @intFromFloat(@floor(l_f));
+                            var r: i32 = @intFromFloat(@ceil(r_f));
+                            var t: i32 = @intFromFloat(@floor(t_f));
+                            var b: i32 = @intFromFloat(@ceil(b_f));
+
+                            if (l < 0) l = 0;
+                            if (t < 0) t = 0;
+                            if (r > client.right) r = client.right;
+                            if (b > client.bottom) b = client.bottom;
+
+                            if (r <= l or b <= t) break :blk null;
+                            break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
                         } else null;
                         
                         const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
