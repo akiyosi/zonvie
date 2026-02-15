@@ -3982,8 +3982,10 @@ final class ZonvieCore {
 
     private func onPopupmenuHide() {
         ZonvieCore.appLog("[popupmenu_hide]")
-        self.popupmenuAnchorGrid = nil
-        ZonvieCore.appLog("[popupmenu] anchor_grid cleared")
+        DispatchQueue.main.async { [weak self] in
+            self?.popupmenuAnchorGrid = nil
+            ZonvieCore.appLog("[popupmenu] anchor_grid cleared")
+        }
     }
 
     private func onPopupmenuSelect(selected: Int32) {
