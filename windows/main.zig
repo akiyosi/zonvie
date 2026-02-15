@@ -243,6 +243,17 @@ pub fn main() u8 {
     var ext_popup_enabled = config.popup.external;
     var ext_messages_enabled = config.messages.external;
     var ext_tabline_enabled = config.tabline.external;
+    var tabline_style: app_mod.TablineStyle = .titlebar;
+    var sidebar_position_right: bool = false;
+    var sidebar_width_px: u32 = 200;
+    if (ext_tabline_enabled) {
+        if (std.mem.eql(u8, config.tabline.style, "sidebar")) {
+            tabline_style = .sidebar;
+        }
+        // "menu" is not supported on Windows, falls through to titlebar
+        sidebar_position_right = std.mem.eql(u8, config.tabline.sidebar_position, "right");
+        sidebar_width_px = config.tabline.sidebar_width;
+    }
     var ext_windows_enabled = config.windows.external;
     var cli_log_path: ?[]const u8 = null;
     var wsl_mode: bool = config.neovim.wsl;
@@ -478,6 +489,9 @@ pub fn main() u8 {
         .ext_cmdline_enabled = ext_cmdline_enabled,
         .ext_messages_enabled = ext_messages_enabled,
         .ext_tabline_enabled = ext_tabline_enabled,
+        .tabline_style = tabline_style,
+        .sidebar_position_right = sidebar_position_right,
+        .sidebar_width_px = sidebar_width_px,
         .ext_windows_enabled = ext_windows_enabled,
         .wsl_mode = wsl_mode,
         .wsl_distro = wsl_distro,

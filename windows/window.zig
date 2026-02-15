@@ -154,7 +154,7 @@ pub export fn WndProc(
         // DWM custom titlebar: extend client area into titlebar
         c.WM_NCCALCSIZE => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and wParam != 0) {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and wParam != 0) {
                     // When wParam is TRUE, return 0 to use entire window as client area.
                     // This removes the standard titlebar/frame.
                     // The NCCALCSIZE_PARAMS structure at lParam defines the client rect.
@@ -169,7 +169,7 @@ pub export fn WndProc(
         // DWM custom titlebar: hit testing for resize borders and caption dragging
         c.WM_NCHITTEST => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled) {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
                     // Get cursor position in screen coordinates
                     const x = @as(i16, @truncate(lParam & 0xFFFF));
                     const y = @as(i16, @truncate((lParam >> 16) & 0xFFFF));
@@ -289,8 +289,8 @@ pub export fn WndProc(
                     applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
                 }
 
-                // DWM custom titlebar: trigger frame recalculation
-                if (app.ext_tabline_enabled) {
+                // DWM custom titlebar: trigger frame recalculation (titlebar mode only)
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
                     var rc: c.RECT = undefined;
                     _ = c.GetWindowRect(hwnd, &rc);
                     _ = c.SetWindowPos(
@@ -513,13 +513,26 @@ pub export fn WndProc(
 
                     // Content Y offset for ext_tabline (pushes content down below tabbar)
                     // When using content_hwnd (child window for D3D11), offset is 0 because D3D11 renders in child window starting at y=0
-                    const content_y_offset: ?u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                    // Only applies to titlebar mode (sidebar mode uses standard titlebar)
+                    const content_y_offset: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
                         @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
                     else
                         null;
 
+                    // Content X offset for sidebar mode (pushes content right of sidebar)
+                    const content_x_offset: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                    else
+                        null;
+
+                    // Sidebar right width (reduces content area from right edge)
+                    const sidebar_right_width: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+                        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                    else
+                        null;
+
                     // Tabbar background color (dark gray) - fallback if tabline texture not available
-                    const tabbar_bg_color: ?[4]f32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                    const tabbar_bg_color: ?[4]f32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
                         .{ 0.12, 0.12, 0.12, 1.0 }
                     else
                         null;
@@ -538,12 +551,19 @@ pub export fn WndProc(
                         break :blk @max(snapped, cell_total_h);
                     };
 
-                    // Update tabline texture (rendered via GDI offscreen -> D3D11 texture)
+                    // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
                     // This avoids DWM composition issues by keeping GDI rendering offscreen
-                    if (app.ext_tabline_enabled and app.tabline_state.tab_count > 0) {
-                        const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
-                        const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
-                        tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
+                    if (app.ext_tabline_enabled) {
+                        if (app.tabline_style == .titlebar and app.tabline_state.tab_count > 0) {
+                            const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
+                            const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
+                            tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
+                        } else if (app.tabline_style == .sidebar) {
+                            // Always call renderSidebarToD3D: it releases texture when tab_count == 0
+                            const sw: u32 = @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))));
+                            const sh: u32 = @intCast(@max(1, client_for_content.bottom));
+                            tabline_mod.renderSidebarToD3D(app, sw, sh);
+                        }
                     }
 
                     if (!row_mode) {
@@ -553,7 +573,7 @@ pub export fn WndProc(
                             const main_verts_now = app.main_verts.items;
                             // Only include cursor verts if blink state is visible
                             const cursor_verts_now = if (app.cursor_blink_state) app.cursor_verts.items else &[_]core.Vertex{};
-                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
+                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
                                 render_ok = true;
                             } else |e| {
                                 applog.appLog("gpu.draw failed: {any}\n", .{e});
@@ -690,19 +710,23 @@ pub export fn WndProc(
                         const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
                         _ = c.GetClientRect(client_hwnd, &client);
 
-                        // Get cursor rect and transform Y coords to match viewport when ext_tabline is enabled.
-                        // rectFromCursorVerts calculates Y using full window height, but viewport has Y offset
-                        // and reduced height. Transform: new_y = y_off + old_y * (full_h - y_off) / full_h
+                        // Get cursor rect and transform coords to match viewport when ext_tabline/sidebar is enabled.
+                        // rectFromCursorVerts calculates using full window size, but viewport has X/Y offset
+                        // and reduced size. Transform: new_coord = offset + old_coord * content_size / full_size
                         const cursor_rc_raw = callbacks.rectFromCursorVerts(client_hwnd, cursor_verts_snapshot);
                         const cursor_rc_opt: ?c.RECT = if (cursor_rc_raw) |cr| blk: {
                             const y_off: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                            if (y_off > 0) {
+                            const x_off: i32 = if (content_x_offset) |off| @intCast(off) else 0;
+                            const right_w: i32 = if (sidebar_right_width) |sw| @intCast(sw) else 0;
+                            if (y_off > 0 or x_off > 0 or right_w > 0) {
                                 const full_h: f32 = @floatFromInt(@max(1, client.bottom));
+                                const full_w: f32 = @floatFromInt(@max(1, client.right));
                                 const content_h: f32 = full_h - @as(f32, @floatFromInt(y_off));
+                                const content_w: f32 = full_w - @as(f32, @floatFromInt(x_off)) - @as(f32, @floatFromInt(right_w));
                                 break :blk .{
-                                    .left = cr.left,
+                                    .left = x_off + @as(i32, @intFromFloat(@as(f32, @floatFromInt(cr.left)) * content_w / full_w)),
                                     .top = y_off + @as(i32, @intFromFloat(@as(f32, @floatFromInt(cr.top)) * content_h / full_h)),
-                                    .right = cr.right,
+                                    .right = x_off + @as(i32, @intFromFloat(@ceil(@as(f32, @floatFromInt(cr.right)) * content_w / full_w))),
                                     .bottom = y_off + @as(i32, @intFromFloat(@ceil(@as(f32, @floatFromInt(cr.bottom)) * content_h / full_h))),
                                 };
                             } else {
@@ -989,6 +1013,8 @@ pub export fn WndProc(
                                 .preserve_on_null_dirty = preserve_back,
                                 .content_width = content_width,
                                 .content_y_offset = content_y_offset,
+                                .content_x_offset = content_x_offset,
+                                .sidebar_right_width = sidebar_right_width,
                                 .content_height = content_height,
                                 .tabbar_bg_color = tabbar_bg_color,
                             },
@@ -1084,11 +1110,12 @@ pub export fn WndProc(
                                         rv.uploaded_gen = rv.gen;
                                     }
 
-                                    // Add content_y_offset for ext_tabline (scissor is in screen coords)
+                                    // Add content offsets for ext_tabline (scissor is in screen coords)
                                     const y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
+                                    const x_offset: i32 = if (content_x_offset) |off| @intCast(off) else 0;
                                     const top: i32 = y_offset + @as(i32, @intCast(row)) * row_h_px;
                                     const bottom: i32 = top + row_h_px;
-                                    const row_rc: c.RECT = .{ .left = 0, .top = top, .right = client.right, .bottom = bottom };
+                                    const row_rc: c.RECT = .{ .left = x_offset, .top = top, .right = client.right, .bottom = bottom };
 
                                     if (use_row_scissor) {
                                         if (rs_set_sc_fn) |f| {
@@ -1160,22 +1187,25 @@ pub export fn WndProc(
                             if (app.cursor_vb) |vb| {
                                 if (ctx_ptr != null) {
                                     if (rs_set_sc_fn) |f| {
-                                        // Clamp to content width for "always" scrollbar mode
-                                        const scissor_right: c.LONG = if (content_width) |cw| @as(c.LONG, @intCast(cw)) else client.right;
+                                        // Compute scissor bounds matching content viewport (absolute coords)
+                                        const sc_x_off: c.LONG = if (content_x_offset) |off| @intCast(off) else 0;
+                                        const sc_y_off: c.LONG = if (content_y_offset) |off| @intCast(off) else 0;
+                                        // content_width is viewport-relative; add x_off for absolute coords
+                                        const sc_right: c.LONG = if (content_width) |cw| sc_x_off + @as(c.LONG, @intCast(cw)) else client.right;
                                         if (cursor_rc_opt) |cr| {
                                             // cursor_rc_opt is already transformed to viewport coords
                                             var sc: c.D3D11_RECT = .{
                                                 .left = cr.left,
                                                 .top = cr.top,
-                                                .right = @min(cr.right, scissor_right),
+                                                .right = @min(cr.right, sc_right),
                                                 .bottom = cr.bottom,
                                             };
                                             f(ctx_ptr, 1, &sc);
                                         } else {
                                             var sc: c.D3D11_RECT = .{
-                                                .left = 0,
-                                                .top = 0,
-                                                .right = scissor_right,
+                                                .left = sc_x_off,
+                                                .top = sc_y_off,
+                                                .right = sc_right,
                                                 .bottom = client.bottom,
                                             };
                                             f(ctx_ptr, 1, &sc);
@@ -2069,6 +2099,7 @@ pub export fn WndProc(
                     .on_guifont = callbacks.onGuiFont,
                     .on_linespace = callbacks.onLineSpace,
                     .on_exit = callbacks.onExit,
+                    .on_default_colors_set = callbacks.onDefaultColorsSet,
                     .on_set_title = callbacks.onSetTitle,
                     .on_external_window = external_windows.onExternalWindow,
                     .on_external_window_close = external_windows.onExternalWindowClose,
@@ -2705,11 +2736,29 @@ pub export fn WndProc(
                 const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
                 const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
 
-                // Check tabline area first (left button only, when ext_tabline enabled)
-                if (msg == c.WM_LBUTTONDOWN and app.ext_tabline_enabled) {
-                    if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                        tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
-                        return 0; // Handled by tabline
+                // Check tabline/sidebar area first (when ext_tabline enabled)
+                if (app.ext_tabline_enabled) {
+                    if (app.tabline_style == .titlebar) {
+                        if (msg == c.WM_LBUTTONDOWN and y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            return 0;
+                        }
+                    } else if (app.tabline_style == .sidebar) {
+                        var client_rect_sb: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect_sb);
+                        const sidebar_w_px = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                        const in_sidebar = if (app.sidebar_position_right)
+                            x >= @as(i16, @intCast(client_rect_sb.right - sidebar_w_px))
+                        else
+                            x < @as(i16, @intCast(sidebar_w_px));
+                        if (in_sidebar) {
+                            // Left button: handle sidebar interaction
+                            // Right/middle button: consume event to prevent Neovim input
+                            if (msg == c.WM_LBUTTONDOWN) {
+                                tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            }
+                            return 0;
+                        }
                     }
                 }
 
@@ -2749,9 +2798,14 @@ pub export fn WndProc(
                 app.mu.unlock();
 
                 const row_h = cell_h + linespace;
-                const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
+                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    @as(i32, x);
+                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
+                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
                     @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
@@ -2798,11 +2852,35 @@ pub export fn WndProc(
                 const x_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
                 const y_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
 
-                // Check tabline drag end or tabline area click (left button only)
-                if (msg == c.WM_LBUTTONUP and app.ext_tabline_enabled) {
-                    if (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                        tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
-                        return 0; // Handled by tabline
+                // Check tabline/sidebar drag end or area click
+                if (app.ext_tabline_enabled) {
+                    if (app.tabline_style == .titlebar) {
+                        if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
+                            tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                            return 0;
+                        }
+                    } else if (app.tabline_style == .sidebar) {
+                        if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or
+                            app.tabline_state.close_button_pressed != null or
+                            app.tabline_state.new_tab_button_pressed))
+                        {
+                            tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                            return 0;
+                        }
+                        // Check if event is in sidebar area — consume all buttons
+                        var client_rect_sb2: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect_sb2);
+                        const sb_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                        const in_sb = if (app.sidebar_position_right)
+                            x_up >= @as(i16, @intCast(client_rect_sb2.right - sb_w))
+                        else
+                            x_up < @as(i16, @intCast(sb_w));
+                        if (in_sb) {
+                            if (msg == c.WM_LBUTTONUP) {
+                                tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                            }
+                            return 0;
+                        }
                     }
                 }
 
@@ -2837,9 +2915,14 @@ pub export fn WndProc(
                 app.mu.unlock();
 
                 const row_h = cell_h + linespace;
-                const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
+                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    @as(i32, x);
+                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
+                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
                     @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
@@ -2879,7 +2962,7 @@ pub export fn WndProc(
         c.WM_NCMOUSEMOVE => {
             // Handle non-client mouse move (e.g., in HTCAPTION area of tabline)
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled) {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
                     // Clear tabline hover states when mouse moves into NC area (empty tabline region)
                     if (app.tabline_state.hovered_tab != null or
                         app.tabline_state.hovered_close != null or
@@ -2910,31 +2993,54 @@ pub export fn WndProc(
                 const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
                 const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
 
-                // Handle tabline drag or hover (when ext_tabline enabled)
+                // Handle tabline/sidebar drag or hover (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
-                    if (app.tabline_state.dragging_tab != null or y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                        tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
-                        // If dragging, consume the message; otherwise let other handlers process too
-                        if (app.tabline_state.dragging_tab != null) return 0;
-                    } else {
-                        // Mouse moved outside tabline area - clear hover state
-                        if (app.tabline_state.hovered_tab != null or
-                            app.tabline_state.hovered_close != null or
-                            app.tabline_state.hovered_window_btn != null or
-                            app.tabline_state.hovered_new_tab_btn)
-                        {
-                            app.tabline_state.hovered_tab = null;
-                            app.tabline_state.hovered_close = null;
-                            app.tabline_state.hovered_window_btn = null;
-                            app.tabline_state.hovered_new_tab_btn = false;
-                            // Invalidate tabline region to redraw without hover
-                            var tabline_rect: c.RECT = .{
-                                .left = 0,
-                                .top = 0,
-                                .right = 4096,
-                                .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                            };
-                            _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                    if (app.tabline_style == .titlebar) {
+                        if (app.tabline_state.dragging_tab != null or y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            if (app.tabline_state.dragging_tab != null) return 0;
+                        } else {
+                            if (app.tabline_state.hovered_tab != null or
+                                app.tabline_state.hovered_close != null or
+                                app.tabline_state.hovered_window_btn != null or
+                                app.tabline_state.hovered_new_tab_btn)
+                            {
+                                app.tabline_state.hovered_tab = null;
+                                app.tabline_state.hovered_close = null;
+                                app.tabline_state.hovered_window_btn = null;
+                                app.tabline_state.hovered_new_tab_btn = false;
+                                var tabline_rect: c.RECT = .{
+                                    .left = 0,
+                                    .top = 0,
+                                    .right = 4096,
+                                    .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
+                                };
+                                _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                            }
+                        }
+                    } else if (app.tabline_style == .sidebar) {
+                        var client_rect_sb3: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect_sb3);
+                        const sb_w3 = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                        const in_sb3 = if (app.sidebar_position_right)
+                            x >= @as(i16, @intCast(client_rect_sb3.right - sb_w3))
+                        else
+                            x < @as(i16, @intCast(sb_w3));
+
+                        if (app.tabline_state.dragging_tab != null or in_sb3) {
+                            tabline_mod.handleSidebarMouseMove(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            // Consume event: sidebar area is UI, not Neovim editor input
+                            return 0;
+                        } else {
+                            if (app.tabline_state.hovered_tab != null or
+                                app.tabline_state.hovered_close != null or
+                                app.tabline_state.hovered_new_tab_btn)
+                            {
+                                app.tabline_state.hovered_tab = null;
+                                app.tabline_state.hovered_close = null;
+                                app.tabline_state.hovered_new_tab_btn = false;
+                                _ = c.InvalidateRect(hwnd, null, 0);
+                            }
                         }
                     }
                 }
@@ -2981,9 +3087,14 @@ pub export fn WndProc(
                 app.mu.unlock();
 
                 const row_h = cell_h + linespace;
-                const col: i32 = if (cell_w > 0) @divTrunc(@as(i32, x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
+                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    @as(i32, x);
+                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
+                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
+                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
                     @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
                 else
                     @as(i32, y);
@@ -3177,7 +3288,7 @@ pub export fn WndProc(
         // DWM custom titlebar: extend frame into client area on activation
         c.WM_ACTIVATE => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled) {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
                     // Enable DWM shadow for borderless window by extending frame with minimal margins.
                     // MARGINS.bottom = 1 tricks DWM into thinking there's a frame, which enables the shadow.
                     // This doesn't cause glass overlay issues because the margin is only 1 pixel.
@@ -3235,25 +3346,72 @@ pub export fn WndProc(
             return 0;
         },
 
-        c.WM_CAPTURECHANGED => {
-            // Mouse capture lost - cancel any tabline drag
+        c.WM_MOUSELEAVE => {
+            // Mouse left the client area - clear sidebar hover states
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_state.dragging_tab != null) {
-                    applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag!\n", .{});
-                    tabline_mod.destroyDragPreviewWindow(app);
-                    app.tabline_state.cancelDrag();
-                    // Invalidate tabline region
-                    var tabline_rect: c.RECT = .{
-                        .left = 0,
-                        .top = 0,
-                        .right = 4096,
-                        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                    };
-                    var client_rect: c.RECT = undefined;
-                    if (c.GetClientRect(hwnd, &client_rect) != 0) {
-                        tabline_rect.right = client_rect.right;
+                if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
+                    if (app.tabline_state.hovered_tab != null or
+                        app.tabline_state.hovered_close != null or
+                        app.tabline_state.hovered_new_tab_btn)
+                    {
+                        app.tabline_state.hovered_tab = null;
+                        app.tabline_state.hovered_close = null;
+                        app.tabline_state.hovered_new_tab_btn = false;
+                        // Invalidate sidebar region
+                        var client_rect: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect);
+                        const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                        var sidebar_rect: c.RECT = .{
+                            .left = if (app.sidebar_position_right) client_rect.right - sidebar_w else 0,
+                            .top = 0,
+                            .right = if (app.sidebar_position_right) client_rect.right else sidebar_w,
+                            .bottom = client_rect.bottom,
+                        };
+                        _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
                     }
-                    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                }
+            }
+            return 0;
+        },
+
+        c.WM_CAPTURECHANGED => {
+            // Mouse capture lost - cancel any tabline/sidebar drag or button press
+            if (getApp(hwnd)) |app| {
+                if (app.ext_tabline_enabled) {
+                    const had_state = app.tabline_state.dragging_tab != null or
+                        app.tabline_state.close_button_pressed != null or
+                        app.tabline_state.new_tab_button_pressed or
+                        app.tabline_state.pressed_window_btn != null;
+
+                    if (had_state) {
+                        applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
+                        tabline_mod.destroyDragPreviewWindow(app);
+                        app.tabline_state.cancelDrag();
+                        app.tabline_state.close_button_pressed = null;
+                        app.tabline_state.new_tab_button_pressed = false;
+                        app.tabline_state.pressed_window_btn = null;
+                        // Invalidate the relevant tab area
+                        var client_rect: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect);
+                        if (app.tabline_style == .sidebar) {
+                            const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                            var sidebar_rect: c.RECT = .{
+                                .left = if (app.sidebar_position_right) client_rect.right - sidebar_w else 0,
+                                .top = 0,
+                                .right = if (app.sidebar_position_right) client_rect.right else sidebar_w,
+                                .bottom = client_rect.bottom,
+                            };
+                            _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
+                        } else {
+                            var tabline_rect: c.RECT = .{
+                                .left = 0,
+                                .top = 0,
+                                .right = client_rect.right,
+                                .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
+                            };
+                            _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                        }
+                    }
                 }
             }
             return 0;

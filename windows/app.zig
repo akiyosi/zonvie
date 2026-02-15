@@ -375,6 +375,9 @@ pub const MessageWindow = struct {
     }
 };
 
+/// Tabline display style
+pub const TablineStyle = enum { titlebar, sidebar };
+
 /// Tab entry for ext_tabline
 pub const TabEntry = struct {
     handle: i64,
@@ -432,6 +435,14 @@ pub const TablineState = struct {
     pub const WINDOW_BTN_WIDTH: c_int = 46; // Each button width
     pub const WINDOW_BTN_COUNT: c_int = 3; // Min, Max, Close
     pub const WINDOW_BTNS_TOTAL: c_int = WINDOW_BTN_WIDTH * WINDOW_BTN_COUNT; // 138px total
+
+    // Sidebar mode constants
+    pub const SIDEBAR_ROW_HEIGHT: c_int = 28;
+    pub const SIDEBAR_PADDING: c_int = 12;
+    pub const SIDEBAR_CLOSE_SIZE: c_int = 14;
+    pub const SIDEBAR_NEW_TAB_HEIGHT: c_int = 32;
+    pub const SIDEBAR_SEPARATOR_WIDTH: c_int = 1;
+    pub const SIDEBAR_INDICATOR_WIDTH: c_int = 3;
 
     pub fn clear(self: *TablineState) void {
         self.tab_count = 0;
@@ -760,6 +771,13 @@ pub const App = struct {
 
     // ext_tabline enabled flag (set from --exttabline command line arg)
     ext_tabline_enabled: bool = false,
+    tabline_style: TablineStyle = .titlebar,
+    sidebar_position_right: bool = false, // false = left, true = right
+    sidebar_width_px: u32 = 200,
+
+    // Colorscheme default colors (0x00RRGGBB, or 0xFFFFFFFF = not set)
+    colorscheme_bg: u32 = 0xFFFFFFFF,
+    colorscheme_fg: u32 = 0xFFFFFFFF,
 
     // ext_windows enabled flag (set from --extwindows command line arg or config)
     ext_windows_enabled: bool = false,
@@ -1321,13 +1339,20 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const client_w: u32 = @intCast(@max(1, rc.right - rc.left));
     const client_h: u32 = @intCast(@max(1, rc.bottom - rc.top));
 
+    // Subtract sidebar width for sidebar mode
+    const sidebar_w: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar)
+        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        0;
+
     // In "always" mode, reserve space for scrollbar
-    const w = getEffectiveContentWidth(app, client_w);
+    const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
+    const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
     // For DWM custom titlebar without content_hwnd: client area includes titlebar,
     // so subtract tabbar height to get the actual content area for Neovim.
     // When using content_hwnd, it already has the correct size (excludes tabbar).
-    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
         @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
     else
         0;
@@ -1365,12 +1390,19 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     const client_w: u32 = @intCast(@max(1, rc.right - rc.left));
     const client_h: u32 = @intCast(@max(1, rc.bottom - rc.top));
 
+    // Subtract sidebar width for sidebar mode
+    const sidebar_w: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar)
+        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        0;
+
     // In "always" mode, use effective content width
-    const w = getEffectiveContentWidth(app, client_w);
+    const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
+    const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
     // Subtract tabbar height when ext_tabline is enabled but content_hwnd doesn't exist
     // When using content_hwnd, it already has the correct size (excludes tabbar).
-    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
         @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
     else
         0;

@@ -195,6 +195,12 @@ pub const Renderer = struct {
     tabline_width: u32 = 0,
     tabline_height: u32 = 0,
 
+    // Sidebar texture (GDI offscreen -> D3D11, for sidebar mode)
+    sidebar_tex: ?*c.ID3D11Texture2D = null,
+    sidebar_srv: ?*c.ID3D11ShaderResourceView = null,
+    sidebar_width_tex: u32 = 0,
+    sidebar_height_tex: u32 = 0,
+
     // Sizing
     width: u32 = 1,
     height: u32 = 1,
@@ -273,6 +279,9 @@ pub const Renderer = struct {
 
         safeRelease(&self.tabline_srv);
         safeRelease(&self.tabline_tex);
+
+        safeRelease(&self.sidebar_srv);
+        safeRelease(&self.sidebar_tex);
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -484,6 +493,14 @@ pub const Renderer = struct {
         // If null, uses 0.
         content_y_offset: ?u32 = null,
 
+        // Content X offset for viewport (used for sidebar to offset content right of sidebar).
+        // If null, uses 0.
+        content_x_offset: ?u32 = null,
+
+        // Sidebar width on the right side (reduces content width from right edge).
+        // If null, no right sidebar.
+        sidebar_right_width: ?u32 = null,
+
         // Content height for viewport, snapped to cell boundaries.
         // Must match the core's NDC viewport calculation (grid_rows * cell_h).
         // If null, uses (self.height - content_y_offset).
@@ -577,13 +594,17 @@ pub const Renderer = struct {
         // ---- Viewport ----
         // Use content_width if specified (for "always" scrollbar mode)
         // Use content_y_offset if specified (for tabline)
-        const viewport_width = opts.content_width orelse self.width;
+        // Use content_x_offset if specified (for left sidebar)
+        const viewport_x_offset = opts.content_x_offset orelse 0;
         const viewport_y_offset = opts.content_y_offset orelse 0;
+        const sidebar_right_w = opts.sidebar_right_width orelse 0;
+        const base_width = opts.content_width orelse self.width;
+        const viewport_width = if (base_width > viewport_x_offset + sidebar_right_w) base_width - viewport_x_offset - sidebar_right_w else 1;
         const viewport_height = opts.content_height orelse
-            (if (self.height > viewport_y_offset) self.height - viewport_y_offset else self.height);
+            (if (self.height > viewport_y_offset) self.height - viewport_y_offset else 1);
         {
             var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
+                .TopLeftX = @floatFromInt(viewport_x_offset),
                 .TopLeftY = @floatFromInt(viewport_y_offset),
                 .Width = @floatFromInt(viewport_width),
                 .Height = @floatFromInt(viewport_height),
@@ -597,25 +618,28 @@ pub const Renderer = struct {
         const effective_dirty: ?c.RECT = if (!self.has_presented_once) null else dirty_rect;
 
         // ---- Scissor ----
+        // D3D11 scissor rects are in render-target absolute coordinates,
+        // so they must include viewport_x_offset and viewport_y_offset.
         {
             const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return;
+            const x_off_i: c.LONG = @intCast(viewport_x_offset);
+            const y_off_i: c.LONG = @intCast(viewport_y_offset);
 
             if (effective_dirty) |r| {
-                // Clamp scissor to viewport width
-                const clamped_right: c.LONG = @min(r.right, @as(c.LONG, @intCast(viewport_width)));
+                // Clamp scissor to viewport bounds (absolute coords)
                 var sr: c.D3D11_RECT = .{
-                    .left = r.left,
-                    .top = r.top,
-                    .right = clamped_right,
-                    .bottom = r.bottom,
+                    .left = x_off_i + r.left,
+                    .top = y_off_i + r.top,
+                    .right = @min(x_off_i + r.right, @as(c.LONG, @intCast(viewport_x_offset + viewport_width))),
+                    .bottom = @min(y_off_i + r.bottom, @as(c.LONG, @intCast(viewport_y_offset + viewport_height))),
                 };
                 rs_set_sc(ctx, 1, &sr);
             } else {
                 var sr: c.D3D11_RECT = .{
-                    .left = 0,
-                    .top = 0,
-                    .right = @intCast(viewport_width),
-                    .bottom = @intCast(self.height),
+                    .left = x_off_i,
+                    .top = y_off_i,
+                    .right = @intCast(viewport_x_offset + viewport_width),
+                    .bottom = @intCast(viewport_y_offset + viewport_height),
                 };
                 rs_set_sc(ctx, 1, &sr);
             }
@@ -707,7 +731,7 @@ pub const Renderer = struct {
 
             // Restore content viewport
             var content_vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
+                .TopLeftX = @floatFromInt(viewport_x_offset),
                 .TopLeftY = @floatFromInt(viewport_y_offset),
                 .Width = @floatFromInt(viewport_width),
                 .Height = @floatFromInt(viewport_height),
@@ -716,24 +740,91 @@ pub const Renderer = struct {
             };
             rs_set_vp(ctx, 1, &content_vp);
 
-            // Restore content scissor
-            if (effective_dirty) |r| {
-                const clamped_right: c.LONG = @min(r.right, @as(c.LONG, @intCast(viewport_width)));
-                var sr: c.D3D11_RECT = .{
-                    .left = r.left,
-                    .top = r.top,
-                    .right = clamped_right,
-                    .bottom = r.bottom,
+            // Restore content scissor (absolute coords matching viewport)
+            {
+                const x_off_t: c.LONG = @intCast(viewport_x_offset);
+                const y_off_t: c.LONG = @intCast(viewport_y_offset);
+                if (effective_dirty) |r| {
+                    var sr: c.D3D11_RECT = .{
+                        .left = x_off_t + r.left,
+                        .top = y_off_t + r.top,
+                        .right = @min(x_off_t + r.right, @as(c.LONG, @intCast(viewport_x_offset + viewport_width))),
+                        .bottom = @min(y_off_t + r.bottom, @as(c.LONG, @intCast(viewport_y_offset + viewport_height))),
+                    };
+                    rs_set_sc(ctx, 1, &sr);
+                } else {
+                    var sr: c.D3D11_RECT = .{
+                        .left = x_off_t,
+                        .top = y_off_t,
+                        .right = @intCast(viewport_x_offset + viewport_width),
+                        .bottom = @intCast(viewport_y_offset + viewport_height),
+                    };
+                    rs_set_sc(ctx, 1, &sr);
+                }
+            }
+        }
+
+        // ---- Sidebar (if content_x_offset or sidebar_right_width is set) ----
+        if (opts.content_x_offset != null or opts.sidebar_right_width != null) {
+            if (self.sidebar_srv != null) {
+                const rs_set_vp_sb = ctx_vtbl.*.RSSetViewports orelse return;
+                const rs_set_sc_sb = ctx_vtbl.*.RSSetScissorRects orelse return;
+
+                // Set full-screen viewport for sidebar drawing
+                var full_vp_sb: c.D3D11_VIEWPORT = .{
+                    .TopLeftX = 0,
+                    .TopLeftY = 0,
+                    .Width = @floatFromInt(self.width),
+                    .Height = @floatFromInt(self.height),
+                    .MinDepth = 0,
+                    .MaxDepth = 1,
                 };
-                rs_set_sc(ctx, 1, &sr);
-            } else {
-                var sr: c.D3D11_RECT = .{
+                rs_set_vp_sb(ctx, 1, &full_vp_sb);
+
+                var full_sr_sb: c.D3D11_RECT = .{
                     .left = 0,
                     .top = 0,
-                    .right = @intCast(viewport_width),
+                    .right = @intCast(self.width),
                     .bottom = @intCast(self.height),
                 };
-                rs_set_sc(ctx, 1, &sr);
+                rs_set_sc_sb(ctx, 1, &full_sr_sb);
+
+                const is_right = opts.sidebar_right_width != null;
+                try self.drawSidebarTexture(is_right);
+
+                // Restore content viewport
+                var content_vp_sb: c.D3D11_VIEWPORT = .{
+                    .TopLeftX = @floatFromInt(viewport_x_offset),
+                    .TopLeftY = @floatFromInt(viewport_y_offset),
+                    .Width = @floatFromInt(viewport_width),
+                    .Height = @floatFromInt(viewport_height),
+                    .MinDepth = 0,
+                    .MaxDepth = 1,
+                };
+                rs_set_vp_sb(ctx, 1, &content_vp_sb);
+
+                // Restore content scissor (absolute coords matching viewport)
+                {
+                    const x_off_r: c.LONG = @intCast(viewport_x_offset);
+                    const y_off_r: c.LONG = @intCast(viewport_y_offset);
+                    if (effective_dirty) |r| {
+                        var sr_sb: c.D3D11_RECT = .{
+                            .left = x_off_r + r.left,
+                            .top = y_off_r + r.top,
+                            .right = @min(x_off_r + r.right, @as(c.LONG, @intCast(viewport_x_offset + viewport_width))),
+                            .bottom = @min(y_off_r + r.bottom, @as(c.LONG, @intCast(viewport_y_offset + viewport_height))),
+                        };
+                        rs_set_sc_sb(ctx, 1, &sr_sb);
+                    } else {
+                        var sr_sb: c.D3D11_RECT = .{
+                            .left = x_off_r,
+                            .top = y_off_r,
+                            .right = @intCast(viewport_x_offset + viewport_width),
+                            .bottom = @intCast(viewport_y_offset + viewport_height),
+                        };
+                        rs_set_sc_sb(ctx, 1, &sr_sb);
+                    }
+                }
             }
         }
 
@@ -1422,6 +1513,133 @@ pub const Renderer = struct {
         try self.drawVertices(&verts);
 
         // Restore atlas texture
+        srvs[0] = self.atlas_srv;
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+    }
+
+    /// Update sidebar texture from BGRA pixel data (rendered by GDI offscreen).
+    pub fn updateSidebarTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {
+        if (width == 0 or height == 0) return;
+
+        const device = self.device orelse return error.NoDevice;
+        const ctx = self.ctx orelse return error.NoContext;
+
+        if (self.sidebar_tex == null or self.sidebar_width_tex != width or self.sidebar_height_tex != height) {
+            safeRelease(&self.sidebar_srv);
+            safeRelease(&self.sidebar_tex);
+
+            var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            tex_desc.Width = width;
+            tex_desc.Height = height;
+            tex_desc.MipLevels = 1;
+            tex_desc.ArraySize = 1;
+            tex_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+            tex_desc.SampleDesc.Count = 1;
+            tex_desc.SampleDesc.Quality = 0;
+            tex_desc.Usage = c.D3D11_USAGE_DEFAULT;
+            tex_desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            tex_desc.CPUAccessFlags = 0;
+            tex_desc.MiscFlags = 0;
+
+            const vtbl = device.*.lpVtbl;
+            const create_tex = vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
+
+            var init_data: c.D3D11_SUBRESOURCE_DATA = std.mem.zeroes(c.D3D11_SUBRESOURCE_DATA);
+            init_data.pSysMem = pixels.ptr;
+            init_data.SysMemPitch = width * 4;
+
+            var tex: ?*c.ID3D11Texture2D = null;
+            var hr = create_tex(device, &tex_desc, &init_data, &tex);
+            if (c.FAILED(hr) or tex == null) {
+                applog.appLog("[d3d] updateSidebarTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                return error.CreateTexture2DFailed;
+            }
+
+            var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
+            srv_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+            srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.unnamed_0.Texture2D.MostDetailedMip = 0;
+            srv_desc.unnamed_0.Texture2D.MipLevels = 1;
+
+            const create_srv = vtbl.*.CreateShaderResourceView orelse {
+                safeRelease(&tex);
+                return error.NoCreateSRV;
+            };
+
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
+            if (c.FAILED(hr) or srv == null) {
+                applog.appLog("[d3d] updateSidebarTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                safeRelease(&tex);
+                return error.CreateSRVFailed;
+            }
+
+            self.sidebar_tex = tex;
+            self.sidebar_srv = srv;
+            self.sidebar_width_tex = width;
+            self.sidebar_height_tex = height;
+
+            applog.appLog("[d3d] updateSidebarTexture: created texture {d}x{d}\n", .{ width, height });
+        } else {
+            const tex = self.sidebar_tex orelse return;
+            const ctx_vtbl = ctx.*.lpVtbl;
+            const update_subres = ctx_vtbl.*.UpdateSubresource orelse return error.NoUpdateSubresource;
+
+            var box: c.D3D11_BOX = .{
+                .left = 0,
+                .top = 0,
+                .front = 0,
+                .right = width,
+                .bottom = height,
+                .back = 1,
+            };
+
+            update_subres(ctx, @ptrCast(tex), 0, &box, pixels.ptr, width * 4, 0);
+        }
+    }
+
+    /// Draw sidebar texture as a vertical strip at left or right of window.
+    pub fn drawSidebarTexture(self: *Renderer, is_right: bool) !void {
+        const srv = self.sidebar_srv orelse return;
+        const ctx = self.ctx orelse return error.NoContext;
+        const sb_width = self.sidebar_width_tex;
+        const sb_height = self.sidebar_height_tex;
+
+        if (sb_width == 0 or sb_height == 0 or self.width == 0 or self.height == 0) return;
+
+        // NDC coordinates for sidebar strip
+        const w_ratio: f32 = 2.0 * @as(f32, @floatFromInt(sb_width)) / @as(f32, @floatFromInt(self.width));
+        var ndc_left: f32 = undefined;
+        var ndc_right: f32 = undefined;
+        if (is_right) {
+            ndc_right = 1.0;
+            ndc_left = 1.0 - w_ratio;
+        } else {
+            ndc_left = -1.0;
+            ndc_right = -1.0 + w_ratio;
+        }
+        const ndc_top: f32 = 1.0;
+        const ndc_bottom: f32 = -1.0;
+
+        const uv_marker: f32 = -5.0;
+        const color: [4]f32 = .{ 1, 1, 1, 1 };
+
+        const verts: [6]core.Vertex = .{
+            .{ .position = .{ ndc_left, ndc_top }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_bottom }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+        };
+
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
+        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+
+        try self.drawVertices(&verts);
+
         srvs[0] = self.atlas_srv;
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }

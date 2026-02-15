@@ -362,7 +362,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
-    const ext_drag_threshold = app.scalePx(TablineState.EXTERNAL_DRAG_THRESHOLD);
+    // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
+    // threshold, which should be constant in physical pixels regardless of DPI.
+    const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
     const plus_space = app.scalePx(40);
     const close_margin = app.scalePx(6);
     const plus_offset = app.scalePx(8);
@@ -372,8 +374,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     if (app.tabline_state.dragging_tab) |drag_idx| {
         app.tabline_state.drag_current_x = x;
 
-        // Check if mouse is outside main window bounds (for external drag)
-        var is_outside_window = false;
+        // Check if mouse is outside tabbar area bounds (for external drag)
+        // Uses tabbar region (top of window, TAB_BAR_HEIGHT tall) instead of full window
+        var is_outside_tabbar = false;
         if (app.hwnd) |main_hwnd| {
             var window_rect: c.RECT = undefined;
             if (c.GetWindowRect(main_hwnd, &window_rect) != 0) {
@@ -381,30 +384,31 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
                 var screen_pt: c.POINT = .{ .x = x, .y = y };
                 _ = c.ClientToScreen(hwnd, &screen_pt);
 
-                // Expand window rect by threshold
-                const threshold = ext_drag_threshold;
-                const expanded_left = window_rect.left - threshold;
-                const expanded_top = window_rect.top - threshold;
-                const expanded_right = window_rect.right + threshold;
-                const expanded_bottom = window_rect.bottom + threshold;
+                // Tabbar area = top of window, TAB_BAR_HEIGHT tall
+                var tabbar_rect = window_rect;
+                tabbar_rect.bottom = tabbar_rect.top + bar_height;
 
-                is_outside_window = (screen_pt.x < expanded_left or screen_pt.x > expanded_right or
+                // Expand tabbar rect by threshold
+                const threshold = ext_drag_threshold;
+                const expanded_left = tabbar_rect.left - threshold;
+                const expanded_top = tabbar_rect.top - threshold;
+                const expanded_right = tabbar_rect.right + threshold;
+                const expanded_bottom = tabbar_rect.bottom + threshold;
+
+                is_outside_tabbar = (screen_pt.x < expanded_left or screen_pt.x > expanded_right or
                     screen_pt.y < expanded_top or screen_pt.y > expanded_bottom);
 
-                if (is_outside_window and !app.tabline_state.is_external_drag) {
-                    // Entering external drag mode
+                if (is_outside_tabbar and !app.tabline_state.is_external_drag) {
                     app.tabline_state.is_external_drag = true;
                     applog.appLog("[tabline] entering external drag mode for tab {d}\n", .{drag_idx});
                     createDragPreviewWindow(app, drag_idx, screen_pt.x, screen_pt.y);
-                } else if (!is_outside_window and app.tabline_state.is_external_drag) {
-                    // Returning to normal drag mode
+                } else if (!is_outside_tabbar and app.tabline_state.is_external_drag) {
                     app.tabline_state.is_external_drag = false;
                     applog.appLog("[tabline] returning to normal drag mode\n", .{});
                     destroyDragPreviewWindow(app);
                 }
 
                 if (app.tabline_state.is_external_drag) {
-                    // Update preview window position
                     updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
                 }
             }
@@ -859,8 +863,8 @@ pub fn createDragPreviewWindow(app: *App, tab_idx: usize, screen_x: c_int, scree
     // Ensure window class is registered
     if (!ensureDragPreviewClassRegistered()) return;
 
-    const preview_w: c_int = 150;
-    const preview_h: c_int = 30;
+    const preview_w: c_int = app.scalePx(150);
+    const preview_h: c_int = app.scalePx(30);
 
     // Create borderless popup window
     const dwExStyle: c.DWORD = c.WS_EX_TOPMOST | c.WS_EX_TOOLWINDOW | c.WS_EX_NOACTIVATE;
@@ -900,8 +904,8 @@ pub fn createDragPreviewWindow(app: *App, tab_idx: usize, screen_x: c_int, scree
 /// Update the position of the drag preview window
 pub fn updateDragPreviewPosition(app: *App, screen_x: c_int, screen_y: c_int) void {
     if (app.tabline_state.drag_preview_hwnd) |preview_hwnd| {
-        const preview_w: c_int = 150;
-        const preview_h: c_int = 30;
+        const preview_w: c_int = app.scalePx(150);
+        const preview_h: c_int = app.scalePx(30);
         const pos_x = screen_x - @divTrunc(preview_w, 2);
         const pos_y = screen_y - @divTrunc(preview_h, 2);
         _ = c.SetWindowPos(preview_hwnd, null, pos_x, pos_y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
@@ -1002,6 +1006,19 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                 const app_ptr = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
                 if (app_ptr != 0) {
                     const app: *App = @ptrFromInt(@as(usize, @bitCast(app_ptr)));
+
+                    // Create DPI-scaled font
+                    const hfont = c.CreateFontW(
+                        app.scalePx(-12), 0, 0, 0,
+                        c.FW_NORMAL, 0, 0, 0,
+                        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS,
+                        c.CLIP_DEFAULT_PRECIS,
+                        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+                    );
+                    const old_font = c.SelectObject(hdc, hfont);
+
+                    const text_pad = app.scalePx(10);
+
                     if (app.tabline_state.dragging_tab) |drag_idx| {
                         if (drag_idx < app.tabline_state.tab_count) {
                             const tab = &app.tabline_state.tabs[drag_idx];
@@ -1020,8 +1037,8 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
 
                                 // Draw text
                                 var text_rect = rect;
-                                text_rect.left += 10;
-                                text_rect.right -= 10;
+                                text_rect.left += text_pad;
+                                text_rect.right -= text_pad;
                                 _ = c.SetBkMode(hdc, c.TRANSPARENT);
                                 _ = c.SetTextColor(hdc, c.RGB(0, 0, 0));
 
@@ -1035,14 +1052,17 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                                 // No name
                                 const no_name = [_]u16{ '[', 'N', 'o', ' ', 'N', 'a', 'm', 'e', ']', 0 };
                                 var text_rect = rect;
-                                text_rect.left += 10;
-                                text_rect.right -= 10;
+                                text_rect.left += text_pad;
+                                text_rect.right -= text_pad;
                                 _ = c.SetBkMode(hdc, c.TRANSPARENT);
                                 _ = c.SetTextColor(hdc, c.RGB(128, 128, 128));
                                 _ = c.DrawTextW(hdc, &no_name, 9, &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER);
                             }
                         }
                     }
+
+                    _ = c.SelectObject(hdc, old_font);
+                    _ = c.DeleteObject(hfont);
                 }
 
                 _ = c.EndPaint(hwnd, &ps);
@@ -1860,5 +1880,708 @@ pub fn handleTablineMouseMove(app: *App, x: c_int, y: c_int) void {
             tab_rect.bottom = bar_height;
             _ = c.InvalidateRect(hwnd, &tab_rect, 0);
         }
+    }
+}
+
+// =========================================================================
+// Sidebar mode rendering and mouse handling
+// =========================================================================
+
+/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
+pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
+    if (app.renderer == null) return;
+    if (width == 0 or height == 0) return;
+    const screen_dc = c.GetDC(null);
+    if (screen_dc == null) return;
+    defer _ = c.ReleaseDC(null, screen_dc);
+
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    if (mem_dc == null) return;
+    defer _ = c.DeleteDC(mem_dc);
+
+    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(width);
+    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var pixels_ptr: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
+    if (dib == null or pixels_ptr == null) return;
+    defer _ = c.DeleteObject(dib);
+
+    const old_bmp = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old_bmp);
+
+    drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height));
+
+    // Set alpha to opaque
+    const pixels: [*]u8 = @ptrCast(pixels_ptr);
+    const pixel_count = width * height;
+    var i: u32 = 0;
+    while (i < pixel_count) : (i += 1) {
+        pixels[i * 4 + 3] = 255;
+    }
+
+    const pixel_data = pixels[0 .. width * height * 4];
+    if (app.renderer) |*g| {
+        g.updateSidebarTexture(width, height, pixel_data) catch |e| {
+            applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
+        };
+    }
+}
+
+/// Compute sidebar colors from the Neovim colorscheme.
+/// Returns (R, G, B) as 0-255 u8 values. Mirrors macOS TabSidebarView color logic (no blur).
+const SidebarColors = struct {
+    bg_r: u8,
+    bg_g: u8,
+    bg_b: u8,
+    selected_r: u8,
+    selected_g: u8,
+    selected_b: u8,
+    hover_r: u8,
+    hover_g: u8,
+    hover_b: u8,
+    text_r: u8,
+    text_g: u8,
+    text_b: u8,
+    text_sel_r: u8,
+    text_sel_g: u8,
+    text_sel_b: u8,
+    sep_r: u8,
+    sep_g: u8,
+    sep_b: u8,
+    close_r: u8,
+    close_g: u8,
+    close_b: u8,
+    close_hi_r: u8,
+    close_hi_g: u8,
+    close_hi_b: u8,
+    indicator_r: u8,
+    indicator_g: u8,
+    indicator_b: u8,
+
+    fn compute(app: *const App) SidebarColors {
+        // Extract colorscheme bg/fg as 0.0-1.0 floats
+        var bgR: f32 = 0.145;
+        var bgG: f32 = 0.149;
+        var bgB: f32 = 0.161;
+        var fgR: f32 = 1.0;
+        var fgG: f32 = 1.0;
+        var fgB: f32 = 1.0;
+
+        if (app.colorscheme_bg != 0xFFFFFFFF) {
+            bgR = @as(f32, @floatFromInt((app.colorscheme_bg >> 16) & 0xFF)) / 255.0;
+            bgG = @as(f32, @floatFromInt((app.colorscheme_bg >> 8) & 0xFF)) / 255.0;
+            bgB = @as(f32, @floatFromInt(app.colorscheme_bg & 0xFF)) / 255.0;
+        }
+        if (app.colorscheme_fg != 0xFFFFFFFF) {
+            fgR = @as(f32, @floatFromInt((app.colorscheme_fg >> 16) & 0xFF)) / 255.0;
+            fgG = @as(f32, @floatFromInt((app.colorscheme_fg >> 8) & 0xFF)) / 255.0;
+            fgB = @as(f32, @floatFromInt(app.colorscheme_fg & 0xFF)) / 255.0;
+        }
+
+        const luminance = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
+        const is_dark = luminance < 0.5;
+
+        // Sidebar background: slightly darker (dark theme) or lighter (light theme) than bg
+        const sb_bgR = if (is_dark) bgR * 0.85 else @min(@as(f32, 1.0), bgR + 0.03);
+        const sb_bgG = if (is_dark) bgG * 0.85 else @min(@as(f32, 1.0), bgG + 0.03);
+        const sb_bgB = if (is_dark) bgB * 0.85 else @min(@as(f32, 1.0), bgB + 0.03);
+
+        // Selected tab: brighter (dark) or darker (light) than bg
+        const sel_R = if (is_dark) bgR + 0.06 else @max(@as(f32, 0.0), bgR - 0.06);
+        const sel_G = if (is_dark) bgG + 0.06 else @max(@as(f32, 0.0), bgG - 0.06);
+        const sel_B = if (is_dark) bgB + 0.06 else @max(@as(f32, 0.0), bgB - 0.06);
+
+        // Hover tab: slightly brighter/darker
+        const hov_R = if (is_dark) bgR + 0.03 else @max(@as(f32, 0.0), bgR - 0.03);
+        const hov_G = if (is_dark) bgG + 0.03 else @max(@as(f32, 0.0), bgG - 0.03);
+        const hov_B = if (is_dark) bgB + 0.03 else @max(@as(f32, 0.0), bgB - 0.03);
+
+        // Text colors
+        const dim = if (is_dark) @as(f32, 0.6) else @as(f32, 0.5);
+        const txt_R = fgR * dim;
+        const txt_G = fgG * dim;
+        const txt_B = fgB * dim;
+
+        // Separator: white 10% alpha on dark bg, black 10% alpha on light bg
+        // For opaque GDI, blend with sidebar bg
+        const sep_R = if (is_dark) sb_bgR * 0.9 + 1.0 * 0.1 else sb_bgR * 0.9;
+        const sep_G = if (is_dark) sb_bgG * 0.9 + 1.0 * 0.1 else sb_bgG * 0.9;
+        const sep_B = if (is_dark) sb_bgB * 0.9 + 1.0 * 0.1 else sb_bgB * 0.9;
+
+        // Close button
+        const close_R = fgR * 0.5;
+        const close_G = fgG * 0.5;
+        const close_B = fgB * 0.5;
+
+        const close_hi_R = fgR * 0.8;
+        const close_hi_G = fgG * 0.8;
+        const close_hi_B = fgB * 0.8;
+
+        // Selection indicator: use fg color as accent
+        const ind_R = fgR * 0.7;
+        const ind_G = fgG * 0.7;
+        const ind_B = fgB * 0.7;
+
+        return .{
+            .bg_r = f2u8(sb_bgR),
+            .bg_g = f2u8(sb_bgG),
+            .bg_b = f2u8(sb_bgB),
+            .selected_r = f2u8(sel_R),
+            .selected_g = f2u8(sel_G),
+            .selected_b = f2u8(sel_B),
+            .hover_r = f2u8(hov_R),
+            .hover_g = f2u8(hov_G),
+            .hover_b = f2u8(hov_B),
+            .text_r = f2u8(txt_R),
+            .text_g = f2u8(txt_G),
+            .text_b = f2u8(txt_B),
+            .text_sel_r = f2u8(fgR),
+            .text_sel_g = f2u8(fgG),
+            .text_sel_b = f2u8(fgB),
+            .sep_r = f2u8(sep_R),
+            .sep_g = f2u8(sep_G),
+            .sep_b = f2u8(sep_B),
+            .close_r = f2u8(close_R),
+            .close_g = f2u8(close_G),
+            .close_b = f2u8(close_B),
+            .close_hi_r = f2u8(close_hi_R),
+            .close_hi_g = f2u8(close_hi_G),
+            .close_hi_b = f2u8(close_hi_B),
+            .indicator_r = f2u8(ind_R),
+            .indicator_g = f2u8(ind_G),
+            .indicator_b = f2u8(ind_B),
+        };
+    }
+
+    fn f2u8(v: f32) u8 {
+        const clamped = @max(@as(f32, 0.0), @min(@as(f32, 1.0), v));
+        return @intFromFloat(clamped * 255.0);
+    }
+};
+
+/// Draw sidebar content (vertical tab list) using GDI.
+/// Colors are derived from the Neovim colorscheme (mirroring macOS TabSidebarView).
+pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) void {
+    const row_h = app.scalePx(TablineState.SIDEBAR_ROW_HEIGHT);
+    const padding = app.scalePx(TablineState.SIDEBAR_PADDING);
+    const close_size = app.scalePx(TablineState.SIDEBAR_CLOSE_SIZE);
+    const new_tab_h = app.scalePx(TablineState.SIDEBAR_NEW_TAB_HEIGHT);
+    const sep_w = app.scalePx(TablineState.SIDEBAR_SEPARATOR_WIDTH);
+    const indicator_w = app.scalePx(TablineState.SIDEBAR_INDICATOR_WIDTH);
+    const close_inset = app.scalePx(3);
+
+    // Compute colors from colorscheme
+    const colors = SidebarColors.compute(app);
+
+    // Background
+    const bg_brush = c.CreateSolidBrush(c.RGB(colors.bg_r, colors.bg_g, colors.bg_b));
+    defer _ = c.DeleteObject(bg_brush);
+    var bg_rect = c.RECT{ .left = 0, .top = 0, .right = width, .bottom = height };
+    _ = c.FillRect(hdc, &bg_rect, bg_brush);
+
+    // Separator line on content-adjacent edge
+    const sep_brush = c.CreateSolidBrush(c.RGB(colors.sep_r, colors.sep_g, colors.sep_b));
+    defer _ = c.DeleteObject(sep_brush);
+    var sep_rect: c.RECT = undefined;
+    if (app.sidebar_position_right) {
+        sep_rect = .{ .left = 0, .top = 0, .right = sep_w, .bottom = height };
+    } else {
+        sep_rect = .{ .left = width - sep_w, .top = 0, .right = width, .bottom = height };
+    }
+    _ = c.FillRect(hdc, &sep_rect, sep_brush);
+
+    // Brushes for tab states
+    const selected_brush = c.CreateSolidBrush(c.RGB(colors.selected_r, colors.selected_g, colors.selected_b));
+    const hover_brush = c.CreateSolidBrush(c.RGB(colors.hover_r, colors.hover_g, colors.hover_b));
+    const indicator_brush = c.CreateSolidBrush(c.RGB(colors.indicator_r, colors.indicator_g, colors.indicator_b));
+    defer {
+        _ = c.DeleteObject(selected_brush);
+        _ = c.DeleteObject(hover_brush);
+        _ = c.DeleteObject(indicator_brush);
+    }
+
+    // Font
+    const font = c.CreateFontW(
+        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
+        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
+        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+    );
+    defer _ = c.DeleteObject(font);
+    const old_font = c.SelectObject(hdc, font);
+    defer _ = c.SelectObject(hdc, old_font);
+
+    _ = c.SetBkMode(hdc, c.TRANSPARENT);
+
+    var y: c_int = 0;
+    for (0..app.tabline_state.tab_count) |i| {
+        const tab = &app.tabline_state.tabs[i];
+        const is_selected = tab.handle == app.tabline_state.current_tab;
+        const is_hovered = app.tabline_state.hovered_tab == i;
+
+        var row_rect = c.RECT{
+            .left = 0,
+            .top = y,
+            .right = width - sep_w,
+            .bottom = y + row_h,
+        };
+
+        // Row background
+        if (is_selected) {
+            _ = c.FillRect(hdc, &row_rect, selected_brush);
+        } else if (is_hovered) {
+            _ = c.FillRect(hdc, &row_rect, hover_brush);
+        }
+
+        // Selection indicator bar
+        if (is_selected) {
+            var ind_rect: c.RECT = undefined;
+            if (app.sidebar_position_right) {
+                ind_rect = .{ .left = sep_w, .top = y, .right = sep_w + indicator_w, .bottom = y + row_h };
+            } else {
+                ind_rect = .{ .left = 0, .top = y, .right = indicator_w, .bottom = y + row_h };
+            }
+            _ = c.FillRect(hdc, &ind_rect, indicator_brush);
+        }
+
+        // Tab name
+        const text_color = if (is_selected)
+            c.RGB(colors.text_sel_r, colors.text_sel_g, colors.text_sel_b)
+        else
+            c.RGB(colors.text_r, colors.text_g, colors.text_b);
+        _ = c.SetTextColor(hdc, text_color);
+
+        var display_name: [256]u8 = undefined;
+        var display_len: usize = 0;
+        if (tab.name_len > 0) {
+            var last_sep: usize = 0;
+            for (0..tab.name_len) |j| {
+                if (tab.name[j] == '/' or tab.name[j] == '\\') {
+                    last_sep = j + 1;
+                }
+            }
+            display_len = tab.name_len - last_sep;
+            @memcpy(display_name[0..display_len], tab.name[last_sep..tab.name_len]);
+        } else {
+            const no_name = "[No Name]";
+            display_len = no_name.len;
+            @memcpy(display_name[0..display_len], no_name);
+        }
+
+        var wide_buf: [256]u16 = undefined;
+        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
+
+        const text_left: c_int = if (is_selected) padding + indicator_w else padding;
+        const close_space: c_int = if (is_selected or is_hovered) close_size + app.scalePx(8) else 0;
+        var text_rect = c.RECT{
+            .left = text_left,
+            .top = y,
+            .right = width - sep_w - padding - close_space,
+            .bottom = y + row_h,
+        };
+        _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+
+        // Close button (X) on selected or hovered tabs
+        if (is_selected or is_hovered) {
+            const close_x = width - sep_w - close_size - app.scalePx(8);
+            const close_y = y + @divTrunc(row_h - close_size, 2);
+
+            if (app.tabline_state.hovered_close == i) {
+                const close_hover_brush = c.CreateSolidBrush(c.RGB(colors.hover_r, colors.hover_g, colors.hover_b));
+                var close_rect = c.RECT{
+                    .left = close_x,
+                    .top = close_y,
+                    .right = close_x + close_size,
+                    .bottom = close_y + close_size,
+                };
+                _ = c.FillRect(hdc, &close_rect, close_hover_brush);
+                _ = c.DeleteObject(close_hover_brush);
+            }
+
+            const close_color = if (app.tabline_state.hovered_close == i)
+                c.RGB(colors.close_hi_r, colors.close_hi_g, colors.close_hi_b)
+            else
+                c.RGB(colors.close_r, colors.close_g, colors.close_b);
+            const pen = c.CreatePen(c.PS_SOLID, 1, close_color);
+            const old_pen = c.SelectObject(hdc, pen);
+            _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
+            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
+            _ = c.SelectObject(hdc, old_pen);
+            _ = c.DeleteObject(pen);
+        }
+
+        y += row_h;
+    }
+
+    // New Tab button
+    {
+        const btn_rect_top = y;
+        if (app.tabline_state.hovered_new_tab_btn) {
+            var btn_rect = c.RECT{
+                .left = 0,
+                .top = btn_rect_top,
+                .right = width - sep_w,
+                .bottom = btn_rect_top + new_tab_h,
+            };
+            _ = c.FillRect(hdc, &btn_rect, hover_brush);
+        }
+
+        // "+" icon
+        const icon_size = app.scalePx(16);
+        const icon_x = padding;
+        const icon_y = btn_rect_top + @divTrunc(new_tab_h - icon_size, 2);
+        const icon_inset = app.scalePx(3);
+
+        const new_tab_color = c.RGB(colors.close_r, colors.close_g, colors.close_b);
+        const plus_pen = c.CreatePen(c.PS_SOLID, app.scalePx(1), new_tab_color);
+        const old_plus_pen = c.SelectObject(hdc, plus_pen);
+        _ = c.MoveToEx(hdc, icon_x + @divTrunc(icon_size, 2), icon_y + icon_inset, null);
+        _ = c.LineTo(hdc, icon_x + @divTrunc(icon_size, 2), icon_y + icon_size - icon_inset);
+        _ = c.MoveToEx(hdc, icon_x + icon_inset, icon_y + @divTrunc(icon_size, 2), null);
+        _ = c.LineTo(hdc, icon_x + icon_size - icon_inset, icon_y + @divTrunc(icon_size, 2));
+        _ = c.SelectObject(hdc, old_plus_pen);
+        _ = c.DeleteObject(plus_pen);
+
+        // "New Tab" text
+        _ = c.SetTextColor(hdc, new_tab_color);
+        const small_font = c.CreateFontW(
+            app.scalePx(-11), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
+            c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
+            c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+        );
+        const old_small_font = c.SelectObject(hdc, small_font);
+        const new_tab_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
+        var nt_rect = c.RECT{
+            .left = padding + icon_size + app.scalePx(6),
+            .top = btn_rect_top,
+            .right = width - sep_w - padding,
+            .bottom = btn_rect_top + new_tab_h,
+        };
+        _ = c.DrawTextW(hdc, @ptrCast(new_tab_label.ptr), @intCast(new_tab_label.len), &nt_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE);
+        _ = c.SelectObject(hdc, old_small_font);
+        _ = c.DeleteObject(small_font);
+    }
+}
+
+/// Handle mouse down in sidebar area
+pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+    const row_h = app.scalePx(TablineState.SIDEBAR_ROW_HEIGHT);
+    const close_size = app.scalePx(TablineState.SIDEBAR_CLOSE_SIZE);
+    const sep_w = app.scalePx(TablineState.SIDEBAR_SEPARATOR_WIDTH);
+    const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+    const new_tab_h = app.scalePx(TablineState.SIDEBAR_NEW_TAB_HEIGHT);
+
+    if (row_h <= 0) return;
+
+    const tab_idx: usize = @intCast(@divTrunc(@max(0, y), row_h));
+
+    // Check new tab button
+    const tabs_bottom: c_int = @intCast(@as(c_int, @intCast(app.tabline_state.tab_count)) * row_h);
+    if (y >= tabs_bottom and y < tabs_bottom + new_tab_h) {
+        app.tabline_state.new_tab_button_pressed = true;
+        _ = c.SetCapture(hwnd);
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    if (tab_idx >= app.tabline_state.tab_count) return;
+
+    // Check close button
+    const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
+    const close_y_start = @as(c_int, @intCast(tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
+    if (app.sidebar_position_right) {
+        // Adjust for right sidebar coordinate space
+    }
+
+    const tab = &app.tabline_state.tabs[tab_idx];
+    const is_selected = tab.handle == app.tabline_state.current_tab;
+    const is_hovered = app.tabline_state.hovered_tab == tab_idx;
+
+    // Close button hit test (for local_x within sidebar)
+    var sb_local_x: c_int = undefined;
+    if (app.sidebar_position_right) {
+        var client_rect2: c.RECT = undefined;
+        _ = c.GetClientRect(hwnd, &client_rect2);
+        sb_local_x = x - (client_rect2.right - sidebar_w);
+    } else {
+        sb_local_x = x;
+    }
+
+    if ((is_selected or is_hovered) and
+        sb_local_x >= close_x_start and sb_local_x < close_x_start + close_size and
+        y >= close_y_start and y < close_y_start + close_size)
+    {
+        app.tabline_state.close_button_pressed = tab_idx;
+        _ = c.SetCapture(hwnd);
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    // Select tab and start drag tracking
+    if (app.corep) |corep| {
+        var cmd_buf: [32]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{tab_idx + 1}) catch return;
+        app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+    }
+
+    app.tabline_state.dragging_tab = tab_idx;
+    app.tabline_state.drag_start_x = x;
+    app.tabline_state.drag_current_x = x;
+    app.tabline_state.is_external_drag = false;
+    _ = c.SetCapture(hwnd);
+}
+
+/// Handle mouse up in sidebar area
+pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+    // Handle close button release
+    if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
+        app.tabline_state.close_button_pressed = null;
+        _ = c.ReleaseCapture();
+
+        if (pressed_tab_idx < app.tabline_state.tab_count) {
+            if (app.corep) |corep| {
+                var cmd_buf: [32]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{pressed_tab_idx + 1}) catch return;
+                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+            }
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    // Handle new tab button release
+    if (app.tabline_state.new_tab_button_pressed) {
+        app.tabline_state.new_tab_button_pressed = false;
+        _ = c.ReleaseCapture();
+
+        if (app.corep) |corep| {
+            const cmd = "tabnew";
+            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    // Handle drag end
+    const was_external_drag = app.tabline_state.is_external_drag;
+    const drag_idx_opt = app.tabline_state.dragging_tab;
+
+    app.tabline_state.cancelDrag();
+    destroyDragPreviewWindow(app);
+    _ = c.ReleaseCapture();
+
+    if (drag_idx_opt) |drag_idx| {
+        if (was_external_drag) {
+            var screen_pt: c.POINT = .{ .x = x, .y = y };
+            _ = c.ClientToScreen(hwnd, &screen_pt);
+            externalizeTab(app, drag_idx, screen_pt.x, screen_pt.y);
+        }
+    }
+    _ = c.InvalidateRect(hwnd, null, 0);
+}
+
+/// Handle mouse move in sidebar area
+pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
+    // Track mouse leave
+    var tme: c.TRACKMOUSEEVENT = .{
+        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+        .dwFlags = c.TME_LEAVE,
+        .hwndTrack = hwnd,
+        .dwHoverTime = 0,
+    };
+    _ = c.TrackMouseEvent(&tme);
+
+    const row_h = app.scalePx(TablineState.SIDEBAR_ROW_HEIGHT);
+    const close_size = app.scalePx(TablineState.SIDEBAR_CLOSE_SIZE);
+    const sep_w = app.scalePx(TablineState.SIDEBAR_SEPARATOR_WIDTH);
+    const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+    const new_tab_h = app.scalePx(TablineState.SIDEBAR_NEW_TAB_HEIGHT);
+    // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
+    // threshold, which should be constant in physical pixels regardless of DPI.
+    // macOS uses 50 points (always unscaled), so we match that behavior.
+    const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
+
+    // Handle close button pressed state - cancel if mouse leaves the button
+    if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
+        if (row_h > 0 and pressed_tab_idx < app.tabline_state.tab_count) {
+            const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
+            const close_y_start = @as(c_int, @intCast(pressed_tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
+
+            var sb_x = x;
+            if (app.sidebar_position_right) {
+                var client_rect: c.RECT = undefined;
+                _ = c.GetClientRect(hwnd, &client_rect);
+                sb_x = x - (client_rect.right - sidebar_w);
+            }
+
+            const is_still_over_close = (sb_x >= close_x_start and sb_x < close_x_start + close_size and
+                y >= close_y_start and y < close_y_start + close_size);
+
+            if (!is_still_over_close) {
+                app.tabline_state.close_button_pressed = null;
+                _ = c.ReleaseCapture();
+                _ = c.InvalidateRect(hwnd, null, 0);
+            }
+        }
+        return;
+    }
+
+    // Handle new tab button pressed state - cancel if mouse leaves the button
+    if (app.tabline_state.new_tab_button_pressed) {
+        const tabs_bottom: c_int = @as(c_int, @intCast(app.tabline_state.tab_count)) * row_h;
+        var sb_x = x;
+        if (app.sidebar_position_right) {
+            var client_rect: c.RECT = undefined;
+            _ = c.GetClientRect(hwnd, &client_rect);
+            sb_x = x - (client_rect.right - sidebar_w);
+        }
+
+        const is_still_over_new_tab = (sb_x >= 0 and sb_x < sidebar_w - sep_w and
+            y >= tabs_bottom and y < tabs_bottom + new_tab_h);
+
+        if (!is_still_over_new_tab) {
+            app.tabline_state.new_tab_button_pressed = false;
+            _ = c.ReleaseCapture();
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+        return;
+    }
+
+    // Handle dragging (external drag detection)
+    if (app.tabline_state.dragging_tab != null) {
+        app.tabline_state.drag_current_x = x;
+
+        // Check if mouse is outside sidebar bounds (for external drag)
+        if (app.hwnd) |main_hwnd| {
+            var client_rect: c.RECT = undefined;
+            if (c.GetClientRect(main_hwnd, &client_rect) != 0) {
+                var screen_pt: c.POINT = .{ .x = x, .y = y };
+                _ = c.ClientToScreen(hwnd, &screen_pt);
+
+                // Get client area origin in screen coordinates
+                var client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                _ = c.ClientToScreen(main_hwnd, &client_origin);
+
+                // Compute sidebar rect in screen coordinates (from client area, not window frame)
+                var sidebar_rect: c.RECT = undefined;
+                if (app.sidebar_position_right) {
+                    sidebar_rect = .{
+                        .left = client_origin.x + client_rect.right - sidebar_w,
+                        .top = client_origin.y,
+                        .right = client_origin.x + client_rect.right,
+                        .bottom = client_origin.y + client_rect.bottom,
+                    };
+                } else {
+                    sidebar_rect = .{
+                        .left = client_origin.x,
+                        .top = client_origin.y,
+                        .right = client_origin.x + sidebar_w,
+                        .bottom = client_origin.y + client_rect.bottom,
+                    };
+                }
+
+                const threshold = ext_drag_threshold;
+                const is_outside = (screen_pt.x < sidebar_rect.left - threshold or
+                    screen_pt.x > sidebar_rect.right + threshold or
+                    screen_pt.y < sidebar_rect.top - threshold or
+                    screen_pt.y > sidebar_rect.bottom + threshold);
+
+                applog.appLog(
+                    "[sidebar-drag] screen=({d},{d}) sidebar=({d},{d},{d},{d}) threshold={d} outside={d} client_x={d} sidebar_w={d}\n",
+                    .{
+                        screen_pt.x,           screen_pt.y,
+                        sidebar_rect.left,     sidebar_rect.top,
+                        sidebar_rect.right,    sidebar_rect.bottom,
+                        threshold,
+                        @as(i32, @intFromBool(is_outside)),
+                        x,
+                        sidebar_w,
+                    },
+                );
+
+                if (is_outside and !app.tabline_state.is_external_drag) {
+                    app.tabline_state.is_external_drag = true;
+                    createDragPreviewWindow(app, app.tabline_state.dragging_tab.?, screen_pt.x, screen_pt.y);
+                } else if (!is_outside and app.tabline_state.is_external_drag) {
+                    app.tabline_state.is_external_drag = false;
+                    destroyDragPreviewWindow(app);
+                }
+
+                if (app.tabline_state.is_external_drag) {
+                    updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
+                }
+            }
+        }
+
+        // Clear hover states during drag
+        app.tabline_state.hovered_tab = null;
+        app.tabline_state.hovered_close = null;
+        app.tabline_state.hovered_new_tab_btn = false;
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return;
+    }
+
+    if (row_h <= 0) return;
+
+    // Local x within sidebar
+    var sb_local_x: c_int = undefined;
+    if (app.sidebar_position_right) {
+        var client_rect: c.RECT = undefined;
+        _ = c.GetClientRect(hwnd, &client_rect);
+        sb_local_x = x - (client_rect.right - sidebar_w);
+    } else {
+        sb_local_x = x;
+    }
+
+    const tab_idx: usize = @intCast(@divTrunc(@max(0, y), row_h));
+
+    // Check new tab button hover
+    const tabs_bottom: c_int = @intCast(@as(c_int, @intCast(app.tabline_state.tab_count)) * row_h);
+    const new_hovered_new_tab = y >= tabs_bottom and y < tabs_bottom + new_tab_h;
+
+    var new_hovered_tab: ?usize = null;
+    var new_hovered_close: ?usize = null;
+
+    if (tab_idx < app.tabline_state.tab_count and !new_hovered_new_tab) {
+        new_hovered_tab = tab_idx;
+
+        // Check close button hover
+        const tab = &app.tabline_state.tabs[tab_idx];
+        const is_selected = tab.handle == app.tabline_state.current_tab;
+        if (is_selected or app.tabline_state.hovered_tab == tab_idx) {
+            const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
+            const close_y_start = @as(c_int, @intCast(tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
+
+            if (sb_local_x >= close_x_start and sb_local_x < close_x_start + close_size and
+                y >= close_y_start and y < close_y_start + close_size)
+            {
+                new_hovered_close = tab_idx;
+            }
+        }
+    }
+
+    var needs_repaint = false;
+    if (app.tabline_state.hovered_tab != new_hovered_tab) {
+        app.tabline_state.hovered_tab = new_hovered_tab;
+        needs_repaint = true;
+    }
+    if (app.tabline_state.hovered_close != new_hovered_close) {
+        app.tabline_state.hovered_close = new_hovered_close;
+        needs_repaint = true;
+    }
+    if (app.tabline_state.hovered_new_tab_btn != new_hovered_new_tab) {
+        app.tabline_state.hovered_new_tab_btn = new_hovered_new_tab;
+        needs_repaint = true;
+    }
+
+    if (needs_repaint) {
+        _ = c.InvalidateRect(hwnd, null, 0);
     }
 }

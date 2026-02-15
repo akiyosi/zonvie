@@ -1390,6 +1390,21 @@ pub fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
     }
 }
 
+pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+
+    if (applog.isEnabled()) applog.appLog("[win] onDefaultColorsSet: fg=0x{x:0>8} bg=0x{x:0>8}\n", .{ fg, bg });
+
+    // 0xFFFFFFFF means "not set" — only update the color that is valid
+    if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
+    if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
+
+    // Invalidate tabline/sidebar to repaint with new colors
+    if (app.hwnd) |hwnd| {
+        _ = c.PostMessageW(hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+    }
+}
+
 pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
