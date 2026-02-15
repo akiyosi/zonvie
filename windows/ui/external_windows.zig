@@ -73,8 +73,25 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // For msg_show/msg_history: add margin around content (DPI-scaled)
     const scaled_msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
 
-    const client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding;
+    var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding;
     const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
+
+    // Clamp cmdline width to monitor work area to prevent overflow beyond screen edge
+    if (is_cmdline) {
+        if (app.hwnd) |main_hwnd| {
+            const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
+            if (monitor) |mon| {
+                var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                mi.cbSize = @sizeOf(c.MONITORINFO);
+                if (c.GetMonitorInfoW(mon, &mi) != 0) {
+                    const work_w: c_int = mi.rcWork.right - mi.rcWork.left;
+                    if (client_w > work_w) {
+                        client_w = work_w;
+                    }
+                }
+            }
+        }
+    }
 
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
@@ -580,6 +597,21 @@ pub fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const app_m
                 const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
                 content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
                 content_h += @as(c_int, @intCast(cmdline_total_padding));
+
+                // Clamp cmdline width to monitor work area
+                if (app.hwnd) |main_hwnd| {
+                    const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
+                    if (monitor) |mon| {
+                        var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                        mi.cbSize = @sizeOf(c.MONITORINFO);
+                        if (c.GetMonitorInfoW(mon, &mi) != 0) {
+                            const work_w: c_int = mi.rcWork.right - mi.rcWork.left;
+                            if (content_w > work_w) {
+                                content_w = work_w;
+                            }
+                        }
+                    }
+                }
             }
 
             // Calculate window size

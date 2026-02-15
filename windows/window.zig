@@ -157,9 +157,21 @@ pub export fn WndProc(
                 if (app.ext_tabline_enabled and app.tabline_style == .titlebar and wParam != 0) {
                     // When wParam is TRUE, return 0 to use entire window as client area.
                     // This removes the standard titlebar/frame.
-                    // The NCCALCSIZE_PARAMS structure at lParam defines the client rect.
-                    // By returning 0 without modification, we get full window as client area.
-                    applog.appLog("[win] WM_NCCALCSIZE: extending client area into titlebar\n", .{});
+                    if (c.IsZoomed(hwnd) != 0) {
+                        // When maximized, Windows extends the window beyond the visible
+                        // screen by the frame thickness (invisible resize borders).
+                        // Inset the proposed rect to match the actual visible area.
+                        const params: *c.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lParam)));
+                        const frame_x = c.GetSystemMetrics(c.SM_CXFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
+                        const frame_y = c.GetSystemMetrics(c.SM_CYFRAME) + c.GetSystemMetrics(c.SM_CXPADDEDBORDER);
+                        params.rgrc[0].left += frame_x;
+                        params.rgrc[0].top += frame_y;
+                        params.rgrc[0].right -= frame_x;
+                        params.rgrc[0].bottom -= frame_y;
+                        applog.appLog("[win] WM_NCCALCSIZE: maximized, inset by frame=({d},{d})\n", .{ frame_x, frame_y });
+                    } else {
+                        applog.appLog("[win] WM_NCCALCSIZE: extending client area into titlebar\n", .{});
+                    }
                     return 0;
                 }
             }
