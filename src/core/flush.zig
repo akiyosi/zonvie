@@ -46,14 +46,62 @@ pub const STYLE_UNDERDOUBLE: u8 = 1 << 5;
 pub const STYLE_UNDERDOTTED: u8 = 1 << 6;
 pub const STYLE_UNDERDASHED: u8 = 1 << 7;
 
-/// Internal cell representation with grid_id tracking for smooth scrolling support.
-pub const RenderCell = struct {
-    scalar: u32,
-    fgRGB: u32,
-    bgRGB: u32,
-    spRGB: u32, // special color for decorations
-    grid_id: i64, // 1 = main grid, >1 = sub-grid (float window)
-    style_flags: u8, // packed style flags
+/// SoA (Struct of Arrays) cell buffer for cache-efficient RLE scanning.
+/// Each field is a separate contiguous array, improving cache utilization
+/// when scans only access 1-2 fields (e.g., bgRGB-only for background RLE).
+pub const RenderCells = struct {
+    scalars: std.ArrayListUnmanaged(u32) = .{},
+    fg_rgbs: std.ArrayListUnmanaged(u32) = .{},
+    bg_rgbs: std.ArrayListUnmanaged(u32) = .{},
+    sp_rgbs: std.ArrayListUnmanaged(u32) = .{},
+    grid_ids: std.ArrayListUnmanaged(i64) = .{},
+    style_flags_arr: std.ArrayListUnmanaged(u8) = .{},
+
+    pub fn ensureTotalCapacity(self: *RenderCells, alloc: std.mem.Allocator, n: usize) !void {
+        try self.scalars.ensureTotalCapacity(alloc, n);
+        try self.fg_rgbs.ensureTotalCapacity(alloc, n);
+        try self.bg_rgbs.ensureTotalCapacity(alloc, n);
+        try self.sp_rgbs.ensureTotalCapacity(alloc, n);
+        try self.grid_ids.ensureTotalCapacity(alloc, n);
+        try self.style_flags_arr.ensureTotalCapacity(alloc, n);
+    }
+
+    pub fn setLen(self: *RenderCells, n: usize) void {
+        self.scalars.items.len = n;
+        self.fg_rgbs.items.len = n;
+        self.bg_rgbs.items.len = n;
+        self.sp_rgbs.items.len = n;
+        self.grid_ids.items.len = n;
+        self.style_flags_arr.items.len = n;
+    }
+
+    pub fn clearRetainingCapacity(self: *RenderCells) void {
+        self.scalars.clearRetainingCapacity();
+        self.fg_rgbs.clearRetainingCapacity();
+        self.bg_rgbs.clearRetainingCapacity();
+        self.sp_rgbs.clearRetainingCapacity();
+        self.grid_ids.clearRetainingCapacity();
+        self.style_flags_arr.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *RenderCells, alloc: std.mem.Allocator) void {
+        self.scalars.deinit(alloc);
+        self.fg_rgbs.deinit(alloc);
+        self.bg_rgbs.deinit(alloc);
+        self.sp_rgbs.deinit(alloc);
+        self.grid_ids.deinit(alloc);
+        self.style_flags_arr.deinit(alloc);
+    }
+
+    /// Write a single cell at index i.
+    pub inline fn set(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8) void {
+        self.scalars.items[i] = scalar;
+        self.fg_rgbs.items[i] = fg;
+        self.bg_rgbs.items[i] = bg;
+        self.sp_rgbs.items[i] = sp;
+        self.grid_ids.items[i] = gid;
+        self.style_flags_arr.items[i] = flags;
+    }
 };
 
 /// Pack style flags from ResolvedAttrWithStyles into u8.
@@ -68,6 +116,123 @@ pub fn packStyleFlags(a: ResolvedAttrWithStyles) u8 {
     if (a.underdotted) flags |= STYLE_UNDERDOTTED;
     if (a.underdashed) flags |= STYLE_UNDERDASHED;
     return flags;
+}
+
+// --- SIMD-accelerated RLE scan helpers ---
+// These use Zig @Vector intrinsics for batch comparison of contiguous SoA arrays.
+// Each returns the first index >= start where the value differs from target (or limit).
+
+/// Scan u32 array for end of run (4-wide SIMD with scalar tail).
+pub inline fn simdFindRunEndU32(items: []const u32, start: usize, limit: usize, target: u32) usize {
+    var i = start;
+    const V = @Vector(4, u32);
+    const t: V = @splat(target);
+    while (i + 4 <= limit) {
+        const chunk: V = items[i..][0..4].*;
+        if (@reduce(.And, chunk == t)) {
+            i += 4;
+        } else {
+            // Scalar scan within the 4-wide chunk to find exact mismatch
+            inline for (0..4) |k| {
+                if (items[i + k] != target) return i + k;
+            }
+            unreachable;
+        }
+    }
+    while (i < limit) : (i += 1) {
+        if (items[i] != target) return i;
+    }
+    return i;
+}
+
+/// Scan i64 array for end of run (2-wide SIMD with scalar tail).
+pub inline fn simdFindRunEndI64(items: []const i64, start: usize, limit: usize, target: i64) usize {
+    var i = start;
+    const V = @Vector(2, i64);
+    const t: V = @splat(target);
+    while (i + 2 <= limit) {
+        const chunk: V = items[i..][0..2].*;
+        if (@reduce(.And, chunk == t)) {
+            i += 2;
+        } else {
+            // Scalar scan within the 2-wide chunk
+            if (items[i] != target) return i;
+            return i + 1;
+        }
+    }
+    if (i < limit and items[i] == target) i += 1;
+    return i;
+}
+
+/// Scan u8 array for end of run (16-wide SIMD with scalar tail).
+pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, target: u8) usize {
+    var i = start;
+    const V = @Vector(16, u8);
+    const t: V = @splat(target);
+    while (i + 16 <= limit) {
+        const chunk: V = items[i..][0..16].*;
+        if (@reduce(.And, chunk == t)) {
+            i += 16;
+        } else {
+            // Scalar scan within the 16-wide chunk to find exact mismatch
+            inline for (0..16) |k| {
+                if (items[i + k] != target) return i + k;
+            }
+            unreachable;
+        }
+    }
+    while (i < limit) : (i += 1) {
+        if (items[i] != target) return i;
+    }
+    return i;
+}
+
+/// Find first index where a bit is NOT set: (items[i] & mask) == 0.
+/// Used for strikethrough run scans that check a specific bit rather than exact equality.
+pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usize, mask: u8) usize {
+    var i = start;
+    const V = @Vector(16, u8);
+    const m: V = @splat(mask);
+    const zeros: V = @splat(0);
+    while (i + 16 <= limit) {
+        const chunk: V = items[i..][0..16].*;
+        const masked = chunk & m;
+        if (!@reduce(.Or, masked == zeros)) {
+            // All 16 have the bit set, continue
+            i += 16;
+        } else {
+            // Scalar scan within chunk to find exact position
+            inline for (0..16) |k| {
+                if (items[i + k] & mask == 0) return i + k;
+            }
+            unreachable;
+        }
+    }
+    while (i < limit) : (i += 1) {
+        if (items[i] & mask == 0) return i;
+    }
+    return i;
+}
+
+/// Check if any u32 in [start..end) is non-space (not 0 and not 32).
+/// Returns true if there is "ink" content to render.
+pub inline fn simdHasInkInRange(scalars: []const u32, start: usize, end: usize) bool {
+    var i = start;
+    const V = @Vector(4, u32);
+    const v_zeros: V = @splat(@as(u32, 0));
+    const v_spaces: V = @splat(@as(u32, 32));
+    while (i + 4 <= end) {
+        const chunk: V = scalars[i..][0..4].*;
+        // Normalize: replace 0 with 32 (zero codepoint means space)
+        const normalized = @select(u32, chunk == v_zeros, v_spaces, chunk);
+        if (!@reduce(.And, normalized == v_spaces)) return true;
+        i += 4;
+    }
+    while (i < end) : (i += 1) {
+        const s: u32 = if (scalars[i] == 0) 32 else scalars[i];
+        if (s != 32) return true;
+    }
+    return false;
 }
 
 /// Cached line data for msg_show scrolling optimization.
@@ -296,18 +461,36 @@ pub const FlushCtx = struct {
                     return .{ nx, ny };
                 }
 
-                inline fn rgb(v: u32) [4]f32 {
-                    const rr: f32 = @as(f32, @floatFromInt((v >> 16) & 0xFF)) / 255.0;
-                    const gg: f32 = @as(f32, @floatFromInt((v >> 8) & 0xFF)) / 255.0;
-                    const bb: f32 = @as(f32, @floatFromInt(v & 0xFF)) / 255.0;
-                    return .{ rr, gg, bb, 1.0 };
+                /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
+                inline fn ndc4(x0: f32, y0: f32, x1: f32, y1: f32, vw: f32, vh: f32) [4][2]f32 {
+                    const V4 = @Vector(4, f32);
+                    const xs = V4{ x0, x1, x0, x1 };
+                    const ys = V4{ y0, y0, y1, y1 };
+                    const nxs = xs / @as(V4, @splat(vw)) * @as(V4, @splat(2.0)) - @as(V4, @splat(1.0));
+                    const nys = @as(V4, @splat(1.0)) - ys / @as(V4, @splat(vh)) * @as(V4, @splat(2.0));
+                    return .{
+                        .{ nxs[0], nys[0] },
+                        .{ nxs[1], nys[1] },
+                        .{ nxs[2], nys[2] },
+                        .{ nxs[3], nys[3] },
+                    };
                 }
 
+                /// SIMD-accelerated RGB→float4 conversion.
+                inline fn rgb(v: u32) [4]f32 {
+                    return rgba(v, 1.0);
+                }
+
+                /// SIMD-accelerated RGBA→float4 conversion.
                 inline fn rgba(v: u32, alpha: f32) [4]f32 {
-                    const rr: f32 = @as(f32, @floatFromInt((v >> 16) & 0xFF)) / 255.0;
-                    const gg: f32 = @as(f32, @floatFromInt((v >> 8) & 0xFF)) / 255.0;
-                    const bb: f32 = @as(f32, @floatFromInt(v & 0xFF)) / 255.0;
-                    return .{ rr, gg, bb, alpha };
+                    const V4u32 = @Vector(4, u32);
+                    const V4f32 = @Vector(4, f32);
+                    const vv: V4u32 = @splat(v);
+                    const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
+                    const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
+                    var arr: [4]f32 = floats;
+                    arr[3] = alpha;
+                    return arr;
                 }
 
                 const solid_uv: [2]f32 = .{ -1.0, -1.0 };
@@ -321,10 +504,8 @@ pub const FlushCtx = struct {
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) !void {
-                    const p0 = ndc(x0, y0, vw, vh);
-                    const p1 = ndc(x1, y0, vw, vh);
-                    const p2 = ndc(x0, y1, vw, vh);
-                    const p3 = ndc(x1, y1, vw, vh);
+                    const pts = ndc4(x0, y0, x1, y1, vw, vh);
+                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
 
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
@@ -348,10 +529,8 @@ pub const FlushCtx = struct {
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) !void {
-                    const p0 = ndc(x0, y0, vw, vh);
-                    const p1 = ndc(x1, y0, vw, vh);
-                    const p2 = ndc(x0, y1, vw, vh);
-                    const p3 = ndc(x1, y1, vw, vh);
+                    const pts = ndc4(x0, y0, x1, y1, vw, vh);
+                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
 
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
@@ -375,10 +554,8 @@ pub const FlushCtx = struct {
                     deco_flags: u32,
                     deco_phase: f32,
                 ) !void {
-                    const p0 = ndc(x0, y0, vw, vh);
-                    const p1 = ndc(x1, y0, vw, vh);
-                    const p2 = ndc(x0, y1, vw, vh);
-                    const p3 = ndc(x1, y1, vw, vh);
+                    const pts = ndc4(x0, y0, x1, y1, vw, vh);
+                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
 
                     // UV coordinates for decorations:
                     // - UV.x = -1 (sentinel for solid/decoration)
@@ -430,7 +607,7 @@ pub const FlushCtx = struct {
             // ----------------------------
             if (need_main) {
                 main.clearRetainingCapacity();
-                var tmp: []RenderCell = &[_]RenderCell{};
+                var tmp: *RenderCells = undefined;
 
                 // Collect visible grids using persistent buffer (zero-allocation hot path)
                 ctx.core.grid_entries.clearRetainingCapacity();
@@ -525,7 +702,7 @@ pub const FlushCtx = struct {
                     const row_cells = &ctx.core.row_cells;
                     if (cols != 0) {
                         try row_cells.ensureTotalCapacity(ctx.core.alloc, cols);
-                        row_cells.items.len = cols;
+                        row_cells.setLen(cols);
                     }
 
                     var log_dirty_rows: u32 = 0;
@@ -647,17 +824,17 @@ pub const FlushCtx = struct {
                                 const sp = a.sp;
                                 const flags = a.style_flags;
 
-                                var i: u32 = c;
-                                while (i < run_end) : (i += 1) {
-                                    const src_cell = grid_cells[row_start + @as(usize, i)];
-                                    row_cells.items[@intCast(i)] = .{
-                                        .scalar = src_cell.cp,
-                                        .fgRGB = fg,
-                                        .bgRGB = bg,
-                                        .spRGB = sp,
-                                        .grid_id = 1, // main grid
-                                        .style_flags = flags,
-                                    };
+                                // Batch fill constant fields with @memset (compiles to SIMD)
+                                const rs: usize = @intCast(c);
+                                const re: usize = @intCast(run_end);
+                                @memset(row_cells.fg_rgbs.items[rs..re], fg);
+                                @memset(row_cells.bg_rgbs.items[rs..re], bg);
+                                @memset(row_cells.sp_rgbs.items[rs..re], sp);
+                                @memset(row_cells.grid_ids.items[rs..re], 1);
+                                @memset(row_cells.style_flags_arr.items[rs..re], flags);
+                                // Only scalars (codepoints) differ per cell
+                                for (rs..re) |i| {
+                                    row_cells.scalars.items[i] = grid_cells[row_start + i].cp;
                                 }
 
                                 c = run_end;
@@ -693,14 +870,7 @@ pub const FlushCtx = struct {
                                         perf_hl_cache_misses += 1;
                                         break :blk2 ctx.core.hl.getWithStyles(cell.hl);
                                     };
-                                    row_cells.items[@intCast(tc)] = .{
-                                        .scalar = cell.cp,
-                                        .fgRGB = a2.fg,
-                                        .bgRGB = a2.bg,
-                                        .spRGB = a2.sp,
-                                        .grid_id = csg.grid_id,
-                                        .style_flags = a2.style_flags,
-                                    };
+                                    row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags);
                                 }
                             }
                         }
@@ -717,16 +887,14 @@ pub const FlushCtx = struct {
                         {
                             var c: u32 = 0;
                             while (c < cols) {
-                                const first = row_cells.items[@intCast(c)];
-                                const run_bg = first.bgRGB;
-                                const run_grid_id = first.grid_id;
+                                const run_bg = row_cells.bg_rgbs.items[@intCast(c)];
+                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
                                 const run_start = c;
 
-                                var end: u32 = c;
-                                while (end < cols) : (end += 1) {
-                                    const cell = row_cells.items[@intCast(end)];
-                                    if (cell.bgRGB != run_bg or cell.grid_id != run_grid_id) break;
-                                }
+                                const end: u32 = @intCast(@min(
+                                    simdFindRunEndU32(row_cells.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
+                                    simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+                                ));
 
                                 const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                                 const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
@@ -756,25 +924,27 @@ pub const FlushCtx = struct {
                         {
                             var c: u32 = 0;
                             while (c < cols) {
-                                const cell = row_cells.items[@intCast(c)];
+                                const cell_style_flags = row_cells.style_flags_arr.items[@intCast(c)];
                                 const under_deco_mask = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
-                                if (cell.style_flags & under_deco_mask == 0) {
+                                if (cell_style_flags & under_deco_mask == 0) {
                                     c += 1;
                                     continue;
                                 }
 
                                 // Find run of cells with same decoration style
                                 const run_start = c;
-                                const run_flags = cell.style_flags;
-                                const run_sp = cell.spRGB;
-                                const run_fg = cell.fgRGB;
-                                const run_grid_id = cell.grid_id;
+                                const run_flags = cell_style_flags;
+                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
+                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
+                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
 
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    const next = row_cells.items[@intCast(run_end)];
-                                    if (next.style_flags != run_flags or next.spRGB != run_sp or next.grid_id != run_grid_id) break;
-                                }
+                                const run_end: u32 = @intCast(@min(
+                                    simdFindRunEndU8(row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
+                                    @min(
+                                        simdFindRunEndU32(row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
+                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
@@ -840,21 +1010,19 @@ pub const FlushCtx = struct {
                         if (ensure_base != null or ensure_styled != null) {
                             var c: u32 = 0;
                             while (c < cols) {
-                                const first = row_cells.items[@intCast(c)];
-                                const run_fg = first.fgRGB;
-                                const run_bg = first.bgRGB;
-                                const run_grid_id = first.grid_id;
+                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
+                                const run_bg = row_cells.bg_rgbs.items[@intCast(c)];
+                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
                                 const run_start = c;
 
-                                var end: u32 = c;
-                                var has_ink = false;
-                                while (end < cols) : (end += 1) {
-                                    const cell = row_cells.items[@intCast(end)];
-                                    if (cell.fgRGB != run_fg or cell.bgRGB != run_bg or cell.grid_id != run_grid_id) break;
-
-                                    const s: u32 = if (cell.scalar == 0) 32 else cell.scalar;
-                                    if (s != 32) has_ink = true;
-                                }
+                                const end: u32 = @intCast(@min(
+                                    simdFindRunEndU32(row_cells.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
+                                    @min(
+                                        simdFindRunEndU32(row_cells.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
+                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
+                                const has_ink = simdHasInkInRange(row_cells.scalars.items, @intCast(c), @intCast(end));
 
                                 if (has_ink) {
                                     const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
@@ -866,8 +1034,9 @@ pub const FlushCtx = struct {
 
                                     var col_i: u32 = run_start;
                                     while (col_i < end) : (col_i += 1) {
-                                        const cell = row_cells.items[@intCast(col_i)];
-                                        const scalar: u32 = if (cell.scalar == 0) 32 else cell.scalar;
+                                        const cell_scalar = row_cells.scalars.items[@intCast(col_i)];
+                                        const cell_style_flags = row_cells.style_flags_arr.items[@intCast(col_i)];
+                                        const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
                                         if (scalar == 32) {
                                             penX += cellW;
                                             continue;
@@ -875,10 +1044,10 @@ pub const FlushCtx = struct {
 
                                         var ge: c_api.GlyphEntry = undefined;
                                         // Use styled callback for bold/italic if available
-                                        const style_mask = cell.style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
                                         // Compute style index: 0=none, 1=bold, 2=italic, 3=bold+italic
-                                        const style_index: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
+                                        const style_index: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
+                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
                                         // GlyphEntry cache lookup for ASCII characters (using dynamic cache)
                                         const glyph_ok = blk: {
                                             // Check dynamic cache for ASCII (0-127)
@@ -893,16 +1062,16 @@ pub const FlushCtx = struct {
                                                     // Cache miss: call callback
                                                     perf_glyph_ascii_misses += 1;
                                                     const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                        const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                         if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                                             ge = entry;
                                                             break :cb true;
                                                         }
                                                         break :cb false;
                                                     } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                        const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                         break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
                                                     } else if (ensure_base) |ensure| cb: {
                                                         break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
@@ -928,16 +1097,16 @@ pub const FlushCtx = struct {
                                                 // Cache miss: call callback
                                                 perf_glyph_nonascii_misses += 1;
                                                 const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                    const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                        @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                    const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                     if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                                         ge = entry;
                                                         break :cb true;
                                                     }
                                                     break :cb false;
                                                 } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                    const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                        @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                    const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                     break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
                                                 } else if (ensure_base) |ensure| cb: {
                                                     break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
@@ -950,16 +1119,16 @@ pub const FlushCtx = struct {
                                             }
                                             // No cache available: call callback directly
                                             const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                                     ge = entry;
                                                     break :cb true;
                                                 }
                                                 break :cb false;
                                             } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
                                             } else if (ensure_base) |ensure| cb: {
                                                 break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
@@ -1015,23 +1184,25 @@ pub const FlushCtx = struct {
                         {
                             var c: u32 = 0;
                             while (c < cols) {
-                                const cell = row_cells.items[@intCast(c)];
-                                if (cell.style_flags & STYLE_STRIKETHROUGH == 0) {
+                                const c_style_flags = row_cells.style_flags_arr.items[@intCast(c)];
+                                if (c_style_flags & STYLE_STRIKETHROUGH == 0) {
                                     c += 1;
                                     continue;
                                 }
 
                                 const run_start = c;
-                                const run_flags = cell.style_flags;
-                                const run_sp = cell.spRGB;
-                                const run_fg = cell.fgRGB;
-                                const run_grid_id = cell.grid_id;
+                                const run_flags = c_style_flags;
+                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
+                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
+                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
 
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    const next = row_cells.items[@intCast(run_end)];
-                                    if (next.style_flags != run_flags or next.spRGB != run_sp or next.grid_id != run_grid_id) break;
-                                }
+                                const run_end: u32 = @intCast(@min(
+                                    simdFindRunEndU8(row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
+                                    @min(
+                                        simdFindRunEndU32(row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
+                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
 
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
                                 const strike_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
@@ -1067,8 +1238,9 @@ pub const FlushCtx = struct {
                         if (log_enabled and scrolled_count > 0 and out.items.len == 0) {
                             // Check if this row actually has visible content
                             var has_visible: bool = false;
-                            for (row_cells.items[0..cols]) |rc| {
-                                if (rc.scalar != 0 and rc.scalar != 32) {
+                            for (0..cols) |idx| {
+                                const sc = row_cells.scalars.items[idx];
+                                if (sc != 0 and sc != 32) {
                                     has_visible = true;
                                     break;
                                 }
@@ -1116,25 +1288,71 @@ pub const FlushCtx = struct {
                     // Use persistent buffer (zero-allocation hot path)
                     try ctx.core.tmp_cells.ensureTotalCapacity(ctx.core.alloc, n_cells2);
                     ctx.core.tmp_cells.clearRetainingCapacity();
-                    ctx.core.tmp_cells.items.len = n_cells2;
-                    tmp = ctx.core.tmp_cells.items;
+                    ctx.core.tmp_cells.setLen(n_cells2);
+                    tmp = &ctx.core.tmp_cells;
 
-                    // 1) draw main grid(1)
-                    var cell_i: usize = 0;
-                    while (cell_i < n_cells2) : (cell_i += 1) {
-                        const cell = ctx.core.grid.cells[cell_i];
-                        const a = ctx.core.hl.getWithStyles(cell.hl);
-                        tmp[cell_i] = .{
-                            .scalar = cell.cp,
-                            .fgRGB = a.fg,
-                            .bgRGB = a.bg,
-                            .spRGB = a.sp,
-                            .grid_id = 1, // main grid
-                            .style_flags = packStyleFlags(a),
-                        };
+                    // Initialize hl_cache for non-row-mode (same as row-mode path)
+                    ctx.core.initHlCache() catch {
+                        ctx.core.log.write("[flush] Failed to initialize hl cache (non-row-mode)\n", .{});
+                    };
+                    const nr_hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
+                    const nr_hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
+                    const nr_hl_cache_limit: u32 = @intCast(nr_hl_valid.len);
+                    @memset(nr_hl_valid, false);
+
+                    // 1) draw main grid(1) with RLE batching + hl_cache
+                    const grid_cells = ctx.core.grid.cells;
+                    var row_i: u32 = 0;
+                    while (row_i < rows) : (row_i += 1) {
+                        const row_start: usize = @as(usize, row_i) * @as(usize, cols);
+                        var c: u32 = 0;
+
+                        while (c < cols) {
+                            const first_cell = grid_cells[row_start + @as(usize, c)];
+                            const run_hl = first_cell.hl;
+
+                            // Find run of consecutive cells with same hl_id
+                            var run_end: u32 = c + 1;
+                            while (run_end < cols) : (run_end += 1) {
+                                if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
+                            }
+
+                            // Get resolved attributes with cache
+                            const a = blk: {
+                                if (run_hl < nr_hl_cache_limit) {
+                                    if (nr_hl_valid[run_hl]) {
+                                        break :blk nr_hl_cache[run_hl];
+                                    }
+                                    const resolved = ctx.core.hl.getWithStyles(run_hl);
+                                    nr_hl_cache[run_hl] = resolved;
+                                    nr_hl_valid[run_hl] = true;
+                                    break :blk resolved;
+                                }
+                                break :blk ctx.core.hl.getWithStyles(run_hl);
+                            };
+
+                            const fg = a.fg;
+                            const bg = a.bg;
+                            const sp = a.sp;
+                            const flags = a.style_flags;
+
+                            // Batch fill constant fields with @memset
+                            const fill_start: usize = row_start + @as(usize, c);
+                            const fill_end: usize = row_start + @as(usize, run_end);
+                            @memset(tmp.fg_rgbs.items[fill_start..fill_end], fg);
+                            @memset(tmp.bg_rgbs.items[fill_start..fill_end], bg);
+                            @memset(tmp.sp_rgbs.items[fill_start..fill_end], sp);
+                            @memset(tmp.grid_ids.items[fill_start..fill_end], 1);
+                            @memset(tmp.style_flags_arr.items[fill_start..fill_end], flags);
+                            for (fill_start..fill_end) |i| {
+                                tmp.scalars.items[i] = grid_cells[i].cp;
+                            }
+
+                            c = run_end;
+                        }
                     }
 
-                    // Then overlay in that order
+                    // Then overlay subgrids (with hl_cache)
                     for (ctx.core.grid_entries.items) |ent| {
                         const subgrid_id = ent.grid_id;
                         const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
@@ -1148,24 +1366,52 @@ pub const FlushCtx = struct {
                             const tr = pos.row + r2;
                             if (tr >= rows) break;
 
+                            const sg_row_start: usize = @as(usize, r2) * @as(usize, sg.cols);
+                            const dst_row_start: usize = @as(usize, tr) * @as(usize, cols);
                             var c2: u32 = 0;
-                            while (c2 < sg.cols) : (c2 += 1) {
+
+                            while (c2 < sg.cols) {
                                 const tc = pos.col + c2;
                                 if (tc >= cols) break;
 
-                                const src_i: usize = @as(usize, r2) * @as(usize, sg.cols) + @as(usize, c2);
-                                const dst_i: usize = @as(usize, tr) * @as(usize, cols) + @as(usize, tc);
+                                const first_cell = sg.cells[sg_row_start + @as(usize, c2)];
+                                const run_hl = first_cell.hl;
 
-                                const cell = sg.cells[src_i];
-                                const a = ctx.core.hl.getWithStyles(cell.hl);
-                                tmp[dst_i] = .{
-                                    .scalar = cell.cp,
-                                    .fgRGB = a.fg,
-                                    .bgRGB = a.bg,
-                                    .spRGB = a.sp,
-                                    .grid_id = subgrid_id,
-                                    .style_flags = packStyleFlags(a),
+                                // Find run of consecutive subgrid cells with same hl_id
+                                var run_end: u32 = c2 + 1;
+                                while (run_end < sg.cols and pos.col + run_end < cols) : (run_end += 1) {
+                                    if (sg.cells[sg_row_start + @as(usize, run_end)].hl != run_hl) break;
+                                }
+
+                                // Get resolved attributes with cache
+                                const a = blk: {
+                                    if (run_hl < nr_hl_cache_limit) {
+                                        if (nr_hl_valid[run_hl]) {
+                                            break :blk nr_hl_cache[run_hl];
+                                        }
+                                        const resolved = ctx.core.hl.getWithStyles(run_hl);
+                                        nr_hl_cache[run_hl] = resolved;
+                                        nr_hl_valid[run_hl] = true;
+                                        break :blk resolved;
+                                    }
+                                    break :blk ctx.core.hl.getWithStyles(run_hl);
                                 };
+
+                                const fg = a.fg;
+                                const bg = a.bg;
+                                const sp = a.sp;
+                                const flags = a.style_flags;
+
+                                var i: u32 = c2;
+                                while (i < run_end) : (i += 1) {
+                                    const ti = pos.col + i;
+                                    if (ti >= cols) break;
+
+                                    const src_cell = sg.cells[sg_row_start + @as(usize, i)];
+                                    tmp.set(dst_row_start + @as(usize, ti), src_cell.cp, fg, bg, sp, subgrid_id, flags);
+                                }
+
+                                c2 = run_end;
                             }
                         }
                     }
@@ -1191,16 +1437,14 @@ pub const FlushCtx = struct {
 
                         var c: u32 = 0;
                         while (c < cols) {
-                            const first = tmp[row_start + @as(usize, c)];
-                            const run_bg = first.bgRGB;
-                            const run_grid_id = first.grid_id;
+                            const run_bg = tmp.bg_rgbs.items[row_start + @as(usize, c)];
+                            const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
                             const run_start = c;
 
-                            var end: u32 = c;
-                            while (end < cols) : (end += 1) {
-                                const cell = tmp[row_start + @as(usize, end)];
-                                if (cell.bgRGB != run_bg or cell.grid_id != run_grid_id) break;
-                            }
+                            const end: u32 = @intCast(@min(
+                                simdFindRunEndU32(tmp.bg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_bg),
+                                simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c), @intCast(cols), run_grid_id),
+                            ));
 
                             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                             const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
@@ -1234,26 +1478,28 @@ pub const FlushCtx = struct {
 
                             var c: u32 = 0;
                             while (c < cols) {
-                                const cell = tmp[row_start + @as(usize, c)];
+                                const cell_sf = tmp.style_flags_arr.items[row_start + @as(usize, c)];
                                 // Check for any under-decoration (not strikethrough)
                                 const under_mask = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
-                                if (cell.style_flags & under_mask == 0) {
+                                if (cell_sf & under_mask == 0) {
                                     c += 1;
                                     continue;
                                 }
 
                                 // Find run of cells with same decoration style
                                 const run_start = c;
-                                const run_flags = cell.style_flags;
-                                const run_sp = cell.spRGB;
-                                const run_fg = cell.fgRGB;
-                                const run_grid_id = cell.grid_id;
+                                const run_flags = cell_sf;
+                                const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c)];
+                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
+                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
 
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    const next = tmp[row_start + @as(usize, run_end)];
-                                    if (next.style_flags != run_flags or next.spRGB != run_sp or next.grid_id != run_grid_id) break;
-                                }
+                                const run_end: u32 = @intCast(@min(
+                                    simdFindRunEndU8(tmp.style_flags_arr.items[row_start..], @intCast(c + 1), @intCast(cols), run_flags),
+                                    @min(
+                                        simdFindRunEndU32(tmp.sp_rgbs.items[row_start..], @intCast(c + 1), @intCast(cols), run_sp),
+                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c + 1), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
@@ -1327,21 +1573,19 @@ pub const FlushCtx = struct {
 
                             var c: u32 = 0;
                             while (c < cols) {
-                                const first = tmp[row_start + @as(usize, c)];
-                                const run_fg = first.fgRGB;
-                                const run_bg = first.bgRGB;
-                                const run_grid_id = first.grid_id;
+                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
+                                const run_bg = tmp.bg_rgbs.items[row_start + @as(usize, c)];
+                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
                                 const run_start = c;
 
-                                var end: u32 = c;
-                                var has_ink = false;
-                                while (end < cols) : (end += 1) {
-                                    const cell = tmp[row_start + @as(usize, end)];
-                                    if (cell.fgRGB != run_fg or cell.bgRGB != run_bg or cell.grid_id != run_grid_id) break;
-
-                                    const s: u32 = if (cell.scalar == 0) 32 else cell.scalar;
-                                    if (s != 32) has_ink = true;
-                                }
+                                const end: u32 = @intCast(@min(
+                                    simdFindRunEndU32(tmp.fg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_fg),
+                                    @min(
+                                        simdFindRunEndU32(tmp.bg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_bg),
+                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
+                                const has_ink = simdHasInkInRange(tmp.scalars.items[row_start..], @intCast(c), @intCast(end));
 
                                 if (has_ink) {
                                     const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
@@ -1352,8 +1596,9 @@ pub const FlushCtx = struct {
 
                                     var col_i: u32 = run_start;
                                     while (col_i < end) : (col_i += 1) {
-                                        const cell = tmp[row_start + @as(usize, col_i)];
-                                        const scalar: u32 = if (cell.scalar == 0) 32 else cell.scalar;
+                                        const cell_scalar = tmp.scalars.items[row_start + @as(usize, col_i)];
+                                        const cell_style_flags = tmp.style_flags_arr.items[row_start + @as(usize, col_i)];
+                                        const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
                                         if (scalar == 32) {
                                             penX += cellW;
                                             continue;
@@ -1361,19 +1606,19 @@ pub const FlushCtx = struct {
 
                                         var ge: c_api.GlyphEntry = undefined;
                                         // Use styled callback for bold/italic if available
-                                        const style_mask = cell.style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
                                         const glyph_ok = blk: {
                                             if (ctx.core.isPhase2Atlas()) {
-                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                                     ge = entry;
                                                     break :blk true;
                                                 }
                                                 break :blk false;
                                             } else if (style_mask != 0 and ensure_styled_full != null) {
-                                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                                 break :blk ensure_styled_full.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
                                             } else if (ensure_base_full) |ensure| {
                                                 break :blk ensure(ctx.core.ctx, scalar, &ge) != 0;
@@ -1429,24 +1674,26 @@ pub const FlushCtx = struct {
 
                             var c: u32 = 0;
                             while (c < cols) {
-                                const cell = tmp[row_start + @as(usize, c)];
+                                const cell_sf2 = tmp.style_flags_arr.items[row_start + @as(usize, c)];
                                 // Only handle strikethrough here
-                                if (cell.style_flags & STYLE_STRIKETHROUGH == 0) {
+                                if (cell_sf2 & STYLE_STRIKETHROUGH == 0) {
                                     c += 1;
                                     continue;
                                 }
 
                                 // Find run of cells with same strikethrough style
                                 const run_start = c;
-                                const run_sp = cell.spRGB;
-                                const run_fg = cell.fgRGB;
-                                const run_grid_id = cell.grid_id;
+                                const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c)];
+                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
+                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
 
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    const next = tmp[row_start + @as(usize, run_end)];
-                                    if (next.style_flags & STYLE_STRIKETHROUGH == 0 or next.spRGB != run_sp or next.grid_id != run_grid_id) break;
-                                }
+                                const run_end: u32 = @intCast(@min(
+                                    simdFindFirstBitUnset(tmp.style_flags_arr.items[row_start..], @intCast(c + 1), @intCast(cols), STYLE_STRIKETHROUGH),
+                                    @min(
+                                        simdFindRunEndU32(tmp.sp_rgbs.items[row_start..], @intCast(c + 1), @intCast(cols), run_sp),
+                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c + 1), @intCast(cols), run_grid_id),
+                                    ),
+                                ));
 
                                 // Use special color if set, otherwise foreground
                                 const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
@@ -1565,10 +1812,8 @@ pub const FlushCtx = struct {
                         // Push cursor background quad with DECO_CURSOR flag
                         // (so shader treats it as decoration, not background with transparency)
                         {
-                            const p0 = Helpers.ndc(rx0, ry0, dw, dh);
-                            const p1 = Helpers.ndc(rx1, ry0, dw, dh);
-                            const p2 = Helpers.ndc(rx0, ry1, dw, dh);
-                            const p3 = Helpers.ndc(rx1, ry1, dw, dh);
+                            const pts = Helpers.ndc4(rx0, ry0, rx1, ry1, dw, dh);
+                            const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
                             const col = Helpers.rgb(cursor_out.bgRGB);
                             const solid_uv = Helpers.solid_uv;
 
@@ -1878,18 +2123,34 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             return .{ nx, ny };
         }
 
+        /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
+        inline fn ndc4(x0: f32, y0: f32, x1: f32, y1: f32, vw: f32, vh: f32) [4][2]f32 {
+            const V4 = @Vector(4, f32);
+            const xs = V4{ x0, x1, x0, x1 };
+            const ys = V4{ y0, y0, y1, y1 };
+            const nxs = xs / @as(V4, @splat(vw)) * @as(V4, @splat(2.0)) - @as(V4, @splat(1.0));
+            const nys = @as(V4, @splat(1.0)) - ys / @as(V4, @splat(vh)) * @as(V4, @splat(2.0));
+            return .{
+                .{ nxs[0], nys[0] },
+                .{ nxs[1], nys[1] },
+                .{ nxs[2], nys[2] },
+                .{ nxs[3], nys[3] },
+            };
+        }
+
         inline fn rgb(v: u32) [4]f32 {
-            const rr: f32 = @as(f32, @floatFromInt((v >> 16) & 0xFF)) / 255.0;
-            const gg: f32 = @as(f32, @floatFromInt((v >> 8) & 0xFF)) / 255.0;
-            const bb: f32 = @as(f32, @floatFromInt(v & 0xFF)) / 255.0;
-            return .{ rr, gg, bb, 1.0 };
+            return rgba(v, 1.0);
         }
 
         inline fn rgba(v: u32, alpha: f32) [4]f32 {
-            const rr: f32 = @as(f32, @floatFromInt((v >> 16) & 0xFF)) / 255.0;
-            const gg: f32 = @as(f32, @floatFromInt((v >> 8) & 0xFF)) / 255.0;
-            const bb: f32 = @as(f32, @floatFromInt(v & 0xFF)) / 255.0;
-            return .{ rr, gg, bb, alpha };
+            const V4u32 = @Vector(4, u32);
+            const V4f32 = @Vector(4, f32);
+            const vv: V4u32 = @splat(v);
+            const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
+            const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
+            var arr: [4]f32 = floats;
+            arr[3] = alpha;
+            return arr;
         }
     };
 
@@ -2146,39 +2407,28 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
             self.row_cells.clearRetainingCapacity();
             self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch continue;
-            self.row_cells.items.len = sg.cols;
+            self.row_cells.setLen(sg.cols);
 
             const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
             for (0..sg.cols) |c| {
                 const cell_idx = row_start + c;
                 if (cell_idx >= n_cells) {
-                    self.row_cells.items[c] = .{ .scalar = ' ', .fgRGB = default_bg, .bgRGB = default_bg, .spRGB = highlight.Highlights.SP_NOT_SET, .grid_id = grid_id, .style_flags = 0 };
+                    self.row_cells.set(c, ' ', default_bg, default_bg, highlight.Highlights.SP_NOT_SET, grid_id, 0);
                     continue;
                 }
                 const cell = composite_cells[cell_idx];
                 const attr = cache.getAttr(&self.hl, cell.hl);
-                self.row_cells.items[c] = .{
-                    .scalar = cell.cp,
-                    .fgRGB = attr.fg,
-                    .bgRGB = attr.bg,
-                    .spRGB = attr.sp,
-                    .grid_id = grid_id,
-                    .style_flags = packStyleFlags(attr),
-                };
+                self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr));
             }
 
             // Pass 1: Background (run-length optimized)
             {
                 var c: u32 = 0;
                 while (c < sg.cols) {
-                    const first = self.row_cells.items[c];
-                    const run_bg = first.bgRGB;
+                    const run_bg = self.row_cells.bg_rgbs.items[c];
                     const run_start = c;
 
-                    var end: u32 = c;
-                    while (end < sg.cols) : (end += 1) {
-                        if (self.row_cells.items[end].bgRGB != run_bg) break;
-                    }
+                    const end: u32 = @intCast(simdFindRunEndU32(self.row_cells.bg_rgbs.items, @intCast(c), @intCast(sg.cols), run_bg));
 
                     const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
                     const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
@@ -2191,10 +2441,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         1.0;
                     const bg_col = Helpers.rgba(run_bg, bg_alpha);
 
-                    const tl = Helpers.ndc(x0, y0, grid_w, grid_h);
-                    const tr = Helpers.ndc(x1, y0, grid_w, grid_h);
-                    const bl = Helpers.ndc(x0, y1, grid_w, grid_h);
-                    const br = Helpers.ndc(x1, y1, grid_w, grid_h);
+                    const bg_pts = Helpers.ndc4(x0, y0, x1, y1, grid_w, grid_h);
+                    const tl = bg_pts[0]; const tr = bg_pts[1]; const bl = bg_pts[2]; const br = bg_pts[3];
 
                     ext_verts.appendAssumeCapacity(.{ .position = tl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
                     ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
@@ -2212,22 +2460,21 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 const under_deco_mask: u8 = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
                 var c: u32 = 0;
                 while (c < sg.cols) {
-                    const cell = self.row_cells.items[c];
-                    if (cell.style_flags & under_deco_mask == 0) {
+                    const ext_cell_sf = self.row_cells.style_flags_arr.items[c];
+                    if (ext_cell_sf & under_deco_mask == 0) {
                         c += 1;
                         continue;
                     }
 
                     const run_start = c;
-                    const run_flags = cell.style_flags;
-                    const run_sp = cell.spRGB;
-                    const run_fg = cell.fgRGB;
+                    const run_flags = ext_cell_sf;
+                    const run_sp = self.row_cells.sp_rgbs.items[c];
+                    const run_fg = self.row_cells.fg_rgbs.items[c];
 
-                    var run_end: u32 = c + 1;
-                    while (run_end < sg.cols) : (run_end += 1) {
-                        const next = self.row_cells.items[run_end];
-                        if (next.style_flags != run_flags or next.spRGB != run_sp) break;
-                    }
+                    const run_end: u32 = @intCast(@min(
+                        simdFindRunEndU8(self.row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(sg.cols), run_flags),
+                        simdFindRunEndU32(self.row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(sg.cols), run_sp),
+                    ));
 
                     const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
                     const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
@@ -2237,10 +2484,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     if (run_flags & STYLE_UNDERLINE != 0) {
                         const uy0 = row_y + cellH - 2.0;
                         const uy1 = uy0 + 1.0;
-                        const utl = Helpers.ndc(x0, uy0, grid_w, grid_h);
-                        const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
-                        const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
-                        const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
+                        const ul_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
+                        const utl = ul_pts[0]; const utr = ul_pts[1]; const ubl = ul_pts[2]; const ubr = ul_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
@@ -2256,10 +2501,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const uy0_2 = row_y + cellH - 2.0;
                         const uy1_2 = uy0_2 + 1.0;
                         // First line
-                        var utl = Helpers.ndc(x0, uy0_1, grid_w, grid_h);
-                        var utr = Helpers.ndc(x1, uy0_1, grid_w, grid_h);
-                        var ubl = Helpers.ndc(x0, uy1_1, grid_w, grid_h);
-                        var ubr = Helpers.ndc(x1, uy1_1, grid_w, grid_h);
+                        const ud1_pts = Helpers.ndc4(x0, uy0_1, x1, uy1_1, grid_w, grid_h);
+                        var utl = ud1_pts[0]; var utr = ud1_pts[1]; var ubl = ud1_pts[2]; var ubr = ud1_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
@@ -2267,10 +2510,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         // Second line
-                        utl = Helpers.ndc(x0, uy0_2, grid_w, grid_h);
-                        utr = Helpers.ndc(x1, uy0_2, grid_w, grid_h);
-                        ubl = Helpers.ndc(x0, uy1_2, grid_w, grid_h);
-                        ubr = Helpers.ndc(x1, uy1_2, grid_w, grid_h);
+                        const ud2_pts = Helpers.ndc4(x0, uy0_2, x1, uy1_2, grid_w, grid_h);
+                        utl = ud2_pts[0]; utr = ud2_pts[1]; ubl = ud2_pts[2]; ubr = ud2_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
@@ -2284,10 +2525,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const uy0 = row_y + cellH - 4.0;
                         const uy1 = row_y + cellH;
                         const phase: f32 = @floatFromInt(run_start);
-                        const utl = Helpers.ndc(x0, uy0, grid_w, grid_h);
-                        const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
-                        const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
-                        const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
+                        const uc_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
+                        const utl = uc_pts[0]; const utr = uc_pts[1]; const ubl = uc_pts[2]; const ubr = uc_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
@@ -2300,10 +2539,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     if (run_flags & STYLE_UNDERDOTTED != 0) {
                         const uy0 = row_y + cellH - 2.0;
                         const uy1 = uy0 + 1.0;
-                        const utl = Helpers.ndc(x0, uy0, grid_w, grid_h);
-                        const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
-                        const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
-                        const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
+                        const udt_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
+                        const utl = udt_pts[0]; const utr = udt_pts[1]; const ubl = udt_pts[2]; const ubr = udt_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
@@ -2316,10 +2553,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     if (run_flags & STYLE_UNDERDASHED != 0) {
                         const uy0 = row_y + cellH - 2.0;
                         const uy1 = uy0 + 1.0;
-                        const utl = Helpers.ndc(x0, uy0, grid_w, grid_h);
-                        const utr = Helpers.ndc(x1, uy0, grid_w, grid_h);
-                        const ubl = Helpers.ndc(x0, uy1, grid_w, grid_h);
-                        const ubr = Helpers.ndc(x1, uy1, grid_w, grid_h);
+                        const uda_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
+                        const utl = uda_pts[0]; const utr = uda_pts[1]; const ubl = uda_pts[2]; const ubr = uda_pts[3];
                         ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
                         ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
@@ -2337,8 +2572,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             const ensure_styled = self.cb.on_atlas_ensure_glyph_styled;
             for (0..sg.cols) |col_idx| {
                 const col: u32 = @intCast(col_idx);
-                const cell = self.row_cells.items[col];
-                const scalar: u32 = if (cell.scalar == 0) 32 else cell.scalar;
+                const cell_sc = self.row_cells.scalars.items[col];
+                const cell_sf = self.row_cells.style_flags_arr.items[col];
+                const scalar: u32 = if (cell_sc == 0) 32 else cell_sc;
 
                 if (scalar == ' ' or scalar == 32) continue;
 
@@ -2349,9 +2585,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 non_space_count += 1;
 
                 const x0: f32 = @as(f32, @floatFromInt(col)) * cellW;
-                const style_mask: u32 = @as(u32, cell.style_flags & (STYLE_BOLD | STYLE_ITALIC));
-                const style_index: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
+                const style_mask: u32 = @as(u32, cell_sf & (STYLE_BOLD | STYLE_ITALIC));
+                const style_index: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) @as(u32, 1) else 0) +
+                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) @as(u32, 2) else 0);
 
                 var ge: c_api.GlyphEntry = undefined;
 
@@ -2369,16 +2605,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             // Cache miss: call callback
                             cache.perf_glyph_ascii_misses += 1;
                             const ok = if (self.isPhase2Atlas()) cb: {
-                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                 if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                     ge = entry;
                                     break :cb true;
                                 }
                                 break :cb false;
                             } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                 break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
                             } else if (ensure_base) |ensure| cb: {
                                 break :cb ensure(self.ctx, scalar, &ge) != 0;
@@ -2403,16 +2639,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         // Cache miss: call callback
                         cache.perf_glyph_nonascii_misses += 1;
                         const ok = if (self.isPhase2Atlas()) cb: {
-                            const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                            const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                             if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
                                 ge = entry;
                                 break :cb true;
                             }
                             break :cb false;
                         } else if (style_mask != 0 and ensure_styled != null) cb: {
-                            const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                            const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                             break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
                         } else if (ensure_base) |ensure| cb: {
                             break :cb ensure(self.ctx, scalar, &ge) != 0;
@@ -2425,16 +2661,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     }
                     // No cache: call callback directly
                     const ok = if (self.isPhase2Atlas()) cb: {
-                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                        const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                            @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                         if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
                             ge = entry;
                             break :cb true;
                         }
                         break :cb false;
                     } else if (style_mask != 0 and ensure_styled != null) cb: {
-                        const c_style: u32 = @as(u32, if (cell.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                            @as(u32, if (cell.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                        const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                            @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                         break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
                     } else if (ensure_base) |ensure| cb: {
                         break :cb ensure(self.ctx, scalar, &ge) != 0;
@@ -2444,7 +2680,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                 if (glyph_ok) {
                     glyph_success_count += 1;
-                    const glyph_col = Helpers.rgb(cell.fgRGB);
+                    const glyph_col = Helpers.rgb(self.row_cells.fg_rgbs.items[col]);
 
                     const baseY = row_y + topPad;
                     const baselineY = baseY + ge.ascent_px;
@@ -2453,10 +2689,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const gy0 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
                     const gy1 = gy0 + ge.bbox_size_px[1];
 
-                    const gtl = Helpers.ndc(gx0, gy0, grid_w, grid_h);
-                    const gtr = Helpers.ndc(gx1, gy0, grid_w, grid_h);
-                    const gbl = Helpers.ndc(gx0, gy1, grid_w, grid_h);
-                    const gbr = Helpers.ndc(gx1, gy1, grid_w, grid_h);
+                    const g_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
+                    const gtl = g_pts[0]; const gtr = g_pts[1]; const gbl = g_pts[2]; const gbr = g_pts[3];
 
                     const uv_x0 = ge.uv_min[0];
                     const uv_y0 = ge.uv_min[1];
@@ -2478,22 +2712,21 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             {
                 var c: u32 = 0;
                 while (c < sg.cols) {
-                    const cell = self.row_cells.items[c];
-                    if (cell.style_flags & STYLE_STRIKETHROUGH == 0) {
+                    const st_sf = self.row_cells.style_flags_arr.items[c];
+                    if (st_sf & STYLE_STRIKETHROUGH == 0) {
                         c += 1;
                         continue;
                     }
 
                     const run_start = c;
-                    const run_flags = cell.style_flags;
-                    const run_sp = cell.spRGB;
-                    const run_fg = cell.fgRGB;
+                    const run_flags = st_sf;
+                    const run_sp = self.row_cells.sp_rgbs.items[c];
+                    const run_fg = self.row_cells.fg_rgbs.items[c];
 
-                    var run_end: u32 = c + 1;
-                    while (run_end < sg.cols) : (run_end += 1) {
-                        const next = self.row_cells.items[run_end];
-                        if (next.style_flags != run_flags or next.spRGB != run_sp) break;
-                    }
+                    const run_end: u32 = @intCast(@min(
+                        simdFindRunEndU8(self.row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(sg.cols), run_flags),
+                        simdFindRunEndU32(self.row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(sg.cols), run_sp),
+                    ));
 
                     const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
                     const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
@@ -2501,10 +2734,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const sy0 = row_y + cellH * 0.5 - 0.5;
                     const sy1 = sy0 + 1.0;
 
-                    const stl = Helpers.ndc(x0, sy0, grid_w, grid_h);
-                    const str = Helpers.ndc(x1, sy0, grid_w, grid_h);
-                    const sbl = Helpers.ndc(x0, sy1, grid_w, grid_h);
-                    const sbr = Helpers.ndc(x1, sy1, grid_w, grid_h);
+                    const s_pts = Helpers.ndc4(x0, sy0, x1, sy1, grid_w, grid_h);
+                    const stl = s_pts[0]; const str = s_pts[1]; const sbl = s_pts[2]; const sbr = s_pts[3];
 
                     ext_verts.appendAssumeCapacity(.{ .position = stl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
                     ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
@@ -2559,10 +2790,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         self.hl.default_fg; // attr_id == 0: swap default colors (per Nvim spec)
                     const cursor_color = Helpers.rgb(cursor_bg);
 
-                    const ctl = Helpers.ndc(crx0, cry0, grid_w, grid_h);
-                    const ctr = Helpers.ndc(crx1, cry0, grid_w, grid_h);
-                    const cbl = Helpers.ndc(crx0, cry1, grid_w, grid_h);
-                    const cbr = Helpers.ndc(crx1, cry1, grid_w, grid_h);
+                    const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
+                    const ctl = c_pts[0]; const ctr = c_pts[1]; const cbl = c_pts[2]; const cbr = c_pts[3];
 
                     ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                     ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
@@ -2620,10 +2849,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         self.hl.default_bg; // attr_id == 0: swap default colors (per Nvim spec)
                                     const text_col = Helpers.rgb(cursor_fg);
 
-                                    const gtl = Helpers.ndc(gx0, gy0, grid_w, grid_h);
-                                    const gtr = Helpers.ndc(gx1, gy0, grid_w, grid_h);
-                                    const gbl = Helpers.ndc(gx0, gy1, grid_w, grid_h);
-                                    const gbr = Helpers.ndc(gx1, gy1, grid_w, grid_h);
+                                    const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
+                                    const gtl = cg_pts[0]; const gtr = cg_pts[1]; const gbl = cg_pts[2]; const gbr = cg_pts[3];
 
                                     ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                                     ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });

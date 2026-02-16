@@ -267,7 +267,7 @@ const STYLE_UNDERCURL = flush.STYLE_UNDERCURL;
 const STYLE_UNDERDOUBLE = flush.STYLE_UNDERDOUBLE;
 const STYLE_UNDERDOTTED = flush.STYLE_UNDERDOTTED;
 const STYLE_UNDERDASHED = flush.STYLE_UNDERDASHED;
-const RenderCell = flush.RenderCell;
+const RenderCells = flush.RenderCells;
 const packStyleFlags = flush.packStyleFlags;
 const MsgCachedLine = flush.MsgCachedLine;
 pub const FlushCache = flush.FlushCache;
@@ -296,8 +296,8 @@ pub const Core = struct {
     row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .{},
 
     // Reusable scratch buffers (zero-allocation hot path)
-    tmp_cells: std.ArrayListUnmanaged(RenderCell) = .{},
-    row_cells: std.ArrayListUnmanaged(RenderCell) = .{},
+    tmp_cells: RenderCells = .{},
+    row_cells: RenderCells = .{},
     grid_entries: std.ArrayListUnmanaged(GridEntry) = .{},
     key_buf: std.ArrayListUnmanaged(u8) = .{},
 

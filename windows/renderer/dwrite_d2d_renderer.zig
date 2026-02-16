@@ -1272,12 +1272,36 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         var y: u32 = 0;
         while (y < height) : (y += 1) {
             const src_row: usize = if (bitmap.pitch >= 0) @as(usize, y) else @as(usize, height - 1 - y);
-            var x: u32 = 0;
-            while (x < width) : (x += 1) {
-                const dst_off = ((@as(usize, dest_y + y) * @as(usize, AtlasW)) + @as(usize, dest_x + x)) * 4;
+            const dst_row_base: usize = @as(usize, dest_y + y) * @as(usize, AtlasW);
 
-                if (bpp == 3) {
-                    // ClearType RGB -> RGBA
+            if (bpp == 3) {
+                // ClearType RGB -> RGBA (SIMD: 4 pixels per iteration)
+                var x: u32 = 0;
+                while (x + 4 <= width) {
+                    const src_base = src_row * pitch + @as(usize, x) * 3;
+                    const dst_base = (dst_row_base + @as(usize, dest_x + x)) * 4;
+                    const s = pixels[src_base..];
+
+                    // Gather RGB channels from stride-3 source
+                    const r4 = @Vector(4, u8){ s[0], s[3], s[6], s[9] };
+                    const g4 = @Vector(4, u8){ s[1], s[4], s[7], s[10] };
+                    const b4 = @Vector(4, u8){ s[2], s[5], s[8], s[11] };
+                    // Alpha = max(R, G, B) — SIMD max
+                    const a4 = @max(r4, @max(g4, b4));
+
+                    // Scatter RGBA to stride-4 destination
+                    const d = self.atlas_cpu.items[dst_base..];
+                    inline for (0..4) |i| {
+                        d[i * 4 + 0] = r4[i];
+                        d[i * 4 + 1] = g4[i];
+                        d[i * 4 + 2] = b4[i];
+                        d[i * 4 + 3] = a4[i];
+                    }
+                    x += 4;
+                }
+                // Scalar tail
+                while (x < width) : (x += 1) {
+                    const dst_off = (dst_row_base + @as(usize, dest_x + x)) * 4;
                     const src_off = src_row * pitch + @as(usize, x) * 3;
                     const r = pixels[src_off];
                     const g = pixels[src_off + 1];
@@ -1286,8 +1310,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                     self.atlas_cpu.items[dst_off + 1] = g;
                     self.atlas_cpu.items[dst_off + 2] = b;
                     self.atlas_cpu.items[dst_off + 3] = @max(r, @max(g, b));
-                } else {
-                    // Grayscale or other: replicate to RGBA
+                }
+            } else {
+                // Grayscale or other: replicate to RGBA
+                var x: u32 = 0;
+                while (x < width) : (x += 1) {
+                    const dst_off = (dst_row_base + @as(usize, dest_x + x)) * 4;
                     const src_off = src_row * pitch + @as(usize, x) * bpp;
                     const v = pixels[src_off];
                     self.atlas_cpu.items[dst_off + 0] = v;

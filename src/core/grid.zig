@@ -445,14 +445,12 @@ pub const GridBuf = struct {
         const min_cols = @min(self.cols, cols);
 
         if (self.cells.len != 0) {
+            // Row-level @memcpy instead of per-cell copy
             var r: u32 = 0;
             while (r < min_rows) : (r += 1) {
-                var c: u32 = 0;
-                while (c < min_cols) : (c += 1) {
-                    const old_i: usize = @as(usize, r) * @as(usize, self.cols) + @as(usize, c);
-                    const new_i: usize = @as(usize, r) * @as(usize, cols) + @as(usize, c);
-                    new_cells[new_i] = self.cells[old_i];
-                }
+                const old_start: usize = @as(usize, r) * @as(usize, self.cols);
+                const new_start: usize = @as(usize, r) * @as(usize, cols);
+                @memcpy(new_cells[new_start..new_start + min_cols], self.cells[old_start..old_start + min_cols]);
             }
             alloc.free(self.cells);
         }
@@ -923,9 +921,12 @@ pub const Grid = struct {
     
     pub fn markDirtyRect(self: *Grid, top: u32, bot: u32) void {
         if (self.dirty_all) return;
-        var r: u32 = top;
-        while (r < bot and r < self.rows) : (r += 1) {
-            self.markDirtyRow(r);
+        const start: usize = @as(usize, top);
+        const end: usize = @as(usize, @min(bot, self.rows));
+        if (start >= end) return;
+        const clamped_end: usize = @min(end, self.dirty_rows.bit_length);
+        if (start < clamped_end) {
+            self.dirty_rows.setRangeValue(.{ .start = start, .end = clamped_end }, true);
         }
     }
     
@@ -957,14 +958,12 @@ pub const Grid = struct {
         const min_cols = @min(self.cols, cols);
 
         if (self.cells.len != 0) {
+            // Row-level @memcpy instead of per-cell copy
             var r: u32 = 0;
             while (r < min_rows) : (r += 1) {
-                var c: u32 = 0;
-                while (c < min_cols) : (c += 1) {
-                    const old_i: usize = @as(usize, r) * @as(usize, self.cols) + @as(usize, c);
-                    const new_i: usize = @as(usize, r) * @as(usize, cols) + @as(usize, c);
-                    new_cells[new_i] = self.cells[old_i];
-                }
+                const old_start: usize = @as(usize, r) * @as(usize, self.cols);
+                const new_start: usize = @as(usize, r) * @as(usize, cols);
+                @memcpy(new_cells[new_start..new_start + min_cols], self.cells[old_start..old_start + min_cols]);
             }
             self.alloc.free(self.cells);
         }
