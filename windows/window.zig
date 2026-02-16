@@ -2752,7 +2752,14 @@ pub export fn WndProc(
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
-                external_windows.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.scroll_accum);
+                external_windows.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.scroll_accum, false);
+                return 0;
+            }
+        },
+
+        c.WM_MOUSEHWHEEL => {
+            if (getApp(hwnd)) |app| {
+                external_windows.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.h_scroll_accum, true);
                 return 0;
             }
         },
@@ -2849,7 +2856,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
+                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
                 var mod_len: usize = 0;
                 if ((wParam & c.MK_SHIFT) != 0) {
                     mod_buf[mod_len] = 'S';
@@ -2859,12 +2866,15 @@ pub export fn WndProc(
                     mod_buf[mod_len] = 'C';
                     mod_len += 1;
                 }
-                // Alt is not in wParam for mouse messages; would need GetKeyState(VK_MENU)
                 if (c.GetKeyState(c.VK_MENU) < 0) {
                     mod_buf[mod_len] = 'A';
                     mod_len += 1;
                 }
-                mod_buf[mod_len] = 0; // null terminate
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+                    mod_buf[mod_len] = 'D';
+                    mod_len += 1;
+                }
+                mod_buf[mod_len] = 0;
 
                 // Track mouse grid for mini window positioning (main window = grid 1)
                 app.last_mouse_grid_id = 1;
@@ -2966,7 +2976,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
+                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
                 var mod_len: usize = 0;
                 if ((wParam & c.MK_SHIFT) != 0) {
                     mod_buf[mod_len] = 'S';
@@ -2978,6 +2988,10 @@ pub export fn WndProc(
                 }
                 if (c.GetKeyState(c.VK_MENU) < 0) {
                     mod_buf[mod_len] = 'A';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+                    mod_buf[mod_len] = 'D';
                     mod_len += 1;
                 }
                 mod_buf[mod_len] = 0;
@@ -2993,6 +3007,119 @@ pub export fn WndProc(
                 );
 
                 return 0;
+            }
+        },
+
+        c.WM_XBUTTONDOWN => {
+            if (getApp(hwnd)) |app| {
+                _ = c.SetCapture(hwnd);
+
+                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+
+                // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
+                const x_button: u16 = @truncate(wParam >> 16);
+                const button: [*:0]const u8 = if (x_button == 1) blk: {
+                    app.mouse_button_held = 4;
+                    break :blk "x1";
+                } else blk: {
+                    app.mouse_button_held = 5;
+                    break :blk "x2";
+                };
+
+                app.mu.lock();
+                const cell_w = app.cell_w_px;
+                const cell_h = app.cell_h_px;
+                const linespace = app.linespace_px;
+                app.mu.unlock();
+
+                const row_h = cell_h + linespace;
+                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    @as(i32, x);
+                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
+                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
+                else
+                    @as(i32, y);
+                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+
+                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+                var mod_len: usize = 0;
+                if ((wParam & c.MK_SHIFT) != 0) { mod_buf[mod_len] = 'S'; mod_len += 1; }
+                if ((wParam & c.MK_CONTROL) != 0) { mod_buf[mod_len] = 'C'; mod_len += 1; }
+                if (c.GetKeyState(c.VK_MENU) < 0) { mod_buf[mod_len] = 'A'; mod_len += 1; }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) { mod_buf[mod_len] = 'D'; mod_len += 1; }
+                mod_buf[mod_len] = 0;
+
+                app.last_mouse_grid_id = 1;
+
+                core.zonvie_core_send_mouse_input(
+                    app.corep,
+                    button,
+                    "press",
+                    @as([*:0]const u8, @ptrCast(&mod_buf)),
+                    1,
+                    @max(0, row),
+                    @max(0, col),
+                );
+
+                // WM_XBUTTONDOWN requires returning TRUE
+                return 1;
+            }
+        },
+
+        c.WM_XBUTTONUP => {
+            if (getApp(hwnd)) |app| {
+                _ = c.ReleaseCapture();
+
+                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+
+                const x_button: u16 = @truncate(wParam >> 16);
+                const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
+
+                app.mouse_button_held = 0;
+
+                app.mu.lock();
+                const cell_w = app.cell_w_px;
+                const cell_h = app.cell_h_px;
+                const linespace = app.linespace_px;
+                app.mu.unlock();
+
+                const row_h = cell_h + linespace;
+                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                else
+                    @as(i32, x);
+                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
+                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
+                else
+                    @as(i32, y);
+                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+
+                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+                var mod_len: usize = 0;
+                if ((wParam & c.MK_SHIFT) != 0) { mod_buf[mod_len] = 'S'; mod_len += 1; }
+                if ((wParam & c.MK_CONTROL) != 0) { mod_buf[mod_len] = 'C'; mod_len += 1; }
+                if (c.GetKeyState(c.VK_MENU) < 0) { mod_buf[mod_len] = 'A'; mod_len += 1; }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) { mod_buf[mod_len] = 'D'; mod_len += 1; }
+                mod_buf[mod_len] = 0;
+
+                core.zonvie_core_send_mouse_input(
+                    app.corep,
+                    button,
+                    "release",
+                    @as([*:0]const u8, @ptrCast(&mod_buf)),
+                    1,
+                    @max(0, row),
+                    @max(0, col),
+                );
+
+                // WM_XBUTTONUP requires returning TRUE
+                return 1;
             }
         },
 
@@ -3113,6 +3240,8 @@ pub export fn WndProc(
                     1 => "left",
                     2 => "right",
                     3 => "middle",
+                    4 => "x1",
+                    5 => "x2",
                     else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
                 };
 
@@ -3138,7 +3267,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [4]u8 = .{ 0, 0, 0, 0 };
+                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
                 var mod_len: usize = 0;
                 if ((wParam & c.MK_SHIFT) != 0) {
                     mod_buf[mod_len] = 'S';
@@ -3150,6 +3279,10 @@ pub export fn WndProc(
                 }
                 if (c.GetKeyState(c.VK_MENU) < 0) {
                     mod_buf[mod_len] = 'A';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+                    mod_buf[mod_len] = 'D';
                     mod_len += 1;
                 }
                 mod_buf[mod_len] = 0;

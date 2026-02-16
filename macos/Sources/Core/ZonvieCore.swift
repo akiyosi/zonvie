@@ -1670,10 +1670,12 @@ final class ZonvieCore {
     var requestRedraw: () -> Void = {}
 
     /// Send mouse scroll event to Neovim
-    func sendMouseScroll(gridId: Int64, row: Int32, col: Int32, direction: String) {
+    func sendMouseScroll(gridId: Int64, row: Int32, col: Int32, direction: String, modifier: String = "") {
         guard let core else { return }
         direction.withCString { dirCStr in
-            zonvie_core_send_mouse_scroll(core, gridId, row, col, dirCStr)
+            modifier.withCString { modCStr in
+                zonvie_core_send_mouse_scroll(core, gridId, row, col, dirCStr, modCStr)
+            }
         }
 
         // For message grid, set timer to process pending scroll after scroll stops

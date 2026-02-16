@@ -938,11 +938,13 @@ pub export fn zonvie_core_send_mouse_scroll(
     row: i32,
     col: i32,
     direction: ?[*:0]const u8,
+    modifier: ?[*:0]const u8,
 ) callconv(.c) void {
     if (p == null or direction == null) return;
     const box = asBox(p.?);
     const dir_str = std.mem.span(direction.?);
-    box.core.sendMouseScroll(grid_id, row, col, dir_str);
+    const mod_str = if (modifier) |m| std.mem.span(m) else "";
+    box.core.sendMouseScroll(grid_id, row, col, dir_str, mod_str);
 }
 
 /// Scroll view to specified line number (1-based).

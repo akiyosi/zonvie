@@ -496,7 +496,8 @@ pub const ExternalWindow = struct {
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
-    scroll_accum: i16 = 0, // Accumulated scroll delta for high-resolution scrolling
+    scroll_accum: i16 = 0, // Accumulated vertical scroll delta for high-resolution scrolling
+    h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
 
@@ -710,7 +711,7 @@ pub const App = struct {
     last_resize_ns: i128 = 0,
 
     // Mouse button tracking for drag events
-    // 0 = none, 1 = left, 2 = right, 3 = middle
+    // 0 = none, 1 = left, 2 = right, 3 = middle, 4 = x1, 5 = x2
     mouse_button_held: u8 = 0,
 
     // Track last cursor grid to detect transitions from external windows
@@ -726,8 +727,9 @@ pub const App = struct {
     cursor_blink_on_ms: u32 = 0,
     cursor_blink_off_ms: u32 = 0,
 
-    // Scroll accumulator for high-resolution scrolling
+    // Scroll accumulators for high-resolution scrolling
     scroll_accum: i16 = 0,
+    h_scroll_accum: i16 = 0,
 
     // Scrollbar state (custom D3D11 overlay scrollbar)
     scrollbar_visible: bool = false,

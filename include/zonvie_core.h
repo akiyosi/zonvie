@@ -868,7 +868,8 @@ ZONVIE_API void zonvie_core_get_cursor_blink(
 );
 
 /* Send mouse scroll event to Neovim.
-   direction: "up" or "down"
+   direction: "up", "down", "left", or "right"
+   modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt), "D" (super/command)
    grid_id: target grid (1 = main grid)
    row, col: position within the grid */
 ZONVIE_API void zonvie_core_send_mouse_scroll(
@@ -876,7 +877,8 @@ ZONVIE_API void zonvie_core_send_mouse_scroll(
     int64_t grid_id,
     int32_t row,
     int32_t col,
-    const char *direction
+    const char *direction,
+    const char *modifier
 );
 
 /* Scroll view to specified line number (1-based).
@@ -906,7 +908,7 @@ ZONVIE_API void zonvie_core_process_pending_msg_scroll(
 /* Send mouse input event to Neovim (click, drag, release).
    button: "left", "right", "middle", "x1", "x2"
    action: "press", "drag", "release"
-   modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt)
+   modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt), "D" (super/command)
    grid_id: target grid (1 = main grid)
    row, col: position within the grid */
 ZONVIE_API void zonvie_core_send_mouse_input(

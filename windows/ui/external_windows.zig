@@ -749,6 +749,7 @@ pub fn handleMouseWheel(
     app: *App,
     grid_id: i64,
     scroll_accum: *i16,
+    horizontal: bool,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
@@ -788,17 +789,41 @@ pub fn handleMouseWheel(
         pt.y;
     const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;
 
+    // Build modifier string from wParam flags and GetKeyState
+    var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    var mod_len: usize = 0;
+    if ((wParam & c.MK_SHIFT) != 0) {
+        mod_buf[mod_len] = 'S';
+        mod_len += 1;
+    }
+    if ((wParam & c.MK_CONTROL) != 0) {
+        mod_buf[mod_len] = 'C';
+        mod_len += 1;
+    }
+    if (c.GetKeyState(c.VK_MENU) < 0) {
+        mod_buf[mod_len] = 'A';
+        mod_len += 1;
+    }
+    if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+        mod_buf[mod_len] = 'D';
+        mod_len += 1;
+    }
+    mod_buf[mod_len] = 0;
+
     // Accumulate scroll delta
     scroll_accum.* += delta;
 
     // Determine scroll direction
-    // Positive delta = scroll up (wheel away from user)
-    // Negative delta = scroll down (wheel toward user)
-    const direction: [*:0]const u8 = if (scroll_accum.* > 0) "up" else "down";
+    // Vertical: positive delta = scroll up (wheel away from user)
+    // Horizontal: positive delta = scroll right (wheel tilt right)
+    const direction: [*:0]const u8 = if (horizontal)
+        (if (scroll_accum.* > 0) "right" else "left")
+    else
+        (if (scroll_accum.* > 0) "up" else "down");
 
     // Send scroll events for each threshold accumulated
     while (scroll_accum.* >= SCROLL_THRESHOLD or scroll_accum.* <= -SCROLL_THRESHOLD) {
-        app_mod.zonvie_core_send_mouse_scroll(corep, grid_id, row, col, direction);
+        app_mod.zonvie_core_send_mouse_scroll(corep, grid_id, row, col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
         if (scroll_accum.* > 0) {
             scroll_accum.* -= SCROLL_THRESHOLD;
         } else {
@@ -998,7 +1023,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock();
 
                 if (grid_id != null and ext_window != null) {
-                    handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum);
+                    handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum, false);
 
                     // Show scrollbar on scroll if in scroll mode
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
@@ -1007,6 +1032,28 @@ pub export fn ExternalWndProc(
                         const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
                         _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
                     }
+                }
+                return 0;
+            }
+        },
+
+        c.WM_MOUSEHWHEEL => {
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lock();
+                var grid_id: ?i64 = null;
+                var ext_window: ?*app_mod.ExternalWindow = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        ext_window = entry.value_ptr;
+                        break;
+                    }
+                }
+                app.mu.unlock();
+
+                if (grid_id != null and ext_window != null) {
+                    handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.h_scroll_accum, true);
                 }
                 return 0;
             }

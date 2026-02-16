@@ -765,8 +765,9 @@ pub const Core = struct {
 
     /// Send mouse scroll event to Neovim (nvim_input_mouse).
     /// direction: "up" or "down"
+    /// modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt)
     /// For MESSAGE_GRID_ID (Zonvie's own grid), scroll is handled locally instead of sending to Neovim.
-    pub fn sendMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8) void {
+    pub fn sendMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8, modifier: []const u8) void {
         // Handle scroll for Zonvie's own message grid locally
         if (grid_id == grid_mod.MESSAGE_GRID_ID) {
             self.handleMsgGridScroll(direction);
@@ -774,7 +775,7 @@ pub const Core = struct {
         }
         // Resolve grid_id -1 to cursor_grid so Neovim receives a valid grid ID
         const effective_id = if (grid_id == -1) self.grid.cursor_grid else grid_id;
-        self.requestMouseScroll(effective_id, row, col, direction) catch |e| {
+        self.requestMouseScroll(effective_id, row, col, direction, modifier) catch |e| {
             self.log.write("sendMouseScroll err: {any}\n", .{e});
         };
     }
@@ -1972,7 +1973,7 @@ pub const Core = struct {
 
     /// Send nvim_input_mouse RPC for scroll events.
     /// nvim_input_mouse(button, action, modifier, grid, row, col)
-    fn requestMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8) !void {
+    fn requestMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8, modifier: []const u8) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
@@ -1982,21 +1983,21 @@ pub const Core = struct {
         // nvim_input_mouse takes 6 arguments:
         // button: "wheel" for scroll
         // action: "up" or "down"
-        // modifier: "" (empty string for no modifiers)
+        // modifier: "" or combination like "SC" for shift+ctrl
         // grid: grid_id
         // row: row position
         // col: column position
         try rpc.packArray(&buf, self.alloc, 6);
         try rpc.packStr(&buf, self.alloc, "wheel"); // button
         try rpc.packStr(&buf, self.alloc, direction); // action (up/down)
-        try rpc.packStr(&buf, self.alloc, ""); // modifier
+        try rpc.packStr(&buf, self.alloc, modifier); // modifier
         try rpc.packInt(&buf, self.alloc, grid_id); // grid
         try rpc.packInt(&buf, self.alloc, @as(i64, row)); // row
         try rpc.packInt(&buf, self.alloc, @as(i64, col)); // col
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_input_mouse (id={d}) wheel {s} grid={d} row={d} col={d}\n", .{ id, direction, grid_id, row, col });
+        self.log.write("rpc send: nvim_input_mouse (id={d}) wheel {s} mod=\"{s}\" grid={d} row={d} col={d}\n", .{ id, direction, modifier, grid_id, row, col });
     }
 
     /// Send nvim_input_mouse RPC for button events (click, drag, release).

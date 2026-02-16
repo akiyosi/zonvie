@@ -68,6 +68,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var scrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var scrollOffsetActive: Bool = false
 
+    // Horizontal scroll accumulator for precise (trackpad) events
+    private var hScrollAccumPx: CGFloat = 0
+
     // Blur transparency support
     private let blurEnabled: Bool
     private let isCmdline: Bool
@@ -666,6 +669,37 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         sendMouseEvent(button: "right", action: "drag", event: event)
     }
 
+    override func otherMouseDown(with event: NSEvent) {
+        super.otherMouseDown(with: event)
+        window?.makeFirstResponder(self)
+        if let btn = otherButtonName(event.buttonNumber) {
+            sendMouseEvent(button: btn, action: "press", event: event)
+        }
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        super.otherMouseUp(with: event)
+        if let btn = otherButtonName(event.buttonNumber) {
+            sendMouseEvent(button: btn, action: "release", event: event)
+        }
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        super.otherMouseDragged(with: event)
+        if let btn = otherButtonName(event.buttonNumber) {
+            sendMouseEvent(button: btn, action: "drag", event: event)
+        }
+    }
+
+    private func otherButtonName(_ buttonNumber: Int) -> String? {
+        switch buttonNumber {
+        case 2: return "middle"
+        case 3: return "x1"
+        case 4: return "x2"
+        default: return nil
+        }
+    }
+
     private func sendMouseEvent(button: String, action: String, event: NSEvent) {
         guard let main = mainTerminalView, let core = main.core else { return }
 
@@ -686,6 +720,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if mods.contains(.shift)   { modStr += "S" }
         if mods.contains(.control) { modStr += "C" }
         if mods.contains(.option)  { modStr += "A" }
+        if mods.contains(.command) { modStr += "D" }
 
         ZonvieCore.appLog("[ExternalGridView mouseEvent] button=\(button) action=\(action) gridId=\(gridId) row=\(row) col=\(col)")
 
@@ -781,7 +816,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard let main = mainTerminalView else { return }
 
         let deltaY = event.scrollingDeltaY
-        if deltaY == 0 { return }
+        let deltaX = event.scrollingDeltaX
+        if deltaY == 0 && deltaX == 0 { return }
 
         // Calculate cell position from mouse location within this view
         let location = convert(event.locationInWindow, from: nil)
@@ -795,29 +831,57 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let viewHeightPx = bounds.height * scale
         let row = Int32((viewHeightPx - location.y * scale) / cellHeightPx)
 
-        ZonvieCore.appLog("[ExternalGridView scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId) row=\(row) col=\(col)")
+        // Build modifier string for scroll event
+        let modifier = main.buildModifierString(from: event.modifierFlags)
 
-        // Use shared scroll handling from main view
-        let newOffset = main.handleScrollInput(
-            gridId: gridId,
-            row: row,
-            col: col,
-            deltaY: deltaY,
-            scale: scale,
-            hasPrecise: event.hasPreciseScrollingDeltas
-        )
+        // Vertical scroll
+        if deltaY != 0 {
+            ZonvieCore.appLog("[ExternalGridView scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId) row=\(row) col=\(col)")
 
-        if event.hasPreciseScrollingDeltas {
-            ZonvieCore.appLog("[ExternalGridView scroll] offset=\(newOffset)")
+            let newOffset = main.handleScrollInput(
+                gridId: gridId,
+                row: row,
+                col: col,
+                deltaY: deltaY,
+                scale: scale,
+                hasPrecise: event.hasPreciseScrollingDeltas,
+                modifier: modifier
+            )
 
-            // Process any pending scroll clears first to ensure offset is in sync with vertices
-            main.processPendingScrollClears()
+            if event.hasPreciseScrollingDeltas {
+                ZonvieCore.appLog("[ExternalGridView scroll] offset=\(newOffset)")
+                main.processPendingScrollClears()
+                updateScrollShaderOffset()
+                requestRedraw()
+            }
+        }
 
-            // Update shader uniform with current visual offset
-            updateScrollShaderOffset()
+        // Horizontal scroll
+        if deltaX != 0 {
+            guard let core = main.core else { return }
+            guard cellWidthPx > 0 else { return }
 
-            // Request redraw to show the sub-cell offset
-            requestRedraw()
+            if event.hasPreciseScrollingDeltas {
+                // Trackpad: accumulate sub-cell deltas, fire only when crossing cellWidthPx
+                hScrollAccumPx += deltaX * scale
+                while abs(hScrollAccumPx) >= cellWidthPx {
+                    let direction = hScrollAccumPx > 0 ? "right" : "left"
+                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                    if hScrollAccumPx > 0 {
+                        hScrollAccumPx -= cellWidthPx
+                    } else {
+                        hScrollAccumPx += cellWidthPx
+                    }
+                }
+            } else {
+                // Discrete mouse wheel: send immediately (at least 1 event per notch)
+                let direction = deltaX > 0 ? "right" : "left"
+                let absDeltaX = abs(deltaX)
+                let scrollCount = max(1, Int(absDeltaX / cellWidthPx))
+                for _ in 0..<scrollCount {
+                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                }
+            }
         }
     }
 

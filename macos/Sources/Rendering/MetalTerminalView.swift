@@ -71,6 +71,10 @@ final class MetalTerminalView: MTKView {
     // In that case, we decay the offset to prevent it from getting stuck.
     private var scrollStaleFrameCount: [Int64: Int] = [:]
 
+    // Per-grid horizontal scroll accumulator for precise (trackpad) events.
+    // Accumulates sub-cell deltas and fires events only when crossing cellWidthPx.
+    private var hScrollAccumPx: [Int64: CGFloat] = [:]
+
     // --- Scrollbar ---
     private lazy var verticalScroller: NSScroller = {
         let scroller = NSScroller()
@@ -493,35 +497,47 @@ final class MetalTerminalView: MTKView {
 
     override func otherMouseDown(with event: NSEvent) {
         super.otherMouseDown(with: event)
-        // Button 2 is middle button
-        if event.buttonNumber == 2 {
-            heldMouseButton = "middle"
-            sendMouseEvent(button: "middle", action: "press", event: event)
+        let btn = otherButtonName(event.buttonNumber)
+        if let btn {
+            heldMouseButton = btn
+            sendMouseEvent(button: btn, action: "press", event: event)
         }
     }
 
     override func otherMouseUp(with event: NSEvent) {
         super.otherMouseUp(with: event)
-        if event.buttonNumber == 2 {
+        let btn = otherButtonName(event.buttonNumber)
+        if btn != nil {
             heldMouseButton = nil
-            sendMouseEvent(button: "middle", action: "release", event: event)
+            sendMouseEvent(button: btn!, action: "release", event: event)
         }
     }
 
     override func otherMouseDragged(with event: NSEvent) {
         super.otherMouseDragged(with: event)
-        if event.buttonNumber == 2 {
-            sendMouseEvent(button: "middle", action: "drag", event: event)
+        let btn = otherButtonName(event.buttonNumber)
+        if let btn {
+            sendMouseEvent(button: btn, action: "drag", event: event)
+        }
+    }
+
+    /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
+    private func otherButtonName(_ buttonNumber: Int) -> String? {
+        switch buttonNumber {
+        case 2: return "middle"
+        case 3: return "x1"
+        case 4: return "x2"
+        default: return nil
         }
     }
 
     /// Build modifier string from NSEvent modifierFlags
-    private func buildModifierString(from flags: NSEvent.ModifierFlags) -> String {
+    func buildModifierString(from flags: NSEvent.ModifierFlags) -> String {
         var mods = ""
         if flags.contains(.shift) { mods += "S" }
         if flags.contains(.control) { mods += "C" }
         if flags.contains(.option) { mods += "A" }
-        // Command is typically not used in Neovim mouse modifiers
+        if flags.contains(.command) { mods += "D" }
         return mods
     }
 
@@ -1229,7 +1245,8 @@ final class MetalTerminalView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         let deltaY = event.scrollingDeltaY
-        if deltaY == 0 { return }
+        let deltaX = event.scrollingDeltaX
+        if deltaY == 0 && deltaX == 0 { return }
 
         // Get cursor position in cell coordinates
         let location = convert(event.locationInWindow, from: nil)
@@ -1237,24 +1254,59 @@ final class MetalTerminalView: MTKView {
 
         let scale = window?.backingScaleFactor ?? 2.0
 
-        ZonvieCore.appLog("[scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId)")
+        // Build modifier string for scroll event
+        let modifier = buildModifierString(from: event.modifierFlags)
 
-        // Use shared scroll handling
-        let newOffset = handleScrollInput(
-            gridId: gridId,
-            row: row,
-            col: col,
-            deltaY: deltaY,
-            scale: scale,
-            hasPrecise: event.hasPreciseScrollingDeltas
-        )
+        // Vertical scroll
+        if deltaY != 0 {
+            ZonvieCore.appLog("[scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId)")
 
-        if event.hasPreciseScrollingDeltas {
-            ZonvieCore.appLog("[scroll] stored offset=\(newOffset) updating shader...")
+            let newOffset = handleScrollInput(
+                gridId: gridId,
+                row: row,
+                col: col,
+                deltaY: deltaY,
+                scale: scale,
+                hasPrecise: event.hasPreciseScrollingDeltas,
+                modifier: modifier
+            )
 
-            // Update shader uniform with current visual offset.
-            updateScrollShaderOffset()
-            requestRedraw()
+            if event.hasPreciseScrollingDeltas {
+                ZonvieCore.appLog("[scroll] stored offset=\(newOffset) updating shader...")
+                updateScrollShaderOffset()
+                requestRedraw()
+            }
+        }
+
+        // Horizontal scroll
+        if deltaX != 0 {
+            guard let core else { return }
+            let cellWidthPx = CGFloat(renderer.cellWidthPx)
+            guard cellWidthPx > 0 else { return }
+
+            if event.hasPreciseScrollingDeltas {
+                // Trackpad: accumulate sub-cell deltas per grid, fire only when crossing cellWidthPx
+                var accum = hScrollAccumPx[gridId] ?? 0
+                accum += deltaX * scale
+                while abs(accum) >= cellWidthPx {
+                    let direction = accum > 0 ? "right" : "left"
+                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                    if accum > 0 {
+                        accum -= cellWidthPx
+                    } else {
+                        accum += cellWidthPx
+                    }
+                }
+                hScrollAccumPx[gridId] = accum
+            } else {
+                // Discrete mouse wheel: send immediately (at least 1 event per notch)
+                let direction = deltaX > 0 ? "right" : "left"
+                let absDeltaX = abs(deltaX)
+                let scrollCount = max(1, Int(absDeltaX / cellWidthPx))
+                for _ in 0..<scrollCount {
+                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                }
+            }
         }
     }
 
@@ -1354,7 +1406,8 @@ final class MetalTerminalView: MTKView {
         col: Int32,
         deltaY: CGFloat,
         scale: CGFloat,
-        hasPrecise: Bool
+        hasPrecise: Bool,
+        modifier: String = ""
     ) -> CGFloat {
         guard let core else { return 0 }
 
@@ -1420,7 +1473,7 @@ final class MetalTerminalView: MTKView {
             var checkOffset = newOffset
             while abs(checkOffset) >= rowHeightPx && canSendMore && scrollCount < 3 {
                 let direction = checkOffset > 0 ? "up" : "down"
-                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction)
+                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
                 scrollCount += 1
 
                 if checkOffset > 0 {
@@ -1461,7 +1514,7 @@ final class MetalTerminalView: MTKView {
             let scrollCount = max(1, Int(deltaYPx / rowHeightPx))
 
             for _ in 0..<scrollCount {
-                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction)
+                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
             }
             return 0
         }
