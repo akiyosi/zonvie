@@ -71,10 +71,6 @@ final class MetalTerminalView: MTKView {
     // In that case, we decay the offset to prevent it from getting stuck.
     private var scrollStaleFrameCount: [Int64: Int] = [:]
 
-    // Per-grid horizontal scroll accumulator for precise (trackpad) events.
-    // Accumulates sub-cell deltas and fires events only when crossing cellWidthPx.
-    private var hScrollAccumPx: [Int64: CGFloat] = [:]
-
     // --- Scrollbar ---
     private lazy var verticalScroller: NSScroller = {
         let scroller = NSScroller()
@@ -1278,36 +1274,6 @@ final class MetalTerminalView: MTKView {
             }
         }
 
-        // Horizontal scroll
-        if deltaX != 0 {
-            guard let core else { return }
-            let cellWidthPx = CGFloat(renderer.cellWidthPx)
-            guard cellWidthPx > 0 else { return }
-
-            if event.hasPreciseScrollingDeltas {
-                // Trackpad: accumulate sub-cell deltas per grid, fire only when crossing cellWidthPx
-                var accum = hScrollAccumPx[gridId] ?? 0
-                accum += deltaX * scale
-                while abs(accum) >= cellWidthPx {
-                    let direction = accum > 0 ? "right" : "left"
-                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-                    if accum > 0 {
-                        accum -= cellWidthPx
-                    } else {
-                        accum += cellWidthPx
-                    }
-                }
-                hScrollAccumPx[gridId] = accum
-            } else {
-                // Discrete mouse wheel: send immediately (at least 1 event per notch)
-                let direction = deltaX > 0 ? "right" : "left"
-                let absDeltaX = abs(deltaX)
-                let scrollCount = max(1, Int(absDeltaX / cellWidthPx))
-                for _ in 0..<scrollCount {
-                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-                }
-            }
-        }
     }
 
     /// Update the shader uniform with current scroll offsets

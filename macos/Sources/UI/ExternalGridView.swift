@@ -68,9 +68,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var scrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var scrollOffsetActive: Bool = false
 
-    // Horizontal scroll accumulator for precise (trackpad) events
-    private var hScrollAccumPx: CGFloat = 0
-
     // Blur transparency support
     private let blurEnabled: Bool
     private let isCmdline: Bool
@@ -856,33 +853,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
         }
 
-        // Horizontal scroll
-        if deltaX != 0 {
-            guard let core = main.core else { return }
-            guard cellWidthPx > 0 else { return }
-
-            if event.hasPreciseScrollingDeltas {
-                // Trackpad: accumulate sub-cell deltas, fire only when crossing cellWidthPx
-                hScrollAccumPx += deltaX * scale
-                while abs(hScrollAccumPx) >= cellWidthPx {
-                    let direction = hScrollAccumPx > 0 ? "right" : "left"
-                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-                    if hScrollAccumPx > 0 {
-                        hScrollAccumPx -= cellWidthPx
-                    } else {
-                        hScrollAccumPx += cellWidthPx
-                    }
-                }
-            } else {
-                // Discrete mouse wheel: send immediately (at least 1 event per notch)
-                let direction = deltaX > 0 ? "right" : "left"
-                let absDeltaX = abs(deltaX)
-                let scrollCount = max(1, Int(absDeltaX / cellWidthPx))
-                for _ in 0..<scrollCount {
-                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-                }
-            }
-        }
     }
 
     // MARK: - IME Preedit Overlay
