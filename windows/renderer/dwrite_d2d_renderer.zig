@@ -26,6 +26,10 @@ const IID_IDWriteFactory_ZONVIE: GUID = .{
     .Data4 = .{ 0xA2, 0xE8, 0x1A, 0xDC, 0x7D, 0x93, 0xDB, 0x48 },
 };
 
+// DWrite font feature struct for IDWriteTextAnalyzer::GetGlyphs.
+const DWriteFontFeature = extern struct { nameTag: u32, parameter: u32 };
+const MAX_FONT_FEATURES = 32;
+
 // Styled glyph logging stats (global)
 var g_log_styled_hits: u64 = 0;
 var g_log_styled_misses: u64 = 0;
@@ -113,6 +117,11 @@ pub const Renderer = struct {
     // Set when atlas is reset; signals the UI thread to request a full re-seed
     // so stale UV coordinates in cached row vertices are refreshed.
     atlas_reset_pending: bool = false,
+
+    // OpenType font features for DWrite shaping.
+    font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
+    font_feature_count: u32 = 0,
+    text_analyzer: ?*c.IDWriteTextAnalyzer = null,
 
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         // Timing for init steps
@@ -206,6 +215,7 @@ pub const Renderer = struct {
         safeRelease(self.glyph_rt);
         safeRelease(self.atlas_bitmap);
 
+        safeRelease(self.text_analyzer);
         safeRelease(self.text_format);
         safeRelease(self.font_face);
         safeRelease(self.bold_font_face);
@@ -496,26 +506,11 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
     // miss-duration will be recorded on each miss-return path below
     const face = self.font_face orelse return error.NoFont;
-    const fvtbl = face.lpVtbl.*; // IMPORTANT: dereference vtbl
 
-    // --- 1) scalar -> glyph_index ---
-    var codepoints: [1]c.UINT32 = .{ @as(c.UINT32, @intCast(scalar)) };
-    var glyph_index: c.UINT16 = 0;
-
-    const get_glyph_indices_fn = fvtbl.GetGlyphIndicesW orelse
-        return error.DWriteFontFaceMissingGetGlyphIndicesW;
-
-    const hr_gi = get_glyph_indices_fn(
-        face,
-        codepoints[0..].ptr,
-        1,
-        &glyph_index,
-    );
-
-    if (c.FAILED(hr_gi)) {
-        if (applog.isEnabled()) applog.appLog("[dwrite] GetGlyphIndicesW FAILED hr=0x{x} scalar=0x{x}\n", .{
-            @as(u32, @bitCast(hr_gi)),
-            scalar,
+    // --- 1) scalar -> glyph_index (with OpenType feature support) ---
+    const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[dwrite] getGlyphIndexForScalar FAILED scalar=0x{x}: {any}\n", .{
+            scalar, e,
         });
 
         if (log_enabled) {
@@ -526,7 +521,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         }
 
         return error.DWriteGetGlyphIndicesFailed;
-    }
+    };
 
     if (glyph_index == 0) {
         // 0 is possibly .notdef; log only
@@ -945,25 +940,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
     /// Internal helper: render glyph with a specific font face
     fn renderGlyphWithFace(self: *Renderer, scalar: u32, face: *c.IDWriteFontFace) !core.GlyphEntry {
-        const fvtbl = face.lpVtbl.*;
-
-        // --- 1) scalar -> glyph_index ---
-        var codepoints: [1]c.UINT32 = .{@as(c.UINT32, @intCast(scalar))};
-        var glyph_index: c.UINT16 = 0;
-
-        const get_glyph_indices_fn = fvtbl.GetGlyphIndicesW orelse
-            return error.DWriteFontFaceMissingGetGlyphIndicesW;
-
-        const hr_gi = get_glyph_indices_fn(
-            face,
-            codepoints[0..].ptr,
-            1,
-            &glyph_index,
-        );
-
-        if (c.FAILED(hr_gi)) {
-            return error.DWriteGetGlyphIndicesFailed;
-        }
+        // --- 1) scalar -> glyph_index (with OpenType feature support) ---
+        const glyph_index = try self.getGlyphIndexForScalar(face, scalar);
 
         // glyph_index == 0 means .notdef (font doesn't have this glyph)
         // Return error so caller can fall back to regular font
@@ -1184,14 +1162,11 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             }
         };
 
-        const fvtbl = face.lpVtbl.*;
-
-        // scalar -> glyph_index
-        var codepoints: [1]c.UINT32 = .{@as(c.UINT32, @intCast(scalar))};
-        var glyph_index: c.UINT16 = 0;
-        const get_glyph_indices_fn = fvtbl.GetGlyphIndicesW orelse return error.DWriteFontFaceMissingGetGlyphIndicesW;
-        const hr_gi = get_glyph_indices_fn(face, codepoints[0..].ptr, 1, &glyph_index);
-        if (c.FAILED(hr_gi)) return error.DWriteGetGlyphIndicesFailed;
+        // scalar -> glyph_index (feature-aware via IDWriteTextAnalyzer when features set)
+        const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
+            if (applog.isEnabled()) applog.appLog("[dwrite] getGlyphIndexForScalar failed in rasterizeGlyphOnly: {any}\n", .{err});
+            return err;
+        };
 
         // glyph run analysis
         var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
@@ -1743,6 +1718,10 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     }
 
     pub fn setFontUtf8(self: *Renderer, name_utf8: []const u8, point_size: f32) !void {
+        return self.setFontUtf8WithFeatures(name_utf8, point_size, "");
+    }
+
+    pub fn setFontUtf8WithFeatures(self: *Renderer, name_utf8: []const u8, point_size: f32, features_str: []const u8) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -1869,6 +1848,22 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const copy_len = @min(name_w.len, self.font_name.len - 1);
         @memcpy(self.font_name[0..copy_len], name_w[0..copy_len]);
 
+        // Parse and store OpenType features
+        self.font_feature_count = 0;
+        if (features_str.len > 0) {
+            self.parseFontFeatures(features_str);
+        }
+        // Ensure text analyzer is available when features are set
+        if (self.font_feature_count > 0 and self.text_analyzer == null) {
+            const dw_factory = self.dwrite_factory orelse return error.NotInitialized;
+            var analyzer: ?*c.IDWriteTextAnalyzer = null;
+            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return error.DWriteFactoryMissingCreateTextAnalyzer;
+            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
+            if (!c.FAILED(hr_ta) and analyzer != null) {
+                self.text_analyzer = analyzer;
+            }
+        }
+
         try self.recomputeCellMetrics();
 
         // Clear glyph cache - old glyphs have wrong metrics/UVs for new font.
@@ -1877,6 +1872,144 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.atlas_next_x = 1;
         self.atlas_next_y = 1;
         self.atlas_row_h = 0;
+    }
+
+    /// Parse comma-separated features string into font_features array.
+    /// Format: "+liga,-dlig,ss01=2"
+    fn parseFontFeatures(self: *Renderer, features_str: []const u8) void {
+        var i: usize = 0;
+        while (i < features_str.len and self.font_feature_count < MAX_FONT_FEATURES) {
+            // Find next comma
+            var j = i;
+            while (j < features_str.len and features_str[j] != ',') : (j += 1) {}
+            const tok = features_str[i..j];
+
+            if (self.parseOneFeature(tok)) |feat| {
+                self.font_features[self.font_feature_count] = feat;
+                self.font_feature_count += 1;
+            }
+
+            i = if (j < features_str.len) j + 1 else j;
+        }
+    }
+
+    fn parseOneFeature(_: *Renderer, tok: []const u8) ?DWriteFontFeature {
+        if (tok.len == 0) return null;
+
+        var tag_str: []const u8 = undefined;
+        var value: u32 = 1;
+
+        if (tok[0] == '+' or tok[0] == '-') {
+            tag_str = tok[1..];
+            value = if (tok[0] == '+') 1 else 0;
+        } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
+            tag_str = tok[0..eq];
+            value = std.fmt.parseInt(u32, tok[eq + 1 ..], 10) catch return null;
+        } else {
+            tag_str = tok;
+        }
+
+        if (tag_str.len != 4) return null;
+
+        // Pack 4-char tag into u32 (big-endian, matching DWRITE_FONT_FEATURE_TAG)
+        const nameTag: u32 = @as(u32, tag_str[0]) |
+            (@as(u32, tag_str[1]) << 8) |
+            (@as(u32, tag_str[2]) << 16) |
+            (@as(u32, tag_str[3]) << 24);
+
+        return DWriteFontFeature{ .nameTag = nameTag, .parameter = value };
+    }
+
+    /// Get glyph index for a scalar, applying OpenType features if set.
+    /// Falls back to GetGlyphIndicesW when no features or analyzer unavailable.
+    fn getGlyphIndexForScalar(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
+        if (self.font_feature_count > 0 and self.text_analyzer != null) {
+            if (self.getGlyphIndexViaAnalyzer(face, scalar)) |gid| {
+                return gid;
+            } else |_| {}
+        }
+
+        // Default path: direct cmap lookup (no features)
+        const fvtbl = face.lpVtbl.*;
+        var codepoints: [1]c.UINT32 = .{@as(c.UINT32, @intCast(scalar))};
+        var glyph_index: c.UINT16 = 0;
+        const get_fn = fvtbl.GetGlyphIndicesW orelse return error.DWriteFontFaceMissingGetGlyphIndicesW;
+        const hr = get_fn(face, codepoints[0..].ptr, 1, &glyph_index);
+        if (c.FAILED(hr)) return error.DWriteGetGlyphIndicesFailed;
+        return glyph_index;
+    }
+
+    /// Use IDWriteTextAnalyzer::GetGlyphs to get feature-aware glyph index.
+    fn getGlyphIndexViaAnalyzer(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
+        const analyzer = self.text_analyzer orelse return error.NoTextAnalyzer;
+        const atbl = analyzer.lpVtbl.*;
+
+        // Convert scalar to UTF-16
+        var text_buf: [2]c.WCHAR = undefined;
+        var text_len: u32 = 1;
+        if (scalar <= 0xFFFF) {
+            text_buf[0] = @intCast(scalar);
+        } else {
+            // Surrogate pair
+            const v = scalar - 0x10000;
+            text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
+            text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
+            text_len = 2;
+        }
+
+        var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
+        script_analysis.script = 0; // Default (Latin)
+        script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
+
+        // Build DWRITE_TYPOGRAPHIC_FEATURES from stored features
+        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
+        for (0..self.font_feature_count) |fi| {
+            dw_features_arr[fi] = .{
+                .nameTag = @bitCast(self.font_features[fi].nameTag),
+                .parameter = self.font_features[fi].parameter,
+            };
+        }
+        var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
+            .features = &dw_features_arr,
+            .featureCount = self.font_feature_count,
+        };
+        var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
+        var feature_range_lengths: [1]c.UINT32 = .{text_len};
+
+        // Output buffers
+        // DWRITE_SHAPING_TEXT_PROPERTIES / DWRITE_SHAPING_GLYPH_PROPERTIES are
+        // opaque in Zig's cimport (UINT16 bitfields). Use raw u16 arrays + @ptrCast.
+        var cluster_map: [2]c.UINT16 = .{ 0, 0 };
+        var text_props_raw: [2]u16 = .{ 0, 0 };
+        var glyph_indices: [4]c.UINT16 = .{ 0, 0, 0, 0 };
+        var glyph_props_raw: [4]u16 = .{ 0, 0, 0, 0 };
+        var actual_glyph_count: u32 = 0;
+
+        const get_glyphs_fn = atbl.GetGlyphs orelse return error.DWriteTextAnalyzerMissingGetGlyphs;
+
+        const hr = get_glyphs_fn(
+            analyzer,
+            &text_buf,
+            text_len,
+            face,
+            c.FALSE, // isSideways
+            c.FALSE, // isRightToLeft
+            &script_analysis,
+            null, // localeName
+            null, // numberSubstitution
+            @ptrCast(&feature_ptrs),
+            &feature_range_lengths,
+            1, // featureRanges
+            4, // maxGlyphCount
+            &cluster_map,
+            @ptrCast(&text_props_raw),
+            &glyph_indices,
+            @ptrCast(&glyph_props_raw),
+            &actual_glyph_count,
+        );
+
+        if (c.FAILED(hr) or actual_glyph_count == 0) return error.DWriteGetGlyphsFailed;
+        return glyph_indices[0];
     }
 
     // Lazy-load Bold/Italic/Bold+Italic font faces on first use.

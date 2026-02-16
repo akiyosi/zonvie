@@ -554,6 +554,26 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 ZonvieCore.appLog("[ext_win] on_win_move_cursor: direction=\(direction) count=\(count)")
                 return me.handleWinMoveCursor(direction: direction, count: count)
+            },
+
+            on_shape_text_run: { ctx, scalars, scalarCount, styleFlags, outGlyphIDs, outClusters, outXAdvance, outXOffset, outYOffset, outCap in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                return atlas.shapeTextRun(
+                    scalars: scalars!, scalarCount: scalarCount,
+                    styleFlags: styleFlags,
+                    outGlyphIDs: outGlyphIDs!, outClusters: outClusters!,
+                    outXAdvance: outXAdvance!, outXOffset: outXOffset!, outYOffset: outYOffset!,
+                    outCap: outCap
+                )
+            },
+
+            on_rasterize_glyph_by_id: { ctx, glyphID, styleFlags, outBitmap in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                return atlas.rasterizeByGlyphID(glyphID: glyphID, styleFlags: styleFlags, outBitmap: outBitmap!) ? 1 : 0
             }
         )
 
@@ -1787,24 +1807,26 @@ final class ZonvieCore {
         let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
 
-        // Expect: "<name>\t<size>"
-        let parts = s.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-        if parts.count == 2 {
+        // Expect: "<name>\t<size>" or "<name>\t<size>\t<features>"
+        let parts = s.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+        if parts.count >= 2 {
             var name = String(parts[0])
             let parsedSize = Double(parts[1]) ?? 0
             // If size is 0 or invalid, use config size
             let size = parsedSize > 0 ? parsedSize : configSize
+            let features = parts.count >= 3 ? String(parts[2]) : ""
 
             // If guifont name is empty, use config font
             if name.isEmpty {
                 name = configFont
                 Self.appLog("[onGuiFont] guifont empty, using config font '\(configFont)' size=\(size)")
             }
+            Self.appLog("[onGuiFont] name='\(name)' size=\(size) features='\(features)'")
 
             // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
             // the same flush's vertex generation) uses the new font immediately.
             // atlas.setFont() is thread-safe (protected by os_unfair_lock).
-            view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size))
+            view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
 
             // Notify core of new cell dimensions so vertex positions match
             // the new glyph metrics. updateLayoutPx detects in_handle_redraw

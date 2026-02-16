@@ -208,19 +208,59 @@ fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
     return .{ .items = out.items };
 }
 
-// ---- guifont "candidate" parse (Zig-side: name + pointSize) ----
+// ---- guifont "candidate" parse (Zig-side: name + pointSize + features) ----
+
+const FontFeature = struct {
+    tag: [4]u8,
+    value: u32,
+};
+
+const MAX_FONT_FEATURES = 32;
 
 const GuiFontResolved = struct {
     name: []const u8,
     point_size: f64,
+    features: []const FontFeature,
 };
 
+/// Try to parse a colon-separated token as an OpenType feature.
+/// Accepted formats: "+liga", "-dlig", "ss01=2", "zero" (4-char tag = enable).
+fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
+    if (tok.len == 0) return null;
+
+    var tag_str: []const u8 = undefined;
+    var value: u32 = 1;
+
+    if (tok[0] == '+' or tok[0] == '-') {
+        tag_str = tok[1..];
+        value = if (tok[0] == '+') 1 else 0;
+    } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
+        tag_str = tok[0..eq];
+        value = std.fmt.parseInt(u32, tok[eq + 1 ..], 10) catch return null;
+    } else {
+        // Bare 4-char tag → enable
+        tag_str = tok;
+    }
+
+    if (tag_str.len != 4) return null;
+    // Reject tags that look like size options (e.g. bare "h140" or "p120")
+    if (tag_str[0] == 'h' or tag_str[0] == 'p') {
+        if (std.fmt.parseFloat(f64, tag_str[1..])) |_| return null else |_| {}
+    }
+
+    return FontFeature{
+        .tag = .{ tag_str[0], tag_str[1], tag_str[2], tag_str[3] },
+        .value = value,
+    };
+}
+
 fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
-    // Format is usually: "Name:h14" or "Name:p14" etc.
+    // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
     // point_size default: 14
     var name_part: []const u8 = cand;
     var point: f64 = 14.0;
+    var features: std.ArrayListUnmanaged(FontFeature) = .{};
 
     if (std.mem.indexOfScalar(u8, cand, ':')) |colon| {
         name_part = cand[0..colon];
@@ -235,8 +275,18 @@ fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontRes
             if (tok.len >= 2) {
                 const c0 = tok[0];
                 if (c0 == 'h' or c0 == 'p') {
-                    const num = tok[1..];
-                    point = std.fmt.parseFloat(f64, num) catch point;
+                    if (std.fmt.parseFloat(f64, tok[1..])) |v| {
+                        point = v;
+                        i = if (j < opts.len) j + 1 else j;
+                        continue;
+                    } else |_| {}
+                }
+            }
+
+            // Try as OpenType feature
+            if (parseFontFeatureToken(tok)) |feat| {
+                if (features.items.len < MAX_FONT_FEATURES) {
+                    try features.append(arena, feat);
                 }
             }
 
@@ -248,12 +298,41 @@ fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontRes
     // If name is empty, return empty string - frontend will use config/OS default.
     const trimmed = std.mem.trim(u8, name_part, " \t\r\n");
 
-    return .{ .name = try arena.dupe(u8, trimmed), .point_size = point };
+    return .{
+        .name = try arena.dupe(u8, trimmed),
+        .point_size = point,
+        .features = features.items,
+    };
 }
 
 fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
-    // "<name>\t<size>"
-    return try std.fmt.allocPrint(arena, "{s}\t{d}", .{ r.name, r.point_size });
+    // "<name>\t<size>" or "<name>\t<size>\t<features>"
+    if (r.features.len == 0) {
+        return try std.fmt.allocPrint(arena, "{s}\t{d}", .{ r.name, r.point_size });
+    }
+
+    // Build features string: "+liga,-dlig,ss01=2"
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    const prefix = try std.fmt.allocPrint(arena, "{s}\t{d}\t", .{ r.name, r.point_size });
+    try buf.appendSlice(arena, prefix);
+
+    for (r.features, 0..) |f, idx| {
+        if (idx > 0) try buf.append(arena, ',');
+        if (f.value == 1) {
+            try buf.append(arena, '+');
+            try buf.appendSlice(arena, &f.tag);
+        } else if (f.value == 0) {
+            try buf.append(arena, '-');
+            try buf.appendSlice(arena, &f.tag);
+        } else {
+            try buf.appendSlice(arena, &f.tag);
+            try buf.append(arena, '=');
+            const val_str = try std.fmt.allocPrint(arena, "{d}", .{f.value});
+            try buf.appendSlice(arena, val_str);
+        }
+    }
+
+    return buf.items;
 }
 
 fn dumpValue(v: anytype, indent: usize) void {

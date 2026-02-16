@@ -34,6 +34,10 @@ final class GlyphAtlas {
     private var pointSize: CGFloat
     private var backingScale: CGFloat = 1.0
 
+    // OpenType font features (parsed from guifont string).
+    private var fontFeatures: [zonvie_font_feature] = []
+    private var hasFeatures: Bool { !fontFeatures.isEmpty }
+
     // Font variants for bold/italic
     private var boldFont: CTFont?
     private var italicFont: CTFont?
@@ -131,13 +135,52 @@ final class GlyphAtlas {
         os_unfair_lock_unlock(&mu)
     }
     
-    func setFont(name: String, pointSize: CGFloat) {
+    func setFont(name: String, pointSize: CGFloat, features: String = "") {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
-    
+
         self.fontName = name
         self.pointSize = pointSize
+        self.fontFeatures = Self.parseFontFeatures(features)
+        ZonvieCore.appLog("[GlyphAtlas.setFont] name='\(name)' pt=\(pointSize) features_str='\(features)' parsed_count=\(self.fontFeatures.count) hasFeatures=\(hasFeatures)")
         rebuildFont_locked()
+    }
+
+    /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
+    private static func parseFontFeatures(_ s: String) -> [zonvie_font_feature] {
+        guard !s.isEmpty else { return [] }
+        return s.split(separator: ",").compactMap { token in
+            let t = token.trimmingCharacters(in: .whitespaces)
+            var tag: String
+            var value: UInt32
+
+            if t.contains("=") {
+                let kv = t.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2, kv[0].count == 4, let val = UInt32(kv[1]) else { return nil }
+                tag = String(kv[0])
+                value = val
+            } else if t.hasPrefix("+") {
+                tag = String(t.dropFirst())
+                guard tag.count == 4 else { return nil }
+                value = 1
+            } else if t.hasPrefix("-") {
+                tag = String(t.dropFirst())
+                guard tag.count == 4 else { return nil }
+                value = 0
+            } else {
+                guard t.count == 4 else { return nil }
+                tag = t
+                value = 1
+            }
+
+            let bytes = Array(tag.utf8)
+            guard bytes.count == 4 else { return nil }
+            var feature = zonvie_font_feature()
+            feature.tag = (Int8(bitPattern: bytes[0]), Int8(bitPattern: bytes[1]),
+                           Int8(bitPattern: bytes[2]), Int8(bitPattern: bytes[3]))
+            feature.value = value
+            return feature
+        }
     }
     
     func setBackingScale(_ s: CGFloat) {
@@ -337,6 +380,20 @@ final class GlyphAtlas {
         if let boldItalicFont {
             self.hbftBoldItalic = createHbFtFont_locked(for: boldItalicFont, px: px)
         }
+
+        // Apply OpenType features to all font handles
+        applyFeatures_locked(to: self.hbftFont)
+        applyFeatures_locked(to: self.hbftBold)
+        applyFeatures_locked(to: self.hbftItalic)
+        applyFeatures_locked(to: self.hbftBoldItalic)
+    }
+
+    /// Apply stored font features to a HarfBuzz font handle.
+    private func applyFeatures_locked(to hbft: OpaquePointer?) {
+        guard let hbft = hbft, !fontFeatures.isEmpty else { return }
+        fontFeatures.withUnsafeBufferPointer { buf in
+            zonvie_ft_hb_font_set_features(hbft, buf.baseAddress, buf.count)
+        }
     }
 
     private func createHbFtFont_locked(for ctFont: CTFont, px: UInt32) -> OpaquePointer? {
@@ -401,6 +458,9 @@ final class GlyphAtlas {
         let createEnd = CFAbsoluteTimeGetCurrent()
 
         guard let hbft = created else { return nil }
+
+        // Apply OpenType features to fallback font handle too
+        applyFeatures_locked(to: hbft)
 
         let loadMs = (loadEnd - loadStart) * 1000
         let createMs = (createEnd - loadEnd) * 1000
@@ -782,6 +842,27 @@ final class GlyphAtlas {
 
     /// Resolve font and glyph ID for a given scalar + style.
     /// Must be called with mu locked.
+    /// Get glyph ID by shaping a single scalar with HarfBuzz (applies OpenType features).
+    /// Returns nil if the font doesn't contain the scalar (glyph_id == 0 = .notdef).
+    private func glyphIDViaShaping(hbft: OpaquePointer, scalar: UInt32) -> UInt32? {
+        var scalars: [UInt32] = [scalar]
+        var glyphId: UInt32 = 0
+        var xAdv: Int32 = 0, yAdv: Int32 = 0, xOff: Int32 = 0, yOff: Int32 = 0
+
+        let count = zonvie_hb_shape_utf32(
+            hbft,
+            &scalars, 1,
+            &glyphId, nil,
+            &xAdv, &yAdv, &xOff, &yOff,
+            1,
+            nil, nil, nil
+        )
+
+        // glyph_id 0 = .notdef = font doesn't have this scalar
+        if count >= 1 && glyphId != 0 { return glyphId }
+        return nil
+    }
+
     private func resolveHbftAndGlyph_locked(scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer, glyphID: UInt32)? {
         let failKey = (UInt64(styleFlags) << 32) | UInt64(scalar)
         if failedScalarCache.contains(failKey) {
@@ -813,19 +894,33 @@ final class GlyphAtlas {
             return nil
         }
 
-        if let gid = glyphID(in: fontToUse, scalar: scalar) {
-            return (hbft: hbft, glyphID: gid)
+        // When features are set, use HarfBuzz shaping to get feature-aware glyph ID.
+        // Otherwise use CTFont cmap (faster, no shaping overhead).
+        if hasFeatures {
+            if let gid = glyphIDViaShaping(hbft: hbft, scalar: scalar) {
+                return (hbft: hbft, glyphID: gid)
+            }
+        } else {
+            if let gid = glyphID(in: fontToUse, scalar: scalar) {
+                return (hbft: hbft, glyphID: gid)
+            }
         }
 
-        if fontToUse !== font, let baseHbft = hbftFont, let gid = glyphID(in: font, scalar: scalar) {
-            return (hbft: baseHbft, glyphID: gid)
+        // Try base font if styled font didn't have the glyph
+        if fontToUse !== font, let baseHbft = hbftFont {
+            if hasFeatures {
+                if let gid = glyphIDViaShaping(hbft: baseHbft, scalar: scalar) {
+                    return (hbft: baseHbft, glyphID: gid)
+                }
+            } else {
+                if let gid = glyphID(in: font, scalar: scalar) {
+                    return (hbft: baseHbft, glyphID: gid)
+                }
+            }
         }
 
+        // Fallback font lookup (always uses CTFont to find the right font)
         guard let fbCT = ctFontForScalarFallback(base: fontToUse, scalar: scalar) else {
-            failedScalarCache.insert(failKey)
-            return nil
-        }
-        guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
             failedScalarCache.insert(failKey)
             return nil
         }
@@ -834,7 +929,18 @@ final class GlyphAtlas {
             return nil
         }
 
-        return (hbft: face.hbft, glyphID: fbGid)
+        if hasFeatures {
+            if let gid = glyphIDViaShaping(hbft: face.hbft, scalar: scalar) {
+                return (hbft: face.hbft, glyphID: gid)
+            }
+        } else {
+            if let gid = glyphID(in: fbCT, scalar: scalar) {
+                return (hbft: face.hbft, glyphID: gid)
+            }
+        }
+
+        failedScalarCache.insert(failKey)
+        return nil
     }
 
     /// Phase 2: Rasterize a glyph without atlas packing.
@@ -891,6 +997,110 @@ final class GlyphAtlas {
             outBitmap.pointee.width = UInt32(w)
             outBitmap.pointee.height = UInt32(h)
             outBitmap.pointee.pitch = Int32(w)  // contiguous: pitch = width
+        }
+
+        return true
+    }
+
+    /// Select the appropriate HBFT font handle for the given style flags.
+    /// Must be called with mu locked.
+    private func selectHbft_locked(styleFlags: UInt32) -> OpaquePointer? {
+        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
+        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
+
+        if isBold && isItalic {
+            return hbftBoldItalic ?? hbftBold ?? hbftItalic ?? hbftFont
+        } else if isBold {
+            return hbftBold ?? hbftFont
+        } else if isItalic {
+            return hbftItalic ?? hbftFont
+        } else {
+            return hbftFont
+        }
+    }
+
+    /// Phase B: Shape a text run using HarfBuzz.
+    /// Returns the actual glyph count. If > outCap, caller should retry with larger buffers.
+    func shapeTextRun(
+        scalars: UnsafePointer<UInt32>, scalarCount: Int,
+        styleFlags: UInt32,
+        outGlyphIDs: UnsafeMutablePointer<UInt32>,
+        outClusters: UnsafeMutablePointer<UInt32>,
+        outXAdvance: UnsafeMutablePointer<Int32>,
+        outXOffset: UnsafeMutablePointer<Int32>,
+        outYOffset: UnsafeMutablePointer<Int32>,
+        outCap: Int
+    ) -> Int {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+
+        // zonvie_hb_shape_utf32 outputs y_advance too, but our callback doesn't need it.
+        // We'll use a temporary buffer for y_advance.
+        var yAdvBuf = [Int32](repeating: 0, count: outCap)
+
+        let count = zonvie_hb_shape_utf32(
+            hbft,
+            scalars, scalarCount,
+            outGlyphIDs, outClusters,
+            outXAdvance, &yAdvBuf,
+            outXOffset, outYOffset,
+            outCap,
+            nil, nil, nil
+        )
+
+        return count
+    }
+
+    /// Phase B: Rasterize a glyph by its glyph ID (post-shaping, skips scalar→glyph_id lookup).
+    func rasterizeByGlyphID(glyphID: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return false }
+
+        var bufPtr: UnsafePointer<UInt8>?
+        var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+        var left: Int32 = 0, top: Int32 = 0, adv26_6: Int32 = 0
+
+        let r = zonvie_ft_render_glyph(
+            hbft, glyphID,
+            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6
+        )
+
+        outBitmap.pointee.bearing_x = left
+        outBitmap.pointee.bearing_y = top
+        outBitmap.pointee.advance_26_6 = adv26_6
+        outBitmap.pointee.ascent_px = ascentPx
+        outBitmap.pointee.descent_px = descentPx
+        outBitmap.pointee.bytes_per_pixel = 1 // grayscale
+
+        if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
+            outBitmap.pointee.pixels = nil
+            outBitmap.pointee.width = 0
+            outBitmap.pointee.height = 0
+        } else {
+            // Copy bitmap data to stable buffer (same as rasterizeOnly)
+            let needed = Int(w) * Int(h)
+            if rasterizeScratch.count < needed {
+                rasterizeScratch = Array(repeating: 0, count: needed)
+            }
+            let absPitch = abs(Int(pitch))
+            rasterizeScratch.withUnsafeMutableBufferPointer { dst in
+                guard let base = dst.baseAddress else { return }
+                for row in 0..<Int(h) {
+                    let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
+                    let src = bufPtr!.advanced(by: srcRow * absPitch)
+                    memcpy(base.advanced(by: row * Int(w)), src, Int(w))
+                }
+            }
+            rasterizeScratch.withUnsafeBufferPointer { buf in
+                outBitmap.pointee.pixels = buf.baseAddress
+            }
+            outBitmap.pointee.width = UInt32(w)
+            outBitmap.pointee.height = UInt32(h)
+            outBitmap.pointee.pitch = Int32(w)
         }
 
         return true

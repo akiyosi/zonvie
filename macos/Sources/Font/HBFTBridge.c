@@ -19,6 +19,10 @@ struct zonvie_ft_hb_font {
   uint8_t* font_bytes_owned;
   size_t font_len;
 
+  // OpenType features for shaping (set via zonvie_ft_hb_font_set_features).
+  hb_feature_t features[ZONVIE_MAX_FONT_FEATURES];
+  size_t feature_count;
+
   // Last rendered glyph bitmap is owned by FreeType (ft_face->glyph->bitmap).
 };
 
@@ -62,6 +66,19 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
 fail:
   zonvie_ft_hb_font_destroy(f);
   return NULL;
+}
+
+void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feature* features, size_t count) {
+  if (!f) return;
+  size_t n = count < ZONVIE_MAX_FONT_FEATURES ? count : ZONVIE_MAX_FONT_FEATURES;
+  f->feature_count = n;
+  for (size_t i = 0; i < n; i++) {
+    f->features[i].tag = HB_TAG(features[i].tag[0], features[i].tag[1],
+                                 features[i].tag[2], features[i].tag[3]);
+    f->features[i].value = features[i].value;
+    f->features[i].start = 0;
+    f->features[i].end = (unsigned int)-1;
+  }
 }
 
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {
@@ -109,7 +126,9 @@ size_t zonvie_hb_shape_utf32(
   hb_buffer_add_codepoints(f->hb_buf, scalars, (int)scalar_count, 0, (int)scalar_count);
   hb_buffer_guess_segment_properties(f->hb_buf);
 
-  hb_shape(f->hb_font, f->hb_buf, NULL, 0);
+  hb_shape(f->hb_font, f->hb_buf,
+           f->feature_count > 0 ? f->features : NULL,
+           (unsigned int)f->feature_count);
 
   unsigned int glyph_count = 0;
   hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(f->hb_buf, &glyph_count);

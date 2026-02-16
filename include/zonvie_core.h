@@ -83,6 +83,26 @@ typedef int (*zonvie_atlas_ensure_glyph_fn)(
 #define ZONVIE_STYLE_BOLD   (1u << 0)
 #define ZONVIE_STYLE_ITALIC (1u << 1)
 
+/* Text-run shaping: shape multiple scalars into glyphs with positions.
+   Frontend performs platform-specific shaping (HarfBuzz on macOS, DWrite on Windows).
+   Returns actual glyph count. If > out_cap, caller should retry with larger buffers.
+   out_clusters[i] = index of first input scalar that produced glyph i (HarfBuzz convention). */
+typedef size_t (*zonvie_shape_text_run_fn)(
+    void* ctx,
+    const uint32_t* scalars, size_t scalar_count,
+    uint32_t style_flags,
+    uint32_t* out_glyph_ids, uint32_t* out_clusters,
+    int32_t* out_x_advance, int32_t* out_x_offset, int32_t* out_y_offset,
+    size_t out_cap
+);
+
+/* Rasterize a glyph by its glyph ID (post-shaping, skips scalar→glyph_id lookup).
+   Returns 1 on success, 0 on failure. */
+typedef int (*zonvie_rasterize_glyph_by_id_fn)(
+    void* ctx, uint32_t glyph_id, uint32_t style_flags,
+    zonvie_glyph_bitmap* out_bitmap
+);
+
 /* Styled glyph lookup (preferred when present) */
 typedef int (*zonvie_atlas_ensure_glyph_styled_fn)(
     void* ctx,
@@ -683,6 +703,12 @@ typedef struct zonvie_callbacks {
     zonvie_on_win_rotate_fn on_win_rotate;
     zonvie_on_win_resize_equal_fn on_win_resize_equal;
     zonvie_on_win_move_cursor_fn on_win_move_cursor;
+
+    /* Text-run shaping callback (NULL = per-cell fallback, no ligatures). */
+    zonvie_shape_text_run_fn on_shape_text_run;
+
+    /* Glyph-ID rasterize callback (NULL = per-cell fallback). */
+    zonvie_rasterize_glyph_by_id_fn on_rasterize_glyph_by_id;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

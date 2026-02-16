@@ -185,6 +185,28 @@ pub const AtlasCreateFn = *const fn (
     atlas_h: u32,
 ) callconv(.c) void;
 
+// Phase B: Text-run shaping callback type
+pub const ShapeTextRunFn = *const fn (
+    ctx: ?*anyopaque,
+    scalars: [*]const u32,
+    scalar_count: usize,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_clusters: [*]u32,
+    out_x_advance: [*]i32,
+    out_x_offset: [*]i32,
+    out_y_offset: [*]i32,
+    out_cap: usize,
+) callconv(.c) usize;
+
+// Phase B: Rasterize glyph by ID (post-shaping, skips scalar→glyph_id lookup)
+pub const RasterizeGlyphByIdFn = *const fn (
+    ctx: ?*anyopaque,
+    glyph_id: u32,
+    style_flags: u32,
+    out_bitmap: *GlyphBitmap,
+) callconv(.c) c_int;
+
 pub const OnVerticesFn = *const fn (
     ctx: ?*anyopaque,
     main_verts: [*]const Vertex,
@@ -470,6 +492,10 @@ pub const Callbacks = extern struct {
     on_win_rotate: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void = null,
     on_win_resize_equal: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_win_move_cursor: ?*const fn (ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 = null,
+
+    // Phase B: Text-run shaping (ligatures)
+    on_shape_text_run: ?ShapeTextRunFn = null,
+    on_rasterize_glyph_by_id: ?RasterizeGlyphByIdFn = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -599,6 +625,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_win_rotate = box.cb.on_win_rotate,
         .on_win_resize_equal = box.cb.on_win_resize_equal,
         .on_win_move_cursor = box.cb.on_win_move_cursor,
+
+        // Phase B: Text-run shaping (ligatures)
+        .on_shape_text_run = box.cb.on_shape_text_run,
+        .on_rasterize_glyph_by_id = box.cb.on_rasterize_glyph_by_id,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);

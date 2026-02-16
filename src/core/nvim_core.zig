@@ -13,6 +13,7 @@ const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
 const shelf_packer = @import("shelf_packer.zig");
+const vertexgen = @import("vertexgen.zig");
 
 pub const Callbacks = struct {
     on_vertices: ?*const fn (
@@ -251,6 +252,10 @@ pub const Callbacks = struct {
     on_win_rotate: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void = null,
     on_win_resize_equal: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
     on_win_move_cursor: ?*const fn (ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 = null,
+
+    // Phase B: Text-run shaping (ligatures)
+    on_shape_text_run: ?c_api.ShapeTextRunFn = null,
+    on_rasterize_glyph_by_id: ?c_api.RasterizeGlyphByIdFn = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -414,6 +419,15 @@ pub const Core = struct {
     glyph_keys_non_ascii: ?[]u64 = null,
     glyph_cache_initialized: bool = false,
 
+    // Phase B: Glyph-ID cache (for shaped glyphs; keyed by (glyph_id << 2) | style_index)
+    glyph_cache_by_id: ?[]c_api.GlyphEntry = null,
+    glyph_keys_by_id: ?[]u64 = null,
+
+    // Phase B: Persistent shaping buffers (reused across flushes, zero per-call alloc)
+    shaping_bufs: vertexgen.ShapingBuffers = .{},
+    shaping_scalars: std.ArrayListUnmanaged(u32) = .{},
+    shaping_col_widths: std.ArrayListUnmanaged(u32) = .{},
+
     // Phase 2: Core-managed atlas
     atlas_packer: ?shelf_packer.ShelfPacker = null,
     atlas_w: u32 = 2048,
@@ -514,6 +528,11 @@ pub const Core = struct {
             self.nvim_path_owned = null;
         }
 
+        // Free shaping buffers (Phase B)
+        self.shaping_bufs.deinit(self.alloc);
+        self.shaping_scalars.deinit(self.alloc);
+        self.shaping_col_widths.deinit(self.alloc);
+
         // Free caches
         self.deinitHlCache();
         self.deinitGlyphCache();
@@ -537,6 +556,15 @@ pub const Core = struct {
             self.alloc.free(buf);
             self.glyph_keys_non_ascii = null;
         }
+        // Phase B: glyph-ID cache
+        if (self.glyph_cache_by_id) |buf| {
+            self.alloc.free(buf);
+            self.glyph_cache_by_id = null;
+        }
+        if (self.glyph_keys_by_id) |buf| {
+            self.alloc.free(buf);
+            self.glyph_keys_by_id = null;
+        }
         self.glyph_cache_initialized = false;
     }
 
@@ -558,6 +586,11 @@ pub const Core = struct {
         const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
         @memset(self.glyph_keys_non_ascii.?, INVALID_KEY);
 
+        // Phase B: glyph-ID cache (same size as non-ASCII cache)
+        self.glyph_cache_by_id = try self.alloc.alloc(c_api.GlyphEntry, non_ascii_size);
+        self.glyph_keys_by_id = try self.alloc.alloc(u64, non_ascii_size);
+        @memset(self.glyph_keys_by_id.?, INVALID_KEY);
+
         self.glyph_cache_initialized = true;
     }
 
@@ -569,6 +602,11 @@ pub const Core = struct {
             @memset(buf, false);
         }
         if (self.glyph_keys_non_ascii) |buf| {
+            const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
+            @memset(buf, INVALID_KEY);
+        }
+        // Phase B: glyph-ID cache
+        if (self.glyph_keys_by_id) |buf| {
             const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
             @memset(buf, INVALID_KEY);
         }
@@ -612,21 +650,10 @@ pub const Core = struct {
             self.cb.on_atlas_create != null;
     }
 
-    /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
-    /// Returns null on unrecoverable failure (rasterize callback returned 0).
-    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
-        // Lazy atlas init
-        if (!self.atlas_initialized) {
-            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
-            if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
-            self.atlas_initialized = true;
-        }
-
-        // Ask frontend to rasterize (no packing / UV)
-        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
-        const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
-        if (ok == 0) return null; // rasterize failed
-
+    /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
+    /// Handles whitespace, oversized glyphs, atlas-full reset, UV computation.
+    /// Returns null only if the glyph cannot fit even after atlas reset.
+    fn packAndUploadBitmap(self: *Core, bm: *const c_api.GlyphBitmap) ?c_api.GlyphEntry {
         // Whitespace / zero-size glyph → return entry with zero UVs
         if (bm.width == 0 or bm.height == 0) {
             const adv: f32 = @as(f32, @floatFromInt(bm.advance_26_6)) / 64.0;
@@ -652,21 +679,19 @@ pub const Core = struct {
         var rect = packer.alloc(bm.width, bm.height);
 
         // Atlas full → reset and retry once.
-        // Flag the reset so the flush loop knows earlier rows have stale UVs.
         if (rect == null) {
             self.atlas_reset_during_flush = true;
-            self.log.write("[scroll_debug] atlas_full_reset scalar=0x{x} style={d} bm={d}x{d}\n", .{ scalar, style_flags, bm.width, bm.height });
             self.resetCoreAtlas();
             packer = &(self.atlas_packer.?);
             rect = packer.alloc(bm.width, bm.height);
-            if (rect == null) return null; // still can't fit, give up
+            if (rect == null) return null;
         }
 
         const r = rect.?;
 
-        // Upload glyph bitmap at (rect.x + padding, rect.y + padding)
+        // Upload glyph bitmap
         if (self.cb.on_atlas_upload) |f| {
-            f(self.ctx, r.x + packer.padding, r.y + packer.padding, bm.width, bm.height, &bm);
+            f(self.ctx, r.x + packer.padding, r.y + packer.padding, bm.width, bm.height, bm);
         }
 
         // Compute UVs (excluding padding)
@@ -688,6 +713,40 @@ pub const Core = struct {
             .ascent_px = bm.ascent_px,
             .descent_px = bm.descent_px,
         };
+    }
+
+    /// Ensure atlas is lazily initialized.
+    fn ensureAtlasInit(self: *Core) void {
+        if (!self.atlas_initialized) {
+            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
+            if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
+            self.atlas_initialized = true;
+        }
+    }
+
+    /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
+    /// Returns null on unrecoverable failure (rasterize callback returned 0).
+    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+        self.ensureAtlasInit();
+
+        // Ask frontend to rasterize (no packing / UV)
+        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
+        if (ok == 0) return null;
+
+        return self.packAndUploadBitmap(&bm);
+    }
+
+    /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
+    /// Similar to ensureGlyphPhase2 but uses on_rasterize_glyph_by_id callback.
+    pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
+        self.ensureAtlasInit();
+
+        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const ok = self.cb.on_rasterize_glyph_by_id.?(self.ctx, glyph_id, style_flags, &bm);
+        if (ok == 0) return null;
+
+        return self.packAndUploadBitmap(&bm);
     }
 
     /// Reset core atlas: clear packer, invalidate cache, recreate texture.

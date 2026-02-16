@@ -1167,15 +1167,24 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
     var name: []const u8 = "";
     var pt: f32 = config_pt;
+    var features_str: []const u8 = "";
 
     if (bytes != null and len != 0) {
         const s = bytes.?[0..len];
-        if (std.mem.indexOfScalar(u8, s, '\t')) |tab| {
-            name = s[0..tab];
-            const size_str = s[tab + 1 ..];
-            const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
-            // If size is 0 or invalid, use config size
-            pt = if (parsed_pt > 0) parsed_pt else config_pt;
+        // Format: "<name>\t<size>" or "<name>\t<size>\t<features>"
+        if (std.mem.indexOfScalar(u8, s, '\t')) |tab1| {
+            name = s[0..tab1];
+            const after_name = s[tab1 + 1 ..];
+            // Look for second tab (features separator)
+            if (std.mem.indexOfScalar(u8, after_name, '\t')) |tab2| {
+                const size_str = after_name[0..tab2];
+                features_str = after_name[tab2 + 1 ..];
+                const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
+                pt = if (parsed_pt > 0) parsed_pt else config_pt;
+            } else {
+                const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
+                pt = if (parsed_pt > 0) parsed_pt else config_pt;
+            }
         } else {
             // No tab => treat as invalid; use config font.
             if (applog.isEnabled()) applog.appLog("onGuiFont: invalid payload (no tab), using config font", .{});
@@ -1196,14 +1205,14 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         var applied_name: []const u8 = name;
         var applied_pt: f32 = pt;
 
-        const try_primary = a.setFontUtf8(name, pt);
+        const try_primary = a.setFontUtf8WithFeatures(name, pt, features_str);
         if (try_primary) |_| {} else |e| {
             if (applog.isEnabled()) applog.appLog("onGuiFont: setFontUtf8 failed name='{s}' pt={d}: {any}", .{ name, pt, e });
 
-            // Fallback chain: config font -> OS default
+            // Fallback chain: config font -> OS default (features only apply to primary)
             const fallback_name = if (std.mem.eql(u8, name, config_font)) os_default_font else config_font;
 
-            const try_fb = a.setFontUtf8(fallback_name, pt);
+            const try_fb = a.setFontUtf8WithFeatures(fallback_name, pt, features_str);
             if (try_fb) |_| {
                 applied_name = fallback_name;
                 applied_pt = pt;
@@ -1212,7 +1221,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
                 if (applog.isEnabled()) applog.appLog("onGuiFont: fallback setFontUtf8 failed name='{s}' pt={d}: {any}", .{ fallback_name, pt, e2 });
                 // Last resort: try OS default if we haven't already
                 if (!std.mem.eql(u8, fallback_name, os_default_font)) {
-                    const try_os = a.setFontUtf8(os_default_font, pt);
+                    const try_os = a.setFontUtf8WithFeatures(os_default_font, pt, features_str);
                     if (try_os) |_| {
                         applied_name = os_default_font;
                         applied_pt = pt;
