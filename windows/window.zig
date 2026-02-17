@@ -431,6 +431,10 @@ pub export fn WndProc(
                         app.need_full_seed.store(true, .seq_cst);
                         app.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
+                        // After atlas reset, external window paints may consume
+                        // shared pending_uploads before the main window sees them.
+                        // Schedule a full atlas upload to ensure all glyph data is present.
+                        app.atlas_full_upload_needed = true;
                     }
                 }
 
@@ -495,6 +499,14 @@ pub export fn WndProc(
                         g.lockContext();
                         defer g.unlockContext();
                         atlas_uploads = a.flushPendingAtlasUploadsToD3D(g);
+                        // After atlas reset, external windows may have consumed some
+                        // pending_uploads before the main window. Upload the full atlas
+                        // once to ensure all glyph data (including shared glyphs) is present.
+                        if (app.atlas_full_upload_needed) {
+                            a.uploadFullAtlasToD3D(g);
+                            app.atlas_full_upload_needed = false;
+                            applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
+                        }
                     }
                 }
                 if (atlas_uploads != 0) {
@@ -2165,6 +2177,9 @@ pub export fn WndProc(
                     .on_win_rotate = external_windows.onWinRotate,
                     .on_win_resize_equal = external_windows.onWinResizeEqual,
                     .on_win_move_cursor = external_windows.onWinMoveCursor,
+                    .on_shape_text_run = callbacks.onShapeTextRun,
+                    .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
+                    .on_get_ascii_table = callbacks.onGetAsciiTable,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 

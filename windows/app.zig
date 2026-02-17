@@ -688,6 +688,9 @@ pub const App = struct {
     // When row-mode starts (or after resize), we must seed the persistent back buffer once.
     // Otherwise the first present may clear to black and only the dirty row gets drawn.
     need_full_seed: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    // After atlas reset, external window paints may consume shared pending_uploads.
+    // This flag ensures the main window uploads the full atlas to cover any missed regions.
+    atlas_full_upload_needed: bool = false,
     // Row-mode seed tracking: require a full set of rows before presenting.
     seed_pending: bool = true,
     seed_clear_pending: bool = true,

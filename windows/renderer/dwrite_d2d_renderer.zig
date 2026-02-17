@@ -2229,6 +2229,474 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.bold_italic_font_face = null;
         self.styled_fonts_initialized = false;
     }
+
+    // =========================================================================
+    // Text-run shaping (on_shape_text_run callback)
+    // =========================================================================
+
+    const SHAPE_MAX_SCALARS = 512;
+    const SHAPE_MAX_UTF16 = SHAPE_MAX_SCALARS * 2;
+    const SHAPE_MAX_GLYPHS = SHAPE_MAX_SCALARS * 3;
+
+    /// Select font face by style flags. Returns null if no font is loaded.
+    /// Must be called with self.mu locked.
+    fn selectFontFace(self: *Renderer, style_flags: u32) ?*c.IDWriteFontFace {
+        if (style_flags != 0) {
+            self.ensureStyledFontFaces();
+            const is_bold = (style_flags & STYLE_BOLD) != 0;
+            const is_italic = (style_flags & STYLE_ITALIC) != 0;
+            if (is_bold and is_italic) {
+                return self.bold_italic_font_face orelse self.bold_font_face orelse self.italic_font_face orelse self.font_face;
+            } else if (is_bold) {
+                return self.bold_font_face orelse self.font_face;
+            } else if (is_italic) {
+                return self.italic_font_face orelse self.font_face;
+            }
+        }
+        return self.font_face;
+    }
+
+    /// Shape a text run using DWrite IDWriteTextAnalyzer.
+    /// Returns glyph count on success, 0 on failure (fallback to per-cell).
+    /// If glyph_count > out_cap, returns the count without filling buffers.
+    pub fn shapeTextRunDWrite(
+        self: *Renderer,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        if (scalar_count == 0) return 0;
+
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const face = self.selectFontFace(style_flags) orelse return 0;
+
+        // For very long runs that exceed the stack-allocated shaping buffers,
+        // fall back to per-codepoint glyph lookup (correct rendering, no ligatures/kerning).
+        // This avoids returning 0 which would trigger the slower per-cell path in the core.
+        if (scalar_count > SHAPE_MAX_SCALARS) {
+            return self.shapeFallbackPerCodepoint(face, scalars, scalar_count, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+        }
+
+        // Ensure text analyzer exists (create lazily if needed)
+        if (self.text_analyzer == null) {
+            const dw_factory = self.dwrite_factory orelse return 0;
+            var analyzer: ?*c.IDWriteTextAnalyzer = null;
+            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return 0;
+            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
+            if (c.FAILED(hr_ta) or analyzer == null) return 0;
+            self.text_analyzer = analyzer;
+        }
+        const analyzer = self.text_analyzer orelse return 0;
+
+        // --- 1) Convert UTF-32 scalars → UTF-16 ---
+        var utf16_buf: [SHAPE_MAX_UTF16]c.WCHAR = undefined;
+        var utf16_to_scalar_idx: [SHAPE_MAX_UTF16]u32 = undefined;
+        var utf16_len: u32 = 0;
+
+        for (0..scalar_count) |si| {
+            const s = scalars[si];
+            if (utf16_len >= SHAPE_MAX_UTF16) return 0;
+            if (s <= 0xFFFF) {
+                utf16_buf[utf16_len] = @intCast(if (s >= 0xD800 and s <= 0xDFFF) @as(u32, 0xFFFD) else s);
+                utf16_to_scalar_idx[utf16_len] = @intCast(si);
+                utf16_len += 1;
+            } else if (s <= 0x10FFFF) {
+                if (utf16_len + 1 >= SHAPE_MAX_UTF16) return 0;
+                const v = s - 0x10000;
+                utf16_buf[utf16_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
+                utf16_to_scalar_idx[utf16_len] = @intCast(si);
+                utf16_len += 1;
+                utf16_buf[utf16_len] = @intCast(0xDC00 + (v & 0x3FF));
+                utf16_to_scalar_idx[utf16_len] = @intCast(si);
+                utf16_len += 1;
+            } else {
+                // Invalid scalar → U+FFFD
+                utf16_buf[utf16_len] = 0xFFFD;
+                utf16_to_scalar_idx[utf16_len] = @intCast(si);
+                utf16_len += 1;
+            }
+        }
+
+        if (utf16_len == 0) return 0;
+
+        // --- 2) Call GetGlyphs ---
+        var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
+        script_analysis.script = 0; // Default (Latin)
+        script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
+
+        // Build features array
+        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
+        for (0..self.font_feature_count) |fi| {
+            dw_features_arr[fi] = .{
+                .nameTag = @bitCast(self.font_features[fi].nameTag),
+                .parameter = self.font_features[fi].parameter,
+            };
+        }
+        var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
+            .features = &dw_features_arr,
+            .featureCount = self.font_feature_count,
+        };
+        var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
+        var feature_range_lengths: [1]c.UINT32 = .{utf16_len};
+
+        const has_features = self.font_feature_count > 0;
+
+        var cluster_map: [SHAPE_MAX_UTF16]c.UINT16 = undefined;
+        var text_props_raw: [SHAPE_MAX_UTF16]u16 = undefined;
+        var glyph_indices: [SHAPE_MAX_GLYPHS]c.UINT16 = undefined;
+        var glyph_props_raw: [SHAPE_MAX_GLYPHS]u16 = undefined;
+        var actual_glyph_count: u32 = 0;
+
+        const atbl = analyzer.lpVtbl.*;
+        const get_glyphs_fn = atbl.GetGlyphs orelse return 0;
+
+        const hr_gg = get_glyphs_fn(
+            analyzer,
+            &utf16_buf,
+            utf16_len,
+            face,
+            c.FALSE, // isSideways
+            c.FALSE, // isRightToLeft
+            &script_analysis,
+            null, // localeName
+            null, // numberSubstitution
+            if (has_features) @ptrCast(&feature_ptrs) else null,
+            if (has_features) &feature_range_lengths else null,
+            if (has_features) @as(u32, 1) else @as(u32, 0),
+            SHAPE_MAX_GLYPHS,
+            &cluster_map,
+            @ptrCast(&text_props_raw),
+            &glyph_indices,
+            @ptrCast(&glyph_props_raw),
+            &actual_glyph_count,
+        );
+
+        if (c.FAILED(hr_gg) or actual_glyph_count == 0) return 0;
+
+        // If more glyphs than output capacity, signal the count
+        if (actual_glyph_count > out_cap) return @intCast(actual_glyph_count);
+
+        // --- 3) Call GetGlyphPlacements ---
+        var glyph_advances: [SHAPE_MAX_GLYPHS]c.FLOAT = undefined;
+        var glyph_offsets: [SHAPE_MAX_GLYPHS]c.DWRITE_GLYPH_OFFSET = undefined;
+
+        const get_placements_fn = atbl.GetGlyphPlacements orelse {
+            // Fallback: fill advances with cell_w_px, offsets with 0
+            const gcount: usize = @intCast(actual_glyph_count);
+            for (0..gcount) |i| {
+                out_glyph_ids[i] = glyph_indices[i];
+                out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
+                out_x_offset[i] = 0;
+                out_y_offset[i] = 0;
+            }
+            // Cluster map inversion
+            var char_ptr: usize = 0;
+            for (0..gcount) |gi| {
+                while (char_ptr + 1 < utf16_len and cluster_map[char_ptr + 1] <= @as(c.UINT16, @intCast(gi))) {
+                    char_ptr += 1;
+                }
+                out_clusters[gi] = utf16_to_scalar_idx[char_ptr];
+            }
+            return gcount;
+        };
+
+        const hr_gp = get_placements_fn(
+            analyzer,
+            &utf16_buf,
+            &cluster_map,
+            @ptrCast(&text_props_raw),
+            utf16_len,
+            &glyph_indices,
+            @ptrCast(&glyph_props_raw),
+            actual_glyph_count,
+            face,
+            self.font_em_size,
+            c.FALSE, // isSideways
+            c.FALSE, // isRightToLeft
+            &script_analysis,
+            null, // localeName
+            if (has_features) @ptrCast(&feature_ptrs) else null,
+            if (has_features) &feature_range_lengths else null,
+            if (has_features) @as(u32, 1) else @as(u32, 0),
+            &glyph_advances,
+            &glyph_offsets,
+        );
+
+        if (c.FAILED(hr_gp)) return 0;
+
+        // --- 4) Convert outputs ---
+        const gcount: usize = @intCast(actual_glyph_count);
+
+        for (0..gcount) |i| {
+            out_glyph_ids[i] = glyph_indices[i];
+            // DIP → 26.6 fixed-point (font_em_size already includes DPI scaling)
+            out_x_advance[i] = @intFromFloat(glyph_advances[i] * 64.0);
+            out_x_offset[i] = @intFromFloat(glyph_offsets[i].advanceOffset * 64.0);
+            out_y_offset[i] = @intFromFloat(glyph_offsets[i].ascenderOffset * 64.0);
+        }
+
+        // Cluster map inversion: DWrite cluster_map[char_j] → first glyph for char j
+        // Core needs out_clusters[glyph_i] → source scalar index
+        {
+            var char_ptr: usize = 0;
+            for (0..gcount) |gi| {
+                while (char_ptr + 1 < utf16_len and cluster_map[char_ptr + 1] <= @as(c.UINT16, @intCast(gi))) {
+                    char_ptr += 1;
+                }
+                out_clusters[gi] = utf16_to_scalar_idx[char_ptr];
+            }
+        }
+
+        return gcount;
+    }
+
+    /// Per-codepoint glyph fallback for runs exceeding SHAPE_MAX_SCALARS.
+    /// Returns 1:1 glyph mapping with correct advances but no multi-glyph shaping.
+    /// Must be called with self.mu locked.
+    fn shapeFallbackPerCodepoint(
+        self: *Renderer,
+        face: *c.IDWriteFontFace,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        if (scalar_count > out_cap) return scalar_count;
+
+        const fvtbl = face.lpVtbl.*;
+        const get_glyph_fn = fvtbl.GetGlyphIndicesW orelse return 0;
+        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
+            // No metrics available — use cell_w_px for advances
+            for (0..scalar_count) |i| {
+                out_glyph_ids[i] = 0;
+                out_clusters[i] = @intCast(i);
+                out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
+                out_x_offset[i] = 0;
+                out_y_offset[i] = 0;
+            }
+            return scalar_count;
+        };
+
+        // Compute advance scale factor
+        var fm: c.DWRITE_FONT_METRICS = undefined;
+        const get_fm_fn = fvtbl.GetMetrics orelse return 0;
+        get_fm_fn(face, &fm);
+        const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
+        if (du_per_em <= 0.0) return 0;
+        const scale: f32 = self.font_em_size / du_per_em * 64.0;
+
+        // Process in small batches to keep stack usage minimal
+        const BATCH = 128;
+        var batch_cp: [BATCH]c.UINT32 = undefined;
+        var batch_gids: [BATCH]c.UINT16 = undefined;
+        var batch_metrics: [BATCH]c.DWRITE_GLYPH_METRICS = undefined;
+
+        var si: usize = 0;
+        while (si < scalar_count) {
+            const n = @min(BATCH, scalar_count - si);
+            for (0..n) |i| batch_cp[i] = scalars[si + i];
+
+            const hr_gi = get_glyph_fn(face, &batch_cp, @intCast(n), &batch_gids);
+            if (c.FAILED(hr_gi)) {
+                // Fill remaining with cell_w_px fallback
+                for (si..scalar_count) |i| {
+                    out_glyph_ids[i] = 0;
+                    out_clusters[i] = @intCast(i);
+                    out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
+                    out_x_offset[i] = 0;
+                    out_y_offset[i] = 0;
+                }
+                return scalar_count;
+            }
+
+            const hr_gm = get_metrics_fn(face, &batch_gids, @intCast(n), &batch_metrics, c.FALSE);
+            const has_metrics = !c.FAILED(hr_gm);
+
+            for (0..n) |i| {
+                out_glyph_ids[si + i] = batch_gids[i];
+                out_clusters[si + i] = @intCast(si + i);
+                out_x_advance[si + i] = if (has_metrics)
+                    @intFromFloat(@as(f32, @floatFromInt(batch_metrics[i].advanceWidth)) * scale)
+                else
+                    @as(i32, @intCast(self.cell_w_px)) * 64;
+                out_x_offset[si + i] = 0;
+                out_y_offset[si + i] = 0;
+            }
+            si += n;
+        }
+        return scalar_count;
+    }
+
+    // =========================================================================
+    // Glyph-ID rasterization (on_rasterize_glyph_by_id callback)
+    // =========================================================================
+
+    /// Rasterize a glyph by its ID (post-shaping, skips scalar→glyph lookup).
+    pub fn rasterizeGlyphByIdDWrite(self: *Renderer, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const face = self.selectFontFace(style_flags) orelse return error.NoFont;
+
+        // Use glyph_id directly (truncate u32 → u16 for DWrite)
+        var gi_arr: [1]c.UINT16 = .{@intCast(glyph_id & 0xFFFF)};
+        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
+        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
+
+        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
+        glyph_run.fontFace = face;
+        glyph_run.fontEmSize = self.font_em_size;
+        glyph_run.glyphCount = 1;
+        glyph_run.glyphIndices = gi_arr[0..].ptr;
+        glyph_run.glyphAdvances = adv_arr[0..].ptr;
+        glyph_run.glyphOffsets = off_arr[0..].ptr;
+
+        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
+        const dwtbl = dw.lpVtbl.*;
+        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
+        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
+        const hr_cgra = create_analysis_fn(dw, &glyph_run, 1.0, null, c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, c.DWRITE_MEASURING_MODE_NATURAL, 0.0, 0.0, &analysis);
+        if (c.FAILED(hr_cgra) or analysis == null) return error.DWriteCreateGlyphRunAnalysisFailed;
+
+        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
+        defer _ = rel_fn(analysis.?);
+
+        var bounds: c.RECT = std.mem.zeroes(c.RECT);
+        const atbl_a = analysis.?.lpVtbl.*;
+        const get_bounds_fn = atbl_a.GetAlphaTextureBounds orelse return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
+        const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
+        if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
+
+        const bw_i32: i32 = bounds.right - bounds.left;
+        const bh_i32: i32 = bounds.bottom - bounds.top;
+        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+
+        out_bitmap.bearing_x = bounds.left;
+        out_bitmap.bearing_y = @as(i32, -bounds.top);
+        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
+        out_bitmap.ascent_px = self.ascent_px;
+        out_bitmap.descent_px = self.descent_px;
+        out_bitmap.bytes_per_pixel = 3;
+
+        if (bw == 0 or bh == 0) {
+            out_bitmap.pixels = null;
+            out_bitmap.width = 0;
+            out_bitmap.height = 0;
+            out_bitmap.pitch = 0;
+            return;
+        }
+
+        const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
+        try self.glyph_tmp.resize(self.alloc, buf_size);
+
+        const create_alpha_fn = atbl_a.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
+        const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+        if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+        out_bitmap.pixels = self.glyph_tmp.items.ptr;
+        out_bitmap.width = bw;
+        out_bitmap.height = bh;
+        out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+    }
+
+    // =========================================================================
+    // ASCII fast path tables (on_get_ascii_table callback)
+    // =========================================================================
+
+    /// Build ASCII fast path tables for a given style variant.
+    pub fn getAsciiTableDWrite(
+        self: *Renderer,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_x_advances: [*]i32,
+        out_lig_triggers: [*]u8,
+    ) bool {
+        applog.appLog("[ascii_table] getAsciiTableDWrite start style={d}\n", .{style_flags});
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const face = self.selectFontFace(style_flags) orelse {
+            applog.appLog("[ascii_table] selectFontFace returned null style={d}\n", .{style_flags});
+            return false;
+        };
+        const fvtbl = face.lpVtbl.*;
+        applog.appLog("[ascii_table] selectFontFace done style={d}\n", .{style_flags});
+
+        // --- 1) Glyph IDs: batch cmap lookup ---
+        var codepoints: [128]c.UINT32 = undefined;
+        for (0..128) |i| codepoints[i] = @intCast(i);
+
+        var glyph_ids_u16: [128]c.UINT16 = undefined;
+        const get_glyph_fn = fvtbl.GetGlyphIndicesW orelse return false;
+        const hr_gi = get_glyph_fn(face, &codepoints, 128, &glyph_ids_u16);
+        if (c.FAILED(hr_gi)) return false;
+
+        for (0..128) |i| {
+            out_glyph_ids[i] = glyph_ids_u16[i];
+        }
+        applog.appLog("[ascii_table] GetGlyphIndicesW done style={d}\n", .{style_flags});
+
+        // --- 2) X Advances: design units → 26.6 fixed-point pixels ---
+        var glyph_metrics: [128]c.DWRITE_GLYPH_METRICS = undefined;
+        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
+            // Fallback: use cell_w_px for all advances
+            for (0..128) |i| {
+                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
+            }
+            @memset(out_lig_triggers[0..128], 0);
+            return true;
+        };
+
+        const hr_gm = get_metrics_fn(face, &glyph_ids_u16, 128, &glyph_metrics, c.FALSE);
+        if (c.FAILED(hr_gm)) {
+            // Fallback to cell_w_px
+            for (0..128) |i| {
+                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
+            }
+        } else {
+            // Get designUnitsPerEm for conversion
+            var fm: c.DWRITE_FONT_METRICS = undefined;
+            const get_fm_fn = fvtbl.GetMetrics orelse return false;
+            get_fm_fn(face, &fm);
+            const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
+            if (du_per_em <= 0.0) return false;
+
+            const scale: f32 = self.font_em_size / du_per_em * 64.0;
+            for (0..128) |i| {
+                const adv_du: f32 = @floatFromInt(glyph_metrics[i].advanceWidth);
+                out_x_advances[i] = @intFromFloat(adv_du * scale);
+            }
+        }
+        applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
+
+        // --- 3) Lig Triggers: introspect GSUB table (matches macOS HarfBuzz approach) ---
+        @memset(out_lig_triggers[0..128], 0);
+
+        applog.appLog("[ascii_table] detectLigTriggersFromGSUB start style={d}\n", .{style_flags});
+        detectLigTriggersFromGSUB(
+            face,
+            &glyph_ids_u16,
+            self.font_features[0..self.font_feature_count],
+            self.font_feature_count,
+            out_lig_triggers,
+        );
+        applog.appLog("[ascii_table] detectLigTriggersFromGSUB done style={d}\n", .{style_flags});
+
+        return true;
+    }
 };
 
 fn safeRelease(p: anytype) void {
@@ -2241,6 +2709,276 @@ fn safeRelease(p: anytype) void {
             _ = release_fn(unk);
         }
     }
+}
+
+/// Pack a 4-char OpenType tag into u32 (little-endian, matching DWRITE_FONT_FEATURE_TAG).
+fn packTag(comptime s: *const [4]u8) u32 {
+    return @as(u32, s[0]) | (@as(u32, s[1]) << 8) | (@as(u32, s[2]) << 16) | (@as(u32, s[3]) << 24);
+}
+
+// =========================================================================
+// OpenType GSUB table parsing helpers for lig_triggers detection
+// =========================================================================
+
+/// Read big-endian u16 from raw table bytes.
+fn readU16BE(data: []const u8, off: usize) ?u16 {
+    if (off + 2 > data.len) return null;
+    return (@as(u16, data[off]) << 8) | @as(u16, data[off + 1]);
+}
+
+/// Read big-endian u32 from raw table bytes.
+fn readU32BE(data: []const u8, off: usize) ?u32 {
+    if (off + 4 > data.len) return null;
+    return (@as(u32, data[off]) << 24) | (@as(u32, data[off + 1]) << 16) |
+        (@as(u32, data[off + 2]) << 8) | @as(u32, data[off + 3]);
+}
+
+/// Map a glyph ID back to ASCII codepoints and mark as trigger.
+fn markAsciiTrigger(gid: u16, ascii_gids: []const c.UINT16, out_triggers: [*]u8) void {
+    for (0x20..0x7F) |cp| {
+        if (ascii_gids[cp] != 0 and ascii_gids[cp] == gid) {
+            out_triggers[cp] = 1;
+        }
+    }
+}
+
+/// Scan a Coverage table and mark covered ASCII glyphs as triggers.
+/// `tbl` is the full GSUB table bytes, `cov_abs` is the absolute offset of the Coverage table.
+fn collectCoverageGlyphs(
+    tbl: []const u8,
+    cov_abs: usize,
+    ascii_gids: []const c.UINT16,
+    out_triggers: [*]u8,
+) void {
+    const fmt = readU16BE(tbl, cov_abs) orelse return;
+    if (fmt == 1) {
+        // Coverage Format 1: list of glyph IDs
+        const count = readU16BE(tbl, cov_abs + 2) orelse return;
+        for (0..count) |i| {
+            const gid = readU16BE(tbl, cov_abs + 4 + i * 2) orelse return;
+            markAsciiTrigger(gid, ascii_gids, out_triggers);
+        }
+    } else if (fmt == 2) {
+        // Coverage Format 2: ranges [startGlyphID, endGlyphID, startCoverageIndex]
+        const range_count = readU16BE(tbl, cov_abs + 2) orelse return;
+        for (0..range_count) |i| {
+            const rec_off = cov_abs + 4 + i * 6;
+            const start_gid = readU16BE(tbl, rec_off) orelse return;
+            const end_gid = readU16BE(tbl, rec_off + 2) orelse return;
+            // Use u32 to avoid u16 overflow when end_gid == 0xFFFF
+            var gid: u32 = start_gid;
+            while (gid <= @as(u32, end_gid)) : (gid += 1) {
+                markAsciiTrigger(@intCast(gid), ascii_gids, out_triggers);
+            }
+        }
+    }
+}
+
+/// Extract coverage from a single GSUB lookup subtable.
+/// Handles lookup types 1-6 directly and type 7 (Extension) by indirection.
+/// `depth` guards against malformed fonts with circular Extension references.
+fn processSubtable(
+    tbl: []const u8,
+    subtable_abs: usize,
+    lookup_type: u16,
+    ascii_gids: []const c.UINT16,
+    out_triggers: [*]u8,
+    depth: u8,
+) void {
+    if (lookup_type == 7) {
+        // Extension Substitution (type 7): dereference to actual subtable
+        // Format: u16 substFormat, u16 extensionLookupType, u32 extensionOffset
+        if (depth >= 2) return; // prevent infinite recursion on malformed fonts
+        const ext_type = readU16BE(tbl, subtable_abs + 2) orelse return;
+        const ext_off = readU32BE(tbl, subtable_abs + 4) orelse return;
+        if (ext_off == 0) return; // self-reference guard
+        const real_abs = subtable_abs + ext_off;
+        if (real_abs >= tbl.len) return;
+        processSubtable(tbl, real_abs, ext_type, ascii_gids, out_triggers, depth + 1);
+        return;
+    }
+
+    // Types 1-4: Coverage offset is always at subtable+2 (all formats).
+    // Types 5/6: Coverage location depends on substFormat:
+    //   Format 1,2: Coverage offset at subtable+2 (same as types 1-4).
+    //   Format 3: Different structure — field at offset 2 is GlyphCount (type 5)
+    //     or BacktrackGlyphCount (type 6), NOT a coverage offset.
+    //     Misinterpreting this causes pathological parsing of garbage data.
+    if (lookup_type == 5 or lookup_type == 6) {
+        const sub_fmt = readU16BE(tbl, subtable_abs) orelse return;
+        if (sub_fmt == 3) {
+            // Format 3: parse input coverage correctly.
+            if (lookup_type == 6) {
+                // ChainingContext format 3: skip backtrack array to find input coverage.
+                // Layout: substFormat(2) + backtrackCount(2) + backtrackCov[N](2*N)
+                //       + inputCount(2) + inputCov[M](2*M) + ...
+                const bt_count = readU16BE(tbl, subtable_abs + 2) orelse return;
+                const input_count_off = subtable_abs + 4 + @as(usize, bt_count) * 2;
+                const input_count = readU16BE(tbl, input_count_off) orelse return;
+                if (input_count == 0) return;
+                // First input coverage offset (relative to subtable start)
+                const cov_off_rel = readU16BE(tbl, input_count_off + 2) orelse return;
+                const cov_abs = subtable_abs + @as(usize, cov_off_rel);
+                if (cov_abs >= tbl.len) return;
+                collectCoverageGlyphs(tbl, cov_abs, ascii_gids, out_triggers);
+            } else {
+                // Context format 3: glyphCount(2) + coverage offsets.
+                // Layout: substFormat(2) + glyphCount(2) + coverageOff[G](2*G) + ...
+                const glyph_count = readU16BE(tbl, subtable_abs + 2) orelse return;
+                if (glyph_count == 0) return;
+                // First coverage offset (relative to subtable start)
+                const cov_off_rel = readU16BE(tbl, subtable_abs + 4) orelse return;
+                const cov_abs = subtable_abs + @as(usize, cov_off_rel);
+                if (cov_abs >= tbl.len) return;
+                collectCoverageGlyphs(tbl, cov_abs, ascii_gids, out_triggers);
+            }
+            return;
+        }
+        // Format 1,2: Coverage at offset 2, fall through to common path.
+    }
+    const cov_off_rel = readU16BE(tbl, subtable_abs + 2) orelse return;
+    const cov_abs = subtable_abs + cov_off_rel;
+    if (cov_abs >= tbl.len) return;
+    collectCoverageGlyphs(tbl, cov_abs, ascii_gids, out_triggers);
+}
+
+/// Detect ligature trigger characters by introspecting the font's GSUB table.
+/// Matches macOS behavior (HarfBuzz `hb_ot_layout_collect_lookups` + `hb_ot_layout_lookup_collect_glyphs`).
+///
+/// `face`: the IDWriteFontFace to query
+/// `ascii_gids`: 128-entry table of codepoint→glyph ID (from GetGlyphIndicesW)
+/// `user_features`/`user_feature_count`: user-specified font features (DWrite format, little-endian tags)
+/// `out_triggers`: 128-entry output, set to 1 for ASCII chars that participate in active GSUB substitutions
+fn detectLigTriggersFromGSUB(
+    face: *c.IDWriteFontFace,
+    ascii_gids: []const c.UINT16,
+    user_features: []const DWriteFontFeature,
+    user_feature_count: u32,
+    out_triggers: [*]u8,
+) void {
+    const fvtbl = face.lpVtbl.*;
+
+    // Get raw GSUB table
+    // DWrite TryGetFontTable uses DWRITE_MAKE_OPENTYPE_TAG byte order (little-endian on x86).
+    // packTag("GSUB") = 'G' | ('S'<<8) | ('U'<<16) | ('B'<<24) = 0x42555347.
+    const gsub_tag: u32 = packTag("GSUB");
+    var table_data: ?*const anyopaque = null;
+    var table_size: c.UINT32 = 0;
+    var table_ctx: ?*anyopaque = null;
+    var exists: c.BOOL = c.FALSE;
+
+    applog.appLog("[gsub] TryGetFontTable calling\n", .{});
+    const try_fn = fvtbl.TryGetFontTable orelse return;
+    const hr = try_fn(face, gsub_tag, &table_data, &table_size, &table_ctx, &exists);
+    applog.appLog("[gsub] TryGetFontTable returned hr=0x{x} exists={d} size={d}\n", .{ @as(u32, @bitCast(hr)), @as(u32, @intFromBool(exists != c.FALSE)), table_size });
+    if (c.FAILED(hr) or exists == c.FALSE or table_data == null or table_size < 10) {
+        // Release context if obtained
+        if (table_ctx != null) {
+            if (fvtbl.ReleaseFontTable) |rel_fn| rel_fn(face, table_ctx);
+        }
+        return;
+    }
+
+    defer {
+        if (table_ctx != null) {
+            if (fvtbl.ReleaseFontTable) |rel_fn| rel_fn(face, table_ctx);
+        }
+    }
+
+    const tbl: []const u8 = @as([*]const u8, @ptrCast(table_data.?))[0..table_size];
+
+    // GSUB header: majorVersion(2) + minorVersion(2) + scriptListOffset(2) + featureListOffset(2) + lookupListOffset(2)
+    // Offsets: 0=majorVer, 2=minorVer, 4=scriptList, 6=featureList, 8=lookupList
+    const feature_list_off = readU16BE(tbl, 6) orelse return;
+    const lookup_list_off = readU16BE(tbl, 8) orelse return;
+
+    // FeatureList: featureCount(2) + featureRecords[featureCount] each = tag(4) + offset(2)
+    const fl_abs = @as(usize, feature_list_off);
+    const feature_count = readU16BE(tbl, fl_abs) orelse return;
+
+    // Determine which features are active.
+    // Default-on features: liga, calt, rlig (matching macOS HBFTBridge.c behavior)
+    // Default-off features: clig, dlig, ss01-ss20, cv01-cv99, etc.
+    // User features can override defaults (enable or disable).
+    const ot_liga: u32 = 0x6C696761; // 'liga' big-endian
+    const ot_calt: u32 = 0x63616C74; // 'calt' big-endian
+    const ot_rlig: u32 = 0x726C6967; // 'rlig' big-endian
+    // Collect lookup indices from active features
+    // We use a bitset for lookup indices (max 65536 lookups, but typically <500)
+    // Use a fixed-size array as a simple bitset (supports up to 4096 lookups)
+    const MAX_LOOKUPS = 4096;
+    var lookup_active = std.mem.zeroes([MAX_LOOKUPS / 8]u8);
+
+    for (0..feature_count) |fi| {
+        const rec_off = fl_abs + 2 + fi * 6;
+        const tag_be = readU32BE(tbl, rec_off) orelse continue;
+        const feat_off_rel = readU16BE(tbl, rec_off + 4) orelse continue;
+
+        // Determine if this feature is active
+        var active = false;
+
+        // Check default-on features
+        if (tag_be == ot_liga or tag_be == ot_calt or tag_be == ot_rlig) {
+            active = true; // default on
+        }
+
+        // Check user overrides: DWrite tags are little-endian, GSUB tags are big-endian
+        for (0..user_feature_count) |ui| {
+            const user_tag_le = user_features[ui].nameTag;
+            // Convert LE→BE for comparison: swap bytes
+            const user_tag_be = @byteSwap(user_tag_le);
+            if (user_tag_be == tag_be) {
+                active = (user_features[ui].parameter != 0);
+                break;
+            }
+        }
+
+        if (!active) continue;
+
+        // Read Feature table: featureParams(2) + lookupCount(2) + lookupListIndices[lookupCount]
+        const feat_abs = fl_abs + @as(usize, feat_off_rel);
+        // Skip featureParams (2 bytes)
+        const lk_count = readU16BE(tbl, feat_abs + 2) orelse continue;
+
+        for (0..lk_count) |li| {
+            const lk_idx = readU16BE(tbl, feat_abs + 4 + li * 2) orelse continue;
+            if (lk_idx < MAX_LOOKUPS) {
+                lookup_active[lk_idx / 8] |= @as(u8, 1) << @intCast(lk_idx % 8);
+            }
+        }
+    }
+
+    // LookupList: lookupCount(2) + lookupOffsets[lookupCount] (each u16)
+    const ll_abs = @as(usize, lookup_list_off);
+    const lookup_count = readU16BE(tbl, ll_abs) orelse return;
+
+    // Count active lookups for logging
+    var active_count: u32 = 0;
+    for (0..@min(lookup_count, MAX_LOOKUPS)) |li| {
+        if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) != 0) active_count += 1;
+    }
+    applog.appLog("[gsub] feature_count={d} lookup_count={d} active_lookups={d} tbl_size={d}\n", .{ feature_count, lookup_count, active_count, table_size });
+
+    for (0..lookup_count) |li| {
+        if (li >= MAX_LOOKUPS) break;
+        // Check if this lookup is in our active set
+        if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) == 0) continue;
+
+        const lk_off_rel = readU16BE(tbl, ll_abs + 2 + li * 2) orelse continue;
+        const lk_abs = ll_abs + @as(usize, lk_off_rel);
+
+        // Lookup table: lookupType(2) + lookupFlag(2) + subTableCount(2) + subtableOffsets[]
+        const lk_type = readU16BE(tbl, lk_abs) orelse continue;
+        // Skip lookupFlag(2)
+        const sub_count = readU16BE(tbl, lk_abs + 4) orelse continue;
+
+        for (0..sub_count) |si| {
+            const sub_off_rel = readU16BE(tbl, lk_abs + 6 + si * 2) orelse continue;
+            const sub_abs = lk_abs + @as(usize, sub_off_rel);
+            processSubtable(tbl, sub_abs, lk_type, ascii_gids, out_triggers, 0);
+        }
+    }
+    applog.appLog("[gsub] parsing complete\n", .{});
 }
 
 fn encodeUtf16Scalar(scalar: u32, out: *[2]u16) usize {

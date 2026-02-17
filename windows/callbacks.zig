@@ -1137,6 +1137,97 @@ pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) 
 }
 
 // =========================================================================
+// Text-run shaping callbacks (ligature + ASCII fast path support)
+// =========================================================================
+
+pub fn onShapeTextRun(
+    ctx: ?*anyopaque,
+    scalars: [*]const u32,
+    scalar_count: usize,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_clusters: [*]u32,
+    out_x_advance: [*]i32,
+    out_x_offset: [*]i32,
+    out_y_offset: [*]i32,
+    out_cap: usize,
+) callconv(.c) usize {
+    const ctxp = ctx orelse return 0;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return 0;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        return a.shapeTextRunDWrite(
+            scalars,
+            scalar_count,
+            style_flags,
+            out_glyph_ids,
+            out_clusters,
+            out_x_advance,
+            out_x_offset,
+            out_y_offset,
+            out_cap,
+        );
+    }
+    return 0;
+}
+
+pub fn onRasterizeGlyphById(
+    ctx: ?*anyopaque,
+    glyph_id: u32,
+    style_flags: u32,
+    out_bitmap: *app_mod.GlyphBitmap,
+) callconv(.c) c_int {
+    const ctxp = ctx orelse return 0;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return 0;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        a.rasterizeGlyphByIdDWrite(glyph_id, style_flags, out_bitmap) catch return 0;
+        return 1;
+    }
+    return 0;
+}
+
+pub fn onGetAsciiTable(
+    ctx: ?*anyopaque,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_x_advances: [*]i32,
+    out_lig_triggers: [*]u8,
+) callconv(.c) c_int {
+    const ctxp = ctx orelse return 0;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return 0;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    var atlas_ptr: ?*dwrite_d2d.Renderer = null;
+    {
+        app.mu.lock();
+        if (app.atlas) |*a| atlas_ptr = a;
+        app.mu.unlock();
+    }
+    if (atlas_ptr) |a| {
+        return if (a.getAsciiTableDWrite(style_flags, out_glyph_ids, out_x_advances, out_lig_triggers)) 1 else 0;
+    }
+    return 0;
+}
+
+// =========================================================================
 // Logging callback
 // =========================================================================
 
