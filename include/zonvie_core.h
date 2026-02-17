@@ -103,6 +103,18 @@ typedef int (*zonvie_rasterize_glyph_by_id_fn)(
     zonvie_glyph_bitmap* out_bitmap
 );
 
+/* ASCII fast path: retrieve pre-computed shaping tables for a style variant.
+   Frontend fills out_glyph_ids[128], out_x_advances[128], out_lig_triggers[128]
+   from its HarfBuzz font handle for the given style.
+   Returns 1 on success, 0 on failure. Called lazily by core after font change. */
+typedef int (*zonvie_get_ascii_table_fn)(
+    void* ctx,
+    uint32_t style_flags,
+    uint32_t* out_glyph_ids,    /* [128] codepoint -> glyph_id */
+    int32_t* out_x_advances,    /* [128] codepoint -> x_advance (26.6 fixed-point) */
+    uint8_t* out_lig_triggers   /* [128] 1=participates in GSUB substitution */
+);
+
 /* Styled glyph lookup (preferred when present) */
 typedef int (*zonvie_atlas_ensure_glyph_styled_fn)(
     void* ctx,
@@ -709,6 +721,9 @@ typedef struct zonvie_callbacks {
 
     /* Glyph-ID rasterize callback (NULL = per-cell fallback). */
     zonvie_rasterize_glyph_by_id_fn on_rasterize_glyph_by_id;
+
+    /* ASCII fast path table callback (NULL = no fast path, always use shaping). */
+    zonvie_get_ascii_table_fn on_get_ascii_table;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1067,6 +1082,7 @@ typedef struct zonvie_config_values {
     int32_t perf_glyph_cache_ascii;
     int32_t perf_glyph_cache_non_ascii;
     int32_t perf_hl_cache_size;
+    int32_t perf_shape_cache_size;
     // ime
     bool ime_disable_on_activate;
     bool ime_disable_on_modechange;

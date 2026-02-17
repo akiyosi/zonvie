@@ -111,6 +111,10 @@ struct ZonvieConfig {
         /// Highlight attribute cache size for flush vertex generation
         /// Default: 512, Range: 64-2048
         var hlCacheSize: Int = 512
+
+        /// Shape cache size for HarfBuzz text-run shaping results (2-way set associative)
+        /// Default: 4096, Range: 512-65536
+        var shapeCacheSize: Int = 4096
     }
 
     struct IMEConfig {
@@ -196,6 +200,7 @@ struct ZonvieConfig {
         config.performance.glyphCacheAsciiSize = Int(v.perf_glyph_cache_ascii)
         config.performance.glyphCacheNonAsciiSize = Int(v.perf_glyph_cache_non_ascii)
         config.performance.hlCacheSize = Int(v.perf_hl_cache_size)
+        config.performance.shapeCacheSize = Int(v.perf_shape_cache_size)
 
         // IME
         config.ime.disableOnActivate = v.ime_disable_on_activate

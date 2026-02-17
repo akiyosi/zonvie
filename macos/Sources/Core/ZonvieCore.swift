@@ -574,6 +574,17 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
                 return atlas.rasterizeByGlyphID(glyphID: glyphID, styleFlags: styleFlags, outBitmap: outBitmap!) ? 1 : 0
+            },
+
+            on_get_ascii_table: { ctx, styleFlags, outGlyphIDs, outXAdvances, outLigTriggers in
+                guard let ctx else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                return atlas.getAsciiTable(
+                    styleFlags: styleFlags,
+                    outGlyphIDs: outGlyphIDs!, outXAdvances: outXAdvances!,
+                    outLigTriggers: outLigTriggers!
+                )
             }
         )
 

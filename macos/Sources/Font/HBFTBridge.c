@@ -8,6 +8,7 @@
 
 #include </opt/homebrew/include/harfbuzz/hb.h>
 #include </opt/homebrew/include/harfbuzz/hb-ft.h>
+#include </opt/homebrew/include/harfbuzz/hb-ot.h>
 
 struct zonvie_ft_hb_font {
   FT_Library ft_lib;
@@ -23,8 +24,89 @@ struct zonvie_ft_hb_font {
   hb_feature_t features[ZONVIE_MAX_FONT_FEATURES];
   size_t feature_count;
 
+  // ASCII fast path tables (built at create + set_features time).
+  // Uses hb_font_get_glyph_h_advance() for individual codepoints, so GPOS
+  // pair-kerning is intentionally not reflected. This is correct for monospace
+  // fonts (all advances uniform) which is the expected terminal use case.
+  uint32_t ascii_glyph_ids[128];    // codepoint -> glyph ID (0 = unmapped)
+  int32_t  ascii_x_advances[128];   // codepoint -> x_advance in 26.6 fixed-point
+  uint8_t  ascii_lig_triggers[128]; // 1 = codepoint participates in active GSUB substitutions
+  int      ascii_tables_valid;      // 1 if tables are populated
+
   // Last rendered glyph bitmap is owned by FreeType (ft_face->glyph->bitmap).
 };
+
+// Build ASCII glyph tables and ligature trigger bitset from GSUB introspection.
+// Called at font creation time and when features change.
+static void build_ascii_tables(zonvie_ft_hb_font* f) {
+  if (!f || !f->hb_font) return;
+
+  // 1) Build glyph_id + x_advance tables for ASCII 0-127
+  memset(f->ascii_glyph_ids, 0, sizeof(f->ascii_glyph_ids));
+  memset(f->ascii_x_advances, 0, sizeof(f->ascii_x_advances));
+  memset(f->ascii_lig_triggers, 0, sizeof(f->ascii_lig_triggers));
+
+  for (uint32_t cp = 0; cp < 128; cp++) {
+    hb_codepoint_t gid = 0;
+    if (hb_font_get_glyph(f->hb_font, cp, 0, &gid)) {
+      f->ascii_glyph_ids[cp] = gid;
+      f->ascii_x_advances[cp] = hb_font_get_glyph_h_advance(f->hb_font, gid);
+    }
+  }
+
+  // 2) Build ligature trigger bitset from GSUB table
+  hb_face_t* face = hb_font_get_face(f->hb_font);
+  if (!face) { f->ascii_tables_valid = 1; return; }
+
+  // Feature tags that can produce ligature/contextual substitutions
+  const hb_tag_t lig_features[] = {
+    HB_TAG('l','i','g','a'),  // Standard ligatures (default on)
+    HB_TAG('c','a','l','t'),  // Contextual alternates (default on)
+    HB_TAG('r','l','i','g'),  // Required ligatures (always on)
+    HB_TAG('c','l','i','g'),  // Contextual ligatures (default off)
+    HB_TAG('d','l','i','g'),  // Discretionary ligatures (default off)
+  };
+  const int num_features = 5;
+  // Default activation: liga=on, calt=on, rlig=on, clig=off, dlig=off
+  int feature_active[] = { 1, 1, 1, 0, 0 };
+
+  // Override defaults based on user-set features
+  for (size_t fi = 0; fi < f->feature_count; fi++) {
+    for (int li = 0; li < num_features; li++) {
+      if (f->features[fi].tag == lig_features[li]) {
+        feature_active[li] = (f->features[fi].value != 0) ? 1 : 0;
+      }
+    }
+  }
+
+  // Collect GSUB lookup indices for all active ligature features
+  hb_set_t* lookups = hb_set_create();
+  for (int li = 0; li < num_features; li++) {
+    if (!feature_active[li]) continue;
+    const hb_tag_t tags[] = { lig_features[li], HB_TAG_NONE };
+    hb_ot_layout_collect_lookups(face, HB_OT_TAG_GSUB, NULL, NULL, tags, lookups);
+  }
+
+  // For each lookup, collect input glyphs and map back to ASCII codepoints
+  hb_set_t* input_glyphs = hb_set_create();
+  hb_codepoint_t lookup_idx = HB_SET_VALUE_INVALID;
+  while (hb_set_next(lookups, &lookup_idx)) {
+    hb_set_clear(input_glyphs);
+    hb_ot_layout_lookup_collect_glyphs(face, HB_OT_TAG_GSUB, lookup_idx,
+        NULL, input_glyphs, NULL, NULL);
+
+    for (uint32_t cp = 0x20; cp <= 0x7E; cp++) {
+      if (f->ascii_glyph_ids[cp] != 0 &&
+          hb_set_has(input_glyphs, f->ascii_glyph_ids[cp])) {
+        f->ascii_lig_triggers[cp] = 1;
+      }
+    }
+  }
+
+  hb_set_destroy(input_glyphs);
+  hb_set_destroy(lookups);
+  f->ascii_tables_valid = 1;
+}
 
 zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index) {
   if (!font_bytes || font_len == 0 || pixel_size == 0) return NULL;
@@ -61,6 +143,8 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
   f->hb_buf = hb_buffer_create();
   if (!f->hb_buf) goto fail;
 
+  build_ascii_tables(f);
+
   return f;
 
 fail:
@@ -79,6 +163,7 @@ void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feat
     f->features[i].start = 0;
     f->features[i].end = (unsigned int)-1;
   }
+  build_ascii_tables(f);
 }
 
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {
@@ -177,5 +262,23 @@ int zonvie_ft_render_glyph(
   if (out_advance_x_26_6) *out_advance_x_26_6 = (int32_t)g->advance.x;
 
   return 0;
+}
+
+int zonvie_ft_hb_get_ascii_glyph_ids(zonvie_ft_hb_font* f, uint32_t* out_glyph_ids) {
+  if (!f || !f->ascii_tables_valid || !out_glyph_ids) return 0;
+  memcpy(out_glyph_ids, f->ascii_glyph_ids, sizeof(f->ascii_glyph_ids));
+  return 1;
+}
+
+int zonvie_ft_hb_get_ascii_x_advances(zonvie_ft_hb_font* f, int32_t* out_x_advances) {
+  if (!f || !f->ascii_tables_valid || !out_x_advances) return 0;
+  memcpy(out_x_advances, f->ascii_x_advances, sizeof(f->ascii_x_advances));
+  return 1;
+}
+
+int zonvie_ft_hb_get_ascii_lig_triggers(zonvie_ft_hb_font* f, uint8_t* out_lig_triggers) {
+  if (!f || !f->ascii_tables_valid || !out_lig_triggers) return 0;
+  memcpy(out_lig_triggers, f->ascii_lig_triggers, sizeof(f->ascii_lig_triggers));
+  return 1;
 }
 

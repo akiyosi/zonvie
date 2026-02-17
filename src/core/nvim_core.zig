@@ -256,6 +256,9 @@ pub const Callbacks = struct {
     // Phase B: Text-run shaping (ligatures)
     on_shape_text_run: ?c_api.ShapeTextRunFn = null,
     on_rasterize_glyph_by_id: ?c_api.RasterizeGlyphByIdFn = null,
+
+    // ASCII fast path table callback
+    on_get_ascii_table: ?c_api.GetAsciiTableFn = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -276,6 +279,63 @@ const RenderCells = flush.RenderCells;
 const packStyleFlags = flush.packStyleFlags;
 const MsgCachedLine = flush.MsgCachedLine;
 pub const FlushCache = flush.FlushCache;
+
+// Phase B: Shaping result cache (4-way set associative)
+pub const SHAPE_CACHE_WAYS: usize = 4;
+pub const SHAPE_CACHE_MAX_GLYPHS: usize = 64;
+
+/// Round up to next power of 2 (for hash masking).
+pub fn nextPow2(n: u32) u32 {
+    if (n <= 1) return 1;
+    var v: u32 = n - 1;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v +% 1;
+}
+
+pub const ShapeCacheEntry = struct {
+    key_hash: u64 = 0, // Primary hash (0 = empty)
+    key_hash2: u64 = 0, // Secondary hash (different seed)
+    font_gen: u64 = 0, // Font generation at time of caching
+    scalar_count: u32 = 0,
+    glyph_count: u32 = 0,
+    glyph_ids: [SHAPE_CACHE_MAX_GLYPHS]u32 = undefined,
+    clusters: [SHAPE_CACHE_MAX_GLYPHS]u32 = undefined,
+    x_adv: [SHAPE_CACHE_MAX_GLYPHS]i32 = undefined,
+    x_off: [SHAPE_CACHE_MAX_GLYPHS]i32 = undefined,
+    y_off: [SHAPE_CACHE_MAX_GLYPHS]i32 = undefined,
+};
+
+/// Primary hash (FNV-1a, offset basis 0xcbf29ce484222325)
+pub fn shapeCacheHash(scalars: []const u32, style_flags: u32) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const prime: u64 = 0x100000001b3;
+    h ^= @as(u64, style_flags);
+    h *%= prime;
+    for (scalars) |s| {
+        h ^= @as(u64, s & 0xFFFF);
+        h *%= prime;
+        h ^= @as(u64, s >> 16);
+        h *%= prime;
+    }
+    return if (h == 0) 1 else h;
+}
+
+/// Secondary hash (FNV-1a, different offset basis)
+pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
+    var h: u64 = 0x9e3779b97f4a7c15;
+    const prime: u64 = 0x100000001b3;
+    h ^= @as(u64, style_flags);
+    h *%= prime;
+    for (scalars) |s| {
+        h ^= @as(u64, s);
+        h *%= prime;
+    }
+    return if (h == 0) 1 else h;
+}
 
 pub const Core = struct {
     alloc: std.mem.Allocator,
@@ -428,6 +488,18 @@ pub const Core = struct {
     shaping_scalars: std.ArrayListUnmanaged(u32) = .{},
     shaping_col_widths: std.ArrayListUnmanaged(u32) = .{},
 
+    // Phase B: Shaping result cache (4-way set associative, keyed by text content + style)
+    shape_cache_size: u32 = 4096, // total entries (configurable via [performance] in config.toml)
+    shape_cache_sets: u32 = 2048, // number of sets (power of 2, computed from shape_cache_size)
+    shape_cache: ?[]ShapeCacheEntry = null,
+    font_generation: u64 = 0,
+
+    // ASCII fast path tables (4 style variants × 128 codepoints, no heap alloc)
+    ascii_glyph_ids: [4][128]u32 = .{.{0} ** 128} ** 4,
+    ascii_x_advances: [4][128]i32 = .{.{0} ** 128} ** 4,
+    ascii_lig_triggers: [4][128]u8 = .{.{0} ** 128} ** 4,
+    ascii_tables_valid: bool = false,
+
     // Phase 2: Core-managed atlas
     atlas_packer: ?shelf_packer.ShelfPacker = null,
     atlas_w: u32 = 2048,
@@ -565,6 +637,11 @@ pub const Core = struct {
             self.alloc.free(buf);
             self.glyph_keys_by_id = null;
         }
+        // Phase B: shaping result cache
+        if (self.shape_cache) |buf| {
+            self.alloc.free(buf);
+            self.shape_cache = null;
+        }
         self.glyph_cache_initialized = false;
     }
 
@@ -591,6 +668,15 @@ pub const Core = struct {
         self.glyph_keys_by_id = try self.alloc.alloc(u64, non_ascii_size);
         @memset(self.glyph_keys_by_id.?, INVALID_KEY);
 
+        // Phase B: shaping result cache (4-way set associative)
+        // Sets count derived from shape_cache_size / 2 (not / WAYS) to maintain
+        // the same number of sets when associativity increases. Total entries =
+        // sets * WAYS, which is 2x the user-configured size for better collision resistance.
+        self.shape_cache_sets = nextPow2(@max(1, self.shape_cache_size >> 1));
+        const shape_total: usize = @as(usize, self.shape_cache_sets) * SHAPE_CACHE_WAYS;
+        self.shape_cache = try self.alloc.alloc(ShapeCacheEntry, shape_total);
+        @memset(self.shape_cache.?, .{});
+
         self.glyph_cache_initialized = true;
     }
 
@@ -609,6 +695,51 @@ pub const Core = struct {
         if (self.glyph_keys_by_id) |buf| {
             const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
             @memset(buf, INVALID_KEY);
+        }
+    }
+
+    /// Reset shaping result cache. Called on guifont/font feature change.
+    /// NOT called on atlas reset (shaping results are atlas-independent).
+    pub fn resetShapeCache(self: *Core) void {
+        self.font_generation +%= 1;
+        if (self.shape_cache) |buf| {
+            @memset(buf, .{});
+        }
+        self.ascii_tables_valid = false;
+    }
+
+    /// Lazily load ASCII fast path tables from the frontend.
+    /// Called once after font change. No-op if callback is not registered.
+    /// Returns true if tables were loaded (or already valid).
+    pub fn loadAsciiTables(self: *Core) bool {
+        if (self.ascii_tables_valid) return true;
+        const cb = self.cb.on_get_ascii_table orelse return false;
+        const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
+        var all_ok = true;
+        for (0..4) |i| {
+            const ok = cb(
+                self.ctx,
+                style_combos[i],
+                &self.ascii_glyph_ids[i],
+                &self.ascii_x_advances[i],
+                &self.ascii_lig_triggers[i],
+            );
+            if (ok == 0) all_ok = false;
+        }
+        self.ascii_tables_valid = all_ok;
+        return all_ok;
+    }
+
+    /// Set shape cache size (triggers reinit on next flush).
+    pub fn setShapeCacheSize(self: *Core, size: u32) void {
+        self.shape_cache_size = @max(512, @min(65536, size));
+        // Free existing cache; will be reallocated in initGlyphCache on next flush
+        if (self.shape_cache) |buf| {
+            self.alloc.free(buf);
+            self.shape_cache = null;
+        }
+        if (self.glyph_cache_initialized) {
+            self.deinitGlyphCache();
         }
     }
 

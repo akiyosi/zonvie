@@ -60,6 +60,12 @@ int zonvie_ft_render_glyph(
     int32_t* out_advance_x_26_6
 );
 
+// ASCII fast path: retrieve pre-computed tables for codepoints 0-127.
+// Returns 1 if tables are valid, 0 if not. Caller provides [128]-element buffers.
+int zonvie_ft_hb_get_ascii_glyph_ids(zonvie_ft_hb_font* f, uint32_t* out_glyph_ids);
+int zonvie_ft_hb_get_ascii_x_advances(zonvie_ft_hb_font* f, int32_t* out_x_advances);
+int zonvie_ft_hb_get_ascii_lig_triggers(zonvie_ft_hb_font* f, uint8_t* out_lig_triggers);
+
 #ifdef __cplusplus
 }
 #endif

@@ -236,6 +236,73 @@ pub inline fn simdHasInkInRange(scalars: []const u32, start: usize, end: usize) 
     return false;
 }
 
+/// SIMD check: are ALL u32 values in [0x20, 0x7E] (printable ASCII)?
+/// Uses unsigned wrapping subtract for single-comparison range check.
+pub inline fn simdAllAsciiPrintable(scalars: []const u32, count: usize) bool {
+    const V = @Vector(4, u32);
+    const lo: V = @splat(@as(u32, 0x20));
+    const range: V = @splat(@as(u32, 0x5E)); // 0x7E - 0x20
+    var i: usize = 0;
+    while (i + 4 <= count) {
+        const chunk: V = scalars[i..][0..4].*;
+        if (!@reduce(.And, chunk -% lo <= range)) return false;
+        i += 4;
+    }
+    while (i < count) : (i += 1) {
+        if (scalars[i] -% 0x20 > 0x5E) return false;
+    }
+    return true;
+}
+
+/// SIMD check: are ALL u32 values non-zero in [start..end)?
+/// Used to detect absence of wide char continuations for bulk copy.
+pub inline fn simdAllNonZero(scalars: []const u32, start: usize, end: usize) bool {
+    const V = @Vector(4, u32);
+    const zeros: V = @splat(@as(u32, 0));
+    var i = start;
+    while (i + 4 <= end) {
+        const chunk: V = scalars[i..][0..4].*;
+        if (@reduce(.Or, chunk == zeros)) return false;
+        i += 4;
+    }
+    while (i < end) : (i += 1) {
+        if (scalars[i] == 0) return false;
+    }
+    return true;
+}
+
+/// SIMD fill with sequential u32 values (0, 1, 2, 3, ...).
+pub inline fn simdFillSequential(out: [*]u32, count: usize) void {
+    const V = @Vector(4, u32);
+    const step: V = @splat(@as(u32, 4));
+    var base: V = .{ 0, 1, 2, 3 };
+    var i: usize = 0;
+    while (i + 4 <= count) {
+        @as(*[4]u32, @ptrCast(out + i)).* = base;
+        base += step;
+        i += 4;
+    }
+    while (i < count) : (i += 1) {
+        out[i] = @intCast(i);
+    }
+}
+
+/// SIMD extract cp fields from Cell array (stride-2 u32 extraction).
+/// Cell = struct { cp: u32, hl: u32 } → extracts every other u32.
+pub inline fn simdExtractCp(cells: [*]const grid_mod.Cell, out: [*]u32, count: usize) void {
+    const raw: [*]const u32 = @ptrCast(cells);
+    var i: usize = 0;
+    while (i + 4 <= count) {
+        const v: @Vector(8, u32) = @as(*const [8]u32, @ptrCast(raw + i * 2)).*;
+        const cps: @Vector(4, u32) = @shuffle(u32, v, undefined, [4]i32{ 0, 2, 4, 6 });
+        @as(*[4]u32, @ptrCast(out + i)).* = cps;
+        i += 4;
+    }
+    while (i < count) : (i += 1) {
+        out[i] = raw[i * 2];
+    }
+}
+
 /// Cached line data for msg_show scrolling optimization.
 pub const MsgCachedLine = struct {
     data: [256]u8 = undefined,
@@ -530,10 +597,23 @@ pub const FlushCtx = struct {
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) !void {
+                    try out.ensureUnusedCapacity(alloc, 6);
+                    pushGlyphQuadAssumeCapacity(out, x0, y0, x1, y1, uv0, uv1, uv2, uv3, col, vw, vh, grid_id, base_deco_flags);
+                }
+
+                /// Same as pushGlyphQuad but caller guarantees capacity.
+                fn pushGlyphQuadAssumeCapacity(
+                    out: *std.ArrayListUnmanaged(c_api.Vertex),
+                    x0: f32, y0: f32, x1: f32, y1: f32,
+                    uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32,
+                    col: [4]f32,
+                    vw: f32, vh: f32,
+                    grid_id: i64,
+                    base_deco_flags: u32,
+                ) void {
                     const pts = ndc4(x0, y0, x1, y1, vw, vh);
                     const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
 
-                    try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
                     v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
@@ -746,6 +826,9 @@ pub const FlushCtx = struct {
                     var perf_glyph_ascii_misses: u32 = 0;
                     var perf_glyph_nonascii_hits: u32 = 0;
                     var perf_glyph_nonascii_misses: u32 = 0;
+                    var perf_shape_cache_hits: u32 = 0;
+                    var perf_shape_cache_misses: u32 = 0;
+                    var perf_ascii_fast_path: u32 = 0;
                     // Glyph cache is persistent across flushes.
                     // It is only reset on font changes (see onGuifont).
                     // NOTE: Do NOT call resetGlyphCacheFlags() here. With Phase 2
@@ -834,9 +917,8 @@ pub const FlushCtx = struct {
                                 @memset(row_cells.grid_ids.items[rs..re], 1);
                                 @memset(row_cells.style_flags_arr.items[rs..re], flags);
                                 // Only scalars (codepoints) differ per cell
-                                for (rs..re) |i| {
-                                    row_cells.scalars.items[i] = grid_cells[row_start + i].cp;
-                                }
+                                // SIMD stride-2 extraction: Cell{cp,hl} → cp only
+                                simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
 
                                 c = run_end;
                             }
@@ -1011,6 +1093,9 @@ pub const FlushCtx = struct {
                         const shape_text_run = ctx.core.cb.on_shape_text_run;
                         const has_shaping = shape_text_run != null and ctx.core.isPhase2Atlas() and ctx.core.cb.on_rasterize_glyph_by_id != null;
                         if (has_shaping or ensure_base != null or ensure_styled != null or ctx.core.isPhase2Atlas()) {
+                            // Pre-allocate vertex capacity for entire row's glyphs
+                            // (worst case: 1 glyph per column × 6 vertices per quad)
+                            try out.ensureUnusedCapacity(ctx.core.alloc, cols * 6);
                             var c: u32 = 0;
                             while (c < cols) {
                                 const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
@@ -1055,17 +1140,23 @@ pub const FlushCtx = struct {
                                             c = end;
                                             continue;
                                         };
-                                        var si: u32 = run_start;
-                                        while (si < end) : (si += 1) {
-                                            const s = row_cells.scalars.items[@intCast(si)];
-                                            if (s == 0) {
-                                                // Wide char continuation: skip (don't add to shaping input)
-                                                continue;
+                                        // SIMD fast path: if no wide chars (no zero scalars), bulk copy
+                                        if (simdAllNonZero(row_cells.scalars.items, @intCast(run_start), @intCast(end))) {
+                                            @memcpy(ctx.core.shaping_scalars.items.ptr[0..run_len], row_cells.scalars.items[@intCast(run_start)..@intCast(end)]);
+                                            ctx.core.shaping_scalars.items.len = run_len;
+                                            @memset(ctx.core.shaping_col_widths.items.ptr[0..run_len], 1);
+                                            ctx.core.shaping_col_widths.items.len = run_len;
+                                        } else {
+                                            var si: u32 = run_start;
+                                            while (si < end) : (si += 1) {
+                                                const s = row_cells.scalars.items[@intCast(si)];
+                                                if (s == 0) {
+                                                    continue;
+                                                }
+                                                ctx.core.shaping_scalars.appendAssumeCapacity(s);
+                                                const col_w: u32 = if (si + 1 < end and row_cells.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
+                                                ctx.core.shaping_col_widths.appendAssumeCapacity(col_w);
                                             }
-                                            ctx.core.shaping_scalars.appendAssumeCapacity(s);
-                                            // Track grid column width: 2 if next cell is continuation, else 1
-                                            const col_w: u32 = if (si + 1 < end and row_cells.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
-                                            ctx.core.shaping_col_widths.appendAssumeCapacity(col_w);
                                         }
 
                                         const scalar_count = ctx.core.shaping_scalars.items.len;
@@ -1074,41 +1165,104 @@ pub const FlushCtx = struct {
                                             continue;
                                         }
 
-                                        // 2) Call shape callback
+                                        // 2) ASCII fast path: skip HarfBuzz for runs with only
+                                        //    printable ASCII characters. Single-char runs always
+                                        //    use fast path (ligatures need ≥2 chars, calt needs
+                                        //    context). Multi-char runs skip triggers.
+                                        //    Note: uses per-codepoint advances (no GPOS pair kerning),
+                                        //    which is correct for monospace terminal fonts.
                                         const bufs = &ctx.core.shaping_bufs;
-                                        bufs.ensureCapacity(ctx.core.alloc, scalar_count) catch {
-                                            c = end;
-                                            continue;
-                                        };
-                                        bufs.setLen(scalar_count); // set capacity for output
+                                        var final_glyph_count: usize = 0;
+                                        var used_ascii_fast_path = false;
 
-                                        const glyph_count = shape_text_run.?(
-                                            ctx.core.ctx,
-                                            ctx.core.shaping_scalars.items.ptr,
-                                            scalar_count,
-                                            c_style,
-                                            bufs.glyph_ids.items.ptr,
-                                            bufs.clusters.items.ptr,
-                                            bufs.x_adv.items.ptr,
-                                            bufs.x_off.items.ptr,
-                                            bufs.y_off.items.ptr,
-                                            scalar_count,
-                                        );
-
-                                        if (glyph_count == 0) {
-                                            c = end;
-                                            continue;
+                                        if (ctx.core.loadAsciiTables()) {
+                                            const is_ascii_safe = ascii_chk: {
+                                                const scalars = ctx.core.shaping_scalars.items[0..scalar_count];
+                                                // SIMD range check: all in [0x20, 0x7E]
+                                                if (!simdAllAsciiPrintable(scalars, scalar_count)) break :ascii_chk false;
+                                                // Single-char runs: always safe (no context for calt/liga)
+                                                if (scalar_count == 1) break :ascii_chk true;
+                                                // Multi-char: check ligature triggers
+                                                const trigs = &ctx.core.ascii_lig_triggers[style_index];
+                                                for (scalars) |s| {
+                                                    if (trigs[@intCast(s)] != 0) break :ascii_chk false;
+                                                }
+                                                break :ascii_chk true;
+                                            };
+                                            if (is_ascii_safe) {
+                                                bufs.ensureCapacity(ctx.core.alloc, scalar_count) catch {
+                                                    c = end;
+                                                    continue;
+                                                };
+                                                bufs.setLen(scalar_count);
+                                                const gids = &ctx.core.ascii_glyph_ids[style_index];
+                                                const xadvs = &ctx.core.ascii_x_advances[style_index];
+                                                // Batch zero-fill x_off and y_off (compiles to SIMD memset)
+                                                @memset(bufs.x_off.items[0..scalar_count], 0);
+                                                @memset(bufs.y_off.items[0..scalar_count], 0);
+                                                // Sequential cluster fill (SIMD 4-wide)
+                                                simdFillSequential(bufs.clusters.items.ptr, scalar_count);
+                                                // Table lookups (gather - must be scalar)
+                                                for (0..scalar_count) |i| {
+                                                    const s: usize = @intCast(ctx.core.shaping_scalars.items[i]);
+                                                    bufs.glyph_ids.items[i] = gids[s];
+                                                    bufs.x_adv.items[i] = xadvs[s];
+                                                }
+                                                final_glyph_count = scalar_count;
+                                                used_ascii_fast_path = true;
+                                                perf_ascii_fast_path += 1;
+                                            }
                                         }
 
-                                        // If glyph_count > capacity, grow and retry
-                                        var final_glyph_count = glyph_count;
-                                        if (glyph_count > scalar_count) {
-                                            bufs.ensureCapacity(ctx.core.alloc, glyph_count) catch {
+                                        if (!used_ascii_fast_path) {
+                                        // Shape cache lookup / callback
+                                        const sc_hash1 = nvim_core.shapeCacheHash(ctx.core.shaping_scalars.items[0..scalar_count], c_style);
+                                        const sc_hash2 = nvim_core.shapeCacheHash2(ctx.core.shaping_scalars.items[0..scalar_count], c_style);
+                                        const sc_set_base = (sc_hash1 & (@as(u64, ctx.core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
+                                        const sc_font_gen = ctx.core.font_generation;
+
+                                        var sc_cache_hit = false;
+
+                                        // Check both ways of the set
+                                        if (ctx.core.shape_cache) |sc_cache| {
+                                            for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                                                const sc_entry = &sc_cache[sc_set_base + sc_way];
+                                                if (sc_entry.key_hash == sc_hash1 and
+                                                    sc_entry.key_hash2 == sc_hash2 and
+                                                    sc_entry.font_gen == sc_font_gen and
+                                                    sc_entry.scalar_count == @as(u32, @intCast(scalar_count)) and
+                                                    sc_entry.glyph_count > 0 and
+                                                    sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
+                                                {
+                                                    // Cache hit
+                                                    final_glyph_count = sc_entry.glyph_count;
+                                                    bufs.ensureCapacity(ctx.core.alloc, final_glyph_count) catch {
+                                                        c = end;
+                                                        continue;
+                                                    };
+                                                    bufs.setLen(final_glyph_count);
+                                                    @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
+                                                    @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
+                                                    @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
+                                                    @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
+                                                    @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
+                                                    sc_cache_hit = true;
+                                                    perf_shape_cache_hits += 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if (!sc_cache_hit) {
+                                            // Cache miss: call shape callback
+                                            perf_shape_cache_misses += 1;
+                                            bufs.ensureCapacity(ctx.core.alloc, scalar_count) catch {
                                                 c = end;
                                                 continue;
                                             };
-                                            bufs.setLen(glyph_count);
-                                            final_glyph_count = shape_text_run.?(
+                                            bufs.setLen(scalar_count);
+
+                                            const glyph_count = shape_text_run.?(
                                                 ctx.core.ctx,
                                                 ctx.core.shaping_scalars.items.ptr,
                                                 scalar_count,
@@ -1118,15 +1272,76 @@ pub const FlushCtx = struct {
                                                 bufs.x_adv.items.ptr,
                                                 bufs.x_off.items.ptr,
                                                 bufs.y_off.items.ptr,
-                                                glyph_count,
+                                                scalar_count,
                                             );
-                                            if (final_glyph_count == 0) {
+
+                                            if (glyph_count == 0) {
                                                 c = end;
                                                 continue;
                                             }
+
+                                            final_glyph_count = glyph_count;
+                                            if (glyph_count > scalar_count) {
+                                                bufs.ensureCapacity(ctx.core.alloc, glyph_count) catch {
+                                                    c = end;
+                                                    continue;
+                                                };
+                                                bufs.setLen(glyph_count);
+                                                final_glyph_count = shape_text_run.?(
+                                                    ctx.core.ctx,
+                                                    ctx.core.shaping_scalars.items.ptr,
+                                                    scalar_count,
+                                                    c_style,
+                                                    bufs.glyph_ids.items.ptr,
+                                                    bufs.clusters.items.ptr,
+                                                    bufs.x_adv.items.ptr,
+                                                    bufs.x_off.items.ptr,
+                                                    bufs.y_off.items.ptr,
+                                                    glyph_count,
+                                                );
+                                                if (final_glyph_count == 0) {
+                                                    c = end;
+                                                    continue;
+                                                }
+                                            }
+
+                                            // Store in cache if result fits
+                                            if (final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
+                                                if (ctx.core.shape_cache) |sc_cache| {
+                                                    // Prefer empty slot, else overwrite way 0
+                                                    var sc_store_way: usize = 0;
+                                                    for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                                                        if (sc_cache[sc_set_base + sc_way].key_hash == 0) {
+                                                            sc_store_way = sc_way;
+                                                            break;
+                                                        }
+                                                    }
+                                                    const sc_store = &sc_cache[sc_set_base + sc_store_way];
+                                                    sc_store.key_hash = sc_hash1;
+                                                    sc_store.key_hash2 = sc_hash2;
+                                                    sc_store.font_gen = sc_font_gen;
+                                                    sc_store.scalar_count = @intCast(scalar_count);
+                                                    sc_store.glyph_count = @intCast(final_glyph_count);
+                                                    @memcpy(sc_store.glyph_ids[0..final_glyph_count], bufs.glyph_ids.items[0..final_glyph_count]);
+                                                    @memcpy(sc_store.clusters[0..final_glyph_count], bufs.clusters.items[0..final_glyph_count]);
+                                                    @memcpy(sc_store.x_adv[0..final_glyph_count], bufs.x_adv.items[0..final_glyph_count]);
+                                                    @memcpy(sc_store.x_off[0..final_glyph_count], bufs.x_off.items[0..final_glyph_count]);
+                                                    @memcpy(sc_store.y_off[0..final_glyph_count], bufs.y_off.items[0..final_glyph_count]);
+                                                }
+                                            }
                                         }
+                                        } // end !used_ascii_fast_path
 
                                         // 3) Iterate shaped glyphs
+                                        // Ensure capacity for this run's glyphs. The per-row cols*6
+                                        // pre-allocation covers typical cases, but shaping expansion
+                                        // (glyph_count > scalar_count) or .notdef fallback can exceed it.
+                                        // Worst case: non-.notdef → 1 quad/glyph (final_glyph_count),
+                                        // .notdef → 1 quad/scalar in cluster (up to scalar_count total).
+                                        out.ensureUnusedCapacity(ctx.core.alloc, (final_glyph_count + scalar_count) * 6) catch {
+                                            c = end;
+                                            continue;
+                                        };
                                         var penX: f32 = baseX;
                                         const glyph_cache_id = ctx.core.glyph_cache_by_id;
                                         const glyph_keys_id = ctx.core.glyph_keys_by_id;
@@ -1161,12 +1376,21 @@ pub const FlushCtx = struct {
                                                             const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
                                                             const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
 
-                                                            try Helpers.pushGlyphQuad(out, ctx.core.alloc, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                            Helpers.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
                                                         }
                                                     }
                                                     penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
                                                 }
                                                 continue;
+                                            }
+
+                                            // Skip space glyphs: no bitmap, just advance pen
+                                            if (next_cluster == this_cluster + 1) {
+                                                const sp_scalar = ctx.core.shaping_scalars.items[@intCast(this_cluster)];
+                                                if (sp_scalar == 0x20) {
+                                                    penX += @as(f32, @floatFromInt(ctx.core.shaping_col_widths.items[@intCast(this_cluster)])) * cellW;
+                                                    continue;
+                                                }
                                             }
 
                                             // Glyph-ID cache lookup
@@ -1212,16 +1436,22 @@ pub const FlushCtx = struct {
                                                 const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
                                                 const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
-                                                try Helpers.pushGlyphQuad(out, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
                                             }
 
                                             // Advance pen using column widths (correct for wide chars)
                                             {
-                                                var cluster_cols: u32 = 0;
-                                                var cwi: u32 = this_cluster;
-                                                while (cwi < next_cluster) : (cwi += 1) {
-                                                    cluster_cols += ctx.core.shaping_col_widths.items[@intCast(cwi)];
-                                                }
+                                                const cl_span = next_cluster - this_cluster;
+                                                const cluster_cols: u32 = if (cl_span == 1)
+                                                    ctx.core.shaping_col_widths.items[@intCast(this_cluster)]
+                                                else blk: {
+                                                    var sum: u32 = 0;
+                                                    var cwi: u32 = this_cluster;
+                                                    while (cwi < next_cluster) : (cwi += 1) {
+                                                        sum += ctx.core.shaping_col_widths.items[@intCast(cwi)];
+                                                    }
+                                                    break :blk sum;
+                                                };
                                                 penX += @as(f32, @floatFromInt(cluster_cols)) * cellW;
                                             }
                                         }
@@ -1358,7 +1588,7 @@ pub const FlushCtx = struct {
                                         const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            try Helpers.pushGlyphQuad(out, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                            Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
                                         }
 
                                         penX += cellW;
@@ -1477,6 +1707,10 @@ pub const FlushCtx = struct {
                         ctx.core.log.write(
                             "[perf] glyph_cache ascii_hits={d} ascii_misses={d} nonascii_hits={d} nonascii_misses={d}\n",
                             .{ perf_glyph_ascii_hits, perf_glyph_ascii_misses, perf_glyph_nonascii_hits, perf_glyph_nonascii_misses },
+                        );
+                        ctx.core.log.write(
+                            "[perf] shape_cache hits={d} misses={d} size={d} ascii_fast={d}\n",
+                            .{ perf_shape_cache_hits, perf_shape_cache_misses, ctx.core.shape_cache_sets * @as(u32, nvim_core.SHAPE_CACHE_WAYS), perf_ascii_fast_path },
                         );
                     }
                 } else {
@@ -2152,6 +2386,7 @@ pub const FlushCtx = struct {
         // calls sendExternalGridVertices when cell dimensions change).
         // Clearing first ensures those vertices use fresh cache lookups.
         ctx.core.resetGlyphCacheFlags();
+        ctx.core.resetShapeCache();
         if (ctx.core.isPhase2Atlas()) {
             ctx.core.resetCoreAtlas();
         }
@@ -2825,13 +3060,20 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             ec = run_end_ext;
                             continue;
                         };
-                        for (run_start_ext..run_end_ext) |ci| {
-                            const sc = self.row_cells.scalars.items[ci];
-                            if (sc == 0) continue; // wide char continuation
-                            self.shaping_scalars.appendAssumeCapacity(sc);
-                            // Track grid column width: 2 if next cell is continuation, else 1
-                            const ext_col_w: u32 = if (ci + 1 < run_end_ext and self.row_cells.scalars.items[ci + 1] == 0) 2 else 1;
-                            self.shaping_col_widths.appendAssumeCapacity(ext_col_w);
+                        // SIMD fast path: if no wide chars (no zero scalars), bulk copy
+                        if (simdAllNonZero(self.row_cells.scalars.items, run_start_ext, run_end_ext)) {
+                            @memcpy(self.shaping_scalars.items.ptr[0..run_len_ext], self.row_cells.scalars.items[run_start_ext..run_end_ext]);
+                            self.shaping_scalars.items.len = run_len_ext;
+                            @memset(self.shaping_col_widths.items.ptr[0..run_len_ext], 1);
+                            self.shaping_col_widths.items.len = run_len_ext;
+                        } else {
+                            for (run_start_ext..run_end_ext) |ci| {
+                                const sc = self.row_cells.scalars.items[ci];
+                                if (sc == 0) continue;
+                                self.shaping_scalars.appendAssumeCapacity(sc);
+                                const ext_col_w: u32 = if (ci + 1 < run_end_ext and self.row_cells.scalars.items[ci + 1] == 0) 2 else 1;
+                                self.shaping_col_widths.appendAssumeCapacity(ext_col_w);
+                            }
                         }
 
                         const ext_scalar_count = self.shaping_scalars.items.len;
@@ -2840,30 +3082,111 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             continue;
                         }
 
-                        // Shape
+                        // ASCII fast path for external grids
+                        // Single-char runs always safe; multi-char skips triggers.
                         const ext_bufs = &self.shaping_bufs;
-                        ext_bufs.ensureCapacity(self.alloc, ext_scalar_count) catch {
-                            ec = run_end_ext;
-                            continue;
-                        };
-                        ext_bufs.setLen(ext_scalar_count);
+                        var final_ext_glyph_count: usize = 0;
+                        var used_ext_ascii_fast_path = false;
 
-                        const ext_glyph_count = ext_shape_text_run.?(
-                            self.ctx,
-                            self.shaping_scalars.items.ptr,
-                            ext_scalar_count,
-                            c_style_ext,
-                            ext_bufs.glyph_ids.items.ptr,
-                            ext_bufs.clusters.items.ptr,
-                            ext_bufs.x_adv.items.ptr,
-                            ext_bufs.x_off.items.ptr,
-                            ext_bufs.y_off.items.ptr,
-                            ext_scalar_count,
-                        );
+                        if (self.loadAsciiTables()) {
+                            const ext_ascii_ok = ext_ascii_chk: {
+                                const ext_scalars = self.shaping_scalars.items[0..ext_scalar_count];
+                                // SIMD range check: all in [0x20, 0x7E]
+                                if (!simdAllAsciiPrintable(ext_scalars, ext_scalar_count)) break :ext_ascii_chk false;
+                                if (ext_scalar_count == 1) break :ext_ascii_chk true;
+                                const ext_trigs = &self.ascii_lig_triggers[style_index_ext];
+                                for (ext_scalars) |s| {
+                                    if (ext_trigs[@intCast(s)] != 0) break :ext_ascii_chk false;
+                                }
+                                break :ext_ascii_chk true;
+                            };
+                            if (ext_ascii_ok) {
+                                ext_bufs.ensureCapacity(self.alloc, ext_scalar_count) catch {
+                                    ec = run_end_ext;
+                                    continue;
+                                };
+                                ext_bufs.setLen(ext_scalar_count);
+                                const ext_gids = &self.ascii_glyph_ids[style_index_ext];
+                                const ext_xadvs = &self.ascii_x_advances[style_index_ext];
+                                // Batch zero-fill x_off and y_off (compiles to SIMD memset)
+                                @memset(ext_bufs.x_off.items[0..ext_scalar_count], 0);
+                                @memset(ext_bufs.y_off.items[0..ext_scalar_count], 0);
+                                // Sequential cluster fill (SIMD 4-wide)
+                                simdFillSequential(ext_bufs.clusters.items.ptr, ext_scalar_count);
+                                // Table lookups (gather - must be scalar)
+                                for (0..ext_scalar_count) |i| {
+                                    const s: usize = @intCast(self.shaping_scalars.items[i]);
+                                    ext_bufs.glyph_ids.items[i] = ext_gids[s];
+                                    ext_bufs.x_adv.items[i] = ext_xadvs[s];
+                                }
+                                final_ext_glyph_count = ext_scalar_count;
+                                used_ext_ascii_fast_path = true;
+                            }
+                        }
 
-                        if (ext_glyph_count > 0) {
-                            var final_ext_glyph_count = ext_glyph_count;
-                            // Handle buffer growth if needed
+                        if (!used_ext_ascii_fast_path) {
+                        // Shape cache lookup / callback
+                        const ext_sc_hash1 = nvim_core.shapeCacheHash(self.shaping_scalars.items[0..ext_scalar_count], c_style_ext);
+                        const ext_sc_hash2 = nvim_core.shapeCacheHash2(self.shaping_scalars.items[0..ext_scalar_count], c_style_ext);
+                        const ext_sc_set_base = (ext_sc_hash1 & (@as(u64, self.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
+                        const ext_sc_font_gen = self.font_generation;
+
+                        var ext_sc_cache_hit = false;
+
+                        // Check both ways of the set
+                        if (self.shape_cache) |ext_sc_cache| {
+                            for (0..nvim_core.SHAPE_CACHE_WAYS) |ext_sc_way| {
+                                const ext_sc_entry = &ext_sc_cache[ext_sc_set_base + ext_sc_way];
+                                if (ext_sc_entry.key_hash == ext_sc_hash1 and
+                                    ext_sc_entry.key_hash2 == ext_sc_hash2 and
+                                    ext_sc_entry.font_gen == ext_sc_font_gen and
+                                    ext_sc_entry.scalar_count == @as(u32, @intCast(ext_scalar_count)) and
+                                    ext_sc_entry.glyph_count > 0 and
+                                    ext_sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
+                                {
+                                    final_ext_glyph_count = ext_sc_entry.glyph_count;
+                                    ext_bufs.ensureCapacity(self.alloc, final_ext_glyph_count) catch {
+                                        ec = run_end_ext;
+                                        continue;
+                                    };
+                                    ext_bufs.setLen(final_ext_glyph_count);
+                                    @memcpy(ext_bufs.glyph_ids.items[0..final_ext_glyph_count], ext_sc_entry.glyph_ids[0..final_ext_glyph_count]);
+                                    @memcpy(ext_bufs.clusters.items[0..final_ext_glyph_count], ext_sc_entry.clusters[0..final_ext_glyph_count]);
+                                    @memcpy(ext_bufs.x_adv.items[0..final_ext_glyph_count], ext_sc_entry.x_adv[0..final_ext_glyph_count]);
+                                    @memcpy(ext_bufs.x_off.items[0..final_ext_glyph_count], ext_sc_entry.x_off[0..final_ext_glyph_count]);
+                                    @memcpy(ext_bufs.y_off.items[0..final_ext_glyph_count], ext_sc_entry.y_off[0..final_ext_glyph_count]);
+                                    ext_sc_cache_hit = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!ext_sc_cache_hit) {
+                            ext_bufs.ensureCapacity(self.alloc, ext_scalar_count) catch {
+                                ec = run_end_ext;
+                                continue;
+                            };
+                            ext_bufs.setLen(ext_scalar_count);
+
+                            const ext_glyph_count = ext_shape_text_run.?(
+                                self.ctx,
+                                self.shaping_scalars.items.ptr,
+                                ext_scalar_count,
+                                c_style_ext,
+                                ext_bufs.glyph_ids.items.ptr,
+                                ext_bufs.clusters.items.ptr,
+                                ext_bufs.x_adv.items.ptr,
+                                ext_bufs.x_off.items.ptr,
+                                ext_bufs.y_off.items.ptr,
+                                ext_scalar_count,
+                            );
+
+                            if (ext_glyph_count == 0) {
+                                ec = run_end_ext;
+                                continue;
+                            }
+
+                            final_ext_glyph_count = ext_glyph_count;
                             if (ext_glyph_count > ext_scalar_count) {
                                 ext_bufs.ensureCapacity(self.alloc, ext_glyph_count) catch {
                                     ec = run_end_ext;
@@ -2888,6 +3211,40 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                 }
                             }
 
+                            // Store in cache if result fits
+                            if (final_ext_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
+                                if (self.shape_cache) |ext_sc_cache| {
+                                    var ext_sc_store_way: usize = 0;
+                                    for (0..nvim_core.SHAPE_CACHE_WAYS) |ext_sc_way| {
+                                        if (ext_sc_cache[ext_sc_set_base + ext_sc_way].key_hash == 0) {
+                                            ext_sc_store_way = ext_sc_way;
+                                            break;
+                                        }
+                                    }
+                                    const ext_sc_store = &ext_sc_cache[ext_sc_set_base + ext_sc_store_way];
+                                    ext_sc_store.key_hash = ext_sc_hash1;
+                                    ext_sc_store.key_hash2 = ext_sc_hash2;
+                                    ext_sc_store.font_gen = ext_sc_font_gen;
+                                    ext_sc_store.scalar_count = @intCast(ext_scalar_count);
+                                    ext_sc_store.glyph_count = @intCast(final_ext_glyph_count);
+                                    @memcpy(ext_sc_store.glyph_ids[0..final_ext_glyph_count], ext_bufs.glyph_ids.items[0..final_ext_glyph_count]);
+                                    @memcpy(ext_sc_store.clusters[0..final_ext_glyph_count], ext_bufs.clusters.items[0..final_ext_glyph_count]);
+                                    @memcpy(ext_sc_store.x_adv[0..final_ext_glyph_count], ext_bufs.x_adv.items[0..final_ext_glyph_count]);
+                                    @memcpy(ext_sc_store.x_off[0..final_ext_glyph_count], ext_bufs.x_off.items[0..final_ext_glyph_count]);
+                                    @memcpy(ext_sc_store.y_off[0..final_ext_glyph_count], ext_bufs.y_off.items[0..final_ext_glyph_count]);
+                                }
+                            }
+                        }
+                        } // end !used_ext_ascii_fast_path
+
+                        if (final_ext_glyph_count > 0) {
+                            // Ensure capacity: .notdef (gid==0) expands 1 glyph to
+                            // up to cluster_span quads. Worst case total across all
+                            // glyphs = final_ext_glyph_count + ext_scalar_count.
+                            ext_verts.ensureUnusedCapacity(self.alloc, (final_ext_glyph_count + ext_scalar_count) * 6) catch {
+                                ec = run_end_ext;
+                                continue;
+                            };
                             var ext_penX: f32 = @as(f32, @floatFromInt(run_start_ext)) * cellW;
                             const ext_fg_col = Helpers.rgb(run_fg_ext);
                             const ext_glyph_cache_id = self.glyph_cache_by_id;
@@ -2936,6 +3293,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         ext_penX += @as(f32, @floatFromInt(efb_col_w)) * cellW;
                                     }
                                     continue;
+                                }
+
+                                // Skip space glyphs: no bitmap, just advance pen
+                                if (next_cl == this_cl + 1) {
+                                    const esp_scalar = self.shaping_scalars.items[@intCast(this_cl)];
+                                    if (esp_scalar == 0x20) {
+                                        ext_penX += @as(f32, @floatFromInt(self.shaping_col_widths.items[@intCast(this_cl)])) * cellW;
+                                        continue;
+                                    }
                                 }
 
                                 // Glyph-ID cache lookup
@@ -2991,11 +3357,17 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                                 // Advance pen using column widths (correct for wide chars)
                                 {
-                                    var ext_cluster_cols: u32 = 0;
-                                    var ecwi: u32 = this_cl;
-                                    while (ecwi < next_cl) : (ecwi += 1) {
-                                        ext_cluster_cols += self.shaping_col_widths.items[@intCast(ecwi)];
-                                    }
+                                    const ext_cl_span = next_cl - this_cl;
+                                    const ext_cluster_cols: u32 = if (ext_cl_span == 1)
+                                        self.shaping_col_widths.items[@intCast(this_cl)]
+                                    else blk: {
+                                        var sum: u32 = 0;
+                                        var ecwi: u32 = this_cl;
+                                        while (ecwi < next_cl) : (ecwi += 1) {
+                                            sum += self.shaping_col_widths.items[@intCast(ecwi)];
+                                        }
+                                        break :blk sum;
+                                    };
                                     ext_penX += @as(f32, @floatFromInt(ext_cluster_cols)) * cellW;
                                 }
                             }

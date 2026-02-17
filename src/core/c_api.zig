@@ -207,6 +207,15 @@ pub const RasterizeGlyphByIdFn = *const fn (
     out_bitmap: *GlyphBitmap,
 ) callconv(.c) c_int;
 
+// ASCII fast path table retrieval callback
+pub const GetAsciiTableFn = *const fn (
+    ctx: ?*anyopaque,
+    style_flags: u32,
+    out_glyph_ids: [*]u32,
+    out_x_advances: [*]i32,
+    out_lig_triggers: [*]u8,
+) callconv(.c) c_int;
+
 pub const OnVerticesFn = *const fn (
     ctx: ?*anyopaque,
     main_verts: [*]const Vertex,
@@ -496,6 +505,9 @@ pub const Callbacks = extern struct {
     // Phase B: Text-run shaping (ligatures)
     on_shape_text_run: ?ShapeTextRunFn = null,
     on_rasterize_glyph_by_id: ?RasterizeGlyphByIdFn = null,
+
+    // ASCII fast path table callback (NULL = no fast path, always use shaping)
+    on_get_ascii_table: ?GetAsciiTableFn = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -629,6 +641,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Phase B: Text-run shaping (ligatures)
         .on_shape_text_run = box.cb.on_shape_text_run,
         .on_rasterize_glyph_by_id = box.cb.on_rasterize_glyph_by_id,
+
+        // ASCII fast path
+        .on_get_ascii_table = box.cb.on_get_ascii_table,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);
@@ -1135,6 +1150,10 @@ pub export fn zonvie_core_load_config(
         box.core.hl_cache_size = new_hl_size;
         box.core.reinitHlCache();
     }
+    const new_shape_size = box.msg_config.performance.shape_cache_size;
+    if (new_shape_size != box.core.shape_cache_size) {
+        box.core.setShapeCacheSize(new_shape_size);
+    }
 
     return 1;
 }
@@ -1231,6 +1250,7 @@ pub const zonvie_config_values = extern struct {
     perf_glyph_cache_ascii: i32 = 512,
     perf_glyph_cache_non_ascii: i32 = 256,
     perf_hl_cache_size: i32 = 512,
+    perf_shape_cache_size: i32 = 4096,
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
@@ -1300,6 +1320,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .perf_glyph_cache_ascii = @intCast(cfg.performance.glyph_cache_ascii_size),
         .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),
         .perf_hl_cache_size = @intCast(cfg.performance.hl_cache_size),
+        .perf_shape_cache_size = @intCast(cfg.performance.shape_cache_size),
         // ime
         .ime_disable_on_activate = cfg.ime.disable_on_activate,
         .ime_disable_on_modechange = cfg.ime.disable_on_modechange,

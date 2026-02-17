@@ -237,6 +237,7 @@ pub const Config = struct {
         glyph_cache_ascii_size: u32 = 512,
         glyph_cache_non_ascii_size: u32 = 256,
         hl_cache_size: u32 = 512,
+        shape_cache_size: u32 = 4096,
     };
 
     pub const IMEConfig = struct {
@@ -392,6 +393,7 @@ pub const Config = struct {
             if (p.glyph_cache_ascii_size) |s| self.performance.glyph_cache_ascii_size = @max(128, s);
             if (p.glyph_cache_non_ascii_size) |s| self.performance.glyph_cache_non_ascii_size = @max(64, s);
             if (p.hl_cache_size) |s| self.performance.hl_cache_size = @max(64, @min(2048, s));
+            if (p.shape_cache_size) |s| self.performance.shape_cache_size = @max(512, @min(65536, s));
         }
 
         if (cfg.ime) |i| {
@@ -583,6 +585,7 @@ const TomlPerformance = struct {
     glyph_cache_ascii_size: ?u32 = null,
     glyph_cache_non_ascii_size: ?u32 = null,
     hl_cache_size: ?u32 = null,
+    shape_cache_size: ?u32 = null,
 };
 
 const TomlIME = struct {

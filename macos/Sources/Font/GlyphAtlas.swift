@@ -117,6 +117,9 @@ final class GlyphAtlas {
     /// Must not share with `scratch` which is used by uploadRegion.
     private var rasterizeScratch: [UInt8] = []
 
+    /// Persistent y-advance buffer for shapeTextRun (avoids per-call heap allocation).
+    private var shapeYAdvBuf: [Int32] = []
+
     /// Maximum scratch buffer size (64KB - sufficient for large glyphs/emoji)
     private let maxScratchSize: Int = 64 * 1024
 
@@ -1037,20 +1040,42 @@ final class GlyphAtlas {
         guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
 
         // zonvie_hb_shape_utf32 outputs y_advance too, but our callback doesn't need it.
-        // We'll use a temporary buffer for y_advance.
-        var yAdvBuf = [Int32](repeating: 0, count: outCap)
+        // Use persistent buffer to avoid per-call heap allocation.
+        if shapeYAdvBuf.count < outCap {
+            shapeYAdvBuf = [Int32](repeating: 0, count: max(outCap, 256))
+        }
 
         let count = zonvie_hb_shape_utf32(
             hbft,
             scalars, scalarCount,
             outGlyphIDs, outClusters,
-            outXAdvance, &yAdvBuf,
+            outXAdvance, &shapeYAdvBuf,
             outXOffset, outYOffset,
             outCap,
             nil, nil, nil
         )
 
         return count
+    }
+
+    /// ASCII fast path: fill pre-computed tables for the given style variant.
+    /// Called lazily by core on first shaping attempt after font change.
+    func getAsciiTable(
+        styleFlags: UInt32,
+        outGlyphIDs: UnsafeMutablePointer<UInt32>,
+        outXAdvances: UnsafeMutablePointer<Int32>,
+        outLigTriggers: UnsafeMutablePointer<UInt8>
+    ) -> Int32 {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+
+        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+
+        let ok1 = zonvie_ft_hb_get_ascii_glyph_ids(hbft, outGlyphIDs)
+        let ok2 = zonvie_ft_hb_get_ascii_x_advances(hbft, outXAdvances)
+        let ok3 = zonvie_ft_hb_get_ascii_lig_triggers(hbft, outLigTriggers)
+
+        return (ok1 != 0 && ok2 != 0 && ok3 != 0) ? 1 : 0
     }
 
     /// Phase B: Rasterize a glyph by its glyph ID (post-shaping, skips scalar→glyph_id lookup).
