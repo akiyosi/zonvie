@@ -1336,6 +1336,10 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app_mod.updateRowsColsFromClientForce(h, app);
     }
 
+    // Clear saved cmdline position so it re-centers with the new font size
+    app.cmdline_saved_x = null;
+    app.cmdline_saved_y = null;
+
     // Calculate pending resize for all external windows (same as onLineSpace)
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;

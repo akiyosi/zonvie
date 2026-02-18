@@ -541,14 +541,33 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         return;
     }
 
-    // Calculate position: cmdline keeps center, others keep top-left
+    // Calculate position: cmdline re-centers on display, others keep top-left
     var pos_x: c_int = undefined;
     var pos_y: c_int = undefined;
     if (is_cmdline) {
-        const old_center_x = @divTrunc(current_rect.left + current_rect.right, 2);
-        const old_center_y = @divTrunc(current_rect.top + current_rect.bottom, 2);
-        pos_x = old_center_x - @divTrunc(window_w, 2);
-        pos_y = old_center_y - @divTrunc(window_h, 2);
+        // Re-center cmdline on the current monitor after font size change.
+        // Preserving the old position caused visible drift on repeated changes.
+        const monitor = c.MonitorFromWindow(ext_hwnd, c.MONITOR_DEFAULTTONEAREST);
+        if (monitor) |mon| {
+            var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+            mi.cbSize = @sizeOf(c.MONITORINFO);
+            if (c.GetMonitorInfoW(mon, &mi) != 0) {
+                const work_w = mi.rcWork.right - mi.rcWork.left;
+                const work_h = mi.rcWork.bottom - mi.rcWork.top;
+                pos_x = mi.rcWork.left + @divTrunc(work_w - window_w, 2);
+                pos_y = mi.rcWork.top + @divTrunc(work_h - window_h, 3);
+            } else {
+                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
+                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
+                pos_x = @divTrunc(screen_w - window_w, 2);
+                pos_y = @divTrunc(screen_h - window_h, 3);
+            }
+        } else {
+            const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
+            const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
+            pos_x = @divTrunc(screen_w - window_w, 2);
+            pos_y = @divTrunc(screen_h - window_h, 3);
+        }
     } else {
         pos_x = current_rect.left;
         pos_y = current_rect.top;
@@ -573,6 +592,13 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     app.mu.lock();
     if (app.external_windows.getPtr(grid_id)) |ew| {
         ew.suppress_resize_callback = false;
+    }
+    // Clear saved cmdline position after programmatic resize (e.g. font change).
+    // SetWindowPos triggers WM_WINDOWPOSCHANGED which re-saves the position,
+    // but this stale position would prevent proper re-centering next time.
+    if (is_cmdline) {
+        app.cmdline_saved_x = null;
+        app.cmdline_saved_y = null;
     }
     app.mu.unlock();
 }
@@ -601,6 +627,12 @@ pub fn updateExtFloatPositions(app: *App) void {
     const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
     const msg_history_rows: u32 = if (msg_history_entry) |e| e.rows else 0;
     const msg_history_cols: u32 = if (msg_history_entry) |e| e.cols else 0;
+    // When using DWM custom titlebar, client area extends into the titlebar.
+    // Compute offset to position floats below the custom titlebar area.
+    const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
+    else
+        0;
     app.mu.unlock();
 
     // Calculate target rect based on position mode (mutex unlocked, safe to call core functions)
@@ -627,7 +659,7 @@ pub fn updateExtFloatPositions(app: *App) void {
                     _ = c.ClientToScreen(main_hwnd, &pt);
                     target_rect = .{
                         .left = pt.x,
-                        .top = pt.y,
+                        .top = pt.y + titlebar_offset,
                         .right = pt.x + client_rect.right,
                         .bottom = pt.y + client_rect.bottom,
                     };
@@ -671,7 +703,7 @@ pub fn updateExtFloatPositions(app: *App) void {
 
                 target_rect = .{
                     .left = client_origin.x,
-                    .top = client_origin.y,
+                    .top = client_origin.y + titlebar_offset,
                     .right = client_origin.x + grid_right_px,
                     .bottom = client_origin.y + grid_bottom_px,
                 };

@@ -924,9 +924,15 @@ pub const App = struct {
                         _ = c.ClientToScreen(main_hwnd, &pt);
                         const width = rect.right - rect.left;
                         const height = rect.bottom - rect.top;
+                        // When using DWM custom titlebar, client area extends into titlebar.
+                        // Offset top to position below the custom titlebar area.
+                        const titlebar_offset: c_int = if (self.ext_tabline_enabled and self.tabline_style == .titlebar and self.content_hwnd == null)
+                            self.scalePx(TablineState.TAB_BAR_HEIGHT)
+                        else
+                            0;
                         return c.RECT{
                             .left = pt.x,
-                            .top = pt.y,
+                            .top = pt.y + titlebar_offset,
                             .right = pt.x + width,
                             .bottom = pt.y + height,
                         };
@@ -962,9 +968,15 @@ pub const App = struct {
                         _ = c.ClientToScreen(main_hwnd, &pt);
                         const width = rect.right - rect.left;
                         const height = rect.bottom - rect.top;
+                        // When using DWM custom titlebar, client area extends into titlebar.
+                        // Offset top to position below the custom titlebar area.
+                        const titlebar_offset: c_int = if (self.ext_tabline_enabled and self.tabline_style == .titlebar and self.content_hwnd == null)
+                            self.scalePx(TablineState.TAB_BAR_HEIGHT)
+                        else
+                            0;
                         return c.RECT{
                             .left = pt.x,
-                            .top = pt.y,
+                            .top = pt.y + titlebar_offset,
                             .right = pt.x + width,
                             .bottom = pt.y + height,
                         };
