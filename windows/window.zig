@@ -591,22 +591,47 @@ pub export fn WndProc(
                     }
 
                     if (!row_mode) {
-                        // Non-row mode: draw under lock to keep main/cursor verts stable.
-                        app.mu.lock();
-                        if (!app.row_mode) {
-                            const main_verts_now = app.main_verts.items;
-                            // Only include cursor verts if blink state is visible
-                            const cursor_verts_now = if (app.cursor_blink_state) app.cursor_verts.items else &[_]core.Vertex{};
-                            if (g.drawEx(main_verts_now, cursor_verts_now, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
+                        // Non-row mode: snapshot vertex data under lock, then draw outside lock.
+                        // IMPORTANT: Do NOT hold app.mu during drawEx.
+                        // drawEx calls DXGI Present which can pump Win32 messages internally.
+                        // If a re-entrant message handler tries app.mu.lock() on the same thread
+                        // -> self-deadlock (SRWLOCK is non-reentrant).
+                        // Use local arrays (not app fields) so that even if DXGI message pumping
+                        // causes a re-entrant WM_PAINT, each invocation has its own snapshot.
+                        var local_main: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        defer local_main.deinit(app.alloc);
+                        var local_cursor: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        defer local_cursor.deinit(app.alloc);
+                        var non_row_draw = false;
+                        {
+                            app.mu.lock();
+                            defer app.mu.unlock();
+                            if (!app.row_mode) {
+                                non_row_draw = blk: {
+                                    local_main.appendSlice(app.alloc, app.main_verts.items) catch |e| {
+                                        applog.appLog("[win] WM_PAINT(non-row) main snapshot failed: {any}\n", .{e});
+                                        break :blk false;
+                                    };
+                                    if (app.cursor_blink_state) {
+                                        local_cursor.appendSlice(app.alloc, app.cursor_verts.items) catch |e| {
+                                            applog.appLog("[win] WM_PAINT(non-row) cursor snapshot failed: {any}\n", .{e});
+                                            break :blk false;
+                                        };
+                                    }
+                                    break :blk true;
+                                };
+                            } else {
+                                // Row-mode flipped mid-frame; skip and let the next paint handle it.
+                                applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
+                            }
+                        }
+                        if (non_row_draw) {
+                            if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
                                 render_ok = true;
                             } else |e| {
                                 applog.appLog("gpu.draw failed: {any}\n", .{e});
                             }
-                        } else {
-                            // Row-mode flipped mid-frame; skip and let the next paint handle it.
-                            applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
                         }
-                        app.mu.unlock();
                     } else {
                         // --- Row-mode ---
                         const log_enabled = applog.isEnabled();
@@ -1635,14 +1660,26 @@ pub export fn WndProc(
                 }
 
                 // 4) Trigger D3D11 resize
-                // When ext_tabline is enabled, D3D11 renders to parent window (no content_hwnd)
-                app.mu.lock();
-                if (app.renderer) |*g| {
-                    g.resize() catch {};
+                // IMPORTANT: Do NOT hold app.mu during g.resize().
+                // DXGI ResizeBuffers (FLIP model) can pump Win32 messages internally.
+                // If a pending WM_PAINT is dispatched re-entrantly, it tries app.mu.lock()
+                // on the same thread -> self-deadlock (SRWLOCK is non-reentrant).
+                {
+                    var gpu_ptr: ?*d3d11.Renderer = null;
+                    app.mu.lock();
+                    if (app.renderer) |*g| gpu_ptr = g;
+                    app.mu.unlock();
+
+                    if (gpu_ptr) |g| {
+                        g.resize() catch {};
+                    }
                 }
-                app.paint_full = true;
-                app.paint_rects.clearRetainingCapacity();
-                app.mu.unlock();
+                {
+                    app.mu.lock();
+                    app.paint_full = true;
+                    app.paint_rects.clearRetainingCapacity();
+                    app.mu.unlock();
+                }
 
                 // 5) repaint
                 _ = c.InvalidateRect(hwnd, null, 0);
