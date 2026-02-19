@@ -129,6 +129,8 @@ pub const TIMER_SCROLLBAR_REPEAT: c.UINT_PTR = 5;
 pub const TIMER_CURSOR_BLINK: c.UINT_PTR = 6;
 /// Timer ID for quit request timeout
 pub const TIMER_QUIT_TIMEOUT: c.UINT_PTR = 7;
+/// Timer ID for coalescing float/mini repositioning during window drag
+pub const TIMER_REPOSITION_FLOATS: c.UINT_PTR = 8;
 /// Quit timeout in milliseconds (5 seconds)
 pub const QUIT_TIMEOUT_MS: c.UINT = 5000;
 /// Scrollbar fade animation interval (16ms ~= 60fps)

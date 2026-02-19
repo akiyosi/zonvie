@@ -74,6 +74,7 @@ const TIMER_SCROLLBAR_FADE = app_mod.TIMER_SCROLLBAR_FADE;
 const TIMER_SCROLLBAR_REPEAT = app_mod.TIMER_SCROLLBAR_REPEAT;
 const TIMER_CURSOR_BLINK = app_mod.TIMER_CURSOR_BLINK;
 const TIMER_QUIT_TIMEOUT = app_mod.TIMER_QUIT_TIMEOUT;
+const TIMER_REPOSITION_FLOATS = app_mod.TIMER_REPOSITION_FLOATS;
 const QUIT_TIMEOUT_MS = app_mod.QUIT_TIMEOUT_MS;
 const SCROLLBAR_FADE_INTERVAL = app_mod.SCROLLBAR_FADE_INTERVAL;
 const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
@@ -1687,6 +1688,14 @@ pub export fn WndProc(
             return 0;
         },
 
+        c.WM_MOVE => {
+            // Reposition ext-float and mini windows when main window moves.
+            // Use a coalescing timer to avoid flooding the message queue
+            // during window drag (SetTimer resets if the same ID is pending).
+            _ = c.SetTimer(hwnd, TIMER_REPOSITION_FLOATS, 15, null);
+            return 0;
+        },
+
         WM_APP_ATLAS_ENSURE_GLYPH => {
             if (getApp(hwnd)) |app| {
                 const scalar: u32 = @intCast(wParam);
@@ -2142,6 +2151,12 @@ pub export fn WndProc(
                             // TODO: show error message to user
                         }
                     }
+                }
+            } else if (wParam == TIMER_REPOSITION_FLOATS) {
+                _ = c.KillTimer(hwnd, TIMER_REPOSITION_FLOATS);
+                if (getApp(hwnd)) |app| {
+                    messages.updateExtFloatPositions(app);
+                    messages.updateMiniWindows(app);
                 }
             } else if (wParam == TIMER_QUIT_TIMEOUT) {
                 // Neovim not responding to quit request - show force quit dialog
