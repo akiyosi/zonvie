@@ -935,9 +935,29 @@ pub fn onVerticesRow(
         rc.right = client.right;
 
         _ = c.InvalidateRect(hwnd, &rc, c.FALSE);
+    }
+}
 
-        // Update scrollbar via PostMessage to avoid deadlock
-        _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_SCROLLBAR, 0, 0);
+/// Called once per flush (from core thread via on_flush_end callback).
+/// Posts a single WM_APP_UPDATE_SCROLLBAR with atomic coalescing to avoid
+/// flooding the message queue when flushes are frequent.
+pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
+    const ctxp = ctx orelse return;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return;
+    const app: *App = @ptrFromInt(ctx_bits);
+    // Coalesce: only post if not already pending (atomic CAS: false -> true)
+    if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
+        // CAS succeeded: we own the pending slot
+        if (app.hwnd) |hwnd| {
+            if (c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_SCROLLBAR, 0, 0) == 0) {
+                // PostMessage failed: reset pending to avoid permanent stall
+                app.scrollbar_update_pending.store(false, .release);
+            }
+        } else {
+            // No hwnd yet: reset pending
+            app.scrollbar_update_pending.store(false, .release);
+        }
     }
 }
 

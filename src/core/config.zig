@@ -236,7 +236,7 @@ pub const Config = struct {
     pub const PerformanceConfig = struct {
         glyph_cache_ascii_size: u32 = 512,
         glyph_cache_non_ascii_size: u32 = 256,
-        hl_cache_size: u32 = 512,
+        hl_cache_size: u32 = 2048, // NOTE: default must match nvim_core.zig hl_cache_size
         shape_cache_size: u32 = 4096,
     };
 

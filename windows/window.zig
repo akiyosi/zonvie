@@ -513,12 +513,7 @@ pub export fn WndProc(
                     }
                 }
                 if (atlas_uploads != 0) {
-                    applog.appLog("[win] atlas_uploads flushed={d} -> request repaint\n", .{ atlas_uploads });
-                    app.mu.lock();
-                    app.paint_full = true;
-                    app.paint_rects.clearRetainingCapacity();
-                    app.mu.unlock();
-                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    applog.appLog("[win] atlas_uploads flushed={d}\n", .{ atlas_uploads });
                 }
         
                 var render_ok = false;
@@ -709,6 +704,16 @@ pub export fn WndProc(
                             }
                         }
                         // ---- end normalize rows_to_draw ----
+
+                        // If atlas was uploaded but no rows will be drawn in this frame,
+                        // request a full repaint so newly uploaded glyphs become visible.
+                        if (atlas_uploads != 0 and rows_to_draw.items.len == 0) {
+                            app.mu.lock();
+                            app.paint_full = true;
+                            app.paint_rects.clearRetainingCapacity();
+                            app.mu.unlock();
+                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                        }
 
                         applog.appLog(
                             "[win] WM_PAINT(row) force_full_rows={d} rows_to_draw={d} dirty_keys={d} row_verts_len={d}\n",
@@ -2275,6 +2280,7 @@ pub export fn WndProc(
                     .on_shape_text_run = callbacks.onShapeTextRun,
                     .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
                     .on_get_ascii_table = callbacks.onGetAsciiTable,
+                    .on_flush_end = callbacks.onFlushEnd,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 
@@ -2878,6 +2884,8 @@ pub export fn WndProc(
 
         WM_APP_UPDATE_SCROLLBAR => {
             if (getApp(hwnd)) |app| {
+                // Clear pending flag BEFORE processing (allows new PostMessage during updateScrollbar)
+                app.scrollbar_update_pending.store(false, .release);
                 scrollbar.updateScrollbar(hwnd, app);
                 return 0;
             }

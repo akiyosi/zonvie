@@ -465,7 +465,7 @@ pub const Core = struct {
     glyph_cache_non_ascii_size: u32 = 256, // default: 256 entries hash table
 
     // Highlight cache size for flush vertex generation (configurable via [performance] in config.toml)
-    hl_cache_size: u32 = 512,
+    hl_cache_size: u32 = 2048, // NOTE: default must match config.zig PerformanceConfig.hl_cache_size
 
     // Heap-allocated highlight cache buffers (sized by hl_cache_size, allocated on first flush)
     hl_cache_buf: ?[]highlight.ResolvedAttrWithStyles = null,
