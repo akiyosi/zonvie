@@ -1,3 +1,5 @@
 // Zonvie Windows Resource File
 // Application icon (IDI_ICON1 = 1)
 1 ICON "zonvie.ico"
+// Text file association icon (IDI_ICON2 = 2)
+2 ICON "zombie_txt_icon.ico"

@@ -42,7 +42,7 @@ do {
         if arg == "--nofork" || arg == "--help" || arg == "-h" ||
            arg == "--extcmdline" || arg == "--extpopup" || arg == "--extpopupmenu" ||
            arg == "--extmessages" || arg == "--exttabline" || arg == "--extwindows" ||
-           arg == "--devcontainer-rebuild" {
+           arg == "--devcontainer-rebuild" || arg == "--install" {
             // Skip this argument (it's zonvie-specific)
             i += 1
         } else if arg == "--log" {
@@ -125,6 +125,7 @@ if args.contains("--help") || args.contains("-h") {
             --devcontainer=<workspace>    Run inside a devcontainer
             --devcontainer-config=<path>  Path to devcontainer.json
             --devcontainer-rebuild        Rebuild devcontainer before starting
+            --install                     Create default config file and exit
             --help, -h                    Show this help message and exit
             --                            Pass all remaining arguments to nvim
 
@@ -179,6 +180,52 @@ if args.contains("--help") || args.contains("-h") {
         For more information, visit: https://github.com/akiyosi/zonvie
         """
     print(help)
+    exit(0)
+}
+
+// Handle --install: create default config.toml and exit
+if args.contains("--install") {
+    let configURL = ZonvieConfig.configFilePath
+    let configPath = configURL.path
+    let fm = FileManager.default
+
+    if fm.fileExists(atPath: configPath) {
+        print("Config file already exists, skipped: \(configPath)")
+    } else {
+        let dirURL = configURL.deletingLastPathComponent()
+        do {
+            try fm.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        } catch {
+            fputs("Failed to create config directory: \(error)\n", stderr)
+            exit(1)
+        }
+
+        let defaultConfig = """
+            # Zonvie configuration file
+            # See `zonvie --help` for all available options.
+
+            [font]
+            # family = "SF Mono"
+            # size = 14.0
+            # linespace = 0
+
+            [neovim]
+            # path = "nvim"
+
+            [window]
+            # opacity = 1.0
+            # blur = false
+            # blur_radius = 20
+
+            """
+        do {
+            try defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
+            print("Default config.toml created: \(configPath)")
+        } catch {
+            fputs("Failed to write config file: \(error)\n", stderr)
+            exit(1)
+        }
+    }
     exit(0)
 }
 

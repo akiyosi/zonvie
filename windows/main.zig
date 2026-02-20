@@ -296,6 +296,7 @@ pub fn main() u8 {
                     \\    --devcontainer=<workspace>    Run inside a devcontainer
                     \\    --devcontainer-config=<path>  Path to devcontainer.json
                     \\    --devcontainer-rebuild        Rebuild devcontainer before starting
+                    \\    --install                     First-launch setup (icon + default config) and exit
                     \\    --help, -h                    Show this help message and exit
                     \\    --                            Pass all remaining arguments to nvim
                     \\
@@ -347,6 +348,48 @@ pub fn main() u8 {
             }
             return 0;
         }
+        if (std.mem.eql(u8, arg, "--install")) {
+            const file_assoc = @import("file_assoc.zig");
+            const icon_ok = file_assoc.registerAppIcon();
+            const config_result2 = createDefaultConfig(alloc);
+            const has_error = !icon_ok or config_result2 == .err;
+
+            _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
+            const stdout = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
+            if (stdout != c.INVALID_HANDLE_VALUE) {
+                var written: c.DWORD = 0;
+                if (icon_ok) {
+                    const m = "File association icon registered.\r\n";
+                    _ = c.WriteFile(stdout, m.ptr, @intCast(m.len), &written, null);
+                } else {
+                    const m = "ERROR: Failed to register file association icon.\r\n";
+                    _ = c.WriteFile(stdout, m.ptr, @intCast(m.len), &written, null);
+                }
+                switch (config_result2) {
+                    .created => {
+                        const m = "Default config.toml created.\r\n";
+                        _ = c.WriteFile(stdout, m.ptr, @intCast(m.len), &written, null);
+                    },
+                    .already_exists => {
+                        const m = "Config file already exists, skipped.\r\n";
+                        _ = c.WriteFile(stdout, m.ptr, @intCast(m.len), &written, null);
+                    },
+                    .err => {
+                        const m = "ERROR: Failed to create config file.\r\n";
+                        _ = c.WriteFile(stdout, m.ptr, @intCast(m.len), &written, null);
+                    },
+                }
+            }
+            return if (has_error) 1 else 0;
+        }
+    }
+
+    // First launch (no config file) — register file association icon and create default config.
+    // Placed after --help / --install early-exit loop so those commands stay side-effect-free.
+    if (config_result.path == null) {
+        const file_assoc = @import("file_assoc.zig");
+        _ = file_assoc.registerAppIcon();
+        _ = createDefaultConfig(alloc);
     }
 
     // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
@@ -554,3 +597,51 @@ pub fn main() u8 {
     if (applog.isEnabled()) applog.appLog("[win] message loop ended, returning exit_code={d}\n", .{exit_code});
     return exit_code;
 }
+
+const ConfigCreateResult = enum { created, already_exists, err };
+
+/// Create default config.toml at %APPDATA%\zonvie\config.toml if it doesn't exist.
+fn createDefaultConfig(alloc: std.mem.Allocator) ConfigCreateResult {
+    const appdata = std.process.getEnvVarOwned(alloc, "APPDATA") catch return .err;
+    defer alloc.free(appdata);
+
+    const dir_path = std.fs.path.join(alloc, &.{ appdata, "zonvie" }) catch return .err;
+    defer alloc.free(dir_path);
+
+    const file_path = std.fs.path.join(alloc, &.{ dir_path, "config.toml" }) catch return .err;
+    defer alloc.free(file_path);
+
+    // Skip if config already exists
+    if (std.fs.accessAbsolute(file_path, .{})) |_| {
+        return .already_exists;
+    } else |_| {}
+
+    // Create directory if needed
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return .err,
+    };
+
+    // Write default config
+    const file = std.fs.createFileAbsolute(file_path, .{}) catch return .err;
+    defer file.close();
+    file.writeAll(default_config_toml) catch return .err;
+    return .created;
+}
+
+const default_config_toml =
+    \\# Zonvie configuration file
+    \\# See `zonvie.exe --help` for all available options.
+    \\
+    \\[font]
+    \\# family = "Consolas"
+    \\# size = 14.0
+    \\# linespace = 0
+    \\
+    \\[neovim]
+    \\# path = "nvim"
+    \\
+    \\[window]
+    \\# opacity = 1.0
+    \\
+;

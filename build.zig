@@ -78,6 +78,10 @@ pub fn build(b: *std.Build) !void {
 
         // --- Add: CredUI for password dialogs ---
         win_exe.linkSystemLibrary("credui");
+
+        // --- Add: Registry + Shell for file associations ---
+        win_exe.linkSystemLibrary("advapi32");
+        win_exe.linkSystemLibrary("shell32");
     }
 
     const install_win = b.addInstallArtifact(win_exe, .{});

@@ -44,7 +44,12 @@ pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
     if (std.process.getEnvVarOwned(alloc, "USERPROFILE")) |userprofile| {
         defer alloc.free(userprofile);
         const path = try std.fs.path.join(alloc, &.{ userprofile, ".config", "zonvie", "config.toml" });
-        return path;
+
+        if (std.fs.accessAbsolute(path, .{})) |_| {
+            return path;
+        } else |_| {
+            alloc.free(path);
+        }
     } else |_| {}
 
     return error.NoConfigPath;
