@@ -1531,8 +1531,10 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     if (applog.isEnabled()) applog.appLog("[win] onDefaultColorsSet: fg=0x{x:0>8} bg=0x{x:0>8}\n", .{ fg, bg });
 
     // 0xFFFFFFFF means "not set" — only update the color that is valid
+    app.mu.lock();
     if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
     if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
+    app.mu.unlock();
 
     // Invalidate tabline/sidebar to repaint with new colors
     if (app.hwnd) |hwnd| {
@@ -1550,13 +1552,35 @@ pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) c
     const title = title_ptr.?[0..title_len];
     if (applog.isEnabled()) applog.appLog("[win] onSetTitle: {s}\n", .{title});
 
-    if (app.hwnd) |hwnd| {
-        // Convert UTF-8 to UTF-16 for Windows API
-        var wide_buf: [512]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, title) catch return;
-        if (wide_len >= wide_buf.len) return;
-        wide_buf[wide_len] = 0; // null terminate
-        _ = c.SetWindowTextW(hwnd, &wide_buf);
+    // Defer SetWindowTextW to UI thread via PostMessage to avoid deadlock.
+    // SetWindowTextW from a non-owning thread is an implicit cross-thread
+    // SendMessage(WM_SETTEXT), which blocks with grid_mu held.
+    const hwnd = app.hwnd orelse return;
+
+    // Truncate UTF-8 input to fit the pending_title buffer (511 UTF-16 units + null).
+    // If the full title doesn't fit, progressively shorten the UTF-8 slice at
+    // codepoint boundaries until it fits, so we always get a partial update
+    // rather than silently dropping the title.
+    app.mu.lock();
+    var src = title;
+    var wide_len: usize = 0;
+    while (src.len > 0) {
+        wide_len = std.unicode.utf8ToUtf16Le(&app.pending_title, src) catch {
+            // Shorten src by one codepoint from the end and retry.
+            var trim = src.len - 1;
+            while (trim > 0 and (src[trim] & 0xC0) == 0x80) trim -= 1;
+            src = src[0..trim];
+            continue;
+        };
+        break;
+    }
+    const clamped_len = @min(wide_len, app.pending_title.len - 1);
+    app.pending_title[clamped_len] = 0; // null terminate
+    app.pending_title_len = clamped_len;
+    app.mu.unlock();
+
+    if (clamped_len > 0) {
+        _ = c.PostMessageW(hwnd, app_mod.WM_APP_SET_TITLE, 0, 0);
     }
 }
 

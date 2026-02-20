@@ -2364,6 +2364,8 @@ pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callc
     swapWindowPositions(sorted[si].hwnd, sorted[si].rect, sorted[di].hwnd, sorted[di].rect);
 }
 
+/// Defers SetWindowPos to UI thread via PostMessage to avoid blocking the core
+/// thread on cross-thread message processing while grid_mu is held.
 pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
     _ = grid_id;
     _ = win;
@@ -2372,9 +2374,12 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
 
     app.mu.lock();
     const coll = collectWindowInfos(app, true);
-    app.mu.unlock();
+    const hwnd = app.hwnd;
 
-    if (coll.count < 2) return;
+    if (coll.count < 2) {
+        app.mu.unlock();
+        return;
+    }
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
     sortSpatially(sorted[0..coll.count]);
 
@@ -2414,23 +2419,48 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
         }
     }
 
+    // Replace semantics: reset count before writing new batch
+    app.deferred_win_ops_count = 0;
     for (0..n) |i| {
-        const w = sorted[i].rect.right - sorted[i].rect.left;
-        const h = sorted[i].rect.bottom - sorted[i].rect.top;
-        _ = c.SetWindowPos(sorted[i].hwnd, null, lefts[i], tops[i], w, h, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+        if (i >= App.MAX_DEFERRED_WIN_OPS) break;
+        app.deferred_win_ops[i] = .{
+            .hwnd = sorted[i].hwnd,
+            .x = lefts[i],
+            .y = tops[i],
+            .w = sorted[i].rect.right - sorted[i].rect.left,
+            .h = sorted[i].rect.bottom - sorted[i].rect.top,
+            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+        };
+        app.deferred_win_ops_count = i + 1;
+    }
+    app.mu.unlock();
+
+    if (hwnd) |h| {
+        if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
+            if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: PostMessageW failed\n", .{});
+            app.mu.lock();
+            app.deferred_win_ops_count = 0;
+            app.mu.unlock();
+        }
     }
 }
 
 /// Make all windows equal size (including main window).
+/// Defers SetWindowPos to UI thread via PostMessage to avoid deadlock:
+/// SetWindowPos on the main window from core thread sends WM_SIZE → updateLayoutToCore → grid_mu.lock()
+/// while grid_mu is already held by the core thread during this callback.
 pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
 
     app.mu.lock();
     const coll = collectWindowInfos(app, true);
-    app.mu.unlock();
+    const hwnd = app.hwnd;
 
-    if (coll.count < 2) return;
+    if (coll.count < 2) {
+        app.mu.unlock();
+        return;
+    }
     const infos = coll.infos[0..coll.count];
 
     // Calculate average size
@@ -2444,8 +2474,29 @@ pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
     const avg_w = @divTrunc(total_w, n);
     const avg_h = @divTrunc(total_h, n);
 
-    for (infos) |info| {
-        _ = c.SetWindowPos(info.hwnd, null, info.rect.left, info.rect.top, avg_w, avg_h, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    // Replace semantics: reset count before writing new batch
+    app.deferred_win_ops_count = 0;
+    for (infos, 0..) |info, i| {
+        if (i >= App.MAX_DEFERRED_WIN_OPS) break;
+        app.deferred_win_ops[i] = .{
+            .hwnd = info.hwnd,
+            .x = info.rect.left,
+            .y = info.rect.top,
+            .w = avg_w,
+            .h = avg_h,
+            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+        };
+        app.deferred_win_ops_count = i + 1;
+    }
+    app.mu.unlock();
+
+    if (hwnd) |h| {
+        if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
+            if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal: PostMessageW failed\n", .{});
+            app.mu.lock();
+            app.deferred_win_ops_count = 0;
+            app.mu.unlock();
+        }
     }
 }
 

@@ -104,6 +104,8 @@ pub const WM_APP_QUIT_REQUESTED: c.UINT = c.WM_APP + 19;
 pub const WM_APP_QUIT_TIMEOUT: c.UINT = c.WM_APP + 20;
 pub const WM_APP_RESIZE_POPUPMENU: c.UINT = c.WM_APP + 21;
 pub const WM_APP_UPDATE_CMDLINE_COLORS: c.UINT = c.WM_APP + 22;
+pub const WM_APP_SET_TITLE: c.UINT = c.WM_APP + 23;
+pub const WM_APP_DEFERRED_WIN_POS: c.UINT = c.WM_APP + 24;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -572,6 +574,17 @@ pub const ScrollbarGeometry = struct {
 // =========================================================================
 
 pub const App = struct {
+    // Deferred SetWindowPos operations (avoids cross-thread WM_SIZE deadlock)
+    pub const MAX_DEFERRED_WIN_OPS = 32;
+    pub const DeferredWinOp = struct {
+        hwnd: c.HWND,
+        x: c_int,
+        y: c_int,
+        w: c_int,
+        h: c_int,
+        flags: c.UINT,
+    };
+
     alloc: std.mem.Allocator,
 
     // Configuration loaded from config.toml
@@ -785,6 +798,14 @@ pub const App = struct {
     // Colorscheme default colors (0x00RRGGBB, or 0xFFFFFFFF = not set)
     colorscheme_bg: u32 = 0xFFFFFFFF,
     colorscheme_fg: u32 = 0xFFFFFFFF,
+
+    // Pending title for deferred SetWindowTextW (avoids cross-thread SendMessage deadlock)
+    pending_title: [512]u16 = undefined,
+    pending_title_len: usize = 0,
+
+    // Deferred SetWindowPos operations (avoids cross-thread WM_SIZE deadlock)
+    deferred_win_ops: [MAX_DEFERRED_WIN_OPS]DeferredWinOp = undefined,
+    deferred_win_ops_count: usize = 0,
 
     // ext_windows enabled flag (set from --extwindows command line arg or config)
     ext_windows_enabled: bool = false,

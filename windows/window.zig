@@ -62,6 +62,8 @@ const WM_APP_QUIT_REQUESTED = app_mod.WM_APP_QUIT_REQUESTED;
 const WM_APP_QUIT_TIMEOUT = app_mod.WM_APP_QUIT_TIMEOUT;
 const WM_APP_RESIZE_POPUPMENU = app_mod.WM_APP_RESIZE_POPUPMENU;
 const WM_APP_UPDATE_CMDLINE_COLORS = app_mod.WM_APP_UPDATE_CMDLINE_COLORS;
+const WM_APP_SET_TITLE = app_mod.WM_APP_SET_TITLE;
+const WM_APP_DEFERRED_WIN_POS = app_mod.WM_APP_DEFERRED_WIN_POS;
 
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
@@ -2052,6 +2054,47 @@ pub export fn WndProc(
             // deadlock when calling zonvie_core_get_hl_by_name from callback context.
             if (getApp(hwnd)) |app| {
                 external_windows.updateExternalWindowColors(app);
+            }
+            return 0;
+        },
+
+        WM_APP_SET_TITLE => {
+            // Deferred SetWindowTextW from onSetTitle callback.
+            // SetWindowTextW from the core thread would be an implicit cross-thread
+            // SendMessage(WM_SETTEXT), blocking with grid_mu held → deadlock.
+            if (getApp(hwnd)) |app| {
+                var local_buf: [512]u16 = undefined;
+                app.mu.lock();
+                const len = app.pending_title_len;
+                if (len > 0) {
+                    @memcpy(local_buf[0..len], app.pending_title[0..len]);
+                }
+                app.mu.unlock();
+                if (len > 0) {
+                    local_buf[len] = 0; // null terminate
+                    _ = c.SetWindowTextW(hwnd, &local_buf);
+                }
+            }
+            return 0;
+        },
+
+        WM_APP_DEFERRED_WIN_POS => {
+            // Deferred SetWindowPos from onWinResizeEqual/onWinRotate callbacks.
+            // SetWindowPos from the core thread sends WM_SIZE to the UI thread,
+            // which calls updateLayoutToCore → grid_mu.lock() → deadlock.
+            if (getApp(hwnd)) |app| {
+                var local_ops: [App.MAX_DEFERRED_WIN_OPS]App.DeferredWinOp = undefined;
+                var count: usize = 0;
+                app.mu.lock();
+                count = @min(app.deferred_win_ops_count, App.MAX_DEFERRED_WIN_OPS);
+                if (count > 0) {
+                    @memcpy(local_ops[0..count], app.deferred_win_ops[0..count]);
+                    app.deferred_win_ops_count = 0;
+                }
+                app.mu.unlock();
+                for (local_ops[0..count]) |op| {
+                    _ = c.SetWindowPos(op.hwnd, null, op.x, op.y, op.w, op.h, op.flags);
+                }
             }
             return 0;
         },

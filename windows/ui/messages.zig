@@ -956,30 +956,32 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     var rect: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &rect);
 
-    // Get colors from Normal highlight
+    // Get colors from cached Normal highlight (avoids zonvie_core_get_hl_by_name
+    // which locks grid_mu — calling it during WM_PAINT creates deadlock risk with
+    // any core callback that blocks on the UI thread).
     var bg_rgb: c.COLORREF = c.RGB(38, 38, 46); // Default dark background
     var fg_rgb: c.COLORREF = c.RGB(255, 255, 255); // Default white text
-    if (app.corep) |corep| {
-        var fg: u32 = 0;
-        var bg: u32 = 0;
-        const found = app_mod.zonvie_core_get_hl_by_name(corep, "Normal", &fg, &bg);
-        if (found != 0) {
-            if (bg != 0) {
-                // Apply brightness adjustment
-                var r = @as(u8, @intCast((bg >> 16) & 0xFF));
-                var g = @as(u8, @intCast((bg >> 8) & 0xFF));
-                var b = @as(u8, @intCast(bg & 0xFF));
-                r = @min(255, @as(u16, r) * 13 / 10 + 12);
-                g = @min(255, @as(u16, g) * 13 / 10 + 12);
-                b = @min(255, @as(u16, b) * 13 / 10 + 12);
-                bg_rgb = c.RGB(r, g, b);
-            }
-            if (fg != 0) {
-                const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-                const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-                const b = @as(u8, @intCast(fg & 0xFF));
-                fg_rgb = c.RGB(r, g, b);
-            }
+    {
+        app.mu.lock();
+        const fg = app.colorscheme_fg;
+        const bg = app.colorscheme_bg;
+        app.mu.unlock();
+
+        if (bg != 0xFFFFFFFF and bg != 0) {
+            // Apply brightness adjustment
+            var r = @as(u8, @intCast((bg >> 16) & 0xFF));
+            var g = @as(u8, @intCast((bg >> 8) & 0xFF));
+            var b = @as(u8, @intCast(bg & 0xFF));
+            r = @min(255, @as(u16, r) * 13 / 10 + 12);
+            g = @min(255, @as(u16, g) * 13 / 10 + 12);
+            b = @min(255, @as(u16, b) * 13 / 10 + 12);
+            bg_rgb = c.RGB(r, g, b);
+        }
+        if (fg != 0xFFFFFFFF and fg != 0) {
+            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
+            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
+            const b = @as(u8, @intCast(fg & 0xFF));
+            fg_rgb = c.RGB(r, g, b);
         }
     }
 
@@ -1090,27 +1092,28 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     }
     app.mu.unlock();
 
-    // Get colors from Normal highlight
+    // Get colors from cached Normal highlight (avoids zonvie_core_get_hl_by_name
+    // which locks grid_mu — calling it during WM_PAINT creates deadlock risk).
     var bg_rgb: c.COLORREF = c.RGB(30, 30, 38);
     var fg_rgb: c.COLORREF = c.RGB(180, 180, 180);
-    if (app.corep) |corep| {
-        var fg: u32 = 0;
-        var bg: u32 = 0;
-        const found = app_mod.zonvie_core_get_hl_by_name(corep, "Normal", &fg, &bg);
-        if (found != 0) {
-            if (bg != 0) {
-                // Darken background slightly for mini windows
-                const r = @as(u8, @intCast((bg >> 16) & 0xFF)) / 2;
-                const g = @as(u8, @intCast((bg >> 8) & 0xFF)) / 2;
-                const b = @as(u8, @intCast(bg & 0xFF)) / 2;
-                bg_rgb = c.RGB(r, g, b);
-            }
-            if (fg != 0) {
-                const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-                const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-                const b = @as(u8, @intCast(fg & 0xFF));
-                fg_rgb = c.RGB(r, g, b);
-            }
+    {
+        app.mu.lock();
+        const fg = app.colorscheme_fg;
+        const bg = app.colorscheme_bg;
+        app.mu.unlock();
+
+        if (bg != 0xFFFFFFFF and bg != 0) {
+            // Darken background slightly for mini windows
+            const r = @as(u8, @intCast((bg >> 16) & 0xFF)) / 2;
+            const g = @as(u8, @intCast((bg >> 8) & 0xFF)) / 2;
+            const b = @as(u8, @intCast(bg & 0xFF)) / 2;
+            bg_rgb = c.RGB(r, g, b);
+        }
+        if (fg != 0xFFFFFFFF and fg != 0) {
+            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
+            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
+            const b = @as(u8, @intCast(fg & 0xFF));
+            fg_rgb = c.RGB(r, g, b);
         }
     }
 
