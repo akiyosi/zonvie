@@ -341,7 +341,8 @@ pub export fn WndProc(
             return 0;
         },
         c.WM_PAINT => {
-            applog.appLog("WM_PAINT tid={d}", .{ c.GetCurrentThreadId() });
+            const log_enabled = applog.isEnabled();
+            if (log_enabled) applog.appLog("WM_PAINT tid={d}", .{ c.GetCurrentThreadId() });
 
             if (getApp(hwnd)) |app| {
                 var ps: c.PAINTSTRUCT = undefined;
@@ -400,7 +401,15 @@ pub export fn WndProc(
                 // if (dirty) |r| {
                 //     applog.appLog("[win]   dirty_rect=({d},{d})-({d},{d})\n", .{ r.left, r.top, r.right, r.bottom });
                 // }
-        
+
+                // Phase timing for WM_PAINT
+                var t_snapshot_start_ns: i128 = 0;
+                var t_snapshot_end_ns: i128 = 0;
+                var t_atlas_end_ns: i128 = 0;
+                if (log_enabled) {
+                    t_snapshot_start_ns = std.time.nanoTimestamp();
+                }
+
                 app.mu.lock();
                 if (app.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
@@ -474,23 +483,29 @@ pub export fn WndProc(
 
     app.mu.unlock();
 
-                applog.appLog(
-                    "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d} main_verts={d}\n",
-                    .{
-                        ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom,
-                        if (dirty == null) "null" else "rect",
-                        @as(u32, @intFromBool(did_need_seed)),
-                        @as(u32, @intFromBool(row_mode)),
-                        rows_snapshot,
-                        row_verts_len,
-                        main_verts_len_snapshot,
-                    },
-                );
-                if (row_mode and rows_mismatch) {
+                if (log_enabled) {
+                    t_snapshot_end_ns = std.time.nanoTimestamp();
+                }
+
+                if (log_enabled) {
                     applog.appLog(
-                        "[win] WM_PAINT(row) WARN rows_mismatch rows={d} max_row_end={d} row_verts_len={d}\n",
-                        .{ rows_snapshot, row_mode_max_row_end_snapshot, row_verts_len },
+                        "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d} main_verts={d}\n",
+                        .{
+                            ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom,
+                            if (dirty == null) "null" else "rect",
+                            @as(u32, @intFromBool(did_need_seed)),
+                            @as(u32, @intFromBool(row_mode)),
+                            rows_snapshot,
+                            row_verts_len,
+                            main_verts_len_snapshot,
+                        },
                     );
+                    if (row_mode and rows_mismatch) {
+                        applog.appLog(
+                            "[win] WM_PAINT(row) WARN rows_mismatch rows={d} max_row_end={d} row_verts_len={d}\n",
+                            .{ rows_snapshot, row_mode_max_row_end_snapshot, row_verts_len },
+                        );
+                    }
                 }
         
                 // Flush atlas uploads (may be triggered by core updates).
@@ -508,14 +523,17 @@ pub export fn WndProc(
                         if (app.atlas_full_upload_needed) {
                             a.uploadFullAtlasToD3D(g);
                             app.atlas_full_upload_needed = false;
-                            applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
+                            if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
                         }
                     }
                 }
-                if (atlas_uploads != 0) {
+                if (log_enabled and atlas_uploads != 0) {
                     applog.appLog("[win] atlas_uploads flushed={d}\n", .{ atlas_uploads });
                 }
-        
+                if (log_enabled) {
+                    t_atlas_end_ns = std.time.nanoTimestamp();
+                }
+
                 var render_ok = false;
                 if (gpu_ptr) |g| {
                     // Lock D3D context for thread-safe rendering
@@ -620,7 +638,7 @@ pub export fn WndProc(
                                 };
                             } else {
                                 // Row-mode flipped mid-frame; skip and let the next paint handle it.
-                                applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
+                                if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
                             }
                         }
                         if (non_row_draw) {
@@ -632,7 +650,6 @@ pub export fn WndProc(
                         }
                     } else {
                         // --- Row-mode ---
-                        const log_enabled = applog.isEnabled();
                         var t_row_start_ns: i128 = 0;
                         var t_present_start_ns: i128 = 0;
                         if (log_enabled) {
@@ -715,32 +732,34 @@ pub export fn WndProc(
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
 
-                        applog.appLog(
-                            "[win] WM_PAINT(row) force_full_rows={d} rows_to_draw={d} dirty_keys={d} row_verts_len={d}\n",
-                            .{
-                                @as(u32, @intFromBool(force_full_rows)),
-                                rows_to_draw.items.len,
-                                dirty_row_keys.items.len,
-                                row_verts_len,
-                            },
-                        );
-                        if (force_full_rows and effective_rows == 0) {
+                        if (log_enabled) {
                             applog.appLog(
-                                "[win] WM_PAINT(row) WARN rows_unknown skip_present rows_to_draw={d} row_verts_len={d}\n",
-                                .{ rows_to_draw.items.len, row_verts_len },
+                                "[win] WM_PAINT(row) force_full_rows={d} rows_to_draw={d} dirty_keys={d} row_verts_len={d}\n",
+                                .{
+                                    @as(u32, @intFromBool(force_full_rows)),
+                                    rows_to_draw.items.len,
+                                    dirty_row_keys.items.len,
+                                    row_verts_len,
+                                },
                             );
-                        }
-                        if (force_full_rows and effective_rows != 0 and rows_to_draw.items.len != effective_rows) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) WARN partial_full_rows rows={d} rows_to_draw={d}\n",
-                                .{ effective_rows, rows_to_draw.items.len },
-                            );
-                        }
-                        if (!force_full_rows and rows_to_draw.items.len == 0 and (dirty_row_keys.items.len != 0 or paint_rects_snapshot.items.len != 0)) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) WARN empty_rows_to_draw rows={d} row_verts_len={d} dirty_keys={d} paint_rects={d}\n",
-                                .{ rows_snapshot, row_verts_len, dirty_row_keys.items.len, paint_rects_snapshot.items.len },
-                            );
+                            if (force_full_rows and effective_rows == 0) {
+                                applog.appLog(
+                                    "[win] WM_PAINT(row) WARN rows_unknown skip_present rows_to_draw={d} row_verts_len={d}\n",
+                                    .{ rows_to_draw.items.len, row_verts_len },
+                                );
+                            }
+                            if (force_full_rows and effective_rows != 0 and rows_to_draw.items.len != effective_rows) {
+                                applog.appLog(
+                                    "[win] WM_PAINT(row) WARN partial_full_rows rows={d} rows_to_draw={d}\n",
+                                    .{ effective_rows, rows_to_draw.items.len },
+                                );
+                            }
+                            if (!force_full_rows and rows_to_draw.items.len == 0 and (dirty_row_keys.items.len != 0 or paint_rects_snapshot.items.len != 0)) {
+                                applog.appLog(
+                                    "[win] WM_PAINT(row) WARN empty_rows_to_draw rows={d} row_verts_len={d} dirty_keys={d} paint_rects={d}\n",
+                                    .{ rows_snapshot, row_verts_len, dirty_row_keys.items.len, paint_rects_snapshot.items.len },
+                                );
+                            }
                         }
 
                         // --- Build present dirty from actual drawn row_rc + cursor_rc (don't use rcPaint) ---
@@ -751,7 +770,7 @@ pub export fn WndProc(
                             defer app.mu.unlock();
                             app.row_tmp_verts.clearRetainingCapacity();
                             const cur = app.cursor_verts.items;
-                            applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cur.len});
+                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cur.len});
                             if (cur.len != 0) {
                                 app.row_tmp_verts.ensureTotalCapacity(app.alloc, cur.len) catch {
                                     applog.appLog("[win] WM_PAINT(row) cursor snapshot ensure cap failed\n", .{});
@@ -823,7 +842,7 @@ pub export fn WndProc(
                         else
                             rowHeightPxFromClient(hwnd, rows_for_layout, fallback_row_h);
                         const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
-                        if (row_h_px_u32 != fallback_row_h or rows_mismatch) {
+                        if (log_enabled and (row_h_px_u32 != fallback_row_h or rows_mismatch)) {
                             applog.appLog(
                                 "[win] WM_PAINT(row) row_h_px adjust rows={d} client_h={d} fallback={d} row_h={d}\n",
                                 .{ rows_for_layout, client.bottom, fallback_row_h, row_h_px_u32 },
@@ -993,12 +1012,12 @@ pub export fn WndProc(
                                 }
                                 if (!exists) {
                                     present_rects.append(app.alloc, cr) catch {};
-                                    applog.appLog("[win] WM_PAINT(row) cursor added to present_rects (contained={d})\n", .{@intFromBool(contained)});
+                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor added to present_rects (contained={d})\n", .{@intFromBool(contained)});
                                 } else {
-                                    applog.appLog("[win] WM_PAINT(row) cursor already in present_rects\n", .{});
+                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor already in present_rects\n", .{});
                                 }
                             } else {
-                                applog.appLog("[win] WM_PAINT(row) cursor rect invalid after clamp\n", .{});
+                                if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor rect invalid after clamp\n", .{});
                             }
                         }
 
@@ -1076,7 +1095,7 @@ pub export fn WndProc(
                         // all swapchain buffers are properly cleared as they rotate. This prevents
                         // ghost artifacts in the gutter area when grid shrinks.
                         const preserve_back = !seed_clear and !seed_pending_snapshot;
-                        applog.appLog(
+                        if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{
                                 @as(u32, @intFromBool(preserve_back)),
@@ -1103,7 +1122,7 @@ pub export fn WndProc(
                         ) catch |e| {
                             applog.appLog("gpu.drawEx(row-setup) failed: {any}\n", .{e});
                         };
-                        applog.appLog(
+                        if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d}\n",
                             .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len },
                         );
@@ -1124,7 +1143,7 @@ pub export fn WndProc(
                         {
                             const ctx = g.ctx orelse null;
                             if (ctx == null) {
-                                applog.appLog("gpu ctx null in WM_PAINT(row)\n", .{});
+                                if (log_enabled) applog.appLog("gpu ctx null in WM_PAINT(row)\n", .{});
                             } else {
                                 ctx_ptr = ctx.?;
                                 const ctx_vtbl = ctx.?.*.lpVtbl;
@@ -1135,7 +1154,7 @@ pub export fn WndProc(
 
                                 const use_row_scissor = !seed_pending_snapshot;
                                 if (!use_row_scissor) {
-                                    applog.appLog("[win] WM_PAINT(row) seed_pending: scissor=full\n", .{});
+                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) seed_pending: scissor=full\n", .{});
                                     if (rs_set_sc_fn) |f| {
                                         // Clamp to content width for "always" scrollbar mode
                                         const scissor_right: c.LONG = if (content_width) |cw| @intCast(cw) else client.right;
@@ -1227,15 +1246,17 @@ pub export fn WndProc(
                                     drawn_rows += 1;
                                 }
 
-                                applog.appLog(
-                                    "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
-                                    .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
-                                );
-                                if (first_empty_row) |erow| {
+                                if (log_enabled) {
                                     applog.appLog(
-                                        "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
-                                        .{ erow, rows_snapshot, row_verts_len },
+                                        "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
+                                        .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
                                     );
+                                    if (first_empty_row) |erow| {
+                                        applog.appLog(
+                                            "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
+                                            .{ erow, rows_snapshot, row_verts_len },
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1296,21 +1317,21 @@ pub export fn WndProc(
 
                                     // Only draw cursor if blink state is visible
                                     if (app.cursor_blink_state) {
-                                        applog.appLog("[win] WM_PAINT(row) drawing cursor verts={d}\n", .{cursor_verts_snapshot.len});
+                                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) drawing cursor verts={d}\n", .{cursor_verts_snapshot.len});
                                         g.drawVB(vb, cursor_verts_snapshot.len) catch |e| {
                                             applog.appLog("drawVB failed cursor: {any}\n", .{e});
                                         };
                                     } else {
-                                        applog.appLog("[win] WM_PAINT(row) cursor hidden (blink off)\n", .{});
+                                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor hidden (blink off)\n", .{});
                                         // Redraw cursor row to clear cursor from back_tex
                                         if (cursor_rc_opt) |cr| {
                                             const y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
                                             if (row_h_px > 0) {
                                                 const cursor_row: usize = @intCast(@divFloor(@max(0, cr.top - y_offset_i32), row_h_px));
-                                                applog.appLog("[win] WM_PAINT(row) redrawing cursor_row={d} to clear\n", .{cursor_row});
+                                                if (log_enabled) applog.appLog("[win] WM_PAINT(row) redrawing cursor_row={d} to clear\n", .{cursor_row});
                                                 if (cursor_row < app.row_verts.items.len) {
                                                     const rv = &app.row_verts.items[cursor_row];
-                                                    applog.appLog("[win] WM_PAINT(row) cursor_row rv.vb={} src.len={d}\n", .{ rv.vb != null, rv.verts.items.len });
+                                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_row rv.vb={} src.len={d}\n", .{ rv.vb != null, rv.verts.items.len });
                                                     if (rv.vb) |row_vb| {
                                                         const src = rv.verts.items;
                                                         if (src.len > 0) {
@@ -1327,14 +1348,14 @@ pub export fn WndProc(
                                                             if (rs_set_sc_fn) |f| {
                                                                 f(ctx_ptr, 1, &sc);
                                                             }
-                                                            applog.appLog("[win] WM_PAINT(row) drawing cursor_row={d} verts={d}\n", .{ cursor_row, src.len });
+                                                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) drawing cursor_row={d} verts={d}\n", .{ cursor_row, src.len });
                                                             g.drawVB(row_vb, src.len) catch |e| {
                                                                 applog.appLog("drawVB failed cursor_row clear: {any}\n", .{e});
                                                             };
                                                         }
                                                     }
                                                 } else {
-                                                    applog.appLog("[win] WM_PAINT(row) cursor_row={d} out of range (len={d})\n", .{ cursor_row, app.row_verts.items.len });
+                                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_row={d} out of range (len={d})\n", .{ cursor_row, app.row_verts.items.len });
                                                 }
                                             }
                                         }
@@ -1342,33 +1363,33 @@ pub export fn WndProc(
                                 }
                             }
                         } else {
-                            applog.appLog("[win] WM_PAINT(row) NO cursor (snapshot empty)\n", .{});
+                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) NO cursor (snapshot empty)\n", .{});
                         }
 
-                        if (force_full_rows and skipped_empty != 0) {
+                        if (log_enabled and force_full_rows and skipped_empty != 0) {
                             applog.appLog(
                                 "[win] WM_PAINT(row) WARN skip_present missing_rows={d} rows={d} row_verts_len={d}\n",
                                 .{ skipped_empty, rows_snapshot, row_verts_len },
                             );
                         }
 
-                        var log_present_rects_area_px: u64 = 0;
+                        if (log_enabled) {
+                            var log_present_rects_area_px: u64 = 0;
 
-                        // --- log: present_rects area (sum of rect areas) ---
-                        if (present_rects.items.len != 0) {
-                            var pi: usize = 0;
-                            while (pi < present_rects.items.len) : (pi += 1) {
-                                const r = present_rects.items[pi];
-                                const w_i32: i32 = r.right - r.left;
-                                const h_i32: i32 = r.bottom - r.top;
-                                if (w_i32 > 0 and h_i32 > 0) {
-                                    log_present_rects_area_px +=
-                                        @as(u64, @intCast(w_i32)) * @as(u64, @intCast(h_i32));
+                            // --- log: present_rects area (sum of rect areas) ---
+                            if (present_rects.items.len != 0) {
+                                var pi: usize = 0;
+                                while (pi < present_rects.items.len) : (pi += 1) {
+                                    const r = present_rects.items[pi];
+                                    const w_i32: i32 = r.right - r.left;
+                                    const h_i32: i32 = r.bottom - r.top;
+                                    if (w_i32 > 0 and h_i32 > 0) {
+                                        log_present_rects_area_px +=
+                                            @as(u64, @intCast(w_i32)) * @as(u64, @intCast(h_i32));
+                                    }
                                 }
                             }
-                        }
 
-                        if (applog.isEnabled()) {
                             applog.appLog(
                                 "[win] WM_PAINT(row-frame) drawn_rows={d} rows_to_draw={d} present_rects={d} present_area_px={d} vb_upload_rows={d} vb_upload_rows_bytes={d} vb_upload_cursor={d} vb_upload_cursor_bytes={d}\n",
                                 .{
@@ -1488,13 +1509,13 @@ pub export fn WndProc(
                                 app.paint_rects.clearRetainingCapacity();
                                 app.seed_clear_pending = true;
                                 app.mu.unlock();
-                                applog.appLog(
+                                if (log_enabled) applog.appLog(
                                     "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
                                     .{ effective_rows, effective_row_valid_count },
                                 );
                                 _ = c.InvalidateRect(hwnd, null, c.FALSE);
                             }
-                        } else {
+                        } else if (log_enabled) {
                             var resize_age_ms: i64 = -1;
                             const last_resize_ns = app.last_resize_ns;
                             if (last_resize_ns != 0) {
@@ -1527,14 +1548,16 @@ pub export fn WndProc(
 
                         if (log_enabled) {
                             const t_done_ns: i128 = std.time.nanoTimestamp();
+                            const snapshot_us: u64 = @intCast(@divTrunc(@max(0, t_snapshot_end_ns - t_snapshot_start_ns), 1000));
+                            const atlas_us: u64 = @intCast(@divTrunc(@max(0, t_atlas_end_ns - t_snapshot_end_ns), 1000));
                             const row_us: u64 = @intCast(@divTrunc(@max(0, t_present_start_ns - t_row_start_ns), 1000));
                             const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_present_start_ns), 1000));
                             const total_us: u64 = row_us + present_us;
                             const vb_upload_us: u64 = @intCast(@divTrunc(@max(0, log_vb_upload_ns), 1000));
                             const draw_vb_us: u64 = @intCast(@divTrunc(@max(0, log_draw_vb_ns), 1000));
                             applog.appLog(
-                                "[perf] row_mode_ui rows={d} vb_upload_us={d} draw_vb_us={d} row_us={d} present_us={d} total_us={d}\n",
-                                .{ rows_to_draw.items.len, vb_upload_us, draw_vb_us, row_us, present_us, total_us },
+                                "[perf] row_mode_ui snapshot_us={d} atlas_us={d} rows={d} vb_upload_us={d} draw_vb_us={d} row_us={d} present_us={d} total_us={d}\n",
+                                .{ snapshot_us, atlas_us, rows_to_draw.items.len, vb_upload_us, draw_vb_us, row_us, present_us, total_us },
                             );
                         }
                     }
@@ -1720,7 +1743,7 @@ pub export fn WndProc(
                     };
                     out_entry.* = e;
 
-                    applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: ok scalar={d} out_entry_ptr=0x{x} uv_min=({d:.6},{d:.6}) uv_max=({d:.6},{d:.6})", .{
+                    if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: ok scalar={d} out_entry_ptr=0x{x} uv_min=({d:.6},{d:.6}) uv_max=({d:.6},{d:.6})", .{
                         scalar,
                         out_entry_ptr_bits,
                         e.uv_min[0], e.uv_min[1],
@@ -1788,8 +1811,16 @@ pub export fn WndProc(
                 } else {
                     // Cursor moved to main grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
-                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                    applog.appLog("[win] activated main window (cursor on grid_id={d})\n", .{grid_id});
+                    // Only invalidate if no paint is already pending from on_vertices_row/partial.
+                    // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
+                    // will handle cursor rendering as part of the normal draw.
+                    app.mu.lock();
+                    const has_pending = app.dirty_rows.count() > 0 or app.paint_full or app.paint_rects.items.len > 0;
+                    app.mu.unlock();
+                    if (!has_pending) {
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+                    applog.appLog("[win] activated main window (cursor on grid_id={d}) pending={}\n", .{ grid_id, has_pending });
                 }
             }
             return 0;

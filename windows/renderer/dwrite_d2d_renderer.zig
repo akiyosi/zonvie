@@ -935,14 +935,16 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         }
 
         // Periodic stats report
-        const now_ns: i128 = std.time.nanoTimestamp();
-        if (g_log_styled_last_report_ns == 0) g_log_styled_last_report_ns = now_ns;
-        if (now_ns - g_log_styled_last_report_ns >= @as(i128, 1_000_000_000)) {
-            if (applog.isEnabled()) applog.appLog("[styled] stats: hits={d} misses={d} fallbacks={d}\n", .{ g_log_styled_hits, g_log_styled_misses, g_log_styled_fallbacks });
-            g_log_styled_hits = 0;
-            g_log_styled_misses = 0;
-            g_log_styled_fallbacks = 0;
-            g_log_styled_last_report_ns = now_ns;
+        if (applog.isEnabled()) {
+            const now_ns: i128 = std.time.nanoTimestamp();
+            if (g_log_styled_last_report_ns == 0) g_log_styled_last_report_ns = now_ns;
+            if (now_ns - g_log_styled_last_report_ns >= @as(i128, 1_000_000_000)) {
+                applog.appLog("[styled] stats: hits={d} misses={d} fallbacks={d}\n", .{ g_log_styled_hits, g_log_styled_misses, g_log_styled_fallbacks });
+                g_log_styled_hits = 0;
+                g_log_styled_misses = 0;
+                g_log_styled_fallbacks = 0;
+                g_log_styled_last_report_ns = now_ns;
+            }
         }
 
         self.styled_glyph_map.put(cache_key, entry) catch {
@@ -1433,9 +1435,10 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         verts: []const core.Vertex,
     ) !void {
         if (verts.len < 6) return;
-    
+
         _ = self;
-    
+        const log_active = applog.isEnabled();
+
         const rtv = rt.lpVtbl.*;
     
         // Avoid GetSize (it can crash in some states); use caller-provided client size.
@@ -1516,16 +1519,16 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             }
     
             // ---- Debug for root-cause: first 4 quads ----
-            if (i < 24) {
+            if (i < 24 and log_active) {
                 applog.appLog(
                     "[d2d] quad{d} any_bg={any} uv(min/max)=({d},{d})..({d},{d})\n",
                     .{ i / 6, any_bg_marker, min_u, min_v, max_u, max_v },
                 );
             }
-    
+
             // BG quad: FillRectangle
             if (any_bg_marker) {
-                if (i == 0) {
+                if (i == 0 and log_active) {
                     applog.appLog("[d2d] quad0 BG FillRectangle dst=({d},{d},{d},{d})\n", .{
                         dst.left, dst.top, dst.right, dst.bottom,
                     });
@@ -1543,7 +1546,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             const v_max = std.math.clamp(max_v, 0.0, 1.0);
     
             if (u_max <= u_min or v_max <= v_min) {
-                if (i < 24) {
+                if (i < 24 and log_active) {
                     applog.appLog(
                         "[d2d] quad{d} UV degenerate (clamped) u={d}..{d} v={d}..{d}\n",
                         .{ i / 6, u_min, u_max, v_min, v_max },
@@ -1560,7 +1563,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             };
     
             if (rtv.FillOpacityMask) |fill_mask_fn| {
-                if (i < 24) {
+                if (i < 24 and log_active) {
                     applog.appLog(
                         "[d2d] quad{d} GLYPH FillOpacityMask dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
                         .{
@@ -1580,20 +1583,22 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                     &src,
                 );
     
-                if (i < 24) {
+                if (i < 24 and log_active) {
                     applog.appLog("[d2d] quad{d} FillOpacityMask returned\n", .{ i / 6 });
                 }
             }
         }
 
-        // DEBUG: count glyph vertices inside THIS vertex list (texCoord >= 0)
-        var glyph_vtx: usize = 0;
-        for (verts) |v| {
-            if (v.texCoord[0] >= 0.0 and v.texCoord[1] >= 0.0) {
-                glyph_vtx += 1;
+        if (log_active) {
+            // DEBUG: count glyph vertices inside THIS vertex list (texCoord >= 0)
+            var glyph_vtx: usize = 0;
+            for (verts) |v| {
+                if (v.texCoord[0] >= 0.0 and v.texCoord[1] >= 0.0) {
+                    glyph_vtx += 1;
+                }
             }
+            applog.appLog("[d2d] drawVertexList: total_vtx={d} glyph_vtx={d}\n", .{ verts.len, glyph_vtx });
         }
-        applog.appLog("[d2d] drawVertexList: total_vtx={d} glyph_vtx={d}\n", .{ verts.len, glyph_vtx });
     }
 
     fn flushPendingAtlasUploadsLocked(self: *Renderer) void {
@@ -1632,8 +1637,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         d3d: anytype, // expects: d3d.atlasUploadRect(x,y,w,h,data,row_pitch)
     ) u32 {
         if (self.pending_uploads.items.len == 0) return 0;
-    
-        applog.appLog(
+
+        if (applog.isEnabled()) applog.appLog(
             "[atlas] cpu_atlas: len={d} cap={d} ptr=0x{x}\n",
             .{
                 self.atlas_cpu.items.len,
@@ -1649,7 +1654,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             const h: u32 = r.bottom - r.top;
             if (w == 0 or h == 0) continue;
     
-            if (idx < 8) {
+            if (idx < 8 and applog.isEnabled()) {
                 applog.appLog(
                     "[atlas]   upload[{d}] (x={d},y={d},w={d},h={d})\n",
                     .{ idx, r.left, r.top, w, h },
@@ -1692,7 +1697,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
 
     if (self.atlas_cpu.items.len == 0) return;
 
-    applog.appLog(
+    if (applog.isEnabled()) applog.appLog(
         "[atlas] uploadFullAtlasToD3D: uploading full atlas {d}x{d}\n",
         .{ AtlasW, AtlasH },
     );

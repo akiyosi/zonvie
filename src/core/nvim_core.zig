@@ -714,6 +714,10 @@ pub const Core = struct {
     pub fn loadAsciiTables(self: *Core) bool {
         if (self.ascii_tables_valid) return true;
         const cb = self.cb.on_get_ascii_table orelse return false;
+
+        const log_active = self.log.cb != null;
+        const t0: i128 = if (log_active) std.time.nanoTimestamp() else 0;
+
         const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
         var all_ok = true;
         for (0..4) |i| {
@@ -726,7 +730,21 @@ pub const Core = struct {
             );
             if (ok == 0) all_ok = false;
         }
+
+        const t1: i128 = if (log_active) std.time.nanoTimestamp() else 0;
+
         self.ascii_tables_valid = all_ok;
+        if (all_ok) {
+            self.preRasterizeAscii();
+        }
+
+        if (log_active) {
+            const t2 = std.time.nanoTimestamp();
+            const table_us: i64 = @intCast(@divTrunc(@max(0, t1 - t0), 1000));
+            const preraster_us: i64 = @intCast(@divTrunc(@max(0, t2 - t1), 1000));
+            self.log.write("[perf] loadAsciiTables table_fetch_us={d} preraster_us={d} ok={}\n", .{ table_us, preraster_us, all_ok });
+        }
+
         return all_ok;
     }
 
@@ -853,6 +871,57 @@ pub const Core = struct {
             if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
             self.atlas_initialized = true;
         }
+    }
+
+    /// Pre-rasterize printable ASCII (0x20-0x7E) for all style combos
+    /// to eliminate cold-cache DWrite spikes on first flush.
+    /// Called once after loadAsciiTables() succeeds (on font init).
+    pub fn preRasterizeAscii(self: *Core) void {
+        // Guard: required callbacks must be set (ensureGlyphByID unwraps .?)
+        if (self.cb.on_rasterize_glyph_by_id == null) return;
+        if (self.cb.on_atlas_upload == null) return;
+        if (self.cb.on_atlas_create == null) return;
+
+        self.initGlyphCache() catch return;
+        const cache = self.glyph_cache_by_id orelse return;
+        const keys = self.glyph_keys_by_id orelse return;
+        const CACHE_SIZE = self.glyph_cache_non_ascii_size;
+        if (CACHE_SIZE == 0) return;
+
+        const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
+        const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
+
+        var rasterized: u32 = 0;
+        var skipped: u32 = 0;
+
+        for (0..4) |si| {
+            const gids = &self.ascii_glyph_ids[si];
+            const c_style = style_combos[si];
+
+            for (0x20..0x7F) |scalar| {
+                const gid = gids[scalar];
+                if (gid == 0) continue; // .notdef
+
+                const key = (@as(u64, gid) << 2) | @as(u64, si);
+                const hash_val = (gid *% 2654435761) ^ @as(u32, @intCast(si));
+                const hash_idx = @as(usize, hash_val % CACHE_SIZE);
+
+                // Already cached → skip
+                if (keys[hash_idx] != INVALID_KEY and keys[hash_idx] == key) {
+                    skipped += 1;
+                    continue;
+                }
+
+                // Rasterize + pack + upload
+                if (self.ensureGlyphByID(gid, c_style)) |entry| {
+                    cache[hash_idx] = entry;
+                    keys[hash_idx] = key;
+                    rasterized += 1;
+                }
+            }
+        }
+
+        self.log.write("[perf] preRasterizeAscii rasterized={d} skipped={d}\n", .{ rasterized, skipped });
     }
 
     /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.

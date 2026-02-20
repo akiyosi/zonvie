@@ -687,6 +687,11 @@ pub const App = struct {
     // Scrollbar update coalescing: set by on_flush_end (core thread), cleared by WM_APP_UPDATE_SCROLLBAR (UI thread).
     scrollbar_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    // DWrite rasterization perf counters (accumulated during flush, reported by onFlushEnd)
+    rasterize_call_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    rasterize_total_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rasterize_max_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     // ---- NEW: cursor VB upload generation (row-mode overlay) ----
     cursor_gen: u64 = 0,
     cursor_uploaded_gen: u64 = 0,

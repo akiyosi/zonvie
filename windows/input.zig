@@ -284,7 +284,8 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const comp_len = app.ime_composition_str.items.len;
     app.mu.unlock();
 
-    applog.appLog("[IME] updateImePreeditOverlay composing={d} comp_len={d}\n", .{ @intFromBool(composing), comp_len });
+    const log_active = applog.isEnabled();
+    if (log_active) applog.appLog("[IME] updateImePreeditOverlay composing={d} comp_len={d}\n", .{ @intFromBool(composing), comp_len });
 
     // Hide overlay if not composing
     if (!composing or comp_len == 0) {
@@ -328,13 +329,13 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     }
 
     if (corep == null) {
-        applog.appLog("[IME] corep is null\n", .{});
+        if (log_active) applog.appLog("[IME] corep is null\n", .{});
         return;
     }
 
     // Validate cell dimensions
     if (cell_w == 0 or cell_h == 0) {
-        applog.appLog("[IME] cell dimensions are 0\n", .{});
+        if (log_active) applog.appLog("[IME] cell dimensions are 0\n", .{});
         return;
     }
 
@@ -458,7 +459,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     }
     _ = c.ClientToScreen(coord_hwnd, &pt);
 
-    applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h });
+    if (log_active) applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h });
 
     // Create overlay window if it doesn't exist (use layered window)
     if (app.ime_overlay_hwnd == null) {
@@ -477,11 +478,11 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
             null,
         );
         if (new_overlay == null) {
-            applog.appLog("[IME] CreateWindowExW failed\n", .{});
+            if (log_active) applog.appLog("[IME] CreateWindowExW failed\n", .{});
             return;
         }
         app.ime_overlay_hwnd = new_overlay;
-        applog.appLog("[IME] created overlay window\n", .{});
+        if (log_active) applog.appLog("[IME] created overlay window\n", .{});
     }
 
     const overlay = app.ime_overlay_hwnd orelse return;
@@ -527,7 +528,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // Draw the entire composition string
     _ = c.TextOutW(mem_dc, 0, 0, comp_str.ptr, @intCast(comp_str.len));
 
-    applog.appLog("[IME] overlay draw: target_start={d} target_end={d} comp_len={d}\n", .{ target_start, target_end, comp_str.len });
+    if (log_active) applog.appLog("[IME] overlay draw: target_start={d} target_end={d} comp_len={d}\n", .{ target_start, target_end, comp_str.len });
 
     // Draw underline for target clause using pen (same as main window approach)
     if (target_start < comp_str.len and target_end <= comp_str.len and target_start < target_end) {
@@ -550,7 +551,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
             target_end_x = size_to_end.cx;
         }
 
-        applog.appLog("[IME] underline: start_x={d} end_x={d}\n", .{ target_start_x, target_end_x });
+        if (log_active) applog.appLog("[IME] underline: start_x={d} end_x={d}\n", .{ target_start_x, target_end_x });
 
         if (target_end_x > target_start_x) {
             const old_pen = c.SelectObject(mem_dc, pen_target);
@@ -598,7 +599,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         c.ULW_ALPHA,
     );
 
-    applog.appLog("[IME] overlay updated\n", .{});
+    if (log_active) applog.appLog("[IME] overlay updated\n", .{});
 }
 
 /// Hide IME preedit overlay.
@@ -618,7 +619,7 @@ pub fn startCursorBlinking(hwnd: c.HWND, app: *App, wait_ms: u32, on_ms: u32, of
 
     // Don't blink if on_ms is 0
     if (on_ms == 0) {
-        applog.appLog("[blink] on_ms=0, not blinking\n", .{});
+        if (applog.isEnabled()) applog.appLog("[blink] on_ms=0, not blinking\n", .{});
         return;
     }
 
@@ -628,11 +629,11 @@ pub fn startCursorBlinking(hwnd: c.HWND, app: *App, wait_ms: u32, on_ms: u32, of
 
     // Start with wait phase if wait_ms > 0
     if (wait_ms > 0) {
-        applog.appLog("[blink] starting with wait_ms={d}\n", .{wait_ms});
+        if (applog.isEnabled()) applog.appLog("[blink] starting with wait_ms={d}\n", .{wait_ms});
         app.cursor_blink_phase = 0;
         app.cursor_blink_state = true;
         const timer_result = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, wait_ms, null);
-        applog.appLog("[blink] SetTimer result={d}\n", .{timer_result});
+        if (applog.isEnabled()) applog.appLog("[blink] SetTimer result={d}\n", .{timer_result});
         app.cursor_blink_timer = timer_result;
     } else {
         // No wait, start blinking immediately
@@ -642,7 +643,7 @@ pub fn startCursorBlinking(hwnd: c.HWND, app: *App, wait_ms: u32, on_ms: u32, of
 
 /// Enter the on/off blink cycle
 pub fn enterBlinkCycle(hwnd: c.HWND, app: *App) void {
-    applog.appLog("[blink] enterBlinkCycle\n", .{});
+    if (applog.isEnabled()) applog.appLog("[blink] enterBlinkCycle\n", .{});
     app.cursor_blink_phase = 1;
     app.cursor_blink_state = true;
     scheduleNextBlink(hwnd, app, true);
@@ -655,11 +656,11 @@ pub fn scheduleNextBlink(hwnd: c.HWND, app: *App, is_currently_on: bool) void {
     const interval = if (is_currently_on) app.cursor_blink_on_ms else app.cursor_blink_off_ms;
 
     if (interval == 0) {
-        applog.appLog("[blink] interval=0, stopping\n", .{});
+        if (applog.isEnabled()) applog.appLog("[blink] interval=0, stopping\n", .{});
         return;
     }
 
-    applog.appLog("[blink] scheduleNextBlink: is_on={} interval={d}ms\n", .{ is_currently_on, interval });
+    if (applog.isEnabled()) applog.appLog("[blink] scheduleNextBlink: is_on={} interval={d}ms\n", .{ is_currently_on, interval });
     app.cursor_blink_timer = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, interval, null);
 }
 
@@ -674,7 +675,7 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
     } else {
         // Toggle blink state
         app.cursor_blink_state = !app.cursor_blink_state;
-        applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink_state});
+        if (applog.isEnabled()) applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink_state});
 
         // Update external windows blink state
         updateExternalWindowsBlinkState(app);
@@ -714,7 +715,7 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
         app_mod.zonvie_core_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms);
     }
 
-    applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink_wait_ms, app.cursor_blink_on_ms, app.cursor_blink_off_ms });
+    if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink_wait_ms, app.cursor_blink_on_ms, app.cursor_blink_off_ms });
 
     // Check if blink settings changed
     const settings_changed = wait_ms != app.cursor_blink_wait_ms or
@@ -724,19 +725,19 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
     // Check if timer is currently stopped
     const timer_stopped = app.cursor_blink_timer == 0;
 
-    applog.appLog("[blink] settings_changed={}, on_ms>0={}, off_ms>0={}, timer_stopped={}\n", .{ settings_changed, on_ms > 0, off_ms > 0, timer_stopped });
+    if (applog.isEnabled()) applog.appLog("[blink] settings_changed={}, on_ms>0={}, off_ms>0={}, timer_stopped={}\n", .{ settings_changed, on_ms > 0, off_ms > 0, timer_stopped });
 
     if (on_ms > 0 and off_ms > 0) {
         // Blink should be enabled
         if (settings_changed or timer_stopped) {
             // Start/restart if settings changed OR timer was stopped (e.g., after mode change to non-blinking mode)
-            applog.appLog("[blink] calling startCursorBlinking\n", .{});
+            if (applog.isEnabled()) applog.appLog("[blink] calling startCursorBlinking\n", .{});
             startCursorBlinking(hwnd, app, wait_ms, on_ms, off_ms);
         }
     } else {
         // Blink should be disabled
         if (settings_changed) {
-            applog.appLog("[blink] calling stopCursorBlinking\n", .{});
+            if (applog.isEnabled()) applog.appLog("[blink] calling stopCursorBlinking\n", .{});
             stopCursorBlinking(hwnd, app);
         }
     }

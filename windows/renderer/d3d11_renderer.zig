@@ -1732,7 +1732,7 @@ pub const Renderer = struct {
     fn drawVertices(self: *Renderer, verts: []const core.Vertex) !void {
         if (verts.len == 0) return;
 
-        if (verts.len != 0) {
+        if (applog.isEnabled() and verts.len != 0) {
             const v0 = verts[0];
             applog.appLog(
                 "[d3d] drawVertices n={d} v0 pos=({d:.3},{d:.3}) uv=({d:.3},{d:.3}) col=({d:.2},{d:.2},{d:.2},{d:.2})\n",

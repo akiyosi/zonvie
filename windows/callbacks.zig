@@ -946,6 +946,21 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const ctx_bits: usize = @intFromPtr(ctxp);
     if (ctx_bits % @alignOf(App) != 0) return;
     const app: *App = @ptrFromInt(ctx_bits);
+
+    // Report DWrite rasterization stats for this flush (only when logging enabled)
+    if (applog.isEnabled()) {
+        const raster_count = app.rasterize_call_count.swap(0, .monotonic);
+        if (raster_count > 0) {
+            const raster_total = app.rasterize_total_ns.swap(0, .monotonic);
+            const raster_max = app.rasterize_max_ns.swap(0, .monotonic);
+            applog.appLog("[perf] flush_rasterize calls={d} total_us={d} max_us={d}\n", .{
+                raster_count,
+                @as(u64, @divTrunc(raster_total, 1000)),
+                @as(u64, @divTrunc(raster_max, 1000)),
+            });
+        }
+    }
+
     // Coalesce: only post if not already pending (atomic CAS: false -> true)
     if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
         // CAS succeeded: we own the pending slot
@@ -1116,7 +1131,21 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
         app.mu.unlock();
     }
     if (atlas_ptr) |a| {
-        a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+        if (applog.isEnabled()) {
+            const t0 = std.time.nanoTimestamp();
+            a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+            const elapsed_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t0));
+            _ = app.rasterize_call_count.fetchAdd(1, .monotonic);
+            _ = app.rasterize_total_ns.fetchAdd(elapsed_ns, .monotonic);
+            var cur_max = app.rasterize_max_ns.load(.monotonic);
+            while (elapsed_ns > cur_max) {
+                if (app.rasterize_max_ns.cmpxchgWeak(cur_max, elapsed_ns, .monotonic, .monotonic)) |actual| {
+                    cur_max = actual;
+                } else break;
+            }
+        } else {
+            a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+        }
         return 1;
     }
     return 0;
@@ -1217,7 +1246,21 @@ pub fn onRasterizeGlyphById(
         app.mu.unlock();
     }
     if (atlas_ptr) |a| {
-        a.rasterizeGlyphByIdDWrite(glyph_id, style_flags, out_bitmap) catch return 0;
+        if (applog.isEnabled()) {
+            const t0 = std.time.nanoTimestamp();
+            a.rasterizeGlyphByIdDWrite(glyph_id, style_flags, out_bitmap) catch return 0;
+            const elapsed_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t0));
+            _ = app.rasterize_call_count.fetchAdd(1, .monotonic);
+            _ = app.rasterize_total_ns.fetchAdd(elapsed_ns, .monotonic);
+            var cur_max = app.rasterize_max_ns.load(.monotonic);
+            while (elapsed_ns > cur_max) {
+                if (app.rasterize_max_ns.cmpxchgWeak(cur_max, elapsed_ns, .monotonic, .monotonic)) |actual| {
+                    cur_max = actual;
+                } else break;
+            }
+        } else {
+            a.rasterizeGlyphByIdDWrite(glyph_id, style_flags, out_bitmap) catch return 0;
+        }
         return 1;
     }
     return 0;

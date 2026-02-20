@@ -573,7 +573,7 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
     const geom = getScrollbarGeometry(app, client.right, client.bottom);
     const hit = scrollbarHitTest(app, client.right, client.bottom, mouse_x, mouse_y);
 
-    applog.appLog("[scrollbar] mouseDown x={d} y={d} client=({d},{d}) track=({d:.0},{d:.0})-({d:.0},{d:.0}) knob=({d:.0},{d:.0}) hit={s}\n", .{
+    if (applog.isEnabled()) applog.appLog("[scrollbar] mouseDown x={d} y={d} client=({d},{d}) track=({d:.0},{d:.0})-({d:.0},{d:.0}) knob=({d:.0},{d:.0}) hit={s}\n", .{
         mouse_x, mouse_y, client.right, client.bottom,
         geom.track_left, geom.track_top, geom.track_right, geom.track_bottom,
         geom.knob_top, geom.knob_bottom,
@@ -598,7 +598,7 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
         },
         .track_above => {
             // Page up - execute immediately and start repeat timer
-            applog.appLog("[scrollbar] track_above: executing page scroll up\n", .{});
+            if (applog.isEnabled()) applog.appLog("[scrollbar] track_above: executing page scroll up\n", .{});
             scrollbarPageScroll(app, -1);
             app.scrollbar_repeat_dir = -1;
             _ = c.SetCapture(hwnd);
@@ -608,7 +608,7 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
         },
         .track_below => {
             // Page down - execute immediately and start repeat timer
-            applog.appLog("[scrollbar] track_below: executing page scroll down\n", .{});
+            if (applog.isEnabled()) applog.appLog("[scrollbar] track_below: executing page scroll down\n", .{});
             scrollbarPageScroll(app, 1);
             app.scrollbar_repeat_dir = 1;
             _ = c.SetCapture(hwnd);
@@ -679,7 +679,7 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
     const elapsed = now - app.scrollbar_last_scroll_time;
 
     if (elapsed >= app_mod.SCROLLBAR_THROTTLE_MS) {
-        applog.appLog("[scrollbar] mouseMove y={d} ratio={d:.3} line={d} bottom={any} (sending)\n", .{
+        if (applog.isEnabled()) applog.appLog("[scrollbar] mouseMove y={d} ratio={d:.3} line={d} bottom={any} (sending)\n", .{
             mouse_y, scroll_ratio, target_line, use_bottom,
         });
         app_mod.zonvie_core_scroll_to_line(corep, target_line, use_bottom);
@@ -691,11 +691,11 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
 /// Execute page scroll in given direction (-1 = up, 1 = down)
 pub fn scrollbarPageScroll(app: *App, direction: i8) void {
     const corep = app.corep orelse {
-        applog.appLog("[scrollbar] scrollbarPageScroll: corep is null\n", .{});
+        if (applog.isEnabled()) applog.appLog("[scrollbar] scrollbarPageScroll: corep is null\n", .{});
         return;
     };
 
-    applog.appLog("[scrollbar] scrollbarPageScroll: direction={d}\n", .{direction});
+    if (applog.isEnabled()) applog.appLog("[scrollbar] scrollbarPageScroll: direction={d}\n", .{direction});
 
     // Single RPC call using Neovim's native <C-f>/<C-b> for exact page scroll.
     // grid_id=-1: target the cursor grid (current window).
@@ -708,7 +708,7 @@ pub fn scrollbarMouseUp(hwnd: c.HWND, app: *App) void {
         // Send any pending scroll position before releasing
         if (app.scrollbar_pending_line > 0) {
             if (app.corep) |corep| {
-                applog.appLog("[scrollbar] mouseUp sending pending line={d} bottom={any}\n", .{ app.scrollbar_pending_line, app.scrollbar_pending_use_bottom });
+                if (applog.isEnabled()) applog.appLog("[scrollbar] mouseUp sending pending line={d} bottom={any}\n", .{ app.scrollbar_pending_line, app.scrollbar_pending_use_bottom });
                 app_mod.zonvie_core_scroll_to_line(corep, app.scrollbar_pending_line, app.scrollbar_pending_use_bottom);
             }
             app.scrollbar_pending_line = -1;
