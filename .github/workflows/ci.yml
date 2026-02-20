@@ -52,6 +52,9 @@ jobs:
           tar -xf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
 
+      - name: Check shader bytecode freshness
+        run: python3 windows/shaders/check_shader_hash.py
+
       - name: Build Windows App
         run: zig build windows -Dtarget=x86_64-windows-gnu
 

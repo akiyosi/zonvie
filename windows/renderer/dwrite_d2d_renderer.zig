@@ -36,6 +36,13 @@ var g_log_styled_misses: u64 = 0;
 var g_log_styled_fallbacks: u64 = 0;
 var g_log_styled_last_report_ns: i128 = 0;
 
+// GSUB ligature trigger cache entry, keyed by IDWriteFontFace pointer.
+const GsubCacheEntry = struct {
+    font_face_ptr: usize = 0,
+    lig_triggers: [128]u8 = [_]u8{0} ** 128,
+    valid: bool = false,
+};
+
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
@@ -122,6 +129,10 @@ pub const Renderer = struct {
     font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
     font_feature_count: u32 = 0,
     text_analyzer: ?*c.IDWriteTextAnalyzer = null,
+
+    // GSUB ligature trigger cache (see GsubCacheEntry above).
+    // Invalidated on font/DPI/device changes.
+    gsub_cache: [4]GsubCacheEntry = [_]GsubCacheEntry{.{}} ** 4,
 
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         // Timing for init steps
@@ -344,6 +355,10 @@ pub const Renderer = struct {
         try self.createAtlasResources();
         _ = c.QueryPerformanceCounter(&t1);
         applog.appLog("[d2d] [TIMING]   createAtlasResources: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        // Invalidate GSUB cache on device recreation (conservative; font faces may
+        // still be valid, but atlas and glyph state have been reset).
+        self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
     }
 
     /// Public wrapper that acquires self.mu before recreating the render target.
@@ -1804,8 +1819,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const hr_face = create_face_fn(font.?, &new_face);
         if (c.FAILED(hr_face) or new_face == null) return error.DWriteCreateFontFaceFailed;
 
-        // NOTE: Bold/Italic/Bold+Italic font variants are lazy-loaded on first use
-        // in ensureStyledFontFaces() to improve startup time (~10ms savings)
+        // NOTE: Bold/Italic/Bold+Italic font variants are created eagerly
+        // via ensureStyledFontFaces() at the end of this function.
 
         // Compute ascent/descent in pixels from design units.
         var fm: c.DWRITE_FONT_METRICS = undefined;
@@ -1872,6 +1887,13 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.atlas_next_x = 1;
         self.atlas_next_y = 1;
         self.atlas_row_h = 0;
+
+        // Invalidate GSUB lig trigger cache (font faces changed).
+        self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
+
+        // Eagerly create Bold/Italic/BoldItalic font faces now instead of deferring
+        // to the first flush. Moves ~4ms of DWrite font matching out of the hot path.
+        self.ensureStyledFontFaces();
     }
 
     /// Parse comma-separated features string into font_features array.
@@ -2228,6 +2250,9 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.italic_font_face = null;
         self.bold_italic_font_face = null;
         self.styled_fonts_initialized = false;
+
+        // Invalidate GSUB cache (font faces released above).
+        self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
     }
 
     // =========================================================================
@@ -2682,18 +2707,39 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         }
         applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
 
-        // --- 3) Lig Triggers: introspect GSUB table (matches macOS HarfBuzz approach) ---
+        // --- 3) Lig Triggers: check GSUB cache first, then parse if needed ---
+        // Search ALL cache slots by font_face_ptr so that different styles sharing
+        // the same IDWriteFontFace get a cross-style cache hit.
         @memset(out_lig_triggers[0..128], 0);
 
-        applog.appLog("[ascii_table] detectLigTriggersFromGSUB start style={d}\n", .{style_flags});
-        detectLigTriggersFromGSUB(
-            face,
-            &glyph_ids_u16,
-            self.font_features[0..self.font_feature_count],
-            self.font_feature_count,
-            out_lig_triggers,
-        );
-        applog.appLog("[ascii_table] detectLigTriggersFromGSUB done style={d}\n", .{style_flags});
+        const face_ptr: usize = @intFromPtr(face);
+        const cache_hit: ?usize = for (self.gsub_cache, 0..) |entry, i| {
+            if (entry.valid and entry.font_face_ptr == face_ptr) break i;
+        } else null;
+
+        if (cache_hit) |idx| {
+            applog.appLog("[ascii_table] GSUB cache hit style={d} slot={d}\n", .{ style_flags, idx });
+            @memcpy(out_lig_triggers[0..128], &self.gsub_cache[idx].lig_triggers);
+        } else {
+            // Cache miss: parse GSUB and store result
+            applog.appLog("[ascii_table] detectLigTriggersFromGSUB start style={d}\n", .{style_flags});
+            detectLigTriggersFromGSUB(
+                face,
+                &glyph_ids_u16,
+                self.font_features[0..self.font_feature_count],
+                self.font_feature_count,
+                out_lig_triggers,
+            );
+            applog.appLog("[ascii_table] detectLigTriggersFromGSUB done style={d}\n", .{style_flags});
+
+            // Store in the slot corresponding to this style (evicts previous entry for this slot).
+            const store_slot = style_flags & 3;
+            self.gsub_cache[store_slot] = .{
+                .font_face_ptr = face_ptr,
+                .lig_triggers = out_lig_triggers[0..128].*,
+                .valid = true,
+            };
+        }
 
         return true;
     }
