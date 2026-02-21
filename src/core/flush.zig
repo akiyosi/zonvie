@@ -847,9 +847,35 @@ pub const FlushCtx = struct {
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
 
+                    var saw_atlas_reset: bool = false;
+                    var atlas_retried: bool = false;
+
+                    retry_loop: while (true) {
+                        // On retry: force all rows (stale UVs in non-dirty rows too)
+                        const effective_rebuild_all = rebuild_all or atlas_retried;
+                        if (atlas_retried) {
+                            // Reset all per-pass mutable state for clean retry
+                            had_glyph_miss = false;
+                            perf_hl_cache_hits = 0;
+                            perf_hl_cache_misses = 0;
+                            perf_glyph_ascii_hits = 0;
+                            perf_glyph_ascii_misses = 0;
+                            perf_glyph_nonascii_hits = 0;
+                            perf_glyph_nonascii_misses = 0;
+                            perf_shape_cache_hits = 0;
+                            perf_shape_cache_misses = 0;
+                            perf_ascii_fast_path = 0;
+                            if (log_enabled) {
+                                log_dirty_rows = rows; // Retry processes all rows
+                                t_rows_start_ns = std.time.nanoTimestamp();
+                            }
+                            // hl_valid does NOT need reset: hl data is atlas-independent
+                            // glyph caches already cleared by resetGlyphCacheFlags() inside resetCoreAtlas()
+                        }
+
                     var r: u32 = 0;
                     while (r < rows) : (r += 1) {
-                        if (!rebuild_all) {
+                        if (!effective_rebuild_all) {
                             if (!ctx.core.grid.dirty_rows.isSet(@as(usize, r))) continue;
                         }
 
@@ -1677,19 +1703,58 @@ pub const FlushCtx = struct {
                             }
                         }
 
+                        // CHECK: atlas reset happened during glyph processing for this row.
+                        // Already-sent rows have stale UVs → need to restart or abort.
+                        if (ctx.core.atlas_reset_during_flush) {
+                            saw_atlas_reset = true;
+                            ctx.core.atlas_reset_during_flush = false; // Clear before retry
+
+                            if (!atlas_retried) {
+                                // First occurrence: restart loop from row 0 with all rows
+                                atlas_retried = true;
+                                if (log_enabled) {
+                                    ctx.core.log.write(
+                                        "[scroll_debug] atlas_reset_during_flush at row={d}: restarting row loop\n",
+                                        .{r},
+                                    );
+                                }
+                                continue :retry_loop;
+                            }
+                            // Already retried: abort remaining rows.
+                            // saw_atlas_reset=true ensures markAllDirty at end → next flush fixes.
+                            if (log_enabled) {
+                                ctx.core.log.write(
+                                    "[scroll_debug] atlas_reset_during_flush at row={d} on retry: aborting\n",
+                                    .{r},
+                                );
+                            }
+                            break;
+                        }
+
                         // Contract: row_count == 1, grid_id == 1 for main window
                         row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
                     }
+                    break; // Normal exit from retry_loop
+                    }
 
                     ctx.core.grid.clearDirty();
-                    if (had_glyph_miss or ctx.core.atlas_reset_during_flush) {
+                    if (had_glyph_miss or saw_atlas_reset) {
                         ctx.core.grid.markAllDirty();
+                        // Also mark external grids dirty (atlas reset invalidates their UVs too)
+                        if (saw_atlas_reset) {
+                            var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                            while (sg_it.next()) |sg| {
+                                sg.dirty = true;
+                            }
+                        }
                         if (log_enabled) {
-                            ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss={any} atlas_reset={any} scrolled={d}\n", .{
-                                had_glyph_miss, ctx.core.atlas_reset_during_flush, scrolled_count,
+                            ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss={any} saw_atlas_reset={any} scrolled={d}\n", .{
+                                had_glyph_miss, saw_atlas_reset, scrolled_count,
                             });
                         }
                     }
+                    // Clear unconditionally so sendExternalGridVertices sees clean state
+                    // (sub_grids already marked dirty above if needed)
                     ctx.core.atlas_reset_during_flush = false;
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
@@ -2623,6 +2688,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const GLYPH_CACHE_ASCII_SIZE = self.glyph_cache_ascii_size;
     const GLYPH_CACHE_NON_ASCII_SIZE = self.glyph_cache_non_ascii_size;
 
+    // Track atlas reset across all external grids.
+    // If any grid triggers a reset, already-sent grids also have stale UVs.
+    var ext_saw_atlas_reset_any: bool = false;
+
     // Iterate over all known external grids
     var ext_it = self.known_external_grids.keyIterator();
     while (ext_it.next()) |grid_id_ptr| {
@@ -2822,6 +2891,20 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         const cursor_col = self.grid.cursor_col;
         const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
 
+        var ext_saw_atlas_reset: bool = false;
+        var ext_retried: bool = false;
+
+        ext_retry: while (true) {
+            if (ext_retried) {
+                // Reset per-pass state for clean retry
+                non_space_count = 0;
+                glyph_success_count = 0;
+                glyph_fail_count = 0;
+                sample_idx = 0;
+                cache.reset(); // Resets perf counters + hl_valid (hl_valid reset is harmless)
+            }
+            const ext_effective_rebuild = ext_retried;
+
         for (0..sg.rows) |row_idx| {
             const row: u32 = @intCast(row_idx);
 
@@ -2830,10 +2913,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
             // Skip clean rows unless full redraw needed or cursor is on this row
             const is_cursor_row = if (cursor_row) |cr| cr == row else false;
-            if (!need_full_redraw and !is_cursor_row) {
+            if (!need_full_redraw and !ext_effective_rebuild and !is_cursor_row) {
                 // Check dirty_rows bitmap (also respect dirty flag which is set on resize/clear)
                 // When dirty=true (after resize), all rows should be redrawn
-                if (!sg.dirty and sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(row)) {
+                if (!sg.dirty and sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(@as(usize, row))) {
                     continue; // Row is clean, skip it
                 }
             }
@@ -3674,12 +3757,27 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 }
             }
 
+            // CHECK: atlas reset happened during glyph processing for this row.
+            // Already-sent rows have stale UVs → need to restart or abort.
+            if (self.atlas_reset_during_flush) {
+                ext_saw_atlas_reset = true;
+                ext_saw_atlas_reset_any = true;
+                self.atlas_reset_during_flush = false; // Clear for retry
+                if (!ext_retried) {
+                    ext_retried = true;
+                    continue :ext_retry; // Restart this grid's row loop from row 0
+                }
+                break; // Abort remaining rows (2nd reset in same grid)
+            }
+
             // Send this row's vertices
             // Pass viewport dimensions (target size) instead of sg dimensions so that
             // the frontend's scroll offset calculation matches the NDC viewport used here.
             if (ext_verts.items.len > 0) {
                 row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
             }
+        }
+        break :ext_retry; // Normal exit from retry loop
         }
 
         // Debug log glyph statistics
@@ -3699,9 +3797,17 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         sg.clearDirty();
         // If atlas was reset during this grid's rendering, re-mark dirty
         // so it gets re-rendered with correct UVs next flush.
-        if (self.atlas_reset_during_flush) {
+        if (ext_saw_atlas_reset) {
             sg.dirty = true;
-            self.atlas_reset_during_flush = false;
+        }
+    }
+
+    // After ALL grids processed: if any atlas reset occurred,
+    // already-sent grids also have stale UVs → mark ALL sub_grids dirty
+    if (ext_saw_atlas_reset_any) {
+        var sg_it = self.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg_val| {
+            sg_val.dirty = true;
         }
     }
 }
