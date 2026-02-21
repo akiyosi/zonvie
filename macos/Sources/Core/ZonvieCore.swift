@@ -508,6 +508,7 @@ final class ZonvieCore {
                     let bg = zonvie_core_get_default_bg(corePtr)
                     me.terminalView?.renderer.updateDefaultBgColor(bg)
                 }
+                // (scrollbar update is handled per-row in submitVerticesRaw/submitVerticesRowRaw)
             },
 
             // Colorscheme change notification (from default_colors_set redraw event).

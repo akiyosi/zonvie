@@ -203,6 +203,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var cursorVertexCount: Int = 0
 
         var usingRowBuffers: Bool = false
+        var knownTotalRows: Int = 0   // Actual grid row count from core
     }
 
     private let bufferSets: [BufferSet] = [BufferSet(), BufferSet(), BufferSet()]
@@ -486,6 +487,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let dst = bufferSets[picked]
 
         // Deep copy row buffer contents: committed → write set
+        dst.knownTotalRows = src.knownTotalRows
         let srcRowCount = src.rowVertexBuffers.count
         // Ensure dst arrays are large enough
         if dst.rowVertexBuffers.count < srcRowCount {
@@ -1840,6 +1842,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Switch to row-buffer mode.
         bufferSets[s].usingRowBuffers = true
 
+        // Track actual grid row count for markAllRowsDirty bounds.
+        if totalRows > 0 {
+            bufferSets[s].knownTotalRows = totalRows
+        }
+
         // Handle grid resize: if totalRows is smaller than current row storage,
         // shrink arrays to free memory (when significantly oversized).
         if totalRows > 0 && totalRows < bufferSets[s].rowVertexBuffers.count {
@@ -1936,7 +1943,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        let rowCount = bufferSets[committedSetIndex].rowVertexBuffers.count
+        let bufCount = bufferSets[committedSetIndex].rowVertexBuffers.count
+        let known = bufferSets[committedSetIndex].knownTotalRows
+        let rowCount = known > 0 ? min(bufCount, known) : bufCount
         if rowCount > 0 {
             pendingDirtyRows.insert(integersIn: 0..<rowCount)
         }

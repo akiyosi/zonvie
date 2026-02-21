@@ -2583,14 +2583,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         cursor_grid, cursor_rev, self.last_ext_cursor_grid, self.last_ext_cursor_rev, cursor_changed, cursor_grid_changed,
     });
 
-    // Only update last cursor state if we have external grids to process
-    // Otherwise we consume the cursor state before the grid window is created
-    const should_update_cursor_state = self.known_external_grids.count() > 0;
+    // Only update last cursor grid if we have external grids to process.
+    // Otherwise we consume the cursor state before the grid window is created.
+    // Always update cursor rev to prevent stale changed=true accumulation.
+    const has_external_grids = self.known_external_grids.count() > 0;
     defer {
-        if (should_update_cursor_state) {
+        if (has_external_grids) {
             self.last_ext_cursor_grid = cursor_grid;
-            self.last_ext_cursor_rev = cursor_rev;
         }
+        self.last_ext_cursor_rev = cursor_rev;
     }
 
     // Check if cursor is on a non-existent external grid (e.g., closed cmdline)
@@ -2604,8 +2605,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         self.log.write("[sendExternalGridVertices] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.last_ext_cursor_grid});
     }
 
-    // Notify frontend when cursor grid changes (for window activation)
-    if (cursor_grid_changed) {
+    // Notify frontend when cursor grid changes (for window activation).
+    // Only fire when external grids exist — window activation is only relevant
+    // for external grid windows. Without external grids, cursor_grid_changed
+    // comparison against stale last_ext_cursor_grid produces false positives.
+    if (cursor_grid_changed and has_external_grids) {
         if (self.cb.on_cursor_grid_changed) |cursor_cb| {
             cursor_cb(self.ctx, cursor_grid);
         }

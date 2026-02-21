@@ -97,6 +97,12 @@ final class MetalTerminalView: MTKView {
     private var pageScrollTime: CFAbsoluteTime = 0
     private static let pageScrollGuardInterval: TimeInterval = 0.5
 
+    /// Scroll offset below this threshold (in pixels) is treated as zero and removed.
+    /// Used consistently in processPendingScrollClears, updateScrollShaderOffset,
+    /// and decayStaleScrollOffsets to prevent stale zero-offset entries from keeping
+    /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
+    private static let scrollOffsetEpsilon: CGFloat = 1.0
+
     // --- Input throttling to prevent event accumulation during slow rendering ---
     private var pendingInput: String? = nil
     private let inputLock = NSLock()
@@ -153,8 +159,13 @@ final class MetalTerminalView: MTKView {
             self.flushPendingInput()
             // Check msg_show throttle timeout (noice.nvim-style)
             self.core?.tickMsgThrottle()
-            // Update scrollbar if viewport changed
-            self.updateScrollbarIfNeeded()
+            // Only poll viewport when a flush has occurred since last check.
+            // This prevents bursts of getViewport calls after scrolling stops
+            // while displayLink is still active.
+            if self.flushSinceLastPoll {
+                self.flushSinceLastPoll = false
+                self.updateScrollbarIfNeeded()
+            }
         }
     }
 
@@ -675,6 +686,12 @@ final class MetalTerminalView: MTKView {
 
     // MARK: - Scrollbar
 
+    /// Set when a flush completes; consumed by displayLinkFired to gate
+    /// viewport polling. Without this, displayLink calls getViewport every
+    /// tick (~60fps) even when nothing has changed, causing bursts of
+    /// redundant calls after scrolling stops. Only accessed on main thread.
+    private var flushSinceLastPoll = false
+
     /// Update scrollbar if viewport changed
     private func updateScrollbarIfNeeded() {
         let config = ZonvieConfig.shared.scrollbar
@@ -966,6 +983,7 @@ final class MetalTerminalView: MTKView {
 
         // Update scrollbar on vertex submission
         DispatchQueue.main.async { [weak self] in
+            self?.flushSinceLastPoll = true
             self?.updateScrollbarIfNeeded()
         }
     }
@@ -1130,6 +1148,7 @@ final class MetalTerminalView: MTKView {
 
         // Update scrollbar on vertex submission
         DispatchQueue.main.async { [weak self] in
+            self?.flushSinceLastPoll = true
             self?.updateScrollbarIfNeeded()
         }
     }
@@ -1307,6 +1326,9 @@ final class MetalTerminalView: MTKView {
 
         let offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
             guard let info = gridInfoMap[gridId] else { return nil }
+            // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
+            // preventing markAllRowsDirty from firing every frame.
+            guard abs(offsetPx) >= Self.scrollOffsetEpsilon else { return nil }
 
             // Calculate grid's top Y in NDC
             // Grid starts at startRow (in cells from top), each cell is cellHeightPx
@@ -1330,9 +1352,6 @@ final class MetalTerminalView: MTKView {
 
         renderer.updateScrollOffsets(offsets, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
 
-        // Mark all rows as dirty ONLY when there are active scroll offsets
-        // (smooth scrolling in progress). Without offsets, row-based dirty
-        // tracking from submitVerticesRowRaw is sufficient.
         if !offsets.isEmpty {
             renderer.markAllRowsDirty()
         }
@@ -1532,7 +1551,7 @@ final class MetalTerminalView: MTKView {
 
             if staleFrames >= staleThreshold {
                 let currentOffset = scrollOffsetPx[gridId] ?? 0
-                if abs(currentOffset) < 1.0 {
+                if abs(currentOffset) < Self.scrollOffsetEpsilon {
                     // Close enough to 0 — clear everything
                     scrollOffsetPx.removeValue(forKey: gridId)
                     scrollStaleFrameCount.removeValue(forKey: gridId)
@@ -1543,8 +1562,17 @@ final class MetalTerminalView: MTKView {
                 } else {
                     // Decay: reduce offset by ~30% per frame (converges in ~5 frames)
                     let decayed = currentOffset * 0.7
-                    scrollOffsetPx[gridId] = decayed
-                    ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) decay offset=\(currentOffset) -> \(decayed) pending=\(pendingCount) staleFrames=\(staleFrames)")
+                    if abs(decayed) < Self.scrollOffsetEpsilon {
+                        scrollOffsetPx.removeValue(forKey: gridId)
+                        scrollStaleFrameCount.removeValue(forKey: gridId)
+                        pendingSentScrollLock.lock()
+                        pendingSentScroll.removeValue(forKey: gridId)
+                        pendingSentScrollLock.unlock()
+                        ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) cleared after decay (was \(currentOffset) -> \(decayed))")
+                    } else {
+                        scrollOffsetPx[gridId] = decayed
+                        ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) decay offset=\(currentOffset) -> \(decayed) pending=\(pendingCount) staleFrames=\(staleFrames)")
+                    }
                 }
             }
         }
@@ -1595,7 +1623,11 @@ final class MetalTerminalView: MTKView {
                 if scrollEventCount > toConsume {
                     newOffset = 0
                 }
-                scrollOffsetPx[gridId] = newOffset
+                if abs(newOffset) < Self.scrollOffsetEpsilon {
+                    scrollOffsetPx.removeValue(forKey: gridId)
+                } else {
+                    scrollOffsetPx[gridId] = newOffset
+                }
                 ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) sentCount=\(sentCount) consumed=\(toConsume) offset=\(currentOffset) -> \(newOffset)")
             } else {
                 pendingSentScrollLock.unlock()
