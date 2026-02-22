@@ -210,7 +210,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var writeSetIndex: Int = 0       // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
-    private let inflightSemaphore = DispatchSemaphore(value: 2)  // Max 2 GPU in-flight
+    private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
     private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
@@ -468,12 +468,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
         if picked == -1 {
-            // All non-committed sets are GPU in-flight (rare edge case).
+            // All non-committed sets are GPU in-flight (should be unreachable
+            // with semaphore=1 + sem.wait() before gpuInFlightCount++).
             // Drop this flush entirely to avoid GPU/CPU race on shared buffers.
-            // The next flush will retry once a GPU frame completes.
+            let inf = gpuInFlightCount
             lock.unlock()
             isInFlush = false
-            ZonvieCore.appLog("[WARNING] beginFlush: no free buffer set, dropping flush")
+            ZonvieCore.appLog("[WARNING] beginFlush: no free buffer set, dropping flush committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
             return
         }
         writeSetIndex = picked
@@ -828,6 +829,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Update atlas backing scale outside lock (atlas has its own internal lock)
             atlas.setBackingScale(backingScale)
 
+            // Acquire GPU slot BEFORE marking gpuInFlightCount.
+            // This prevents sem.wait()-blocked draw() from inflating gpuInFlightCount,
+            // which would cause beginFlush() to incorrectly see all sets as "in-flight".
+            inflightSemaphore.wait()
+
             // === PERF LOG: lock取得開始 ===
             var t_lock_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -868,13 +874,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // Safety defer: decrement gpuInFlight + signal semaphore on early return.
             // On normal GPU submission, the completion handler handles cleanup instead.
-            var semaphoreAcquired = false
             var gpuSubmitted = false
             defer {
                 if !gpuSubmitted {
-                    if semaphoreAcquired {
-                        inflightSemaphore.signal()
-                    }
+                    inflightSemaphore.signal()
                     lock.lock()
                     gpuInFlightCount[csi] -= 1
                     lock.unlock()
@@ -1015,11 +1018,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
-
-            // Limit GPU in-flight frames to 2 (triple buffering safety).
-            // Ensures the write set picked by beginFlush() is never GPU in-flight.
-            inflightSemaphore.wait()
-            semaphoreAcquired = true
 
             guard let cmd = queue.makeCommandBuffer() else {
                 // defer handles: semaphore.signal() + gpuInFlight decrement
