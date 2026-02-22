@@ -391,8 +391,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
 				GENERATE_INFOPLIST_FILE = NO;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
-				"HEADER_SEARCH_PATHS[arch=*]" = /opt/homebrew/include/freetype2;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../include",
+					/opt/homebrew/include,
+					/opt/homebrew/include/freetype2,
+					/usr/local/include,
+					/usr/local/include/freetype2,
+				);
 				INFOPLIST_FILE = Sources/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
@@ -404,6 +409,7 @@
 					"$(SRCROOT)/../zig-out/lib",
 					"$(PROJECT_DIR)",
 					/opt/homebrew/lib,
+					/usr/local/lib,
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = (
@@ -433,8 +439,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
 				GENERATE_INFOPLIST_FILE = NO;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/../include";
-				"HEADER_SEARCH_PATHS[arch=*]" = /opt/homebrew/include/freetype2;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../include",
+					/opt/homebrew/include,
+					/opt/homebrew/include/freetype2,
+					/usr/local/include,
+					/usr/local/include/freetype2,
+				);
 				INFOPLIST_FILE = Sources/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
@@ -446,6 +457,7 @@
 					"$(SRCROOT)/../zig-out/lib",
 					"$(PROJECT_DIR)",
 					/opt/homebrew/lib,
+					/usr/local/lib,
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = (

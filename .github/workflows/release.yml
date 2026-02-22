@@ -13,16 +13,28 @@ env:
 
 jobs:
   build-macos:
-    name: Build macOS Release
-    runs-on: macos-15
+    name: Build macOS Release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            zig_host: aarch64-macos
+          - arch: x86_64
+            runner: macos-15-intel
+            zig_host: x86_64-macos
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install dependencies (Homebrew)
+        run: brew install freetype harfbuzz
+
       - name: Download and Setup Zig
         run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_host }}-${ZIG_VERSION}.tar.xz"
           tar -xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> $GITHUB_PATH
+          echo "$PWD/zig-${{ matrix.zig_host }}-${ZIG_VERSION}" >> $GITHUB_PATH
 
       - name: Build Zig Core (macOS)
         run: zig build -Doptimize=ReleaseFast
@@ -33,13 +45,13 @@ jobs:
             -scheme zonvie \
             -configuration Release \
             -derivedDataPath macos/.derived \
-            -destination "platform=macOS,arch=arm64" \
+            -destination "platform=macOS,arch=${{ matrix.arch }}" \
             build
 
       - name: Create macOS DMG
         run: |
           APP_PATH="macos/.derived/Build/Products/Release/zonvie.app"
-          DMG_NAME="zonvie-${{ github.ref_name }}-macos-arm64.dmg"
+          DMG_NAME="zonvie-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
 
           # Create temporary directory for DMG contents
           mkdir -p dmg_contents
@@ -55,12 +67,19 @@ jobs:
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:
-          name: macos-release
+          name: macos-release-${{ matrix.arch }}
           path: "*.dmg"
 
   build-windows:
-    name: Build Windows Release
+    name: Build Windows Release (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-windows-gnu
+          - arch: arm64
+            target: aarch64-windows-gnu
     steps:
       - uses: actions/checkout@v4
 
@@ -71,11 +90,11 @@ jobs:
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
 
       - name: Build Windows App (Release)
-        run: zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+        run: zig build windows -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Create Windows ZIP
         run: |
-          ZIP_NAME="zonvie-${{ github.ref_name }}-windows-x64.zip"
+          ZIP_NAME="zonvie-${{ github.ref_name }}-windows-${{ matrix.arch }}.zip"
           cd zig-out/bin
           zip -r "../../$ZIP_NAME" zonvie.exe
           cd ../..
@@ -83,7 +102,7 @@ jobs:
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: windows-release
+          name: windows-release-${{ matrix.arch }}
           path: "*.zip"
 
   create-release:
@@ -93,17 +112,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download macOS artifact
+      - name: Download all release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: macos-release
+          pattern: '*-release-*'
           path: artifacts/
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-release
-          path: artifacts/
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v1

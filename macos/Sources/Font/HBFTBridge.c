@@ -6,9 +6,9 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
-#include </opt/homebrew/include/harfbuzz/hb.h>
-#include </opt/homebrew/include/harfbuzz/hb-ft.h>
-#include </opt/homebrew/include/harfbuzz/hb-ot.h>
+#include <harfbuzz/hb.h>
+#include <harfbuzz/hb-ft.h>
+#include <harfbuzz/hb-ot.h>
 
 struct zonvie_ft_hb_font {
   FT_Library ft_lib;

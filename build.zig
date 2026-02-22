@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) !void {
         .linkage = .static,
         .root_module = core_mod,
     });
+    core_lib.bundle_compiler_rt = true;
     b.installArtifact(core_lib);
 
     // Core-only step for macOS

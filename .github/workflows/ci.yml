@@ -11,16 +11,28 @@ env:
 
 jobs:
   build-macos:
-    name: Build macOS
-    runs-on: macos-15
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            zig_host: aarch64-macos
+          - arch: x86_64
+            runner: macos-15-intel
+            zig_host: x86_64-macos
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install dependencies (Homebrew)
+        run: brew install freetype harfbuzz
+
       - name: Download and Setup Zig
         run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_host }}-${ZIG_VERSION}.tar.xz"
           tar -xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> $GITHUB_PATH
+          echo "$PWD/zig-${{ matrix.zig_host }}-${ZIG_VERSION}" >> $GITHUB_PATH
 
       - name: Build Zig Core (macOS)
         run: zig build
@@ -31,18 +43,25 @@ jobs:
             -scheme zonvie \
             -configuration Debug \
             -derivedDataPath macos/.derived \
-            -destination "platform=macOS,arch=arm64" \
+            -destination "platform=macOS,arch=${{ matrix.arch }}" \
             build
 
       - name: Upload macOS Build
         uses: actions/upload-artifact@v4
         with:
-          name: zonvie-macos-debug
+          name: zonvie-macos-${{ matrix.arch }}-debug
           path: macos/.derived/Build/Products/Debug/zonvie.app
 
   build-windows:
-    name: Build Windows
+    name: Build Windows (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-windows-gnu
+          - arch: arm64
+            target: aarch64-windows-gnu
     steps:
       - uses: actions/checkout@v4
 
@@ -56,12 +75,12 @@ jobs:
         run: python3 windows/shaders/check_shader_hash.py
 
       - name: Build Windows App
-        run: zig build windows -Dtarget=x86_64-windows-gnu
+        run: zig build windows -Dtarget=${{ matrix.target }}
 
       - name: Upload Windows Build
         uses: actions/upload-artifact@v4
         with:
-          name: zonvie-windows-debug
+          name: zonvie-windows-${{ matrix.arch }}-debug
           path: zig-out/bin/zonvie.exe
 
   test:
