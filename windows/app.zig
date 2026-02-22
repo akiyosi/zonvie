@@ -840,6 +840,9 @@ pub const App = struct {
     // Extra arguments to pass to nvim (not recognized as zonvie arguments)
     nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .{},
 
+    // CLI --nvim override (points into args allocation, no ownership)
+    cli_nvim_path: ?[]const u8 = null,
+
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,
 

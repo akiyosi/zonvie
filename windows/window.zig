@@ -2377,6 +2377,20 @@ pub export fn WndProc(
                 var nvim_cmd_buf: [1024]u8 = undefined;
                 var nvim_cmd_slice: []const u8 = undefined;
 
+                // Compute effective local nvim path (CLI override + quote for spaces)
+                const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
+                const quoted_nvim: []const u8 = blk: {
+                    if (std.mem.indexOfScalar(u8, effective_nvim, ' ') != null) {
+                        const buf = app.alloc.alloc(u8, effective_nvim.len + 2) catch
+                            break :blk effective_nvim; // OOM: fallback to unquoted (catastrophic scenario)
+                        buf[0] = '\'';
+                        @memcpy(buf[1 .. 1 + effective_nvim.len], effective_nvim);
+                        buf[1 + effective_nvim.len] = '\'';
+                        break :blk buf;
+                    }
+                    break :blk effective_nvim;
+                };
+
                 if (app.wsl_mode) {
                     var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
                     const writer = fbs.writer();
@@ -2405,7 +2419,10 @@ pub export fn WndProc(
                             writer.writeAll(" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no") catch {};
                         }
                         writer.writeAll(" -o StrictHostKeyChecking=accept-new") catch {};
-                        writer.print(" {s} nvim --headless --embed", .{host}) catch {};
+                        // Use --nvim override for remote nvim path, default to bare "nvim" (PATH lookup)
+                        // Quote with "'...'" so Zig parser strips "" and remote shell strips ''
+                        const remote_nvim = app.cli_nvim_path orelse "nvim";
+                        writer.print(" {s} \"'{s}'\" --headless --embed", .{ host, remote_nvim }) catch {};
                         nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
                         applog.appLog("[win] SSH command: {s}\n", .{nvim_cmd_slice});
 
@@ -2436,7 +2453,7 @@ pub export fn WndProc(
                         _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("DISPLAY"), std.unicode.utf8ToUtf16LeStringLiteral("dummy:0"));
                     } else {
                         applog.appLog("[win] SSH mode enabled but no host specified\n", .{});
-                        nvim_cmd_slice = app.config.neovim.path;
+                        nvim_cmd_slice = quoted_nvim;
                     }
                 } else if (app.devcontainer_mode) devcontainer_block: {
                     if (app.devcontainer_workspace) |workspace| {
@@ -2454,7 +2471,7 @@ pub export fn WndProc(
                             const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
                                 applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
                                 dialogs.hideDevcontainerProgressDialog();
-                                nvim_cmd_slice = app.config.neovim.path;
+                                nvim_cmd_slice = quoted_nvim;
                                 break :devcontainer_block;
                             };
                             thread.detach();
@@ -2492,14 +2509,14 @@ pub export fn WndProc(
                         }
                     } else {
                         applog.appLog("[win] devcontainer mode enabled but no workspace specified\n", .{});
-                        nvim_cmd_slice = app.config.neovim.path;
+                        nvim_cmd_slice = quoted_nvim;
                     }
                 } else {
                     // Native mode: add extra args if any
                     if (app.nvim_extra_args.items.len > 0) {
                         var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
                         const writer = fbs.writer();
-                        writer.writeAll(app.config.neovim.path) catch {};
+                        writer.writeAll(quoted_nvim) catch {};
                         for (app.nvim_extra_args.items) |arg| {
                             writer.writeAll(" ") catch {};
                             // Escape arguments with spaces
@@ -2514,7 +2531,7 @@ pub export fn WndProc(
                         nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
                         applog.appLog("[win] Added nvim extra args, command: {s}\n", .{nvim_cmd_slice});
                     } else {
-                        nvim_cmd_slice = app.config.neovim.path;
+                        nvim_cmd_slice = quoted_nvim;
                     }
                 }
 

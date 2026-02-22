@@ -256,6 +256,7 @@ pub fn main() u8 {
     }
     var ext_windows_enabled = config.windows.external;
     var cli_log_path: ?[]const u8 = null;
+    var cli_nvim_path: ?[]const u8 = null;
     var wsl_mode: bool = config.neovim.wsl;
     var wsl_distro: ?[]const u8 = config.neovim.wsl_distro;
     var ssh_mode: bool = config.neovim.ssh;
@@ -283,6 +284,8 @@ pub fn main() u8 {
                     \\    zonvie.exe [OPTIONS]
                     \\
                     \\OPTIONS:
+                    \\    --nvim <path>                 Path to Neovim executable (overrides config)
+                    \\    --nvim=<path>                 Same as above (equals-separated)
                     \\    --log <path>                  Write application logs to specified file path
                     \\    --extcmdline                  Enable external command line UI
                     \\    --extpopup                    Enable external popup menu UI
@@ -427,6 +430,15 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, arg, "--extwindows")) {
             ext_windows_enabled = true;
             applog.appLog("[win] --extwindows flag detected (override config)\n", .{});
+        } else if (std.mem.eql(u8, arg, "--nvim")) {
+            if (i + 1 < args.len) {
+                cli_nvim_path = args[i + 1];
+                i += 1; // skip the path argument
+            }
+            applog.appLog("[win] --nvim flag detected\n", .{});
+        } else if (std.mem.startsWith(u8, arg, "--nvim=")) {
+            cli_nvim_path = arg[7..]; // after "--nvim="
+            applog.appLog("[win] --nvim flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--log")) {
             if (i + 1 < args.len) {
                 cli_log_path = args[i + 1];
@@ -484,6 +496,17 @@ pub fn main() u8 {
     } else if (config.log.enabled) {
         applog.setEnabled(true);
         applog.setLogPath(config.log.path);
+    }
+
+    // Validate --nvim path (reject quote characters that break shell/Zig parser quoting)
+    if (cli_nvim_path) |path| {
+        if (std.mem.indexOfScalar(u8, path, '\'') != null or
+            std.mem.indexOfScalar(u8, path, '"') != null)
+        {
+            applog.appLog("[win] ERROR: --nvim path contains quote characters. Ignoring --nvim.\n", .{});
+            std.debug.print("Error: --nvim path must not contain quote characters (' or \"). Ignoring --nvim.\n", .{});
+            cli_nvim_path = null;
+        }
     }
 
     // Log config info (after applog is enabled)
@@ -549,6 +572,7 @@ pub fn main() u8 {
         .devcontainer_config = devcontainer_config,
         .devcontainer_rebuild = devcontainer_rebuild,
         .nvim_extra_args = nvim_extra_args,
+        .cli_nvim_path = cli_nvim_path,
     };
 
     // Prevent config.deinit from freeing strings now owned by app

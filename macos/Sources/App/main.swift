@@ -13,11 +13,12 @@ let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") }
 
 // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
 // zonvie-specific arguments:
-//   --nofork, --log <path>, --extcmdline, --extpopup, --extpopupmenu,
+//   --nofork, --nvim <path>, --log <path>, --extcmdline, --extpopup, --extpopupmenu,
 //   --extmessages, --exttabline, --extwindows, --ssh=*, --ssh-identity=*,
 //   --devcontainer=*, --devcontainer-config=*, --devcontainer-rebuild,
 //   --help, -h
 // After "--", all remaining arguments are passed to nvim
+var cliNvimPath: String? = nil
 var nvimExtraArgs: [String] = []
 do {
     var i = 1  // Skip argv[0] (executable path)
@@ -44,6 +45,16 @@ do {
            arg == "--extmessages" || arg == "--exttabline" || arg == "--extwindows" ||
            arg == "--devcontainer-rebuild" || arg == "--install" {
             // Skip this argument (it's zonvie-specific)
+            i += 1
+        } else if arg == "--nvim" {
+            // Skip --nvim and its value (nvim path override, space-separated)
+            if i + 1 < args.count {
+                cliNvimPath = args[i + 1]
+            }
+            i += 2
+        } else if arg.hasPrefix("--nvim=") {
+            // --nvim=<path> (equals-separated)
+            cliNvimPath = String(arg.dropFirst("--nvim=".count))
             i += 1
         } else if arg == "--log" {
             // Skip --log and its value
@@ -114,6 +125,7 @@ if args.contains("--help") || args.contains("-h") {
 
         OPTIONS:
             --nofork                      Don't fork; stay attached to terminal, keep cwd
+            --nvim <path>                 Path to Neovim executable (overrides config)
             --log <path>                  Write application logs to specified file path
             --extcmdline                  Enable external command line UI
             --extpopup, --extpopupmenu    Enable external popup menu UI
@@ -429,6 +441,12 @@ if let logPath = cliLogPath {
     ZonvieCore.configureLogging(enabled: true, filePath: config.log.path)
 } else {
     ZonvieCore.configureLogging(enabled: false, filePath: nil)
+}
+
+// Validate --nvim path (reject quote characters that break shell/Zig parser quoting)
+if let nvim = cliNvimPath, nvim.contains("'") || nvim.contains("\"") {
+    fputs("Error: --nvim path must not contain quote characters (' or \")\n", stderr)
+    cliNvimPath = nil
 }
 
 // Log config info after logging is configured

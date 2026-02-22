@@ -98,7 +98,7 @@ final class ViewController: NSViewController {
         }
 
         // Delay start to ensure RunLoop is running (needed for SSH password dialog)
-        let nvimPath = config.neovim.path
+        let nvimPath = cliNvimPath ?? config.neovim.path
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             // rows/cols initial is decided by Zig core; current bootstrap uses 1x1.

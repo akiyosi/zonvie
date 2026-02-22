@@ -763,8 +763,13 @@ final class ZonvieCore {
 
         ZonvieCore.appLog("[start] SSH config: host=\(sshHost ?? "nil"), port=\(sshPort ?? -1), identity=\(sshIdentity ?? "nil")")
 
-        // Build final command path
-        var finalPath = nvimPath
+        // Build final command path (quote if path contains spaces for Zig parser)
+        var finalPath: String
+        if nvimPath.contains(" ") {
+            finalPath = "'" + nvimPath + "'"
+        } else {
+            finalPath = nvimPath
+        }
         if let host = sshHost {
             // Create SSH_ASKPASS script that shows dialog on demand
             // This handles both password auth and key passphrase
@@ -811,7 +816,13 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[start] SSH mode: password auth")
             }
             sshCmd += " -o StrictHostKeyChecking=accept-new"
-            sshCmd += " \(host) '$SHELL --login -c \"nvim --embed\"'"
+            // Use --nvim override for remote nvim path, default to bare "nvim" (PATH lookup)
+            let remoteNvim = cliNvimPath ?? "nvim"
+            // Escape \ for remote shell double-quote context
+            let escapedNvim = remoteNvim.replacingOccurrences(of: "\\", with: "\\\\")
+            // Quote path with \" for remote shell: Zig parser preserves \" inside single-quotes,
+            // remote shell interprets \" as literal " which protects spaces in the path
+            sshCmd += " \(host) '$SHELL --login -c \"\\\"\(escapedNvim)\\\" --embed\"'"
             finalPath = sshCmd
             ZonvieCore.appLog("[start] SSH mode enabled, command: \(finalPath)")
         } else if let workspace = devcontainerWorkspace {
