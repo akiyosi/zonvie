@@ -4363,6 +4363,8 @@ pub fn notifyTablineChanges(self: *Core) void {
     const state = &self.grid.tabline_state;
 
     if (state.visible and state.tabs.items.len > 0) {
+        self.log.write("[tabline] notify: curtab={d} tabs={d} visible={any}\n", .{ state.current_tab, state.tabs.items.len, state.visible });
+
         // Build C-compatible tab array
         var c_tabs = std.ArrayListUnmanaged(c_api.TabEntry){};
         defer c_tabs.deinit(self.alloc);
@@ -4399,6 +4401,7 @@ pub fn notifyTablineChanges(self: *Core) void {
             );
         }
     } else {
+        self.log.write("[tabline] notify: hide (visible={any} tabs={d})\n", .{ state.visible, state.tabs.items.len });
         if (self.cb.on_tabline_hide) |cb| {
             cb(self.ctx);
         }

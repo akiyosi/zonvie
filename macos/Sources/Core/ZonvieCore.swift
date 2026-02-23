@@ -5392,12 +5392,13 @@ final class ZonvieCore {
 
         ZonvieCore.appLog("[Tabline] update: curtab=\(curtab) tabs=\(parsedTabs.count)")
 
-        // Dispatch to main thread via NotificationCenter
+        // Dispatch to main thread via NotificationCenter.
+        // Pass data as notification.object (reference type) to avoid Obj-C
+        // bridging issues with named tuples in NSDictionary-backed userInfo.
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: ZonvieCore.tablineUpdateNotification,
-                object: nil,
-                userInfo: ["tabs": parsedTabs, "currentTab": curtab]
+                object: TablineUpdateInfo(tabs: parsedTabs, currentTab: curtab)
             )
         }
     }
@@ -5457,6 +5458,17 @@ final class ZonvieCore {
             ZonvieCore.appLog("[IME] Switched to ASCII input source")
         } else {
             ZonvieCore.appLog("[IME] Failed to select input source, error=\(result)")
+        }
+    }
+
+    /// Container for tabline update data passed via NSNotification.object.
+    /// Uses a reference type to avoid Obj-C bridging issues with named tuples in userInfo.
+    final class TablineUpdateInfo {
+        let tabs: [(handle: Int64, name: String)]
+        let currentTab: Int64
+        init(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
+            self.tabs = tabs
+            self.currentTab = currentTab
         }
     }
 

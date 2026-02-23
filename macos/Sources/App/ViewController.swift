@@ -152,11 +152,11 @@ final class ViewController: NSViewController {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            guard let tabs = notification.userInfo?["tabs"] as? [(handle: Int64, name: String)],
-                  let currentTab = notification.userInfo?["currentTab"] as? Int64 else {
+            guard let info = notification.object as? ZonvieCore.TablineUpdateInfo else {
+                ZonvieCore.appLog("[Tabline] WARNING: notification object cast failed: \(String(describing: notification.object))")
                 return
             }
-            self?.handleTablineUpdate(tabs: tabs, currentTab: currentTab)
+            self?.handleTablineUpdate(tabs: info.tabs, currentTab: info.currentTab)
         }
 
         tablineHideObserver = NotificationCenter.default.addObserver(

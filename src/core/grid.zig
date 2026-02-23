@@ -1703,6 +1703,9 @@ pub const Grid = struct {
     // --- ext_tabline methods ---
 
     /// Handle tabline_update event.
+    /// Uses build-then-swap: new data is fully constructed before touching
+    /// old state. On allocation failure the old state and dirty flag are
+    /// preserved unchanged so the frontend keeps the previous (correct) view.
     pub fn setTablineUpdate(
         self: *Grid,
         curtab: i64,
@@ -1710,27 +1713,56 @@ pub const Grid = struct {
         curbuf: i64,
         buffers: []const BufferEntry,
     ) !void {
-        // Clear previous state
-        self.tabline_state.clear(self.alloc);
-
-        // Copy tabs (dup strings from arena memory)
+        // --- Phase 1: build new tab list (old state untouched on error) ---
+        var new_tabs: std.ArrayListUnmanaged(TabEntry) = .{};
+        errdefer {
+            for (new_tabs.items) |t| {
+                if (t.name.len > 0) self.alloc.free(t.name);
+            }
+            new_tabs.deinit(self.alloc);
+        }
         for (tabs) |tab| {
             const duped_name = if (tab.name.len > 0) try self.alloc.dupe(u8, tab.name) else "";
-            try self.tabline_state.tabs.append(self.alloc, TabEntry{
+            new_tabs.append(self.alloc, TabEntry{
                 .tab_handle = tab.tab_handle,
                 .name = duped_name,
-            });
+            }) catch |e| {
+                if (duped_name.len > 0) self.alloc.free(duped_name);
+                return e;
+            };
         }
 
-        // Copy buffers (dup strings from arena memory)
+        // --- Phase 2: build new buffer list (old state untouched on error) ---
+        var new_bufs: std.ArrayListUnmanaged(BufferEntry) = .{};
+        errdefer {
+            for (new_bufs.items) |b| {
+                if (b.name.len > 0) self.alloc.free(b.name);
+            }
+            new_bufs.deinit(self.alloc);
+        }
         for (buffers) |buf| {
             const duped_name = if (buf.name.len > 0) try self.alloc.dupe(u8, buf.name) else "";
-            try self.tabline_state.buffers.append(self.alloc, BufferEntry{
+            new_bufs.append(self.alloc, BufferEntry{
                 .buffer_handle = buf.buffer_handle,
                 .name = duped_name,
-            });
+            }) catch |e| {
+                if (duped_name.len > 0) self.alloc.free(duped_name);
+                return e;
+            };
         }
 
+        // --- Phase 3: all allocations succeeded → free old state, install new ---
+        for (self.tabline_state.tabs.items) |t| {
+            if (t.name.len > 0) self.alloc.free(t.name);
+        }
+        self.tabline_state.tabs.deinit(self.alloc);
+        for (self.tabline_state.buffers.items) |b| {
+            if (b.name.len > 0) self.alloc.free(b.name);
+        }
+        self.tabline_state.buffers.deinit(self.alloc);
+
+        self.tabline_state.tabs = new_tabs;
+        self.tabline_state.buffers = new_bufs;
         self.tabline_state.current_tab = curtab;
         self.tabline_state.current_buffer = curbuf;
         self.tabline_state.visible = tabs.len > 0;
