@@ -14,6 +14,7 @@ const Logger = @import("log.zig").Logger;
 const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
+const block_elements = @import("block_elements.zig");
 
 pub const GridEntry = struct {
     grid_id: i64,
@@ -576,6 +577,29 @@ pub const FlushCtx = struct {
                     const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
 
                     try out.ensureUnusedCapacity(alloc, 6);
+                    const v = out.addManyAsSliceAssumeCapacity(6);
+
+                    v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+                    v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                    v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+                }
+
+                /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
+                fn pushSolidQuadAssumeCapacity(
+                    out: *std.ArrayListUnmanaged(c_api.Vertex),
+                    x0: f32, y0: f32, x1: f32, y1: f32,
+                    col: [4]f32,
+                    vw: f32, vh: f32,
+                    grid_id: i64,
+                    base_deco_flags: u32,
+                ) void {
+                    const pts = ndc4(x0, y0, x1, y1, vw, vh);
+                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
                     v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
@@ -1389,6 +1413,23 @@ pub const FlushCtx = struct {
                                                         penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
                                                         continue;
                                                     }
+                                                    // Block element: geometric rendering (no atlas)
+                                                    if (block_elements.isBlockElement(fb_scalar)) {
+                                                        const blk_w = @as(f32, @floatFromInt(fb_col_w)) * cellW;
+                                                        const blk_geo = block_elements.getBlockGeometry(fb_scalar);
+                                                        if (blk_geo.count > 0) {
+                                                            const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                                            out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                                                penX += blk_w;
+                                                                continue;
+                                                            };
+                                                            for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                                                Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                            }
+                                                        }
+                                                        penX += blk_w;
+                                                        continue;
+                                                    }
                                                     if (ctx.core.ensureGlyphPhase2(fb_scalar, c_style)) |fb_ge| {
                                                         if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
                                                             const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
@@ -1415,6 +1456,24 @@ pub const FlushCtx = struct {
                                                 const sp_scalar = ctx.core.shaping_scalars.items[@intCast(this_cluster)];
                                                 if (sp_scalar == 0x20) {
                                                     penX += @as(f32, @floatFromInt(ctx.core.shaping_col_widths.items[@intCast(this_cluster)])) * cellW;
+                                                    continue;
+                                                }
+                                                // Block element: geometric rendering (no atlas)
+                                                if (block_elements.isBlockElement(sp_scalar)) {
+                                                    const blk_cols = ctx.core.shaping_col_widths.items[@intCast(this_cluster)];
+                                                    const blk_w = @as(f32, @floatFromInt(blk_cols)) * cellW;
+                                                    const blk_geo = block_elements.getBlockGeometry(sp_scalar);
+                                                    if (blk_geo.count > 0) {
+                                                        const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                                        out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                                            penX += blk_w;
+                                                            continue;
+                                                        };
+                                                        for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                                            Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                        }
+                                                    }
+                                                    penX += blk_w;
                                                     continue;
                                                 }
                                             }
@@ -1491,6 +1550,22 @@ pub const FlushCtx = struct {
                                         const cell_style_flags = row_cells.style_flags_arr.items[@intCast(col_i)];
                                         const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
                                         if (scalar == 32) {
+                                            penX += cellW;
+                                            continue;
+                                        }
+                                        // Block element: geometric rendering (no atlas)
+                                        if (block_elements.isBlockElement(scalar)) {
+                                            const blk_geo = block_elements.getBlockGeometry(scalar);
+                                            if (blk_geo.count > 0) {
+                                                const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                                out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                                    penX += cellW;
+                                                    continue;
+                                                };
+                                                for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                                    Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, Helpers.rgb(run_fg), dw, dh, run_grid_id, glyph_scroll_flag);
+                                                }
+                                            }
                                             penX += cellW;
                                             continue;
                                         }
@@ -2099,6 +2174,23 @@ pub const FlushCtx = struct {
                                             penX += cellW;
                                             continue;
                                         }
+                                        // Block element: geometric rendering (no atlas)
+                                        if (block_elements.isBlockElement(scalar)) {
+                                            const blk_geo = block_elements.getBlockGeometry(scalar);
+                                            if (blk_geo.count > 0) {
+                                                const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                                const nr_blk_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                                main.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                                    penX += cellW;
+                                                    continue;
+                                                };
+                                                for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                                    Helpers.pushSolidQuadAssumeCapacity(main, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, nr_blk_scroll);
+                                                }
+                                            }
+                                            penX += cellW;
+                                            continue;
+                                        }
 
                                         var ge: c_api.GlyphEntry = undefined;
                                         // Use styled callback for bold/italic if available
@@ -2325,6 +2417,18 @@ pub const FlushCtx = struct {
                         // Render cursor text (character under cursor) with inverted color
                         // Only for block cursor and non-space characters
                         if (@intFromEnum(cursor_out.shape) == 0 and cursor_cp != 0 and cursor_cp != ' ') {
+                            // Block element under cursor: geometric rendering
+                            if (block_elements.isBlockElement(cursor_cp)) {
+                                const blk_geo = block_elements.getBlockGeometry(cursor_cp);
+                                if (blk_geo.count > 0) {
+                                    if (cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6)) {
+                                        const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
+                                        for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                            Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_SCROLLABLE);
+                                        }
+                                    } else |_| {}
+                                }
+                            } else {
                             const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
                             const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
 
@@ -2385,6 +2489,7 @@ pub const FlushCtx = struct {
                                     );
                                 }
                             }
+                            } // end else (non-block-element cursor glyph)
                         }
                     }
                 }
@@ -2663,6 +2768,31 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             var arr: [4]f32 = floats;
             arr[3] = alpha;
             return arr;
+        }
+
+        const solid_uv: [2]f32 = .{ -1.0, -1.0 };
+
+        /// Emit a solid-color quad (caller guarantees 6 vertices of capacity).
+        fn pushSolidQuadAssumeCapacity(
+            out: *std.ArrayListUnmanaged(c_api.Vertex),
+            x0: f32, y0: f32, x1: f32, y1: f32,
+            col: [4]f32,
+            vw: f32, vh: f32,
+            grid_id: i64,
+            base_deco_flags: u32,
+        ) void {
+            const pts = ndc4(x0, y0, x1, y1, vw, vh);
+            const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+            const v = out.addManyAsSliceAssumeCapacity(6);
+
+            v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+            v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+            v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+            v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+            v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+            v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
         }
     };
 
@@ -3353,6 +3483,22 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                             ext_penX += @as(f32, @floatFromInt(efb_col_w)) * cellW;
                                             continue;
                                         }
+                                        // Block element: geometric rendering (no atlas)
+                                        if (block_elements.isBlockElement(efb_scalar)) {
+                                            const eblk_w = @as(f32, @floatFromInt(efb_col_w)) * cellW;
+                                            const eblk_geo = block_elements.getBlockGeometry(efb_scalar);
+                                            if (eblk_geo.count > 0) {
+                                                ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
+                                                    ext_penX += eblk_w;
+                                                    continue;
+                                                };
+                                                for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
+                                                    Helpers.pushSolidQuadAssumeCapacity(ext_verts, ext_penX + rect.x0 * eblk_w, row_y + rect.y0 * cellH, ext_penX + rect.x1 * eblk_w, row_y + rect.y1 * cellH, ext_fg_col, grid_w, grid_h, grid_id, ext_scrollable);
+                                                }
+                                            }
+                                            ext_penX += eblk_w;
+                                            continue;
+                                        }
                                         if (self.ensureGlyphPhase2(efb_scalar, c_style_ext)) |efb_ge| {
                                             if (efb_ge.bbox_size_px[0] > 0 and efb_ge.bbox_size_px[1] > 0) {
                                                 glyph_success_count += 1;
@@ -3387,6 +3533,23 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     const esp_scalar = self.shaping_scalars.items[@intCast(this_cl)];
                                     if (esp_scalar == 0x20) {
                                         ext_penX += @as(f32, @floatFromInt(self.shaping_col_widths.items[@intCast(this_cl)])) * cellW;
+                                        continue;
+                                    }
+                                    // Block element: geometric rendering (no atlas)
+                                    if (block_elements.isBlockElement(esp_scalar)) {
+                                        const eblk_cols = self.shaping_col_widths.items[@intCast(this_cl)];
+                                        const eblk_w = @as(f32, @floatFromInt(eblk_cols)) * cellW;
+                                        const eblk_geo = block_elements.getBlockGeometry(esp_scalar);
+                                        if (eblk_geo.count > 0) {
+                                            ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
+                                                ext_penX += eblk_w;
+                                                continue;
+                                            };
+                                            for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
+                                                Helpers.pushSolidQuadAssumeCapacity(ext_verts, ext_penX + rect.x0 * eblk_w, row_y + rect.y0 * cellH, ext_penX + rect.x1 * eblk_w, row_y + rect.y1 * cellH, ext_fg_col, grid_w, grid_h, grid_id, ext_scrollable);
+                                            }
+                                        }
+                                        ext_penX += eblk_w;
                                         continue;
                                     }
                                 }
@@ -3472,6 +3635,20 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 const scalar: u32 = if (cell_sc == 0) 32 else cell_sc;
 
                 if (scalar == ' ' or scalar == 32) continue;
+
+                // Block element: geometric rendering (no atlas)
+                if (block_elements.isBlockElement(scalar)) {
+                    const eblk_x0: f32 = @as(f32, @floatFromInt(col)) * cellW;
+                    const eblk_geo = block_elements.getBlockGeometry(scalar);
+                    if (eblk_geo.count > 0) {
+                        const eblk_col = Helpers.rgb(self.row_cells.fg_rgbs.items[col]);
+                        ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch continue;
+                        for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
+                            Helpers.pushSolidQuadAssumeCapacity(ext_verts, eblk_x0 + rect.x0 * cellW, row_y + rect.y0 * cellH, eblk_x0 + rect.x1 * cellW, row_y + rect.y1 * cellH, eblk_col, grid_w, grid_h, grid_id, ext_scrollable);
+                        }
+                    }
+                    continue;
+                }
 
                 if (sample_idx < 10) {
                     sample_cps[sample_idx] = scalar;
@@ -3702,6 +3879,22 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         if (cell_idx < sg.cells.len) {
                             const cursor_cell = sg.cells[cell_idx];
                             if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
+                                // Block element under cursor: geometric rendering
+                                if (block_elements.isBlockElement(cursor_cell.cp)) {
+                                    const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
+                                    if (eblk_geo.count > 0) {
+                                        const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
+                                            self.hl.get(self.grid.cursor_attr_id).fg
+                                        else
+                                            self.hl.default_bg;
+                                        const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
+                                        if (ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6)) {
+                                            for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
+                                                Helpers.pushSolidQuadAssumeCapacity(ext_verts, cx0 + rect.x0 * cursor_width, cy0 + rect.y0 * cellH, cx0 + rect.x1 * cursor_width, cy0 + rect.y1 * cellH, eblk_fg_col, grid_w, grid_h, grid_id, c_api.DECO_SCROLLABLE);
+                                            }
+                                        } else |_| {}
+                                    }
+                                } else {
                                 var glyph_entry: c_api.GlyphEntry = undefined;
                                 var glyph_ok: c_int = -1;
 
@@ -3755,6 +3948,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                                     ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                                 }
+                                } // end else (non-block-element ext cursor glyph)
                             }
                         }
                     }
