@@ -881,6 +881,12 @@ pub fn runLoop(self: *Core) void {
         self.stderr_thread = std.Thread.spawn(.{}, pumpStderr, .{ self, ef }) catch null;
     }
 
+    // Start writer thread for non-blocking stdin writes.
+    // SSH mode defers this until after authentication completes (see below).
+    if (!self.is_ssh_mode) {
+        self.startWriterThread();
+    }
+
     // SSH mode: prompt for password immediately after process start
     // With -tt option, password prompt goes to TTY (not visible via pipes)
     // So we show dialog immediately and wait for user to enter password
@@ -921,8 +927,9 @@ pub fn runLoop(self: *Core) void {
             self.log.write("SSH mode: no callback registered\n", .{});
         }
 
-        // Clear pending flag
+        // Clear pending flag and start writer thread now that auth is done
         self.ssh_auth_pending.store(false, .seq_cst);
+        self.startWriterThread();
 
         if (self.stop_flag.load(.seq_cst)) {
             self.log.write("SSH mode: stopped by user\n", .{});

@@ -338,6 +338,8 @@ pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
 }
 
 pub const Core = struct {
+    const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
+
     alloc: std.mem.Allocator,
     cb: Callbacks,
     ctx: ?*anyopaque,
@@ -367,10 +369,18 @@ pub const Core = struct {
     key_buf: std.ArrayListUnmanaged(u8) = .{},
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
-    write_mu: std.Thread.Mutex = .{},
+
+    // Writer thread: non-blocking stdin writes via dedicated thread.
+    // sendRaw() enqueues data here; writerThreadFn drains to stdin pipe.
+    // Lock order: grid_mu must be acquired before write_queue_mu if both are needed.
+    write_queue_mu: std.Thread.Mutex = .{},
+    write_queue_cond: std.Thread.Condition = .{},
+    write_queue: std.ArrayListUnmanaged(u8) = .{},
+    write_queue_closed: bool = false,
+    writer_failed: bool = false,
+    writer_thread: ?std.Thread = null,
 
     // Mutex to protect grid state access from concurrent RPC and UI threads.
-    // Lock order: grid_mu must be acquired before write_mu if both are needed.
     grid_mu: std.Thread.Mutex = .{},
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -553,10 +563,25 @@ pub const Core = struct {
     pub fn stop(self: *Core) void {
         self.stop_flag.store(true, .seq_cst);
 
+        // Signal writer thread to stop and capture thread handle under lock
+        var wt: ?std.Thread = null;
+        {
+            self.write_queue_mu.lock();
+            self.write_queue_closed = true;
+            wt = self.writer_thread;
+            self.writer_thread = null;
+            self.write_queue_cond.signal();
+            self.write_queue_mu.unlock();
+        }
+
+        // Close stdin to unblock writer thread's writeAll() if it's blocked on pipe I/O
         if (self.stdin_file) |f| {
             f.close();
             self.stdin_file = null;
         }
+
+        // Join writer thread (exits due to closed flag or I/O error from stdin close)
+        if (wt) |t| t.join();
 
         if (self.child_handle) |_| {
             // On Windows targets, std.posix.kill is not available.
@@ -593,6 +618,7 @@ pub const Core = struct {
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
+        self.write_queue.deinit(self.alloc);
 
         // Free nvim path copy
         if (self.nvim_path_owned) |p| {
@@ -1695,7 +1721,81 @@ pub const Core = struct {
         }
     }
 
+    /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
+    /// Receives the file handle by value to avoid racing with stop().
+    fn writerThreadFn(self: *Core, file: std.fs.File) void {
+        var drain: std.ArrayListUnmanaged(u8) = .{};
+        defer drain.deinit(self.alloc);
+
+        while (true) {
+            self.write_queue_mu.lock();
+
+            // Wait for data or close signal
+            while (self.write_queue.items.len == 0 and !self.write_queue_closed) {
+                self.write_queue_cond.wait(&self.write_queue_mu);
+            }
+
+            if (self.write_queue.items.len == 0 and self.write_queue_closed) {
+                self.write_queue_mu.unlock();
+                self.log.write("writer thread: clean shutdown (queue drained)\n", .{});
+                break;
+            }
+
+            // O(1) swap: take full queue, leave empty drain buffer for producers
+            std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_queue, &drain);
+            self.write_queue_mu.unlock();
+
+            // Write to pipe WITHOUT holding any mutex
+            file.writeAll(drain.items) catch |e| {
+                self.log.write("writer thread writeAll err: {any}\n", .{e});
+                // Mark writer as failed + closed, notify any future waiters
+                self.write_queue_mu.lock();
+                self.writer_failed = true;
+                self.write_queue_closed = true;
+                self.write_queue_cond.broadcast();
+                self.write_queue_mu.unlock();
+                break;
+            };
+
+            drain.clearRetainingCapacity();
+        }
+    }
+
+    /// Start the dedicated writer thread for non-blocking stdin writes.
+    /// Safe to call from rpc_session.zig after stdin_file is set.
+    pub fn startWriterThread(self: *Core) void {
+        const file = self.stdin_file orelse {
+            self.log.write("startWriterThread: stdin_file is null\n", .{});
+            return;
+        };
+
+        self.write_queue_mu.lock();
+
+        // Guard: don't start if shutdown is in progress or already running.
+        // write_queue_closed is set by stop() under the same mutex, so this
+        // check fully closes the race window between stop_flag and lock acquisition.
+        if (self.write_queue_closed or self.writer_thread != null) {
+            self.write_queue_mu.unlock();
+            return;
+        }
+
+        // Reset state flags and drain stale data (safe for reconnect / re-use)
+        self.writer_failed = false;
+        self.write_queue.clearRetainingCapacity();
+
+        self.writer_thread = std.Thread.spawn(.{}, writerThreadFn, .{ self, file }) catch |e| {
+            self.write_queue_mu.unlock();
+            self.log.write("FATAL: failed to spawn writer thread: {any}, using sync writes\n", .{e});
+            return; // writer_thread remains null → sendRaw uses sync fallback
+        };
+
+        self.write_queue_mu.unlock();
+    }
+
     pub fn sendRaw(self: *Core, bytes: []const u8) !void {
+        // Don't attempt writes during shutdown (avoids sync fallback re-block)
+        if (self.stop_flag.load(.seq_cst)) return error.BrokenPipe;
+
         // SSH mode: wait if authentication is pending (block RPC sends until password is entered)
         if (self.is_ssh_mode and self.ssh_auth_pending.load(.seq_cst)) {
             self.log.write("sendRaw: blocked during SSH auth, waiting...\n", .{});
@@ -1708,9 +1808,36 @@ pub const Core = struct {
             self.log.write("sendRaw: SSH auth done, proceeding\n", .{});
         }
 
-        self.write_mu.lock();
-        defer self.write_mu.unlock();
+        // Check writer thread state under lock to avoid data race with stop()/startWriterThread()
+        self.write_queue_mu.lock();
 
+        if (self.writer_thread != null) {
+            // Writer thread is active → enqueue (non-blocking path)
+            if (self.writer_failed or self.write_queue_closed) {
+                self.write_queue_mu.unlock();
+                return error.BrokenPipe;
+            }
+
+            // Queue cap check (subtraction form to avoid usize overflow)
+            if (bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue.items.len) {
+                self.log.write("sendRaw: write queue full ({d} bytes), dropping\n",
+                    .{self.write_queue.items.len});
+                self.write_queue_mu.unlock();
+                return error.OutOfMemory;
+            }
+
+            self.write_queue.appendSlice(self.alloc, bytes) catch {
+                self.write_queue_mu.unlock();
+                return error.OutOfMemory;
+            };
+            self.write_queue_cond.signal();
+            self.write_queue_mu.unlock();
+            return;
+        }
+
+        self.write_queue_mu.unlock();
+
+        // Fallback: no writer thread → synchronous write (startup / spawn failure)
         if (self.stdin_file) |f| {
             try f.writeAll(bytes);
         } else {
