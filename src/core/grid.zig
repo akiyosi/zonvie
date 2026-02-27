@@ -768,6 +768,13 @@ pub const Grid = struct {
     // Also set initially by tryResizeGrid for new windows.
     external_grid_target_sizes: std.AutoHashMapUnmanaged(i64, GridSize) = .{},
 
+    // ext_windows: set during handleRedraw when a composited (non-external,
+    // non-float) editor window receives win_close. Used by the promotion
+    // logic in rpc_session.zig to detect that Neovim may have re-composited
+    // grid 2 as a fallback, which should not block promotion.
+    // Cleared after the promotion check.
+    composited_win_closed: bool = false,
+
     // ext_cmdline state
     cmdline_states: std.AutoHashMapUnmanaged(u32, CmdlineState) = .{}, // level -> state
     cmdline_block: CmdlineBlock = .{},

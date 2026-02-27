@@ -720,6 +720,12 @@ pub fn handleRedraw(
                 const t = tv.arr;
                 if (t.len < 1 or t[0] != .int) continue;
                 const grid_id = t[0].int;
+                // Track if a composited (non-external, non-float) editor window
+                // is being closed. The promotion logic uses this to detect when
+                // Neovim re-composites grid 2 as a fallback in the same batch.
+                if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
+                    grid.composited_win_closed = true;
+                }
                 grid.hideWin(grid_id);
                 // On permanent close, remove from ext_windows tracking.
                 // On hide (tab switch), keep tracking so win_pos can restore.

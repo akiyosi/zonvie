@@ -572,14 +572,6 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Handle tabline changes (ext_tabline)
         self.notifyTablineChanges();
 
-        // ext_windows: ensure grid 2 (default editor window) is composited.
-        // With ext_windows, Neovim may not send win_pos for the default window.
-        // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
-        // auto-position it at (0,0) so it gets rendered in the main window.
-        if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
-            self.grid.setWinPos(2, 1000, 0, 0) catch {};
-        }
-
         // Process pending ext_windows grid resizes (from win_resize events).
         // win_resize is Neovim's request to the UI. The UI decides the actual
         // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
@@ -629,6 +621,181 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
         self.grid.pending_win_ops.clearRetainingCapacity();
+
+        // ext_windows: Promote external grids back to composited when the main
+        // window has no composited editor windows left.
+        //
+        // This handles the case where the user closes the last composited window
+        // in a split layout (e.g. :close). Neovim sends win_close for the closed
+        // grid and win_pos for the remaining grid(s) in the same redraw batch.
+        // After processing the batch, if no editor windows remain composited in
+        // the main window, we promote external grids back to composited so the
+        // user sees them in the main window instead of only in separate OS windows.
+        //
+        // notifyExternalWindowChanges() (below) naturally detects the removal from
+        // external_grids and fires on_external_window_close so the frontend closes
+        // the external OS window.
+        //
+        // IMPORTANT: This must run BEFORE the grid 2 auto-compositing fallback
+        // below, because win_close removes grid 2 from win_pos, and the fallback
+        // would re-add it — making the promotion check think there's still a
+        // composited editor window and skipping promotion entirely.
+        var ext_windows_promoted = false;
+        if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
+            // Detect whether the main grid has any composited editor windows.
+            // Skip: grid 1 (global/status), floats (in win_layer), external grids,
+            // and grids without a real Neovim window handle (not in grid_win_ids).
+            var has_composited_editor_win = false;
+            var only_grid2_composited = true;
+            {
+                var wp_it = self.grid.win_pos.keyIterator();
+                while (wp_it.next()) |key_ptr| {
+                    const gid = key_ptr.*;
+                    if (gid == 1) continue;
+                    if (self.grid.win_layer.contains(gid)) continue;
+                    if (self.grid.external_grids.contains(gid)) continue;
+                    if (!self.grid.grid_win_ids.contains(gid)) continue;
+                    has_composited_editor_win = true;
+                    if (gid != 2) only_grid2_composited = false;
+                }
+            }
+
+            // If a composited editor window was closed in this batch and the
+            // only remaining composited window is grid 2, treat grid 2 as a
+            // Neovim fallback and remove it so promotion can proceed.
+            // This handles the case where: user closes a promoted window →
+            // Neovim re-composites grid 2 as default → we want to promote the
+            // next external window instead of showing grid 2's empty buffer.
+            if (has_composited_editor_win and self.grid.composited_win_closed and only_grid2_composited) {
+                self.grid.hideWin(2);
+                has_composited_editor_win = false;
+                self.log.write("[ext_windows_promote] removed fallback grid 2 (composited_win_closed)\n", .{});
+            }
+            self.grid.composited_win_closed = false;
+
+            if (!has_composited_editor_win) {
+                // Main window is empty of editor windows. Collect promotion candidates.
+                // Only consider grids in BOTH ext_windows_grids AND external_grids.
+                // ext_windows_grids can contain win_hide'd grids (tab switch) that have
+                // been removed from external_grids — those must not be promoted.
+                const PromoteEntry = struct {
+                    grid_id: i64,
+                    win_id: i64,
+                    row: u32,
+                    col: u32,
+                };
+
+                // Find ONE grid to promote. Only promote a single grid to avoid
+                // multiple external grids rendering on top of each other in the
+                // main window. The remaining external windows stay as separate
+                // OS windows.
+                //
+                // Selection: pick the first candidate that exists in BOTH
+                // ext_windows_grids AND external_grids, preferring one with a
+                // valid position (start_row >= 0). If none have valid positions,
+                // fall back to (0,0).
+                var promote_target: ?PromoteEntry = null;
+                var fallback_target: ?PromoteEntry = null;
+                {
+                    var ew_it = self.grid.ext_windows_grids.iterator();
+                    while (ew_it.next()) |entry| {
+                        const gid = entry.key_ptr.*;
+                        const wid = entry.value_ptr.*;
+
+                        const ext_info = self.grid.external_grids.get(gid) orelse continue;
+
+                        if (ext_info.start_row >= 0 and ext_info.start_col >= 0) {
+                            // First candidate with valid position wins.
+                            promote_target = .{
+                                .grid_id = gid,
+                                .win_id = wid,
+                                .row = @intCast(ext_info.start_row),
+                                .col = @intCast(ext_info.start_col),
+                            };
+                            break;
+                        } else if (fallback_target == null) {
+                            // Remember first candidate as fallback (position unknown).
+                            fallback_target = .{
+                                .grid_id = gid,
+                                .win_id = wid,
+                                .row = 0,
+                                .col = 0,
+                            };
+                        }
+                    }
+                }
+
+                // Use fallback if no candidate had a valid position.
+                if (promote_target == null and fallback_target != null) {
+                    promote_target = fallback_target;
+                    self.log.write("[ext_windows_promote] fallback: promoting grid={d} at (0,0) (no valid position)\n", .{fallback_target.?.grid_id});
+                }
+
+                // Execute promotion of the single selected grid.
+                if (promote_target) |p| {
+                    // Remove from external tracking BEFORE calling setWinPos
+                    // (setWinPos has guard: if external_grids.contains(grid_id) return)
+                    _ = self.grid.external_grids.remove(p.grid_id);
+                    _ = self.grid.ext_windows_grids.remove(p.grid_id);
+                    _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
+                    _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
+
+                    self.grid.setWinPos(p.grid_id, p.win_id, p.row, p.col) catch |e| {
+                        self.log.write("[ext_windows_promote] setWinPos grid={d} failed: {any}\n", .{ p.grid_id, e });
+                    };
+                    self.log.write("[ext_windows_promote] promoted grid={d} win={d} at ({d},{d})\n", .{ p.grid_id, p.win_id, p.row, p.col });
+
+                    // Resize the promoted grid to fill the main window IMMEDIATELY
+                    // so the grid content covers the entire main window (prevents
+                    // "window in a window" visual). New cells are filled with
+                    // spaces (default bg). Neovim will populate them when it
+                    // processes the try_resize_grid request.
+                    self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols) catch |e| {
+                        self.log.write("[ext_windows_promote] resizeGrid grid={d} failed: {any}\n", .{ p.grid_id, e });
+                    };
+                    self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols) catch |e| {
+                        self.log.write("[ext_windows_promote] requestTryResizeGridInternal grid={d} failed: {any}\n", .{ p.grid_id, e });
+                    };
+                    self.log.write("[ext_windows_promote] resized+requested grid={d} to {d}x{d}\n", .{ p.grid_id, self.grid.rows, self.grid.cols });
+
+                    ext_windows_promoted = true;
+                    self.grid.markAllDirty();
+                }
+            }
+        } else {
+            // Clear the flag even when the promotion block was skipped
+            // (e.g. ext_windows disabled or no ext_windows grids).
+            self.grid.composited_win_closed = false;
+        }
+
+        // ext_windows: ensure grid 2 (default editor window) is composited.
+        // With ext_windows, Neovim may not send win_pos for the default window.
+        // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
+        // auto-position it at (0,0) so it gets rendered in the main window.
+        //
+        // Skip this if:
+        //   - External grids were just promoted in this batch, OR
+        //   - Another non-float editor grid is already composited (e.g. a
+        //     previously promoted grid still occupying the main window).
+        // In both cases grid 2 would overlap the promoted grid.
+        if (!ext_windows_promoted) {
+            if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
+                var has_other_editor_grid = false;
+                {
+                    var wp_chk = self.grid.win_pos.keyIterator();
+                    while (wp_chk.next()) |key_ptr| {
+                        const gid = key_ptr.*;
+                        if (gid == 1 or gid == 2) continue;
+                        if (self.grid.win_layer.contains(gid)) continue;
+                        has_other_editor_grid = true;
+                        break;
+                    }
+                }
+                if (!has_other_editor_grid) {
+                    self.grid.setWinPos(2, 1000, 0, 0) catch {};
+                }
+            }
+        }
 
         // Check for external window changes and notify frontend
         const new_ext_grids = self.notifyExternalWindowChanges();
