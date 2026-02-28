@@ -115,6 +115,10 @@ struct ZonvieConfig {
         /// Shape cache size for HarfBuzz text-run shaping results (2-way set associative)
         /// Default: 4096, Range: 512-65536
         var shapeCacheSize: Int = 4096
+
+        /// Glyph atlas texture size (square, both width and height)
+        /// Default: 2048, Range: 1024-4096
+        var atlasSize: Int = 2048
     }
 
     struct IMEConfig {
@@ -201,6 +205,7 @@ struct ZonvieConfig {
         config.performance.glyphCacheNonAsciiSize = Int(v.perf_glyph_cache_non_ascii)
         config.performance.hlCacheSize = Int(v.perf_hl_cache_size)
         config.performance.shapeCacheSize = Int(v.perf_shape_cache_size)
+        config.performance.atlasSize = Int(v.perf_atlas_size)
 
         // IME
         config.ime.disableOnActivate = v.ime_disable_on_activate

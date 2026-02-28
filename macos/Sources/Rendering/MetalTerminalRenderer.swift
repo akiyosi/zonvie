@@ -832,7 +832,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Acquire GPU slot BEFORE marking gpuInFlightCount.
             // This prevents sem.wait()-blocked draw() from inflating gpuInFlightCount,
             // which would cause beginFlush() to incorrectly see all sets as "in-flight".
+            var t_sem_start: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled {
+                t_sem_start = CFAbsoluteTimeGetCurrent()
+            }
             inflightSemaphore.wait()
+            if ZonvieCore.appLogEnabled {
+                let sem_us = (CFAbsoluteTimeGetCurrent() - t_sem_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_semaphore_wait us=\(String(format: "%.1f", sem_us))")
+            }
 
             // === PERF LOG: lock取得開始 ===
             var t_lock_start: CFAbsoluteTime = 0
@@ -973,10 +981,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lastRenderedBlinkState = cursorBlinkState
 
             // We always need a drawable to present.
+            var t_drawable_start: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled {
+                t_drawable_start = CFAbsoluteTimeGetCurrent()
+            }
             guard let drawable = view.currentDrawable else { return }
+            if ZonvieCore.appLogEnabled {
+                let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
+            }
 
             // Ensure persistent back buffer matches current drawable size.
+            var t_backbuf_start: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled {
+                t_backbuf_start = CFAbsoluteTimeGetCurrent()
+            }
             ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
+            if ZonvieCore.appLogEnabled {
+                let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
+            }
             guard let backTex = backBuffer else { return }
 
             // --- 1) Render into back buffer (partial redraw is valid here) ---
@@ -1283,6 +1307,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
 
+            var t_present_start: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled {
+                t_present_start = CFAbsoluteTimeGetCurrent()
+            }
             cmd.present(drawable)
             cmd.addCompletedHandler { [weak self, weak view] _ in
                 guard let self = self else { return }
@@ -1317,6 +1345,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
             cmd.commit()
+            if ZonvieCore.appLogEnabled {
+                let present_commit_us = (CFAbsoluteTimeGetCurrent() - t_present_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_present_commit us=\(String(format: "%.1f", present_commit_us))")
+            }
             gpuSubmitted = true  // Completion handler handles cleanup; prevent defer
 
             // === PERF LOG: draw終了 ===

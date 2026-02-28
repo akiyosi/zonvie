@@ -342,6 +342,7 @@ pub fn main() u8 {
                     \\        glyph_cache_non_ascii_size  Non-ASCII glyph cache size (min: 64)
                     \\        hl_cache_size               Highlight cache size (64-2048, default: 512)
                     \\        shape_cache_size            Shape cache size (512-65536, default: 4096)
+                    \\        atlas_size                  Glyph atlas texture size (1024-4096, default: 2048)
                     \\
                     \\For more information, visit: https://github.com/akiyosi/zonvie
                     \\

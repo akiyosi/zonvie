@@ -771,6 +771,11 @@ void zonvie_core_set_inherit_cwd(zonvie_core *core, int enabled);
  * Should be called before zonvie_core_start() for best results. */
 void zonvie_core_set_glyph_cache_size(zonvie_core *core, unsigned ascii_size, unsigned non_ascii_size);
 
+/* Set glyph atlas texture size (square, both width and height).
+ * size: atlas dimension in pixels (default: 2048, range: 1024-4096)
+ * Must be called before zonvie_core_start(). Ignored after start. */
+void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
+
 /* Create a new core instance.
    cb:             pointer to callback struct (may be NULL).
    callbacks_size: sizeof(zonvie_callbacks) as seen by the caller.
@@ -1083,6 +1088,7 @@ typedef struct zonvie_config_values {
     int32_t perf_glyph_cache_non_ascii;
     int32_t perf_hl_cache_size;
     int32_t perf_shape_cache_size;
+    int32_t perf_atlas_size;
     // ime
     bool ime_disable_on_activate;
     bool ime_disable_on_modechange;

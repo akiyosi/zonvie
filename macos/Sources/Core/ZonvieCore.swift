@@ -878,6 +878,7 @@ final class ZonvieCore {
             UInt32(perfConfig.glyphCacheAsciiSize),
             UInt32(perfConfig.glyphCacheNonAsciiSize)
         )
+        zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
 
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))

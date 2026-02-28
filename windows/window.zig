@@ -435,11 +435,27 @@ pub export fn WndProc(
                 // Request a full re-seed so the core regenerates every row.
                 // Guard with renderer mutex (resetAtlas sets the flag under a.mu).
                 if (atlas_ptr) |a| {
-                    a.mu.lock();
-                    const reset_pending = a.atlas_reset_pending;
-                    if (reset_pending) a.atlas_reset_pending = false;
-                    a.mu.unlock();
+                    var reset_pending = false;
+                    var cur_atlas_w: u32 = 0;
+                    var cur_atlas_h: u32 = 0;
+                    {
+                        a.mu.lock();
+                        defer a.mu.unlock();
+                        reset_pending = a.atlas_reset_pending;
+                        if (reset_pending) a.atlas_reset_pending = false;
+                        cur_atlas_w = a.atlas_w;
+                        cur_atlas_h = a.atlas_h;
+                    }
                     if (reset_pending) {
+                        // Resize D3D atlas texture if dimensions changed (render-thread-owned)
+                        if (gpu_ptr) |g| {
+                            g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch {
+                                applog.appLog("[win] FATAL: D3D atlas texture recreation failed, skipping frame\n", .{});
+                                if (app.hwnd) |h| _ = c.PostMessageW(h, c.WM_CLOSE, 0, 0);
+                                app.mu.unlock();
+                                return 0;
+                            };
+                        }
                         app.need_full_seed.store(true, .seq_cst);
                         app.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
@@ -2372,6 +2388,18 @@ pub export fn WndProc(
                     app.config.performance.glyph_cache_ascii_size,
                     app.config.performance.glyph_cache_non_ascii_size,
                 });
+                // Clamp atlas_size against D3D max texture size, then set
+                const atlas_cfg = app.config.performance.atlas_size;
+                var atlas_size_clamped = atlas_cfg;
+                if (app.renderer) |*g| {
+                    const max_tex = g.maxTextureSize();
+                    if (atlas_cfg > max_tex) {
+                        applog.appLog("[win] atlas_size {d} exceeds D3D max {d}, clamping\n", .{ atlas_cfg, max_tex });
+                        atlas_size_clamped = max_tex;
+                    }
+                }
+                core.zonvie_core_set_atlas_size(app.corep, atlas_size_clamped);
+                applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
 
                 // Build nvim command and start nvim (runs in background thread)
                 var nvim_cmd_buf: [1024]u8 = undefined;

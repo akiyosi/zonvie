@@ -129,6 +129,11 @@ pub const default_routes = [_]MsgRoute{
     .{ .event = .msg_history_show, .view = .split },
 };
 
+// Atlas size limits (shared between TOML parser and C API setter)
+pub const atlas_size_min: u32 = 1024;
+pub const atlas_size_max: u32 = 4096;
+pub const atlas_size_default: u32 = 2048;
+
 /// Zonvie configuration (nested structure for compatibility with existing code)
 pub const Config = struct {
     neovim: NeovimConfig = .{},
@@ -238,6 +243,7 @@ pub const Config = struct {
         glyph_cache_non_ascii_size: u32 = 256,
         hl_cache_size: u32 = 2048, // NOTE: default must match nvim_core.zig hl_cache_size
         shape_cache_size: u32 = 4096,
+        atlas_size: u32 = atlas_size_default,
     };
 
     pub const IMEConfig = struct {
@@ -394,6 +400,7 @@ pub const Config = struct {
             if (p.glyph_cache_non_ascii_size) |s| self.performance.glyph_cache_non_ascii_size = @max(64, s);
             if (p.hl_cache_size) |s| self.performance.hl_cache_size = @max(64, @min(2048, s));
             if (p.shape_cache_size) |s| self.performance.shape_cache_size = @max(512, @min(65536, s));
+            if (p.atlas_size) |s| self.performance.atlas_size = @max(atlas_size_min, @min(atlas_size_max, s));
         }
 
         if (cfg.ime) |i| {
@@ -586,6 +593,7 @@ const TomlPerformance = struct {
     glyph_cache_non_ascii_size: ?u32 = null,
     hl_cache_size: ?u32 = null,
     shape_cache_size: ?u32 = null,
+    atlas_size: ?u32 = null,
 };
 
 const TomlIME = struct {

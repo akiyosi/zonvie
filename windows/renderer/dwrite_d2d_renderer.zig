@@ -3,11 +3,6 @@ const core = @import("zonvie_core");
 const c = @import("../win32.zig").c;
 const applog = @import("../app_log.zig");
 
-// Move outside Renderer (Zig cannot have const declarations between container fields)
-// Must match core's atlas_w/atlas_h (nvim_core.zig) for Phase 2 UV consistency.
-const AtlasW: u32 = 2048;
-const AtlasH: u32 = 2048;
-
 // DPI function (Windows 10 v1607+)
 extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
 
@@ -95,7 +90,11 @@ pub const Renderer = struct {
     // style_flags uses bits 21-22 since Unicode scalars only use bits 0-20
     styled_glyph_map: std.AutoHashMap(u32, core.GlyphEntry),
 
-    // CPU-side atlas (full size: AtlasW * AtlasH). Always keeps the whole atlas.
+    // Atlas dimensions (set by recreateAtlasTexture, default 2048x2048)
+    atlas_w: u32 = 2048,
+    atlas_h: u32 = 2048,
+
+    // CPU-side atlas (full size: atlas_w * atlas_h * 4 bytes).
     atlas_cpu: std.ArrayListUnmanaged(u8) = .{},
     
     // temporary buffer for a single glyph (padded) generation
@@ -394,7 +393,7 @@ pub const Renderer = struct {
         };
     
         var bmp: ?*c.ID2D1Bitmap = null;
-        const sz = c.D2D1_SIZE_U{ .width = AtlasW, .height = AtlasH };
+        const sz = c.D2D1_SIZE_U{ .width = self.atlas_w, .height = self.atlas_h };
 
         // ★ HwndRenderTarget vtbl doesn't expose CreateBitmap, so cast to base RenderTarget
         const rt_base: *c.ID2D1RenderTarget = @as(*c.ID2D1RenderTarget, @ptrCast(rt));
@@ -448,7 +447,7 @@ pub const Renderer = struct {
         }
 
         // 4 bytes per pixel (RGBA) for true ClearType subpixel rendering
-        const total = @as(usize, AtlasW) * @as(usize, AtlasH) * 4;
+        const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
         try self.atlas_cpu.resize(self.alloc, total);
         @memset(self.atlas_cpu.items, 0);
 
@@ -458,13 +457,13 @@ pub const Renderer = struct {
         const bvtbl = bmp_ptr.lpVtbl.*;
         const copy_fn = bvtbl.CopyFromMemory orelse return error.BitmapMissingCopyFromMemory;
 
-        const rect = c.D2D1_RECT_U{ .left = 0, .top = 0, .right = AtlasW, .bottom = AtlasH };
+        const rect = c.D2D1_RECT_U{ .left = 0, .top = 0, .right = self.atlas_w, .bottom = self.atlas_h };
 
         const hr3 = copy_fn(
             bmp_ptr,
             &rect,
             self.atlas_cpu.items.ptr,
-            AtlasW * 4, // bytes per row (RGBA)
+            self.atlas_w * 4, // bytes per row (RGBA)
         );
         
         if (c.FAILED(hr3)) return error.ClearAtlasFailed;
@@ -720,24 +719,24 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     const packed_h: u32 = bh + pad * 2;
 
     // wrap to next row if needed
-    if (self.atlas_next_x + packed_w + 1 >= AtlasW) {
+    if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
         self.atlas_next_x = 1;
         self.atlas_next_y += self.atlas_row_h + 1;
         self.atlas_row_h = 0;
     }
     // If atlas is full, reset and retry (simple eviction strategy)
-    if (self.atlas_next_y + packed_h + 1 >= AtlasH) {
+    if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
         if (applog.isEnabled()) applog.appLog("[atlas] ensureGlyph scalar=0x{x}: atlas full, resetting\n", .{scalar});
         self.resetAtlas();
 
         // After reset, re-check row wrap (should start at x=1, y=1)
-        if (self.atlas_next_x + packed_w + 1 >= AtlasW) {
+        if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
             self.atlas_next_x = 1;
             self.atlas_next_y += self.atlas_row_h + 1;
             self.atlas_row_h = 0;
         }
         // If still doesn't fit after reset, glyph is too large for atlas
-        if (self.atlas_next_y + packed_h + 1 >= AtlasH) {
+        if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
             if (applog.isEnabled()) applog.appLog("[atlas] ensureGlyph scalar=0x{x}: glyph too large for atlas ({d}x{d})\n", .{ scalar, packed_w, packed_h });
             return error.GlyphTooLarge;
         }
@@ -754,7 +753,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     {
         var y: u32 = 0;
         while (y < packed_h) : (y += 1) {
-            const row_off = ((@as(usize, place_y + y) * @as(usize, AtlasW)) + @as(usize, place_x)) * 4;
+            const row_off = ((@as(usize, place_y + y) * @as(usize, self.atlas_w)) + @as(usize, place_x)) * 4;
             @memset(self.atlas_cpu.items[row_off .. row_off + packed_w * 4], 0);
         }
     }
@@ -768,7 +767,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             var x: u32 = 0;
             while (x < bw) : (x += 1) {
                 const src_off = (@as(usize, y) * @as(usize, bw) + @as(usize, x)) * 3;
-                const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, AtlasW)) + @as(usize, place_x + pad + x)) * 4;
+                const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, self.atlas_w)) + @as(usize, place_x + pad + x)) * 4;
 
                 // Store RGB directly for subpixel blending
                 const r = tmp_rgb[src_off];
@@ -796,10 +795,10 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     self.atlas_version +%= 1;
 
     // UV for *actual glyph area* excluding padding
-    const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(AtlasW));
-    const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(AtlasH));
-    const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(AtlasW));
-    const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(AtlasH));
+    const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(self.atlas_w));
+    const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(self.atlas_h));
+    const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(self.atlas_w));
+    const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(self.atlas_h));
 
     const entry = core.GlyphEntry{
         .uv_min = .{ uv_u0, uv_v0 },
@@ -1058,24 +1057,24 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         const packed_h: u32 = bh + pad * 2;
 
         // wrap to next row if needed
-        if (self.atlas_next_x + packed_w + 1 >= AtlasW) {
+        if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
             self.atlas_next_x = 1;
             self.atlas_next_y += self.atlas_row_h + 1;
             self.atlas_row_h = 0;
         }
         // If atlas is full, reset and retry (simple eviction strategy)
-        if (self.atlas_next_y + packed_h + 1 >= AtlasH) {
+        if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
             if (applog.isEnabled()) applog.appLog("[atlas] renderGlyphWithFace scalar=0x{x}: atlas full, resetting\n", .{scalar});
             self.resetAtlas();
 
             // After reset, re-check row wrap
-            if (self.atlas_next_x + packed_w + 1 >= AtlasW) {
+            if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
                 self.atlas_next_x = 1;
                 self.atlas_next_y += self.atlas_row_h + 1;
                 self.atlas_row_h = 0;
             }
             // If still doesn't fit after reset, glyph is too large
-            if (self.atlas_next_y + packed_h + 1 >= AtlasH) {
+            if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
                 if (applog.isEnabled()) applog.appLog("[atlas] renderGlyphWithFace scalar=0x{x}: glyph too large ({d}x{d})\n", .{ scalar, packed_w, packed_h });
                 return error.GlyphTooLarge;
             }
@@ -1091,7 +1090,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         {
             var y: u32 = 0;
             while (y < packed_h) : (y += 1) {
-                const row_off = ((@as(usize, place_y + y) * @as(usize, AtlasW)) + @as(usize, place_x)) * 4;
+                const row_off = ((@as(usize, place_y + y) * @as(usize, self.atlas_w)) + @as(usize, place_x)) * 4;
                 @memset(self.atlas_cpu.items[row_off .. row_off + packed_w * 4], 0);
             }
         }
@@ -1103,7 +1102,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                 var x: u32 = 0;
                 while (x < bw) : (x += 1) {
                     const src_off = (@as(usize, y) * @as(usize, bw) + @as(usize, x)) * 3;
-                    const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, AtlasW)) + @as(usize, place_x + pad + x)) * 4;
+                    const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, self.atlas_w)) + @as(usize, place_x + pad + x)) * 4;
 
                     const r = tmp_rgb[src_off];
                     const g = tmp_rgb[src_off + 1];
@@ -1129,10 +1128,10 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         self.atlas_version +%= 1;
 
         // UV for actual glyph area excluding padding
-        const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(AtlasW));
-        const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(AtlasH));
-        const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(AtlasW));
-        const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(AtlasH));
+        const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(self.atlas_w));
+        const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(self.atlas_h));
+        const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(self.atlas_w));
+        const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(self.atlas_h));
 
         return core.GlyphEntry{
             .uv_min = .{ uv_u0, uv_v0 },
@@ -1264,7 +1263,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         var y: u32 = 0;
         while (y < height) : (y += 1) {
             const src_row: usize = if (bitmap.pitch >= 0) @as(usize, y) else @as(usize, height - 1 - y);
-            const dst_row_base: usize = @as(usize, dest_y + y) * @as(usize, AtlasW);
+            const dst_row_base: usize = @as(usize, dest_y + y) * @as(usize, self.atlas_w);
 
             if (bpp == 3) {
                 // ClearType RGB -> RGBA (SIMD: 4 pixels per iteration)
@@ -1333,10 +1332,27 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Core's atlas dimensions must match our compile-time constants.
-        // If this fires, update AtlasW/AtlasH to match core's atlas_w/atlas_h.
-        std.debug.assert(atlas_w == AtlasW);
-        std.debug.assert(atlas_h == AtlasH);
+        // Resize CPU atlas buffer before updating dimensions to avoid inconsistency
+        const total = @as(usize, atlas_w) * @as(usize, atlas_h) * 4;
+        if (self.atlas_cpu.items.len != total) {
+            self.atlas_cpu.resize(self.alloc, total) catch {
+                // Resize failed: keep old dimensions, just clear and reset
+                applog.appLog("[atlas] recreateAtlasTexture: resize to {d}x{d} failed, keeping {d}x{d}\n", .{ atlas_w, atlas_h, self.atlas_w, self.atlas_h });
+                self.glyph_map.clearRetainingCapacity();
+                self.styled_glyph_map.clearRetainingCapacity();
+                self.atlas_next_x = 1;
+                self.atlas_next_y = 1;
+                self.atlas_row_h = 0;
+                self.pending_uploads.clearRetainingCapacity();
+                if (self.atlas_cpu.items.len > 0) @memset(self.atlas_cpu.items, 0);
+                self.atlas_reset_pending = true;
+                return;
+            };
+        }
+
+        // Resize succeeded (or same size): commit new dimensions
+        self.atlas_w = atlas_w;
+        self.atlas_h = atlas_h;
 
         // Clear caches
         self.glyph_map.clearRetainingCapacity();
@@ -1350,7 +1366,6 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         // Clear pending uploads
         self.pending_uploads.clearRetainingCapacity();
 
-        // Clear CPU atlas
         if (self.atlas_cpu.items.len > 0) {
             @memset(self.atlas_cpu.items, 0);
         }
@@ -1436,7 +1451,6 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     ) !void {
         if (verts.len < 6) return;
 
-        _ = self;
         const log_active = applog.isEnabled();
 
         const rtv = rt.lpVtbl.*;
@@ -1446,9 +1460,9 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         const h: f32 = client_h;
     
         // IMPORTANT: Do NOT call atlas->GetPixelSize().
-        // Use compile-time atlas size constants to avoid COM/VTBL mismatch crashes.
-        const atlas_w: f32 = @floatFromInt(AtlasW);
-        const atlas_h: f32 = @floatFromInt(AtlasH);
+        // Use instance atlas size fields to avoid COM/VTBL mismatch crashes.
+        const atlas_w: f32 = @floatFromInt(self.atlas_w);
+        const atlas_h: f32 = @floatFromInt(self.atlas_h);
     
         var i: usize = 0;
         while (i + 5 < verts.len) : (i += 6) {
@@ -1610,12 +1624,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     
         for (self.pending_uploads.items) |r| {
             // RGBA format: 4 bytes per pixel
-            const src_off = (@as(usize, r.top) * @as(usize, AtlasW) + @as(usize, r.left)) * 4;
+            const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
             _ = copy_fn(
                 bmp,
                 &r,
                 self.atlas_cpu.items.ptr + src_off,
-                AtlasW * 4, // bytes per row (RGBA)
+                self.atlas_w * 4, // bytes per row (RGBA)
             );
         }
     
@@ -1663,11 +1677,11 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             idx += 1;
     
             // RGBA format: 4 bytes per pixel
-            const src_off = (@as(usize, r.top) * @as(usize, AtlasW) + @as(usize, r.left)) * 4;
+            const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
             const src_ptr: [*]const u8 = self.atlas_cpu.items.ptr + src_off;
 
-            // row_pitch is AtlasW * 4 bytes because atlas_cpu is RGBA
-            d3d.atlasUploadRect(r.left, r.top, w, h, src_ptr, AtlasW * 4);
+            // row_pitch is self.atlas_w * 4 bytes because atlas_cpu is RGBA
+            d3d.atlasUploadRect(r.left, r.top, w, h, src_ptr, self.atlas_w * 4);
         }
     
         self.pending_uploads.clearRetainingCapacity();
@@ -1699,11 +1713,11 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
 
     if (applog.isEnabled()) applog.appLog(
         "[atlas] uploadFullAtlasToD3D: uploading full atlas {d}x{d}\n",
-        .{ AtlasW, AtlasH },
+        .{ self.atlas_w, self.atlas_h },
     );
 
     // Upload the entire atlas as a single rect
-    d3d.atlasUploadRect(0, 0, AtlasW, AtlasH, self.atlas_cpu.items.ptr, AtlasW * 4);
+    d3d.atlasUploadRect(0, 0, self.atlas_w, self.atlas_h, self.atlas_cpu.items.ptr, self.atlas_w * 4);
 }
 
     pub fn ascentPx(self: *Renderer) f32 { return self.ascent_px; }

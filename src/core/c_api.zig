@@ -812,6 +812,21 @@ pub export fn zonvie_core_set_glyph_cache_size(p: ?*zonvie_core, ascii_size: u32
     box.core.log.write("[c_api] zonvie_core_set_glyph_cache_size: ascii={d} non_ascii={d}\n", .{ box.core.glyph_cache_ascii_size, box.core.glyph_cache_non_ascii_size });
 }
 
+/// Set glyph atlas texture size (square). Must be called before zonvie_core_start().
+/// Ignored after start. size is clamped to [1024, 4096].
+pub export fn zonvie_core_set_atlas_size(p: ?*zonvie_core, size: u32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    if (box.core.started) {
+        box.core.log.write("[c_api] zonvie_core_set_atlas_size: ignored (already started)\n", .{});
+        return;
+    }
+    const clamped = @max(config.atlas_size_min, @min(config.atlas_size_max, size));
+    box.core.atlas_w = clamped;
+    box.core.atlas_h = clamped;
+    box.core.log.write("[c_api] zonvie_core_set_atlas_size: {d}x{d}\n", .{ clamped, clamped });
+}
+
 /// Enable ext_messages UI extension. Must be called before zonvie_core_start().
 /// When enabled, message events are sent to frontend callbacks instead of being
 /// rendered in the main grid. Messages are displayed as external floating windows.
@@ -1251,6 +1266,7 @@ pub const zonvie_config_values = extern struct {
     perf_glyph_cache_non_ascii: i32 = 256,
     perf_hl_cache_size: i32 = 512,
     perf_shape_cache_size: i32 = 4096,
+    perf_atlas_size: i32 = 2048,
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
@@ -1321,6 +1337,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),
         .perf_hl_cache_size = @intCast(cfg.performance.hl_cache_size),
         .perf_shape_cache_size = @intCast(cfg.performance.shape_cache_size),
+        .perf_atlas_size = @intCast(cfg.performance.atlas_size),
         // ime
         .ime_disable_on_activate = cfg.ime.disable_on_activate,
         .ime_disable_on_modechange = cfg.ime.disable_on_modechange,

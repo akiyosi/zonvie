@@ -59,6 +59,7 @@ pub const zonvie_core_tick_msg_throttle = core.zonvie_core_tick_msg_throttle;
 pub const zonvie_core_set_blur_enabled = core.zonvie_core_set_blur_enabled;
 pub const zonvie_core_set_inherit_cwd = core.zonvie_core_set_inherit_cwd;
 pub const zonvie_core_set_glyph_cache_size = core.zonvie_core_set_glyph_cache_size;
+pub const zonvie_core_set_atlas_size = core.zonvie_core_set_atlas_size;
 pub const zonvie_core_load_config = core.zonvie_core_load_config;
 pub const zonvie_core_route_message = core.zonvie_core_route_message;
 pub const zonvie_core_request_quit = core.zonvie_core_request_quit;

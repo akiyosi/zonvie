@@ -185,9 +185,14 @@ pub const Renderer = struct {
     vb: ?*c.ID3D11Buffer = null,
     vb_bytes: usize = 0,
 
-    // Atlas texture (R8_UNORM)
+    // Atlas texture (R8G8B8A8_UNORM)
     atlas_tex: ?*c.ID3D11Texture2D = null,
     atlas_srv: ?*c.ID3D11ShaderResourceView = null,
+    atlas_w: u32 = 2048,
+    atlas_h: u32 = 2048,
+
+    // D3D feature level (captured at device creation)
+    feature_level: u32 = 0,
 
     // Tabline texture (B8G8R8A8_UNORM) - rendered from GDI bitmap
     tabline_tex: ?*c.ID3D11Texture2D = null,
@@ -660,9 +665,9 @@ pub const Renderer = struct {
             const ps_set = ctx_vtbl.*.PSSetShader orelse return;
             ps_set(ctx, self.ps.?, null, 0);
     
-            // PS SRV
+            // PS SRV (skip draw if atlas was destroyed and not yet recreated)
             const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return;
-            const srv = self.atlas_srv.?;
+            const srv = self.atlas_srv orelse return;
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{ srv };
             const pp_srvs: [*c]?*c.ID3D11ShaderResourceView =
                 @as([*c]?*c.ID3D11ShaderResourceView, @ptrCast(&srvs));
@@ -1931,7 +1936,8 @@ pub const Renderer = struct {
 
         var dev: ?*c.ID3D11Device = null;
         var ctx: ?*c.ID3D11DeviceContext = null;
-    
+        var fl: u32 = 0;
+
         var flags: c.UINT = 0;
         const is_debug = (@import("builtin").mode == .Debug);
         if (is_debug) flags |= c.D3D11_CREATE_DEVICE_DEBUG;
@@ -1946,7 +1952,7 @@ pub const Renderer = struct {
             0,
             c.D3D11_SDK_VERSION,
             @ptrCast(&dev),
-            null,
+            @ptrCast(&fl),
             @ptrCast(&ctx),
         );
 
@@ -1954,7 +1960,7 @@ pub const Renderer = struct {
         if ((hr != 0 or dev == null or ctx == null) and is_debug) {
             dev = null;
             ctx = null;
-    
+
             flags &= ~@as(c.UINT, c.D3D11_CREATE_DEVICE_DEBUG);
             hr = c.D3D11CreateDevice(
                 null,
@@ -1965,7 +1971,7 @@ pub const Renderer = struct {
                 0,
                 c.D3D11_SDK_VERSION,
                 @ptrCast(&dev),
-                null,
+                @ptrCast(&fl),
                 @ptrCast(&ctx),
             );
         }
@@ -1974,7 +1980,8 @@ pub const Renderer = struct {
             dbgLog("[d3d] init: D3D11CreateDevice failed hr=0x{x}\n", .{ @as(u32, @bitCast(hr)) });
             return error.D3DCreateFailed;
         }
-        dbgLog("[d3d] init: D3D11CreateDevice ok dev=0x{x} ctx=0x{x}\n", .{ if (dev) |p| @intFromPtr(p) else 0, if (ctx) |p| @intFromPtr(p) else 0 });
+        dbgLog("[d3d] init: D3D11CreateDevice ok dev=0x{x} ctx=0x{x} fl=0x{x}\n", .{ if (dev) |p| @intFromPtr(p) else 0, if (ctx) |p| @intFromPtr(p) else 0, fl });
+        self.feature_level = fl;
 
         const enable_flip_model = true;
 
@@ -2323,6 +2330,30 @@ pub const Renderer = struct {
         self.atlas_srv = srv;
     }
 
+
+    /// Return the maximum 2D texture dimension supported by the device's feature level.
+    pub fn maxTextureSize(self: *const Renderer) u32 {
+        // D3D_FEATURE_LEVEL enum values: 9_1=0x9100, 9_2=0x9200, 9_3=0x9300, 10_0=0xa000, 11_0=0xb000
+        if (self.feature_level >= 0xb000) return 16384; // FL 11_0+
+        if (self.feature_level >= 0xa000) return 8192; // FL 10_0+
+        if (self.feature_level >= 0x9300) return 4096; // FL 9_3
+        return 2048; // FL 9_1, 9_2
+    }
+
+    /// Recreate atlas texture if dimensions changed. No-op for same-size resets.
+    /// Returns error if D3D texture creation fails (caller should terminate).
+    pub fn recreateAtlasTextureIfNeeded(self: *Renderer, w: u32, h: u32) !void {
+        if (w == self.atlas_w and h == self.atlas_h) return;
+
+        // Release old resources
+        safeRelease(&self.atlas_srv);
+        safeRelease(&self.atlas_tex);
+
+        try self.createAtlasTexture(w, h);
+        self.atlas_w = w;
+        self.atlas_h = h;
+        dbgLog("[d3d] recreateAtlasTextureIfNeeded: {d}x{d}\n", .{ w, h });
+    }
 
     fn createPipeline(self: *Renderer) !void {
         const dev = self.device.?;

@@ -517,6 +517,9 @@ pub const Core = struct {
     atlas_initialized: bool = false,
     atlas_reset_during_flush: bool = false,
 
+    // Set to true after successful start(); prevents post-start setter calls
+    started: bool = false,
+
     // Owned copy of nvim path (kept alive for runLoop thread)
     nvim_path_owned: ?[]const u8 = null,
 
@@ -558,6 +561,7 @@ pub const Core = struct {
         // Copy nvim_path so it outlives the caller's scope (thread safety)
         self.nvim_path_owned = self.alloc.dupe(u8, nvim_path) catch null;
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.started = true;
     }
 
     pub fn stop(self: *Core) void {
