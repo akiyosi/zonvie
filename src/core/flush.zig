@@ -307,7 +307,7 @@ pub inline fn simdExtractCp(cells: [*]const grid_mod.Cell, out: [*]u32, count: u
 /// Cached line data for msg_show scrolling optimization.
 pub const MsgCachedLine = struct {
     data: [256]u8 = undefined,
-    len: u8 = 0,
+    len: u16 = 0,
     display_width: u16 = 0,
 };
 

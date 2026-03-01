@@ -2226,26 +2226,61 @@ final class ZonvieCore {
                             let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
                             windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
                         }
-                    } else if let mainWindow = mainView.window {
-                        // Buffer completion: position relative to main window
-                        let mainFrame = mainWindow.frame
-                        let mainContentFrame = mainWindow.contentLayoutRect
-                        let titleBarHeight = mainFrame.height - mainContentFrame.height
-                        let mainContentY = mainFrame.origin.y
-                        let mainContentTop = mainFrame.origin.y + mainFrame.height - titleBarHeight
+                    } else if win > 0, let anchorWindow = self.externalWindows[win],
+                              let anchorContentView = anchorWindow.contentView {
+                        // Completion on external window: position relative to content area
+                        anchorContentView.layoutSubtreeIfNeeded()
+                        let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
+                        let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+
+                        let origin = gridToScreenOrigin(
+                            row: startRow, col: startCol,
+                            windowHeight: windowHeight,
+                            cellW: cellW, cellH: cellH, scale: scale,
+                            referenceFrame: anchorContentFrame
+                        )
+                        let screenTop = (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+
+                        let belowY = origin.y
                         let pxY = CGFloat(startRow) * cellH / scale
+                        let aboveY = anchorContentFrame.origin.y + anchorContentFrame.height - pxY + (cellH / scale * 2)
 
-                        let x = mainFrame.origin.x + CGFloat(startCol) * cellW / scale
-                        var y = mainContentTop - pxY - windowHeight
-
-                        // If popupmenu would go below main window, position above cursor
-                        // Add 2 cell heights: 1 for the cursor row itself, 1 for the cmdline row
-                        if y < mainContentY {
-                            let cursorRowTopY = mainContentTop - pxY + (cellH / scale * 2)
-                            y = cursorRowTopY
+                        let y: CGFloat
+                        if belowY >= anchorContentFrame.origin.y {
+                            y = belowY
+                        } else if (aboveY + windowHeight) <= screenTop {
+                            y = aboveY
+                        } else {
+                            y = belowY
                         }
 
-                        windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                        windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
+                    } else if let tvFrame = self.terminalViewScreenFrame() {
+                        // Buffer completion on main window: position relative to terminal view
+                        let origin = gridToScreenOrigin(
+                            row: startRow, col: startCol,
+                            windowHeight: windowHeight,
+                            cellW: cellW, cellH: cellH, scale: scale,
+                            referenceFrame: tvFrame
+                        )
+                        let screenTop = (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+
+                        // Position below cursor (default)
+                        let belowY = origin.y
+                        // Position above cursor (flipped)
+                        let pxY = CGFloat(startRow) * cellH / scale
+                        let aboveY = tvFrame.origin.y + tvFrame.height - pxY + (cellH / scale * 2)
+
+                        let y: CGFloat
+                        if belowY >= tvFrame.origin.y {
+                            y = belowY  // Fits within terminal view
+                        } else if (aboveY + windowHeight) <= screenTop {
+                            y = aboveY  // Flip above: fits on screen
+                        } else {
+                            y = belowY  // Neither fits: keep below to avoid cursor overlap
+                        }
+
+                        windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
                     }
 
                     existingWindow.setFrame(windowRect, display: false)
@@ -2418,45 +2453,65 @@ final class ZonvieCore {
                             windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
                         }
                     }
-                } else if win > 0, let anchorWindow = self.externalWindows[win] {
-                    // Completion on external window: position relative to that window
-                    let anchorFrame = anchorWindow.frame
+                } else if win > 0, let anchorWindow = self.externalWindows[win],
+                          let anchorContentView = anchorWindow.contentView {
+                    // Completion on external window: position relative to content area (excludes title bar)
+                    anchorContentView.layoutSubtreeIfNeeded()
+                    let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
+                    let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
 
-                    // Calculate position from cell coordinates (Y is flipped in AppKit)
-                    let pxX = CGFloat(startCol) * cellW / scale
+                    let origin = gridToScreenOrigin(
+                        row: startRow, col: startCol,
+                        windowHeight: windowHeight,
+                        cellW: cellW, cellH: cellH, scale: scale,
+                        referenceFrame: anchorContentFrame
+                    )
+                    let screenTop = (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+
+                    // Position below cursor (default)
+                    let belowY = origin.y
+                    // Position above cursor (flipped)
                     let pxY = CGFloat(startRow) * cellH / scale
+                    let aboveY = anchorContentFrame.origin.y + anchorContentFrame.height - pxY + (cellH / scale * 2)
 
-                    // Position below the cursor position within the external window
-                    let x = anchorFrame.origin.x + pxX
-                    let y = anchorFrame.origin.y + anchorFrame.height - pxY - windowHeight
-
-                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(x),\(y)) relative to ext_win=\(win)")
-                } else if let mainWindow = mainView.window {
-                    // Buffer completion: position relative to main window
-                    let mainFrame = mainWindow.frame
-                    let mainContentRect = mainWindow.contentRect(forFrameRect: mainFrame)
-
-                    // Calculate position from cell coordinates (Y is flipped in AppKit)
-                    let pxX = CGFloat(startCol) * cellW / scale
-                    let pxY = CGFloat(startRow) * cellH / scale
-
-                    // Position below the cursor position (AppKit Y is from bottom)
-                    let x = mainContentRect.origin.x + pxX
-                    var y = mainContentRect.origin.y + mainContentRect.height - pxY - windowHeight
-
-                    // If popupmenu would go below main window (e.g., cmdline completion without ext_cmdline),
-                    // position it above the cursor row instead
-                    // Add 2 cell heights: 1 for the cursor row itself, 1 for the cmdline row
-                    let cursorRowTopY = mainContentRect.origin.y + mainContentRect.height - pxY + (cellH / scale * 2)
-                    if y < mainContentRect.origin.y {
-                        // Position above the cursor row (and cmdline row)
-                        y = cursorRowTopY
-                        ZonvieCore.appLog("[external_window] popupmenu flipped to above cursor at y=\(y)")
+                    let y: CGFloat
+                    if belowY >= anchorContentFrame.origin.y {
+                        y = belowY  // Fits within anchor window
+                    } else if (aboveY + windowHeight) <= screenTop {
+                        y = aboveY  // Flip above: fits on screen
+                    } else {
+                        y = belowY  // Neither fits: keep below to avoid cursor overlap
                     }
 
-                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(x),\(y)) from cursor pos (\(startRow),\(startCol))")
+                    windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
+                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(origin.x),\(y)) relative to ext_win=\(win)")
+                } else if let tvFrame = self.terminalViewScreenFrame() {
+                    // Buffer completion: position relative to terminal view
+                    let origin = gridToScreenOrigin(
+                        row: startRow, col: startCol,
+                        windowHeight: windowHeight,
+                        cellW: cellW, cellH: cellH, scale: scale,
+                        referenceFrame: tvFrame
+                    )
+                    let screenTop = (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+
+                    // Position below cursor (default)
+                    let belowY = origin.y
+                    // Position above cursor (flipped)
+                    let pxY = CGFloat(startRow) * cellH / scale
+                    let aboveY = tvFrame.origin.y + tvFrame.height - pxY + (cellH / scale * 2)
+
+                    let y: CGFloat
+                    if belowY >= tvFrame.origin.y {
+                        y = belowY  // Fits within terminal view
+                    } else if (aboveY + windowHeight) <= screenTop {
+                        y = aboveY  // Flip above: fits on screen
+                    } else {
+                        y = belowY  // Neither fits: keep below to avoid cursor overlap
+                    }
+
+                    windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
+                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(origin.x),\(y)) from cursor pos (\(startRow),\(startCol))")
                 } else {
                     windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
                 }
@@ -2502,23 +2557,17 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
                 self.pendingExternalWindowPosition = nil  // Clear after use
             } else if startRow >= 0 && startCol >= 0 {
-                // Position relative to main window using win_pos
+                // Position relative to terminal view using win_pos
                 styleMask = [.titled, .closable, .resizable]
-                if let mainWindow = mainView.window {
-                    // Get main window content rect in screen coordinates
-                    let mainFrame = mainWindow.frame
-                    let mainContentRect = mainWindow.contentRect(forFrameRect: mainFrame)
-
-                    // Calculate position from cell coordinates (Y is flipped in AppKit)
-                    let pxX = CGFloat(startCol) * cellW / scale
-                    let pxY = CGFloat(startRow) * cellH / scale
-
-                    // Position at top-left of the cell position (AppKit Y is from bottom)
-                    let x = mainContentRect.origin.x + pxX
-                    let y = mainContentRect.origin.y + mainContentRect.height - pxY - windowHeight
-
-                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from win_pos (\(startRow),\(startCol))")
+                if let tvFrame = self.terminalViewScreenFrame() {
+                    let origin = gridToScreenOrigin(
+                        row: startRow, col: startCol,
+                        windowHeight: windowHeight,
+                        cellW: cellW, cellH: cellH, scale: scale,
+                        referenceFrame: tvFrame
+                    )
+                    windowRect = NSRect(x: origin.x, y: origin.y, width: windowWidth, height: windowHeight)
+                    ZonvieCore.appLog("[external_window] positioned at (\(origin.x),\(origin.y)) from win_pos (\(startRow),\(startCol))")
                 } else {
                     windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
                 }
@@ -4685,6 +4734,35 @@ final class ZonvieCore {
             // Note: hl_id based coloring could be added with zonvie_core_get_hl_by_id API
             return self.getNormalForegroundColor()
         }
+    }
+
+    /// Returns the terminal view's frame in screen coordinates.
+    /// Uses the actual Auto Layout position, so tab bar, sidebar, and title bar
+    /// offsets are automatically accounted for without style-specific branching.
+    private func terminalViewScreenFrame() -> NSRect? {
+        guard let mainView = terminalView, let window = mainView.window else { return nil }
+        // Ensure Auto Layout has resolved before reading the frame.
+        // Prevents stale coordinates after window resize or tabline toggle.
+        mainView.layoutSubtreeIfNeeded()
+        let viewBoundsInWindow = mainView.convert(mainView.bounds, to: nil)
+        return window.convertToScreen(viewBoundsInWindow)
+    }
+
+    /// Converts grid cell coordinates to a screen-space origin for window positioning.
+    /// Pure function: maps grid (row, col) to AppKit screen coordinates (bottom-left origin)
+    /// using the provided reference frame (typically from terminalViewScreenFrame()).
+    private func gridToScreenOrigin(
+        row: Int32, col: Int32,
+        windowHeight: CGFloat,
+        cellW: CGFloat, cellH: CGFloat, scale: CGFloat,
+        referenceFrame: NSRect
+    ) -> NSPoint {
+        let pxX = CGFloat(col) * cellW / scale
+        let pxY = CGFloat(row) * cellH / scale
+        return NSPoint(
+            x: referenceFrame.origin.x + pxX,
+            y: referenceFrame.origin.y + referenceFrame.height - pxY - windowHeight
+        )
     }
 
     /// Get target frame for ext-float positioning based on config
