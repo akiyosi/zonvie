@@ -980,6 +980,65 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
 
+            // --- Step 1: Detect blink-only frame condition ---
+            let isBlinkOnlyFrame = blinkStateChanged
+                && !hasNewCommit
+                && dirtyRows.isEmpty
+                && dirtyRectPxOpt == nil
+                && !smoothScrolling
+                && !drawableSizeChanged
+                && hasPresentedOnce
+                && fontChg == nil
+
+            // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
+            let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
+            let cellHi = max(1, UInt32(ch.rounded(.toNearestOrAwayFromZero)))
+            let drawableWi: UInt32
+            let drawableHi: UInt32
+            if snappedCommittedDrawableW > 0 && snappedCommittedDrawableH > 0 {
+                drawableWi = snappedCommittedDrawableW
+                drawableHi = snappedCommittedDrawableH
+            } else {
+                drawableWi = max(1, UInt32(view.drawableSize.width))
+                drawableHi = max(1, UInt32(view.drawableSize.height))
+            }
+            let vpWidth = Double((drawableWi / cellWi) * cellWi)
+            let vpHeight = Double((drawableHi / cellHi) * cellHi)
+
+            let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
+
+            let safeRowCount: Int
+            if rowMode {
+                safeRowCount = min(rowBuffersSnapshot.count, rowCountsSnapshot.count)
+            } else {
+                safeRowCount = 0
+            }
+
+            // --- Step 3: Compute cursor grid row from NDC vertex positions ---
+            var cursorGridRow: Int = -1
+            if currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
+                let ptr = cvb.contents().bindMemory(to: Vertex.self, capacity: currentCursorCount)
+                var maxNdcY: Float = ptr[0].position.y
+                for i in 1..<currentCursorCount {
+                    let y = ptr[i].position.y
+                    if y > maxNdcY { maxNdcY = y }
+                }
+                // NDC → pixel (top-origin): y_px = (1 - ndc_y) * vpHeight / 2
+                // Inverse of Zig core's ndc(): ny = 1.0 - (y_px / dh) * 2.0
+                let topYPx = (1.0 - maxNdcY) * Float(vpHeight) / 2.0
+                cursorGridRow = Int(floor(topYPx / Float(cellHi)))
+                // No clamping: out-of-range → canBlinkFastPath = false → full redraw
+            }
+
+            // --- Step 4: Gate for blink fast path ---
+            let canBlinkFastPath: Bool = {
+                guard isBlinkOnlyFrame && blurEnabled && rowMode && use2Pass else { return false }
+                guard cursorGridRow >= 0 && cursorGridRow < safeRowCount else { return false }
+                guard rowCountsSnapshot[cursorGridRow] > 0 else { return false }
+                guard rowBuffersSnapshot[cursorGridRow] != nil else { return false }
+                return true
+            }()
+
             // We always need a drawable to present.
             var t_drawable_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -1021,7 +1080,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // DEBUG: Detailed loadAction decision logging
             ZonvieCore.appLog("[DEBUG-LOADACTION] blurEnabled=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) hasAnyDirtyInRowMode=\(hasAnyDirtyInRowMode) mainCount=\(currentMainCount) cursorCount=\(currentCursorCount) backBufferSize=\(backBufferSize)")
 
-            if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
+            if canBlinkFastPath {
+                // Blink-only fast path: preserve back buffer, redraw only cursor row
+                rpd.colorAttachments[0].loadAction = .load
+                ZonvieCore.appLog("[draw] loadAction=.load (blinkFastPath cursorRow=\(cursorGridRow))")
+            } else if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
                 rpd.colorAttachments[0].loadAction = .load
                 ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
             } else {
@@ -1054,23 +1117,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // Set viewport to exact grid pixel dimensions to prevent sub-cell stretching.
             // Must match Zig core's NDC computation: cols = drawableW / cellW, grid_w = cols * cellW.
-            // Uses integer division to match Zig's u32 arithmetic exactly.
-            let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
-            let cellHi = max(1, UInt32(ch.rounded(.toNearestOrAwayFromZero)))
-            // Use the drawable size from the last committed flush so the Metal
-            // viewport matches the NDC coordinates baked into the vertices.
-            // Falls back to view.drawableSize before the first flush completes.
-            let drawableWi: UInt32
-            let drawableHi: UInt32
-            if snappedCommittedDrawableW > 0 && snappedCommittedDrawableH > 0 {
-                drawableWi = snappedCommittedDrawableW
-                drawableHi = snappedCommittedDrawableH
-            } else {
-                drawableWi = max(1, UInt32(view.drawableSize.width))
-                drawableHi = max(1, UInt32(view.drawableSize.height))
-            }
-            let vpWidth = Double((drawableWi / cellWi) * cellWi)
-            let vpHeight = Double((drawableHi / cellHi) * cellHi)
+            // cellWi/cellHi/drawableWi/drawableHi/vpWidth/vpHeight are pre-computed in Step 2 above.
             if vpWidth > 0 && vpHeight > 0 {
                 enc.setViewport(MTLViewport(originX: 0, originY: 0, width: vpWidth, height: vpHeight, znear: 0, zfar: 1))
             }
@@ -1133,35 +1180,55 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
 
-            // Use 2-pass rendering when blur is enabled and pipelines are available
-            let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
+            // use2Pass and safeRowCount are pre-computed in Step 2 above.
 
             if rowMode {
-                // Safe row count: use snapshots taken under lock to avoid race conditions
-                let safeRowCount = min(rowBuffersSnapshot.count, rowCountsSnapshot.count)
-
                 if use2Pass {
-                    // 2-Pass rendering for blur: draw backgrounds first, then glyphs
-                    // This prevents ghosting with semi-transparent backgrounds
+                    if canBlinkFastPath {
+                        // FAST PATH: blink-only — redraw only cursor row (2-pass)
+                        let vc = rowCountsSnapshot[cursorGridRow]
+                        let vb = rowBuffersSnapshot[cursorGridRow]!  // guaranteed non-nil by canBlinkFastPath
 
-                    // Pass 1: Background (overwrite blending)
-                    enc.setRenderPipelineState(backgroundPipeline!)
-                    for row in 0..<safeRowCount {
-                        let vc = rowCountsSnapshot[row]
-                        if vc <= 0 { continue }
-                        guard let vb = rowBuffersSnapshot[row] else { continue }
+                        let y = max(0, cursorGridRow * Int(cellHi))
+                        let h = Int(cellHi)
+                        if drawableW > 0 && h > 0 {
+                            enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
+                        }
+
+                        // Pass 1: Background (overwrite blending — erases old cursor)
+                        enc.setRenderPipelineState(backgroundPipeline!)
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-                    }
 
-                    // Pass 2: Glyphs (standard alpha blending)
-                    enc.setRenderPipelineState(glyphPipeline!)
-                    for row in 0..<safeRowCount {
-                        let vc = rowCountsSnapshot[row]
-                        if vc <= 0 { continue }
-                        guard let vb = rowBuffersSnapshot[row] else { continue }
+                        // Pass 2: Glyph (alpha blending — redraws text/decorations)
+                        enc.setRenderPipelineState(glyphPipeline!)
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+
+                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc)")
+                    } else {
+                        // 2-Pass rendering for blur: draw backgrounds first, then glyphs
+                        // This prevents ghosting with semi-transparent backgrounds
+
+                        // Pass 1: Background (overwrite blending)
+                        enc.setRenderPipelineState(backgroundPipeline!)
+                        for row in 0..<safeRowCount {
+                            let vc = rowCountsSnapshot[row]
+                            if vc <= 0 { continue }
+                            guard let vb = rowBuffersSnapshot[row] else { continue }
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
+
+                        // Pass 2: Glyphs (standard alpha blending)
+                        enc.setRenderPipelineState(glyphPipeline!)
+                        for row in 0..<safeRowCount {
+                            let vc = rowCountsSnapshot[row]
+                            if vc <= 0 { continue }
+                            guard let vb = rowBuffersSnapshot[row] else { continue }
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
                     }
                 } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
@@ -1236,7 +1303,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
-            if rowMode && !use2Pass {
+            // canBlinkFastPath also sets a scissor that must be reset.
+            if (rowMode && !use2Pass) || canBlinkFastPath {
                 let fullW = max(0, Int(view.drawableSize.width.rounded(.down)))
                 let fullH = max(0, Int(view.drawableSize.height.rounded(.down)))
                 if fullW > 0 && fullH > 0 {
