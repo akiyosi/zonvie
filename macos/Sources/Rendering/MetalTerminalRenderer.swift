@@ -1920,19 +1920,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
         }
-        // === PERF LOG: submitVerticesRowRaw開始 ===
-        var t_start: CFAbsoluteTime = 0
-        if ZonvieCore.appLogEnabled {
-            t_start = CFAbsoluteTimeGetCurrent()
-        }
-        defer {
-            if ZonvieCore.appLogEnabled {
-                let t_end = CFAbsoluteTimeGetCurrent()
-                let us = (t_end - t_start) * 1_000_000
-                ZonvieCore.appLog("[perf] submitVerticesRowRaw row=\(rowStart) count=\(count) us=\(String(format: "%.1f", us))")
-            }
-        }
-
         // Write to write set (called during flush, no lock needed for vertex data).
         // The write set is exclusively owned by the core thread during flush.
         let s = writeSetIndex

@@ -112,8 +112,6 @@ final class ZonvieCore {
         }
     }
 
-    private var logEnabled = true
-
     init() {
         let unmanaged = Unmanaged.passUnretained(self)
         self.ctxPtr = unmanaged.toOpaque()
@@ -180,8 +178,6 @@ final class ZonvieCore {
 
             on_vertices_row: { ctx, gridId, rowStart, rowCount, verts, vertCount, flags, totalRows, totalCols in
                 guard let ctx else { return }
-
-                ZonvieCore.appLog("cb:on_vertices_row gridId=\(gridId) rowStart=\(rowStart) rowCount=\(rowCount) vertCount=\(vertCount) flags=0x\(String(flags, radix: 16)) totalRows=\(totalRows) totalCols=\(totalCols)")
 
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
 
@@ -294,7 +290,7 @@ final class ZonvieCore {
             on_log: { ctx, bytes, len in
                 guard let ctx, let bytes else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                if !me.logEnabled { return }
+                if !ZonvieCore.appLogEnabled { return }
                 me.onLog(bytes: bytes, len: Int(len))
             },
             on_guifont: { ctx, bytes, len in
@@ -1543,7 +1539,6 @@ final class ZonvieCore {
             return nil
         }
 
-        ZonvieCore.appLog("[getViewport] grid=\(gridId) found=\(found) topline=\(vp.topline) lineCount=\(vp.line_count)")
         return ViewportInfo(
             gridId: vp.grid_id,
             topline: vp.topline,
@@ -1584,8 +1579,6 @@ final class ZonvieCore {
     /// Check if cursor blink settings changed and update timer if needed
     func updateCursorBlinking() {
         let (waitMs, onMs, offMs) = getCursorBlink()
-
-        ZonvieCore.appLog("[blink] updateCursorBlinking: wait=\(waitMs) on=\(onMs) off=\(offMs) last=(\(lastBlinkWaitMs),\(lastBlinkOnMs),\(lastBlinkOffMs))")
 
         // Check if blink parameters changed
         if waitMs == lastBlinkWaitMs && onMs == lastBlinkOnMs && offMs == lastBlinkOffMs {

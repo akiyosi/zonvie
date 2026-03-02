@@ -24,7 +24,7 @@ final class MetalTerminalView: MTKView {
     private let redrawLock = NSLock()
     private var lastCursorDirtyRectPx: NSRect? = nil
 
-    private static let dirtyLogEnabled = true
+    private static var dirtyLogEnabled: Bool { ZonvieCore.appLogEnabled }
 
     // --- IME / NSTextInputClient support ---
     private var markedText: NSMutableAttributedString = NSMutableAttributedString()
@@ -222,8 +222,6 @@ final class MetalTerminalView: MTKView {
     func requestRedraw(_ rect: NSRect? = nil) {
         redrawLock.lock()
 
-        dirtyLog("requestRedraw(in): rect=\(String(describing: rect)) bounds=\(bounds) isFlipped=\(isFlipped) windowScale=\(window?.backingScaleFactor ?? -1) drawableSize=\(drawableSize) redrawPending=\(redrawPending)")
-
         if let rect {
             if let cur = pendingRedrawRect {
                 pendingRedrawRect = cur.union(rect)
@@ -236,7 +234,6 @@ final class MetalTerminalView: MTKView {
         }
 
         if redrawPending {
-            dirtyLog("requestRedraw: skipping (already pending)")
             redrawLock.unlock()
             return
         }
@@ -365,7 +362,6 @@ final class MetalTerminalView: MTKView {
             if let core = self?.core {
                 let state = core.cursorBlinkState
                 self?.renderer.cursorBlinkState = state
-                ZonvieCore.appLog("[onPreDraw] set cursorBlinkState=\(state)")
             }
         }
 
@@ -994,8 +990,6 @@ final class MetalTerminalView: MTKView {
         updateMain: Bool,
         updateCursor: Bool
     ) {
-        ZonvieCore.appLog("[zonvie] cb:on_vertices_partial mainCount=\(mainCount) cursorCount=\(cursorCount) updateMain=\(updateMain) updateCursor=\(updateCursor)")
-
         // Process pending scroll clears BEFORE submitting new vertices.
         // This ensures scroll offsets are cleared atomically with vertex updates,
         // preventing double-shift glitches when grid_scroll moves content.
