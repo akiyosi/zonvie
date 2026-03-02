@@ -860,6 +860,14 @@ pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callco
 pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
+    // Lock grid_mu to synchronize with handleRedraw (RPC thread).
+    // IMPORTANT: All callbacks fired from within this tick (on_external_window_close,
+    // on_msg_clear, on_msg_show) execute while grid_mu is held. Frontend callback
+    // implementations MUST NOT synchronously call back into core APIs that acquire
+    // grid_mu. Use async dispatch (DispatchQueue.main.async on macOS, PostMessage
+    // on Windows) instead.
+    box.core.grid_mu.lock();
+    defer box.core.grid_mu.unlock();
     box.core.checkMsgShowThrottleTimeout();
 }
 

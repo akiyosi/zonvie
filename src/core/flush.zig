@@ -4526,6 +4526,14 @@ pub fn sendCmdlineHide(self: *Core) void {
         self.grid.cursor_rev +%= 1;
     }
 
+    // Neovim does NOT send msg_clear after confirm dialog is answered via cmdline.
+    // Dismiss confirm when cmdline hides (noice.nvim pattern: confirm lifecycle = cmdline lifecycle).
+    if (self.grid.message_state.confirm_msg.active) {
+        self.log.write("[cmdline] hide: dismissing confirm (cmdline lifecycle)\n", .{});
+        self.grid.message_state.confirm_msg.clear();
+        self.grid.message_state.confirm_dirty = true;
+    }
+
     self.log.write("[cmdline] hide\n", .{});
 }
 
@@ -4730,12 +4738,62 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
     }
 }
 
+/// Check if auto-hide timeout has expired for msg_show/msg_history grids.
+/// Called from frontend tick (same as throttle timeout).
+/// IMPORTANT: Caller must hold grid_mu (via c_api tick entry point).
+pub fn checkMsgAutoHideTimeout(self: *Core) void {
+    if (!self.ext_messages_enabled) return;
+    const now = std.time.nanoTimestamp();
+
+    // msg_show (grid -102) auto-hide
+    if (self.msg_show_auto_hide_at) |hide_at| {
+        if (now >= hide_at) {
+            self.msg_show_auto_hide_at = null;
+            self.log.write("[msg] auto-hide: msg_show timeout expired\n", .{});
+            self.grid.message_state.clearMessages(self.grid.alloc);
+            hideMsgShow(self);
+            // Remove from known_external_grids and notify close only if it was tracked.
+            // This prevents spurious close notifications for grids that were never
+            // registered or already closed.
+            if (self.known_external_grids.remove(grid_mod.MESSAGE_GRID_ID)) {
+                if (self.cb.on_external_window_close) |cb| {
+                    cb(self.ctx, grid_mod.MESSAGE_GRID_ID);
+                }
+            }
+            // Clear callback-based message windows (extFloatWindow etc),
+            // but preserve promptWindow if confirm is active
+            if (!self.grid.message_state.confirm_msg.active) {
+                if (self.cb.on_msg_clear) |cb| {
+                    cb(self.ctx);
+                }
+            }
+        }
+    }
+
+    // msg_history (grid -103) auto-hide
+    if (self.msg_history_auto_hide_at) |hide_at| {
+        if (now >= hide_at) {
+            self.msg_history_auto_hide_at = null;
+            self.log.write("[msg] auto-hide: msg_history timeout expired\n", .{});
+            hideMsgHistory(self);
+            self.grid.msg_history_state.clear(self.grid.alloc);
+            // Same guard: only notify if it was actually tracked
+            if (self.known_external_grids.remove(grid_mod.MSG_HISTORY_GRID_ID)) {
+                if (self.cb.on_external_window_close) |cb| {
+                    cb(self.ctx, grid_mod.MSG_HISTORY_GRID_ID);
+                }
+            }
+        }
+    }
+}
+
 /// Handle message changes - notify frontend via callbacks.
 /// Uses throttle for msg_show (like noice.nvim) to accumulate messages before deciding view.
 pub fn notifyMessageChanges(self: *Core) void {
     if (!self.ext_messages_enabled) return;
 
     const msg_dirty = self.grid.message_state.msg_dirty;
+    const confirm_dirty = self.grid.message_state.confirm_dirty;
     const showmode_dirty = self.grid.message_state.showmode_dirty;
     const showcmd_dirty = self.grid.message_state.showcmd_dirty;
     const ruler_dirty = self.grid.message_state.ruler_dirty;
@@ -4744,22 +4802,63 @@ pub fn notifyMessageChanges(self: *Core) void {
     // Also check if there's a pending throttle timeout to handle
     const has_pending_throttle = self.msg_show_pending_since != null;
 
-    if (!msg_dirty and !showmode_dirty and !showcmd_dirty and !ruler_dirty and !history_dirty and !has_pending_throttle) return;
+    if (!msg_dirty and !confirm_dirty and !showmode_dirty and !showcmd_dirty and !ruler_dirty and !history_dirty and !has_pending_throttle) return;
 
     // Note: We don't use defer for clearMessageDirty anymore because msg_dirty
     // should only be cleared after throttle period expires
     defer self.grid.clearMsgHistoryDirty();
+
+    // Guard: at most one on_msg_clear per flush cycle
+    var sent_msg_clear = false;
+
+    // Handle confirm message changes (noice.nvim pattern: separate from regular messages)
+    if (confirm_dirty) {
+        if (self.grid.message_state.confirm_msg.active) {
+            sendConfirmCallback(self);
+        } else {
+            // Confirm dismissed -> notify frontend to hide prompt window
+            self.log.write("[msg] confirm dismissed -> on_msg_clear\n", .{});
+            if (self.cb.on_msg_clear) |cb| {
+                cb(self.ctx);
+            }
+            sent_msg_clear = true;
+        }
+    }
 
     // Handle msg_show/msg_clear changes
     // Use throttle only for external command output (list_cmd, shell_out, shell_err)
     // to accumulate messages before deciding split view vs message window.
     // When return_prompt arrives, we must act immediately (like noice.nvim).
     if (msg_dirty) {
-        const messages = self.grid.message_state.messages.items;
-        if (messages.len == 0) {
-            // msg_clear: hide immediately
+        const cleared_in_batch = self.grid.message_state.msg_cleared_in_batch;
+        self.grid.message_state.msg_cleared_in_batch = false;
+
+        // If msg_clear was received in this batch, notify frontend to clear old state
+        // BEFORE processing new messages. This handles msg_clear -> msg_show same-batch.
+        if (cleared_in_batch and !sent_msg_clear) {
             hideMsgShow(self);
             self.msg_show_pending_since = null;
+            self.msg_show_auto_hide_at = null;
+            if (self.cb.on_msg_clear) |cb| {
+                cb(self.ctx);
+            }
+            sent_msg_clear = true;
+        }
+
+        const messages = self.grid.message_state.messages.items;
+        if (messages.len == 0) {
+            if (!cleared_in_batch) {
+                // Pure empty (not from same-batch clear which was already handled above)
+                hideMsgShow(self);
+                self.msg_show_pending_since = null;
+                self.msg_show_auto_hide_at = null;
+                if (!sent_msg_clear) {
+                    if (self.cb.on_msg_clear) |cb| {
+                        cb(self.ctx);
+                    }
+                    sent_msg_clear = true;
+                }
+            }
         } else {
             // Check message types
             var has_shell_cmd = false;
@@ -4793,6 +4892,7 @@ pub fn notifyMessageChanges(self: *Core) void {
     }
 
     self.grid.message_state.msg_dirty = false;
+    self.grid.message_state.confirm_dirty = false;
     self.grid.message_state.showmode_dirty = false;
     self.grid.message_state.showcmd_dirty = false;
     self.grid.message_state.ruler_dirty = false;
@@ -4821,10 +4921,10 @@ pub fn sendMsgShow(self: *Core) void {
     const messages = self.grid.message_state.messages.items;
 
     if (messages.len == 0) {
-        // No messages - hide the message window and notify frontend (for confirm/prompt windows)
-        _ = self.grid.external_grids.fetchRemove(msg_grid_id);
+        // Full state reset (scroll, cache, grid -102) then explicit on_msg_clear
+        hideMsgShow(self);
+        self.msg_show_auto_hide_at = null;
         self.log.write("[msg] sendMsgShow: hide (empty)\n", .{});
-        // Call on_msg_clear to hide any native prompt windows (confirm dialogs)
         if (self.cb.on_msg_clear) |cb| {
             cb(self.ctx);
         }
@@ -4846,6 +4946,7 @@ pub fn sendMsgShow(self: *Core) void {
     var has_ext_float = false;
     var has_split = false;
     var split_auto_dismiss = false;
+    var max_ext_float_timeout: f32 = 0;
 
     for (messages) |msg| {
         const chunks = msg.content.items;
@@ -4868,7 +4969,9 @@ pub fn sendMsgShow(self: *Core) void {
                 sendMsgShowCallback(self, msg, chunks, route_result.view, route_result.timeout);
             },
             .confirm => {
-                // Send to frontend callback for confirm view display (no timeout)
+                // return_prompt routes here via config.zig hardcoding.
+                // confirm/confirm_sub are in confirm_msg (Step 5), not here.
+                // Send via callback regardless (safety for return_prompt + fallback).
                 self.log.write("[msg] sendMsgShow: view=confirm, sending to callback\n", .{});
                 sendMsgShowCallback(self, msg, chunks, route_result.view, 0);
             },
@@ -4879,6 +4982,8 @@ pub fn sendMsgShow(self: *Core) void {
             },
             .ext_float => {
                 has_ext_float = true;
+                if (route_result.timeout > max_ext_float_timeout)
+                    max_ext_float_timeout = route_result.timeout;
             },
             .split => {
                 has_split = true;
@@ -4893,6 +4998,16 @@ pub fn sendMsgShow(self: *Core) void {
         buildMsgLineCache(self);
         self.msg_scroll_offset = 0;
         renderMsgGridFromCache(self, 0);
+
+        // Set auto-hide timeout (timeout=0 means no auto-hide, e.g. errors)
+        if (max_ext_float_timeout > 0) {
+            const timeout_ns: i128 = @intFromFloat(
+                max_ext_float_timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
+            );
+            self.msg_show_auto_hide_at = std.time.nanoTimestamp() + timeout_ns;
+        } else {
+            self.msg_show_auto_hide_at = null;
+        }
     }
 
     // Handle split view (renders all split-routed messages together)
@@ -4943,6 +5058,7 @@ pub fn sendMsgShow(self: *Core) void {
     // If no ext_float messages, remove the message grid
     if (!has_ext_float) {
         _ = self.grid.external_grids.fetchRemove(msg_grid_id);
+        self.msg_show_auto_hide_at = null; // prevent stale timer
     }
 }
 
@@ -4974,8 +5090,9 @@ pub fn buildMsgLineCache(self: *Core) void {
                 const nl_pos = std.mem.indexOfScalar(u8, remaining, '\n');
 
                 if (nl_pos) |pos| {
-                    // Copy text before newline
-                    const copy_len = @min(pos, current_line.data.len - current_line.len);
+                    // Copy text before newline, excluding trailing \r (CRLF → LF)
+                    const effective_pos = if (pos > 0 and remaining[pos - 1] == '\r') pos - 1 else pos;
+                    const copy_len = @min(effective_pos, current_line.data.len - current_line.len);
                     @memcpy(current_line.data[current_line.len..][0..copy_len], remaining[0..copy_len]);
                     current_line.len += @intCast(copy_len);
 
@@ -5152,10 +5269,36 @@ pub fn hideMsgShow(self: *Core) void {
     self.msg_cache_valid = false;
     self.msg_line_cache.clearRetainingCapacity();
     self.log.write("[msg] hideMsgShow\n", .{});
-    // Call on_msg_clear to hide any native prompt windows (confirm dialogs)
-    if (self.cb.on_msg_clear) |cb| {
-        cb(self.ctx);
-    }
+}
+
+/// Send confirm message to frontend via on_msg_show callback (confirm view).
+/// Uses the singleton ConfirmMessage from MessageState (zero-alloc path).
+fn sendConfirmCallback(self: *Core) void {
+    const cb = self.cb.on_msg_show orelse return;
+    const cm = &self.grid.message_state.confirm_msg;
+    if (!cm.active or cm.text_len == 0) return;
+
+    var c_chunks: [1]c_api.MsgChunk = .{.{
+        .hl_id = cm.hl_id,
+        .text = &cm.text,
+        .text_len = cm.text_len,
+    }};
+
+    self.log.write("[msg] sendConfirmCallback: kind={s} id={d}\n", .{
+        cm.kind[0..cm.kind_len], cm.id,
+    });
+
+    cb(
+        self.ctx,
+        c_api.zonvie_msg_view_type.confirm,
+        &cm.kind,
+        cm.kind_len,
+        &c_chunks,
+        1,
+        0, 0, 0, // replace_last, history, append
+        cm.id,
+        0, // timeout_ms
+    );
 }
 
 /// Send msg_show callback to frontend (helper for short messages or fallback).
@@ -5347,9 +5490,11 @@ pub fn sendMsgClear(self: *Core) void {
 
     // Hide msg_show external grid
     hideMsgShow(self);
+    self.msg_show_auto_hide_at = null;
 
     // Hide msg_history external grid
     hideMsgHistory(self);
+    self.msg_history_auto_hide_at = null;
 
     // Call frontend callback
     if (self.cb.on_msg_clear) |cb| {
@@ -5487,6 +5632,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     if (entries.len == 0) {
         // No entries - hide the history window if visible
         _ = self.grid.external_grids.fetchRemove(history_grid_id);
+        self.msg_history_auto_hide_at = null;
         self.log.write("[msg_history] hide (empty)\n", .{});
         return;
     }
@@ -5500,23 +5646,27 @@ pub fn sendMsgHistoryShow(self: *Core) void {
         .none => {
             // Don't show anything
             _ = self.grid.external_grids.fetchRemove(history_grid_id);
+            self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=none, hiding\n", .{});
             return;
         },
         .mini => {
             // Mini view: send all entries combined to frontend callback
+            self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=mini, sending {d} entries to callback\n", .{entries.len});
             sendMsgHistoryCallbackAll(self, entries, route_result.view);
             return;
         },
         .notification => {
             // Notification view: send all entries combined to frontend callback for OS notification
+            self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=notification, sending {d} entries to callback\n", .{entries.len});
             sendMsgHistoryCallbackAll(self, entries, route_result.view);
             return;
         },
         .split => {
             // Split view: create Neovim split window
+            self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=split (auto_dismiss={}), creating split window\n", .{route_result.auto_dismiss});
 
             // auto_dismiss: send <CR> to clear any pending prompt (e.g. return_prompt)
@@ -5628,6 +5778,16 @@ pub fn sendMsgHistoryShow(self: *Core) void {
         self.log.write("[msg_history] external_grids.put failed: {any}\n", .{e});
         return;
     };
+
+    // Set auto-hide timeout (timeout=0 means no auto-hide)
+    if (route_result.timeout > 0) {
+        const timeout_ns: i128 = @intFromFloat(
+            route_result.timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
+        );
+        self.msg_history_auto_hide_at = std.time.nanoTimestamp() + timeout_ns;
+    } else {
+        self.msg_history_auto_hide_at = null;
+    }
 }
 
 /// Hide msg_history external grid.

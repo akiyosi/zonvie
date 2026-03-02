@@ -2096,8 +2096,12 @@ final class ZonvieCore {
         /// Saved position for next cmdline show (nil = use default center)
         static var savedOrigin: CGPoint?
 
-        /// Called when window is moved - save position
+        /// When true, suppress saving position (used during programmatic confirm-relative positioning)
+        var suppressPositionSave = false
+
+        /// Called when window is moved - save position (only for user-initiated moves)
         func windowDidMove(_ notification: Notification) {
+            if suppressPositionSave { return }
             CmdlineWindow.savedOrigin = frame.origin
             ZonvieCore.appLog("[CmdlineWindow] saved position: \(frame.origin)")
         }
@@ -2119,10 +2123,8 @@ final class ZonvieCore {
     private var messageTextField: NSTextField?
     /// Message container view for ext_messages
     private var messageContainerView: NSView?
-    /// Work item for message auto-hide timer
+    /// Work item for message auto-hide timer (timeout_ms based)
     private var messageAutoHideWorkItem: DispatchWorkItem?
-    /// Message auto-hide timeout in seconds
-    private static let messageAutoHideTimeout: Double = 4.0
     /// Pending messages for stack display (echo/error/warning only)
     private var pendingMessages: [(kind: String, content: String, hlId: Int32)] = []
 
@@ -2288,25 +2290,30 @@ final class ZonvieCore {
                     existingWindow.orderFront(nil)
                     return
                 } else if isCmdline {
-                    // Cmdline window exists - update position if promptWindow (confirm dialog) is visible
+                    // Cmdline window exists - reposition if promptWindow (confirm dialog) is visible
                     let promptWinVisible = self.promptWindow?.isVisible == true
 
                     if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
-                        // Position cmdline below promptWindow (confirm dialog)
-                        // X: center of app window, Y: below promptWindow
+                        // Temporarily position cmdline below confirm — suppress savedOrigin update
+                        if let cmdWin = existingWindow as? CmdlineWindow {
+                            cmdWin.suppressPositionSave = true
+                        }
                         let promptFrame = promptWin.frame
                         let screenFrame = screen.visibleFrame
                         let appFrame = mainWindow.frame
                         let containerWidth = existingWindow.frame.width
                         let containerHeight = existingWindow.frame.height
-                        let x = appFrame.midX - containerWidth / 2  // Center on app window
-                        // container top = y + containerHeight
-                        // We want: container top = promptFrame.origin.y - 4
+                        let x = appFrame.midX - containerWidth / 2
                         var y = promptFrame.origin.y - 4 - containerHeight
                         y = max(screenFrame.minY, y)
 
                         existingWindow.setFrame(NSRect(x: x, y: y, width: containerWidth, height: containerHeight), display: false)
                         ZonvieCore.appLog("[external_window] cmdline repositioned below prompt at (\(x), \(y))")
+                    } else {
+                        // Normal case: re-enable position saving
+                        if let cmdWin = existingWindow as? CmdlineWindow {
+                            cmdWin.suppressPositionSave = false
+                        }
                     }
                     existingWindow.orderFront(nil)
                     return
@@ -2396,19 +2403,14 @@ final class ZonvieCore {
 
                 if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
                     // Position cmdline below promptWindow (confirm dialog)
-                    // X: center of app window, Y: below promptWindow
+                    // This is a temporary position — do not save to savedOrigin.
                     let promptFrame = promptWin.frame
                     let screenFrame = screen.visibleFrame
                     let appFrame = mainWindow.frame
-                    let x = appFrame.midX - containerWidth / 2  // Center on app window
-                    // containerView starts at (0,0) and has size (containerWidth, containerHeight)
-                    // container top (in screen coords) = y + containerHeight
-                    // We want: container top = promptWindow bottom - 4
+                    let x = appFrame.midX - containerWidth / 2
                     var y = promptFrame.origin.y - 4 - containerHeight
                     y = max(screenFrame.minY, y)
                     windowRect = NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
-                    ZonvieCore.appLog("[cmdline_pos] promptWindow bottom=\(promptFrame.origin.y)")
-                    ZonvieCore.appLog("[cmdline_pos] cmdline content top=\(y + containerHeight) (should be \(promptFrame.origin.y - 4))")
                     ZonvieCore.appLog("[external_window] cmdline positioned below prompt at (\(x), \(y))")
                 } else if let savedOrigin = CmdlineWindow.savedOrigin, let screen = NSScreen.main {
                     // Use saved position, but ensure window stays on screen
@@ -2588,6 +2590,8 @@ final class ZonvieCore {
                 )
                 // Set self as delegate to track window movement
                 cmdlineWindow.delegate = cmdlineWindow
+                // Suppress position save when positioned relative to confirm dialog
+                cmdlineWindow.suppressPositionSave = (self.promptWindow?.isVisible == true)
                 window = cmdlineWindow
             } else {
                 window = NSWindow(
@@ -4235,7 +4239,7 @@ final class ZonvieCore {
                 let displayKind = self.pendingMessages.last?.kind ?? kindStr
                 let displayHlId = self.pendingMessages.last?.hlId ?? primaryHlId
 
-                self.showMessageWindow(kind: displayKind, content: displayContent, hlId: displayHlId)
+                self.showMessageWindow(kind: displayKind, content: displayContent, hlId: displayHlId, timeoutMs: timeoutMs)
             }
         }
     }
@@ -4280,8 +4284,13 @@ final class ZonvieCore {
             case ZONVIE_MSG_VIEW_MINI:
                 self.updateMini(.showmode, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showmode: show in message window
-                self.showMessageWindow(kind: "showmode", content: contentStr)
+                // ext_float for showmode: state-driven (no timeout needed,
+                // cleared when Neovim sends empty content on mode exit)
+                if contentStr.isEmpty {
+                    self.hideMessageWindow()
+                } else {
+                    self.showMessageWindow(kind: "showmode", content: contentStr)
+                }
             case ZONVIE_MSG_VIEW_NOTIFICATION:
                 // OS notification for showmode
                 self.showOSNotification(title: "Neovim", body: contentStr)
@@ -4321,8 +4330,13 @@ final class ZonvieCore {
             case ZONVIE_MSG_VIEW_MINI:
                 self.updateMini(.showcmd, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showcmd: show in message window
-                self.showMessageWindow(kind: "showcmd", content: contentStr)
+                // ext_float for showcmd: state-driven (no timeout needed,
+                // cleared when Neovim sends empty content)
+                if contentStr.isEmpty {
+                    self.hideMessageWindow()
+                } else {
+                    self.showMessageWindow(kind: "showcmd", content: contentStr)
+                }
             case ZONVIE_MSG_VIEW_NOTIFICATION:
                 // OS notification for showcmd
                 self.showOSNotification(title: "Neovim", body: contentStr)
@@ -4362,8 +4376,13 @@ final class ZonvieCore {
             case ZONVIE_MSG_VIEW_MINI:
                 self.updateMini(.ruler, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for ruler: show in message window
-                self.showMessageWindow(kind: "ruler", content: contentStr)
+                // ext_float for ruler: state-driven (no timeout needed,
+                // cleared when Neovim sends empty content)
+                if contentStr.isEmpty {
+                    self.hideMessageWindow()
+                } else {
+                    self.showMessageWindow(kind: "ruler", content: contentStr)
+                }
             case ZONVIE_MSG_VIEW_NOTIFICATION:
                 // OS notification for ruler
                 self.showOSNotification(title: "Neovim", body: contentStr)
@@ -4848,7 +4867,7 @@ final class ZonvieCore {
         }
     }
 
-    private func showMessageWindow(kind: String, content: String, hlId: Int32 = 0) {
+    private func showMessageWindow(kind: String, content: String, hlId: Int32 = 0, timeoutMs: UInt32 = 0) {
         guard let mainView = self.terminalView,
               let renderer = mainView.renderer,
               let screen = NSScreen.main else {
@@ -4900,13 +4919,15 @@ final class ZonvieCore {
         )
 
         // Start auto-hide timer for external window (but not for prompts)
+        // timeout_ms=0 means no auto-hide (e.g. errors), manual dismiss only
         messageAutoHideWorkItem?.cancel()
-        if !isPrompt {
+        messageAutoHideWorkItem = nil
+        if !isPrompt && timeoutMs > 0 {
             let workItem = DispatchWorkItem { [weak self] in
                 self?.hideMessageWindow()
             }
             messageAutoHideWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.messageAutoHideTimeout, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(timeoutMs) / 1000.0, execute: workItem)
         }
     }
 

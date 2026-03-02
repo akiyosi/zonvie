@@ -439,6 +439,10 @@ pub const Core = struct {
     msg_show_pending_since: ?i128 = null, // nanos timestamp when first msg_dirty was set
     msg_show_throttle_ns: i128 = 33 * std.time.ns_per_ms, // 33ms default throttle (matches noice.nvim)
 
+    // Auto-hide deadlines for ext_float grids (nanos timestamp)
+    msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
+    msg_history_auto_hide_at: ?i128 = null, // grid -103 auto-hide deadline
+
     // Scroll state for msg_show ext-float (Zonvie's own grid)
     msg_scroll_offset: u32 = 0, // Current scroll offset (lines from top)
     msg_total_lines: u32 = 0, // Total line count in current message content
@@ -2177,7 +2181,7 @@ pub const Core = struct {
             \\  if not ok then return end
             \\  state.buf = buf
             \\  -- Prepare lines with optional label
-            \\  local lines = vim.split(content, '\n')
+            \\  local lines = vim.split(content:gsub('\r', ''), '\n')
             \\  if has_label and label ~= "" then
             \\    local sep = string.rep("─", 40)
             \\    table.insert(lines, 1, sep)
@@ -2532,6 +2536,7 @@ pub const Core = struct {
 
     pub fn checkMsgShowThrottleTimeout(self: *Core) void {
         flush.checkMsgShowThrottleTimeout(self);
+        flush.checkMsgAutoHideTimeout(self);
     }
 
     pub fn notifyMessageChanges(self: *Core) void {

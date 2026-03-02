@@ -197,6 +197,33 @@ pub const PendingMessage = struct {
     id: i64 = 0,
 };
 
+/// Singleton confirm message (noice.nvim pattern: confirm lifecycle = cmdline lifecycle).
+/// Zero-alloc: fixed-size buffers matching PendingMessage pattern.
+pub const ConfirmMessage = struct {
+    kind: [32]u8 = undefined,
+    kind_len: usize = 0,
+    text: [4096]u8 = undefined,
+    text_len: usize = 0,
+    hl_id: u32 = 0,
+    id: i64 = 0,
+    active: bool = false,
+
+    pub fn clear(self: *ConfirmMessage) void {
+        self.active = false;
+        self.kind_len = 0;
+        self.text_len = 0;
+        self.hl_id = 0;
+        self.id = 0;
+    }
+
+    /// Append text to existing confirm message (for append semantics).
+    pub fn appendText(self: *ConfirmMessage, text: []const u8) void {
+        const copy_len = @min(text.len, self.text.len - self.text_len);
+        @memcpy(self.text[self.text_len..][0..copy_len], text[0..copy_len]);
+        self.text_len += copy_len;
+    }
+};
+
 pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .{},
     showmode_content: std.ArrayListUnmanaged(MsgChunk) = .{},
@@ -205,6 +232,14 @@ pub const MessageState = struct {
     visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
+    /// Singleton confirm message (separated from messages list per noice.nvim pattern)
+    confirm_msg: ConfirmMessage = .{},
+    /// Dirty flag for confirm message changes
+    confirm_dirty: bool = false,
+    /// Set by setMsgClear within an RPC batch. Ensures on_msg_clear is sent to the
+    /// frontend even when new msg_show events follow in the same batch.
+    /// Reset by notifyMessageChanges after processing.
+    msg_cleared_in_batch: bool = false,
     /// Dirty flag for showmode changes
     showmode_dirty: bool = false,
     /// Dirty flag for showcmd changes
@@ -242,6 +277,16 @@ pub const MessageState = struct {
         self.ruler_content.deinit(alloc);
     }
 
+    /// Clear msg_show messages only. Does NOT clear showmode/showcmd/ruler
+    /// (per Neovim docs: msg_clear only clears msg_show content).
+    pub fn clearMessages(self: *MessageState, alloc: std.mem.Allocator) void {
+        for (self.messages.items) |*msg| {
+            msg.deinit(alloc);
+        }
+        self.messages.clearRetainingCapacity();
+        self.visible = false;
+    }
+
     pub fn clear(self: *MessageState, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*msg| {
             msg.deinit(alloc);
@@ -266,6 +311,7 @@ pub const MessageState = struct {
         }
         self.ruler_content.clearRetainingCapacity();
 
+        self.confirm_msg.clear();
         self.visible = false;
         self.msg_dirty = false;
         self.showmode_dirty = false;
@@ -1794,6 +1840,64 @@ pub const Grid = struct {
         append: bool,
         msg_id: i64,
     ) !void {
+        // Discard empty messages (chunks=0). Neovim sends these (e.g., kind="empty")
+        // as no-op events that should not create visible display.
+        if (content.len == 0) return;
+
+        // Route confirm/confirm_sub to singleton ConfirmMessage (noice.nvim pattern:
+        // confirm lifecycle = cmdline lifecycle, stored separately from messages list).
+        const is_confirm = std.mem.eql(u8, kind, "confirm") or
+            std.mem.eql(u8, kind, "confirm_sub");
+        if (is_confirm) {
+            var cm = &self.message_state.confirm_msg;
+
+            if (append and cm.active) {
+                // Append to existing confirm (e.g., confirm_sub continuation)
+                for (content) |chunk| {
+                    cm.appendText(chunk.text);
+                }
+                if (msg_id != 0) cm.id = msg_id;
+            } else {
+                // New or replace confirm message
+                if (!replace_last) cm.clear();
+                // Copy kind
+                const klen = @min(kind.len, cm.kind.len);
+                @memcpy(cm.kind[0..klen], kind[0..klen]);
+                cm.kind_len = klen;
+                // Copy text from chunks
+                if (replace_last) cm.text_len = 0; // Reset text for replace
+                var primary_hl: u32 = cm.hl_id;
+                for (content) |chunk| {
+                    if (primary_hl == 0) primary_hl = chunk.hl_id;
+                    const clen = @min(chunk.text.len, cm.text.len - cm.text_len);
+                    @memcpy(cm.text[cm.text_len..][0..clen], chunk.text[0..clen]);
+                    cm.text_len += clen;
+                    if (cm.text_len >= cm.text.len) break;
+                }
+                cm.hl_id = primary_hl;
+                cm.id = msg_id;
+                cm.active = true;
+            }
+
+            self.message_state.confirm_dirty = true;
+            return; // Do NOT add to messages list
+        }
+
+        // Singleton display for non-accumulating message kinds.
+        // Neovim sends consecutive msg_show (e.g., undo) without msg_clear,
+        // expecting the UI to show only the latest (like terminal command line behavior).
+        // Shell output, list_cmd, and return_prompt accumulate by design.
+        if (!append and !replace_last) {
+            const is_accumulating =
+                std.mem.eql(u8, kind, "shell_out") or
+                std.mem.eql(u8, kind, "shell_err") or
+                std.mem.eql(u8, kind, "list_cmd") or
+                std.mem.eql(u8, kind, "return_prompt");
+            if (!is_accumulating) {
+                self.message_state.clearMessages(self.alloc);
+            }
+        }
+
         // If replace_last is true, replace the last message (or find by msg_id if non-zero)
         if (replace_last and self.message_state.messages.items.len > 0) {
             // Find message to replace: by msg_id if non-zero, otherwise last message
@@ -1900,9 +2004,15 @@ pub const Grid = struct {
     }
 
     /// Handle msg_clear event.
+    /// Per Neovim docs, msg_clear only clears msg_show content (not showmode/showcmd/ruler).
     pub fn setMsgClear(self: *Grid) void {
-        self.message_state.clear(self.alloc);
+        self.message_state.clearMessages(self.alloc);
         self.message_state.msg_dirty = true;
+        self.message_state.msg_cleared_in_batch = true;
+        if (self.message_state.confirm_msg.active) {
+            self.message_state.confirm_msg.clear();
+            self.message_state.confirm_dirty = true;
+        }
         // Note: Do NOT clear pending_show here - it should survive msg_clear
     }
 
@@ -2002,6 +2112,7 @@ pub const Grid = struct {
     /// Clear message dirty flags.
     pub fn clearMessageDirty(self: *Grid) void {
         self.message_state.msg_dirty = false;
+        self.message_state.confirm_dirty = false;
         self.message_state.showmode_dirty = false;
         self.message_state.showcmd_dirty = false;
         self.message_state.ruler_dirty = false;
