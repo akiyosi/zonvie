@@ -387,6 +387,17 @@ final class MetalTerminalView: MTKView {
         registerForDraggedTypes([.fileURL])
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Cycle the input context so the system IME candidate window
+        // picks up the current Light/Dark appearance.
+        // Skip if the user is mid-composition to avoid breaking the IME session.
+        if let ctx = _inputContext, !hasMarkedText() {
+            ctx.deactivate()
+            ctx.activate()
+        }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
@@ -1991,6 +2002,13 @@ final class PreeditOverlayView: NSView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Re-resolve the dynamic NSColor for the current Light/Dark appearance.
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.95).cgColor
+        needsDisplay = true
     }
 
     /// Clear the preedit overlay content.

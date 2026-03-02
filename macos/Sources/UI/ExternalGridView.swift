@@ -1028,6 +1028,17 @@ extension ExternalGridView: NSTextInputClient {
 
     // MARK: - Scrollbar
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Cycle the input context so the system IME candidate window
+        // picks up the current Light/Dark appearance.
+        // Skip if the user is mid-composition to avoid breaking the IME session.
+        if let ctx = _inputContext, !hasMarkedText() {
+            ctx.deactivate()
+            ctx.activate()
+        }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
