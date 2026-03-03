@@ -243,6 +243,9 @@ final class ViewController: NSViewController {
         sidebar.onTabExternalized = { [weak self] handle, dropPoint in
             self?.externalizeTab(handle: handle, dropPoint: dropPoint)
         }
+        sidebar.onTabMoved = { [weak self] (fromIndex: Int, toIndex: Int) in
+            self?.moveTab(from: fromIndex, to: toIndex)
+        }
 
         self.sidebarView = sidebar
 

@@ -130,14 +130,18 @@ final class TabSidebarView: NSView {
     var onTabClosed: ((Int64) -> Void)?
     var onNewTabRequested: (() -> Void)?
     var onTabExternalized: ((Int64, NSPoint) -> Void)?
+    var onTabMoved: ((Int, Int) -> Void)?
 
-    // Drag state for tab externalization
+    // Drag state for tab externalization and reordering
     private var draggingTabIndex: Int? = nil
     private var dragStartPoint: NSPoint = .zero
     private var isExternalDrag: Bool = false
-    private var dragPreviewWindow: NSWindow? = nil
+    private let dragPreviewHelper = TabDragPreviewHelper()
     private let dragThreshold: CGFloat = 5
     private let externalDragThreshold: CGFloat = 50
+    private var dragOffsetY: CGFloat = 0
+    private var dragCurrentY: CGFloat = 0
+    private var dropTargetIndex: Int? = nil
 
     // Tracking area for mouse hover
     private var trackingArea: NSTrackingArea?
@@ -248,24 +252,72 @@ final class TabSidebarView: NSView {
             NSRect(x: bounds.maxX - separatorWidth, y: 0, width: separatorWidth, height: bounds.height).fill()
         }
 
+        // Determine if we're in an active internal drag (threshold exceeded)
+        let isInternalDrag = draggingTabIndex != nil && dropTargetIndex != nil && !isExternalDrag
+
         // Draw tab rows
         var y: CGFloat = 0
         for (index, tab) in tabs.enumerated() {
             let rowRect = NSRect(x: 0, y: y, width: bounds.width - separatorWidth, height: tabRowHeight)
-            drawTabRow(tab, in: rowRect, index: index)
+            let isBeingDragged = isInternalDrag && index == draggingTabIndex
+            drawTabRow(tab, in: rowRect, index: index, isBeingDragged: isBeingDragged)
             y += tabRowHeight
         }
 
         // Draw "New Tab" button below tab list
         drawNewTabButton(at: y)
+
+        // Draw drop indicator and floating tab (after everything else so they're on top)
+        if isInternalDrag, let dragIdx = draggingTabIndex, let targetIdx = dropTargetIndex {
+            // A) Drop indicator line
+            if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
+                let indicatorY = CGFloat(targetIdx) * tabRowHeight
+                NSColor.controlAccentColor.setFill()
+                NSRect(x: 0, y: indicatorY - 1, width: bounds.width - separatorWidth, height: 2).fill()
+            }
+
+            // B) Floating tab row
+            let floatY = dragCurrentY - dragOffsetY
+            let floatRect = NSRect(x: 2, y: floatY, width: bounds.width - separatorWidth - 4, height: tabRowHeight)
+            let floatPath = NSBezierPath(roundedRect: floatRect, xRadius: 4, yRadius: 4)
+
+            NSColor.controlAccentColor.withAlphaComponent(0.3).setFill()
+            floatPath.fill()
+            NSColor.controlAccentColor.setStroke()
+            floatPath.lineWidth = 1.0
+            floatPath.stroke()
+
+            // Draw tab name in floating row
+            let tab = tabs[dragIdx]
+            let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
+            let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.lineBreakMode = .byTruncatingTail
+            let attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: tabTextSelectedColor,
+                .font: font,
+                .paragraphStyle: paragraphStyle
+            ]
+            let textRect = NSRect(
+                x: tabPadding + 2,
+                y: floatY + (tabRowHeight - 16) / 2,
+                width: floatRect.width - tabPadding * 2,
+                height: 16
+            )
+            displayName.draw(in: textRect, withAttributes: attributes)
+        }
     }
 
-    private func drawTabRow(_ tab: Tab, in rect: NSRect, index: Int) {
+    private func drawTabRow(_ tab: Tab, in rect: NSRect, index: Int, isBeingDragged: Bool = false) {
         let isSelected = tab.handle == currentTab
         let isHovered = hoveredTabIndex == index
 
         // Row background
-        if isSelected {
+        if isBeingDragged {
+            // Ghost appearance for the original position of the dragged tab
+            NSColor.controlAccentColor.withAlphaComponent(0.1).setFill()
+            rect.fill()
+        } else if isSelected {
             tabSelectedColor.setFill()
             rect.fill()
         } else if isHovered {
@@ -424,7 +476,7 @@ final class TabSidebarView: NSView {
         }
     }
 
-    /// Track tab drag for externalization (drag outside sidebar to create external window)
+    /// Track tab drag for reordering and externalization
     private func trackTabDrag(initialEvent: NSEvent, tabIndex: Int) {
         guard let window = self.window else { return }
         guard tabIndex < tabs.count else { return }
@@ -433,8 +485,14 @@ final class TabSidebarView: NSView {
         dragStartPoint = startLocation
         draggingTabIndex = tabIndex
         isExternalDrag = false
+        dragOffsetY = startLocation.y - CGFloat(tabIndex) * tabRowHeight
+        dragCurrentY = startLocation.y
+        dropTargetIndex = nil
         var isDragging = true
         var hasMoved = false
+
+        // Select the dragged tab immediately (`:tabmove` moves the current tab)
+        onTabSelected?(tabs[tabIndex].handle)
 
         while isDragging {
             guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
@@ -444,11 +502,9 @@ final class TabSidebarView: NSView {
             let location = convert(event.locationInWindow, from: nil)
             let screenLocation = window.convertPoint(toScreen: event.locationInWindow)
 
-            // Sidebar bounds in screen coordinates
-            let sidebarBoundsInWindow = self.convert(self.bounds, to: nil)
-            let sidebarScreenRect = window.convertToScreen(sidebarBoundsInWindow)
-            let expandedRect = sidebarScreenRect.insetBy(dx: -externalDragThreshold, dy: -externalDragThreshold)
-            let isOutsideSidebar = !expandedRect.contains(screenLocation)
+            let isOutsideSidebar = TabDragPreviewHelper.isOutsideBounds(
+                of: self, screenPoint: screenLocation, threshold: externalDragThreshold
+            )
 
             switch event.type {
             case .leftMouseDragged:
@@ -457,87 +513,57 @@ final class TabSidebarView: NSView {
 
                 if hasMoved && isOutsideSidebar && !isExternalDrag {
                     isExternalDrag = true
-                    createDragPreviewWindow(for: tabIndex, at: screenLocation)
+                    dropTargetIndex = nil
+                    dragPreviewHelper.create(tabName: tabs[tabIndex].name, at: screenLocation)
                 } else if hasMoved && !isOutsideSidebar && isExternalDrag {
                     isExternalDrag = false
-                    destroyDragPreviewWindow()
+                    dragPreviewHelper.destroy()
                 }
 
                 if isExternalDrag {
-                    updateDragPreviewPosition(screenLocation)
+                    dragPreviewHelper.updatePosition(screenLocation)
+                } else if hasMoved {
+                    // Internal reorder drag
+                    dragCurrentY = location.y
+
+                    // Calculate drop target from Y position
+                    var targetIdx = 0
+                    for i in 0..<tabs.count {
+                        let rowCenterY = CGFloat(i) * tabRowHeight + tabRowHeight / 2
+                        if location.y < rowCenterY {
+                            targetIdx = i
+                            break
+                        }
+                        targetIdx = i + 1
+                    }
+                    dropTargetIndex = min(targetIdx, tabs.count)
                 }
+                needsDisplay = true
 
             case .leftMouseUp:
                 isDragging = false
+
                 if isExternalDrag {
-                    destroyDragPreviewWindow()
+                    dragPreviewHelper.destroy()
                     onTabExternalized?(tabs[tabIndex].handle, screenLocation)
                 } else if !hasMoved {
-                    onTabSelected?(tabs[tabIndex].handle)
+                    // Click without drag — tab was already selected above
+                } else if let targetIdx = dropTargetIndex {
+                    if targetIdx != tabIndex && targetIdx != tabIndex + 1 {
+                        onTabMoved?(tabIndex, targetIdx)
+                    }
                 }
+
+                // Reset drag state
                 draggingTabIndex = nil
+                dropTargetIndex = nil
                 isExternalDrag = false
+                needsDisplay = true
 
             default:
                 break
             }
         }
-    }
-
-    // MARK: - External Drag Preview Window
-
-    private func createDragPreviewWindow(for tabIndex: Int, at screenPoint: NSPoint) {
-        guard tabIndex < tabs.count else { return }
-        let tab = tabs[tabIndex]
-
-        let previewWidth: CGFloat = 150
-        let previewHeight: CGFloat = 30
-
-        let previewWindow = NSWindow(
-            contentRect: NSRect(
-                x: screenPoint.x - previewWidth / 2,
-                y: screenPoint.y - previewHeight / 2,
-                width: previewWidth,
-                height: previewHeight
-            ),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        previewWindow.isOpaque = false
-        previewWindow.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.95)
-        previewWindow.level = .floating
-        previewWindow.hasShadow = true
-
-        previewWindow.contentView?.wantsLayer = true
-        previewWindow.contentView?.layer?.cornerRadius = 8
-        previewWindow.contentView?.layer?.masksToBounds = true
-
-        let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
-        let label = NSTextField(labelWithString: displayName)
-        label.frame = NSRect(x: 10, y: 5, width: previewWidth - 20, height: 20)
-        label.alignment = .center
-        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        label.textColor = NSColor.labelColor
-        label.lineBreakMode = .byTruncatingTail
-        previewWindow.contentView?.addSubview(label)
-
-        previewWindow.orderFront(nil)
-        dragPreviewWindow = previewWindow
-    }
-
-    private func updateDragPreviewPosition(_ screenPoint: NSPoint) {
-        guard let preview = dragPreviewWindow else { return }
-        let previewSize = preview.frame.size
-        preview.setFrameOrigin(NSPoint(
-            x: screenPoint.x - previewSize.width / 2,
-            y: screenPoint.y - previewSize.height / 2
-        ))
-    }
-
-    private func destroyDragPreviewWindow() {
-        dragPreviewWindow?.orderOut(nil)
-        dragPreviewWindow = nil
     }
 
     private func trackCloseButtonClick(initialEvent: NSEvent, tabIndex: Int) {

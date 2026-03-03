@@ -412,6 +412,8 @@ pub const TablineState = struct {
     drag_offset_x: c_int = 0, // Offset from tab left edge to mouse
     drag_current_x: c_int = 0, // Current mouse X during drag
     drop_target_index: ?usize = null, // Where the tab would be dropped
+    drag_start_y: c_int = 0, // Mouse Y when drag started (sidebar)
+    drag_current_y: c_int = 0, // Current mouse Y during drag (sidebar)
 
     // External drag state (for tab externalization)
     is_external_drag: bool = false,

@@ -7,6 +7,59 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const TablineState = app_mod.TablineState;
+const TabEntry = app_mod.TabEntry;
+
+// ---- Shared helpers for titlebar and sidebar tab operations ----
+
+/// Extract the display name (basename) from a tab entry.
+/// Returns the length of the display name written to out_buf.
+fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
+    if (tab.name_len > 0) {
+        var last_sep: usize = 0;
+        for (0..tab.name_len) |j| {
+            if (tab.name[j] == '/' or tab.name[j] == '\\') {
+                last_sep = j + 1;
+            }
+        }
+        const display_len = tab.name_len - last_sep;
+        @memcpy(out_buf[0..display_len], tab.name[last_sep..tab.name_len]);
+        return display_len;
+    } else {
+        const no_name = "[No Name]";
+        @memcpy(out_buf[0..no_name.len], no_name);
+        return no_name.len;
+    }
+}
+
+/// Calculate the Neovim :tabmove position from a drop target index.
+/// Returns the value N for `:tabmove N`.
+fn calculateTabMovePosition(to_idx: usize, tab_count: usize) i32 {
+    if (to_idx == 0) {
+        return 0;
+    } else if (to_idx >= tab_count) {
+        return @intCast(tab_count);
+    } else {
+        return @intCast(to_idx - 1);
+    }
+}
+
+/// Calculate a drop target index from a mouse position along a uniform-sized item list.
+/// Works for both X-axis (titlebar) and Y-axis (sidebar) by passing the appropriate coordinate.
+fn calculateDropTarget(mouse_pos: c_int, item_count: usize, item_size: c_int) usize {
+    var target_idx: usize = 0;
+    for (0..item_count) |i| {
+        const item_center: c_int = @as(c_int, @intCast(i)) * item_size + @divTrunc(item_size, 2);
+        if (mouse_pos < item_center) {
+            target_idx = i;
+            break;
+        }
+        target_idx = i + 1;
+    }
+    if (target_idx > item_count) {
+        target_idx = item_count;
+    }
+    return target_idx;
+}
 
 const tabline_class_name: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieTablineClass");
 var tabline_class_registered: bool = false;
@@ -814,20 +867,7 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
                 // :tabmove 0 moves to the beginning
                 // :tabmove $ or large number moves to end
 
-                // Calculate the target position for :tabmove
-                // :tabmove N moves current tab to after tab N (1-based)
-                // :tabmove 0 moves to the beginning
-                // Match macOS implementation exactly
-                var new_pos: i32 = 0;
-                if (to_idx == 0) {
-                    new_pos = 0;  // Move to first position
-                } else if (to_idx >= app.tabline_state.tab_count) {
-                    // Move to end
-                    new_pos = @intCast(app.tabline_state.tab_count);
-                } else {
-                    // Middle position: to_idx - 1 (works for both directions)
-                    new_pos = @intCast(to_idx - 1);
-                }
+                const new_pos = calculateTabMovePosition(to_idx, app.tabline_state.tab_count);
 
                 applog.appLog("[tabline] mouseUp: calculated new_pos={d}\n", .{new_pos});
 
@@ -1242,23 +1282,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Convert name to display
         var display_name: [256]u8 = undefined;
-        var display_len: usize = 0;
-
-        if (tab.name_len > 0) {
-            // Find last path separator
-            var last_sep: usize = 0;
-            for (0..tab.name_len) |j| {
-                if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                    last_sep = j + 1;
-                }
-            }
-            display_len = tab.name_len - last_sep;
-            @memcpy(display_name[0..display_len], tab.name[last_sep..tab.name_len]);
-        } else {
-            const no_name = "[No Name]";
-            display_len = no_name.len;
-            @memcpy(display_name[0..display_len], no_name);
-        }
+        const display_len = extractTabDisplayName(tab, &display_name);
 
         // Convert to wide string
         var wide_buf: [256]u16 = undefined;
@@ -1459,24 +1483,8 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
                 .bottom = bar_height,
             };
 
-            // Convert name to display
             var float_display_name: [256]u8 = undefined;
-            var float_display_len: usize = 0;
-
-            if (tab.name_len > 0) {
-                var last_sep: usize = 0;
-                for (0..tab.name_len) |j| {
-                    if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                        last_sep = j + 1;
-                    }
-                }
-                float_display_len = tab.name_len - last_sep;
-                @memcpy(float_display_name[0..float_display_len], tab.name[last_sep..tab.name_len]);
-            } else {
-                const no_name = "[No Name]";
-                float_display_len = no_name.len;
-                @memcpy(float_display_name[0..float_display_len], no_name);
-            }
+            const float_display_len = extractTabDisplayName(tab, &float_display_name);
 
             var float_wide_buf: [256]u16 = undefined;
             const float_wide_len = std.unicode.utf8ToUtf16Le(&float_wide_buf, float_display_name[0..float_display_len]) catch 0;
@@ -1634,23 +1642,7 @@ pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Convert name to display
         var display_name: [256]u8 = undefined;
-        var display_len: usize = 0;
-
-        if (tab.name_len > 0) {
-            // Find last path separator
-            var last_sep: usize = 0;
-            for (0..tab.name_len) |j| {
-                if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                    last_sep = j + 1;
-                }
-            }
-            display_len = tab.name_len - last_sep;
-            @memcpy(display_name[0..display_len], tab.name[last_sep..tab.name_len]);
-        } else {
-            const no_name = "[No Name]";
-            display_len = no_name.len;
-            @memcpy(display_name[0..display_len], no_name);
-        }
+        const display_len = extractTabDisplayName(tab, &display_name);
 
         // Convert to wide string
         var wide_buf: [256]u16 = undefined;
@@ -2118,11 +2110,17 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
+    // Determine if we're in an active internal drag (threshold exceeded)
+    const is_internal_drag = app.tabline_state.dragging_tab != null and
+        app.tabline_state.drop_target_index != null and
+        !app.tabline_state.is_external_drag;
+
     var y: c_int = 0;
     for (0..app.tabline_state.tab_count) |i| {
         const tab = &app.tabline_state.tabs[i];
         const is_selected = tab.handle == app.tabline_state.current_tab;
         const is_hovered = app.tabline_state.hovered_tab == i;
+        const is_being_dragged = is_internal_drag and app.tabline_state.dragging_tab == i;
 
         var row_rect = c.RECT{
             .left = 0,
@@ -2132,14 +2130,17 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         };
 
         // Row background
-        if (is_selected) {
+        if (is_being_dragged) {
+            // Ghost appearance for the original position of the dragged tab
+            _ = c.FillRect(hdc, &row_rect, indicator_brush);
+        } else if (is_selected) {
             _ = c.FillRect(hdc, &row_rect, selected_brush);
         } else if (is_hovered) {
             _ = c.FillRect(hdc, &row_rect, hover_brush);
         }
 
         // Selection indicator bar
-        if (is_selected) {
+        if (is_selected and !is_being_dragged) {
             var ind_rect: c.RECT = undefined;
             if (app.sidebar_position_right) {
                 ind_rect = .{ .left = sep_w, .top = y, .right = sep_w + indicator_w, .bottom = y + row_h };
@@ -2157,21 +2158,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         _ = c.SetTextColor(hdc, text_color);
 
         var display_name: [256]u8 = undefined;
-        var display_len: usize = 0;
-        if (tab.name_len > 0) {
-            var last_sep: usize = 0;
-            for (0..tab.name_len) |j| {
-                if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                    last_sep = j + 1;
-                }
-            }
-            display_len = tab.name_len - last_sep;
-            @memcpy(display_name[0..display_len], tab.name[last_sep..tab.name_len]);
-        } else {
-            const no_name = "[No Name]";
-            display_len = no_name.len;
-            @memcpy(display_name[0..display_len], no_name);
-        }
+        const display_len = extractTabDisplayName(tab, &display_name);
 
         var wide_buf: [256]u16 = undefined;
         const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
@@ -2187,17 +2174,17 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
 
         // Close button (X) on selected or hovered tabs
-        if (is_selected or is_hovered) {
+        if ((is_selected or is_hovered) and !is_being_dragged) {
             const close_x = width - sep_w - close_size - app.scalePx(8);
-            const close_y = y + @divTrunc(row_h - close_size, 2);
+            const close_y_pos = y + @divTrunc(row_h - close_size, 2);
 
             if (app.tabline_state.hovered_close == i) {
                 const close_hover_brush = c.CreateSolidBrush(c.RGB(colors.hover_r, colors.hover_g, colors.hover_b));
                 var close_rect = c.RECT{
                     .left = close_x,
-                    .top = close_y,
+                    .top = close_y_pos,
                     .right = close_x + close_size,
-                    .bottom = close_y + close_size,
+                    .bottom = close_y_pos + close_size,
                 };
                 _ = c.FillRect(hdc, &close_rect, close_hover_brush);
                 _ = c.DeleteObject(close_hover_brush);
@@ -2209,10 +2196,10 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
                 c.RGB(colors.close_r, colors.close_g, colors.close_b);
             const pen = c.CreatePen(c.PS_SOLID, 1, close_color);
             const old_pen = c.SelectObject(hdc, pen);
-            _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
-            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
+            _ = c.MoveToEx(hdc, close_x + close_inset, close_y_pos + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y_pos + close_size - close_inset);
+            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y_pos + close_inset, null);
+            _ = c.LineTo(hdc, close_x + close_inset, close_y_pos + close_size - close_inset);
             _ = c.SelectObject(hdc, old_pen);
             _ = c.DeleteObject(pen);
         }
@@ -2267,6 +2254,70 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         _ = c.DrawTextW(hdc, @ptrCast(new_tab_label.ptr), @intCast(new_tab_label.len), &nt_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE);
         _ = c.SelectObject(hdc, old_small_font);
         _ = c.DeleteObject(small_font);
+    }
+
+    // Draw drag visual feedback (drop indicator + floating tab) on top of everything
+    if (is_internal_drag) {
+        if (app.tabline_state.dragging_tab) |drag_idx| {
+            if (app.tabline_state.drop_target_index) |target_idx| {
+                // B) Drop indicator line
+                if (target_idx != drag_idx and target_idx != drag_idx + 1) {
+                    const ind_y: c_int = @as(c_int, @intCast(target_idx)) * row_h;
+                    var ind_rect = c.RECT{
+                        .left = 0,
+                        .top = ind_y - 1,
+                        .right = width - sep_w,
+                        .bottom = ind_y + 1,
+                    };
+                    _ = c.FillRect(hdc, &ind_rect, indicator_brush);
+                }
+
+                // C) Floating tab row at drag position
+                if (drag_idx < app.tabline_state.tab_count) {
+                    const drag_tab = &app.tabline_state.tabs[drag_idx];
+                    const float_y = app.tabline_state.drag_current_y - @divTrunc(row_h, 2);
+
+                    // Floating row background (accent color approximation)
+                    const float_brush = c.CreateSolidBrush(c.RGB(colors.indicator_r, colors.indicator_g, colors.indicator_b));
+                    var float_rect = c.RECT{
+                        .left = 2,
+                        .top = float_y,
+                        .right = width - sep_w - 2,
+                        .bottom = float_y + row_h,
+                    };
+                    _ = c.FillRect(hdc, &float_rect, float_brush);
+                    _ = c.DeleteObject(float_brush);
+
+                    // Floating row border
+                    const border_pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(colors.indicator_r, colors.indicator_g, colors.indicator_b));
+                    const old_border_pen = c.SelectObject(hdc, border_pen);
+                    _ = c.MoveToEx(hdc, float_rect.left, float_rect.top, null);
+                    _ = c.LineTo(hdc, float_rect.right, float_rect.top);
+                    _ = c.LineTo(hdc, float_rect.right, float_rect.bottom);
+                    _ = c.LineTo(hdc, float_rect.left, float_rect.bottom);
+                    _ = c.LineTo(hdc, float_rect.left, float_rect.top);
+                    _ = c.SelectObject(hdc, old_border_pen);
+                    _ = c.DeleteObject(border_pen);
+
+                    // Floating row tab name
+                    _ = c.SetTextColor(hdc, c.RGB(colors.text_sel_r, colors.text_sel_g, colors.text_sel_b));
+
+                    var float_display_name: [256]u8 = undefined;
+                    const float_display_len = extractTabDisplayName(drag_tab, &float_display_name);
+
+                    var float_wide_buf: [256]u16 = undefined;
+                    const float_wide_len = std.unicode.utf8ToUtf16Le(&float_wide_buf, float_display_name[0..float_display_len]) catch 0;
+
+                    var float_text_rect = c.RECT{
+                        .left = padding + 2,
+                        .top = float_y,
+                        .right = width - sep_w - padding - 2,
+                        .bottom = float_y + row_h,
+                    };
+                    _ = c.DrawTextW(hdc, &float_wide_buf, @intCast(float_wide_len), &float_text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+                }
+            }
+        }
     }
 }
 
@@ -2334,6 +2385,9 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     app.tabline_state.dragging_tab = tab_idx;
     app.tabline_state.drag_start_x = x;
     app.tabline_state.drag_current_x = x;
+    app.tabline_state.drag_start_y = y;
+    app.tabline_state.drag_current_y = y;
+    app.tabline_state.drop_target_index = null;
     app.tabline_state.is_external_drag = false;
     _ = c.SetCapture(hwnd);
 }
@@ -2372,6 +2426,8 @@ pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     // Handle drag end
     const was_external_drag = app.tabline_state.is_external_drag;
     const drag_idx_opt = app.tabline_state.dragging_tab;
+    const drop_target_opt = app.tabline_state.drop_target_index;
+    const drag_start_y_saved = app.tabline_state.drag_start_y;
 
     app.tabline_state.cancelDrag();
     destroyDragPreviewWindow(app);
@@ -2382,6 +2438,30 @@ pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
             var screen_pt: c.POINT = .{ .x = x, .y = y };
             _ = c.ClientToScreen(hwnd, &screen_pt);
             externalizeTab(app, drag_idx, screen_pt.x, screen_pt.y);
+        } else {
+            // Internal reorder
+            const dy = if (y > drag_start_y_saved)
+                y - drag_start_y_saved
+            else
+                drag_start_y_saved - y;
+            const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
+
+            if (dy > drag_threshold) {
+                if (drop_target_opt) |to_idx| {
+                    if (to_idx != drag_idx and to_idx != drag_idx + 1) {
+                        const new_pos = calculateTabMovePosition(to_idx, app.tabline_state.tab_count);
+
+                        if (app.corep) |corep| {
+                            var cmd_buf: [32]u8 = undefined;
+                            const cmd = std.fmt.bufPrint(&cmd_buf, "tabmove {d}", .{new_pos}) catch {
+                                _ = c.InvalidateRect(hwnd, null, 0);
+                                return;
+                            };
+                            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+                        }
+                    }
+                }
+            }
         }
     }
     _ = c.InvalidateRect(hwnd, null, 0);
@@ -2454,9 +2534,10 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         return;
     }
 
-    // Handle dragging (external drag detection)
+    // Handle dragging (external drag detection + internal reorder)
     if (app.tabline_state.dragging_tab != null) {
         app.tabline_state.drag_current_x = x;
+        app.tabline_state.drag_current_y = y;
 
         // Check if mouse is outside sidebar bounds (for external drag)
         if (app.hwnd) |main_hwnd| {
@@ -2508,6 +2589,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
                 if (is_outside and !app.tabline_state.is_external_drag) {
                     app.tabline_state.is_external_drag = true;
+                    app.tabline_state.drop_target_index = null;
                     createDragPreviewWindow(app, app.tabline_state.dragging_tab.?, screen_pt.x, screen_pt.y);
                 } else if (!is_outside and app.tabline_state.is_external_drag) {
                     app.tabline_state.is_external_drag = false;
@@ -2516,6 +2598,16 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
                 if (app.tabline_state.is_external_drag) {
                     updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
+                } else {
+                    // Internal reorder: calculate drop target from Y position
+                    const dy = if (y > app.tabline_state.drag_start_y)
+                        y - app.tabline_state.drag_start_y
+                    else
+                        app.tabline_state.drag_start_y - y;
+
+                    if (dy > app.scalePx(TablineState.DRAG_THRESHOLD)) {
+                        app.tabline_state.drop_target_index = calculateDropTarget(y, app.tabline_state.tab_count, row_h);
+                    }
                 }
             }
         }

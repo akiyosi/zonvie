@@ -49,7 +49,7 @@ final class TabBarView: NSView {
 
     // External drag state (for tab externalization)
     private var isExternalDrag: Bool = false
-    private var dragPreviewWindow: NSWindow? = nil
+    private let dragPreviewHelper = TabDragPreviewHelper()
     private let externalDragThreshold: CGFloat = 50  // pixels outside window to trigger external drag
 
     // Tab appearance constants
@@ -468,34 +468,32 @@ final class TabBarView: NSView {
             let location = convert(event.locationInWindow, from: nil)
             let screenLocation = window.convertPoint(toScreen: event.locationInWindow)
 
-            // Check if mouse is outside tab bar bounds (with threshold)
-            let tabBarBoundsInWindow = self.convert(self.bounds, to: nil)
-            let tabBarScreenRect = window.convertToScreen(tabBarBoundsInWindow)
-            let expandedTabBarRect = tabBarScreenRect.insetBy(dx: -externalDragThreshold, dy: -externalDragThreshold)
-            let isOutsideTabBar = !expandedTabBarRect.contains(screenLocation)
+            let isOutsideTabBar = TabDragPreviewHelper.isOutsideBounds(
+                of: self, screenPoint: screenLocation, threshold: externalDragThreshold
+            )
 
             switch event.type {
             case .leftMouseDragged:
                 // DEBUG: Log drag position
                 if isOutsideTabBar {
-                    ZonvieCore.appLog("[TAB-DRAG] screenLocation=\(screenLocation) tabBarScreenRect=\(tabBarScreenRect) expandedTabBarRect=\(expandedTabBarRect) isOutside=\(isOutsideTabBar)")
+                    ZonvieCore.appLog("[TAB-DRAG] screenLocation=\(screenLocation) isOutside=\(isOutsideTabBar)")
                 }
 
                 if isOutsideTabBar && !isExternalDrag {
                     // Entering external drag mode
                     isExternalDrag = true
                     ZonvieCore.appLog("[TAB-DRAG] Entering external drag mode for tab \(tabIndex)")
-                    createDragPreviewWindow(for: tabIndex, at: screenLocation)
+                    dragPreviewHelper.create(tabName: tabs[tabIndex].name, at: screenLocation)
                 } else if !isOutsideTabBar && isExternalDrag {
                     // Returning to normal drag mode
                     isExternalDrag = false
                     ZonvieCore.appLog("[TAB-DRAG] Returning to normal drag mode")
-                    destroyDragPreviewWindow()
+                    dragPreviewHelper.destroy()
                 }
 
                 if isExternalDrag {
                     // Update preview window position
-                    updateDragPreviewPosition(screenLocation)
+                    dragPreviewHelper.updatePosition(screenLocation)
                 } else {
                     // Normal in-window drag
                     dragCurrentX = location.x
@@ -524,7 +522,7 @@ final class TabBarView: NSView {
                     // Externalize the tab
                     let tab = tabs[tabIndex]
                     ZonvieCore.appLog("[TAB-DRAG] Externalizing tab handle=\(tab.handle) name=\(tab.name)")
-                    destroyDragPreviewWindow()
+                    dragPreviewHelper.destroy()
                     onTabExternalized?(tab.handle, screenLocation)
                 } else {
                     let movedDistance = abs(location.x - dragStartX)
@@ -625,64 +623,6 @@ final class TabBarView: NSView {
                 break
             }
         }
-    }
-
-    // MARK: - External Drag Preview Window
-
-    private func createDragPreviewWindow(for tabIndex: Int, at screenPoint: NSPoint) {
-        guard tabIndex < tabs.count else { return }
-        let tab = tabs[tabIndex]
-
-        let previewWidth: CGFloat = 150
-        let previewHeight: CGFloat = 30
-
-        let previewWindow = NSWindow(
-            contentRect: NSRect(
-                x: screenPoint.x - previewWidth / 2,
-                y: screenPoint.y - previewHeight / 2,
-                width: previewWidth,
-                height: previewHeight
-            ),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        previewWindow.isOpaque = false
-        previewWindow.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.95)
-        previewWindow.level = .floating
-        previewWindow.hasShadow = true
-
-        // Round corners
-        previewWindow.contentView?.wantsLayer = true
-        previewWindow.contentView?.layer?.cornerRadius = 8
-        previewWindow.contentView?.layer?.masksToBounds = true
-
-        // Add tab name label
-        let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
-        let label = NSTextField(labelWithString: displayName)
-        label.frame = NSRect(x: 10, y: 5, width: previewWidth - 20, height: 20)
-        label.alignment = .center
-        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        label.textColor = NSColor.labelColor
-        label.lineBreakMode = .byTruncatingTail
-        previewWindow.contentView?.addSubview(label)
-
-        previewWindow.orderFront(nil)
-        dragPreviewWindow = previewWindow
-    }
-
-    private func updateDragPreviewPosition(_ screenPoint: NSPoint) {
-        guard let preview = dragPreviewWindow else { return }
-        let previewSize = preview.frame.size
-        preview.setFrameOrigin(NSPoint(
-            x: screenPoint.x - previewSize.width / 2,
-            y: screenPoint.y - previewSize.height / 2
-        ))
-    }
-
-    private func destroyDragPreviewWindow() {
-        dragPreviewWindow?.orderOut(nil)
-        dragPreviewWindow = nil
     }
 
     override func mouseDragged(with event: NSEvent) {
