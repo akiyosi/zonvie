@@ -5345,6 +5345,35 @@ pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: con
     );
 }
 
+/// Send config parse error to frontend via on_msg_show callback (ext_float view).
+/// Called once after first redraw batch when Neovim is ready.
+/// Always sets config_error_sent = true regardless of whether callback exists,
+/// to avoid infinite retry when on_msg_show is not registered.
+pub fn sendConfigError(self: *Core, err_msg: []const u8) void {
+    self.config_error_sent = true;
+
+    const cb = self.cb.on_msg_show orelse return;
+    const kind = "emsg";
+    var chunks: [1]c_api.MsgChunk = .{.{
+        .hl_id = 0,
+        .text = err_msg.ptr,
+        .text_len = err_msg.len,
+    }};
+    cb(
+        self.ctx,
+        .ext_float,
+        kind.ptr,
+        kind.len,
+        &chunks,
+        1, // chunk_count
+        0, // replace_last
+        0, // history
+        0, // append
+        -1, // msg_id (synthetic)
+        0, // timeout_ms (0 = no auto-hide)
+    );
+}
+
 /// Send all msg_history entries combined to frontend callback (for mini view).
 pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHistoryEntry, view: config.MsgViewType) void {
     const cb = self.cb.on_msg_show orelse return;

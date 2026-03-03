@@ -1167,6 +1167,9 @@ pub export fn zonvie_core_load_config(
     // Also update nvim_core's config reference
     box.core.msg_config = box.msg_config;
 
+    // Reset config error notification flag so new errors get reported
+    box.core.config_error_sent = false;
+
     // Apply performance settings to core
     const new_hl_size = box.msg_config.performance.hl_cache_size;
     if (new_hl_size != box.core.hl_cache_size) {

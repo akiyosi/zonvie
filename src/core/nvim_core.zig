@@ -462,6 +462,8 @@ pub const Core = struct {
 
     // Message routing config (loaded from config.toml)
     msg_config: config.Config = .{},
+    // Config error notification: true after first notification attempt (prevents retry)
+    config_error_sent: bool = false,
 
     // Blur transparency enabled (macOS only, Windows should keep false)
     blur_enabled: bool = false,

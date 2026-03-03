@@ -152,9 +152,10 @@ pub const Config = struct {
     // Internal state
     alloc: ?std.mem.Allocator = null,
     routes_allocated: bool = false,
+    parse_error: ?[]const u8 = null,
 
     pub const NeovimConfig = struct {
-        path: []const u8 = if (builtin.os.tag == .macos) "/usr/local/bin/nvim" else "nvim",
+        path: []const u8 = "nvim",
         wsl: bool = false,
         wsl_distro: ?[]const u8 = null,
         ssh: bool = false,
@@ -278,6 +279,28 @@ pub const Config = struct {
         defer parser.deinit();
 
         const result = parser.parseString(content) catch |err| {
+            // Extract position info from zig-toml's error_info
+            if (parser.error_info) |info| {
+                switch (info) {
+                    .parse => |pos| {
+                        self.parse_error = std.fmt.allocPrint(alloc,
+                            "config.toml: TOML syntax error at line {d}, column {d}",
+                            .{ pos.line, pos.pos },
+                        ) catch null;
+                    },
+                    .struct_mapping => {
+                        self.parse_error = std.fmt.allocPrint(alloc,
+                            "config.toml: unknown field in config",
+                            .{},
+                        ) catch null;
+                    },
+                }
+            } else {
+                self.parse_error = std.fmt.allocPrint(alloc,
+                    "config.toml: parse error ({s})",
+                    .{@errorName(err)},
+                ) catch null;
+            }
             return err;
         };
         defer result.deinit();
@@ -482,6 +505,11 @@ pub const Config = struct {
         // Free duplicated log.path
         if (self.log.path) |s| {
             alloc.free(s);
+        }
+
+        // Free parse error message
+        if (self.parse_error) |e| {
+            alloc.free(e);
         }
 
         // Free allocated routes

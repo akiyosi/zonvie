@@ -569,6 +569,15 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Handle message changes (ext_messages)
         self.notifyMessageChanges();
 
+        // Send config parse error on first redraw (Neovim is ready at this point)
+        if (!self.config_error_sent) {
+            if (self.msg_config.parse_error) |err_msg| {
+                flush.sendConfigError(self, err_msg);
+            } else {
+                self.config_error_sent = true;
+            }
+        }
+
         // Handle tabline changes (ext_tabline)
         self.notifyTablineChanges();
 

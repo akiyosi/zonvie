@@ -39,7 +39,7 @@
 		AB9AE9A82EF1B8320072639A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AB9AE9AB2EF1B8320072639A /* ViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewController.swift; sourceTree = "<group>"; };
 		AB9AE9B22EF1BAAC0072639A /* Zonvie-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Zonvie-Bridging-Header.h"; sourceTree = "<group>"; };
-		AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libzonvie_core.a; sourceTree = "<group>"; };
+		AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzonvie_core.a; path = ../zig-out/lib/libzonvie_core.a; sourceTree = SOURCE_ROOT; };
 		AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlas.swift; sourceTree = "<group>"; };
 		AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalRenderer.swift; sourceTree = "<group>"; };
 		AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalView.swift; sourceTree = "<group>"; };
