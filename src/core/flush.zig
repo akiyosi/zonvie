@@ -58,6 +58,7 @@ pub const RenderCells = struct {
     sp_rgbs: std.ArrayListUnmanaged(u32) = .{},
     grid_ids: std.ArrayListUnmanaged(i64) = .{},
     style_flags_arr: std.ArrayListUnmanaged(u8) = .{},
+    overline_arr: std.ArrayListUnmanaged(u8) = .{},
 
     pub fn ensureTotalCapacity(self: *RenderCells, alloc: std.mem.Allocator, n: usize) !void {
         try self.scalars.ensureTotalCapacity(alloc, n);
@@ -66,6 +67,7 @@ pub const RenderCells = struct {
         try self.sp_rgbs.ensureTotalCapacity(alloc, n);
         try self.grid_ids.ensureTotalCapacity(alloc, n);
         try self.style_flags_arr.ensureTotalCapacity(alloc, n);
+        try self.overline_arr.ensureTotalCapacity(alloc, n);
     }
 
     pub fn setLen(self: *RenderCells, n: usize) void {
@@ -75,6 +77,7 @@ pub const RenderCells = struct {
         self.sp_rgbs.items.len = n;
         self.grid_ids.items.len = n;
         self.style_flags_arr.items.len = n;
+        self.overline_arr.items.len = n;
     }
 
     pub fn clearRetainingCapacity(self: *RenderCells) void {
@@ -84,6 +87,7 @@ pub const RenderCells = struct {
         self.sp_rgbs.clearRetainingCapacity();
         self.grid_ids.clearRetainingCapacity();
         self.style_flags_arr.clearRetainingCapacity();
+        self.overline_arr.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderCells, alloc: std.mem.Allocator) void {
@@ -93,16 +97,18 @@ pub const RenderCells = struct {
         self.sp_rgbs.deinit(alloc);
         self.grid_ids.deinit(alloc);
         self.style_flags_arr.deinit(alloc);
+        self.overline_arr.deinit(alloc);
     }
 
     /// Write a single cell at index i.
-    pub inline fn set(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8) void {
+    pub inline fn set(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8, overline: u8) void {
         self.scalars.items[i] = scalar;
         self.fg_rgbs.items[i] = fg;
         self.bg_rgbs.items[i] = bg;
         self.sp_rgbs.items[i] = sp;
         self.grid_ids.items[i] = gid;
         self.style_flags_arr.items[i] = flags;
+        self.overline_arr.items[i] = overline;
     }
 };
 
@@ -966,6 +972,7 @@ pub const FlushCtx = struct {
                                 @memset(row_cells.sp_rgbs.items[rs..re], sp);
                                 @memset(row_cells.grid_ids.items[rs..re], 1);
                                 @memset(row_cells.style_flags_arr.items[rs..re], flags);
+                                @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
                                 // Only scalars (codepoints) differ per cell
                                 // SIMD stride-2 extraction: Cell{cp,hl} → cp only
                                 simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
@@ -1003,7 +1010,7 @@ pub const FlushCtx = struct {
                                         perf_hl_cache_misses += 1;
                                         break :blk2 ctx.core.hl.getWithStyles(cell.hl);
                                     };
-                                    row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags);
+                                    row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
                                 }
                             }
                         }
@@ -1746,6 +1753,44 @@ pub const FlushCtx = struct {
                             }
                         }
 
+                        // 5) Overline (line at top of cell)
+                        {
+                            var c: u32 = 0;
+                            while (c < cols) {
+                                if (row_cells.overline_arr.items[@intCast(c)] == 0) {
+                                    c += 1;
+                                    continue;
+                                }
+
+                                const run_start = c;
+                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
+                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
+                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
+
+                                var run_end: u32 = c + 1;
+                                while (run_end < cols) : (run_end += 1) {
+                                    if (row_cells.overline_arr.items[@intCast(run_end)] == 0) break;
+                                    if (row_cells.sp_rgbs.items[@intCast(run_end)] != run_sp) break;
+                                    if (row_cells.grid_ids.items[@intCast(run_end)] != run_grid_id) break;
+                                    // When sp is unset, color falls back to fg — break on fg change
+                                    if (run_sp == highlight.Highlights.SP_NOT_SET and
+                                        row_cells.fg_rgbs.items[@intCast(run_end)] != run_fg) break;
+                                }
+
+                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                const ol_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+                                const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
+
+                                const y0 = row_y;
+                                const y1 = y0 + 1.0;
+                                try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_OVERLINE | ol_scroll_flag, 0);
+
+                                c = run_end;
+                            }
+                        }
+
                         // Log row timing for performance measurement
                         if (log_enabled) {
                             const t_row_strike_end = std.time.nanoTimestamp();
@@ -1915,6 +1960,7 @@ pub const FlushCtx = struct {
                             @memset(tmp.sp_rgbs.items[fill_start..fill_end], sp);
                             @memset(tmp.grid_ids.items[fill_start..fill_end], 1);
                             @memset(tmp.style_flags_arr.items[fill_start..fill_end], flags);
+                            @memset(tmp.overline_arr.items[fill_start..fill_end], @intFromBool(a.overline));
                             for (fill_start..fill_end) |i| {
                                 tmp.scalars.items[i] = grid_cells[i].cp;
                             }
@@ -1972,6 +2018,7 @@ pub const FlushCtx = struct {
                                 const bg = a.bg;
                                 const sp = a.sp;
                                 const flags = a.style_flags;
+                                const ol: u8 = @intFromBool(a.overline);
 
                                 var i: u32 = c2;
                                 while (i < run_end) : (i += 1) {
@@ -1979,7 +2026,7 @@ pub const FlushCtx = struct {
                                     if (ti >= cols) break;
 
                                     const src_cell = sg.cells[sg_row_start + @as(usize, i)];
-                                    tmp.set(dst_row_start + @as(usize, ti), src_cell.cp, fg, bg, sp, subgrid_id, flags);
+                                    tmp.set(dst_row_start + @as(usize, ti), src_cell.cp, fg, bg, sp, subgrid_id, flags, ol);
                                 }
 
                                 c2 = run_end;
@@ -2297,6 +2344,44 @@ pub const FlushCtx = struct {
                                 try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH | nr_strike_scroll, 0);
 
                                 c = run_end;
+                            }
+
+                            // 5) Overline (line at top of cell)
+                            {
+                                var c2_ol: u32 = 0;
+                                while (c2_ol < cols) {
+                                    if (tmp.overline_arr.items[row_start + @as(usize, c2_ol)] == 0) {
+                                        c2_ol += 1;
+                                        continue;
+                                    }
+
+                                    const run_start = c2_ol;
+                                    const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c2_ol)];
+                                    const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c2_ol)];
+                                    const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c2_ol)];
+
+                                    var run_end: u32 = c2_ol + 1;
+                                    while (run_end < cols) : (run_end += 1) {
+                                        if (tmp.overline_arr.items[row_start + @as(usize, run_end)] == 0) break;
+                                        if (tmp.sp_rgbs.items[row_start + @as(usize, run_end)] != run_sp) break;
+                                        if (tmp.grid_ids.items[row_start + @as(usize, run_end)] != run_grid_id) break;
+                                        if (run_sp == highlight.Highlights.SP_NOT_SET and
+                                            tmp.fg_rgbs.items[row_start + @as(usize, run_end)] != run_fg) break;
+                                    }
+
+                                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                                    const nr_ol_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_strike_scrollable, cached_subgrids[0..cached_subgrid_count]);
+
+                                    const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+                                    const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+                                    const row_y: f32 = @as(f32, @floatFromInt(r2)) * cellH;
+
+                                    const y0 = row_y;
+                                    const y1 = y0 + 1.0;
+                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_OVERLINE | nr_ol_scroll, 0);
+
+                                    c2_ol = run_end;
+                                }
                             }
                         }
                     }
@@ -3060,8 +3145,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // Clear buffer for this row
             ext_verts.clearRetainingCapacity();
 
-            // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco per cell + 12 cursor
-            const row_est = @as(usize, sg.cols) * 18 + 12;
+            // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline per cell + 12 cursor
+            const row_est = @as(usize, sg.cols) * 24 + 12;
             ext_verts.ensureTotalCapacity(self.alloc, row_est) catch continue;
 
             // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
@@ -3073,12 +3158,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             for (0..sg.cols) |c| {
                 const cell_idx = row_start + c;
                 if (cell_idx >= n_cells) {
-                    self.row_cells.set(c, ' ', default_bg, default_bg, highlight.Highlights.SP_NOT_SET, grid_id, 0);
+                    self.row_cells.set(c, ' ', default_bg, default_bg, highlight.Highlights.SP_NOT_SET, grid_id, 0, 0);
                     continue;
                 }
                 const cell = composite_cells[cell_idx];
                 const attr = cache.getAttr(&self.hl, cell.hl);
-                self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr));
+                self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
             }
 
             // Pass 1: Background (run-length optimized)
@@ -3816,6 +3901,47 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
                     ext_verts.appendAssumeCapacity(.{ .position = sbr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
                     ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
+
+                    c = run_end;
+                }
+            }
+
+            // Pass 5: Overline (line at top of cell)
+            {
+                var c: u32 = 0;
+                while (c < sg.cols) {
+                    if (self.row_cells.overline_arr.items[c] == 0) {
+                        c += 1;
+                        continue;
+                    }
+
+                    const run_start = c;
+                    const run_sp = self.row_cells.sp_rgbs.items[c];
+                    const run_fg = self.row_cells.fg_rgbs.items[c];
+
+                    var run_end: u32 = c + 1;
+                    while (run_end < sg.cols) : (run_end += 1) {
+                        if (self.row_cells.overline_arr.items[run_end] == 0) break;
+                        if (self.row_cells.sp_rgbs.items[run_end] != run_sp) break;
+                        if (run_sp == highlight.Highlights.SP_NOT_SET and
+                            self.row_cells.fg_rgbs.items[run_end] != run_fg) break;
+                    }
+
+                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
+                    const ox0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+                    const ox1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+                    const oy0 = row_y;
+                    const oy1 = oy0 + 1.0;
+
+                    const o_pts = Helpers.ndc4(ox0, oy0, ox1, oy1, grid_w, grid_h);
+                    const otl = o_pts[0]; const otr = o_pts[1]; const obl = o_pts[2]; const obr = o_pts[3];
+
+                    ext_verts.appendAssumeCapacity(.{ .position = otl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = otr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = obl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = otr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = obr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = obl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
 
                     c = run_end;
                 }

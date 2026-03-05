@@ -18,6 +18,13 @@ const scrollbar = @import("ui/scrollbar.zig");
 const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
 
+// Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
+fn loadSystemCursor(id: usize) c.HCURSOR {
+    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
+    const load_fn: RawLoadCursorFn = @ptrCast(&c.LoadCursorW);
+    return @ptrCast(@alignCast(load_fn(null, id)));
+}
+
 // Type aliases from app_mod (to minimize changes in WndProc)
 const ExternalWindow = app_mod.ExternalWindow;
 const RowVerts = app_mod.RowVerts;
@@ -3339,6 +3346,80 @@ pub export fn WndProc(
                             .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
                         };
                         _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                    }
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_SETCURSOR => {
+            if (getApp(hwnd)) |app| {
+                const hit_test: u16 = @truncate(@as(usize, @bitCast(lParam)));
+                if (hit_test == c.HTCLIENT) {
+                    // Perform URL hit-test here (WM_SETCURSOR fires before WM_MOUSEMOVE)
+                    var cursor_pt: c.POINT = undefined;
+                    _ = c.GetCursorPos(&cursor_pt);
+                    _ = c.ScreenToClient(hwnd, &cursor_pt);
+                    const mx: i16 = @intCast(cursor_pt.x);
+                    const my: i16 = @intCast(cursor_pt.y);
+
+                    app.mu.lock();
+                    const sc_cell_w = app.cell_w_px;
+                    const sc_cell_h = app.cell_h_px;
+                    const sc_ls = app.linespace_px;
+                    app.mu.unlock();
+
+                    const sc_row_h = sc_cell_h + sc_ls;
+                    const sc_cx: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+                        @as(i32, mx) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                    else
+                        @as(i32, mx);
+                    const sc_cy: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+                        @as(i32, my) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
+                    else
+                        @as(i32, my);
+
+                    if (sc_cx < 0 or sc_cy < 0) {
+                        app.cursor_is_hand = false;
+                    } else if (app.corep) |corep| {
+                        const global_col: i32 = if (sc_cell_w > 0) @divTrunc(sc_cx, @as(i32, @intCast(sc_cell_w))) else 0;
+                        const global_row: i32 = if (sc_row_h > 0) @divTrunc(sc_cy, @as(i32, @intCast(sc_row_h))) else 0;
+
+                        // Hit-test visible grids to find the correct grid and local coordinates
+                        const vg = app.getVisibleGridsCached(corep);
+                        var best_grid_id: i64 = 1;
+                        var local_row: i32 = global_row;
+                        var local_col: i32 = global_col;
+                        var best_zindex: i64 = -1;
+                        for (vg.grids[0..vg.count]) |g| {
+                            if (global_row >= g.start_row and global_row < g.start_row + g.rows and
+                                global_col >= g.start_col and global_col < g.start_col + g.cols and
+                                g.zindex > best_zindex)
+                            {
+                                best_zindex = g.zindex;
+                                best_grid_id = g.grid_id;
+                                local_row = global_row - g.start_row;
+                                local_col = global_col - g.start_col;
+                            }
+                        }
+
+                        const result = core.zonvie_core_try_cell_has_url(corep, best_grid_id, local_row, local_col);
+                        if (result >= 0) {
+                            app.cursor_is_hand = (result == 1);
+                            app.url_cache_grid = best_grid_id;
+                            app.url_cache_row = local_row;
+                            app.url_cache_col = local_col;
+                        } else {
+                            // Lock unavailable: use cached value only for same cell, else reset
+                            if (app.url_cache_grid != best_grid_id or app.url_cache_row != local_row or app.url_cache_col != local_col) {
+                                app.cursor_is_hand = false;
+                            }
+                        }
+                    }
+
+                    if (app.cursor_is_hand) {
+                        _ = c.SetCursor(loadSystemCursor(32649)); // IDC_HAND
+                        return 1;
                     }
                 }
             }

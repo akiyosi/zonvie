@@ -1744,6 +1744,25 @@ final class ZonvieCore {
         zonvie_core_page_scroll(core, gridId, forward)
     }
 
+    /// Cached URL state for non-blocking queries (main thread only).
+    private var cachedUrlState: (gridId: Int64, row: Int32, col: Int32, hasUrl: Bool) = (0, 0, 0, false)
+
+    /// Non-blocking check whether a cell has a URL highlight attribute.
+    /// Returns cached result when tryLock fails (same cell) or false (different cell).
+    func cellHasURL(gridId: Int64, row: Int32, col: Int32) -> Bool {
+        guard let core else { return false }
+        let result = zonvie_core_try_cell_has_url(core, gridId, row, col)
+        if result >= 0 {
+            cachedUrlState = (gridId, row, col, result == 1)
+            return result == 1
+        }
+        // tryLock failed: return cached value only if same cell
+        if cachedUrlState.gridId == gridId && cachedUrlState.row == row && cachedUrlState.col == col {
+            return cachedUrlState.hasUrl
+        }
+        return false
+    }
+
     /// Send mouse input event to Neovim (click, drag, release)
     func sendMouseInput(button: String, action: String, modifier: String, gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return }

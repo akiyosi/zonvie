@@ -419,6 +419,7 @@ final class MetalTerminalView: MTKView {
         }
 
         if window != nil {
+            window?.acceptsMouseMovedEvents = true
             startInputThrottling()
 
             // Ensure layer transparency settings are applied after window is available
@@ -643,6 +644,40 @@ final class MetalTerminalView: MTKView {
     }
 
     private var scrollbarTrackingArea: NSTrackingArea?
+    private var urlTrackingArea: NSTrackingArea?
+    private var lastUrlCursorIsHand = false
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        // Re-add URL tracking area covering entire view
+        if let existing = urlTrackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        urlTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let location = convert(event.locationInWindow, from: nil)
+        let (gridId, row, col) = hitTestGrid(at: location)
+        let hasUrl = core?.cellHasURL(gridId: gridId, row: row, col: col) ?? false
+        if hasUrl != lastUrlCursorIsHand {
+            lastUrlCursorIsHand = hasUrl
+            if hasUrl {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
 
     private func setupScrollbarHoverTracking() {
         // Remove existing tracking area if any

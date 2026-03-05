@@ -10,6 +10,10 @@ using namespace metal;
 #define DECO_STRIKETHROUGH (1u << 5)
 #define DECO_CURSOR        (1u << 6)
 #define DECO_SCROLLABLE    (1u << 7)
+#define DECO_OVERLINE      (1u << 8)
+
+// Mask for visual decoration flags (excludes transport-only flags like SCROLLABLE)
+#define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE)
 
 struct VertexIn {
     float2 position [[attribute(0)]];
@@ -71,8 +75,8 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
                 float offset = scrollOffsets[i].offset_y;
 
                 // Check if this is a plain background quad (uv.x < 0, no deco/cursor flags).
-                // Bits 0-6 cover all non-SCROLLABLE flags; if none set → plain background.
-                bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & 0x7Fu) == 0);
+                // Check visual decoration flags; if none set → plain background.
+                bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & DECO_VISUAL_MASK) == 0);
 
                 if (is_plain_bg) {
                     // Background quads at content area edges: keep the boundary vertex
@@ -138,9 +142,8 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (in.uv.x < 0.0) {
         // Handle decorations (keep full alpha for decorations like underlines)
-        // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag,
-        // not a visual decoration.
-        if ((in.deco_flags & 0x7Fu) != 0) {
+        // Check visual decoration flags (excludes transport-only SCROLLABLE flag).
+        if ((in.deco_flags & DECO_VISUAL_MASK) != 0) {
             // Undercurl: sine wave
             if (in.deco_flags & DECO_UNDERCURL) {
                 float wave_freq = 3.14159265 * 2.0;  // One full wave per cell
@@ -252,8 +255,7 @@ fragment float4 ps_background(VSOut in [[stage_in]],
     }
 
     // Only process background quads (uv.x < 0 and no visual decoration flags)
-    // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag.
-    if (in.uv.x >= 0.0 || (in.deco_flags & 0x7Fu) != 0) {
+    if (in.uv.x >= 0.0 || (in.deco_flags & DECO_VISUAL_MASK) != 0) {
         discard_fragment();
     }
 
@@ -296,8 +298,7 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
     }
 
     // Handle decorations (underlines, undercurl, etc.)
-    // Mask with 0x7F to exclude DECO_SCROLLABLE (bit 7) which is a transport flag.
-    if (in.uv.x < 0.0 && (in.deco_flags & 0x7Fu) != 0) {
+    if (in.uv.x < 0.0 && (in.deco_flags & DECO_VISUAL_MASK) != 0) {
         // Undercurl: sine wave
         if (in.deco_flags & DECO_UNDERCURL) {
             float wave_freq = 3.14159265 * 2.0;

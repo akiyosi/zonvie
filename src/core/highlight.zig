@@ -15,6 +15,8 @@ pub const Attr = struct {
     underdouble: bool = false,
     underdotted: bool = false,
     underdashed: bool = false,
+    overline: bool = false,
+    has_url: bool = false,
 };
 
 pub const Styles = struct {
@@ -26,6 +28,7 @@ pub const Styles = struct {
     underdouble: bool = false,
     underdotted: bool = false,
     underdashed: bool = false,
+    overline: bool = false,
 };
 
 pub const ResolvedAttr = struct {
@@ -45,6 +48,7 @@ pub const ResolvedAttrWithStyles = struct {
     underdouble: bool,
     underdotted: bool,
     underdashed: bool,
+    overline: bool,
     style_flags: u8, // Pre-packed style flags for fast access
 };
 
@@ -123,6 +127,7 @@ pub const Highlights = struct {
         reverse: bool,
         blend: u8,
         styles: Styles,
+        has_url: bool,
     ) !void {
         const a: Attr = .{
             .fg = fg,
@@ -139,6 +144,8 @@ pub const Highlights = struct {
             .underdouble = styles.underdouble,
             .underdotted = styles.underdotted,
             .underdashed = styles.underdashed,
+            .overline = styles.overline,
+            .has_url = has_url,
         };
         try self.map.put(id, a);
     }
@@ -209,6 +216,7 @@ pub const Highlights = struct {
             .underdouble = raw.underdouble,
             .underdotted = raw.underdotted,
             .underdashed = raw.underdashed,
+            .overline = raw.overline,
             .style_flags = style_flags,
         };
     }

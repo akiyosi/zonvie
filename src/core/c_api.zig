@@ -77,6 +77,7 @@ pub const DECO_UNDERDASHED: u32 = 1 << 4;
 pub const DECO_STRIKETHROUGH: u32 = 1 << 5;
 pub const DECO_CURSOR: u32 = 1 << 6; // Marker for cursor vertices (not a decoration, used to preserve cursor from transparency)
 pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area (not margin)
+pub const DECO_OVERLINE: u32 = 1 << 8;
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -1387,4 +1388,22 @@ pub export fn zonvie_config_destroy(p: ?*zonvie_config) callconv(.c) void {
     const handle: *ConfigHandle = @ptrCast(@alignCast(p.?));
     handle.arena.deinit();
     std.heap.page_allocator.destroy(handle);
+}
+
+/// Non-blocking check whether a cell's highlight has a URL attribute.
+/// Returns: 1 = has url, 0 = no url, -1 = lock unavailable.
+pub export fn zonvie_core_try_cell_has_url(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    row: i32,
+    col: i32,
+) callconv(.c) i32 {
+    if (p == null) return 0;
+    if (row < 0 or col < 0) return 0;
+    const box = asBox(p.?);
+    if (!box.core.grid_mu.tryLock()) return -1;
+    defer box.core.grid_mu.unlock();
+    const hl_id = box.core.grid.getCellHLGrid(grid_id, @intCast(row), @intCast(col));
+    const attr = box.core.hl.map.get(hl_id) orelse return 0;
+    return if (attr.has_url) @as(i32, 1) else @as(i32, 0);
 }

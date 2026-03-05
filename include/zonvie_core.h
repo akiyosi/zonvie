@@ -175,6 +175,7 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_STRIKETHROUGH (1u << 5)
 #define ZONVIE_DECO_CURSOR        (1u << 6)  /* Marker for cursor vertices (not a decoration) */
 #define ZONVIE_DECO_SCROLLABLE    (1u << 7)  /* Vertex is in scrollable content area (not margin) */
+#define ZONVIE_DECO_OVERLINE      (1u << 8)
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];
@@ -1104,6 +1105,12 @@ ZONVIE_API zonvie_config_values zonvie_config_get_values(const zonvie_config* co
 
 /* Free config handle and all associated memory. */
 ZONVIE_API void zonvie_config_destroy(zonvie_config* config);
+
+/* Non-blocking check whether a cell's highlight has a URL attribute.
+   Returns: 1 = has url, 0 = no url, -1 = lock unavailable.
+   Use from UI thread to avoid blocking when core is in handleRedraw. */
+ZONVIE_API int32_t zonvie_core_try_cell_has_url(
+    zonvie_core *core, int64_t grid_id, int32_t row, int32_t col);
 
 #ifdef __cplusplus
 }

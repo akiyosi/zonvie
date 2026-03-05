@@ -769,6 +769,10 @@ pub const App = struct {
     scrollbar_drag_start_y: i32 = 0, // Mouse Y at drag start
     scrollbar_drag_start_topline: i64 = 0, // topline at drag start
     scrollbar_hover: bool = false, // Mouse hovering over scrollbar area
+    cursor_is_hand: bool = false, // URL hover: hand cursor
+    url_cache_grid: i64 = 0,
+    url_cache_row: i32 = 0,
+    url_cache_col: i32 = 0,
     scrollbar_repeat_dir: i8 = 0, // -1 = page up, 1 = page down, 0 = none
     scrollbar_repeat_timer: c.UINT_PTR = 0, // Timer for repeat scroll
     scrollbar_last_scroll_time: i64 = 0, // Last scroll time in ms (for throttling)

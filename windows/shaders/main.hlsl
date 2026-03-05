@@ -38,6 +38,7 @@ SamplerState samp0 : register(s0);
 #define DECO_UNDERDOTTED   (1u << 3)
 #define DECO_UNDERDASHED   (1u << 4)
 #define DECO_STRIKETHROUGH (1u << 5)
+#define DECO_OVERLINE      (1u << 8)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)

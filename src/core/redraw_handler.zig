@@ -1038,11 +1038,14 @@ pub fn handleRedraw(
                         .underdouble = mapGetBool(m, "underdouble") orelse false,
                         .underdotted = mapGetBool(m, "underdotted") orelse false,
                         .underdashed = mapGetBool(m, "underdashed") orelse false,
+                        .overline = mapGetBool(m, "overline") orelse false,
                     };
 
-                    try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles);
+                    const has_url = (mapGetStr(m, "url") != null);
+
+                    try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
                 } else {
-                    try hl.define(id_u32, null, null, null, false, 0, Styles{});
+                    try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
                 }
             }
 
