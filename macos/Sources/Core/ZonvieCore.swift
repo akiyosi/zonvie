@@ -48,6 +48,19 @@ final class ZonvieCore {
     private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
     private static let quitTimeoutSeconds: Double = 5.0
 
+    /// Lock-free atomic query: is post-process bloom glow enabled?
+    /// Safe to call from draw thread without locking.
+    func isGlowEnabled() -> Bool {
+        guard let c = core else { return false }
+        return zonvie_core_get_glow_enabled(c)
+    }
+
+    /// Lock-free atomic query: glow bloom intensity (0.0–1.0).
+    func getGlowIntensity() -> Float {
+        guard let c = core else { return 0.0 }
+        return zonvie_core_get_glow_intensity(c)
+    }
+
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
         let line = "[zonvie] \(message())\n"
@@ -505,6 +518,9 @@ final class ZonvieCore {
                     me.terminalView?.renderer.updateDefaultBgColor(bg)
                 }
                 // (scrollbar update is handled per-row in submitVerticesRaw/submitVerticesRowRaw)
+                // Ensure repaint after every flush (needed for glow config changes
+                // that arrive via RPC response outside the normal vertex submission path).
+                me.terminalView?.requestRedraw()
             },
 
             // Colorscheme change notification (from default_colors_set redraw event).
@@ -849,11 +865,25 @@ final class ZonvieCore {
         // Append extra arguments for nvim (collected in main.swift)
         // Only for native mode (not SSH/devcontainer - local file paths don't make sense on remote)
         if sshHost == nil && !isDevcontainerMode && !nvimExtraArgs.isEmpty {
-            // Escape arguments with spaces and special characters
+            // Escape arguments for Zig shell-split parser.
+            // The Zig parser treats ' and " as quote delimiters and \' or \" as
+            // escaped quotes inside the corresponding quote type.
+            // POSIX-style '\'' does NOT work with the Zig parser.
             let escapedArgs = nvimExtraArgs.map { arg -> String in
-                if arg.contains(" ") || arg.contains("'") || arg.contains("\"") {
-                    // Wrap in single quotes, escape existing single quotes
-                    return "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                let hasSingle = arg.contains("'")
+                let hasDouble = arg.contains("\"")
+                let hasSpace = arg.contains(" ")
+                if hasSingle && !hasDouble {
+                    // Contains single quotes but no double quotes: wrap in double quotes
+                    return "\"" + arg + "\""
+                } else if (hasSpace || hasDouble) && !hasSingle {
+                    // Contains spaces/double quotes but no single quotes: wrap in single quotes
+                    return "'" + arg + "'"
+                } else if hasSingle && hasDouble {
+                    // Contains both: wrap in double quotes, escape internal double quotes
+                    return "\"" + arg.replacingOccurrences(of: "\"", with: "\\\"") + "\""
+                } else if hasSpace {
+                    return "'" + arg + "'"
                 }
                 return arg
             }

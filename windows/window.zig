@@ -600,6 +600,10 @@ pub export fn WndProc(
                     else
                         null;
 
+                    // Post-process bloom (neon glow) state from core
+                    const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
+                    const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
+
                     // Snap viewport height to cell boundaries to match core's NDC calculation.
                     // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
                     // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
@@ -665,7 +669,7 @@ pub export fn WndProc(
                             }
                         }
                         if (non_row_draw) {
-                            if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color })) {
+                            if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                             } else |e| {
                                 applog.appLog("gpu.draw failed: {any}\n", .{e});
@@ -688,7 +692,7 @@ pub export fn WndProc(
                         rows_to_draw.clearRetainingCapacity();
 
                         const force_full_rows =
-                            did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot;
+                            did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot or glow_enabled;
 
                         // Pre-allocate capacity based on expected row count
                         const max_rows = @max(effective_rows, @max(row_verts_len, @as(u32, @intCast(dirty_row_keys.items.len))));
@@ -1117,7 +1121,7 @@ pub export fn WndProc(
                         // During seed mode (seed_pending), always clear the back buffer to ensure
                         // all swapchain buffers are properly cleared as they rotate. This prevents
                         // ghost artifacts in the gutter area when grid shrinks.
-                        const preserve_back = !seed_clear and !seed_pending_snapshot;
+                        const preserve_back = !seed_clear and !seed_pending_snapshot and !glow_enabled;
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{
@@ -1162,6 +1166,10 @@ pub export fn WndProc(
 
                         var ctx_ptr: ?*c.ID3D11DeviceContext = null;
                         var rs_set_sc_fn: ?*const fn (?*c.ID3D11DeviceContext, c.UINT, [*c]const c.D3D11_RECT) callconv(.c) void = null;
+
+                        // Bloom: collect row verts under lock, draw after lock release
+                        var bloom_verts: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        defer bloom_verts.deinit(app.alloc);
 
                         {
                             const ctx = g.ctx orelse null;
@@ -1281,6 +1289,17 @@ pub export fn WndProc(
                                         );
                                     }
                                 }
+
+                                // Collect all row verts for bloom extract (under lock)
+                                if (glow_enabled) {
+                                    var ri: usize = 0;
+                                    while (ri < app.row_verts.items.len) : (ri += 1) {
+                                        const rv_bloom = &app.row_verts.items[ri];
+                                        if (rv_bloom.verts.items.len > 0) {
+                                            bloom_verts.appendSlice(app.alloc, rv_bloom.verts.items) catch {};
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -1387,6 +1406,17 @@ pub export fn WndProc(
                             }
                         } else {
                             if (log_enabled) applog.appLog("[win] WM_PAINT(row) NO cursor (snapshot empty)\n", .{});
+                        }
+
+                        // Post-process bloom (neon glow) for row-mode
+                        if (glow_enabled and bloom_verts.items.len > 0) {
+                            const bloom_vp_x: u32 = content_x_offset orelse 0;
+                            const bloom_vp_y: u32 = content_y_offset orelse 0;
+                            const bloom_sidebar_r: u32 = sidebar_right_width orelse 0;
+                            const bloom_base_w: u32 = content_width orelse g.width;
+                            const bloom_vp_w: u32 = if (bloom_base_w > bloom_vp_x + bloom_sidebar_r) bloom_base_w - bloom_vp_x - bloom_sidebar_r else 1;
+                            const bloom_vp_h: u32 = content_height;
+                            g.drawBloomFromVerts(bloom_verts.items, cursor_verts_snapshot, glow_intensity, bloom_vp_x, bloom_vp_y, bloom_vp_w, bloom_vp_h);
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {

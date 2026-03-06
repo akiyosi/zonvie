@@ -974,6 +974,13 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             app.scrollbar_update_pending.store(false, .release);
         }
     }
+
+    // Ensure the window repaints after flush (needed for glow config changes
+    // that arrive via RPC response outside the normal vertex submission path).
+    // InvalidateRect is idempotent and cheap; WM_PAINT is coalesced by Windows.
+    if (app.hwnd) |hwnd| {
+        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    }
 }
 
 pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.GlyphEntry) callconv(.c) c_int {

@@ -206,6 +206,24 @@ pub const Renderer = struct {
     sidebar_width_tex: u32 = 0,
     sidebar_height_tex: u32 = 0,
 
+    // Post-process bloom (neon glow, Dual Kawase)
+    glow_extract_tex: ?*c.ID3D11Texture2D = null,
+    glow_extract_rtv: ?*c.ID3D11RenderTargetView = null,
+    glow_extract_srv: ?*c.ID3D11ShaderResourceView = null,
+    glow_mip_tex: [3]?*c.ID3D11Texture2D = .{ null, null, null },
+    glow_mip_rtv: [3]?*c.ID3D11RenderTargetView = .{ null, null, null },
+    glow_mip_srv: [3]?*c.ID3D11ShaderResourceView = .{ null, null, null },
+    glow_half_w: u32 = 0,
+    glow_half_h: u32 = 0,
+    vs_fullscreen: ?*c.ID3D11VertexShader = null,
+    ps_glow_extract: ?*c.ID3D11PixelShader = null,
+    ps_kawase_down: ?*c.ID3D11PixelShader = null,
+    ps_kawase_up: ?*c.ID3D11PixelShader = null,
+    ps_glow_composite: ?*c.ID3D11PixelShader = null,
+    additive_blend: ?*c.ID3D11BlendState = null,
+    bilinear_sampler: ?*c.ID3D11SamplerState = null,
+    glow_cb: ?*c.ID3D11Buffer = null,
+
     // Sizing
     width: u32 = 1,
     height: u32 = 1,
@@ -287,6 +305,22 @@ pub const Renderer = struct {
 
         safeRelease(&self.sidebar_srv);
         safeRelease(&self.sidebar_tex);
+
+        // Bloom resources
+        safeRelease(&self.glow_extract_srv);
+        safeRelease(&self.glow_extract_rtv);
+        safeRelease(&self.glow_extract_tex);
+        for (&self.glow_mip_srv) |*s| safeRelease(s);
+        for (&self.glow_mip_rtv) |*r| safeRelease(r);
+        for (&self.glow_mip_tex) |*t| safeRelease(t);
+        safeRelease(&self.vs_fullscreen);
+        safeRelease(&self.ps_glow_extract);
+        safeRelease(&self.ps_kawase_down);
+        safeRelease(&self.ps_kawase_up);
+        safeRelease(&self.ps_glow_composite);
+        safeRelease(&self.additive_blend);
+        safeRelease(&self.bilinear_sampler);
+        safeRelease(&self.glow_cb);
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -514,6 +548,10 @@ pub const Renderer = struct {
         // Tabbar background color (RGBA, premultiplied alpha).
         // If non-null and content_y_offset is set, draws a solid rect in the tabbar area.
         tabbar_bg_color: ?[4]f32 = null,
+
+        // Post-process bloom (neon glow)
+        glow_enabled: bool = false,
+        glow_intensity: f32 = 0.8,
     };
 
     pub fn drawEx(
@@ -844,7 +882,15 @@ pub const Renderer = struct {
         // ---- Draw in two batches ----
         try self.drawVertices(main);
         try self.drawVertices(cursor);
-    
+
+        // ---- Post-process bloom (neon glow) ----
+        if (opts.glow_enabled and self.vs_fullscreen != null and self.ps_glow_extract != null) {
+            self.ensureGlowTextures();
+            if (self.glow_extract_rtv != null and self.glow_mip_rtv[0] != null) {
+                self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, opts.glow_intensity, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height);
+            }
+        }
+
         if (opts.present) {
             const dst_bb: *c.ID3D11Resource = @ptrCast(bb_tex);
             const src_back: *c.ID3D11Resource = @ptrCast(back_tex);
@@ -2298,6 +2344,321 @@ pub const Renderer = struct {
         self.back_rtv = back_rtv;
     }
 
+    fn ensureGlowTextures(self: *Renderer) void {
+        const hw = @max(1, self.width / 2);
+        const hh = @max(1, self.height / 2);
+        if (self.glow_extract_tex != null and self.glow_half_w == hw and self.glow_half_h == hh) return;
+
+        // Release old textures
+        safeRelease(&self.glow_extract_srv);
+        safeRelease(&self.glow_extract_rtv);
+        safeRelease(&self.glow_extract_tex);
+        for (&self.glow_mip_srv) |*s| safeRelease(s);
+        for (&self.glow_mip_rtv) |*r| safeRelease(r);
+        for (&self.glow_mip_tex) |*t| safeRelease(t);
+
+        const dev = self.device orelse return;
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_tex = dev_vtbl.*.CreateTexture2D orelse return;
+        const create_rtv = dev_vtbl.*.CreateRenderTargetView orelse return;
+        const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return;
+
+        var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = c.DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = c.D3D11_USAGE_DEFAULT;
+        td.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
+
+        // Extract texture: 1/2 resolution
+        td.Width = hw;
+        td.Height = hh;
+
+        var tex1: ?*c.ID3D11Texture2D = null;
+        if (c.FAILED(create_tex(dev, &td, null, &tex1)) or tex1 == null) return;
+        self.glow_extract_tex = tex1;
+
+        var rtv1: ?*c.ID3D11RenderTargetView = null;
+        if (c.FAILED(create_rtv(dev, @ptrCast(tex1.?), null, &rtv1)) or rtv1 == null) return;
+        self.glow_extract_rtv = rtv1;
+
+        var srv1: ?*c.ID3D11ShaderResourceView = null;
+        if (c.FAILED(create_srv(dev, @ptrCast(tex1.?), null, &srv1)) or srv1 == null) return;
+        self.glow_extract_srv = srv1;
+
+        // Mip textures: 1/4, 1/8, 1/16
+        var mw = @max(1, hw / 2);
+        var mh = @max(1, hh / 2);
+        for (0..3) |i| {
+            td.Width = mw;
+            td.Height = mh;
+
+            var tex_m: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex_m)) or tex_m == null) return;
+            self.glow_mip_tex[i] = tex_m;
+
+            var rtv_m: ?*c.ID3D11RenderTargetView = null;
+            if (c.FAILED(create_rtv(dev, @ptrCast(tex_m.?), null, &rtv_m)) or rtv_m == null) return;
+            self.glow_mip_rtv[i] = rtv_m;
+
+            var srv_m: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex_m.?), null, &srv_m)) or srv_m == null) return;
+            self.glow_mip_srv[i] = srv_m;
+
+            mw = @max(1, mw / 2);
+            mh = @max(1, mh / 2);
+        }
+
+        self.glow_half_w = hw;
+        self.glow_half_h = hh;
+    }
+
+    /// Execute post-process bloom: extract → Dual Kawase downsample/upsample → composite.
+    fn drawBloomPasses(
+        self: *Renderer,
+        ctx: *c.ID3D11DeviceContext,
+        ctx_vtbl: anytype,
+        main: []const core.Vertex,
+        cursor: []const core.Vertex,
+        intensity: f32,
+        vp_x: u32,
+        vp_y: u32,
+        vp_w: u32,
+        vp_h: u32,
+    ) void {
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return;
+        const ps_set_fn = ctx_vtbl.*.PSSetShader orelse return;
+        const vs_set_fn = ctx_vtbl.*.VSSetShader orelse return;
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return;
+        const ps_set_samp = ctx_vtbl.*.PSSetSamplers orelse return;
+        const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return;
+        const rs_set_vp = ctx_vtbl.*.RSSetViewports orelse return;
+        const rs_set_sc = ctx_vtbl.*.RSSetScissorRects orelse return;
+        const ia_set_top = ctx_vtbl.*.IASetPrimitiveTopology orelse return;
+        const ia_set_il = ctx_vtbl.*.IASetInputLayout orelse return;
+        const draw_fn = ctx_vtbl.*.Draw orelse return;
+        const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
+
+        const hw = self.glow_half_w;
+        const hh = self.glow_half_h;
+
+        // --- Pass 1: Glow extract → glow_extract_tex (1/2 res) ---
+        // Apply content viewport offset (sidebar/tabline) scaled to half resolution.
+        {
+            const clear_black: [4]f32 = .{ 0, 0, 0, 0 };
+            clear_rtv(ctx, self.glow_extract_rtv.?, &clear_black);
+
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{ self.glow_extract_rtv.? };
+            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+
+            const ex_x: f32 = @as(f32, @floatFromInt(vp_x)) / 2.0;
+            const ex_y: f32 = @as(f32, @floatFromInt(vp_y)) / 2.0;
+            const ex_w: f32 = @as(f32, @floatFromInt(vp_w)) / 2.0;
+            const ex_h: f32 = @as(f32, @floatFromInt(vp_h)) / 2.0;
+
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = ex_x,
+                .TopLeftY = ex_y,
+                .Width = ex_w,
+                .Height = ex_h,
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &vp);
+
+            var sr: c.D3D11_RECT = .{
+                .left = @intFromFloat(ex_x),
+                .top = @intFromFloat(ex_y),
+                .right = @intFromFloat(@ceil(ex_x + ex_w)),
+                .bottom = @intFromFloat(@ceil(ex_y + ex_h)),
+            };
+            rs_set_sc(ctx, 1, &sr);
+
+            ps_set_fn(ctx, self.ps_glow_extract.?, null, 0);
+
+            self.drawVertices(main) catch return;
+            self.drawVertices(cursor) catch return;
+
+            ps_set_fn(ctx, self.ps.?, null, 0);
+        }
+
+        // Helper: compute mip dimensions
+        const mip_widths: [3]u32 = .{
+            @max(1, hw / 2),
+            @max(1, hw / 4),
+            @max(1, hw / 8),
+        };
+        const mip_heights: [3]u32 = .{
+            @max(1, hh / 2),
+            @max(1, hh / 4),
+            @max(1, hh / 8),
+        };
+
+        // Setup common state for fullscreen passes
+        vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
+        var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+        om_set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+        ia_set_il(ctx, null);
+        ia_set_top(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        var samps: [1]?*c.ID3D11SamplerState = .{ self.bilinear_sampler.? };
+        ps_set_samp(ctx, 1, 1, @ptrCast(&samps));
+
+        // --- Downsample chain: extract → mip[0] → mip[1] → mip[2] ---
+        for (0..3) |level| {
+            // Unbind SRV slot 1 to avoid RTV/SRV hazard
+            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{ self.glow_mip_rtv[level].? };
+            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = 0,
+                .Width = @floatFromInt(mip_widths[level]),
+                .Height = @floatFromInt(mip_heights[level]),
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &vp);
+
+            var sr: c.D3D11_RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = @intCast(mip_widths[level]),
+                .bottom = @intCast(mip_heights[level]),
+            };
+            rs_set_sc(ctx, 1, &sr);
+
+            // Source: extract for level 0, mip[level-1] otherwise
+            const src_srv = if (level == 0) self.glow_extract_srv.? else self.glow_mip_srv[level - 1].?;
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ src_srv };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
+
+            ps_set_fn(ctx, self.ps_kawase_down.?, null, 0);
+            draw_fn(ctx, 3, 0);
+        }
+
+        // --- Upsample chain: mip[2] → mip[1] → mip[0] → extractTex ---
+        for (0..3) |i| {
+            const level = 2 - i;
+
+            // Unbind SRV slot 1
+            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+
+            // Destination: mip[level-1] for level > 0, extract for level 0
+            const dst_rtv = if (level == 0) self.glow_extract_rtv.? else self.glow_mip_rtv[level - 1].?;
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{ dst_rtv };
+            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+
+            // Viewport = destination size
+            const dst_w: u32 = if (level == 0) hw else mip_widths[level - 1];
+            const dst_h: u32 = if (level == 0) hh else mip_heights[level - 1];
+
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = 0,
+                .Width = @floatFromInt(dst_w),
+                .Height = @floatFromInt(dst_h),
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &vp);
+
+            var sr: c.D3D11_RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = @intCast(dst_w),
+                .bottom = @intCast(dst_h),
+            };
+            rs_set_sc(ctx, 1, &sr);
+
+            // Source: mip[level] (the smaller texture we're upsampling from)
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.glow_mip_srv[level].? };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
+
+            ps_set_fn(ctx, self.ps_kawase_up.?, null, 0);
+            draw_fn(ctx, 3, 0);
+        }
+
+        // --- Composite → back buffer (additive blend) ---
+        {
+            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{ self.back_rtv.? };
+            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = 0,
+                .Width = @floatFromInt(self.width),
+                .Height = @floatFromInt(self.height),
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            rs_set_vp(ctx, 1, &vp);
+
+            var sr: c.D3D11_RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = @intCast(self.width),
+                .bottom = @intCast(self.height),
+            };
+            rs_set_sc(ctx, 1, &sr);
+
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.glow_extract_srv.? };
+            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
+
+            const gcb_res: *c.ID3D11Resource = @ptrCast(self.glow_cb.?);
+            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+            const hr_map = mapDiscard(ctx, gcb_res, &mapped);
+            if (!c.FAILED(hr_map)) {
+                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
+                dst.* = .{ intensity, 0, 0, 0 };
+                unmap0(ctx, gcb_res);
+            }
+
+            const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
+            var cbs: [1]?*c.ID3D11Buffer = .{ self.glow_cb.? };
+            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
+
+            om_set_blend(ctx, self.additive_blend.?, &blend_factor, 0xFFFFFFFF);
+
+            ps_set_fn(ctx, self.ps_glow_composite.?, null, 0);
+
+            draw_fn(ctx, 3, 0);
+
+            // --- Restore state ---
+            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+
+            var null_cbs: [1]?*c.ID3D11Buffer = .{ null };
+            ps_set_cb(ctx, 0, 1, @ptrCast(&null_cbs));
+
+            vs_set_fn(ctx, self.vs.?, null, 0);
+            ps_set_fn(ctx, self.ps.?, null, 0);
+            om_set_blend(ctx, self.blend.?, &blend_factor, 0xFFFFFFFF);
+            ia_set_il(ctx, self.il.?);
+
+            var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.atlas_srv };
+            ps_set_srv(ctx, 0, 1, @ptrCast(&atlas_srvs));
+        }
+    }
+
+    /// Public entry point for bloom passes (used by row-mode rendering).
+    /// Requires vertices to be passed in (collected from row VBs).
+    pub fn drawBloomFromVerts(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex, intensity: f32, vp_x: u32, vp_y: u32, vp_w: u32, vp_h: u32) void {
+        if (self.vs_fullscreen == null or self.ps_glow_extract == null) return;
+        self.ensureGlowTextures();
+        if (self.glow_extract_rtv == null or self.glow_mip_rtv[0] == null) return;
+        const ctx = self.ctx orelse return;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, intensity, vp_x, vp_y, vp_w, vp_h);
+    }
+
     fn createAtlasTexture(self: *Renderer, w: u32, h: u32) !void {
         const dev = self.device.?;
     
@@ -2567,6 +2928,110 @@ pub const Renderer = struct {
             const hr = create_rs(dev, &rd, &rs);
             if (c.FAILED(hr) or rs == null) return error.D3DCreateRasterizerFailed;
             self.rs = rs;
+        }
+
+        // --- Bloom shaders (runtime compile only, no pre-compiled bytecode) ---
+        {
+            const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return error.D3DCreateVSFailed;
+            const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return error.D3DCreatePSFailed;
+
+            const BloomEntry = struct {
+                entry: [*:0]const u8,
+                target: [*:0]const u8,
+                is_vs: bool,
+            };
+            const bloom_entries = [_]BloomEntry{
+                .{ .entry = "VSFullscreen", .target = "vs_5_0", .is_vs = true },
+                .{ .entry = "PSGlowExtract", .target = "ps_5_0", .is_vs = false },
+                .{ .entry = "PSKawaseDown", .target = "ps_5_0", .is_vs = false },
+                .{ .entry = "PSKawaseUp", .target = "ps_5_0", .is_vs = false },
+                .{ .entry = "PSGlowComposite", .target = "ps_5_0", .is_vs = false },
+            };
+
+            var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{ null, null, null, null, null };
+            defer for (&bloom_blobs) |*b| blobRelease(b.*);
+
+            for (bloom_entries, 0..) |be, idx| {
+                var blob: ?*ID3DBlob = null;
+                var err_b: ?*ID3DBlob = null;
+                defer blobRelease(err_b);
+
+                const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
+                if (hr_b != 0 or blob == null) {
+                    dumpBlobAsText("[D3DCompile bloom] ", err_b);
+                    dbgLog("[d3d] WARNING: bloom shader '{s}' compile failed, bloom disabled\n", .{be.entry});
+                    return; // Non-fatal: bloom just won't work
+                }
+                bloom_blobs[idx] = blob;
+            }
+
+            // Create shader objects
+            const bp0 = blobPtr(bloom_blobs[0]) orelse return;
+            const bs0 = blobSize(bloom_blobs[0]);
+            var vs_fs: ?*c.ID3D11VertexShader = null;
+            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) return;
+            self.vs_fullscreen = vs_fs;
+
+            inline for (.{ 1, 2, 3, 4 }, .{ &self.ps_glow_extract, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
+                const bp = blobPtr(bloom_blobs[idx]) orelse return;
+                const bs = blobSize(bloom_blobs[idx]);
+                var ps_out: ?*c.ID3D11PixelShader = null;
+                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return;
+                field.* = ps_out;
+            }
+        }
+
+        // --- Additive blend state (ONE, ONE) for bloom composite ---
+        {
+            const create_blend = dev_vtbl.*.CreateBlendState orelse return error.D3DCreateBlendFailed;
+
+            var abd: c.D3D11_BLEND_DESC = std.mem.zeroes(c.D3D11_BLEND_DESC);
+            abd.RenderTarget[0].BlendEnable = c.TRUE;
+            abd.RenderTarget[0].SrcBlend = c.D3D11_BLEND_ONE;
+            abd.RenderTarget[0].DestBlend = c.D3D11_BLEND_ONE;
+            abd.RenderTarget[0].BlendOp = c.D3D11_BLEND_OP_ADD;
+            abd.RenderTarget[0].SrcBlendAlpha = c.D3D11_BLEND_ONE;
+            abd.RenderTarget[0].DestBlendAlpha = c.D3D11_BLEND_ONE;
+            abd.RenderTarget[0].BlendOpAlpha = c.D3D11_BLEND_OP_ADD;
+            abd.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+
+            var ab: ?*c.ID3D11BlendState = null;
+            const hr_ab = create_blend(dev, &abd, &ab);
+            if (c.FAILED(hr_ab) or ab == null) return error.D3DCreateBlendFailed;
+            self.additive_blend = ab;
+        }
+
+        // --- Bilinear sampler for bloom blur ---
+        {
+            const create_samp = dev_vtbl.*.CreateSamplerState orelse return error.D3DCreateSamplerFailed;
+
+            var sd: c.D3D11_SAMPLER_DESC = std.mem.zeroes(c.D3D11_SAMPLER_DESC);
+            sd.Filter = c.D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+            sd.AddressU = c.D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressV = c.D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressW = c.D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.MaxLOD = c.D3D11_FLOAT32_MAX;
+
+            var bsamp: ?*c.ID3D11SamplerState = null;
+            const hr_bs = create_samp(dev, &sd, &bsamp);
+            if (c.FAILED(hr_bs) or bsamp == null) return error.D3DCreateSamplerFailed;
+            self.bilinear_sampler = bsamp;
+        }
+
+        // --- Glow constant buffer (16 bytes: float intensity + padding) ---
+        {
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVSCBFailed;
+
+            var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            cbd.ByteWidth = 16;
+            cbd.Usage = c.D3D11_USAGE_DYNAMIC;
+            cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+            cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+
+            var gcb: ?*c.ID3D11Buffer = null;
+            const hr_gcb = create_buf(dev, &cbd, null, &gcb);
+            if (c.FAILED(hr_gcb) or gcb == null) return error.D3DCreateVSCBFailed;
+            self.glow_cb = gcb;
         }
     }
 

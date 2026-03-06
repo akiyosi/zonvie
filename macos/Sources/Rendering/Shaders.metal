@@ -11,6 +11,7 @@ using namespace metal;
 #define DECO_CURSOR        (1u << 6)
 #define DECO_SCROLLABLE    (1u << 7)
 #define DECO_OVERLINE      (1u << 8)
+#define DECO_GLOW          (1u << 9)
 
 // Mask for visual decoration flags (excludes transport-only flags like SCROLLABLE)
 #define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE)
@@ -254,6 +255,11 @@ fragment float4 ps_background(VSOut in [[stage_in]],
         }
     }
 
+    // Discard glow quads (rendered in glyph pass, not background pass)
+    if (in.deco_flags & DECO_GLOW) {
+        discard_fragment();
+    }
+
     // Only process background quads (uv.x < 0 and no visual decoration flags)
     if (in.uv.x >= 0.0 || (in.deco_flags & DECO_VISUAL_MASK) != 0) {
         discard_fragment();
@@ -396,4 +402,78 @@ fragment float4 ps_copy(CopyVSOut in [[stage_in]],
                         texture2d<float> srcTexture [[texture(0)]],
                         sampler samp [[sampler(0)]]) {
     return srcTexture.sample(samp, in.uv);
+}
+
+// ============================================================================
+// Post-Process Bloom Shaders (Neon Glow)
+// ============================================================================
+// Bloom pipeline: extract → Dual Kawase downsample/upsample → composite (additive)
+// Uses progressive mip chain (1/4 → 1/32) for smooth, grid-pattern-free blur.
+// ============================================================================
+
+/// Glow extract: render only DECO_GLOW glyphs with their original foreground color.
+/// Non-glow vertices and non-glyph vertices are discarded.
+/// Output is premultiplied alpha (color.rgb * coverage, coverage).
+fragment float4 ps_glow_extract(VSOut in [[stage_in]],
+                                 texture2d<float> tex [[texture(0)]],
+                                 sampler samp [[sampler(0)]],
+                                 constant DrawableSize& drawableSize [[buffer(0)]]) {
+    // Only extract DECO_GLOW flagged glyphs
+    if (!(in.deco_flags & DECO_GLOW)) discard_fragment();
+    // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
+    if (in.uv.x < 0.0) discard_fragment();
+
+    // Scroll clip (same logic as ps_main)
+    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
+    if (in.was_content > 0.5) {
+        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
+            discard_fragment();
+        }
+    }
+
+    float cov = tex.sample(samp, in.uv).r;
+    return float4(in.color.rgb * cov, cov);
+}
+
+/// Dual Kawase downsample (5 taps).
+/// Each pass halves resolution, progressively eliminating grid patterns.
+fragment float4 ps_kawase_down(CopyVSOut in [[stage_in]],
+                                texture2d<float> src [[texture(0)]],
+                                sampler samp [[sampler(0)]]) {
+    float2 halfpixel = 0.5 / float2(src.get_width(), src.get_height());
+
+    float4 sum = src.sample(samp, in.uv) * 4.0;
+    sum += src.sample(samp, in.uv + float2(-halfpixel.x, -halfpixel.y));
+    sum += src.sample(samp, in.uv + float2( halfpixel.x, -halfpixel.y));
+    sum += src.sample(samp, in.uv + float2(-halfpixel.x,  halfpixel.y));
+    sum += src.sample(samp, in.uv + float2( halfpixel.x,  halfpixel.y));
+    return sum / 8.0;
+}
+
+/// Dual Kawase upsample (9 taps).
+/// Each pass doubles resolution, accumulating smooth blur.
+fragment float4 ps_kawase_up(CopyVSOut in [[stage_in]],
+                              texture2d<float> src [[texture(0)]],
+                              sampler samp [[sampler(0)]]) {
+    float2 halfpixel = 0.5 / float2(src.get_width(), src.get_height());
+
+    float4 sum = 0;
+    sum += src.sample(samp, in.uv + float2(-halfpixel.x * 2.0, 0.0));
+    sum += src.sample(samp, in.uv + float2(-halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += src.sample(samp, in.uv + float2(0.0,  halfpixel.y * 2.0));
+    sum += src.sample(samp, in.uv + float2( halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += src.sample(samp, in.uv + float2( halfpixel.x * 2.0, 0.0));
+    sum += src.sample(samp, in.uv + float2( halfpixel.x, -halfpixel.y)) * 2.0;
+    sum += src.sample(samp, in.uv + float2(0.0, -halfpixel.y * 2.0));
+    sum += src.sample(samp, in.uv + float2(-halfpixel.x, -halfpixel.y)) * 2.0;
+    return sum / 12.0;
+}
+
+/// Glow composite: blend blurred glow onto back buffer with additive blending.
+/// Pipeline uses additive blend state (ONE, ONE).
+fragment float4 ps_glow_composite(CopyVSOut in [[stage_in]],
+                                   texture2d<float> src [[texture(0)]],
+                                   sampler samp [[sampler(0)]],
+                                   constant float& intensity [[buffer(0)]]) {
+    return src.sample(samp, in.uv) * intensity;
 }

@@ -59,6 +59,7 @@ pub const RenderCells = struct {
     grid_ids: std.ArrayListUnmanaged(i64) = .{},
     style_flags_arr: std.ArrayListUnmanaged(u8) = .{},
     overline_arr: std.ArrayListUnmanaged(u8) = .{},
+    glow_arr: std.ArrayListUnmanaged(u8) = .{},
 
     pub fn ensureTotalCapacity(self: *RenderCells, alloc: std.mem.Allocator, n: usize) !void {
         try self.scalars.ensureTotalCapacity(alloc, n);
@@ -68,6 +69,7 @@ pub const RenderCells = struct {
         try self.grid_ids.ensureTotalCapacity(alloc, n);
         try self.style_flags_arr.ensureTotalCapacity(alloc, n);
         try self.overline_arr.ensureTotalCapacity(alloc, n);
+        try self.glow_arr.ensureTotalCapacity(alloc, n);
     }
 
     pub fn setLen(self: *RenderCells, n: usize) void {
@@ -78,6 +80,7 @@ pub const RenderCells = struct {
         self.grid_ids.items.len = n;
         self.style_flags_arr.items.len = n;
         self.overline_arr.items.len = n;
+        self.glow_arr.items.len = n;
     }
 
     pub fn clearRetainingCapacity(self: *RenderCells) void {
@@ -88,6 +91,7 @@ pub const RenderCells = struct {
         self.grid_ids.clearRetainingCapacity();
         self.style_flags_arr.clearRetainingCapacity();
         self.overline_arr.clearRetainingCapacity();
+        self.glow_arr.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderCells, alloc: std.mem.Allocator) void {
@@ -98,6 +102,7 @@ pub const RenderCells = struct {
         self.grid_ids.deinit(alloc);
         self.style_flags_arr.deinit(alloc);
         self.overline_arr.deinit(alloc);
+        self.glow_arr.deinit(alloc);
     }
 
     /// Write a single cell at index i.
@@ -387,6 +392,11 @@ pub const FlushCtx = struct {
         }
 
         ctx.core.missing_glyph_log_count = 0;
+
+        // Cache glow state once per flush — these don't change while grid_mu is held.
+        const glow_enabled = ctx.core.glow_enabled.load(.acquire);
+        const glow_all = ctx.core.glow_all;
+        const glow_hl_ids = if (ctx.core.glow_hl_ids) |*m| m else null;
 
         // Notify frontend about scrolled grids BEFORE vertex generation.
         // This allows Swift to clear pixel offsets before new vertices are rendered,
@@ -973,6 +983,10 @@ pub const FlushCtx = struct {
                                 @memset(row_cells.grid_ids.items[rs..re], 1);
                                 @memset(row_cells.style_flags_arr.items[rs..re], flags);
                                 @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
+                                if (glow_enabled) {
+                                    const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                    @memset(row_cells.glow_arr.items[rs..re], has_glow);
+                                }
                                 // Only scalars (codepoints) differ per cell
                                 // SIMD stride-2 extraction: Cell{cp,hl} → cp only
                                 simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
@@ -1011,6 +1025,9 @@ pub const FlushCtx = struct {
                                         break :blk2 ctx.core.hl.getWithStyles(cell.hl);
                                     };
                                     row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
+                                    if (glow_enabled) {
+                                        row_cells.glow_arr.items[@intCast(tc)] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                    }
                                 }
                             }
                         }
@@ -1150,8 +1167,8 @@ pub const FlushCtx = struct {
                         const shape_text_run = ctx.core.cb.on_shape_text_run;
                         const has_shaping = shape_text_run != null and ctx.core.isPhase2Atlas() and ctx.core.cb.on_rasterize_glyph_by_id != null;
                         if (has_shaping or ensure_base != null or ensure_styled != null or ctx.core.isPhase2Atlas()) {
-                            // Pre-allocate vertex capacity for entire row's glyphs
-                            // (worst case: 1 glyph per column × 6 vertices per quad)
+                            // Pre-allocate vertex capacity for entire row's glyphs + glow
+                            // (worst case: 1 glyph per column × 6 vertices per quad + 6 glow per column)
                             try out.ensureUnusedCapacity(ctx.core.alloc, cols * 6);
                             var c: u32 = 0;
                             while (c < cols) {
@@ -1160,13 +1177,18 @@ pub const FlushCtx = struct {
                                 const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
                                 const run_start = c;
 
-                                const end: u32 = @intCast(@min(
+                                const base_end = @min(
                                     simdFindRunEndU32(row_cells.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
                                     @min(
                                         simdFindRunEndU32(row_cells.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
                                         simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
                                     ),
-                                ));
+                                );
+                                const run_glow: u8 = if (glow_enabled) row_cells.glow_arr.items[@intCast(c)] else 0;
+                                const end: u32 = @intCast(if (glow_enabled)
+                                    @min(base_end, simdFindRunEndU8(row_cells.glow_arr.items, @intCast(c), @intCast(cols), run_glow))
+                                else
+                                    base_end);
                                 const has_ink = simdHasInkInRange(row_cells.scalars.items, @intCast(c), @intCast(end));
 
                                 if (has_ink) {
@@ -1174,6 +1196,7 @@ pub const FlushCtx = struct {
                                     const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
                                     const fg = Helpers.rgb(run_fg);
                                     const glyph_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                                    const run_has_glow = run_glow != 0;
 
                                     if (has_shaping) {
                                         // --- Text-run shaping path (Phase B: ligatures) ---
@@ -1450,7 +1473,8 @@ pub const FlushCtx = struct {
                                                             const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
                                                             const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
 
-                                                            Helpers.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                            const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                                            Helpers.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, dw, dh, run_grid_id, fb_glyph_deco);
                                                         }
                                                     }
                                                     penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
@@ -1528,7 +1552,8 @@ pub const FlushCtx = struct {
                                                 const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
                                                 const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
-                                                Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                                const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                                Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_deco);
                                             }
 
                                             // Advance pen using column widths (correct for wide chars)
@@ -1696,7 +1721,8 @@ pub const FlushCtx = struct {
                                         const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_scroll_flag);
+                                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                            Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, pc_glyph_deco);
                                         }
 
                                         penX += cellW;
@@ -1961,6 +1987,10 @@ pub const FlushCtx = struct {
                             @memset(tmp.grid_ids.items[fill_start..fill_end], 1);
                             @memset(tmp.style_flags_arr.items[fill_start..fill_end], flags);
                             @memset(tmp.overline_arr.items[fill_start..fill_end], @intFromBool(a.overline));
+                            if (glow_enabled) {
+                                const has_glow_nr: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                @memset(tmp.glow_arr.items[fill_start..fill_end], has_glow_nr);
+                            }
                             for (fill_start..fill_end) |i| {
                                 tmp.scalars.items[i] = grid_cells[i].cp;
                             }
@@ -2039,7 +2069,7 @@ pub const FlushCtx = struct {
 
                 if (!sent_main_by_rows) {
 
-                    // Estimate capacity: rows*cols*12 vertices (BG + glyph)
+                    // Estimate capacity: rows*cols*12 vertices (BG + glyph) + glow
                     const est_cells: usize = @as(usize, rows) * @as(usize, cols);
                     _ = main.ensureTotalCapacity(ctx.core.alloc, est_cells * 12) catch {};
 
@@ -2196,13 +2226,18 @@ pub const FlushCtx = struct {
                                 const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
                                 const run_start = c;
 
-                                const end: u32 = @intCast(@min(
+                                const run_glow_nr: u8 = if (glow_enabled) tmp.glow_arr.items[row_start + @as(usize, c)] else 0;
+                                const base_end_nr = @min(
                                     simdFindRunEndU32(tmp.fg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_fg),
                                     @min(
                                         simdFindRunEndU32(tmp.bg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_bg),
                                         simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c), @intCast(cols), run_grid_id),
                                     ),
-                                ));
+                                );
+                                const end: u32 = @intCast(if (glow_enabled)
+                                    @min(base_end_nr, simdFindRunEndU8(tmp.glow_arr.items[row_start..], @intCast(c), @intCast(cols), run_glow_nr))
+                                else
+                                    base_end_nr);
                                 const has_ink = simdHasInkInRange(tmp.scalars.items[row_start..], @intCast(c), @intCast(end));
 
                                 if (has_ink) {
@@ -2211,6 +2246,7 @@ pub const FlushCtx = struct {
 
                                     var penX: f32 = baseX;
                                     const fg = Helpers.rgb(run_fg);
+                                    const nr_run_has_glow = run_glow_nr != 0;
 
                                     var col_i: u32 = run_start;
                                     while (col_i < end) : (col_i += 1) {
@@ -2280,7 +2316,8 @@ pub const FlushCtx = struct {
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                                             const nr_glyph_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                            try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, nr_glyph_scroll);
+                                            const nr_glyph_deco: u32 = nr_glyph_scroll | (if (nr_run_has_glow) c_api.DECO_GLOW else 0);
+                                            try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, nr_glyph_deco);
                                         }
 
                                         // Monospace cell model: advance by cellW
@@ -2763,6 +2800,11 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
 pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_grid_id: ?i64) void {
     self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d} force={} only_grid={?d}\n", .{ self.known_external_grids.count(), force_render, only_grid_id });
 
+    // Cache glow state once — doesn't change while grid_mu is held.
+    const ext_glow_enabled = self.glow_enabled.load(.acquire);
+    const ext_glow_all = self.glow_all;
+    const ext_glow_hl_ids = if (self.glow_hl_ids) |*m| m else null;
+
     // Check if cursor changed (position or grid) - do this first, before early returns
     const cursor_grid = self.grid.cursor_grid;
     const cursor_rev = self.grid.cursor_rev;
@@ -2879,6 +2921,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
             v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
         }
+
     };
 
     // Default background for blur transparency
@@ -3145,7 +3188,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // Clear buffer for this row
             ext_verts.clearRetainingCapacity();
 
-            // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline per cell + 12 cursor
+            // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
             const row_est = @as(usize, sg.cols) * 24 + 12;
             ext_verts.ensureTotalCapacity(self.alloc, row_est) catch continue;
 
@@ -3159,11 +3202,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 const cell_idx = row_start + c;
                 if (cell_idx >= n_cells) {
                     self.row_cells.set(c, ' ', default_bg, default_bg, highlight.Highlights.SP_NOT_SET, grid_id, 0, 0);
+                    if (ext_glow_enabled) self.row_cells.glow_arr.items[c] = 0;
                     continue;
                 }
                 const cell = composite_cells[cell_idx];
                 const attr = cache.getAttr(&self.hl, cell.hl);
                 self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                if (ext_glow_enabled) {
+                    self.row_cells.glow_arr.items[c] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                }
             }
 
             // Pass 1: Background (run-length optimized)
@@ -3325,13 +3372,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 while (ec < sg.cols) {
                     const run_fg_ext = self.row_cells.fg_rgbs.items[ec];
                     const run_sf_ext = self.row_cells.style_flags_arr.items[ec];
+                    const run_glow_ext: u8 = if (ext_glow_enabled) self.row_cells.glow_arr.items[ec] else 0;
                     const run_start_ext = ec;
 
-                    // Find end of HL run (same fg + style flags)
+                    // Find end of HL run (same fg + style flags, + glow when enabled)
                     var run_end_ext = ec + 1;
                     while (run_end_ext < sg.cols) : (run_end_ext += 1) {
                         if (self.row_cells.fg_rgbs.items[run_end_ext] != run_fg_ext or
                             self.row_cells.style_flags_arr.items[run_end_ext] != run_sf_ext) break;
+                        if (ext_glow_enabled and self.row_cells.glow_arr.items[run_end_ext] != run_glow_ext) break;
                     }
 
                     // Check if run has any ink
@@ -3549,6 +3598,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             };
                             var ext_penX: f32 = @as(f32, @floatFromInt(run_start_ext)) * cellW;
                             const ext_fg_col = Helpers.rgb(run_fg_ext);
+                            const ext_run_has_glow = run_glow_ext != 0;
                             const ext_glyph_cache_id = self.glyph_cache_by_id;
                             const ext_glyph_keys_id = self.glyph_keys_by_id;
 
@@ -3595,15 +3645,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                                 const efb_gy0 = efb_baselineY - (efb_ge.bbox_origin_px[1] + efb_ge.bbox_size_px[1]);
                                                 const efb_gy1 = efb_gy0 + efb_ge.bbox_size_px[1];
 
+                                                const efb_deco: u32 = ext_scrollable | (if (ext_run_has_glow) c_api.DECO_GLOW else 0);
                                                 const efb_pts = Helpers.ndc4(efb_gx0, efb_gy0, efb_gx1, efb_gy1, grid_w, grid_h);
                                                 const efb_tl = efb_pts[0]; const efb_tr = efb_pts[1]; const efb_bl = efb_pts[2]; const efb_br = efb_pts[3];
 
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_br, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_br, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
+                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
                                             }
                                         } else {
                                             glyph_fail_count += 1;
@@ -3677,15 +3728,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     const egy0 = (ext_baselineY + ext_y_off_px) - (ext_ge.bbox_origin_px[1] + ext_ge.bbox_size_px[1]);
                                     const egy1 = egy0 + ext_ge.bbox_size_px[1];
 
+                                    const eg_deco: u32 = ext_scrollable | (if (ext_run_has_glow) c_api.DECO_GLOW else 0);
                                     const eg_pts = Helpers.ndc4(egx0, egy0, egx1, egy1, grid_w, grid_h);
                                     const egtl = eg_pts[0]; const egtr = eg_pts[1]; const egbl = eg_pts[2]; const egbr = eg_pts[3];
 
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egtl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egbr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
                                 } else if (!ext_glyph_ok) {
                                     glyph_fail_count += 1;
                                 }
@@ -3846,6 +3898,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const gy0 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
                     const gy1 = gy0 + ge.bbox_size_px[1];
 
+                    const pc_ext_deco: u32 = ext_scrollable | (if (ext_glow_enabled and self.row_cells.glow_arr.items[col] != 0) c_api.DECO_GLOW else 0);
                     const g_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
                     const gtl = g_pts[0]; const gtr = g_pts[1]; const gbl = g_pts[2]; const gbr = g_pts[3];
 
@@ -3854,12 +3907,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const uv_x1 = ge.uv_max[0];
                     const uv_y1 = ge.uv_max[1];
 
-                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
                 } else {
                     glyph_fail_count += 1;
                 }
