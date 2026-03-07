@@ -360,6 +360,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // --- Cursor blink support for shader ---
     private var cursorBlinkBuffer: MTLBuffer?
 
+    // --- Post-process bloom (neon glow, Dual Kawase) ---
+    private var glowExtractPipeline: MTLRenderPipelineState?
+    private var kawaseDownPipeline: MTLRenderPipelineState?
+    private var kawaseUpPipeline: MTLRenderPipelineState?
+    private var glowCompositePipeline: MTLRenderPipelineState?
+    private var glowExtractTex: MTLTexture?
+    private var glowMipTextures: [MTLTexture?] = [nil, nil, nil]
+    private var glowTexSize: CGSize = .zero
+    private var bilinearSampler: MTLSamplerState?
+    private var glowIntensityBuffer: MTLBuffer?
+
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
 
@@ -386,6 +397,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+    }
+
+    /// Ensure glow textures exist: extract (1/2 res) + 3 mip levels for Dual Kawase.
+    /// Mip sizes: 1/4, 1/8, 1/16 of drawable.
+    private func ensureGlowTextures(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
+        let halfSize = CGSize(width: max(1, drawableSize.width / 2.0),
+                              height: max(1, drawableSize.height / 2.0))
+        if glowExtractTex != nil, glowTexSize == halfSize { return }
+
+        let desc = MTLTextureDescriptor()
+        desc.textureType = .type2D
+        desc.pixelFormat = pixelFormat
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        desc.mipmapLevelCount = 1
+
+        // Extract texture: 1/2 resolution
+        desc.width = max(1, Int(halfSize.width))
+        desc.height = max(1, Int(halfSize.height))
+        glowExtractTex = device.makeTexture(descriptor: desc)
+
+        // Mip textures: 1/4, 1/8, 1/16
+        var mw = max(1, desc.width / 2)
+        var mh = max(1, desc.height / 2)
+        for i in 0..<3 {
+            desc.width = mw
+            desc.height = mh
+            glowMipTextures[i] = device.makeTexture(descriptor: desc)
+            mw = max(1, mw / 2)
+            mh = max(1, mh / 2)
+        }
+
+        glowTexSize = halfSize
     }
 
     init?(view: MTKView) {
@@ -1336,6 +1380,146 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us))")
             }
 
+            // --- Post-process bloom (neon glow) ---
+            // Insert 4 bloom passes between main render and copy-to-drawable.
+            // Skip entirely when glow is disabled (no GPU cost).
+            let glowEnabled = (view as? MetalTerminalView)?.core?.isGlowEnabled() ?? false
+            if glowEnabled,
+               let extractPipe = glowExtractPipeline,
+               let downPipe = kawaseDownPipeline,
+               let upPipe = kawaseUpPipeline,
+               let compositePipe = glowCompositePipeline,
+               let copyVB = copyVertexBuffer,
+               let bilinSamp = bilinearSampler,
+               let intensityBuf = glowIntensityBuffer
+            {
+                ensureGlowTextures(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
+
+                if let extractTex = glowExtractTex,
+                   glowMipTextures.allSatisfy({ $0 != nil })
+                {
+                    let intensity = (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8
+                    intensityBuf.contents().storeBytes(of: intensity, as: Float.self)
+
+                    let halfW = max(1, Int(view.drawableSize.width / 2.0))
+                    let halfH = max(1, Int(view.drawableSize.height / 2.0))
+                    let extractViewport = MTLViewport(originX: 0, originY: 0,
+                                                      width: Double(halfW), height: Double(halfH),
+                                                      znear: 0, zfar: 1)
+
+                    // Pass 1: Glow extract → extractTex (1/2 res, DECO_GLOW only)
+                    let extractRPD = MTLRenderPassDescriptor()
+                    extractRPD.colorAttachments[0].texture = extractTex
+                    extractRPD.colorAttachments[0].loadAction = .clear
+                    extractRPD.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                    extractRPD.colorAttachments[0].storeAction = .store
+
+                    if let enc = cmd.makeRenderCommandEncoder(descriptor: extractRPD) {
+                        enc.setRenderPipelineState(extractPipe)
+                        enc.setViewport(extractViewport)
+
+                        var extractSize = DrawableSize(width: Float(halfW), height: Float(halfH))
+                        enc.setFragmentBytes(&extractSize, length: MemoryLayout<DrawableSize>.size, index: 0)
+                        enc.setFragmentTexture(glyphAtlas.texture, index: 0)
+                        enc.setFragmentSamplerState(sampler!, index: 0)
+
+                        var extractScrollCount = UInt32(scrollSnapshot.count)
+                        if !scrollSnapshot.isEmpty {
+                            scrollSnapshot.withUnsafeBytes { ptr in
+                                enc.setVertexBytes(ptr.baseAddress!, length: ptr.count, index: 1)
+                            }
+                        } else {
+                            var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                            enc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
+                            extractScrollCount = 0
+                        }
+                        enc.setVertexBytes(&extractScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
+
+                        if rowMode {
+                            for row in 0..<safeRowCount {
+                                let vc = rowCountsSnapshot[row]
+                                if vc <= 0 { continue }
+                                guard let vb = rowBuffersSnapshot[row] else { continue }
+                                enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                            }
+                        } else if currentMainCount > 0, let mvb = committed.mainVertexBuffer {
+                            enc.setVertexBuffer(mvb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentMainCount)
+                        }
+
+                        enc.endEncoding()
+                    }
+
+                    // Dual Kawase downsample chain: extract → mip[0] → mip[1] → mip[2]
+                    for level in 0..<3 {
+                        let srcTex = (level == 0) ? extractTex : glowMipTextures[level - 1]!
+                        let dstTex = glowMipTextures[level]!
+
+                        let rpd = MTLRenderPassDescriptor()
+                        rpd.colorAttachments[0].texture = dstTex
+                        rpd.colorAttachments[0].loadAction = .dontCare
+                        rpd.colorAttachments[0].storeAction = .store
+
+                        if let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) {
+                            enc.setRenderPipelineState(downPipe)
+                            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                         width: Double(dstTex.width), height: Double(dstTex.height),
+                                                         znear: 0, zfar: 1))
+                            enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+                            enc.setFragmentTexture(srcTex, index: 0)
+                            enc.setFragmentSamplerState(bilinSamp, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                            enc.endEncoding()
+                        }
+                    }
+
+                    // Dual Kawase upsample chain: mip[2] → mip[1] → mip[0] → extractTex
+                    for level in stride(from: 2, through: 0, by: -1) {
+                        let srcTex = (level == 2) ? glowMipTextures[2]! : glowMipTextures[level]!
+                        let dstTex: MTLTexture
+                        if level == 0 {
+                            dstTex = extractTex
+                        } else {
+                            dstTex = glowMipTextures[level - 1]!
+                        }
+
+                        let rpd = MTLRenderPassDescriptor()
+                        rpd.colorAttachments[0].texture = dstTex
+                        rpd.colorAttachments[0].loadAction = .dontCare
+                        rpd.colorAttachments[0].storeAction = .store
+
+                        if let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) {
+                            enc.setRenderPipelineState(upPipe)
+                            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                         width: Double(dstTex.width), height: Double(dstTex.height),
+                                                         znear: 0, zfar: 1))
+                            enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+                            enc.setFragmentTexture(srcTex, index: 0)
+                            enc.setFragmentSamplerState(bilinSamp, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                            enc.endEncoding()
+                        }
+                    }
+
+                    // Composite → backBuffer (additive blend)
+                    let compositeRPD = MTLRenderPassDescriptor()
+                    compositeRPD.colorAttachments[0].texture = backTex
+                    compositeRPD.colorAttachments[0].loadAction = .load
+                    compositeRPD.colorAttachments[0].storeAction = .store
+
+                    if let enc = cmd.makeRenderCommandEncoder(descriptor: compositeRPD) {
+                        enc.setRenderPipelineState(compositePipe)
+                        enc.setVertexBuffer(copyVB, offset: 0, index: 0)
+                        enc.setFragmentTexture(extractTex, index: 0)
+                        enc.setFragmentSamplerState(bilinSamp, index: 0)
+                        enc.setFragmentBuffer(intensityBuf, offset: 0, index: 0)
+                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                        enc.endEncoding()
+                    }
+                }
+            }
+
             // === PERF LOG: Copy開始 ===
             var t_copy_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -1482,6 +1666,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if blurEnabled {
                 _ = build2PassPipelinesAndGetDescriptors(lib: lib, vs: vs, vertexDesc: vertexDesc, pixelFormat: pixelFormat)
             }
+            // Build bloom pipelines for neon glow
+            buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
             // Build copy vertex buffer
             buildCopyVertexBuffer()
             return
@@ -1547,6 +1733,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             (bgDesc, glyphDesc) = build2PassPipelinesAndGetDescriptors(lib: lib, vs: vs, vertexDesc: vertexDesc, pixelFormat: pixelFormat)
         }
 
+        // Build bloom pipelines for neon glow (always, glow check is at draw time)
+        buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+
         // Cache all pipelines to binary archive for future use
         cacheToArchive(mainDesc: desc, bgDesc: bgDesc, glyphDesc: glyphDesc, copyDesc: copyDesc)
     }
@@ -1600,6 +1789,108 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
             return (nil, nil)
+        }
+    }
+
+    /// Build bloom pipelines for post-process neon glow.
+    /// Called once during pipeline initialization and also from archive path.
+    private func buildBloomPipelines(lib: MTLLibrary, vs: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) {
+        guard let fsExtract = lib.makeFunction(name: "ps_glow_extract") else {
+            ZonvieCore.appLog("WARNING: Missing ps_glow_extract shader (bloom disabled)")
+            return
+        }
+        guard let fsKawaseDown = lib.makeFunction(name: "ps_kawase_down") else {
+            ZonvieCore.appLog("WARNING: Missing ps_kawase_down shader (bloom disabled)")
+            return
+        }
+        guard let fsKawaseUp = lib.makeFunction(name: "ps_kawase_up") else {
+            ZonvieCore.appLog("WARNING: Missing ps_kawase_up shader (bloom disabled)")
+            return
+        }
+        guard let fsComposite = lib.makeFunction(name: "ps_glow_composite") else {
+            ZonvieCore.appLog("WARNING: Missing ps_glow_composite shader (bloom disabled)")
+            return
+        }
+        guard let vsCopy = lib.makeFunction(name: "vs_copy") else {
+            ZonvieCore.appLog("WARNING: Missing vs_copy shader for bloom (bloom disabled)")
+            return
+        }
+
+        // Glow extract: same vertex layout as main, sourceAlpha blend, render to 1/4 res
+        let extractDesc = MTLRenderPipelineDescriptor()
+        extractDesc.vertexFunction = vs
+        extractDesc.fragmentFunction = fsExtract
+        extractDesc.vertexDescriptor = vertexDesc
+        extractDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = extractDesc.colorAttachments[0] {
+            a.isBlendingEnabled = true
+            a.rgbBlendOperation = .add
+            a.alphaBlendOperation = .add
+            a.sourceRGBBlendFactor = .one
+            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.sourceAlphaBlendFactor = .one
+            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+
+        // Kawase down/up: fullscreen quad, no blending
+        let kawaseDownDesc = MTLRenderPipelineDescriptor()
+        kawaseDownDesc.vertexFunction = vsCopy
+        kawaseDownDesc.fragmentFunction = fsKawaseDown
+        kawaseDownDesc.vertexDescriptor = copyVertexDesc
+        kawaseDownDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = kawaseDownDesc.colorAttachments[0] {
+            a.isBlendingEnabled = false
+        }
+
+        let kawaseUpDesc = MTLRenderPipelineDescriptor()
+        kawaseUpDesc.vertexFunction = vsCopy
+        kawaseUpDesc.fragmentFunction = fsKawaseUp
+        kawaseUpDesc.vertexDescriptor = copyVertexDesc
+        kawaseUpDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = kawaseUpDesc.colorAttachments[0] {
+            a.isBlendingEnabled = false
+        }
+
+        // Composite: additive blend (ONE, ONE)
+        let compositeDesc = MTLRenderPipelineDescriptor()
+        compositeDesc.vertexFunction = vsCopy
+        compositeDesc.fragmentFunction = fsComposite
+        compositeDesc.vertexDescriptor = copyVertexDesc
+        compositeDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = compositeDesc.colorAttachments[0] {
+            a.isBlendingEnabled = true
+            a.rgbBlendOperation = .add
+            a.alphaBlendOperation = .add
+            a.sourceRGBBlendFactor = .one
+            a.destinationRGBBlendFactor = .one
+            a.sourceAlphaBlendFactor = .one
+            a.destinationAlphaBlendFactor = .one
+        }
+
+        do {
+            glowExtractPipeline = try device.makeRenderPipelineState(descriptor: extractDesc)
+            kawaseDownPipeline = try device.makeRenderPipelineState(descriptor: kawaseDownDesc)
+            kawaseUpPipeline = try device.makeRenderPipelineState(descriptor: kawaseUpDesc)
+            glowCompositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)
+            ZonvieCore.appLog("[Renderer] Bloom pipelines created successfully")
+        } catch {
+            ZonvieCore.appLog("[Renderer] ERROR: Failed to create bloom pipelines: \(error)")
+        }
+
+        // Bilinear sampler for blur passes
+        if bilinearSampler == nil {
+            let samplerDesc = MTLSamplerDescriptor()
+            samplerDesc.minFilter = .linear
+            samplerDesc.magFilter = .linear
+            samplerDesc.mipFilter = .notMipmapped
+            samplerDesc.sAddressMode = .clampToEdge
+            samplerDesc.tAddressMode = .clampToEdge
+            bilinearSampler = device.makeSamplerState(descriptor: samplerDesc)
+        }
+
+        // Intensity buffer
+        if glowIntensityBuffer == nil {
+            glowIntensityBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
         }
     }
 

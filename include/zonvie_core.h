@@ -176,6 +176,7 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_CURSOR        (1u << 6)  /* Marker for cursor vertices (not a decoration) */
 #define ZONVIE_DECO_SCROLLABLE    (1u << 7)  /* Vertex is in scrollable content area (not margin) */
 #define ZONVIE_DECO_OVERLINE      (1u << 8)
+#define ZONVIE_DECO_GLOW          (1u << 9)  /* Neon glow halo around glyph */
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];
@@ -995,6 +996,14 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
 // Return Neovim default background color as 0x00RRGGBB.
 // Safe to call from within callbacks (no lock acquisition).
 ZONVIE_API uint32_t zonvie_core_get_default_bg(zonvie_core *core);
+
+// Query whether post-process bloom glow is currently enabled (lock-free atomic read).
+// Safe to call from any thread (including the draw thread) without locking grid_mu.
+ZONVIE_API bool zonvie_core_get_glow_enabled(zonvie_core *core);
+
+// Query the glow bloom intensity (0.0–1.0) for the post-process composite pass (lock-free atomic read).
+// Safe to call from any thread.
+ZONVIE_API float zonvie_core_get_glow_intensity(zonvie_core *core);
 
 // Read the current drawable/cell layout stored in core.
 // Intended for use from on_flush_end callback (grid_mu is held, so the

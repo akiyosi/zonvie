@@ -78,6 +78,7 @@ pub const DECO_STRIKETHROUGH: u32 = 1 << 5;
 pub const DECO_CURSOR: u32 = 1 << 6; // Marker for cursor vertices (not a decoration, used to preserve cursor from transparency)
 pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area (not margin)
 pub const DECO_OVERLINE: u32 = 1 << 8;
+pub const DECO_GLOW: u32 = 1 << 9;
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -1093,6 +1094,20 @@ pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
     if (p == null) return 0;
     const box = asBox(p.?);
     return box.core.hl.default_bg;
+}
+
+/// Query whether post-process bloom glow is enabled (lock-free atomic read).
+pub export fn zonvie_core_get_glow_enabled(p: ?*zonvie_core) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    return box.core.glow_enabled.load(.acquire);
+}
+
+/// Query the glow bloom intensity (0.0–1.0) for post-process composite (lock-free atomic read).
+pub export fn zonvie_core_get_glow_intensity(p: ?*zonvie_core) callconv(.c) f32 {
+    if (p == null) return 0.0;
+    const box = asBox(p.?);
+    return box.core.getGlowIntensity();
 }
 
 /// Read the current drawable/cell layout stored in core.

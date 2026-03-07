@@ -83,6 +83,10 @@ pub const Highlights = struct {
     default_bg: u32 = 0x00000000,
     default_sp: u32 = 0x00000000,
 
+    // Flags set by setGroup/setDefaults, consumed by rpc_session post-handleRedraw
+    groups_changed: bool = false,
+    default_colors_changed: bool = false,
+
     pub fn init(alloc: std.mem.Allocator) Highlights {
         return .{
             .alloc = alloc,
@@ -106,16 +110,19 @@ pub const Highlights = struct {
         if (fg) |v| self.default_fg = v;
         if (bg) |v| self.default_bg = v;
         if (sp) |v| self.default_sp = v;
+        self.default_colors_changed = true;
     }
 
     pub fn setGroup(self: *Highlights, name: []const u8, hl_id: u32) !void {
         if (self.groups.getEntry(name)) |e| {
             e.value_ptr.* = hl_id;
+            self.groups_changed = true;
             return;
         }
         const k = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(k);
         try self.groups.put(k, hl_id);
+        self.groups_changed = true;
     }
 
     pub fn define(

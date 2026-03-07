@@ -550,6 +550,29 @@ pub const Core = struct {
     // Clipboard setup done flag
     clipboard_setup_done: bool = false,
 
+    // Neon glow configuration (read from vim.g.zonvie_glow)
+    // glow_enabled and glow_intensity are atomic: written by RPC thread, read by frontend draw thread.
+    glow_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    glow_all: bool = false, // true = apply glow to all cells (groups = "all")
+    glow_radius_px: f32 = 6.0,
+    glow_intensity_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
+    glow_hl_ids: ?std.AutoHashMap(u32, void) = null,
+    // Owned strings — each element is alloc.dupe'd from RPC response
+    glow_group_names: std.ArrayListUnmanaged([]const u8) = .{},
+    // Atomic msgid for tracking pending glow config RPC request (0 = no pending)
+    glow_request_msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    // Startup retry counter: decremented on nil response, not on each flush.
+    // Needs enough retries for -c commands to execute after Neovim startup.
+    glow_startup_retries: u8 = 30,
+
+    pub fn getGlowIntensity(self: *const Core) f32 {
+        return @bitCast(self.glow_intensity_bits.load(.acquire));
+    }
+
+    pub fn setGlowIntensity(self: *Core, val: f32) void {
+        self.glow_intensity_bits.store(@bitCast(val), .release);
+    }
+
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
         return .{
             .alloc = alloc,
@@ -640,6 +663,11 @@ pub const Core = struct {
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
+
+        // Free glow state
+        self.freeGlowGroupNames();
+        self.glow_group_names.deinit(self.alloc);
+        if (self.glow_hl_ids) |*m| m.deinit();
 
         // Free caches
         self.deinitHlCache();
@@ -2119,6 +2147,71 @@ pub const Core = struct {
             self.log.write("quitConfirmed error: {any}\n", .{e});
         };
         self.log.write("quitConfirmed: sent {s}\n", .{cmd});
+    }
+
+    // ---- Neon glow configuration ----
+
+    /// Free all owned glow group name strings.
+    pub fn freeGlowGroupNames(self: *Core) void {
+        for (self.glow_group_names.items) |name| {
+            self.alloc.free(@constCast(name));
+        }
+        self.glow_group_names.clearRetainingCapacity();
+    }
+
+    /// Re-resolve glow group names → highlight IDs.
+    /// Lightweight (hash lookups only). Safe to call under grid_mu.
+    pub fn resolveGlowGroups(self: *Core) void {
+        if (self.glow_hl_ids) |*m| {
+            m.clearRetainingCapacity();
+        } else {
+            self.glow_hl_ids = std.AutoHashMap(u32, void).init(self.alloc);
+        }
+        // glow_all mode: skip per-group resolution, glow applies to all cells
+        if (self.glow_all) {
+            self.glow_enabled.store(true, .release);
+            return;
+        }
+        var map = &(self.glow_hl_ids.?);
+        for (self.glow_group_names.items) |name| {
+            if (self.hl.groups.get(name)) |hl_id| {
+                map.put(hl_id, {}) catch {};
+            }
+        }
+        self.glow_enabled.store(self.glow_group_names.items.len > 0, .release);
+    }
+
+    /// Request vim.g.zonvie_glow from Neovim via RPC.
+    /// Tracked by glow_request_msgid; response handled in handleRpcResponse.
+    /// Multiple requests may be in flight; only the latest one's response is processed.
+    pub fn requestGlowConfig(self: *Core) void {
+        const id = self.nextMsgId();
+        self.glow_request_msgid.store(id, .release);
+
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        self.sendRequestHeader(&buf, id, "nvim_exec_lua") catch {
+            self.glow_request_msgid.store(0, .release);
+            return;
+        };
+        rpc.packArray(&buf, self.alloc, 2) catch {
+            self.glow_request_msgid.store(0, .release);
+            return;
+        };
+        rpc.packStr(&buf, self.alloc, "return vim.g.zonvie_glow") catch {
+            self.glow_request_msgid.store(0, .release);
+            return;
+        };
+        rpc.packArray(&buf, self.alloc, 0) catch {
+            self.glow_request_msgid.store(0, .release);
+            return;
+        };
+        self.sendRaw(buf.items) catch {
+            self.glow_request_msgid.store(0, .release);
+            return;
+        };
+        self.log.write("rpc send: requestGlowConfig (id={d})\n", .{id});
     }
 
     /// Execute Lua code in Neovim via nvim_exec_lua.

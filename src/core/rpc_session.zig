@@ -218,6 +218,14 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
                 cb(self.ctx, 0); // Assume no unsaved on error
             }
         }
+        // Glow config request error — decrement retry (next redraw will re-request)
+        const pending_glow_id = self.glow_request_msgid.load(.acquire);
+        if (pending_glow_id != 0 and id == pending_glow_id) {
+            self.glow_request_msgid.store(0, .release);
+            if (self.glow_startup_retries > 0) {
+                self.glow_startup_retries -= 1;
+            }
+        }
         return;
     }
 
@@ -262,6 +270,117 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
             self.quitConfirmed(false);
         }
         return;
+    }
+
+    // Check if this is glow config response
+    const pending_glow_id = self.glow_request_msgid.load(.acquire);
+    if (pending_glow_id != 0 and id == pending_glow_id) {
+        self.glow_request_msgid.store(0, .release);
+        self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
+        applyGlowConfig(self, top[3]);
+        return;
+    }
+
+}
+
+/// Force full vertex regeneration (content_rev bump + dirty_all + onFlush).
+/// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
+fn forceGlowFlush(self: *Core) void {
+    self.grid.content_rev +%= 1;
+    self.grid.dirty_all = true;
+    self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    self.grid_mu.lock();
+    var fctx = flush.FlushCtx{ .core = self };
+    flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch {};
+    self.grid_mu.unlock();
+    self.redraw_thread_id.store(0, .seq_cst);
+}
+
+/// Disable glow and flush if it was previously enabled (clears DECO_GLOW from vertices).
+fn disableGlow(self: *Core) void {
+    const was_enabled = self.glow_enabled.load(.acquire);
+    self.glow_enabled.store(false, .release);
+    if (was_enabled) {
+        forceGlowFlush(self);
+    }
+}
+
+/// Parse vim.g.zonvie_glow response and apply configuration.
+/// Expected format: { groups = {"Keyword", "String", ...}, radius = 6, intensity = 0.6 }
+fn applyGlowConfig(self: *Core, result: mp.Value) void {
+    // Free old group names and reset glow_all
+    self.freeGlowGroupNames();
+    self.glow_all = false;
+
+    // nil means variable is not set
+    if (result == .nil) {
+        disableGlow(self);
+        if (self.glow_startup_retries > 0) {
+            self.glow_startup_retries -= 1;
+        }
+        return;
+    }
+
+    // Must be a map/dict
+    if (result != .map) {
+        disableGlow(self);
+        if (self.glow_startup_retries > 0) {
+            self.glow_startup_retries -= 1;
+        }
+        self.log.write("glow config: unexpected type: {s}\n", .{@tagName(result)});
+        return;
+    }
+
+    const map = result.map;
+    var found_groups = false;
+
+    for (map) |entry| {
+        const key = if (entry.key == .str) entry.key.str else continue;
+
+        if (std.mem.eql(u8, key, "groups")) {
+            if (entry.val == .arr) {
+                for (entry.val.arr) |item| {
+                    if (item == .str) {
+                        const duped = self.alloc.dupe(u8, item.str) catch continue;
+                        self.glow_group_names.append(self.alloc, duped) catch {
+                            self.alloc.free(duped);
+                            continue;
+                        };
+                    }
+                }
+                found_groups = self.glow_group_names.items.len > 0;
+            } else if (entry.val == .str and std.mem.eql(u8, entry.val.str, "all")) {
+                // "all" means apply glow to every cell
+                self.glow_all = true;
+                found_groups = true;
+            }
+        } else if (std.mem.eql(u8, key, "radius")) {
+            if (entry.val == .int) {
+                const r: f32 = @floatFromInt(entry.val.int);
+                self.glow_radius_px = std.math.clamp(r, 2.0, 16.0);
+            } else if (entry.val == .float) {
+                self.glow_radius_px = std.math.clamp(@as(f32, @floatCast(entry.val.float)), 2.0, 16.0);
+            }
+        } else if (std.mem.eql(u8, key, "intensity")) {
+            if (entry.val == .int) {
+                const i_val: f32 = @floatFromInt(entry.val.int);
+                self.setGlowIntensity(std.math.clamp(i_val, 0.0, 1.0));
+            } else if (entry.val == .float) {
+                self.setGlowIntensity(std.math.clamp(@as(f32, @floatCast(entry.val.float)), 0.0, 1.0));
+            }
+        }
+    }
+
+    if (found_groups) {
+        self.resolveGlowGroups();
+        self.glow_startup_retries = 0;
+        self.log.write("glow config: enabled, {d} groups, radius={d:.1}, intensity={d:.1}\n", .{
+            self.glow_group_names.items.len, self.glow_radius_px, self.getGlowIntensity(),
+        });
+        forceGlowFlush(self);
+    } else {
+        disableGlow(self);
+        self.log.write("glow config: disabled (no groups)\n", .{});
     }
 }
 
@@ -823,8 +942,35 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
 
+        // Glow triggers: resolve under grid_mu (lightweight).
+        // Re-resolve hl IDs on groups_changed (hl_group_set events).
+        // On default_colors_set, only re-request glow config if glow is not yet
+        // configured (initial nil response). Once glow is active, skip re-request
+        // to avoid disruptive async clear+reload cycles.
+        var need_reload_glow_config = false;
+        if (self.hl.groups_changed) {
+            self.hl.groups_changed = false;
+            self.resolveGlowGroups();
+        }
+        if (self.hl.default_colors_changed) {
+            self.hl.default_colors_changed = false;
+            // Always re-request glow config on colorscheme change.
+            // hl group IDs may have changed, so existing glow_hl_ids could be stale.
+            need_reload_glow_config = true;
+        }
+
         self.grid_mu.unlock();
         self.redraw_thread_id.store(0, .seq_cst);
+
+        if (need_reload_glow_config) {
+            self.requestGlowConfig();
+        } else if (self.glow_startup_retries > 0 and
+            !self.glow_enabled.load(.acquire) and self.glow_group_names.items.len == 0 and !self.glow_all and
+            self.glow_request_msgid.load(.acquire) == 0)
+        {
+            // Only send if no request already pending (avoid burning retries)
+            self.requestGlowConfig();
+        }
     } else if (std.mem.eql(u8, method, "zonvie_ime_off")) {
         // Custom RPC notification for IME off (user-invokable)
         if (self.cb.on_ime_off) |cb| {
@@ -1126,6 +1272,9 @@ pub fn runLoop(self: *Core) void {
     ui_attached = true;
     self.requestTryResize(self.init_rows, self.init_cols) catch |e| self.log.write("try_resize send failed: {any}\n", .{e});
     self.requestCommand("redraw!") catch |e| self.log.write("redraw! send failed: {any}\n", .{e});
+
+    // Glow config is requested via glow_startup_retries during flush processing.
+    // -c commands may not have run yet at this point.
 
     if (self.pending_resize_valid) {
         const pr = self.pending_resize_rows;

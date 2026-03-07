@@ -39,6 +39,7 @@ SamplerState samp0 : register(s0);
 #define DECO_UNDERDASHED   (1u << 4)
 #define DECO_STRIKETHROUGH (1u << 5)
 #define DECO_OVERLINE      (1u << 8)
+#define DECO_GLOW          (1u << 9)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -216,4 +217,87 @@ float4 PSMain(VSOut i) : SV_Target {
     float contrasted = DWrite_EnhanceContrast(glyph_a, blendEnhancedContrast);
     float alphaCorrected = DWrite_ApplyAlphaCorrection(contrasted, intensity, gammaRatios);
     return alphaCorrected * foreground;
+}
+
+// ============================================================================
+// Post-Process Bloom Shaders (Neon Glow)
+// ============================================================================
+// Bloom pipeline: extract → Dual Kawase downsample/upsample → composite (additive)
+// Uses progressive mip chain (1/4 → 1/32) for smooth, grid-pattern-free blur.
+// ============================================================================
+
+// Fullscreen triangle vertex shader (no vertex buffer needed, use Draw(3,0))
+struct FSQuadVSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+FSQuadVSOut VSFullscreen(uint id : SV_VertexID) {
+    FSQuadVSOut o;
+    // Oversize triangle trick: 3 vertices cover entire screen
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uv;
+    return o;
+}
+
+// Glow extract: render only DECO_GLOW glyphs with original foreground color.
+// Non-glow vertices and non-glyph vertices are discarded.
+// Output is premultiplied alpha.
+float4 PSGlowExtract(VSOut i) : SV_Target {
+    // Only extract DECO_GLOW flagged glyphs
+    if (!(i.deco_flags & DECO_GLOW)) discard;
+    // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
+    if (i.uv.x < 0.0) discard;
+
+    float4 tex = atlasTex.Sample(samp0, i.uv);
+    float cov = dot(tex.rgb, float3(0.299, 0.587, 0.114));
+    return float4(i.col.rgb * cov, cov);
+}
+
+// Glow texture + sampler (register t1/s1 to avoid conflict with atlas t0/s0)
+Texture2D glowTex : register(t1);
+SamplerState glowSamp : register(s1);
+
+// Dual Kawase downsample (5 taps)
+float4 PSKawaseDown(FSQuadVSOut i) : SV_Target {
+    uint w, h;
+    glowTex.GetDimensions(w, h);
+    float2 halfpixel = 0.5 / float2(w, h);
+
+    float4 sum = glowTex.Sample(glowSamp, i.uv) * 4.0;
+    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x, -halfpixel.y));
+    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x, -halfpixel.y));
+    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x,  halfpixel.y));
+    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x,  halfpixel.y));
+    return sum / 8.0;
+}
+
+// Dual Kawase upsample (9 taps)
+float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
+    uint w, h;
+    glowTex.GetDimensions(w, h);
+    float2 halfpixel = 0.5 / float2(w, h);
+
+    float4 sum = 0;
+    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x * 2.0, 0.0));
+    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += glowTex.Sample(glowSamp, i.uv + float2(0.0,  halfpixel.y * 2.0));
+    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x,  halfpixel.y)) * 2.0;
+    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x * 2.0, 0.0));
+    sum += glowTex.Sample(glowSamp, i.uv + float2( halfpixel.x, -halfpixel.y)) * 2.0;
+    sum += glowTex.Sample(glowSamp, i.uv + float2(0.0, -halfpixel.y * 2.0));
+    sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x, -halfpixel.y)) * 2.0;
+    return sum / 12.0;
+}
+
+// Glow composite: blend blurred glow onto back buffer with additive blending.
+// Pipeline uses additive blend state (ONE, ONE), so we just scale by intensity.
+cbuffer GlowParams : register(b0) {
+    float glowIntensity;
+    float3 _pad;
+};
+
+float4 PSGlowComposite(FSQuadVSOut i) : SV_Target {
+    return glowTex.Sample(glowSamp, i.uv) * glowIntensity;
 }
