@@ -1193,12 +1193,6 @@ final class MetalTerminalView: MTKView {
         }
     }
 
-    // New data-only entry point (preferred): Zig already resolved name+pointSize.
-    func applyGuiFont(name: String, pointSize: CGFloat) {
-        renderer.setGuiFont(name: name, pointSize: pointSize)
-        requestRedraw()
-    }
-
     func applyLineSpace(px: Int32) {
         renderer.setLineSpace(px: px)
 

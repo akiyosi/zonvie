@@ -226,7 +226,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var committedDrawableW: UInt32 = 0 // Protected by lock
     private var committedDrawableH: UInt32 = 0 // Protected by lock
 
-    private var pendingFont: (name: String, size: CGFloat)?
+    private var committedAtlasTexture: MTLTexture?  // Protected by lock
     private var linespacePx: Int32 = 0
 
     private var backingScale: CGFloat = 1.0
@@ -496,7 +496,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Called from on_flush_begin callback (core thread).
     /// Deep-copies committed data into write set so partial updates overwrite cleanly.
     /// Picks a buffer set that is not committed and not GPU in-flight.
-    func beginFlush() {
+    enum BeginFlushResult {
+        case proceed                   // Normal flush, no special action needed
+        case proceedWithInvalidation   // Flush OK, but core glyph cache invalidation needed
+        case dropped                   // Flush aborted — core must skip vertex/atlas generation
+    }
+
+    func beginFlush() -> BeginFlushResult {
         isInFlush = true
 
         // Under lock: read committed index + gpuInFlight to pick a safe write set
@@ -519,7 +525,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lock.unlock()
             isInFlush = false
             ZonvieCore.appLog("[WARNING] beginFlush: no free buffer set, dropping flush committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
-            return
+            return .dropped
         }
         writeSetIndex = picked
         if ZonvieCore.appLogEnabled {
@@ -527,6 +533,42 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[scroll_debug] beginFlush committed=\(srcIdx) write=\(picked) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
         }
         lock.unlock()
+
+        // Prepare atlas back texture
+        var needsCoreInvalidation = false
+        if let cmd = queue.makeCommandBuffer() {
+            let result = atlas.prepareBackTexture(commandBuffer: cmd)
+            needsCoreInvalidation = result.needsCoreInvalidation
+            if result.shouldAbort {
+                isInFlush = false
+                ZonvieCore.appLog("[WARNING] beginFlush: atlas back-texture sync failed (nil texture/resize/encoder), dropping flush")
+                return .dropped
+            }
+            if result.didBlit {
+                cmd.commit()
+                cmd.waitUntilCompleted()
+                if cmd.status == .completed {
+                    atlas.markBackSynced()
+                } else {
+                    // Blit failed (device loss, encoding error, etc.).
+                    // backDirty stays true; drop this flush to avoid writing
+                    // incremental glyph changes into a stale back texture.
+                    isInFlush = false
+                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit command buffer failed (status=\(cmd.status.rawValue)), dropping flush")
+                    return .dropped
+                }
+            }
+        } else {
+            // commandBuffer creation failed.
+            // If atlas state requires attention (backDirty, needsAtlasRebuild,
+            // or atlasModified), we must abort — continuing would let uploadRegion
+            // write to an un-synced back texture or leave stale cache active.
+            if atlas.hasAtlasStateRequiringAttention() {
+                isInFlush = false
+                ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed with pending atlas state, dropping flush")
+                return .dropped
+            }
+        }
 
         let src = bufferSets[srcIdx]
         let dst = bufferSets[picked]
@@ -602,6 +644,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         dst.usingRowBuffers = src.usingRowBuffers
+
+        return needsCoreInvalidation ? .proceedWithInvalidation : .proceed
+    }
+
+    /// Called after beginFlush() returned .proceed/.proceedWithInvalidation but
+    /// the core later called zonvie_core_abort_flush (e.g. recreateTexture failure).
+    /// Clears isInFlush so commitFlush becomes a no-op, preventing stale vertices
+    /// from being published under the new layout dimensions.
+    func abortFlush() {
+        isInFlush = false
     }
 
     /// Called from on_flush_end callback (core thread, grid_mu held).
@@ -610,12 +662,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// zonvie_core_get_layout while grid_mu is still held — this guarantees
     /// the values match the NDC coordinates in the committed vertices.
     func commitFlush(drawableW: UInt32, drawableH: UInt32) {
-        guard isInFlush else { return }  // Flush was dropped by beginFlush
+        guard isInFlush else { return }  // Flush was dropped or aborted
+
+        // Atomically commit atlas (swap if modified) and snapshot front texture
+        let newAtlasTex = atlas.commitAndSnapshotFrontTexture()
+
         let ws = writeSetIndex
         lock.lock()
         committedSetIndex = writeSetIndex
         committedDrawableW = drawableW
         committedDrawableH = drawableH
+        committedAtlasTexture = newAtlasTex  // same lock as vertex state
         commitRevision &+= 1
         let rev = commitRevision
         lock.unlock()
@@ -628,6 +685,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
         }
+    }
+
+    /// Returns the committed atlas texture for external grid views.
+    /// Uses same lock + committed state as vertex data.
+    func committedAtlasSnapshot() -> MTLTexture? {
+        lock.lock()
+        let tex = committedAtlasTexture
+        lock.unlock()
+        return tex
     }
 
     /// Update the default Neovim background color (for clear color in viewport edges).
@@ -724,13 +790,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 bufferSets[s].cursorVertexCount = 0
             }
         }
-    }
-
-    func setGuiFont(name: String, pointSize: CGFloat) {
-        ZonvieCore.appLog("renderer setGuiFont: \(name) \(pointSize)")
-        lock.lock()
-        defer { lock.unlock() }
-        pendingFont = (name, pointSize)
     }
 
     func setLineSpace(px: Int32) {
@@ -896,7 +955,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // This prevents beginFlush() from picking our committed set as its write target.
             let csi: Int
             let currentCommitRevision: UInt64
-            let fontChg: (name: String, size: CGFloat)?
+            let atlasTex: MTLTexture?
             let dirtyRectPxOpt: CGRect?
             let dirtyRows: [Int]
             let smoothScrolling: Bool
@@ -911,8 +970,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             currentCommitRevision = commitRevision
             gpuInFlightCount[csi] += 1  // Prevent beginFlush from using this set
 
-            fontChg = pendingFont
-            pendingFont = nil
+            atlasTex = committedAtlasTexture  // same lock scope as vertex snapshot
             dirtyRectPxOpt = pendingDirtyRectPx
             dirtyRows = Array(pendingDirtyRows)
             pendingDirtyRectPx = nil
@@ -961,10 +1019,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             ZonvieCore.appLog("draw(fetch): rowMode=\(rowMode) mainCount=\(committedMainCount) cursorCount=\(committedCursorCount) dirtyRectPxOpt=\(String(describing: dirtyRectPxOpt)) dirtyRowsCount=\(dirtyRows.count) hasPresentedOnce=\(hasPresentedOnce) drawableSize=\(view.drawableSize)")
 
-            if let fontChg {
-                atlas.setFont(name: fontChg.name, pointSize: fontChg.size)
-            }
-
             let cw = atlas.cellWidthPx
             let ch = atlas.cellHeightPx + Float(linespacePx)
             if cw != lastCellWidthPx || ch != lastCellHeightPx {
@@ -999,7 +1053,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             if hasPresentedOnce,
-               fontChg == nil,
                !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
@@ -1032,7 +1085,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 && !smoothScrolling
                 && !drawableSizeChanged
                 && hasPresentedOnce
-                && fontChg == nil
 
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
             let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
@@ -1170,7 +1222,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             enc.setRenderPipelineState(pipeline!)
 
             // atlas texture + sampler
-            if let tex = atlas.texture {
+            if let tex = atlasTex {
                 enc.setFragmentTexture(tex, index: 0)
             }
             enc.setFragmentSamplerState(sampler!, index: 0)
@@ -1420,7 +1472,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
                         var extractSize = DrawableSize(width: Float(halfW), height: Float(halfH))
                         enc.setFragmentBytes(&extractSize, length: MemoryLayout<DrawableSize>.size, index: 0)
-                        enc.setFragmentTexture(glyphAtlas.texture, index: 0)
+                        if let tex = atlasTex {
+                            enc.setFragmentTexture(tex, index: 0)
+                        }
                         enc.setFragmentSamplerState(sampler!, index: 0)
 
                         var extractScrollCount = UInt32(scrollSnapshot.count)

@@ -407,12 +407,9 @@ pub const FlushCtx = struct {
                 scrolled_count, ctx.core.grid.content_rev, ctx.core.grid.dirty_all,
             });
         }
-        if (ctx.core.cb.on_grid_scroll) |cb| {
-            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
-                cb(ctx.core.ctx, grid_id);
-            }
-        }
-        ctx.core.grid.clearScrolledGrids();
+        // Reset flush_aborted BEFORE calling on_flush_begin
+        // (the callback may set it via zonvie_core_abort_flush)
+        ctx.core.flush_aborted = false;
 
         // Notify frontend: flush begins (for triple buffer write-set preparation)
         if (ctx.core.cb.on_flush_begin) |cb| {
@@ -424,6 +421,19 @@ pub const FlushCtx = struct {
                 cb(ctx.core.ctx);
             }
         }
+
+        // If frontend aborted, skip all vertex/atlas work.
+        // Grid scroll events are NOT dispatched or cleared — they are preserved
+        // for the retry flush so smooth-scroll offsets stay in sync with vertices.
+        if (ctx.core.flush_aborted) return;
+
+        // Dispatch grid_scroll events AFTER abort check so they are preserved on retry.
+        if (ctx.core.cb.on_grid_scroll) |cb| {
+            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
+                cb(ctx.core.ctx, grid_id);
+            }
+        }
+        ctx.core.grid.clearScrolledGrids();
 
         // Check msg_show throttle timeout for external commands
         ctx.core.checkMsgShowThrottleTimeout();

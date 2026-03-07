@@ -1422,3 +1422,32 @@ pub export fn zonvie_core_try_cell_has_url(
     const attr = box.core.hl.map.get(hl_id) orelse return 0;
     return if (attr.has_url) @as(i32, 1) else @as(i32, 0);
 }
+
+// Invalidate glyph cache, shape cache, and atlas state.
+// Mirrors onGuifont invalidation sequence (flush.zig).
+// Must be called on core thread (e.g. from on_flush_begin callback).
+pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.resetGlyphCacheFlags();
+    box.core.resetShapeCache();
+    if (box.core.isPhase2Atlas()) {
+        box.core.resetCoreAtlas();
+    }
+    box.core.grid.markAllDirty();
+    // Bump content_rev so the flush's need_main check passes even when
+    // Neovim has not changed any cells (e.g. backing-scale change only).
+    box.core.grid.content_rev +%= 1;
+    var sg_it = box.core.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| {
+        sg.dirty = true;
+    }
+}
+
+// Abort the current flush cycle.
+// Called from on_flush_begin when the frontend cannot accept this flush.
+pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.flush_aborted = true;
+}

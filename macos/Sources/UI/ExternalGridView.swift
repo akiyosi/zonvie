@@ -447,10 +447,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // Bind atlas texture
-            if let atlas = sharedAtlas, let tex = atlas.texture {
+            if let tex = mainTerminalView?.renderer.committedAtlasSnapshot() {
                 enc.setFragmentTexture(tex, index: 0)
             } else {
-                ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) WARNING: atlas or texture is nil! sharedAtlas=\(sharedAtlas != nil)")
+                ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) WARNING: committed atlas texture is nil!")
             }
             enc.setFragmentSamplerState(sampler, index: 0)
 

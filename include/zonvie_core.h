@@ -1121,6 +1121,21 @@ ZONVIE_API void zonvie_config_destroy(zonvie_config* config);
 ZONVIE_API int32_t zonvie_core_try_cell_has_url(
     zonvie_core *core, int64_t grid_id, int32_t row, int32_t col);
 
+/* Invalidate glyph cache, shape cache, and atlas state.
+   Call when frontend font/scale parameters change outside of guifont flow.
+   Must be called on core thread (e.g. from on_flush_begin callback).
+   Triggers on_atlas_create callback to recreate atlas texture. */
+ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
+
+/* Abort the current flush cycle.
+   Call from on_flush_begin when the frontend cannot accept this flush
+   (e.g. no free buffer set, or commandBuffer creation failed with pending atlas state).
+   Sets an internal flag that causes the flush pipeline to skip vertex generation,
+   atlas operations, and vertex submission.
+   on_flush_end is still called (via defer) so the frontend can clean up.
+   The aborted flush's dirty state is preserved — next flush retries everything. */
+ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
+
 #ifdef __cplusplus
 }
 #endif

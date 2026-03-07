@@ -400,6 +400,11 @@ pub const Core = struct {
     /// Extra pixels between lines (Neovim 'linespace').
     linespace_px: u32 = 0,
 
+    /// Set by zonvie_core_abort_flush() from on_flush_begin callback.
+    /// When true, the flush pipeline skips vertex generation and atlas operations.
+    /// Reset at the start of each flush cycle before on_flush_begin is called.
+    flush_aborted: bool = false,
+
     init_rows: u32 = 24,
     init_cols: u32 = 80,
 

@@ -273,10 +273,11 @@ final class ZonvieCore {
                                 )
                             }
 
-                            // Request redraw after last row is submitted
-                            if rs == tr - 1 {
-                                gridView.requestRedraw()
-                            }
+                            // NOTE: do NOT call gridView.requestRedraw() here.
+                            // External grid redraws are triggered from on_flush_end,
+                            // after commitFlush() has updated committedAtlasTexture.
+                            // Calling it here would race: the draw could sample the
+                            // old atlas while vertices already reference new UVs.
                         } else if let vertexArray = vertexArray {
                             // GridView not created yet - save vertices for later (per-row, non-empty only)
                             ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(vertexArray.count) vertices for row \(rs)")
@@ -499,7 +500,30 @@ final class ZonvieCore {
             on_flush_begin: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.terminalView?.renderer.beginFlush()
+                let result = me.terminalView?.renderer.beginFlush() ?? .dropped
+                guard let corePtr = me.core else { return }
+
+                switch result {
+                case .dropped:
+                    // Frontend cannot accept this flush — tell core to skip vertex/atlas work.
+                    zonvie_core_abort_flush(corePtr)
+                case .proceedWithInvalidation:
+                    // Scale change detected — invalidate core glyph cache.
+                    // This triggers resetCoreAtlas → on_atlas_create → recreateTexture.
+                    zonvie_core_invalidate_glyph_cache(corePtr)
+                    // If recreateTexture failed (makeTexture returned nil), needsAtlasRebuild
+                    // is still set (only cleared on success). Continuing would generate
+                    // vertices with new UVs that don't match the old front atlas.
+                    // Note: do NOT use hasAtlasStateRequiringAttention() here — on success,
+                    // atlasModified is true which would also trigger abort.
+                    if let renderer = me.terminalView?.renderer,
+                       renderer.glyphAtlas.needsAtlasRebuildPending {
+                        renderer.abortFlush()
+                        zonvie_core_abort_flush(corePtr)
+                    }
+                case .proceed:
+                    break
+                }
             },
             on_flush_end: { ctx in
                 guard let ctx else { return }
@@ -521,6 +545,17 @@ final class ZonvieCore {
                 // Ensure repaint after every flush (needed for glow config changes
                 // that arrive via RPC response outside the normal vertex submission path).
                 me.terminalView?.requestRedraw()
+                // Ensure external grids also repaint with the committed atlas.
+                // Their vertices may have been dispatched (async) before commitFlush
+                // updated committedAtlasTexture — this guarantees a redraw with the
+                // correct atlas even if a display refresh slipped in between.
+                // Dispatch to main because externalGridViews is main-thread-only state.
+                DispatchQueue.main.async { [weak me] in
+                    guard let me = me else { return }
+                    for (_, gridView) in me.externalGridViews {
+                        gridView.requestRedraw()
+                    }
+                }
             },
 
             // Colorscheme change notification (from default_colors_set redraw event).

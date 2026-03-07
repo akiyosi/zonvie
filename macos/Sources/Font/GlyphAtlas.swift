@@ -51,7 +51,13 @@ final class GlyphAtlas {
     private(set) var ascentPx: Float = 0
     private(set) var descentPx: Float = 0
 
-    private(set) var texture: MTLTexture?
+    // Double-buffered atlas textures: textures[frontIndex] = draw reads,
+    // textures[1 - frontIndex] = flush writes (uploadRegion).
+    private var textures: [MTLTexture?] = [nil, nil]
+    private var frontIndex: Int = 0          // mu protected
+    private var backDirty: Bool = false       // mu protected: front has content not yet synced to back
+    private var atlasModified: Bool = false   // mu protected: back content changed during this flush
+    private var needsAtlasRebuild: Bool = false // mu protected: setBackingScale applied font+metrics but atlas reset pending
 
     // Atlas config (keep simple; can be parameterized later).
     private let atlasW: Int = 2048
@@ -113,6 +119,9 @@ final class GlyphAtlas {
 
     private var scratch: [UInt8] = []
 
+    /// Persistent zero-clear buffer for makeTexture (max 2048 bytes for 2048-wide atlas).
+    private var zeroRow: [UInt8] = []
+
     /// Separate scratch buffer for rasterizeOnly (Phase 2).
     /// Must not share with `scratch` which is used by uploadRegion.
     private var rasterizeScratch: [UInt8] = []
@@ -134,7 +143,13 @@ final class GlyphAtlas {
         self.font = CTFontCreateWithName(fontName as CFString, pointSize, nil) // temporary
 
         os_unfair_lock_lock(&mu)
+        // rebuildFont_locked → resetAtlas_locked creates textures[1 - frontIndex] (back).
         rebuildFont_locked()
+        // Create front as a separate zeroed texture.
+        textures[frontIndex] = makeTexture(device: device, w: atlasW, h: atlasH)
+        // Both textures exist, are distinct objects, and are zeroed.
+        backDirty = false
+        atlasModified = false
         os_unfair_lock_unlock(&mu)
     }
     
@@ -147,6 +162,7 @@ final class GlyphAtlas {
         self.fontFeatures = Self.parseFontFeatures(features)
         ZonvieCore.appLog("[GlyphAtlas.setFont] name='\(name)' pt=\(pointSize) features_str='\(features)' parsed_count=\(self.fontFeatures.count) hasFeatures=\(hasFeatures)")
         rebuildFont_locked()
+        atlasModified = true  // atlas generation changed, ensure commit swaps
     }
 
     /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
@@ -188,13 +204,26 @@ final class GlyphAtlas {
     
     func setBackingScale(_ s: CGFloat) {
         let ns = max(0.5, min(8.0, s))
-    
+
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
+        if backingScale == ns && !needsAtlasRebuild { return }
         if backingScale == ns { return }
         backingScale = ns
-        rebuildFont_locked()
+
+        // Immediate: font rebuild + metrics (needed for layout calculation).
+        // cellWidthPx / cellHeightPx are correct after this call.
+        rebuildFontAndMetrics_locked()
+
+        // Immediate: clear glyph caches so any in-progress flush does not
+        // mix old-scale cache entries with new-scale metrics.
+        // clearCaches_locked() is idempotent; prepareBackTexture() may call
+        // it again on the next flush — that is harmless.
+        clearCaches_locked()
+
+        // Deferred: atlas texture reset applied at prepareBackTexture
+        needsAtlasRebuild = true
     }
 
     private func recomputeMetrics() {
@@ -284,21 +313,25 @@ final class GlyphAtlas {
         }
     }
 
-    // NOTE: only call when holding mu
+    // NOTE: only call when holding mu. Full rebuild: font + metrics + caches + atlas.
     private func rebuildFont_locked() {
-        // CTFont also used for CoreText-side references like glyphID(forScalar:)
+        rebuildFontAndMetrics_locked()
+        clearCaches_locked()
+        resetAtlas_locked()
+    }
+
+    /// Font + metrics rebuild only. Metrics available immediately after return.
+    /// Does NOT touch atlas texture or caches.
+    private func rebuildFontAndMetrics_locked() {
         font = CTFontCreateWithName(fontName as CFString, pointSize * backingScale, nil)
-
-        // Load font variants (bold, italic, bold+italic)
         loadFontVariants_locked()
-
-        // First rebuild FreeType/HarfBuzz side with 'new size'
         rebuildHbFtFont_locked()
-
-        // Use that hbftFont (new) to finalize metrics
         recomputeMetrics()
+    }
 
-        // Drop fallback faces and caches (they depend on pixel size / font settings).
+    /// Clear all glyph/fallback caches. Must be called before rasterization with new font.
+    /// Idempotent: safe to call repeatedly on retry (caches already empty after first call).
+    private func clearCaches_locked() {
         for (_, f) in fallbackFacesByURL {
             zonvie_ft_hb_font_destroy(f.hbft)
         }
@@ -306,9 +339,6 @@ final class GlyphAtlas {
         fallbackFontCache.removeAll()
         failedScalarCache.removeAll()
         scalarToGlyphIDCache.removeAll()
-
-        // After finalizing metrics, rebuild atlas (to match cellWidth/Height)
-        resetAtlas_locked()
     }
 
     private func loadFontVariants_locked() {
@@ -694,16 +724,17 @@ final class GlyphAtlas {
     }
 
     private func resetAtlas_locked() {
-        // Skip if atlas is already empty and texture exists (no work to do)
-        if map.isEmpty && nextY == 1 && nextX == 1 && texture != nil {
-            return
-        }
+        let bi = 1 - frontIndex
         ZonvieCore.appLog("[Atlas] RESET! map.count=\(map.count) nextY=\(nextY)/\(atlasH)")
         map.removeAll(keepingCapacity: true)
         nextX = 1
         nextY = 1
         rowH = 0
-        texture = makeTexture(device: device, w: atlasW, h: atlasH)
+        textures[bi] = makeTexture(device: device, w: atlasW, h: atlasH)
+        // NOTE: does NOT set atlasModified.
+        // Callers that need swap must set it explicitly:
+        //   - setFont: sets atlasModified = true after rebuildFont_locked
+        //   - recreateTexture (core callback, incl. scale-change path): sets atlasModified = true
     }
 
     private func makeTexture(device: MTLDevice, w: Int, h: Int) -> MTLTexture? {
@@ -719,11 +750,21 @@ final class GlyphAtlas {
             ZonvieCore.appLog("[GlyphAtlas] Failed to create atlas texture (\(w)x\(h))")
             return nil
         }
+
+        // Zero-clear: reuse persistent 1-row buffer
+        if zeroRow.count < w { zeroRow = Array<UInt8>(repeating: 0, count: w) }
+        zeroRow.withUnsafeBytes { raw in
+            guard let ptr = raw.baseAddress else { return }
+            for row in 0..<h {
+                tex.replace(region: MTLRegionMake2D(0, row, w, 1),
+                            mipmapLevel: 0, withBytes: ptr, bytesPerRow: w)
+            }
+        }
         return tex
     }
 
     private func rasterizeAndPack(hbft: OpaquePointer, glyphID: UInt32) -> Entry? {
-        guard let tex = texture else { return nil }
+        guard let tex = textures[1 - frontIndex] else { return nil }
     
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0
@@ -1136,7 +1177,8 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let tex = texture, let pixels = bitmap.pointee.pixels else { return }
+        let tex = textures[1 - frontIndex]  // always write to back
+        guard let tex, let pixels = bitmap.pointee.pixels else { return }
         let pitch = Int(bitmap.pointee.pitch)
         let absPitch = abs(pitch)
         let needed = width * height
@@ -1165,6 +1207,8 @@ final class GlyphAtlas {
             let region = MTLRegionMake2D(destX, destY, width, height)
             tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: width)
         }
+
+        atlasModified = true
     }
 
     /// Phase 2: Recreate atlas texture with the given dimensions.
@@ -1172,13 +1216,150 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        texture = makeTexture(device: device, w: width, h: height)
+        let bi = 1 - frontIndex
+        guard let newTex = makeTexture(device: device, w: width, h: height) else {
+            // makeTexture failed: invalidate back so uploadRegion cannot write stale data.
+            textures[bi] = nil
+            ZonvieCore.appLog("[GlyphAtlas] recreateTexture: makeTexture failed, back invalidated, will retry next flush")
+            return
+        }
+        textures[bi] = newTex
         // Reset local packer state (core manages packing in Phase 2)
         nextX = 1
         nextY = 1
         rowH = 0
         map.removeAll(keepingCapacity: true)
         failedScalarCache.removeAll(keepingCapacity: true)
+        atlasModified = true
+        // needsAtlasRebuild cleared here because recreateTexture() is the terminal
+        // point of the scale-change invalidation path (setBackingScale → prepareBackTexture
+        // → core invalidation → on_atlas_create → recreateTexture). This flag is
+        // scale-change-only; setFont uses rebuildFont_locked() which does not touch it.
+        needsAtlasRebuild = false
+    }
+
+    // MARK: - Double-Buffer Lifecycle
+
+    struct PrepareResult {
+        let didBlit: Bool
+        let needsCoreInvalidation: Bool
+        let shouldAbort: Bool  // true when backDirty but blit is impossible (textures nil, resize/encoder failed)
+    }
+
+    /// Called from beginFlush() on core thread.
+    /// Applies deferred atlas rebuild, then syncs front -> back if needed.
+    func prepareBackTexture(commandBuffer: MTLCommandBuffer) -> PrepareResult {
+        os_unfair_lock_lock(&mu)
+
+        // Phase 1: Apply deferred atlas rebuild (from setBackingScale)
+        if needsAtlasRebuild {
+            // DO NOT clear needsAtlasRebuild here.
+            // It is cleared by recreateTexture() when the core invalidation path
+            // successfully creates a new back texture (on_atlas_create -> recreateTexture).
+            // If flush is dropped before invalidation, or makeTexture fails inside
+            // recreateTexture, needsAtlasRebuild stays true -> retried next flush.
+            //
+            // clearCaches_locked() is idempotent: on retry, caches are already empty
+            // (fallbackFacesByURL destroyed, all maps cleared). Safe to call repeatedly.
+            clearCaches_locked()
+            backDirty = false  // old front content is for wrong scale, don't blit
+            os_unfair_lock_unlock(&mu)
+            return PrepareResult(didBlit: false, needsCoreInvalidation: true, shouldAbort: false)
+        }
+
+        // Phase 2: Sync front -> back if dirty
+        guard backDirty else {
+            os_unfair_lock_unlock(&mu)
+            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: false)
+        }
+
+        let fi = frontIndex
+        let bi = 1 - frontIndex
+        guard let front = textures[fi], var back = textures[bi] else {
+            // backDirty is true but textures are nil — cannot sync.
+            // Continuing would let atlas modifications write to an unsynced back;
+            // on swap the new front would be missing glyphs from the old front.
+            os_unfair_lock_unlock(&mu)
+            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+        }
+
+        // Defensive: recreate back if size mismatch
+        if back.width != front.width || back.height != front.height {
+            guard let newBack = makeTexture(device: device, w: front.width, h: front.height) else {
+                // Cannot recreate back texture — same risk as nil textures above.
+                os_unfair_lock_unlock(&mu)
+                return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+            }
+            textures[bi] = newBack
+            back = newBack
+        }
+
+        // DO NOT set backDirty = false here.
+        // Caller must call markBackSynced() after blit completes successfully.
+        os_unfair_lock_unlock(&mu)
+
+        // Encode blit outside mu (texture refs are stable, no contention in this interval)
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            // Cannot encode blit — same risk as nil textures above.
+            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+        }
+        blit.copy(from: front, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: front.width, height: front.height, depth: 1),
+                  to: back, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        return PrepareResult(didBlit: true, needsCoreInvalidation: false, shouldAbort: false)
+    }
+
+    /// Called after blit command buffer completes successfully.
+    func markBackSynced() {
+        os_unfair_lock_lock(&mu)
+        backDirty = false
+        os_unfair_lock_unlock(&mu)
+    }
+
+    /// Returns true if atlas has pending state that requires attention:
+    /// - backDirty: front->back blit needed (requires commandBuffer)
+    /// - needsAtlasRebuild: scale change pending (requires core invalidation)
+    /// - atlasModified: uncommitted atlas changes exist
+    func hasAtlasStateRequiringAttention() -> Bool {
+        os_unfair_lock_lock(&mu)
+        let result = backDirty || needsAtlasRebuild || atlasModified
+        os_unfair_lock_unlock(&mu)
+        return result
+    }
+
+    /// Returns true if needsAtlasRebuild is set (scale change not yet fully applied).
+    /// Used specifically to detect recreateTexture failure in the scale-change path.
+    var needsAtlasRebuildPending: Bool {
+        os_unfair_lock_lock(&mu)
+        let result = needsAtlasRebuild
+        os_unfair_lock_unlock(&mu)
+        return result
+    }
+
+    /// Called from commitFlush() on core thread.
+    /// If atlas was modified during this flush, swaps front/back and returns new front.
+    /// If not modified, returns current front without swap.
+    func commitAndSnapshotFrontTexture() -> MTLTexture? {
+        os_unfair_lock_lock(&mu)
+        if atlasModified {
+            frontIndex = 1 - frontIndex   // swap: back (with new content) becomes front
+            backDirty = true              // old front (now back) is behind
+            atlasModified = false
+        }
+        let tex = textures[frontIndex]
+        os_unfair_lock_unlock(&mu)
+        return tex
+    }
+
+    /// Returns the committed front texture under lock.
+    func snapshotFrontTexture() -> MTLTexture? {
+        os_unfair_lock_lock(&mu)
+        let tex = textures[frontIndex]
+        os_unfair_lock_unlock(&mu)
+        return tex
     }
 
 }
