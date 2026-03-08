@@ -252,8 +252,14 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         if (cmdline_win) |cw| {
             var cmdline_rect: c.RECT = undefined;
             if (c.GetWindowRect(cw.hwnd, &cmdline_rect) != 0) {
+                const cmdline_content_x: c_int =
+                    @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
+                    @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
+                const popupmenu_padding: c_int = 8;
                 // Position above cmdline window with small gap
-                pos_x = cmdline_rect.left + @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
+                pos_x = cmdline_rect.left + cmdline_content_x +
+                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)) -
+                    popupmenu_padding;
                 pos_y = cmdline_rect.top - window_h - 4; // 4px gap
                 if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
             }

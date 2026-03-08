@@ -2193,6 +2193,8 @@ final class ZonvieCore {
     private static let messageGridId: Int64 = -102
     /// Reserved grid ID for message history (must match MSG_HISTORY_GRID_ID in grid.zig)
     private static let msgHistoryGridId: Int64 = -103
+    private static let specialWindowCornerRadius: CGFloat = 8.0
+    private static let specialWindowBorderLayerName = "ZonvieSpecialWindowBorder"
 
     /// Message window for ext_messages (top-right for echo/error/warning)
     private var extFloatWindow: NSWindow?
@@ -2449,6 +2451,7 @@ final class ZonvieCore {
 
             // Padding for cmdline window (from ZonvieConfig)
             let cmdlinePadding: CGFloat = isCmdline ? ZonvieConfig.cmdlinePadding : 0.0
+            let popupmenuPadding: CGFloat = isPopupmenu ? 8.0 : 0.0
             // Padding for msg_show/msg_history windows
             let msgPadding: CGFloat = (isMsgShow || isMsgHistory) ? 8.0 : 0.0
             // Shadow margin for cmdline window (allows shadow to extend beyond content)
@@ -2462,8 +2465,8 @@ final class ZonvieCore {
                 contentWidth = min(contentWidth, maxContentWidth)
             }
 
-            let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (msgPadding * 2)
-            let containerHeight = contentHeight + (cmdlinePadding * 2) + (msgPadding * 2)
+            let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2)
+            let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
             let windowWidth = containerWidth + (shadowMargin * 2)
             let windowHeight = containerHeight + (shadowMargin * 2)
 
@@ -2516,8 +2519,10 @@ final class ZonvieCore {
                     // Cmdline completion: position above the cmdline window
                     if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
                         let cmdlineFrame = cmdlineWindow.frame
+                        let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
+                        let popupmenuPadding: CGFloat = 8.0
                         // Position popupmenu so its bottom is at cmdline top (with small gap)
-                        let x = cmdlineFrame.origin.x + CGFloat(startCol) * cellW / scale
+                        let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
                         let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0  // 4px gap above cmdline
                         windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
                         ZonvieCore.appLog("[external_window] popupmenu positioned above cmdline at (\(x),\(y))")
@@ -2751,7 +2756,8 @@ final class ZonvieCore {
                 // Create container view (no shadow margin - use window shadow instead)
                 let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight))
                 containerView.wantsLayer = true
-                containerView.layer?.cornerRadius = 8.0
+                containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+                containerView.layer?.cornerCurve = .continuous
                 containerView.layer?.masksToBounds = true
 
                 // Set semi-transparent background on containerView for margin area
@@ -2765,8 +2771,7 @@ final class ZonvieCore {
 
                 // Border using Search highlight color
                 let borderColor = self.getSearchHighlightColor()
-                containerView.layer?.borderColor = borderColor.cgColor
-                containerView.layer?.borderWidth = 1.0
+                self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
 
                 // Add icon view for cmdline window
                 if isCmdline {
@@ -2788,8 +2793,8 @@ final class ZonvieCore {
 
                 // Position gridView with padding inside containerView (offset by icon width for cmdline)
                 // For cmdline: offset includes icon area; for msg_show/msg_history: use msgPadding
-                let gridViewX = cmdlinePadding + cmdlineIconTotalWidth + msgPadding
-                let gridViewY = cmdlinePadding + msgPadding
+                let gridViewX = cmdlinePadding + cmdlineIconTotalWidth + popupmenuPadding + msgPadding
+                let gridViewY = cmdlinePadding + popupmenuPadding + msgPadding
                 gridView.frame = NSRect(x: gridViewX, y: gridViewY, width: contentWidth, height: contentHeight)
                 containerView.addSubview(gridView)
 
@@ -3131,8 +3136,8 @@ final class ZonvieCore {
                                      rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat, scale: CGFloat, bgColor: NSColor) {
         // Update border color from Search highlight
         let borderColor = self.getSearchHighlightColor()
-        containerView.layer?.borderColor = borderColor.cgColor
-        containerView.layer?.borderWidth = 1.0
+        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+        containerView.layer?.cornerCurve = .continuous
 
         let cmdlinePadding = ZonvieConfig.cmdlinePadding
         let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
@@ -3162,6 +3167,7 @@ final class ZonvieCore {
         }
 
         containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
+        self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
 
         let oldFrame = window.frame
         var newX = oldFrame.midX - containerWidth / 2
@@ -3184,13 +3190,17 @@ final class ZonvieCore {
     private func resizePopupmenuWindow(window: NSWindow, containerView: NSView, gridView: ExternalGridView,
                                        rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat, scale: CGFloat) {
         let popupmenuPadding: CGFloat = 8.0
+        let borderColor = self.getSearchHighlightColor()
         let contentWidth = CGFloat(cols) * cellW / scale
         let contentHeight = CGFloat(rows) * cellH / scale
         let containerWidth = contentWidth + (popupmenuPadding * 2)
         let containerHeight = contentHeight + (popupmenuPadding * 2)
 
+        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+        containerView.layer?.cornerCurve = .continuous
         gridView.frame = NSRect(x: popupmenuPadding, y: popupmenuPadding, width: contentWidth, height: contentHeight)
         containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
+        self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
 
         let oldFrame = window.frame
         window.setFrame(NSRect(x: oldFrame.origin.x, y: oldFrame.origin.y, width: containerWidth, height: containerHeight), display: true)
@@ -3692,8 +3702,7 @@ final class ZonvieCore {
 
                 // Update border color from Search highlight
                 let borderColor = self.getSearchHighlightColor()
-                containerView.layer?.borderColor = borderColor.cgColor
-                containerView.layer?.borderWidth = 1.0
+                self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
 
                 // Resize window based on new content dimensions
                 let renderer = mainView.renderer!
@@ -3760,31 +3769,33 @@ final class ZonvieCore {
             // Update popupmenu window: resize based on new content dimensions
             if gridId == ZonvieCore.popupmenuGridId,
                let window = self.externalWindows[gridId],
-               let mainView = self.terminalView {
+               let mainView = self.terminalView,
+               let containerView = window.contentView,
+               let gridView = self.externalGridViews[gridId] {
 
                 let renderer = mainView.renderer!
                 let cellW = CGFloat(renderer.cellWidthPx)
                 let cellH = CGFloat(renderer.cellHeightPx)
                 let scale = mainView.window?.backingScaleFactor ?? 1.0
 
-                let contentWidth = CGFloat(cols) * cellW / scale
-                let contentHeight = CGFloat(rows) * cellH / scale
-
-                // Update gridView frame
-                if let gridView = self.externalGridViews[gridId] {
-                    gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-                }
-
-                // Update window size while keeping top-left position
-                // (popupmenu should stay anchored near the cursor)
                 let oldFrame = window.frame
-                let newX = oldFrame.origin.x
-                // Keep top position (macOS coordinate: origin.y + height = top)
                 let oldTop = oldFrame.origin.y + oldFrame.height
-                let newY = oldTop - contentHeight
 
-                window.setFrame(NSRect(x: newX, y: newY, width: contentWidth, height: contentHeight), display: true)
-                ZonvieCore.appLog("[external_vertices] popupmenu resized: width=\(contentWidth) height=\(contentHeight)")
+                self.resizePopupmenuWindow(
+                    window: window,
+                    containerView: containerView,
+                    gridView: gridView,
+                    rows: rows,
+                    cols: cols,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale
+                )
+
+                let newFrame = window.frame
+                let newY = oldTop - newFrame.height
+                window.setFrameOrigin(NSPoint(x: oldFrame.origin.x, y: newY))
+                ZonvieCore.appLog("[external_vertices] popupmenu resized: width=\(newFrame.width) height=\(newFrame.height)")
             }
 
             // Update msg_show/msg_history window: resize based on new content dimensions
@@ -3904,6 +3915,38 @@ final class ZonvieCore {
     }
 
     // MARK: - Highlight helpers
+
+    private func updateSpecialWindowBorder(containerView: NSView, borderColor: NSColor, lineWidth: CGFloat) {
+        guard let layer = containerView.layer else { return }
+
+        layer.borderWidth = 0.0
+
+        let borderLayer: CAShapeLayer
+        if let existing = layer.sublayers?.first(where: { $0.name == Self.specialWindowBorderLayerName }) as? CAShapeLayer {
+            borderLayer = existing
+        } else {
+            let created = CAShapeLayer()
+            created.name = Self.specialWindowBorderLayerName
+            created.fillColor = NSColor.clear.cgColor
+            created.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+            layer.addSublayer(created)
+            borderLayer = created
+        }
+
+        borderLayer.frame = layer.bounds
+        borderLayer.strokeColor = borderColor.cgColor
+        borderLayer.lineWidth = lineWidth
+
+        let inset = lineWidth / 2.0
+        let radius = max(0.0, Self.specialWindowCornerRadius - inset)
+        let pathRect = layer.bounds.insetBy(dx: inset, dy: inset)
+        borderLayer.path = CGPath(
+            roundedRect: pathRect,
+            cornerWidth: radius,
+            cornerHeight: radius,
+            transform: nil
+        )
+    }
 
     /// Get the Search highlight color (background) for cmdline border.
     private func getSearchHighlightColor() -> NSColor {

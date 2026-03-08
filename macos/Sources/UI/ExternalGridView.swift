@@ -161,7 +161,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let layerExists = self.layer != nil
         ZonvieCore.appLog("[DEBUG-EXTGRID-INIT] gridId=\(gridId) blurEnabled=\(blurEnabled) layerExists=\(layerExists) ZonvieConfig.blurEnabled=\(ZonvieConfig.shared.blurEnabled)")
 
-        if blurEnabled {
+        if isCmdline || blurEnabled {
             self.layer?.isOpaque = false
             self.layer?.backgroundColor = NSColor.clear.cgColor
             ZonvieCore.appLog("[ExternalGridView] layer: isOpaque=false, backgroundColor=clear")
@@ -248,7 +248,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
         hasPresentedOnce = false
-        // Clear all row vertex counts so stale rows from the old font are not drawn
         for i in 0..<rowVertexCounts.count {
             rowVertexCounts[i] = 0
         }
@@ -270,10 +269,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         gridCols = cols
 
         if count > 0, let ptr = ptr {
-            ensureVertexBufferCapacity(count)
+            ensureVertexBufferCapacity(count, forceReplace: true)
             if let vb = vertexBuffer {
                 memcpy(vb.contents(), ptr, count * MemoryLayout<Vertex>.stride)
                 pendingVertexCount = count
+            } else {
+                pendingVertexCount = 0
             }
         } else {
             pendingVertexCount = 0
@@ -308,17 +309,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         guard count > 0, let validPtr = ptr else {
             rowVertexCounts[row] = 0
+            pendingDirtyRows.insert(row)
             return
         }
 
         let neededBytes = count * MemoryLayout<Vertex>.stride
 
-        // Grow buffer if needed
-        if rowVertexBuffers[row] == nil || neededBytes > rowVertexBufferCaps[row] {
-            let newCap = max(neededBytes, rowVertexBufferCaps[row] * 2, 4096)
-            rowVertexBuffers[row] = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
-            rowVertexBufferCaps[row] = newCap
-        }
+        // Always replace the row buffer on update so the previous frame can keep
+        // reading the old MTLBuffer without CPU/GPU races during rapid scrolling.
+        let newCap = max(neededBytes, rowVertexBufferCaps[row], 4096)
+        rowVertexBuffers[row] = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
+        rowVertexBufferCaps[row] = newCap
 
         // Copy vertices
         if let vb = rowVertexBuffers[row] {
@@ -558,7 +559,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             enc.endEncoding()
-
             cmd.present(drawable)
             cmd.commit()
 
@@ -574,11 +574,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     // MARK: - Private
 
-    private func ensureVertexBufferCapacity(_ count: Int) {
+    private func ensureVertexBufferCapacity(_ count: Int, forceReplace: Bool = false) {
         let needed = count * MemoryLayout<Vertex>.stride
-        if needed <= vertexBufferCapacity { return }
+        if !forceReplace && needed <= vertexBufferCapacity { return }
 
-        // Grow with some headroom
         let newCap = max(needed, vertexBufferCapacity * 2, 4096)
         vertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
         vertexBufferCapacity = newCap
