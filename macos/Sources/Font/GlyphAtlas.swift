@@ -59,9 +59,9 @@ final class GlyphAtlas {
     private var atlasModified: Bool = false   // mu protected: back content changed during this flush
     private var needsAtlasRebuild: Bool = false // mu protected: setBackingScale applied font+metrics but atlas reset pending
 
-    // Atlas config (keep simple; can be parameterized later).
-    private let atlasW: Int = 2048
-    private let atlasH: Int = 2048
+    // Atlas dimensions (updated by recreateTexture when core sets atlas_size).
+    private var atlasW: Int = 2048
+    private var atlasH: Int = 2048
 
     // HarfBuzz+FreeType backend handle (base font).
     private var hbftFont: OpaquePointer?
@@ -119,7 +119,7 @@ final class GlyphAtlas {
 
     private var scratch: [UInt8] = []
 
-    /// Persistent zero-clear buffer for makeTexture (max 2048 bytes for 2048-wide atlas).
+    /// Persistent zero-clear buffer for makeTexture (one row of atlas width).
     private var zeroRow: [UInt8] = []
 
     /// Separate scratch buffer for rasterizeOnly (Phase 2).
@@ -1224,6 +1224,9 @@ final class GlyphAtlas {
             return
         }
         textures[bi] = newTex
+        // Update atlas dimensions to match core-configured size
+        atlasW = width
+        atlasH = height
         // Reset local packer state (core manages packing in Phase 2)
         nextX = 1
         nextY = 1

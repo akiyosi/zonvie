@@ -277,8 +277,8 @@ pub const Renderer = struct {
         dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
         _ = c.QueryPerformanceCounter(&t0);
-        // NOTE: Must match AtlasW/AtlasH in dwrite_d2d_renderer.zig (2048x2048)
-        try self.createAtlasTexture(2048, 2048);
+        // Initial atlas texture (will be recreated by on_atlas_create with configured size)
+        try self.createAtlasTexture(self.atlas_w, self.atlas_h);
         _ = c.QueryPerformanceCounter(&t1);
         dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
