@@ -284,7 +284,7 @@ pub const TrayIcon = struct {
             title_buf[i] = title[i];
         }
         title_buf[title_len] = 0;
-        @memcpy(self.nid.szInfoTitle[0..title_len + 1], title_buf[0..title_len + 1]);
+        @memcpy(self.nid.szInfoTitle[0 .. title_len + 1], title_buf[0 .. title_len + 1]);
 
         // Copy msg to szInfo (max 255 chars + null)
         var msg_buf: [256]u16 = undefined;
@@ -293,7 +293,7 @@ pub const TrayIcon = struct {
             msg_buf[i] = msg_text[i];
         }
         msg_buf[msg_len] = 0;
-        @memcpy(self.nid.szInfo[0..msg_len + 1], msg_buf[0..msg_len + 1]);
+        @memcpy(self.nid.szInfo[0 .. msg_len + 1], msg_buf[0 .. msg_len + 1]);
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
         applog.appLog("[tray] showBalloon: title='{s}' msg='{s}'\n", .{ title, msg_text });
@@ -873,7 +873,6 @@ pub const App = struct {
     cached_visible_grids: [16]GridInfo = undefined,
     cached_visible_grids_count: usize = 0,
 
-
     // Tray icon for OS notification (balloon notification)
     tray_icon: ?TrayIcon = null,
 
@@ -1267,12 +1266,12 @@ pub fn addSearchIconVerts(
     // uv.x = -2.0 (ICON_CIRCLE), uv.y = local_x, deco_phase = local_y
     const circle_tex_x: f32 = -2.0;
     const quad_positions = [_][2]f32{
-        .{ safe_x, safe_y },                   // top-left
-        .{ safe_x + safe_w, safe_y },          // top-right
-        .{ safe_x, safe_y - safe_h },          // bottom-left
-        .{ safe_x + safe_w, safe_y },          // top-right
+        .{ safe_x, safe_y }, // top-left
+        .{ safe_x + safe_w, safe_y }, // top-right
+        .{ safe_x, safe_y - safe_h }, // bottom-left
+        .{ safe_x + safe_w, safe_y }, // top-right
         .{ safe_x + safe_w, safe_y - safe_h }, // bottom-right
-        .{ safe_x, safe_y - safe_h },          // bottom-left
+        .{ safe_x, safe_y - safe_h }, // bottom-left
     };
     const local_uvs = [_][2]f32{
         .{ 0.0, 0.0 }, // top-left
@@ -1340,12 +1339,12 @@ pub fn addChevronIconVerts(
     // uv.x = -3.0 (ICON_CHEVRON), uv.y = local_x, deco_phase = local_y
     const chevron_tex_x: f32 = -3.0;
     const positions = [_][2]f32{
-        .{ safe_x, safe_y },                   // top-left
-        .{ safe_x + safe_w, safe_y },          // top-right
-        .{ safe_x, safe_y - safe_h },          // bottom-left
-        .{ safe_x + safe_w, safe_y },          // top-right
+        .{ safe_x, safe_y }, // top-left
+        .{ safe_x + safe_w, safe_y }, // top-right
+        .{ safe_x, safe_y - safe_h }, // bottom-left
+        .{ safe_x + safe_w, safe_y }, // top-right
         .{ safe_x + safe_w, safe_y - safe_h }, // bottom-right
-        .{ safe_x, safe_y - safe_h },          // bottom-left
+        .{ safe_x, safe_y - safe_h }, // bottom-left
     };
     const local_uvs = [_][2]f32{
         .{ 0.0, 0.0 }, // top-left
@@ -1478,6 +1477,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
+        app.row_mode_max_row_end = 0;
         app.row_layout_gen +%= 1;
         if (rows != 0) {
             app.row_valid.resize(app.alloc, @intCast(rows), false) catch {};
@@ -1491,7 +1491,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
             rv.gen +%= 1;
         }
         applog.appLog(
-            "[win] bootstrap rows/cols from client rows={d} cols={d} cell={d}x{d} client={d}x{d}\n",
+            "[win] bootstrap rows/cols from client rows={d} cols={d} cell={d}x{d} client={d}x{d} row_mode_max_row_end=0\n",
             .{ rows, cols, cw, ch, w, h },
         );
     }

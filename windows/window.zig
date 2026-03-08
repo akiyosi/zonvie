@@ -107,7 +107,6 @@ const CMDLINE_BORDER_WIDTH = app_mod.CMDLINE_BORDER_WIDTH;
 const CMDLINE_CORNER_RADIUS = app_mod.CMDLINE_CORNER_RADIUS;
 const MSG_PADDING = app_mod.MSG_PADDING;
 
-
 // Layout helpers are in app_mod (getEffectiveContentWidth, updateLayoutToCore,
 // rowHeightPxFromClient, updateRowsColsFromClientForce).
 const getEffectiveContentWidth = app_mod.getEffectiveContentWidth;
@@ -142,16 +141,16 @@ pub export fn WndProc(
     switch (msg) {
         c.WM_NCCREATE => {
             applog.appLog("WM_NCCREATE hwnd={*} wParam={d} lParam=0x{x}", .{ hwnd, wParam, @as(usize, @bitCast(lParam)) });
-        
+
             const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
             applog.appLog("  CREATESTRUCTW ptr={*} lpCreateParams={*}", .{ cs, cs.lpCreateParams });
-        
+
             const lp = cs.lpCreateParams orelse {
                 applog.appLog("  lpCreateParams is null -> fail", .{});
                 return 0;
             };
             applog.appLog("  lpCreateParams={*}", .{lp});
-        
+
             const app: *App = @ptrCast(@alignCast(lp));
             applog.appLog("  app ptr={*} align={d}", .{ app, @alignOf(App) });
 
@@ -349,7 +348,7 @@ pub export fn WndProc(
         },
         c.WM_PAINT => {
             const log_enabled = applog.isEnabled();
-            if (log_enabled) applog.appLog("WM_PAINT tid={d}", .{ c.GetCurrentThreadId() });
+            if (log_enabled) applog.appLog("WM_PAINT tid={d}", .{c.GetCurrentThreadId()});
 
             if (getApp(hwnd)) |app| {
                 var ps: c.PAINTSTRUCT = undefined;
@@ -379,7 +378,7 @@ pub export fn WndProc(
                         ps.rcPaint
                     else
                         null;
-        
+
                 // Consume need_full_seed ONCE here.
                 const did_need_seed = app.need_full_seed.swap(false, .seq_cst);
                 if (did_need_seed) {
@@ -390,10 +389,10 @@ pub export fn WndProc(
 
                     // IMPORTANT: do not hold app.mu while calling into core.
                     updateLayoutToCore(hwnd, app);
-        
+
                     // Force full redraw request on this paint.
                     dirty = null;
-        
+
                     // Ensure we get a paint covering the whole surface.
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     {
@@ -403,7 +402,7 @@ pub export fn WndProc(
                         app.mu.unlock();
                     }
                 }
-        
+
                 // Note: row_mode/rows/main_verts length are logged after snapshotting under lock.
                 // if (dirty) |r| {
                 //     applog.appLog("[win]   dirty_rect=({d},{d})-({d},{d})\n", .{ r.left, r.top, r.right, r.bottom });
@@ -422,7 +421,7 @@ pub export fn WndProc(
                     updateRowsColsFromClient(hwnd, app);
                 }
                 // Snapshot state under lock.
-        
+
                 const row_mode = app.row_mode;
                 const seed_pending_snapshot = app.seed_pending;
                 const row_valid_count_snapshot = app.row_valid_count;
@@ -430,7 +429,7 @@ pub export fn WndProc(
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
                 const main_verts_len_snapshot: u32 = @intCast(app.main_verts.items.len);
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
-        
+
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
                 // Take pointers to the option payloads instead.
                 var atlas_ptr: ?*dwrite_d2d.Renderer = null;
@@ -484,7 +483,7 @@ pub export fn WndProc(
                 }
                 // Clear dirty rows set now (we have the snapshot).
                 app.dirty_rows.clearRetainingCapacity();
-        
+
                 // Also snapshot row_verts length (for logging / bounds).
                 const row_verts_len: u32 = @intCast(app.row_verts.items.len);
                 var effective_rows: u32 = rows_snapshot;
@@ -500,11 +499,11 @@ pub export fn WndProc(
                 defer paint_rects_snapshot.deinit(app.alloc);
                 paint_rects_snapshot.appendSlice(app.alloc, app.paint_rects.items) catch {};
                 app.paint_rects.clearRetainingCapacity();
-                
+
                 const paint_full_snapshot = app.paint_full;
                 app.paint_full = false;
 
-    app.mu.unlock();
+                app.mu.unlock();
 
                 if (log_enabled) {
                     t_snapshot_end_ns = std.time.nanoTimestamp();
@@ -514,13 +513,9 @@ pub export fn WndProc(
                     applog.appLog(
                         "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d} main_verts={d}\n",
                         .{
-                            ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom,
-                            if (dirty == null) "null" else "rect",
-                            @as(u32, @intFromBool(did_need_seed)),
-                            @as(u32, @intFromBool(row_mode)),
-                            rows_snapshot,
-                            row_verts_len,
-                            main_verts_len_snapshot,
+                            ps.rcPaint.left,                       ps.rcPaint.top,                        ps.rcPaint.right,                 ps.rcPaint.bottom,
+                            if (dirty == null) "null" else "rect", @as(u32, @intFromBool(did_need_seed)), @as(u32, @intFromBool(row_mode)), rows_snapshot,
+                            row_verts_len,                         main_verts_len_snapshot,
                         },
                     );
                     if (row_mode and rows_mismatch) {
@@ -530,7 +525,7 @@ pub export fn WndProc(
                         );
                     }
                 }
-        
+
                 // Flush atlas uploads (may be triggered by core updates).
                 // If uploads occurred, force a repaint so newly uploaded glyphs are drawn.
                 var atlas_uploads: u32 = 0;
@@ -551,7 +546,7 @@ pub export fn WndProc(
                     }
                 }
                 if (log_enabled and atlas_uploads != 0) {
-                    applog.appLog("[win] atlas_uploads flushed={d}\n", .{ atlas_uploads });
+                    applog.appLog("[win] atlas_uploads flushed={d}\n", .{atlas_uploads});
                 }
                 if (log_enabled) {
                     t_atlas_end_ns = std.time.nanoTimestamp();
@@ -599,6 +594,12 @@ pub export fn WndProc(
                         .{ 0.12, 0.12, 0.12, 1.0 }
                     else
                         null;
+                    const content_x_offset_i32: i32 = if (content_x_offset) |off| @intCast(off) else 0;
+                    const content_y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
+                    const content_right_i32: i32 = if (content_width) |cw|
+                        content_x_offset_i32 + @as(i32, @intCast(cw))
+                    else
+                        client_for_content.right;
 
                     // Post-process bloom (neon glow) state from core
                     const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
@@ -682,7 +683,7 @@ pub export fn WndProc(
                         if (log_enabled) {
                             t_row_start_ns = std.time.nanoTimestamp();
                         }
-        
+
                         // Build list of rows to draw.
                         // Rule:
                         // - After resize seed OR dirty==null (full redraw request), draw ALL cached rows.
@@ -730,11 +731,11 @@ pub export fn WndProc(
                                 }
                             }
                             rows_to_draw.items.len = w;
-                        
+
                             // Second: sort + unique (duplicates can happen)
                             if (rows_to_draw.items.len != 0) {
                                 std.sort.pdq(u32, rows_to_draw.items, {}, comptime std.sort.asc(u32));
-                        
+
                                 w = 0;
                                 i = 0;
                                 while (i < rows_to_draw.items.len) : (i += 1) {
@@ -861,7 +862,7 @@ pub export fn WndProc(
                             if (r <= l or b <= t) break :blk null;
                             break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
                         } else null;
-                        
+
                         const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
                         const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
                         const row_h_px_u32 = if (rows_mismatch)
@@ -1187,14 +1188,18 @@ pub export fn WndProc(
                                 if (!use_row_scissor) {
                                     if (log_enabled) applog.appLog("[win] WM_PAINT(row) seed_pending: scissor=full\n", .{});
                                     if (rs_set_sc_fn) |f| {
-                                        // Clamp to content width for "always" scrollbar mode
-                                        const scissor_right: c.LONG = if (content_width) |cw| @intCast(cw) else client.right;
                                         var sc_full: c.D3D11_RECT = .{
-                                            .left = 0,
-                                            .top = 0,
-                                            .right = scissor_right,
+                                            .left = content_x_offset_i32,
+                                            .top = content_y_offset_i32,
+                                            .right = content_right_i32,
                                             .bottom = client.bottom,
                                         };
+                                        if (log_enabled and content_x_offset_i32 != 0) {
+                                            applog.appLog(
+                                                "[win] WM_PAINT(row) seed scissor adjusted left={d} right={d} content_width={any}\n",
+                                                .{ sc_full.left, sc_full.right, content_width },
+                                            );
+                                        }
                                         f(ctx.?, 1, &sc_full);
                                     }
                                 }
@@ -1243,22 +1248,26 @@ pub export fn WndProc(
                                     }
 
                                     // Add content offsets for ext_tabline (scissor is in screen coords)
-                                    const y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
-                                    const x_offset: i32 = if (content_x_offset) |off| @intCast(off) else 0;
+                                    const y_offset: i32 = content_y_offset_i32;
+                                    const x_offset: i32 = content_x_offset_i32;
                                     const top: i32 = y_offset + @as(i32, @intCast(row)) * row_h_px;
                                     const bottom: i32 = top + row_h_px;
                                     const row_rc: c.RECT = .{ .left = x_offset, .top = top, .right = client.right, .bottom = bottom };
 
                                     if (use_row_scissor) {
                                         if (rs_set_sc_fn) |f| {
-                                            // Clamp to content width for "always" scrollbar mode
-                                            const scissor_right: c.LONG = if (content_width) |cw| @min(row_rc.right, @as(c.LONG, @intCast(cw))) else row_rc.right;
                                             var sc: c.D3D11_RECT = .{
                                                 .left = row_rc.left,
                                                 .top = row_rc.top,
-                                                .right = scissor_right,
+                                                .right = @min(row_rc.right, content_right_i32),
                                                 .bottom = row_rc.bottom,
                                             };
+                                            if (log_enabled and content_x_offset_i32 != 0 and row == 0 and i == 0) {
+                                                applog.appLog(
+                                                    "[win] WM_PAINT(row) row scissor adjusted left={d} right={d} content_right={d} client_right={d}\n",
+                                                    .{ sc.left, sc.right, content_right_i32, client.right },
+                                                );
+                                            }
                                             f(ctx.?, 1, &sc);
                                         }
                                     }
@@ -1367,9 +1376,8 @@ pub export fn WndProc(
                                         if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor hidden (blink off)\n", .{});
                                         // Redraw cursor row to clear cursor from back_tex
                                         if (cursor_rc_opt) |cr| {
-                                            const y_offset_i32: i32 = if (content_y_offset) |off| @intCast(off) else 0;
                                             if (row_h_px > 0) {
-                                                const cursor_row: usize = @intCast(@divFloor(@max(0, cr.top - y_offset_i32), row_h_px));
+                                                const cursor_row: usize = @intCast(@divFloor(@max(0, cr.top - content_y_offset_i32), row_h_px));
                                                 if (log_enabled) applog.appLog("[win] WM_PAINT(row) redrawing cursor_row={d} to clear\n", .{cursor_row});
                                                 if (cursor_row < app.row_verts.items.len) {
                                                     const rv = &app.row_verts.items[cursor_row];
@@ -1378,13 +1386,12 @@ pub export fn WndProc(
                                                         const src = rv.verts.items;
                                                         if (src.len > 0) {
                                                             // Set scissor to row
-                                                            const top_px: i32 = y_offset_i32 + @as(i32, @intCast(cursor_row)) * row_h_px;
+                                                            const top_px: i32 = content_y_offset_i32 + @as(i32, @intCast(cursor_row)) * row_h_px;
                                                             const bottom_px: i32 = top_px + row_h_px;
-                                                            const scissor_right: c.LONG = if (content_width) |cw| @as(c.LONG, @intCast(cw)) else client.right;
                                                             var sc: c.D3D11_RECT = .{
-                                                                .left = 0,
+                                                                .left = content_x_offset_i32,
                                                                 .top = top_px,
-                                                                .right = scissor_right,
+                                                                .right = content_right_i32,
                                                                 .bottom = bottom_px,
                                                             };
                                                             if (rs_set_sc_fn) |f| {
@@ -1718,7 +1725,10 @@ pub export fn WndProc(
                     "[win] WM_SIZE wParam={d} client=({d},{d})-({d},{d}) need_full_seed=1 atlas={s} gpu={s} resize_ns={d}\n",
                     .{
                         @as(u32, @intCast(wParam)),
-                        rc.left, rc.top, rc.right, rc.bottom,
+                        rc.left,
+                        rc.top,
+                        rc.right,
+                        rc.bottom,
                         if (app.atlas != null) "Y" else "N",
                         if (app.renderer != null) "Y" else "N",
                         app.last_resize_ns,
@@ -1739,7 +1749,7 @@ pub export fn WndProc(
                         0,
                         rc.right,
                         app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                        0,  // No SWP_NOZORDER - explicitly set Z-order
+                        0, // No SWP_NOZORDER - explicitly set Z-order
                     );
                 }
 
@@ -1799,8 +1809,10 @@ pub export fn WndProc(
                     if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: ok scalar={d} out_entry_ptr=0x{x} uv_min=({d:.6},{d:.6}) uv_max=({d:.6},{d:.6})", .{
                         scalar,
                         out_entry_ptr_bits,
-                        e.uv_min[0], e.uv_min[1],
-                        e.uv_max[0], e.uv_max[1],
+                        e.uv_min[0],
+                        e.uv_min[1],
+                        e.uv_max[0],
+                        e.uv_max[1],
                     });
 
                     return 1;
@@ -2763,9 +2775,12 @@ pub export fn WndProc(
                     var out_ign: [8]u8 = undefined;
 
                     const pair = input.toUnicodePairUtf8(
-                        vk, scancode,
-                        &tmp_chars, &tmp_ign,
-                        &out_chars, &out_ign,
+                        vk,
+                        scancode,
+                        &tmp_chars,
+                        &tmp_ign,
+                        &out_chars,
+                        &out_ign,
                     );
 
                     input.sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
@@ -3042,7 +3057,6 @@ pub export fn WndProc(
                     if (scrollbar.scrollbarMouseDown(hwnd, app, @as(i32, x), @as(i32, y))) {
                         return 0; // Handled by scrollbar
                     }
-
                 }
 
                 // Capture mouse to receive WM_MOUSEMOVE outside window
@@ -3278,10 +3292,22 @@ pub export fn WndProc(
 
                 var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
                 var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) { mod_buf[mod_len] = 'S'; mod_len += 1; }
-                if ((wParam & c.MK_CONTROL) != 0) { mod_buf[mod_len] = 'C'; mod_len += 1; }
-                if (c.GetKeyState(c.VK_MENU) < 0) { mod_buf[mod_len] = 'A'; mod_len += 1; }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) { mod_buf[mod_len] = 'D'; mod_len += 1; }
+                if ((wParam & c.MK_SHIFT) != 0) {
+                    mod_buf[mod_len] = 'S';
+                    mod_len += 1;
+                }
+                if ((wParam & c.MK_CONTROL) != 0) {
+                    mod_buf[mod_len] = 'C';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_MENU) < 0) {
+                    mod_buf[mod_len] = 'A';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+                    mod_buf[mod_len] = 'D';
+                    mod_len += 1;
+                }
                 mod_buf[mod_len] = 0;
 
                 app.last_mouse_grid_id = 1;
@@ -3333,10 +3359,22 @@ pub export fn WndProc(
 
                 var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
                 var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) { mod_buf[mod_len] = 'S'; mod_len += 1; }
-                if ((wParam & c.MK_CONTROL) != 0) { mod_buf[mod_len] = 'C'; mod_len += 1; }
-                if (c.GetKeyState(c.VK_MENU) < 0) { mod_buf[mod_len] = 'A'; mod_len += 1; }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) { mod_buf[mod_len] = 'D'; mod_len += 1; }
+                if ((wParam & c.MK_SHIFT) != 0) {
+                    mod_buf[mod_len] = 'S';
+                    mod_len += 1;
+                }
+                if ((wParam & c.MK_CONTROL) != 0) {
+                    mod_buf[mod_len] = 'C';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_MENU) < 0) {
+                    mod_buf[mod_len] = 'A';
+                    mod_len += 1;
+                }
+                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+                    mod_buf[mod_len] = 'D';
+                    mod_len += 1;
+                }
                 mod_buf[mod_len] = 0;
 
                 core.zonvie_core_send_mouse_input(
