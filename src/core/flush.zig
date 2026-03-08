@@ -370,6 +370,219 @@ pub const FlushCache = struct {
     }
 };
 
+// ---------------------------------------------------------------
+// Scroll-aware flush: fast path eligibility
+// ---------------------------------------------------------------
+
+pub const ScrollFallbackReason = enum(u8) {
+    eligible = 0,
+    no_pending_scroll,
+    multi_row_scroll, // |rows| > 1
+    horizontal_scroll, // cols != 0
+    partial_width, // left != 0 or right != target_cols
+    not_full_region, // top/bot don't cover scrollable region
+    rebuild_all_set, // resize/guifont/dirty_all forced full rebuild
+    atlas_retried, // atlas reset caused retry
+    multi_scroll_batch, // scrolled_count > 1
+    no_subgrid, // grid_id != 1 but not in sub_grids (shouldn't happen)
+};
+
+pub const ScrollFastPathResult = struct {
+    eligible: bool,
+    reason: ScrollFallbackReason,
+    scroll_op: ?grid_mod.ScrollOp,
+};
+
+/// Determine whether the current flush can use the scroll-optimized fast path.
+///
+/// Requirements:
+///   - scrolled_count == 1 (single scroll in batch)
+///   - grid_id >= 2 (multigrid content grid, not base grid)
+///   - win_pos_row == 0 (grid at top of main grid)
+///   - 0 < abs(rows) < region_height (vertical scroll within region)
+///   - cols == 0 (no horizontal scroll)
+///   - full width (left == 0, right == target_cols)
+///   - bot <= target_rows (valid region bounds)
+///   - no rebuild_all, no atlas retry
+///   - cached_subgrid_count <= 1 (no overlapping float windows)
+pub fn checkScrollFastPath(
+    grid: *const grid_mod.Grid,
+    rebuild_all: bool,
+    atlas_retried_flag: bool,
+    scrolled_count: u8,
+    cached_subgrid_count: usize,
+) ScrollFastPathResult {
+    const no = ScrollFastPathResult{ .eligible = false, .scroll_op = null, .reason = .no_pending_scroll };
+
+    const ps = grid.pending_scroll orelse
+        return no;
+
+    if (scrolled_count != 1)
+        return .{ .eligible = false, .reason = .multi_scroll_batch, .scroll_op = ps };
+    // Only support the main content grid (grid_id >= 2, typically 2).
+    // grid_id == 1 is the base grid and has different composition rules.
+    if (ps.grid_id < 2)
+        return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+    // win_pos_row == 0: the scrolling grid starts at main grid row 0.
+    // Non-zero win_pos means the grid is embedded at an offset and cache
+    // shift indices would not correspond to main grid row indices.
+    if (ps.win_pos_row != 0)
+        return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
+    // Multi-row scroll: abs(rows) must be positive and less than the scroll
+    // region height. If abs(rows) >= region height the entire region is vacated
+    // and there's nothing to reuse.
+    const abs_rows: u32 = if (ps.rows > 0) @intCast(ps.rows) else @intCast(-ps.rows);
+    const region_height: u32 = ps.bot -| ps.top;
+    // abs_rows must be < region_height (otherwise nothing to reuse) and
+    // <= 16 (stack buffer limit in shiftScrollCacheAndValidate).
+    if (abs_rows == 0 or abs_rows >= region_height or abs_rows > 16)
+        return .{ .eligible = false, .reason = .multi_row_scroll, .scroll_op = ps };
+    if (ps.cols != 0)
+        return .{ .eligible = false, .reason = .horizontal_scroll, .scroll_op = ps };
+    if (ps.left != 0 or ps.right != ps.target_cols)
+        return .{ .eligible = false, .reason = .partial_width, .scroll_op = ps };
+    // Scroll region must not exceed the grid bounds.
+    // top < bot is guaranteed by the abs_rows check above.
+    if (ps.bot > ps.target_rows)
+        return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
+    if (rebuild_all)
+        return .{ .eligible = false, .reason = .rebuild_all_set, .scroll_op = ps };
+    if (atlas_retried_flag)
+        return .{ .eligible = false, .reason = .atlas_retried, .scroll_op = ps };
+    // Overlapping subgrids (float windows etc.) make row reuse unsafe
+    // because their content overlays main grid rows in compose.
+    // cached_subgrid_count == 1 means only the scrolling grid itself is composited;
+    // >1 means additional float/overlay grids are present.
+    if (cached_subgrid_count > 1)
+        return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+
+    return .{ .eligible = true, .reason = .eligible, .scroll_op = ps };
+}
+
+/// Result of scroll cache shift + validity check.
+pub const ScrollCacheShiftResult = struct {
+    /// True if all non-regen rows have valid cache after shift.
+    fast_path_ok: bool,
+    /// Number of cached rows that would be emitted (valid, non-regen).
+    cached_emit_count: u32,
+    /// Number of cached rows with vert_count == 0 (empty row emission).
+    empty_emit_count: u32,
+};
+
+/// Perform scroll cache shift + y-adjust + validity check.
+/// Extracted from onFlush for testability.
+///
+/// Operates directly on core.scroll_cache / scroll_cache_valid.
+/// After return, cache entries are shifted and y-adjusted.
+/// Caller decides whether to emit or fall back based on result.
+pub fn shiftScrollCacheAndValidate(
+    core: *Core,
+    scroll_top: usize,
+    scroll_bot: usize,
+    scroll_rows_raw: i32,
+    delta_y: f32,
+    total_rows: u32,
+    regen_rows: []const u32,
+) ScrollCacheShiftResult {
+    if (core.scroll_cache_rows != total_rows) {
+        return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+    }
+
+    // Shift cache entries within scroll region.
+    // For shift > 1, multiple rows scroll off and multiple rows become vacant.
+    if (scroll_rows_raw > 0) {
+        const shift: usize = @intCast(scroll_rows_raw);
+        // Save scrolled-off row buffers for reuse at vacated positions
+        var saved_bufs: [16]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        for (0..shift) |s| {
+            saved_bufs[s] = core.scroll_cache.items[scroll_top + s];
+        }
+        // Shift: row[i] <- row[i + shift], adjust y
+        var i: usize = scroll_top;
+        while (i + shift < scroll_bot) : (i += 1) {
+            core.scroll_cache.items[i] = core.scroll_cache.items[i + shift];
+            for (core.scroll_cache.items[i].items) |*v| {
+                v.position[1] += delta_y;
+            }
+            if (core.scroll_cache_valid.isSet(i + shift)) {
+                core.scroll_cache_valid.set(i);
+            } else {
+                core.scroll_cache_valid.unset(i);
+            }
+        }
+        // Vacated rows at region bottom: reuse saved buffers, mark invalid
+        for (0..shift) |s| {
+            saved_bufs[s].clearRetainingCapacity();
+            core.scroll_cache.items[scroll_bot - shift + s] = saved_bufs[s];
+            core.scroll_cache_valid.unset(scroll_bot - shift + s);
+        }
+    } else if (scroll_rows_raw < 0) {
+        const shift: usize = @intCast(-scroll_rows_raw);
+        // Save scrolled-off row buffers for reuse at vacated positions
+        var saved_bufs: [16]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        for (0..shift) |s| {
+            saved_bufs[s] = core.scroll_cache.items[scroll_bot - 1 - s];
+        }
+        // Shift: row[i] <- row[i - shift], adjust y
+        var i: usize = scroll_bot - 1;
+        while (i >= scroll_top + shift) : (i -= 1) {
+            core.scroll_cache.items[i] = core.scroll_cache.items[i - shift];
+            for (core.scroll_cache.items[i].items) |*v| {
+                v.position[1] += delta_y;
+            }
+            if (core.scroll_cache_valid.isSet(i - shift)) {
+                core.scroll_cache_valid.set(i);
+            } else {
+                core.scroll_cache_valid.unset(i);
+            }
+            if (i == scroll_top + shift) break;
+        }
+        // Vacated rows at region top: reuse saved buffers, mark invalid
+        for (0..shift) |s| {
+            saved_bufs[s].clearRetainingCapacity();
+            core.scroll_cache.items[scroll_top + s] = saved_bufs[s];
+            core.scroll_cache_valid.unset(scroll_top + s);
+        }
+    }
+
+    // Mark regen rows as invalid
+    for (regen_rows) |rr| {
+        if (rr < total_rows) {
+            core.scroll_cache_valid.unset(rr);
+        }
+    }
+
+    // Check all non-regen rows have valid cache
+    var all_valid = true;
+    var cached_emit_count: u32 = 0;
+    var empty_emit_count: u32 = 0;
+    for (0..total_rows) |ri| {
+        var is_regen = false;
+        for (regen_rows) |rr| {
+            if (rr == @as(u32, @intCast(ri))) {
+                is_regen = true;
+                break;
+            }
+        }
+        if (is_regen) continue;
+
+        if (!core.scroll_cache_valid.isSet(ri)) {
+            all_valid = false;
+            break;
+        }
+        cached_emit_count += 1;
+        if (core.scroll_cache.items[ri].items.len == 0) {
+            empty_emit_count += 1;
+        }
+    }
+
+    return .{
+        .fast_path_ok = all_valid,
+        .cached_emit_count = cached_emit_count,
+        .empty_emit_count = empty_emit_count,
+    };
+}
+
 pub const FlushCtx = struct {
     core: *Core,
 
@@ -402,6 +615,11 @@ pub const FlushCtx = struct {
         // This allows Swift to clear pixel offsets before new vertices are rendered,
         // preventing double-shift glitches in split windows.
         const scrolled_count = ctx.core.grid.scrolled_grid_count;
+        // Snapshot scrolled grid IDs before clearScrolledGrids() zeroes the array
+        var scrolled_ids_snapshot: [16]i64 = undefined;
+        if (scrolled_count > 0) {
+            @memcpy(scrolled_ids_snapshot[0..scrolled_count], ctx.core.grid.scrolled_grid_ids[0..scrolled_count]);
+        }
         if (perf_enabled and scrolled_count > 0) {
             ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} content_rev={d} dirty_all={any}\n", .{
                 scrolled_count, ctx.core.grid.content_rev, ctx.core.grid.dirty_all,
@@ -528,7 +746,11 @@ pub const FlushCtx = struct {
             const need_cursor: bool = (ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev);
 
             // If nothing changed, avoid doing any work.
-            if (!need_main and !need_cursor) return;
+            if (!need_main and !need_cursor) {
+                ctx.core.grid.clearDirty();
+                ctx.core.grid.clearScrollState();
+                return;
+            }
 
             var main = &ctx.core.main_verts;
             var cursor = &ctx.core.cursor_verts;
@@ -854,6 +1076,36 @@ pub const FlushCtx = struct {
                         t_rows_start_ns = std.time.nanoTimestamp();
                     }
 
+                    // Scroll-aware flush diagnostics: log scroll state and fast-path eligibility
+                    if (log_enabled and scrolled_count > 0) {
+                        const cached_sg_count = ctx.core.grid_entries.items.len;
+                        ctx.core.log.write(
+                            "[scroll_debug] flush_row_mode dirty_rows={d} rebuild_all={any} scrolled_count={d} scrolled_grid_ids[0]={d} subgrid_count={d} cursor_row={d} cursor_col={d}\n",
+                            .{ log_dirty_rows, rebuild_all, scrolled_count, scrolled_ids_snapshot[0], cached_sg_count, ctx.core.grid.cursor_row, ctx.core.grid.cursor_col },
+                        );
+                        if (ctx.core.grid.pending_scroll) |ps| {
+                            ctx.core.log.write(
+                                "[scroll_debug] pending_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target={d}x{d} win_pos_row={d} prev_cursor_row={any}\n",
+                                .{ ps.grid_id, ps.top, ps.bot, ps.left, ps.right, ps.rows, ps.cols, ps.target_rows, ps.target_cols, ps.win_pos_row, ctx.core.grid.prev_cursor_row },
+                            );
+                            const tc = ctx.core.grid.scroll_touched_count;
+                            if (tc > 0) {
+                                const touched = ctx.core.grid.scroll_touched_rows[0..tc];
+                                if (tc >= 4) {
+                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d},{d},{d},...]\n", .{ tc, touched[0], touched[1], touched[2], touched[3] });
+                                } else if (tc == 3) {
+                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d},{d}]\n", .{ tc, touched[0], touched[1], touched[2] });
+                                } else if (tc == 2) {
+                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d}]\n", .{ tc, touched[0], touched[1] });
+                                } else {
+                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d}]\n", .{ tc, touched[0] });
+                                }
+                            } else {
+                                ctx.core.log.write("[scroll_debug] touched_rows count=0\n", .{});
+                            }
+                        }
+                    }
+
                     // Initialize dynamic caches if not already done
                     ctx.core.initHlCache() catch {
                         ctx.core.log.write("[flush] Failed to initialize hl cache\n", .{});
@@ -897,8 +1149,14 @@ pub const FlushCtx = struct {
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
 
+                    // Ensure scroll cache is sized for row-mode flush.
+                    // This prepares the cache so fallback path can populate it
+                    // for future fast-path reuse.
+                    ctx.core.ensureScrollCache(rows) catch {};
+
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
+                    var used_scroll_fast_path: bool = false;
 
                     retry_loop: while (true) {
                         // On retry: force all rows (stale UVs in non-dirty rows too)
@@ -923,9 +1181,135 @@ pub const FlushCtx = struct {
                             // glyph caches already cleared by resetGlyphCacheFlags() inside resetCoreAtlas()
                         }
 
+                    // Scroll-aware fast path eligibility check
+                    const scroll_check = checkScrollFastPath(
+                        &ctx.core.grid,
+                        effective_rebuild_all,
+                        atlas_retried,
+                        @intCast(scrolled_count),
+                        cached_subgrid_count,
+                    );
+                    if (log_enabled and scrolled_count > 0) {
+                        ctx.core.log.write(
+                            "[scroll_debug] fast_path eligible={any} reason={d} touched={d}\n",
+                            .{ scroll_check.eligible, @intFromEnum(scroll_check.reason), ctx.core.grid.scroll_touched_count },
+                        );
+                    }
+
+                    // Build the set of rows to compose this pass.
+                    // Fast path: only touched_rows + prev_cursor_row (frontend retains other rows).
+                    // Fallback: all dirty rows (existing behavior).
+                    var regen_rows: [12]u32 = undefined; // max: 8 touched + prev_cursor + margin
+                    var regen_count: u32 = 0;
+                    var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
+
+                    if (use_scroll_fast_path) {
+                        // Add all touched rows (from grid_line after scroll)
+                        const tc = ctx.core.grid.scroll_touched_count;
+                        for (ctx.core.grid.scroll_touched_rows[0..tc]) |tr| {
+                            if (tr < rows) {
+                                regen_rows[regen_count] = tr;
+                                regen_count += 1;
+                            }
+                        }
+                        // Add prev_cursor_row if set and not already in list
+                        if (ctx.core.grid.prev_cursor_row) |pcr| {
+                            if (pcr < rows) {
+                                var found = false;
+                                for (regen_rows[0..regen_count]) |existing| {
+                                    if (existing == pcr) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found and regen_count < regen_rows.len) {
+                                    regen_rows[regen_count] = pcr;
+                                    regen_count += 1;
+                                }
+                            }
+                        }
+
+                        // --- Scroll cache: shift + y-adjust + validity check ---
+                        const cache_ready = ctx.core.scroll_cache_rows == rows;
+
+                        if (cache_ready) {
+                            const scroll_op = scroll_check.scroll_op.?;
+                            // position[1] is NDC: ndc_y = 1.0 - (y_px / dh) * 2.0
+                            // delta_ndc_y = scroll_rows * cellH / dh * 2.0
+                            const delta_y: f32 = @as(f32, @floatFromInt(scroll_op.rows)) * cellH / dh * 2.0;
+                            const scroll_top: usize = @intCast(scroll_op.top + scroll_op.win_pos_row);
+                            const scroll_bot: usize = @intCast(scroll_op.bot + scroll_op.win_pos_row);
+
+                            const shift_result = shiftScrollCacheAndValidate(
+                                ctx.core,
+                                scroll_top,
+                                scroll_bot,
+                                scroll_op.rows,
+                                delta_y,
+                                rows,
+                                regen_rows[0..regen_count],
+                            );
+
+                            if (!shift_result.fast_path_ok) {
+                                use_scroll_fast_path = false;
+                                if (log_enabled) {
+                                    ctx.core.log.write("[scroll_debug] fast_path cancelled: non-regen rows have invalid cache\n", .{});
+                                }
+                            }
+                        }
+
+                        // Record final fast path decision for perf logging
+                        used_scroll_fast_path = use_scroll_fast_path and cache_ready;
+
+                        // Only emit cached rows if fast path is still active
+                        if (used_scroll_fast_path) {
+                            for (0..rows) |ri| {
+                                const row_idx: u32 = @intCast(ri);
+                                // Skip regen rows (will be composed below)
+                                var is_regen = false;
+                                for (regen_rows[0..regen_count]) |rr| {
+                                    if (rr == row_idx) {
+                                        is_regen = true;
+                                        break;
+                                    }
+                                }
+                                if (is_regen) continue;
+
+                                if (ctx.core.scroll_cache_valid.isSet(ri)) {
+                                    const cached = &ctx.core.scroll_cache.items[ri];
+                                    // Always emit, even when len==0 (empty/bg-only row).
+                                    // Frontend retains previous content for rows with no callback,
+                                    // so we must send empty updates to clear stale content.
+                                    // len==0: pass null pointer with count 0.
+                                    // Frontend must handle vert_count==0 as "clear row".
+                                    const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
+                                    row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
+                                }
+                            }
+                        }
+
+                        if (log_enabled) {
+                            ctx.core.log.write(
+                                "[scroll_debug] fast_path regen_count={d}/{d} cache_ready={any}\n",
+                                .{ regen_count, rows, cache_ready },
+                            );
+                            log_dirty_rows = regen_count;
+                        }
+                    }
+
                     var r: u32 = 0;
                     while (r < rows) : (r += 1) {
-                        if (!effective_rebuild_all) {
+                        if (use_scroll_fast_path) {
+                            // Fast path: only compose rows in regen set
+                            var in_regen = false;
+                            for (regen_rows[0..regen_count]) |rr| {
+                                if (rr == r) {
+                                    in_regen = true;
+                                    break;
+                                }
+                            }
+                            if (!in_regen) continue;
+                        } else if (!effective_rebuild_all) {
                             if (!ctx.core.grid.dirty_rows.isSet(@as(usize, r))) continue;
                         }
 
@@ -1887,6 +2271,15 @@ pub const FlushCtx = struct {
                             break;
                         }
 
+                        // Store composed vertices in scroll cache for future reuse
+                        if (r < ctx.core.scroll_cache_rows) {
+                            var cached_row = &ctx.core.scroll_cache.items[r];
+                            cached_row.clearRetainingCapacity();
+                            cached_row.ensureTotalCapacity(ctx.core.alloc, out.items.len) catch {};
+                            cached_row.appendSliceAssumeCapacity(out.items);
+                            ctx.core.scroll_cache_valid.set(r);
+                        }
+
                         // Contract: row_count == 1, grid_id == 1 for main window
                         row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
                     }
@@ -1894,10 +2287,12 @@ pub const FlushCtx = struct {
                     }
 
                     ctx.core.grid.clearDirty();
+                    ctx.core.grid.clearScrollState();
                     if (had_glyph_miss or saw_atlas_reset) {
                         ctx.core.grid.markAllDirty();
-                        // Also mark external grids dirty (atlas reset invalidates their UVs too)
+                        // Atlas reset invalidates cached UVs in scroll cache too
                         if (saw_atlas_reset) {
+                            ctx.core.invalidateScrollCache();
                             var sg_it = ctx.core.grid.sub_grids.valueIterator();
                             while (sg_it.next()) |sg| {
                                 sg.dirty = true;
@@ -1917,8 +2312,8 @@ pub const FlushCtx = struct {
                         const t_rows_done_ns: i128 = std.time.nanoTimestamp();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
-                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d}\n",
-                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us },
+                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any}\n",
+                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us, used_scroll_fast_path },
                         );
                         // Cache statistics: helps tune cache sizes and identify bottlenecks
                         ctx.core.log.write(
@@ -2659,10 +3054,13 @@ pub const FlushCtx = struct {
                     cur_ptr_opt,  if (need_cursor) cursor.items.len else 0,
                     flags,
                 );
+                ctx.core.grid.clearDirty();
+                ctx.core.grid.clearScrollState();
                 return;
             }
 
             // If main was sent via row callback, do not call legacy full callback.
+            // Row-mode path already cleared dirty/scroll state before reaching here.
             if (sent_main_by_rows) return;
 
             // Legacy path: must always provide BOTH buffers to avoid frontend clearing main on cursor-only updates.
@@ -2672,10 +3070,14 @@ pub const FlushCtx = struct {
                     main.items.ptr, main.items.len,
                     cursor.items.ptr, cursor.items.len,
                 );
+                ctx.core.grid.clearDirty();
+                ctx.core.grid.clearScrollState();
                 return;
             }
 
             // No callback (shouldn't happen because we gated above), but keep safe:
+            ctx.core.grid.clearDirty();
+            ctx.core.grid.clearScrollState();
             return;
 
         }
@@ -2692,6 +3094,8 @@ pub const FlushCtx = struct {
         if (ctx.core.isPhase2Atlas()) {
             ctx.core.resetCoreAtlas();
         }
+        // Scroll cache uses atlas UVs; invalidate on font/atlas change.
+        ctx.core.invalidateScrollCache();
 
         // Mark ALL grids dirty so row-mode vertex generation re-renders
         // every row with the new font/atlas. Without this, the main grid

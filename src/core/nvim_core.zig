@@ -362,6 +362,14 @@ pub const Core = struct {
 
     row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .{},
 
+    // Scroll-aware flush: per-row vertex cache.
+    // Each entry holds the last emitted vertices for that row.
+    // On scroll, entries are logically shifted and y-coordinates adjusted.
+    // Invalidated on resize, guifont, atlas reset.
+    scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .{},
+    scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
+    scroll_cache_rows: u32 = 0,
+
     // Reusable scratch buffers (zero-allocation hot path)
     tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
@@ -589,6 +597,45 @@ pub const Core = struct {
         };
     }
 
+    /// Lightweight constructor for unit tests. No callbacks, no threads.
+    pub fn initForTest(alloc: std.mem.Allocator) Core {
+        return .{
+            .alloc = alloc,
+            .cb = .{},
+            .ctx = null,
+            .log = .{ .cb = null, .ctx = null },
+            .grid = Grid.init(alloc),
+            .hl = Highlights.init(alloc),
+        };
+    }
+
+    /// Cleanup for test-created Core instances (no threads/processes to join).
+    pub fn deinitForTest(self: *Core) void {
+        self.hl.deinit();
+        self.grid.deinit();
+        self.main_verts.deinit(self.alloc);
+        self.cursor_verts.deinit(self.alloc);
+        self.row_verts.deinit(self.alloc);
+        for (self.scroll_cache.items) |*row_cache| {
+            row_cache.deinit(self.alloc);
+        }
+        self.scroll_cache.deinit(self.alloc);
+        self.scroll_cache_valid.deinit(self.alloc);
+        self.tmp_cells.deinit(self.alloc);
+        self.row_cells.deinit(self.alloc);
+        self.grid_entries.deinit(self.alloc);
+        self.key_buf.deinit(self.alloc);
+        self.write_queue.deinit(self.alloc);
+        self.shaping_bufs.deinit(self.alloc);
+        self.shaping_scalars.deinit(self.alloc);
+        self.shaping_col_widths.deinit(self.alloc);
+        self.freeGlowGroupNames();
+        self.glow_group_names.deinit(self.alloc);
+        if (self.glow_hl_ids) |*m| m.deinit();
+        self.deinitHlCache();
+        self.deinitGlyphCache();
+    }
+
     pub fn start(self: *Core, nvim_path: []const u8, rows: u32, cols: u32) !void {
         self.init_rows = rows;
         self.init_cols = cols;
@@ -652,6 +699,11 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        for (self.scroll_cache.items) |*row_cache| {
+            row_cache.deinit(self.alloc);
+        }
+        self.scroll_cache.deinit(self.alloc);
+        self.scroll_cache_valid.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
@@ -677,6 +729,41 @@ pub const Core = struct {
         // Free caches
         self.deinitHlCache();
         self.deinitGlyphCache();
+    }
+
+    /// Ensure scroll_cache has exactly `target_rows` entries.
+    /// Grows or shrinks the per-row vertex lists as needed.
+    pub fn ensureScrollCache(self: *Core, target_rows: u32) !void {
+        const cur = self.scroll_cache_rows;
+        if (cur == target_rows and self.scroll_cache.items.len == target_rows) return;
+
+        // Shrink: deinit excess row buffers
+        if (self.scroll_cache.items.len > target_rows) {
+            for (self.scroll_cache.items[target_rows..]) |*row_buf| {
+                row_buf.deinit(self.alloc);
+            }
+            self.scroll_cache.items.len = target_rows;
+        }
+
+        // Grow: append empty row buffers
+        while (self.scroll_cache.items.len < target_rows) {
+            try self.scroll_cache.append(self.alloc, .{});
+        }
+
+        // Resize the valid bitset
+        if (self.scroll_cache_valid.bit_length != target_rows) {
+            self.scroll_cache_valid.deinit(self.alloc);
+            self.scroll_cache_valid = try std.DynamicBitSetUnmanaged.initEmpty(self.alloc, target_rows);
+        }
+        self.scroll_cache_rows = target_rows;
+    }
+
+    /// Invalidate all scroll cache entries (e.g., on resize, guifont, atlas reset).
+    pub fn invalidateScrollCache(self: *Core) void {
+        if (self.scroll_cache_valid.bit_length != 0) {
+            self.scroll_cache_valid.unsetAll();
+        }
+        self.scroll_cache_rows = 0;
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)

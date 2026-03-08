@@ -4,6 +4,8 @@ pub const config = @import("config.zig");
 
 // Re-exports for test access
 pub const nvim_core = core;
+pub const grid_mod = @import("grid.zig");
+pub const flush_mod = @import("flush.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 

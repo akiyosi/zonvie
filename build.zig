@@ -121,4 +121,19 @@ pub fn build(b: *std.Build) !void {
         .root_module = msgpack_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(msgpack_tests).step);
+
+    // Scroll fast path tests
+    const scroll_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/scroll_fast_path_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const scroll_tests = b.addTest(.{
+        .root_module = scroll_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
 }

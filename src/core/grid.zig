@@ -731,6 +731,24 @@ pub const Viewport = struct {
     scroll_delta: i64 = 0,
 };
 
+/// Describes a pending grid_scroll operation preserved until flush.
+/// Used by scroll-aware flush to determine whether row cache can be reused
+/// instead of recomposing all dirty rows.
+pub const ScrollOp = struct {
+    grid_id: i64,
+    top: u32,
+    bot: u32,
+    left: u32,
+    right: u32,
+    rows: i32, // positive = scroll up (content moves up), negative = scroll down
+    cols: i32,
+    /// Grid dimensions at scroll time (target grid, not necessarily main grid)
+    target_rows: u32,
+    target_cols: u32,
+    /// Main grid row offset from win_pos (0 if grid_id == 1)
+    win_pos_row: u32,
+};
+
 pub const Grid = struct {
     alloc: std.mem.Allocator,
 
@@ -839,6 +857,24 @@ pub const Grid = struct {
     // Track grid_ids that received grid_scroll events (for frontend pixel offset clearing)
     scrolled_grid_ids: [16]i64 = [_]i64{0} ** 16,
     scrolled_grid_count: u8 = 0,
+
+    // Pending scroll operation for scroll-aware flush optimization.
+    // Set by scrollGrid(), consumed and cleared by flush via clearDirty().
+    // When present, flush can potentially reuse row cache instead of recomposing all rows.
+    // Invalidated (set to null) if a second grid_scroll arrives in the same batch.
+    pending_scroll: ?ScrollOp = null,
+
+    // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
+    // These are main grid coordinates (already offset by win_pos for sub-grids).
+    // Tracked as a fixed-size array to avoid allocation. Overflow invalidates pending_scroll.
+    scroll_touched_rows: [8]u32 = undefined,
+    scroll_touched_count: u8 = 0,
+
+    // Previous cursor row before grid_cursor_goto update.
+    // Stored as main grid coordinate (offset by win_pos for sub-grid cursors).
+    // Used by scroll-aware flush to know which rows need cursor redraw.
+    // Set by setCursor(), cleared by clearScrollState().
+    prev_cursor_row: ?u32 = null,
 
     pub fn init(alloc: std.mem.Allocator) Grid {
         return .{ .alloc = alloc };
@@ -987,6 +1023,28 @@ pub const Grid = struct {
         // Fast path: avoid setting all bits; dirty_all dominates.
         self.dirty_all = true;
     }
+
+    /// Record a row touched by grid_line while a pending_scroll is active.
+    /// Uses main grid coordinates. Deduplicates entries.
+    /// On overflow, invalidates pending_scroll (too many touched rows for fast path).
+    fn recordScrollTouchedRow(self: *Grid, row: u32) void {
+        if (self.pending_scroll == null) return;
+
+        // Deduplicate: check if already recorded
+        for (self.scroll_touched_rows[0..self.scroll_touched_count]) |r| {
+            if (r == row) return;
+        }
+
+        // Overflow: too many distinct touched rows, invalidate scroll optimization
+        if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
+            self.pending_scroll = null;
+            self.scroll_touched_count = 0;
+            return;
+        }
+
+        self.scroll_touched_rows[self.scroll_touched_count] = row;
+        self.scroll_touched_count += 1;
+    }
     
     pub fn clearDirty(self: *Grid) void {
         self.dirty_all = false;
@@ -994,6 +1052,14 @@ pub const Grid = struct {
         if (self.dirty_rows.bit_length != 0) {
             self.dirty_rows.unsetAll();
         }
+    }
+
+    /// Clear scroll-aware flush provenance (pending_scroll, touched rows, prev cursor).
+    /// Called by flush after successful vertex emission, NOT on abort/retry.
+    pub fn clearScrollState(self: *Grid) void {
+        self.pending_scroll = null;
+        self.scroll_touched_count = 0;
+        self.prev_cursor_row = null;
     }
 
     pub fn clear(self: *Grid) void {
@@ -1037,7 +1103,7 @@ pub const Grid = struct {
 
     pub fn putCell(self: *Grid, row: u32, col: u32, cp: u32, hl: u32) void {
         if (row >= self.rows or col >= self.cols) return;
-    
+
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
 
         // If no actual change, do nothing (avoid increasing dirty state)
@@ -1049,6 +1115,9 @@ pub const Grid = struct {
 
         // Treat only actual changes as dirty
         self.markDirtyRow(row);
+
+        // Record touched row for scroll-aware flush (main grid coordinate)
+        self.recordScrollTouchedRow(row);
 
         // Advance content_rev only on cell changes (defined in Grid)
         self.content_rev +%= 1;
@@ -1206,6 +1275,8 @@ pub const Grid = struct {
                 if (self.win_pos.get(grid_id)) |p| {
                     const tr = p.row + row;
                     self.markDirtyRow(tr);
+                    // Record touched row for scroll-aware flush (main grid coordinate)
+                    self.recordScrollTouchedRow(tr);
                 } else {
                     // position unknown -> safest
                     self.markAllDirty();
@@ -1226,6 +1297,13 @@ pub const Grid = struct {
     ) void {
         defer self.content_rev +%= 1;
 
+        // Invalidate pending scroll if a second grid_scroll arrives in same batch.
+        // Multiple scrolls in one batch are too complex for fast path.
+        if (self.pending_scroll != null) {
+            self.pending_scroll = null;
+            self.scroll_touched_count = 0;
+        }
+
         // Advance cursor_rev if cursor is in scroll region (cursor text may change)
         if (self.cursor_grid == grid_id and
             self.cursor_row >= top and self.cursor_row < bot and
@@ -1238,15 +1316,34 @@ pub const Grid = struct {
             self.scroll(top, bot, left, right, rows, cols);
             // Record scroll event for frontend notification (pixel offset clearing)
             self.recordScrolledGrid(grid_id);
+            // Record pending scroll for scroll-aware flush optimization
+            self.pending_scroll = .{
+                .grid_id = grid_id,
+                .top = top, .bot = bot, .left = left, .right = right,
+                .rows = rows, .cols = cols,
+                .target_rows = self.rows, .target_cols = self.cols,
+                .win_pos_row = 0,
+            };
+            self.scroll_touched_count = 0;
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll(top, bot, left, right, rows, cols);
+            const win_pos_row: u32 = if (self.win_pos.get(grid_id)) |p| p.row else 0;
             if (self.win_pos.get(grid_id)) |p| {
                 self.markDirtyRect(p.row + top, p.row + bot);
             } else {
                 self.markAllDirty();
             }
+            // Record pending scroll for scroll-aware flush optimization
+            self.pending_scroll = .{
+                .grid_id = grid_id,
+                .top = top, .bot = bot, .left = left, .right = right,
+                .rows = rows, .cols = cols,
+                .target_rows = sg.rows, .target_cols = sg.cols,
+                .win_pos_row = win_pos_row,
+            };
+            self.scroll_touched_count = 0;
 
             // Record scroll event for frontend notification (pixel offset clearing)
             self.recordScrolledGrid(grid_id);
@@ -1488,6 +1585,16 @@ pub const Grid = struct {
             (self.cursor_grid != grid_id) or
             (self.cursor_row != row) or
             (self.cursor_col != col);
+
+        // Record previous cursor row for scroll-aware flush (only first move per batch).
+        // Stored as main grid coordinate (offset by win_pos for sub-grids).
+        if (changed and self.prev_cursor_row == null and self.cursor_valid) {
+            const win_offset: u32 = if (self.cursor_grid != 1)
+                if (self.win_pos.get(self.cursor_grid)) |p| p.row else 0
+            else
+                0;
+            self.prev_cursor_row = win_offset + self.cursor_row;
+        }
 
         self.cursor_grid = grid_id;
         self.cursor_row = row;

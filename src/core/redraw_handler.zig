@@ -999,6 +999,20 @@ pub fn handleRedraw(
                 // No-op scroll: avoid touching dirty state for nothing.
                 if (rows == 0 and cols == 0) continue;
 
+                if (log.cb != null) {
+                    var target_rows: u32 = grid.rows;
+                    var target_cols: u32 = grid.cols;
+                    if (grid_id != 1) {
+                        if (grid.sub_grids.getPtr(grid_id)) |sg| {
+                            target_rows = sg.rows;
+                            target_cols = sg.cols;
+                        }
+                    }
+                    log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
+                        grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
+                    });
+                }
+
                 // Apply scroll to the target grid under ext_multigrid.
                 grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
             }
@@ -1857,8 +1871,9 @@ pub fn handleRedraw(
         } else if (std.mem.eql(u8, name, "flush")) {
             if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
             try flush_fn(flush_ctx, grid.rows, grid.cols);
-
-            grid.clearDirty();
+            // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
+            // inside onFlush on successful completion. On abort, all state is
+            // preserved for the next flush attempt.
         }
     }
 }
