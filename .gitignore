@@ -17,3 +17,4 @@ build/
 
 # Local Claude instructions
 CLAUDE.local.md
+AGENTS.md
