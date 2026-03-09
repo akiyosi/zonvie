@@ -377,6 +377,7 @@ pub const FlushCache = struct {
 pub const ScrollFallbackReason = enum(u8) {
     eligible = 0,
     no_pending_scroll,
+    blocked_batch, // multiple grid_scroll events in one batch
     multi_row_scroll, // |rows| > 1
     horizontal_scroll, // cols != 0
     partial_width, // left != 0 or right != target_cols
@@ -399,12 +400,13 @@ pub const ScrollFastPathResult = struct {
 ///   - scrolled_count == 1 (single scroll in batch)
 ///   - grid_id >= 2 (multigrid content grid, not base grid)
 ///   - win_pos_row == 0 (grid at top of main grid)
-///   - 0 < abs(rows) < region_height (vertical scroll within region)
+///   - abs(rows) == 1 (single-line content shift only)
 ///   - cols == 0 (no horizontal scroll)
 ///   - full width (left == 0, right == target_cols)
 ///   - bot <= target_rows (valid region bounds)
 ///   - no rebuild_all, no atlas retry
 ///   - cached_subgrid_count <= 1 (no overlapping float windows)
+///
 pub fn checkScrollFastPath(
     grid: *const grid_mod.Grid,
     rebuild_all: bool,
@@ -417,9 +419,10 @@ pub fn checkScrollFastPath(
     const ps = grid.pending_scroll orelse
         return no;
 
+    if (grid.scroll_fast_path_blocked)
+        return .{ .eligible = false, .reason = .blocked_batch, .scroll_op = ps };
     if (scrolled_count != 1)
         return .{ .eligible = false, .reason = .multi_scroll_batch, .scroll_op = ps };
-    // Only support the main content grid (grid_id >= 2, typically 2).
     // grid_id == 1 is the base grid and has different composition rules.
     if (ps.grid_id < 2)
         return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
@@ -428,31 +431,23 @@ pub fn checkScrollFastPath(
     // shift indices would not correspond to main grid row indices.
     if (ps.win_pos_row != 0)
         return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
-    // Multi-row scroll: abs(rows) must be positive and less than the scroll
-    // region height. If abs(rows) >= region height the entire region is vacated
-    // and there's nothing to reuse.
-    const abs_rows: u32 = if (ps.rows > 0) @intCast(ps.rows) else @intCast(-ps.rows);
     const region_height: u32 = ps.bot -| ps.top;
-    // abs_rows must be < region_height (otherwise nothing to reuse) and
-    // <= 16 (stack buffer limit in shiftScrollCacheAndValidate).
-    if (abs_rows == 0 or abs_rows >= region_height or abs_rows > 16)
+    const abs_rows: u32 = blk: {
+        if (ps.rows == std.math.minInt(i32)) break :blk region_height;
+        break :blk @intCast(if (ps.rows < 0) -ps.rows else ps.rows);
+    };
+    if (abs_rows != 1 or region_height <= 1)
         return .{ .eligible = false, .reason = .multi_row_scroll, .scroll_op = ps };
     if (ps.cols != 0)
         return .{ .eligible = false, .reason = .horizontal_scroll, .scroll_op = ps };
     if (ps.left != 0 or ps.right != ps.target_cols)
         return .{ .eligible = false, .reason = .partial_width, .scroll_op = ps };
-    // Scroll region must not exceed the grid bounds.
-    // top < bot is guaranteed by the abs_rows check above.
     if (ps.bot > ps.target_rows)
         return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
     if (rebuild_all)
         return .{ .eligible = false, .reason = .rebuild_all_set, .scroll_op = ps };
     if (atlas_retried_flag)
         return .{ .eligible = false, .reason = .atlas_retried, .scroll_op = ps };
-    // Overlapping subgrids (float windows etc.) make row reuse unsafe
-    // because their content overlays main grid rows in compose.
-    // cached_subgrid_count == 1 means only the scrolling grid itself is composited;
-    // >1 means additional float/overlay grids are present.
     if (cached_subgrid_count > 1)
         return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
 
@@ -1212,19 +1207,26 @@ pub const FlushCtx = struct {
                                 regen_count += 1;
                             }
                         }
-                        // Add prev_cursor_row if set and not already in list
-                        if (ctx.core.grid.prev_cursor_row) |pcr| {
-                            if (pcr < rows) {
-                                var found = false;
-                                for (regen_rows[0..regen_count]) |existing| {
-                                    if (existing == pcr) {
-                                        found = true;
-                                        break;
+                        const scroll_op = scroll_check.scroll_op.?;
+                        const scroll_grid_id = scroll_op.grid_id;
+                        const cursor_rows = [_]?u32{
+                            ctx.core.grid.prevCursorMainRowAfterScroll(scroll_op),
+                            ctx.core.grid.currentCursorMainRow(scroll_grid_id),
+                        };
+                        for (cursor_rows) |maybe_row| {
+                            if (maybe_row) |cursor_row| {
+                                if (cursor_row < rows) {
+                                    var found = false;
+                                    for (regen_rows[0..regen_count]) |existing| {
+                                        if (existing == cursor_row) {
+                                            found = true;
+                                            break;
+                                        }
                                     }
-                                }
-                                if (!found and regen_count < regen_rows.len) {
-                                    regen_rows[regen_count] = pcr;
-                                    regen_count += 1;
+                                    if (!found and regen_count < regen_rows.len) {
+                                        regen_rows[regen_count] = cursor_row;
+                                        regen_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -1233,7 +1235,6 @@ pub const FlushCtx = struct {
                         const cache_ready = ctx.core.scroll_cache_rows == rows;
 
                         if (cache_ready) {
-                            const scroll_op = scroll_check.scroll_op.?;
                             // position[1] is NDC: ndc_y = 1.0 - (y_px / dh) * 2.0
                             // delta_ndc_y = scroll_rows * cellH / dh * 2.0
                             const delta_y: f32 = @as(f32, @floatFromInt(scroll_op.rows)) * cellH / dh * 2.0;

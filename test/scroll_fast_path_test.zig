@@ -118,9 +118,8 @@ test "second scrollGrid invalidates pending_scroll" {
 
     // Second scroll in same batch
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
-    // After invalidation, the second call sets a NEW pending_scroll
-    // (the invalidation happens at entry, then the new one is set)
     try std.testing.expect(g.pending_scroll != null);
+    try std.testing.expect(g.scroll_fast_path_blocked);
     try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
 }
 
@@ -141,6 +140,7 @@ test "clearScrollState resets all scroll tracking" {
     g.clearScrollState();
 
     try std.testing.expect(g.pending_scroll == null);
+    try std.testing.expect(!g.scroll_fast_path_blocked);
     try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
     try std.testing.expect(g.prev_cursor_row == null);
 }
@@ -159,6 +159,32 @@ test "setCursor records prev_cursor_row in main grid coordinates" {
     // prev_cursor_row = win_pos_row(0) + old_row(10) = 10
     const pcr = g.prev_cursor_row orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(@as(u32, 10), pcr);
+}
+
+test "currentCursorMainRow returns current row in main grid coordinates" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+
+    g.setCursor(2, 11, 5);
+
+    const current = g.currentCursorMainRow(2) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u32, 11), current);
+    try std.testing.expect(g.currentCursorMainRow(1) == null);
+}
+
+test "prevCursorMainRowAfterScroll applies scroll delta to previous cursor row" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+
+    g.setCursor(2, 24, 5);
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+    g.setCursor(2, 23, 5);
+
+    const ps = g.pending_scroll orelse return error.TestUnexpectedNull;
+    const shifted = g.prevCursorMainRowAfterScroll(ps) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u32, 23), shifted);
 }
 
 // ============================================================================
@@ -191,6 +217,18 @@ test "ineligible: scrolled_count != 1" {
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_scroll_batch, result.reason);
 }
 
+test "ineligible: blocked by repeated scroll in same batch" {
+    const alloc = std.testing.allocator;
+    var g = try makeEligibleGrid(alloc);
+    defer g.deinit();
+
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    try std.testing.expect(!result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.blocked_batch, result.reason);
+}
+
 test "ineligible: grid_id < 2" {
     const alloc = std.testing.allocator;
     var g = Grid.init(alloc);
@@ -203,14 +241,15 @@ test "ineligible: grid_id < 2" {
     try std.testing.expect(!result.eligible);
 }
 
-test "eligible: multi-row scroll (3 rows within region)" {
+test "ineligible: multi-row scroll (3 rows within region)" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 0, 80, 3, 0); // 3 rows, region height=41
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
-    try std.testing.expect(result.eligible);
+    try std.testing.expect(!result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_row_scroll, result.reason);
 }
 
 test "ineligible: scroll rows >= region height" {
@@ -232,6 +271,7 @@ test "eligible: top == 0 (full grid scroll)" {
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
     try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
 
 test "eligible: partial region bot < target_rows" {
@@ -242,6 +282,7 @@ test "eligible: partial region bot < target_rows" {
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
     try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
 
 test "ineligible: bot > target_rows" {
@@ -307,7 +348,7 @@ test "ineligible: no pending_scroll" {
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.no_pending_scroll, result.reason);
 }
 
-test "eligible: scroll up (rows == -1)" {
+test "eligible: reverse single-line scroll (rows == -1)" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
@@ -315,6 +356,7 @@ test "eligible: scroll up (rows == -1)" {
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
     try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
 
 // ============================================================================

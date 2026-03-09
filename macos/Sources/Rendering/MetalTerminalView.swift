@@ -587,7 +587,7 @@ final class MetalTerminalView: MTKView {
 
             // Adjust for smooth scroll offset (same logic as hitTestGrid)
             scrollOffsetLock.lock()
-            let dragOffsetPx = scrollOffsetPx[cache.gridId] ?? 0
+            let dragOffsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[cache.gridId] ?? 0, cellHeightPx: cellH)
             scrollOffsetLock.unlock()
             if abs(dragOffsetPx) > 0.001 {
                 let adjustedPxY = pointPx.y - CGFloat(dragOffsetPx)
@@ -667,7 +667,7 @@ final class MetalTerminalView: MTKView {
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
         let location = convert(event.locationInWindow, from: nil)
-        let (gridId, row, col) = hitTestGrid(at: location)
+        let (gridId, row, col) = hitTestGrid(at: location, adjustForSmoothScroll: false)
         let hasUrl = core?.cellHasURL(gridId: gridId, row: row, col: col) ?? false
         if hasUrl != lastUrlCursorIsHand {
             lastUrlCursorIsHand = hasUrl
@@ -1299,7 +1299,7 @@ final class MetalTerminalView: MTKView {
 
         // Get cursor position in cell coordinates
         let location = convert(event.locationInWindow, from: nil)
-        let (gridId, row, col) = hitTestGrid(at: location)
+        let (gridId, row, col) = hitTestGrid(at: location, adjustForSmoothScroll: false)
 
         let scale = window?.backingScaleFactor ?? 2.0
 
@@ -1352,17 +1352,12 @@ final class MetalTerminalView: MTKView {
         // NDC scale: 2.0 / drawableHeight (top = 1.0, bottom = -1.0)
         let ndcScale: Float = 2.0 / drawableHeight
 
-        // Clamp visual offset to prevent showing empty areas.
-        // With immediate consumption in handleScrollInput, offset is normally
-        // bounded to ±rowHeightPx. This wider safety clamp handles edge cases
-        // when canSendMore is false (pending scrolls saturated).
-        let maxOffsetPx = cellHeightPx * 2.0
-
         let offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
             guard let info = gridInfoMap[gridId] else { return nil }
+            let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: CGFloat(cellHeightPx))
             // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
             // preventing markAllRowsDirty from firing every frame.
-            guard abs(offsetPx) >= Self.scrollOffsetEpsilon else { return nil }
+            guard abs(clampedOffsetPx) >= Self.scrollOffsetEpsilon else { return nil }
 
             // Calculate grid's top Y in NDC
             // Grid starts at startRow (in cells from top), each cell is cellHeightPx
@@ -1370,12 +1365,9 @@ final class MetalTerminalView: MTKView {
             // In NDC: top of screen = 1.0, so gridTopY = 1.0 - (gridTopPx * scale)
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
-            // Clamp offset to prevent showing empty areas
-            let clampedOffsetPx = max(-maxOffsetPx, min(maxOffsetPx, Float(offsetPx)))
-
             return MetalTerminalRenderer.ScrollOffsetInfo(
                 gridId: gridId,
-                offsetYPx: clampedOffsetPx,
+                offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
                 gridRows: info.rows,
                 marginTop: info.marginTop,
@@ -1502,12 +1494,10 @@ final class MetalTerminalView: MTKView {
                 }
             }
 
-            // Clamp offset: allow up to (pending + 1) rows of accumulation.
-            // This prevents unbounded growth while preserving enough headroom
-            // for grid_scroll responses to consume without over-correction.
-            let totalPending = alreadyPending + scrollCount
-            let maxOffsetPx = rowHeightPx * CGFloat(totalPending + 1) + rowHeightPx * 0.5
-            newOffset = max(-maxOffsetPx, min(maxOffsetPx, newOffset))
+            // Clamp stored offset to the same visual range the renderer can display.
+            // Keeping state and presentation aligned avoids input/render divergence
+            // during sustained trackpad scrolling.
+            newOffset = clampVisualScrollOffsetPx(newOffset, cellHeightPx: rowHeightPx)
 
             // Store final offset (atomic with read above — no TOCTOU gap)
             scrollOffsetPx[gridId] = newOffset
@@ -1543,7 +1533,7 @@ final class MetalTerminalView: MTKView {
     func getScrollOffset(gridId: Int64) -> CGFloat {
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
-        return scrollOffsetPx[gridId] ?? 0
+        return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(renderer.cellHeightPx))
     }
 
     /// Mark a grid for scroll offset clearing (thread-safe, can be called from any thread).
@@ -1681,7 +1671,7 @@ final class MetalTerminalView: MTKView {
         guard let core else { return nil }
 
         scrollOffsetLock.lock()
-        let offsetPx = scrollOffsetPx[gridId] ?? 0
+        let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(cellHeightPx))
         scrollOffsetLock.unlock()
         if abs(offsetPx) < 0.001 { return nil }
 
@@ -1705,7 +1695,7 @@ final class MetalTerminalView: MTKView {
     }
 
     /// Hit-test to find which grid is at the given point (highest zindex wins)
-    private func hitTestGrid(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
+    private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
 
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
@@ -1772,10 +1762,10 @@ final class MetalTerminalView: MTKView {
         // visually shifted by scrollOffsetPx. Without this adjustment, clicking
         // on visually-shifted content selects the wrong row.
         scrollOffsetLock.lock()
-        let offsetPx = scrollOffsetPx[bestGridId] ?? 0
+        let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[bestGridId] ?? 0, cellHeightPx: cellH)
         scrollOffsetLock.unlock()
 
-        if abs(offsetPx) > 0.001, let grid = grids.first(where: { $0.gridId == bestGridId }) {
+        if adjustForSmoothScroll, abs(offsetPx) > 0.001, let grid = grids.first(where: { $0.gridId == bestGridId }) {
             // Content at static pixel Y is displayed at visual pixel Y + scrollOffsetPx.
             // Reverse: static Y = visual Y - scrollOffsetPx.
             let adjustedPxY = pointPx.y - CGFloat(offsetPx)
@@ -1792,6 +1782,14 @@ final class MetalTerminalView: MTKView {
 
         ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol) scrollOffset=\(offsetPx)")
         return (bestGridId, localRow, localCol)
+    }
+
+    /// Clamp visual scroll offset to the range the shader can actually display.
+    private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
+        let safeCellHeightPx = max(0, cellHeightPx)
+        let maxOffsetPx = safeCellHeightPx * 2.0
+        guard maxOffsetPx > 0 else { return 0 }
+        return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
     }
 }
 

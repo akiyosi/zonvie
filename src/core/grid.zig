@@ -861,8 +861,12 @@ pub const Grid = struct {
     // Pending scroll operation for scroll-aware flush optimization.
     // Set by scrollGrid(), consumed and cleared by flush via clearDirty().
     // When present, flush can potentially reuse row cache instead of recomposing all rows.
-    // Invalidated (set to null) if a second grid_scroll arrives in the same batch.
+    // A second grid_scroll in the same batch disables fast path for that flush.
     pending_scroll: ?ScrollOp = null,
+
+    // True when this batch observed multiple grid_scroll events and must not use
+    // the scroll fast path. Cleared after flush via clearScrollState().
+    scroll_fast_path_blocked: bool = false,
 
     // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
     // These are main grid coordinates (already offset by win_pos for sub-grids).
@@ -875,6 +879,7 @@ pub const Grid = struct {
     // Used by scroll-aware flush to know which rows need cursor redraw.
     // Set by setCursor(), cleared by clearScrollState().
     prev_cursor_row: ?u32 = null,
+    prev_cursor_grid: ?i64 = null,
 
     pub fn init(alloc: std.mem.Allocator) Grid {
         return .{ .alloc = alloc };
@@ -1058,8 +1063,10 @@ pub const Grid = struct {
     /// Called by flush after successful vertex emission, NOT on abort/retry.
     pub fn clearScrollState(self: *Grid) void {
         self.pending_scroll = null;
+        self.scroll_fast_path_blocked = false;
         self.scroll_touched_count = 0;
         self.prev_cursor_row = null;
+        self.prev_cursor_grid = null;
     }
 
     pub fn clear(self: *Grid) void {
@@ -1297,10 +1304,11 @@ pub const Grid = struct {
     ) void {
         defer self.content_rev +%= 1;
 
-        // Invalidate pending scroll if a second grid_scroll arrives in same batch.
-        // Multiple scrolls in one batch are too complex for fast path.
+        // Multiple scrolls in one batch are too complex for the fast path.
+        // Keep the latest pending_scroll for diagnostics/offset clearing, but block
+        // fast-path eligibility until the batch is flushed.
         if (self.pending_scroll != null) {
-            self.pending_scroll = null;
+            self.scroll_fast_path_blocked = true;
             self.scroll_touched_count = 0;
         }
 
@@ -1594,6 +1602,7 @@ pub const Grid = struct {
             else
                 0;
             self.prev_cursor_row = win_offset + self.cursor_row;
+            self.prev_cursor_grid = self.cursor_grid;
         }
 
         self.cursor_grid = grid_id;
@@ -1602,6 +1611,36 @@ pub const Grid = struct {
         self.cursor_valid = true;
 
         if (changed) self.cursor_rev +%= 1;
+    }
+
+    /// Return the current cursor row in main-grid coordinates when the cursor is
+    /// on the specified grid. Returns null if the cursor is hidden or on another grid.
+    pub fn currentCursorMainRow(self: *const Grid, grid_id: i64) ?u32 {
+        if (!self.cursor_valid or self.cursor_grid != grid_id) return null;
+
+        const win_offset: u32 = if (grid_id != 1)
+            if (self.win_pos.get(grid_id)) |p| p.row else 0
+        else
+            0;
+
+        return win_offset + self.cursor_row;
+    }
+
+    /// Return the previous cursor row after applying the active scroll operation.
+    /// This converts the pre-scroll screen row into the post-scroll screen row,
+    /// which is the row that must be regenerated to clear old cursor text.
+    pub fn prevCursorMainRowAfterScroll(self: *const Grid, scroll_op: ScrollOp) ?u32 {
+        const prev_row = self.prev_cursor_row orelse return null;
+        const prev_grid = self.prev_cursor_grid orelse return null;
+        if (prev_grid != scroll_op.grid_id) return prev_row;
+
+        const shifted = @as(i64, prev_row) - @as(i64, scroll_op.rows);
+        if (shifted < 0) return null;
+
+        const max_rows = @as(i64, scroll_op.win_pos_row) + @as(i64, scroll_op.target_rows);
+        if (shifted >= max_rows) return null;
+
+        return @intCast(shifted);
     }
 
     /// Set viewport info from win_viewport event.
