@@ -3021,16 +3021,21 @@ pub const FlushCtx = struct {
                     }
                 }
 
-                // Mark cursor as sent
-                ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
             }
 
-            // If atlas was reset during vertex generation, mark grid dirty
-            // for re-render next flush (current frame may have stale UVs
-            // for vertices generated before the reset).
+            // If atlas was reset during vertex generation, do NOT submit this flush.
+            // Vertices emitted before the reset carry stale UVs and would sample
+            // unrelated atlas contents for one frame. Preserve dirty state so the
+            // next flush regenerates everything against the fresh atlas.
             if (ctx.core.atlas_reset_during_flush) {
                 ctx.core.grid.markAllDirty();
+                ctx.core.invalidateScrollCache();
+                var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| {
+                    sg.dirty = true;
+                }
                 ctx.core.atlas_reset_during_flush = false;
+                return;
             }
 
             // ----------------------------
@@ -3054,6 +3059,9 @@ pub const FlushCtx = struct {
                     cur_ptr_opt,  if (need_cursor) cursor.items.len else 0,
                     flags,
                 );
+                if (need_cursor) {
+                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
+                }
                 ctx.core.grid.clearDirty();
                 ctx.core.grid.clearScrollState();
                 return;
@@ -3070,6 +3078,9 @@ pub const FlushCtx = struct {
                     main.items.ptr, main.items.len,
                     cursor.items.ptr, cursor.items.len,
                 );
+                if (need_cursor) {
+                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
+                }
                 ctx.core.grid.clearDirty();
                 ctx.core.grid.clearScrollState();
                 return;
