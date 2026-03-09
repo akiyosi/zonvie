@@ -100,8 +100,16 @@ pub const Renderer = struct {
     // temporary buffer for a single glyph (padded) generation
     glyph_tmp: std.ArrayListUnmanaged(u8) = .{},
     
-    // pending dirty rects to upload into atlas_bitmap (flushed before BeginDraw)
+    // Append-only queue of atlas dirty rects. Entries are appended when glyphs
+    // are rasterized and consumed independently by the D2D bitmap path (renderVertices)
+    // and each D3D window via per-consumer cursors. Only cleared on atlas reset.
     pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .{},
+    // Monotonic sequence number of the first entry in pending_uploads.
+    // Advances only on atlas reset (when all entries become invalid).
+    // head_seq = pending_upload_base_seq + pending_uploads.items.len.
+    pending_upload_base_seq: u64 = 0,
+    // D2D bitmap consumer cursor (used by renderVertices / flushPendingAtlasUploadsLocked).
+    d2d_upload_cursor: u64 = 0,
 
     // reusable brushes
     solid_brush: ?*c.ID2D1SolidColorBrush = null,
@@ -253,7 +261,9 @@ pub const Renderer = struct {
         self.atlas_next_y = 1;
         self.atlas_row_h = 0;
 
-        // Clear pending uploads (they're now invalid)
+        // Clear pending uploads (they're now invalid); advance base_seq so
+        // per-window cursors that lag behind will detect the gap.
+        self.pending_upload_base_seq += self.pending_uploads.items.len;
         self.pending_uploads.clearRetainingCapacity();
 
         // Clear CPU atlas buffer to zero (optional but cleaner)
@@ -451,6 +461,7 @@ pub const Renderer = struct {
         try self.atlas_cpu.resize(self.alloc, total);
         @memset(self.atlas_cpu.items, 0);
 
+        self.pending_upload_base_seq += self.pending_uploads.items.len;
         self.pending_uploads.clearRetainingCapacity();
 
         const bmp_ptr = self.atlas_bitmap orelse return error.CreateAtlasFailed;
@@ -1343,6 +1354,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                 self.atlas_next_x = 1;
                 self.atlas_next_y = 1;
                 self.atlas_row_h = 0;
+                self.pending_upload_base_seq += self.pending_uploads.items.len;
                 self.pending_uploads.clearRetainingCapacity();
                 if (self.atlas_cpu.items.len > 0) @memset(self.atlas_cpu.items, 0);
                 self.atlas_reset_pending = true;
@@ -1364,6 +1376,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         self.atlas_row_h = 0;
 
         // Clear pending uploads
+        self.pending_upload_base_seq += self.pending_uploads.items.len;
         self.pending_uploads.clearRetainingCapacity();
 
         if (self.atlas_cpu.items.len > 0) {
@@ -1615,25 +1628,47 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         }
     }
 
+    // Upload pending atlas rects to the D2D bitmap since the last D2D cursor.
+    // Does NOT drain the queue — other consumers (D3D windows) read independently.
     fn flushPendingAtlasUploadsLocked(self: *Renderer) void {
         const bmp = self.atlas_bitmap orelse return;
-        if (self.pending_uploads.items.len == 0) return;
-    
+        const head_seq = self.pending_upload_base_seq + self.pending_uploads.items.len;
+        if (self.d2d_upload_cursor >= head_seq) return;
+
         const bvtbl = bmp.lpVtbl.*;
         const copy_fn = bvtbl.CopyFromMemory orelse return;
-    
-        for (self.pending_uploads.items) |r| {
-            // RGBA format: 4 bytes per pixel
+
+        // If cursor fell behind base (atlas reset), upload the full bitmap.
+        if (self.d2d_upload_cursor < self.pending_upload_base_seq) {
+            if (self.atlas_cpu.items.len > 0) {
+                const full_rect = c.D2D1_RECT_U{
+                    .left = 0,
+                    .top = 0,
+                    .right = self.atlas_w,
+                    .bottom = self.atlas_h,
+                };
+                _ = copy_fn(
+                    bmp,
+                    &full_rect,
+                    self.atlas_cpu.items.ptr,
+                    self.atlas_w * 4,
+                );
+            }
+            self.d2d_upload_cursor = head_seq;
+            return;
+        }
+
+        const start_idx = self.d2d_upload_cursor - self.pending_upload_base_seq;
+        for (self.pending_uploads.items[start_idx..]) |r| {
             const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
             _ = copy_fn(
                 bmp,
                 &r,
                 self.atlas_cpu.items.ptr + src_off,
-                self.atlas_w * 4, // bytes per row (RGBA)
+                self.atlas_w * 4,
             );
         }
-    
-        self.pending_uploads.clearRetainingCapacity();
+        self.d2d_upload_cursor = head_seq;
     }
     
     fn flushPendingAtlasUploads(self: *Renderer) void {
@@ -1646,46 +1681,50 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
 
 
-    pub fn flushPendingAtlasUploadsToD3DLocked(
+    /// Upload atlas dirty rects added since `since_seq` to the given D3D context.
+    /// Returns the new head sequence (caller should store this as its cursor).
+    /// If `since_seq < pending_upload_base_seq`, entries were lost (atlas reset);
+    /// the caller must do a full atlas upload via uploadFullAtlasToD3D and use the
+    /// returned head_seq as its new cursor.
+    fn flushPendingAtlasUploadsSinceToD3DLocked(
         self: *Renderer,
-        d3d: anytype, // expects: d3d.atlasUploadRect(x,y,w,h,data,row_pitch)
-    ) u32 {
-        if (self.pending_uploads.items.len == 0) return 0;
+        d3d: anytype,
+        since_seq: u64,
+    ) u64 {
+        const head_seq = self.pending_upload_base_seq + self.pending_uploads.items.len;
+        if (since_seq >= head_seq) return head_seq;
+
+        // Cursor is behind base: entries were discarded (atlas reset).
+        // Caller must use uploadFullAtlasToD3D to recover.
+        if (since_seq < self.pending_upload_base_seq) return head_seq;
+
+        const start_idx = since_seq - self.pending_upload_base_seq;
 
         if (applog.isEnabled()) applog.appLog(
-            "[atlas] cpu_atlas: len={d} cap={d} ptr=0x{x}\n",
-            .{
-                self.atlas_cpu.items.len,
-                self.atlas_cpu.capacity,
-                @intFromPtr(self.atlas_cpu.items.ptr),
-            },
+            "[atlas] flushSince: since={d} base={d} head={d} uploading={d}\n",
+            .{ since_seq, self.pending_upload_base_seq, head_seq, self.pending_uploads.items.len - start_idx },
         );
-    
-        const total: u32 = @intCast(self.pending_uploads.items.len);
-        var idx: usize = 0;
-        for (self.pending_uploads.items) |r| {
+
+        var log_idx: usize = 0;
+        for (self.pending_uploads.items[start_idx..]) |r| {
             const w: u32 = r.right - r.left;
             const h: u32 = r.bottom - r.top;
             if (w == 0 or h == 0) continue;
-    
-            if (idx < 8 and applog.isEnabled()) {
+
+            if (log_idx < 8 and applog.isEnabled()) {
                 applog.appLog(
                     "[atlas]   upload[{d}] (x={d},y={d},w={d},h={d})\n",
-                    .{ idx, r.left, r.top, w, h },
+                    .{ log_idx, r.left, r.top, w, h },
                 );
             }
-            idx += 1;
-    
-            // RGBA format: 4 bytes per pixel
+            log_idx += 1;
+
             const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
             const src_ptr: [*]const u8 = self.atlas_cpu.items.ptr + src_off;
-
-            // row_pitch is self.atlas_w * 4 bytes because atlas_cpu is RGBA
             d3d.atlasUploadRect(r.left, r.top, w, h, src_ptr, self.atlas_w * 4);
         }
-    
-        self.pending_uploads.clearRetainingCapacity();
-        return total;
+
+        return head_seq;
     }
 
 
@@ -1697,10 +1736,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
 
 
-pub fn flushPendingAtlasUploadsToD3D(self: *Renderer, d3d: anytype) u32 {
+/// Public wrapper: upload atlas dirty rects added since `since_seq`.
+/// Returns the new head sequence for the caller to store as its cursor.
+pub fn flushPendingAtlasUploadsSinceToD3D(self: *Renderer, d3d: anytype, since_seq: u64) u64 {
     self.mu.lock();
     defer self.mu.unlock();
-    return self.flushPendingAtlasUploadsToD3DLocked(d3d);
+    return self.flushPendingAtlasUploadsSinceToD3DLocked(d3d, since_seq);
 }
 
 /// Upload the entire atlas to a D3D11 renderer.

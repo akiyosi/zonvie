@@ -2260,13 +2260,19 @@ pub const FlushCtx = struct {
                                 }
                                 continue :retry_loop;
                             }
-                            // Already retried: abort remaining rows.
-                            // saw_atlas_reset=true ensures markAllDirty at end → next flush fixes.
+                            // Already retried: clear all previously-sent rows (they carry
+                            // stale UVs) then abort. Send vert_count=0 for every row so
+                            // frontends replace stale vertex data with empty buffers.
+                            // markAllDirty (after the loop) ensures the next flush
+                            // regenerates everything against the fresh atlas.
                             if (log_enabled) {
                                 ctx.core.log.write(
-                                    "[scroll_debug] atlas_reset_during_flush at row={d} on retry: aborting\n",
+                                    "[scroll_debug] atlas_reset_during_flush at row={d} on retry: clearing all rows and aborting\n",
                                     .{r},
                                 );
+                            }
+                            for (0..rows) |clear_row| {
+                                row_cb(ctx.core.ctx, 1, @intCast(clear_row), 1, null, 0, 1, rows, cols);
                             }
                             break;
                         }

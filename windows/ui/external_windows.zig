@@ -1634,16 +1634,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
         applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
 
-        // Upload atlas to external window's D3D context
+        // Upload atlas to external window's D3D context.
+        // Uses since-based cursor so each window independently tracks its
+        // position in the append-only pending_uploads queue.
         if (atlas_ptr) |a| {
             if (need_full_atlas_upload) {
-                // First paint - upload the entire atlas
                 applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
                 a.uploadFullAtlasToD3D(g);
-            } else {
-                // Subsequent paints - only flush pending uploads
-                _ = a.flushPendingAtlasUploadsToD3D(g);
             }
+            ext_win.atlas_upload_cursor = a.flushPendingAtlasUploadsSinceToD3D(g, ext_win.atlas_upload_cursor);
         }
 
         if (is_cmdline) {

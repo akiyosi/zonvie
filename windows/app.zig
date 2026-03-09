@@ -503,6 +503,7 @@ pub const ExternalWindow = struct {
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
+    atlas_upload_cursor: u64 = 0, // Per-window cursor into renderer's pending_uploads queue
     scroll_accum: i16 = 0, // Accumulated vertical scroll delta for high-resolution scrolling
     h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
@@ -717,6 +718,8 @@ pub const App = struct {
     // After atlas reset, external window paints may consume shared pending_uploads.
     // This flag ensures the main window uploads the full atlas to cover any missed regions.
     atlas_full_upload_needed: bool = false,
+    // Main window cursor into renderer's pending_uploads queue (since-based upload).
+    atlas_upload_cursor: u64 = 0,
     // Row-mode seed tracking: require a full set of rows before presenting.
     seed_pending: bool = true,
     seed_clear_pending: bool = true,

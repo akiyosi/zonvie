@@ -1436,6 +1436,8 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     if (box.core.isPhase2Atlas()) {
         box.core.resetCoreAtlas();
     }
+    // Scroll cache stores vertices with atlas UVs; invalidate after atlas reset.
+    box.core.invalidateScrollCache();
     box.core.grid.markAllDirty();
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).

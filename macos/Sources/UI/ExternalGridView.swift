@@ -372,8 +372,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 return
             }
 
-            // Fetch pending state under lock
-            let (vertexCount, rowMode, rowBuffersSnapshot, rowCountsSnapshot, dirtyRows, snapGridRows, snapGridCols): (Int, Bool, [MTLBuffer?], [Int], [Int], UInt32, UInt32) = {
+            // Fetch pending state under lock.
+            // vertexBufferSnapshot captures the MTLBuffer reference so draw() never
+            // reads self.vertexBuffer outside the lock (prevents GPU/CPU race when
+            // submitVertices replaces the buffer on the core thread).
+            let (vertexCount, rowMode, rowBuffersSnapshot, rowCountsSnapshot, dirtyRows, snapGridRows, snapGridCols, vertexBufferSnapshot): (Int, Bool, [MTLBuffer?], [Int], [Int], UInt32, UInt32, MTLBuffer?) = {
                 lock.lock()
                 defer { lock.unlock() }
 
@@ -382,13 +385,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let counts = rowVertexCounts
                     let dirty = Array(pendingDirtyRows)
                     pendingDirtyRows.removeAll()
-                    return (0, true, buffers, counts, dirty, gridRows, gridCols)
+                    return (0, true, buffers, counts, dirty, gridRows, gridCols, nil)
                 } else {
                     if let pending = pendingVertexCount {
                         currentVertexCount = pending
                         pendingVertexCount = nil
                     }
-                    return (currentVertexCount, false, [], [], [], gridRows, gridCols)
+                    return (currentVertexCount, false, [], [], [], gridRows, gridCols, vertexBuffer)
                 }
             }()
 
@@ -538,7 +541,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     }
                 }
                 ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) drawnRows=\(drawnRows) use2Pass=\(use2Pass)")
-            } else if use2Pass, let vb = vertexBuffer {
+            } else if use2Pass, let vb = vertexBufferSnapshot {
                 // 2-Pass rendering for blur: draw backgrounds first, then glyphs
                 // Pass 1: Background (overwrite blending)
                 enc.setRenderPipelineState(backgroundPipeline!)
@@ -552,7 +555,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             } else {
                 // Standard single-pass rendering
                 enc.setRenderPipelineState(pipeline)
-                if let vb = vertexBuffer {
+                if let vb = vertexBufferSnapshot {
                     enc.setVertexBuffer(vb, offset: 0, index: 0)
                     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                 }

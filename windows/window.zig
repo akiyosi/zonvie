@@ -527,26 +527,27 @@ pub export fn WndProc(
                 }
 
                 // Flush atlas uploads (may be triggered by core updates).
-                // If uploads occurred, force a repaint so newly uploaded glyphs are drawn.
-                var atlas_uploads: u32 = 0;
+                // Uses since-based cursor so multiple windows can independently
+                // consume the same append-only pending_uploads queue.
+                var atlas_uploaded = false;
                 if (atlas_ptr) |a| {
                     if (gpu_ptr) |g| {
-                        // Lock D3D context for thread-safe atlas upload
                         g.lockContext();
                         defer g.unlockContext();
-                        atlas_uploads = a.flushPendingAtlasUploadsToD3D(g);
-                        // After atlas reset, external windows may have consumed some
-                        // pending_uploads before the main window. Upload the full atlas
-                        // once to ensure all glyph data (including shared glyphs) is present.
+                        // After atlas reset, upload the full atlas first to cover
+                        // any entries that were discarded when base_seq advanced.
                         if (app.atlas_full_upload_needed) {
                             a.uploadFullAtlasToD3D(g);
                             app.atlas_full_upload_needed = false;
                             if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
                         }
+                        const new_cursor = a.flushPendingAtlasUploadsSinceToD3D(g, app.atlas_upload_cursor);
+                        if (new_cursor != app.atlas_upload_cursor) atlas_uploaded = true;
+                        app.atlas_upload_cursor = new_cursor;
                     }
                 }
-                if (log_enabled and atlas_uploads != 0) {
-                    applog.appLog("[win] atlas_uploads flushed={d}\n", .{atlas_uploads});
+                if (log_enabled and atlas_uploaded) {
+                    applog.appLog("[win] atlas_uploads flushed (cursor={d})\n", .{app.atlas_upload_cursor});
                 }
                 if (log_enabled) {
                     t_atlas_end_ns = std.time.nanoTimestamp();
@@ -752,7 +753,7 @@ pub export fn WndProc(
 
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
-                        if (atlas_uploads != 0 and rows_to_draw.items.len == 0) {
+                        if (atlas_uploaded and rows_to_draw.items.len == 0) {
                             app.mu.lock();
                             app.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
