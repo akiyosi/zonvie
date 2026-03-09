@@ -504,6 +504,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         isInFlush = true
+        let perfEnabled = ZonvieCore.appLogEnabled
+        let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        var atlasPrepareUs: Double = 0
+        var atlasCommitUs: Double = 0
+        var atlasWaitUs: Double = 0
+        var atlasDidBlit = false
+        var atlasDidCpuSync = false
+        var atlasNeedsCoreInvalidation = false
+        var atlasSyncedWasRecreate = false
 
         // Under lock: read committed index + gpuInFlight to pick a safe write set
         let srcIdx: Int
@@ -537,16 +546,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Prepare atlas back texture
         var needsCoreInvalidation = false
         if let cmd = queue.makeCommandBuffer() {
+            let tAtlasPrepareStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
             let result = atlas.prepareBackTexture(commandBuffer: cmd)
+            if perfEnabled {
+                atlasPrepareUs = (CFAbsoluteTimeGetCurrent() - tAtlasPrepareStart) * 1_000_000
+            }
             needsCoreInvalidation = result.needsCoreInvalidation
+            atlasNeedsCoreInvalidation = result.needsCoreInvalidation
+            atlasDidBlit = result.didBlit
+            atlasDidCpuSync = result.didCpuSync
+            atlasSyncedWasRecreate = result.syncedWasRecreate
             if result.shouldAbort {
                 isInFlush = false
                 ZonvieCore.appLog("[WARNING] beginFlush: atlas back-texture sync failed (nil texture/resize/encoder), dropping flush")
                 return .dropped
             }
             if result.didBlit {
+                let tAtlasCommitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 cmd.commit()
+                if perfEnabled {
+                    atlasCommitUs = (CFAbsoluteTimeGetCurrent() - tAtlasCommitStart) * 1_000_000
+                }
+                let tAtlasWaitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 cmd.waitUntilCompleted()
+                if perfEnabled {
+                    atlasWaitUs = (CFAbsoluteTimeGetCurrent() - tAtlasWaitStart) * 1_000_000
+                }
                 if cmd.status == .completed {
                     atlas.markBackSynced()
                 } else {
@@ -573,6 +598,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let src = bufferSets[srcIdx]
         let dst = bufferSets[picked]
 
+        var rowCopyBytes = 0
+        var rowCopiedCount = 0
+        var rowReallocCount = 0
+        var rowReallocBytes = 0
+        let tRowCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+
         // Deep copy row buffer contents: committed → write set
         dst.knownTotalRows = src.knownTotalRows
         let srcRowCount = src.rowVertexBuffers.count
@@ -596,12 +627,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let cap = max(neededBytes, dst.rowVertexBufferCaps[i] * 2, 4096)
                 dst.rowVertexBuffers[i] = device.makeBuffer(length: cap, options: .storageModeShared)
                 dst.rowVertexBufferCaps[i] = cap
+                rowReallocCount += 1
+                rowReallocBytes += cap
             }
             if let dstBuf = dst.rowVertexBuffers[i] {
                 memcpy(dstBuf.contents(), srcBuf.contents(), neededBytes)
                 dst.rowVertexCounts[i] = srcCount
+                rowCopiedCount += 1
+                rowCopyBytes += neededBytes
             }
         }
+        let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         // Zero out stale rows beyond src count (prevents drawing old data after grid shrink)
         let dstRowCount = dst.rowVertexBuffers.count
@@ -611,6 +647,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        var mainCopyBytes = 0
+        var mainReallocBytes = 0
+        let tMainCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         // Deep copy main buffer
         if let srcMain = src.mainVertexBuffer, src.mainVertexCount > 0 {
             let bytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
@@ -618,15 +657,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let cap = max(bytes, dst.mainVertexBufferCap * 2, 4096)
                 dst.mainVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
                 dst.mainVertexBufferCap = cap
+                mainReallocBytes = cap
             }
             if let dstBuf = dst.mainVertexBuffer {
                 memcpy(dstBuf.contents(), srcMain.contents(), bytes)
+                mainCopyBytes = bytes
             }
             dst.mainVertexCount = src.mainVertexCount
         } else {
             dst.mainVertexCount = src.mainVertexCount
         }
+        let tMainCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
+        var cursorCopyBytes = 0
+        var cursorReallocBytes = 0
+        let tCursorCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         // Deep copy cursor buffer
         if let srcCursor = src.cursorVertexBuffer, src.cursorVertexCount > 0 {
             let bytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
@@ -634,16 +679,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let cap = max(bytes, dst.cursorVertexBufferCap * 2, 4096)
                 dst.cursorVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
                 dst.cursorVertexBufferCap = cap
+                cursorReallocBytes = cap
             }
             if let dstBuf = dst.cursorVertexBuffer {
                 memcpy(dstBuf.contents(), srcCursor.contents(), bytes)
+                cursorCopyBytes = bytes
             }
             dst.cursorVertexCount = src.cursorVertexCount
         } else {
             dst.cursorVertexCount = src.cursorVertexCount
         }
+        let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         dst.usingRowBuffers = src.usingRowBuffers
+
+        if perfEnabled {
+            let rowCopyUs = (tRowCopyEnd - tRowCopyStart) * 1_000_000
+            let mainCopyUs = (tMainCopyEnd - tMainCopyStart) * 1_000_000
+            let cursorCopyUs = (tCursorCopyEnd - tCursorCopyStart) * 1_000_000
+            let totalUs = (CFAbsoluteTimeGetCurrent() - tBeginFlushStart) * 1_000_000
+            let rowCopyUsStr = String(format: "%.1f", rowCopyUs)
+            let mainCopyUsStr = String(format: "%.1f", mainCopyUs)
+            let cursorCopyUsStr = String(format: "%.1f", cursorCopyUs)
+            let totalUsStr = String(format: "%.1f", totalUs)
+            let atlasPrepareUsStr = String(format: "%.1f", atlasPrepareUs)
+            let atlasCommitUsStr = String(format: "%.1f", atlasCommitUs)
+            let atlasWaitUsStr = String(format: "%.1f", atlasWaitUs)
+            ZonvieCore.appLog(
+                "[perf] begin_flush_copy src=\(srcIdx) dst=\(picked) atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) atlasWaitUs=\(atlasWaitUsStr) rowBuffers=\(srcRowCount) rowCopied=\(rowCopiedCount) rowCopyBytes=\(rowCopyBytes) rowReallocs=\(rowReallocCount) rowReallocBytes=\(rowReallocBytes) rowCopyUs=\(rowCopyUsStr) mainCopyBytes=\(mainCopyBytes) mainReallocBytes=\(mainReallocBytes) mainCopyUs=\(mainCopyUsStr) cursorCopyBytes=\(cursorCopyBytes) cursorReallocBytes=\(cursorReallocBytes) cursorCopyUs=\(cursorCopyUsStr) totalUs=\(totalUsStr)"
+            )
+        }
 
         return needsCoreInvalidation ? .proceedWithInvalidation : .proceed
     }

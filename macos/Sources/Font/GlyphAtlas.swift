@@ -58,6 +58,10 @@ final class GlyphAtlas {
     private var backDirty: Bool = false       // mu protected: front has content not yet synced to back
     private var atlasModified: Bool = false   // mu protected: back content changed during this flush
     private var needsAtlasRebuild: Bool = false // mu protected: setBackingScale applied font+metrics but atlas reset pending
+    private var pendingBackSyncWasRecreate: Bool = false // mu protected: recreateTexture occurred before the next front->back sync
+    private var pendingBackSyncRect: AtlasDirtyRect? = nil // mu protected: dirty union behind the next front->back sync
+    private var flushHadRecreate: Bool = false // mu protected: recreateTexture called during current flush
+    private var flushDirtyRect: AtlasDirtyRect? = nil // mu protected: dirty union for uploads during current flush
 
     // Atlas dimensions (updated by recreateTexture when core sets atlas_size).
     private var atlasW: Int = 2048
@@ -119,8 +123,28 @@ final class GlyphAtlas {
 
     private var scratch: [UInt8] = []
 
+    private struct AtlasDirtyRect {
+        var x: Int
+        var y: Int
+        var width: Int
+        var height: Int
+
+        mutating func union(x newX: Int, y newY: Int, width newWidth: Int, height newHeight: Int) {
+            let minX = min(x, newX)
+            let minY = min(y, newY)
+            let maxX = max(x + width, newX + newWidth)
+            let maxY = max(y + height, newY + newHeight)
+            x = minX
+            y = minY
+            width = maxX - minX
+            height = maxY - minY
+        }
+    }
+
     /// Persistent zero-clear buffer for makeTexture (one row of atlas width).
     private var zeroRow: [UInt8] = []
+    /// Scratch buffer for CPU-side atlas region sync (front -> back).
+    private var backSyncScratch: [UInt8] = []
 
     /// Separate scratch buffer for rasterizeOnly (Phase 2).
     /// Must not share with `scratch` which is used by uploadRegion.
@@ -731,6 +755,8 @@ final class GlyphAtlas {
         nextY = 1
         rowH = 0
         textures[bi] = makeTexture(device: device, w: atlasW, h: atlasH)
+        flushHadRecreate = true
+        flushDirtyRect = nil
         // NOTE: does NOT set atlasModified.
         // Callers that need swap must set it explicitly:
         //   - setFont: sets atlasModified = true after rebuildFont_locked
@@ -1209,6 +1235,12 @@ final class GlyphAtlas {
         }
 
         atlasModified = true
+        if var rect = flushDirtyRect {
+            rect.union(x: destX, y: destY, width: width, height: height)
+            flushDirtyRect = rect
+        } else {
+            flushDirtyRect = AtlasDirtyRect(x: destX, y: destY, width: width, height: height)
+        }
     }
 
     /// Phase 2: Recreate atlas texture with the given dimensions.
@@ -1234,6 +1266,8 @@ final class GlyphAtlas {
         map.removeAll(keepingCapacity: true)
         failedScalarCache.removeAll(keepingCapacity: true)
         atlasModified = true
+        flushHadRecreate = true
+        flushDirtyRect = nil
         // needsAtlasRebuild cleared here because recreateTexture() is the terminal
         // point of the scale-change invalidation path (setBackingScale → prepareBackTexture
         // → core invalidation → on_atlas_create → recreateTexture). This flag is
@@ -1245,8 +1279,10 @@ final class GlyphAtlas {
 
     struct PrepareResult {
         let didBlit: Bool
+        let didCpuSync: Bool
         let needsCoreInvalidation: Bool
         let shouldAbort: Bool  // true when backDirty but blit is impossible (textures nil, resize/encoder failed)
+        let syncedWasRecreate: Bool
     }
 
     /// Called from beginFlush() on core thread.
@@ -1267,23 +1303,25 @@ final class GlyphAtlas {
             clearCaches_locked()
             backDirty = false  // old front content is for wrong scale, don't blit
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, needsCoreInvalidation: true, shouldAbort: false)
+            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: true, shouldAbort: false, syncedWasRecreate: false)
         }
 
         // Phase 2: Sync front -> back if dirty
         guard backDirty else {
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: false)
+            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: false)
         }
 
         let fi = frontIndex
         let bi = 1 - frontIndex
+        let syncedWasRecreate = pendingBackSyncWasRecreate
+        let syncedRect = pendingBackSyncRect
         guard let front = textures[fi], var back = textures[bi] else {
             // backDirty is true but textures are nil — cannot sync.
             // Continuing would let atlas modifications write to an unsynced back;
             // on swap the new front would be missing glyphs from the old front.
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
         }
 
         // Defensive: recreate back if size mismatch
@@ -1291,34 +1329,69 @@ final class GlyphAtlas {
             guard let newBack = makeTexture(device: device, w: front.width, h: front.height) else {
                 // Cannot recreate back texture — same risk as nil textures above.
                 os_unfair_lock_unlock(&mu)
-                return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+                return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
             }
             textures[bi] = newBack
             back = newBack
         }
 
-        // DO NOT set backDirty = false here.
+        if !syncedWasRecreate, let rect = syncedRect {
+            let bytesPerRow = rect.width
+            let totalBytes = rect.width * rect.height
+            if totalBytes > 0 {
+                if backSyncScratch.count < totalBytes {
+                    backSyncScratch = Array<UInt8>(repeating: 0, count: totalBytes)
+                }
+                backSyncScratch.withUnsafeMutableBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    front.getBytes(base, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height), mipmapLevel: 0)
+                    back.replace(region: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height), mipmapLevel: 0, withBytes: base, bytesPerRow: bytesPerRow)
+                }
+                backDirty = false
+                pendingBackSyncWasRecreate = false
+                pendingBackSyncRect = nil
+                os_unfair_lock_unlock(&mu)
+                return PrepareResult(didBlit: false, didCpuSync: true, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
+            }
+        }
+
+        // DO NOT set backDirty = false here for GPU blit.
         // Caller must call markBackSynced() after blit completes successfully.
         os_unfair_lock_unlock(&mu)
 
         // Encode blit outside mu (texture refs are stable, no contention in this interval)
         guard let blit = commandBuffer.makeBlitCommandEncoder() else {
             // Cannot encode blit — same risk as nil textures above.
-            return PrepareResult(didBlit: false, needsCoreInvalidation: false, shouldAbort: true)
+            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
+        }
+        let sourceOrigin: MTLOrigin
+        let sourceSize: MTLSize
+        let destinationOrigin: MTLOrigin
+        if syncedWasRecreate || syncedRect == nil {
+            sourceOrigin = MTLOrigin(x: 0, y: 0, z: 0)
+            sourceSize = MTLSize(width: front.width, height: front.height, depth: 1)
+            destinationOrigin = MTLOrigin(x: 0, y: 0, z: 0)
+        } else {
+            let rect = syncedRect!
+            sourceOrigin = MTLOrigin(x: rect.x, y: rect.y, z: 0)
+            sourceSize = MTLSize(width: rect.width, height: rect.height, depth: 1)
+            destinationOrigin = MTLOrigin(x: rect.x, y: rect.y, z: 0)
         }
         blit.copy(from: front, sourceSlice: 0, sourceLevel: 0,
-                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                  sourceSize: MTLSize(width: front.width, height: front.height, depth: 1),
+                  sourceOrigin: sourceOrigin,
+                  sourceSize: sourceSize,
                   to: back, destinationSlice: 0, destinationLevel: 0,
-                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                  destinationOrigin: destinationOrigin)
         blit.endEncoding()
-        return PrepareResult(didBlit: true, needsCoreInvalidation: false, shouldAbort: false)
+        return PrepareResult(didBlit: true, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
     }
 
     /// Called after blit command buffer completes successfully.
     func markBackSynced() {
         os_unfair_lock_lock(&mu)
         backDirty = false
+        pendingBackSyncWasRecreate = false
+        pendingBackSyncRect = nil
         os_unfair_lock_unlock(&mu)
     }
 
@@ -1348,9 +1421,13 @@ final class GlyphAtlas {
     func commitAndSnapshotFrontTexture() -> MTLTexture? {
         os_unfair_lock_lock(&mu)
         if atlasModified {
+            pendingBackSyncWasRecreate = flushHadRecreate
+            pendingBackSyncRect = flushDirtyRect
             frontIndex = 1 - frontIndex   // swap: back (with new content) becomes front
             backDirty = true              // old front (now back) is behind
             atlasModified = false
+            flushHadRecreate = false
+            flushDirtyRect = nil
         }
         let tex = textures[frontIndex]
         os_unfair_lock_unlock(&mu)
