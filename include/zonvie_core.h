@@ -792,6 +792,16 @@ void zonvie_core_stop(zonvie_core *core);
 
 void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int len);
 
+/* Timestamp helper for perf-log correlation across frontend/core stages. */
+ZONVIE_API int64_t zonvie_core_perf_now_ns(void);
+
+/* Record the latest frontend input trace marker for redraw/flush correlation. */
+ZONVIE_API void zonvie_core_note_input_trace(
+    zonvie_core *core,
+    uint64_t seq,
+    int64_t sent_ns
+);
+
 /* Send a command to Neovim via nvim_command RPC (does not show in cmdline).
    cmd: command string (e.g., "lua vim.notify('hello')")
    len: length of command string */

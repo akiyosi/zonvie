@@ -220,6 +220,15 @@ final class MetalTerminalView: MTKView {
     }
 
     func requestRedraw(_ rect: NSRect? = nil) {
+        if ZonvieCore.appLogEnabled, let inputTrace = core?.currentInputTraceSnapshot(),
+           inputTrace.seq != 0, inputTrace.sentNs != 0,
+           inputTrace.lastRequestRedrawLoggedSeq != inputTrace.seq
+        {
+            let nowNs = zonvie_core_perf_now_ns()
+            let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
+            ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
+            core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
+        }
         redrawLock.lock()
 
         if let rect {

@@ -1011,6 +1011,17 @@ pub fn handleRedraw(
                     log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
                         grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
                     });
+                    if (grid.input_trace_seq != 0 and
+                        grid.input_trace_sent_ns != 0 and
+                        grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq)
+                    {
+                        const now_ns = std.time.nanoTimestamp();
+                        const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - grid.input_trace_sent_ns), 1000));
+                        log.write("[perf_input] seq={d} stage=grid_scroll delta_us={d} grid={d}\n", .{
+                            grid.input_trace_seq, delta_us, grid_id,
+                        });
+                        grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
+                    }
                 }
 
                 // Apply scroll to the target grid under ext_multigrid.
@@ -1339,6 +1350,21 @@ pub fn handleRedraw(
 
                 // Update order (existing behavior)
                 grid.noteGridLine(grid_id);
+                if (log.cb != null and
+                    grid.input_trace_seq != 0 and
+                    grid.input_trace_sent_ns != 0 and
+                    grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq)
+                {
+                    const now_ns = std.time.nanoTimestamp();
+                    const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - grid.input_trace_sent_ns), 1000));
+                    log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
+                        grid.input_trace_seq,
+                        delta_us,
+                        grid_id,
+                        @as(u32, @intCast(t[1].int)),
+                    });
+                    grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
+                }
 
                 const row = @as(u32, @intCast(t[1].int));
                 var col = @as(u32, @intCast(t[2].int));
@@ -1869,7 +1895,20 @@ pub fn handleRedraw(
             }
 
         } else if (std.mem.eql(u8, name, "flush")) {
-            if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
+            if (log.cb != null) {
+                log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
+                if (grid.input_trace_seq != 0 and
+                    grid.input_trace_sent_ns != 0 and
+                    grid.input_trace_flush_logged_seq != grid.input_trace_seq)
+                {
+                    const now_ns = std.time.nanoTimestamp();
+                    const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - grid.input_trace_sent_ns), 1000));
+                    log.write("[perf_input] seq={d} stage=flush_start delta_us={d} rows={d} cols={d}\n", .{
+                        grid.input_trace_seq, delta_us, grid.rows, grid.cols,
+                    });
+                    grid.input_trace_flush_logged_seq = grid.input_trace_seq;
+                }
+            }
             try flush_fn(flush_ctx, grid.rows, grid.cols);
             // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
             // inside onFlush on successful completion. On abort, all state is

@@ -683,6 +683,16 @@ pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: u
     box.core.sendInput(keys[0..len]);
 }
 
+pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
+    return @intCast(std.time.nanoTimestamp());
+}
+
+pub export fn zonvie_core_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: i64) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.noteInputTrace(seq, sent_ns);
+}
+
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;

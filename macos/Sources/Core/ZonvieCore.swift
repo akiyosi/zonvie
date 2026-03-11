@@ -47,6 +47,13 @@ final class ZonvieCore {
     private var quitTimeoutWorkItem: DispatchWorkItem?
     private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
     private static let quitTimeoutSeconds: Double = 5.0
+    private let inputTraceLock = NSLock()
+    private var inputTraceSeq: UInt64 = 0
+    private var inputTraceSentNs: Int64 = 0
+    private var inputTraceLastDrawLoggedSeq: UInt64 = 0
+    private var inputTraceLastFlushEndLoggedSeq: UInt64 = 0
+    private var inputTraceLastDrawStartLoggedSeq: UInt64 = 0
+    private var inputTraceLastRequestRedrawLoggedSeq: UInt64 = 0
 
     /// Lock-free atomic query: is post-process bloom glow enabled?
     /// Safe to call from draw thread without locking.
@@ -540,6 +547,15 @@ final class ZonvieCore {
                 if let corePtr = me.core {
                     let bg = zonvie_core_get_default_bg(corePtr)
                     me.terminalView?.renderer.updateDefaultBgColor(bg)
+                }
+                if ZonvieCore.appLogEnabled {
+                    let snap = me.currentInputTraceSnapshot()
+                    if snap.seq != 0, snap.sentNs != 0, snap.lastFlushEndLoggedSeq != snap.seq {
+                        let nowNs = zonvie_core_perf_now_ns()
+                        let deltaUs = max(Int64(0), (nowNs - snap.sentNs) / 1_000)
+                        ZonvieCore.appLog("[perf_input] seq=\(snap.seq) stage=flush_end delta_us=\(deltaUs)")
+                        me.markInputTraceFlushEndLogged(seq: snap.seq)
+                    }
                 }
                 // (scrollbar update is handled per-row in submitVerticesRaw/submitVerticesRowRaw)
                 // Ensure repaint after every flush (needed for glow config changes
@@ -1226,6 +1242,21 @@ final class ZonvieCore {
             ZonvieCore.appLog("[sendInput] core is nil")
             return
         }
+        if ZonvieCore.appLogEnabled {
+            let traceSeq: UInt64
+            let traceSentNs: Int64 = zonvie_core_perf_now_ns()
+            inputTraceLock.lock()
+            inputTraceSeq &+= 1
+            traceSeq = inputTraceSeq
+            inputTraceSentNs = traceSentNs
+            inputTraceLastDrawLoggedSeq = 0
+            inputTraceLastFlushEndLoggedSeq = 0
+            inputTraceLastDrawStartLoggedSeq = 0
+            inputTraceLastRequestRedrawLoggedSeq = 0
+            inputTraceLock.unlock()
+            zonvie_core_note_input_trace(core, traceSeq, traceSentNs)
+            ZonvieCore.appLog("[perf_input] seq=\(traceSeq) stage=input_send_frontend sent_ns=\(traceSentNs)")
+        }
         let data = s.data(using: .utf8) ?? Data()
         ZonvieCore.appLog("[sendInput] sending \"\(s)\" (\(data.count) bytes)")
         data.withUnsafeBytes { raw in
@@ -1235,6 +1266,36 @@ final class ZonvieCore {
             }
             zonvie_core_send_input(core, base, Int32(data.count))
         }
+    }
+
+    func currentInputTraceSnapshot() -> (seq: UInt64, sentNs: Int64, lastDrawLoggedSeq: UInt64, lastFlushEndLoggedSeq: UInt64, lastDrawStartLoggedSeq: UInt64, lastRequestRedrawLoggedSeq: UInt64) {
+        inputTraceLock.lock()
+        defer { inputTraceLock.unlock() }
+        return (inputTraceSeq, inputTraceSentNs, inputTraceLastDrawLoggedSeq, inputTraceLastFlushEndLoggedSeq, inputTraceLastDrawStartLoggedSeq, inputTraceLastRequestRedrawLoggedSeq)
+    }
+
+    func markInputTraceDrawLogged(seq: UInt64) {
+        inputTraceLock.lock()
+        defer { inputTraceLock.unlock() }
+        if inputTraceSeq == seq { inputTraceLastDrawLoggedSeq = seq }
+    }
+
+    func markInputTraceFlushEndLogged(seq: UInt64) {
+        inputTraceLock.lock()
+        defer { inputTraceLock.unlock() }
+        if inputTraceSeq == seq { inputTraceLastFlushEndLoggedSeq = seq }
+    }
+
+    func markInputTraceDrawStartLogged(seq: UInt64) {
+        inputTraceLock.lock()
+        defer { inputTraceLock.unlock() }
+        if inputTraceSeq == seq { inputTraceLastDrawStartLoggedSeq = seq }
+    }
+
+    func markInputTraceRequestRedrawLogged(seq: UInt64) {
+        inputTraceLock.lock()
+        defer { inputTraceLock.unlock() }
+        if inputTraceSeq == seq { inputTraceLastRequestRedrawLoggedSeq = seq }
     }
 
     /// Send a command to Neovim via nvim_command RPC (does not show in cmdline).

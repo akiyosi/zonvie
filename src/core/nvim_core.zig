@@ -1162,6 +1162,15 @@ pub const Core = struct {
         }
     }
 
+    pub fn noteInputTrace(self: *Core, seq: u64, sent_ns: i64) void {
+        self.grid_mu.lock();
+        defer self.grid_mu.unlock();
+        self.grid.noteInputTrace(seq, sent_ns);
+        if (self.log.cb != null) {
+            self.log.write("[perf_input] seq={d} stage=input_send sent_ns={d}\n", .{ seq, sent_ns });
+        }
+    }
+
     /// Send raw data to child process stdin (for SSH password input).
     /// Signals ssh_auth_done after writing.
     pub fn sendStdinData(self: *Core, data: []const u8) void {

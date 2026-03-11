@@ -208,6 +208,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     private let bufferSets: [BufferSet] = [BufferSet(), BufferSet(), BufferSet()]
     private var writeSetIndex: Int = 0       // Core thread only
+    // Valid only while isInFlush == true. Tracks the committed set we are detaching from.
+    private var flushSourceSetIndex: Int = 0 // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
@@ -537,6 +539,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return .dropped
         }
         writeSetIndex = picked
+        flushSourceSetIndex = srcIdx
         if ZonvieCore.appLogEnabled {
             let inf = gpuInFlightCount
             ZonvieCore.appLog("[scroll_debug] beginFlush committed=\(srcIdx) write=\(picked) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
@@ -598,97 +601,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let src = bufferSets[srcIdx]
         let dst = bufferSets[picked]
 
-        var rowCopyBytes = 0
-        var rowCopiedCount = 0
-        var rowReallocCount = 0
-        var rowReallocBytes = 0
+        let sharedRowRefs = src.rowVertexCounts.reduce(into: 0) { partial, count in
+            if count > 0 { partial += 1 }
+        }
         let tRowCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
-        // Deep copy row buffer contents: committed → write set
+        // Start from the committed set by sharing immutable buffer references.
+        // Updated rows/buffers will be detached lazily on first write.
         dst.knownTotalRows = src.knownTotalRows
         let srcRowCount = src.rowVertexBuffers.count
-        // Ensure dst arrays are large enough
-        if dst.rowVertexBuffers.count < srcRowCount {
-            let grow = srcRowCount - dst.rowVertexBuffers.count
-            dst.rowVertexBuffers.append(contentsOf: Array(repeating: nil, count: grow))
-            dst.rowVertexBufferCaps.append(contentsOf: Array(repeating: 0, count: grow))
-            dst.rowVertexCounts.append(contentsOf: Array(repeating: 0, count: grow))
-        }
-
-        for i in 0..<srcRowCount {
-            let srcCount = src.rowVertexCounts[i]
-            guard srcCount > 0, let srcBuf = src.rowVertexBuffers[i] else {
-                dst.rowVertexCounts[i] = 0
-                continue
-            }
-            let neededBytes = srcCount * MemoryLayout<Vertex>.stride
-            // Grow dst buffer if needed (lazy, never shrinks)
-            if dst.rowVertexBuffers[i] == nil || dst.rowVertexBufferCaps[i] < neededBytes {
-                let cap = max(neededBytes, dst.rowVertexBufferCaps[i] * 2, 4096)
-                dst.rowVertexBuffers[i] = device.makeBuffer(length: cap, options: .storageModeShared)
-                dst.rowVertexBufferCaps[i] = cap
-                rowReallocCount += 1
-                rowReallocBytes += cap
-            }
-            if let dstBuf = dst.rowVertexBuffers[i] {
-                memcpy(dstBuf.contents(), srcBuf.contents(), neededBytes)
-                dst.rowVertexCounts[i] = srcCount
-                rowCopiedCount += 1
-                rowCopyBytes += neededBytes
-            }
-        }
+        dst.rowVertexBuffers = src.rowVertexBuffers
+        dst.rowVertexBufferCaps = src.rowVertexBufferCaps
+        dst.rowVertexCounts = src.rowVertexCounts
         let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
-        // Zero out stale rows beyond src count (prevents drawing old data after grid shrink)
-        let dstRowCount = dst.rowVertexBuffers.count
-        if dstRowCount > srcRowCount {
-            for i in srcRowCount..<dstRowCount {
-                dst.rowVertexCounts[i] = 0
-            }
-        }
-
-        var mainCopyBytes = 0
-        var mainReallocBytes = 0
+        let sharedMainBytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
         let tMainCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        // Deep copy main buffer
-        if let srcMain = src.mainVertexBuffer, src.mainVertexCount > 0 {
-            let bytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
-            if dst.mainVertexBuffer == nil || dst.mainVertexBufferCap < bytes {
-                let cap = max(bytes, dst.mainVertexBufferCap * 2, 4096)
-                dst.mainVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
-                dst.mainVertexBufferCap = cap
-                mainReallocBytes = cap
-            }
-            if let dstBuf = dst.mainVertexBuffer {
-                memcpy(dstBuf.contents(), srcMain.contents(), bytes)
-                mainCopyBytes = bytes
-            }
-            dst.mainVertexCount = src.mainVertexCount
-        } else {
-            dst.mainVertexCount = src.mainVertexCount
-        }
+        dst.mainVertexBuffer = src.mainVertexBuffer
+        dst.mainVertexBufferCap = src.mainVertexBufferCap
+        dst.mainVertexCount = src.mainVertexCount
         let tMainCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
-        var cursorCopyBytes = 0
-        var cursorReallocBytes = 0
+        let sharedCursorBytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
         let tCursorCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        // Deep copy cursor buffer
-        if let srcCursor = src.cursorVertexBuffer, src.cursorVertexCount > 0 {
-            let bytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
-            if dst.cursorVertexBuffer == nil || dst.cursorVertexBufferCap < bytes {
-                let cap = max(bytes, dst.cursorVertexBufferCap * 2, 4096)
-                dst.cursorVertexBuffer = device.makeBuffer(length: cap, options: .storageModeShared)
-                dst.cursorVertexBufferCap = cap
-                cursorReallocBytes = cap
-            }
-            if let dstBuf = dst.cursorVertexBuffer {
-                memcpy(dstBuf.contents(), srcCursor.contents(), bytes)
-                cursorCopyBytes = bytes
-            }
-            dst.cursorVertexCount = src.cursorVertexCount
-        } else {
-            dst.cursorVertexCount = src.cursorVertexCount
-        }
+        dst.cursorVertexBuffer = src.cursorVertexBuffer
+        dst.cursorVertexBufferCap = src.cursorVertexBufferCap
+        dst.cursorVertexCount = src.cursorVertexCount
         let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         dst.usingRowBuffers = src.usingRowBuffers
@@ -706,7 +644,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let atlasCommitUsStr = String(format: "%.1f", atlasCommitUs)
             let atlasWaitUsStr = String(format: "%.1f", atlasWaitUs)
             ZonvieCore.appLog(
-                "[perf] begin_flush_copy src=\(srcIdx) dst=\(picked) atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) atlasWaitUs=\(atlasWaitUsStr) rowBuffers=\(srcRowCount) rowCopied=\(rowCopiedCount) rowCopyBytes=\(rowCopyBytes) rowReallocs=\(rowReallocCount) rowReallocBytes=\(rowReallocBytes) rowCopyUs=\(rowCopyUsStr) mainCopyBytes=\(mainCopyBytes) mainReallocBytes=\(mainReallocBytes) mainCopyUs=\(mainCopyUsStr) cursorCopyBytes=\(cursorCopyBytes) cursorReallocBytes=\(cursorReallocBytes) cursorCopyUs=\(cursorCopyUsStr) totalUs=\(totalUsStr)"
+                "[perf] begin_flush_prepare src=\(srcIdx) dst=\(picked) atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) atlasWaitUs=\(atlasWaitUsStr) rowBuffers=\(srcRowCount) sharedRowRefs=\(sharedRowRefs) sharedRowBytes=\(src.rowVertexCounts.reduce(0, +) * MemoryLayout<Vertex>.stride) rowPrepUs=\(rowCopyUsStr) sharedMainBytes=\(sharedMainBytes) mainPrepUs=\(mainCopyUsStr) sharedCursorBytes=\(sharedCursorBytes) cursorPrepUs=\(cursorCopyUsStr) totalUs=\(totalUsStr)"
             )
         }
 
@@ -954,6 +892,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        if ZonvieCore.appLogEnabled,
+           let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
+           inputTrace.seq != 0,
+           inputTrace.sentNs != 0,
+           inputTrace.lastDrawStartLoggedSeq != inputTrace.seq
+        {
+            let nowNs = zonvie_core_perf_now_ns()
+            let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
+            ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
+            (view as? MetalTerminalView)?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
+        }
         // Skip all rendering for minimized windows.
         // Metal's currentDrawable blocks/crashes when the window is in the
         // Dock, and onPreDraw accesses the Zig core (unnecessary CPU work).
@@ -1727,6 +1676,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let t_draw_end = CFAbsoluteTimeGetCurrent()
                 let draw_ms = (t_draw_end - t_draw_start) * 1000.0
                 ZonvieCore.appLog("[perf] draw_total rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) ms=\(String(format: "%.2f", draw_ms))")
+                if let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
+                   inputTrace.seq != 0,
+                   inputTrace.sentNs != 0,
+                   inputTrace.lastDrawLoggedSeq != inputTrace.seq
+                {
+                    let nowNs = zonvie_core_perf_now_ns()
+                    let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
+                    ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=draw_end delta_us=\(deltaUs) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count)")
+                    (view as? MetalTerminalView)?.core?.markInputTraceDrawLogged(seq: inputTrace.seq)
+                }
             }
 
             (view as? MetalTerminalView)?.didDrawFrame()
@@ -2282,10 +2241,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     
     /// Ensure main vertex buffer in the specified buffer set has sufficient capacity.
     private func ensureMainBufferInSet(_ setIdx: Int, vertexCount: Int) {
+        if setIdx == writeSetIndex {
+            precondition(isInFlush, "write-set buffer detachment is only valid during an active flush")
+        }
         let vc = max(0, vertexCount)
         guard let needed = safeNeededBytes(vertexCount: vc) else { return }
 
-        if bufferSets[setIdx].mainVertexBuffer == nil || needed > bufferSets[setIdx].mainVertexBufferCap {
+        let srcMain = bufferSets[flushSourceSetIndex].mainVertexBuffer
+        let sharesCommitted = setIdx == writeSetIndex && srcMain != nil && bufferSets[setIdx].mainVertexBuffer === srcMain
+        if sharesCommitted || bufferSets[setIdx].mainVertexBuffer == nil || needed > bufferSets[setIdx].mainVertexBufferCap {
             guard let nextCap = growCapacity(current: bufferSets[setIdx].mainVertexBufferCap, needed: max(1, needed)) else { return }
             bufferSets[setIdx].mainVertexBufferCap = nextCap
             bufferSets[setIdx].mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
@@ -2297,10 +2261,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     /// Ensure cursor vertex buffer in the specified buffer set has sufficient capacity.
     private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
+        if setIdx == writeSetIndex {
+            precondition(isInFlush, "write-set buffer detachment is only valid during an active flush")
+        }
         let vc = max(0, vertexCount)
         guard let needed = safeNeededBytes(vertexCount: vc) else { return }
 
-        if bufferSets[setIdx].cursorVertexBuffer == nil || needed > bufferSets[setIdx].cursorVertexBufferCap {
+        let srcCursor = bufferSets[flushSourceSetIndex].cursorVertexBuffer
+        let sharesCommitted = setIdx == writeSetIndex && srcCursor != nil && bufferSets[setIdx].cursorVertexBuffer === srcCursor
+        if sharesCommitted || bufferSets[setIdx].cursorVertexBuffer == nil || needed > bufferSets[setIdx].cursorVertexBufferCap {
             guard let nextCap = growCapacity(current: bufferSets[setIdx].cursorVertexBufferCap, needed: max(1, needed)) else { return }
             bufferSets[setIdx].cursorVertexBufferCap = nextCap
             bufferSets[setIdx].cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
@@ -2379,7 +2348,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        if bufferSets[s].rowVertexBuffers[row] == nil || neededBytes > bufferSets[s].rowVertexBufferCaps[row] {
+        let srcRowBuffer = row < bufferSets[flushSourceSetIndex].rowVertexBuffers.count ? bufferSets[flushSourceSetIndex].rowVertexBuffers[row] : nil
+        let sharesCommitted = srcRowBuffer != nil && bufferSets[s].rowVertexBuffers[row] === srcRowBuffer
+        if sharesCommitted || bufferSets[s].rowVertexBuffers[row] == nil || neededBytes > bufferSets[s].rowVertexBufferCaps[row] {
             guard let nextCap = growCapacity(current: bufferSets[s].rowVertexBufferCaps[row], needed: max(1, neededBytes)) else {
                 bufferSets[s].rowVertexCounts[row] = 0
                 return

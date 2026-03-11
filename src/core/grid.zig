@@ -881,6 +881,12 @@ pub const Grid = struct {
     prev_cursor_row: ?u32 = null,
     prev_cursor_grid: ?i64 = null,
 
+    // Frontend input trace markers for correlating input -> redraw stages.
+    input_trace_seq: u64 = 0,
+    input_trace_sent_ns: i64 = 0,
+    input_trace_first_grid_event_logged_seq: u64 = 0,
+    input_trace_flush_logged_seq: u64 = 0,
+
     pub fn init(alloc: std.mem.Allocator) Grid {
         return .{ .alloc = alloc };
     }
@@ -1067,6 +1073,13 @@ pub const Grid = struct {
         self.scroll_touched_count = 0;
         self.prev_cursor_row = null;
         self.prev_cursor_grid = null;
+    }
+
+    pub fn noteInputTrace(self: *Grid, seq: u64, sent_ns: i64) void {
+        self.input_trace_seq = seq;
+        self.input_trace_sent_ns = sent_ns;
+        self.input_trace_first_grid_event_logged_seq = 0;
+        self.input_trace_flush_logged_seq = 0;
     }
 
     pub fn clear(self: *Grid) void {
