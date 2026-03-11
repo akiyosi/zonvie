@@ -47,6 +47,8 @@ final class ZonvieCore {
     private var quitTimeoutWorkItem: DispatchWorkItem?
     private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
     private static let quitTimeoutSeconds: Double = 5.0
+
+    // Frontend input trace state used to correlate sendInput -> draw timing.
     private let inputTraceLock = NSLock()
     private var inputTraceSeq: UInt64 = 0
     private var inputTraceSentNs: Int64 = 0
@@ -648,6 +650,21 @@ final class ZonvieCore {
                     styleFlags: styleFlags,
                     outGlyphIDs: outGlyphIDs!, outXAdvances: outXAdvances!,
                     outLigTriggers: outLigTriggers!
+                )
+            },
+
+            on_main_row_scroll: { ctx, rowStart, rowEnd, colStart, colEnd, rowsDelta, totalRows, totalCols in
+                guard let ctx else { return }
+                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                guard let view = core.terminalView else { return }
+                view.applyMainRowScrollRaw(
+                    rowStart: Int(rowStart),
+                    rowEnd: Int(rowEnd),
+                    colStart: Int(colStart),
+                    colEnd: Int(colEnd),
+                    rowsDelta: Int(rowsDelta),
+                    totalRows: Int(totalRows),
+                    totalCols: Int(totalCols)
                 )
             }
         )
@@ -1277,25 +1294,33 @@ final class ZonvieCore {
     func markInputTraceDrawLogged(seq: UInt64) {
         inputTraceLock.lock()
         defer { inputTraceLock.unlock() }
-        if inputTraceSeq == seq { inputTraceLastDrawLoggedSeq = seq }
+        if inputTraceSeq == seq {
+            inputTraceLastDrawLoggedSeq = seq
+        }
     }
 
     func markInputTraceFlushEndLogged(seq: UInt64) {
         inputTraceLock.lock()
         defer { inputTraceLock.unlock() }
-        if inputTraceSeq == seq { inputTraceLastFlushEndLoggedSeq = seq }
+        if inputTraceSeq == seq {
+            inputTraceLastFlushEndLoggedSeq = seq
+        }
     }
 
     func markInputTraceDrawStartLogged(seq: UInt64) {
         inputTraceLock.lock()
         defer { inputTraceLock.unlock() }
-        if inputTraceSeq == seq { inputTraceLastDrawStartLoggedSeq = seq }
+        if inputTraceSeq == seq {
+            inputTraceLastDrawStartLoggedSeq = seq
+        }
     }
 
     func markInputTraceRequestRedrawLogged(seq: UInt64) {
         inputTraceLock.lock()
         defer { inputTraceLock.unlock() }
-        if inputTraceSeq == seq { inputTraceLastRequestRedrawLoggedSeq = seq }
+        if inputTraceSeq == seq {
+            inputTraceLastRequestRedrawLoggedSeq = seq
+        }
     }
 
     /// Send a command to Neovim via nvim_command RPC (does not show in cmdline).

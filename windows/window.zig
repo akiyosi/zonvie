@@ -2378,6 +2378,7 @@ pub export fn WndProc(
                     .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
                     .on_get_ascii_table = callbacks.onGetAsciiTable,
                     .on_flush_end = callbacks.onFlushEnd,
+                    .on_main_row_scroll = callbacks.onMainRowScroll,
                 };
                 applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 

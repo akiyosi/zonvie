@@ -512,6 +512,18 @@ pub const Callbacks = extern struct {
 
     // ASCII fast path table callback (NULL = no fast path, always use shaping)
     on_get_ascii_table: ?GetAsciiTableFn = null,
+
+    // Main row-buffer scroll fast path notification (optional)
+    on_main_row_scroll: ?*const fn (
+        ctx: ?*anyopaque,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void = null,
 };
 
 pub const zonvie_render_plan = opaque {};
@@ -648,6 +660,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         // ASCII fast path
         .on_get_ascii_table = box.cb.on_get_ascii_table,
+
+        // Main row-buffer scroll fast path notification
+        .on_main_row_scroll = box.cb.on_main_row_scroll,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);

@@ -1202,6 +1202,33 @@ final class MetalTerminalView: MTKView {
         }
     }
 
+    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+        processPendingScrollClears()
+        renderer.applyMainRowScrollRaw(
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            colStart: colStart,
+            colEnd: colEnd,
+            rowsDelta: rowsDelta,
+            totalRows: totalRows,
+            totalCols: totalCols
+        )
+
+        let cellHpx = CGFloat(renderer.cellHeightPx)
+        let yFromTopPx = CGFloat(rowStart) * cellHpx
+        let hPx = CGFloat(max(0, rowEnd - rowStart)) * cellHpx
+        let drawableWPx = CGFloat(self.drawableSize.width)
+        guard drawableWPx > 0, hPx > 0 else { return }
+
+        let rectPx = NSRect(
+            x: 0,
+            y: max(0, yFromTopPx),
+            width: drawableWPx,
+            height: hPx
+        )
+        requestRedrawDrawablePx(rectPx)
+    }
+
     func applyLineSpace(px: Int32) {
         renderer.setLineSpace(px: px)
 

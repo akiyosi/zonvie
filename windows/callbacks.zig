@@ -152,6 +152,21 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     }
 }
 
+fn shiftVertsY(verts: []app_mod.Vertex, delta_y: f32) void {
+    for (verts) |*v| {
+        v.position[1] += delta_y;
+    }
+}
+
+fn recomputeRowValidCount(app: *App) void {
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (i < app.row_valid.bit_length) : (i += 1) {
+        if (app.row_valid.isSet(i)) count += 1;
+    }
+    app.row_valid_count = count;
+}
+
 pub fn appendRowsFromUpdateRegion(
     hwnd: c.HWND,
     app: *App,
@@ -934,6 +949,133 @@ pub fn onVerticesRow(
         _ = c.GetClientRect(hwnd, &client);
         rc.right = client.right;
 
+        _ = c.InvalidateRect(hwnd, &rc, c.FALSE);
+    }
+}
+
+pub fn onMainRowScroll(
+    ctx: ?*anyopaque,
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    col_end: u32,
+    rows_delta: i32,
+    total_rows: u32,
+    total_cols: u32,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.mu.lock();
+    defer app.mu.unlock();
+
+    if (rows_delta == 0 or row_end <= row_start) return;
+    if (col_start != 0 or col_end != total_cols) return;
+
+    if (total_rows != app.rows) {
+        app.rows = total_rows;
+        app.cols = total_cols;
+        if (total_rows != 0) {
+            app.row_valid.resize(app.alloc, @intCast(total_rows), false) catch {};
+            app.row_valid.unsetAll();
+        } else if (app.row_valid.bit_length != 0) {
+            app.row_valid.unsetAll();
+        }
+        app.row_valid_count = 0;
+        app.row_layout_gen +%= 1;
+    } else {
+        app.rows = total_rows;
+        app.cols = total_cols;
+    }
+
+    if (total_rows == 0) return;
+    if (row_start >= total_rows or row_end > total_rows) return;
+
+    const region_height: u32 = row_end - row_start;
+    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
+    if (abs_rows == 0 or abs_rows >= region_height) return;
+
+    app.row_mode = true;
+    if (app.row_valid.bit_length < total_rows) {
+        app.row_valid.resize(app.alloc, @intCast(total_rows), false) catch {};
+    }
+
+    const last_row: u32 = row_end - 1;
+    app.ensureRowStorage(last_row);
+    if (last_row >= app.row_verts.items.len) return;
+
+    const content_h: f32 = @floatFromInt(@max(@as(u32, 1), app.rows * (app.cell_h_px + app.linespace_px)));
+    const row_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
+    const delta_y: f32 = @as(f32, @floatFromInt(rows_delta)) * row_h / content_h * 2.0;
+
+    const start_idx: usize = @intCast(row_start);
+    const end_idx: usize = @intCast(row_end);
+    const shift: usize = @intCast(abs_rows);
+
+    if (rows_delta > 0) {
+        var dst: usize = start_idx;
+        while (dst + shift < end_idx) : (dst += 1) {
+            const src = dst + shift;
+            std.mem.swap(app_mod.RowVerts, &app.row_verts.items[dst], &app.row_verts.items[src]);
+            shiftVertsY(app.row_verts.items[dst].verts.items, delta_y);
+            app.row_verts.items[dst].gen +%= 1;
+            if (src < app.row_valid.bit_length and app.row_valid.isSet(src)) {
+                app.row_valid.set(dst);
+            } else if (dst < app.row_valid.bit_length) {
+                app.row_valid.unset(dst);
+            }
+        }
+        var vacated: usize = end_idx - shift;
+        while (vacated < end_idx) : (vacated += 1) {
+            app.row_verts.items[vacated].verts.clearRetainingCapacity();
+            app.row_verts.items[vacated].gen +%= 1;
+            if (vacated < app.row_valid.bit_length) app.row_valid.unset(vacated);
+        }
+    } else {
+        var dst: usize = end_idx;
+        while (dst > start_idx + shift) {
+            dst -= 1;
+            const src = dst - shift;
+            std.mem.swap(app_mod.RowVerts, &app.row_verts.items[dst], &app.row_verts.items[src]);
+            shiftVertsY(app.row_verts.items[dst].verts.items, delta_y);
+            app.row_verts.items[dst].gen +%= 1;
+            if (src < app.row_valid.bit_length and app.row_valid.isSet(src)) {
+                app.row_valid.set(dst);
+            } else if (dst < app.row_valid.bit_length) {
+                app.row_valid.unset(dst);
+            }
+        }
+        var vacated: usize = start_idx;
+        while (vacated < start_idx + shift) : (vacated += 1) {
+            app.row_verts.items[vacated].verts.clearRetainingCapacity();
+            app.row_verts.items[vacated].gen +%= 1;
+            if (vacated < app.row_valid.bit_length) app.row_valid.unset(vacated);
+        }
+    }
+
+    recomputeRowValidCount(app);
+
+    var row: u32 = row_start;
+    while (row < row_end) : (row += 1) {
+        _ = app.dirty_rows.put(app.alloc, row, {}) catch {};
+    }
+
+    if (row_end > app.row_mode_max_row_end) {
+        app.row_mode_max_row_end = row_end;
+    }
+
+    if (app.hwnd) |hwnd| {
+        const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
+        const row_h_px_u32 = app_mod.rowHeightPxFromClient(hwnd, app.rows, fallback_row_h);
+        const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
+
+        var rc: c.RECT = .{
+            .left = 0,
+            .top = @intCast(@as(i32, @intCast(row_start)) * row_h_px),
+            .right = 0,
+            .bottom = @intCast(@as(i32, @intCast(row_end)) * row_h_px),
+        };
+        var client: c.RECT = undefined;
+        _ = c.GetClientRect(hwnd, &client);
+        rc.right = client.right;
         _ = c.InvalidateRect(hwnd, &rc, c.FALSE);
     }
 }

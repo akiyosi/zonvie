@@ -52,9 +52,17 @@ struct DrawableSize {
 
 vertex VSOut vs_main(VertexIn in [[stage_in]],
                      constant ScrollOffset* scrollOffsets [[buffer(1)]],
-                     constant uint& scrollOffsetCount [[buffer(2)]]) {
+                     constant uint& scrollOffsetCount [[buffer(2)]],
+                     constant float& rowTranslationY [[buffer(3)]]) {
     VSOut o;
     float2 pos = in.position;
+
+    // Apply row translation first so scroll boundary pin checks compare
+    // against the logical row position, not the source row position.
+    // Without this, remapped rows (from on_main_row_scroll) fail the
+    // content_top_y / content_bottom_y pin test during smooth scrolling,
+    // causing edge rows to be clipped instead of stretched.
+    pos.y += rowTranslationY;
 
     // Default: no clipping needed (content bounds cover entire screen)
     o.content_top_y = 2.0;     // Above screen

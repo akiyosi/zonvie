@@ -259,6 +259,18 @@ pub const Callbacks = struct {
 
     // ASCII fast path table callback
     on_get_ascii_table: ?c_api.GetAsciiTableFn = null,
+
+    // Main row-buffer scroll fast path notification
+    on_main_row_scroll: ?*const fn (
+        ctx: ?*anyopaque,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void = null,
 };
 
 const PipeReader = rpc_session.PipeReader;

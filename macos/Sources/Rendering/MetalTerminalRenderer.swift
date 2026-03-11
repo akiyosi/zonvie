@@ -193,6 +193,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var rowVertexBuffers: [MTLBuffer?] = []
         var rowVertexBufferCaps: [Int] = []     // bytes capacity per row buffer
         var rowVertexCounts: [Int] = []         // vertex count per row
+        var rowLogicalToSlot: [Int] = []        // logical row -> physical slot
+        var rowSlotSourceRows: [Int] = []       // physical slot -> row encoded in vertex positions
 
         // Main / cursor vertex buffers (non-row-mode and partial updates)
         var mainVertexBuffer: MTLBuffer?
@@ -204,6 +206,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         var usingRowBuffers: Bool = false
         var knownTotalRows: Int = 0   // Actual grid row count from core
+        var pendingMainRowScroll: MainRowScroll? = nil
+    }
+
+    private struct MainRowScroll {
+        var rowStart: Int
+        var rowEnd: Int
+        var colStart: Int
+        var colEnd: Int
+        var rowsDelta: Int
+        var totalRows: Int
+        var totalCols: Int
     }
 
     private let bufferSets: [BufferSet] = [BufferSet(), BufferSet(), BufferSet()]
@@ -354,6 +367,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // --- Persistent back buffer (for correct partial redraw) ---
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
+    private var scrollScratchTexture: MTLTexture? = nil
+    private var scrollScratchSize: CGSize = .zero
 
     // --- Blur transparency support ---
     private let blurEnabled: Bool
@@ -399,6 +414,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+    }
+
+    private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
+        if scrollScratchTexture != nil, scrollScratchSize == drawableSize { return }
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: max(1, Int(drawableSize.width)),
+            height: max(1, Int(drawableSize.height)),
+            mipmapped: false
+        )
+        desc.storageMode = .private
+        scrollScratchTexture = device.makeTexture(descriptor: desc)
+        scrollScratchSize = drawableSize
     }
 
     /// Ensure glow textures exist: extract (1/2 res) + 3 mip levels for Dual Kawase.
@@ -613,6 +642,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         dst.rowVertexBuffers = src.rowVertexBuffers
         dst.rowVertexBufferCaps = src.rowVertexBufferCaps
         dst.rowVertexCounts = src.rowVertexCounts
+        dst.rowLogicalToSlot = src.rowLogicalToSlot
+        dst.rowSlotSourceRows = src.rowSlotSourceRows
         let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         let sharedMainBytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
@@ -630,6 +661,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
         dst.usingRowBuffers = src.usingRowBuffers
+        dst.pendingMainRowScroll = nil
 
         if perfEnabled {
             let rowCopyUs = (tRowCopyEnd - tRowCopyStart) * 1_000_000
@@ -974,6 +1006,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let dirtyRows: [Int]
             let smoothScrolling: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
+            let pendingMainRowScroll: MainRowScroll?
+            let rowLogicalToSlotSnapshot: [Int]
+            let rowSlotSourceRowsSnapshot: [Int]
 
             let snappedBgRGB: UInt32
             let snappedCommittedDrawableW: UInt32
@@ -991,6 +1026,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             pendingDirtyRows.removeAll()
             smoothScrolling = hasActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            pendingMainRowScroll = bufferSets[csi].pendingMainRowScroll
+            rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
+            rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             snappedBgRGB = defaultBgRGB
             snappedCommittedDrawableW = committedDrawableW
             snappedCommittedDrawableH = committedDrawableH
@@ -1119,9 +1157,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             let safeRowCount: Int
             if rowMode {
-                safeRowCount = min(rowBuffersSnapshot.count, rowCountsSnapshot.count)
+                safeRowCount = min(min(rowBuffersSnapshot.count, rowCountsSnapshot.count), rowLogicalToSlotSnapshot.count)
             } else {
                 safeRowCount = 0
+            }
+            let useGpuScrollCopy = rowMode
+                && hasNewCommit
+                && pendingMainRowScroll != nil
+                && hasPresentedOnce
+                && !smoothScrolling
+                && !drawableSizeChanged
+            let rowTranslationDenom = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
+            func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                guard logicalRow >= 0, logicalRow < safeRowCount else { return nil }
+                let slot = rowLogicalToSlotSnapshot[logicalRow]
+                guard slot >= 0, slot < rowCountsSnapshot.count, slot < rowBuffersSnapshot.count else { return nil }
+                let vc = rowCountsSnapshot[slot]
+                guard vc > 0, let vb = rowBuffersSnapshot[slot] else { return nil }
+                let sourceRow = slot < rowSlotSourceRowsSnapshot.count ? rowSlotSourceRowsSnapshot[slot] : logicalRow
+                let translationY = Float(sourceRow - logicalRow) * Float(cellHi) / max(1.0, rowTranslationDenom) * 2.0
+                return (vc, vb, translationY)
             }
 
             // --- Step 3: Compute cursor grid row from NDC vertex positions ---
@@ -1144,8 +1199,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let canBlinkFastPath: Bool = {
                 guard isBlinkOnlyFrame && blurEnabled && rowMode && use2Pass else { return false }
                 guard cursorGridRow >= 0 && cursorGridRow < safeRowCount else { return false }
-                guard rowCountsSnapshot[cursorGridRow] > 0 else { return false }
-                guard rowBuffersSnapshot[cursorGridRow] != nil else { return false }
+                guard resolvedRowState(cursorGridRow) != nil else { return false }
                 return true
             }()
 
@@ -1172,6 +1226,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             guard let backTex = backBuffer else { return }
 
+            guard let cmd = queue.makeCommandBuffer() else {
+                return
+            }
+            var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
+            if useGpuScrollCopy, let pendingScroll = pendingMainRowScroll {
+                scrollClearBand = encodePendingMainRowScrollCopy(
+                    commandBuffer: cmd,
+                    backTexture: backTex,
+                    drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
+                    rowHeightPx: Int(cellHi),
+                    scroll: pendingScroll,
+                    logEnabled: ZonvieCore.appLogEnabled
+                )
+            }
+
             // --- 1) Render into back buffer (partial redraw is valid here) ---
             let rpd = MTLRenderPassDescriptor()
             rpd.colorAttachments[0].texture = backTex
@@ -1194,7 +1263,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // Blink-only fast path: preserve back buffer, redraw only cursor row
                 rpd.colorAttachments[0].loadAction = .load
                 ZonvieCore.appLog("[draw] loadAction=.load (blinkFastPath cursorRow=\(cursorGridRow))")
-            } else if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
+            } else if useGpuScrollCopy {
+                rpd.colorAttachments[0].loadAction = .load
+                ZonvieCore.appLog("[draw] loadAction=.load (gpuScrollCopy)")
+            } else if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && !smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode) {
                 rpd.colorAttachments[0].loadAction = .load
                 ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
             } else {
@@ -1216,10 +1288,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
 
-            guard let cmd = queue.makeCommandBuffer() else {
-                // defer handles: semaphore.signal() + gpuInFlight decrement
-                return
-            }
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                 // defer handles: semaphore.signal() + gpuInFlight decrement
                 return
@@ -1276,6 +1344,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 var size = DrawableSize(width: dsW, height: dsH)
                 enc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
             }
+            var zeroRowTranslation: Float = 0
+            enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
 
             // Bind background alpha buffer for blur transparency
             if let alphaBuf = backgroundAlphaBuffer {
@@ -1296,8 +1366,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 if use2Pass {
                     if canBlinkFastPath {
                         // FAST PATH: blink-only — redraw only cursor row (2-pass)
-                        let vc = rowCountsSnapshot[cursorGridRow]
-                        let vb = rowBuffersSnapshot[cursorGridRow]!  // guaranteed non-nil by canBlinkFastPath
+                        let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
+                        let vc = resolved.vc
+                        let vb = resolved.vb
 
                         let y = max(0, cursorGridRow * Int(cellHi))
                         let h = Int(cellHi)
@@ -1307,15 +1378,59 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
                         // Pass 1: Background (overwrite blending — erases old cursor)
                         enc.setRenderPipelineState(backgroundPipeline!)
+                        var rowTranslation = resolved.translationY
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
 
                         // Pass 2: Glyph (alpha blending — redraws text/decorations)
                         enc.setRenderPipelineState(glyphPipeline!)
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
 
                         ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc)")
+                    } else if useGpuScrollCopy {
+                        enc.setRenderPipelineState(backgroundPipeline!)
+                        if let clearBand = scrollClearBand {
+                            drawBackgroundClearBand(
+                                enc,
+                                clearBand: clearBand,
+                                drawableWidth: Float(vpWidth > 0 ? vpWidth : view.drawableSize.width),
+                                drawableHeight: Float(vpHeight > 0 ? vpHeight : view.drawableSize.height),
+                                bgRGB: snappedBgRGB
+                            )
+                        }
+                        for row in dirtyRows {
+                            guard let resolved = resolvedRowState(row) else { continue }
+                            let vc = resolved.vc
+                            let vb = resolved.vb
+                            let y = max(0, row * Int(cellHi))
+                            let h = Int(cellHi)
+                            if drawableW > 0 && h > 0 {
+                                enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
+                            }
+                            var rowTranslation = resolved.translationY
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
+
+                        enc.setRenderPipelineState(glyphPipeline!)
+                        for row in dirtyRows {
+                            guard let resolved = resolvedRowState(row) else { continue }
+                            let vc = resolved.vc
+                            let vb = resolved.vb
+                            let y = max(0, row * Int(cellHi))
+                            let h = Int(cellHi)
+                            if drawableW > 0 && h > 0 {
+                                enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
+                            }
+                            var rowTranslation = resolved.translationY
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
                     } else {
                         // 2-Pass rendering for blur: draw backgrounds first, then glyphs
                         // This prevents ghosting with semi-transparent backgrounds
@@ -1323,9 +1438,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // Pass 1: Background (overwrite blending)
                         enc.setRenderPipelineState(backgroundPipeline!)
                         for row in 0..<safeRowCount {
-                            let vc = rowCountsSnapshot[row]
-                            if vc <= 0 { continue }
-                            guard let vb = rowBuffersSnapshot[row] else { continue }
+                            guard let resolved = resolvedRowState(row) else { continue }
+                            var rowTranslation = resolved.translationY
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            let vc = resolved.vc
+                            let vb = resolved.vb
                             enc.setVertexBuffer(vb, offset: 0, index: 0)
                             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                         }
@@ -1333,9 +1450,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // Pass 2: Glyphs (standard alpha blending)
                         enc.setRenderPipelineState(glyphPipeline!)
                         for row in 0..<safeRowCount {
-                            let vc = rowCountsSnapshot[row]
-                            if vc <= 0 { continue }
-                            guard let vb = rowBuffersSnapshot[row] else { continue }
+                            guard let resolved = resolvedRowState(row) else { continue }
+                            var rowTranslation = resolved.translationY
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            let vc = resolved.vc
+                            let vb = resolved.vb
                             enc.setVertexBuffer(vb, offset: 0, index: 0)
                             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                         }
@@ -1343,40 +1462,71 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
                     for row in 0..<safeRowCount {
-                        let vc = rowCountsSnapshot[row]
-                        if vc <= 0 { continue }
-                        guard let vb = rowBuffersSnapshot[row] else { continue }
+                        guard let resolved = resolvedRowState(row) else { continue }
+                        var rowTranslation = resolved.translationY
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                        let vc = resolved.vc
+                        let vb = resolved.vb
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                     }
-                } else if !dirtyRows.isEmpty {
-                    // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
+                } else if useGpuScrollCopy {
+                    if let clearBand = scrollClearBand {
+                        drawBackgroundClearBand(
+                            enc,
+                            clearBand: clearBand,
+                            drawableWidth: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                            drawableHeight: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                            bgRGB: snappedBgRGB
+                        )
+                    }
                     for row in dirtyRows {
-                        if row < 0 || row >= safeRowCount { continue }
-                        let vc = rowCountsSnapshot[row]
-                        if vc <= 0 { continue }
-                        guard let vb = rowBuffersSnapshot[row] else { continue }
+                        guard let resolved = resolvedRowState(row) else { continue }
+                        let vc = resolved.vc
+                        let vb = resolved.vb
 
                         let y = max(0, row * cellH)
                         if drawableW > 0 && cellH > 0 {
                             enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: cellH))
                         }
 
+                        var rowTranslation = resolved.translationY
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                        enc.setVertexBuffer(vb, offset: 0, index: 0)
+                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                    }
+                } else if !dirtyRows.isEmpty {
+                    // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
+                    for row in dirtyRows {
+                        guard let resolved = resolvedRowState(row) else { continue }
+                        let vc = resolved.vc
+                        let vb = resolved.vb
+
+                        let y = max(0, row * cellH)
+                        if drawableW > 0 && cellH > 0 {
+                            enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: cellH))
+                        }
+
+                        var rowTranslation = resolved.translationY
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                     }
                 } else {
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
                     for row in 0..<safeRowCount {
-                        let vc = rowCountsSnapshot[row]
-                        if vc <= 0 { continue }
-                        guard let vb = rowBuffersSnapshot[row] else { continue }
+                        guard let resolved = resolvedRowState(row) else { continue }
+                        var rowTranslation = resolved.translationY
+                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                        let vc = resolved.vc
+                        let vb = resolved.vb
                         enc.setVertexBuffer(vb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                     }
                 }
             } else {
                 // Non-rowMode
+                enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
                 if use2Pass {
                     // 2-Pass rendering for blur
                     // Pass 1: Background (overwrite blending)
@@ -1414,27 +1564,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
             // canBlinkFastPath also sets a scissor that must be reset.
-            if (rowMode && !use2Pass) || canBlinkFastPath {
+            if (rowMode && (!use2Pass || useGpuScrollCopy)) || canBlinkFastPath {
                 let fullW = max(0, Int(view.drawableSize.width.rounded(.down)))
                 let fullH = max(0, Int(view.drawableSize.height.rounded(.down)))
                 if fullW > 0 && fullH > 0 {
                     enc.setScissorRect(MTLScissorRect(x: 0, y: 0, width: fullW, height: fullH))
                 }
-            }
-
-            // --- cursor pass ---
-            // Cursor uses the original pipeline (ps_main) because:
-            // - Cursor vertices use uv.x < 0 marker (same as backgrounds)
-            // - ps_glyph discards uv.x < 0, so cursor would be invisible
-            // - ps_main handles both backgrounds and glyphs correctly
-            if use2Pass {
-                enc.setRenderPipelineState(pipeline!)
-            }
-            // Only draw cursor if blink state is visible
-            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkState) cursorCount=\(currentCursorCount)")
-            if cursorBlinkState, currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
-                enc.setVertexBuffer(cvb, offset: 0, index: 0)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
             }
 
             enc.endEncoding()
@@ -1502,12 +1637,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             extractScrollCount = 0
                         }
                         enc.setVertexBytes(&extractScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
+                        enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
 
                         if rowMode {
                             for row in 0..<safeRowCount {
-                                let vc = rowCountsSnapshot[row]
-                                if vc <= 0 { continue }
-                                guard let vb = rowBuffersSnapshot[row] else { continue }
+                                guard let resolved = resolvedRowState(row) else { continue }
+                                var rowTranslation = resolved.translationY
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                let vc = resolved.vc
+                                let vb = resolved.vb
                                 enc.setVertexBuffer(vb, offset: 0, index: 0)
                                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
                             }
@@ -1624,6 +1762,65 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let t_copy_end = CFAbsoluteTimeGetCurrent()
                     let copy_us = (t_copy_end - t_copy_start) * 1_000_000
                     ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
+                }
+            }
+
+            // Cursor is composited only on the final drawable.
+            // This keeps the persistent back buffer cursor-free and prevents stale
+            // cursor pixels from being moved by GPU scroll-region copies.
+            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkState) cursorCount=\(currentCursorCount)")
+            if cursorBlinkState, currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
+                let cursorRPD = MTLRenderPassDescriptor()
+                cursorRPD.colorAttachments[0].texture = drawable.texture
+                cursorRPD.colorAttachments[0].loadAction = .load
+                cursorRPD.colorAttachments[0].storeAction = .store
+
+                if let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) {
+                    if vpWidth > 0 && vpHeight > 0 {
+                        cursorEnc.setViewport(MTLViewport(originX: 0, originY: 0, width: vpWidth, height: vpHeight, znear: 0, zfar: 1))
+                    }
+                    cursorEnc.setRenderPipelineState(pipeline!)
+                    if let tex = atlasTex {
+                        cursorEnc.setFragmentTexture(tex, index: 0)
+                    }
+                    cursorEnc.setFragmentSamplerState(sampler!, index: 0)
+
+                    let maxSetVertexBytesSize = 4096
+                    var effectiveScrollCount = UInt32(scrollSnapshot.count)
+                    if !scrollSnapshot.isEmpty {
+                        scrollSnapshot.withUnsafeBytes { ptr in
+                            if ptr.count <= maxSetVertexBytesSize {
+                                cursorEnc.setVertexBytes(ptr.baseAddress!, length: ptr.count, index: 1)
+                            } else if let buf = device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared) {
+                                cursorEnc.setVertexBuffer(buf, offset: 0, index: 1)
+                            } else {
+                                var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                                cursorEnc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
+                                effectiveScrollCount = 0
+                            }
+                        }
+                    } else {
+                        var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                        cursorEnc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
+                    }
+                    cursorEnc.setVertexBytes(&effectiveScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
+                    var zeroTranslation = Float(0)
+                    cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+
+                    let dsW = vpWidth > 0 ? Float(vpWidth) : Float(view.drawableSize.width)
+                    let dsH = vpHeight > 0 ? Float(vpHeight) : Float(view.drawableSize.height)
+                    var size = DrawableSize(width: dsW, height: dsH)
+                    cursorEnc.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
+                    if let alphaBuf = backgroundAlphaBuffer {
+                        cursorEnc.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
+                    }
+                    if let blinkBuf = cursorBlinkBuffer {
+                        cursorEnc.setFragmentBuffer(blinkBuf, offset: 0, index: 2)
+                    }
+
+                    cursorEnc.setVertexBuffer(cvb, offset: 0, index: 0)
+                    cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
+                    cursorEnc.endEncoding()
                 }
             }
 
@@ -2287,11 +2484,351 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return
         }
         if row < bufferSets[setIdx].rowVertexBuffers.count { return }
+        let oldCount = bufferSets[setIdx].rowVertexBuffers.count
         let newCount = row + 1
         let grow = newCount - bufferSets[setIdx].rowVertexBuffers.count
         bufferSets[setIdx].rowVertexBuffers.append(contentsOf: Array(repeating: nil, count: grow))
         bufferSets[setIdx].rowVertexBufferCaps.append(contentsOf: Array(repeating: 0, count: grow))
         bufferSets[setIdx].rowVertexCounts.append(contentsOf: Array(repeating: 0, count: grow))
+        bufferSets[setIdx].rowLogicalToSlot.append(contentsOf: Array(oldCount..<newCount))
+        bufferSets[setIdx].rowSlotSourceRows.append(contentsOf: Array(oldCount..<newCount))
+    }
+
+    private func prepareRowModeSetForWrite(_ setIdx: Int, totalRows: Int) {
+        if totalRows > 0 {
+            bufferSets[setIdx].knownTotalRows = totalRows
+        }
+        bufferSets[setIdx].usingRowBuffers = true
+
+        if totalRows > 0 && totalRows < bufferSets[setIdx].rowVertexBuffers.count {
+            if bufferSets[setIdx].rowVertexBuffers.count > totalRows * 2 {
+                bufferSets[setIdx].rowVertexBuffers.removeSubrange(totalRows...)
+                bufferSets[setIdx].rowVertexBufferCaps.removeSubrange(totalRows...)
+                bufferSets[setIdx].rowVertexCounts.removeSubrange(totalRows...)
+                bufferSets[setIdx].rowLogicalToSlot.removeSubrange(totalRows...)
+                bufferSets[setIdx].rowSlotSourceRows.removeSubrange(totalRows...)
+            } else {
+                for r in totalRows..<bufferSets[setIdx].rowVertexBuffers.count {
+                    bufferSets[setIdx].rowVertexCounts[r] = 0
+                }
+            }
+        }
+    }
+
+    private func ensureDetachedRowBufferInSet(_ setIdx: Int, row: Int, vertexCount: Int) -> MTLBuffer? {
+        if setIdx == writeSetIndex {
+            precondition(isInFlush, "write-set row detachment is only valid during an active flush")
+        }
+        guard row >= 0 && row < maxRowBuffers else { return nil }
+        ensureRowStorageInSet(setIdx, row)
+        guard row < bufferSets[setIdx].rowVertexBuffers.count else { return nil }
+        guard let neededBytes = safeNeededBytes(vertexCount: max(0, vertexCount)) else { return nil }
+
+        let srcRowBuffer = row < bufferSets[flushSourceSetIndex].rowVertexBuffers.count ? bufferSets[flushSourceSetIndex].rowVertexBuffers[row] : nil
+        let sharesCommitted = setIdx == writeSetIndex && srcRowBuffer != nil && bufferSets[setIdx].rowVertexBuffers[row] === srcRowBuffer
+        if sharesCommitted || bufferSets[setIdx].rowVertexBuffers[row] == nil || neededBytes > bufferSets[setIdx].rowVertexBufferCaps[row] {
+            guard let nextCap = growCapacity(current: bufferSets[setIdx].rowVertexBufferCaps[row], needed: max(1, neededBytes)) else { return nil }
+            bufferSets[setIdx].rowVertexBufferCaps[row] = nextCap
+            bufferSets[setIdx].rowVertexBuffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bufferSets[setIdx].rowVertexBuffers[row] == nil {
+                bufferSets[setIdx].rowVertexBufferCaps[row] = 0
+                return nil
+            }
+        }
+        return bufferSets[setIdx].rowVertexBuffers[row]
+    }
+
+    private func canUseGpuMainRowScrollCopy() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hasPresentedOnce && backBuffer != nil
+    }
+
+    private func remapMainRowSlots(
+        setIdx: Int,
+        rowStart: Int,
+        rowEnd: Int,
+        rowsDelta: Int,
+        totalRows: Int
+    ) {
+        prepareRowModeSetForWrite(setIdx, totalRows: totalRows)
+        let regionHeight = rowEnd - rowStart
+        let shift = abs(rowsDelta)
+        guard shift > 0, shift < regionHeight else { return }
+        ensureRowStorageInSet(setIdx, rowEnd - 1)
+        guard rowEnd <= bufferSets[setIdx].rowLogicalToSlot.count else { return }
+
+        if rowsDelta > 0 {
+            let savedSlots = Array(bufferSets[setIdx].rowLogicalToSlot[rowStart..<(rowStart + shift)])
+            for dstRow in rowStart..<(rowEnd - shift) {
+                bufferSets[setIdx].rowLogicalToSlot[dstRow] = bufferSets[setIdx].rowLogicalToSlot[dstRow + shift]
+            }
+            for (idx, slot) in savedSlots.enumerated() {
+                let logicalRow = rowEnd - shift + idx
+                bufferSets[setIdx].rowLogicalToSlot[logicalRow] = slot
+                bufferSets[setIdx].rowVertexCounts[slot] = 0
+                bufferSets[setIdx].rowSlotSourceRows[slot] = logicalRow
+            }
+        } else {
+            let savedSlots = Array(bufferSets[setIdx].rowLogicalToSlot[(rowEnd - shift)..<rowEnd])
+            for dstRow in stride(from: rowEnd - 1, through: rowStart + shift, by: -1) {
+                bufferSets[setIdx].rowLogicalToSlot[dstRow] = bufferSets[setIdx].rowLogicalToSlot[dstRow - shift]
+            }
+            for (idx, slot) in savedSlots.enumerated() {
+                let logicalRow = rowStart + idx
+                bufferSets[setIdx].rowLogicalToSlot[logicalRow] = slot
+                bufferSets[setIdx].rowVertexCounts[slot] = 0
+                bufferSets[setIdx].rowSlotSourceRows[slot] = logicalRow
+            }
+        }
+    }
+
+    private func cpuShiftMainRowBuffers(
+        setIdx: Int,
+        rowStart: Int,
+        rowEnd: Int,
+        rowsDelta: Int,
+        totalRows: Int,
+        totalCols: Int
+    ) {
+        prepareRowModeSetForWrite(setIdx, totalRows: totalRows)
+        remapMainRowSlots(setIdx: setIdx, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows)
+
+        let regionHeight = rowEnd - rowStart
+        let shift = abs(rowsDelta)
+        guard shift > 0, shift < regionHeight else { return }
+
+        let drawableH: Float = {
+            lock.lock()
+            let h = committedDrawableH
+            lock.unlock()
+            return h > 0 ? Float(h) : Float(max(1, totalRows)) * max(1.0, cellHeightPx)
+        }()
+        let deltaY = Float(rowsDelta) * cellHeightPx / max(1.0, drawableH) * 2.0
+
+        let srcSet = bufferSets[flushSourceSetIndex]
+        for row in rowStart..<rowEnd {
+            if row >= maxRowBuffers { break }
+            ensureRowStorageInSet(setIdx, row)
+        }
+
+        if rowsDelta > 0 {
+            for dstRow in rowStart..<(rowEnd - shift) {
+                let srcRow = dstRow + shift
+                guard srcRow < srcSet.rowLogicalToSlot.count else {
+                    bufferSets[setIdx].rowVertexCounts[dstRow] = 0
+                    continue
+                }
+                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
+                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+                guard srcSlot >= 0, srcSlot < srcSet.rowVertexCounts.count else {
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                let srcCount = srcSet.rowVertexCounts[srcSlot]
+                guard srcCount > 0, srcSlot < srcSet.rowVertexBuffers.count, let srcBuffer = srcSet.rowVertexBuffers[srcSlot] else {
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                guard let dstBuffer = ensureDetachedRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                let byteCount = srcCount * MemoryLayout<Vertex>.stride
+                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
+                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
+                for i in 0..<srcCount {
+                    verts[i].position.y += deltaY
+                }
+                bufferSets[setIdx].rowVertexCounts[dstSlot] = srcCount
+                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
+            }
+            for vacatedRow in (rowEnd - shift)..<rowEnd {
+                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
+                ensureRowStorageInSet(setIdx, slot)
+                bufferSets[setIdx].rowVertexCounts[slot] = 0
+                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
+            }
+        } else {
+            for dstRow in stride(from: rowEnd - 1, through: rowStart + shift, by: -1) {
+                let srcRow = dstRow - shift
+                guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
+                    let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
+                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+                let srcCount = srcSet.rowVertexCounts[srcSlot]
+                guard srcCount > 0, srcSlot < srcSet.rowVertexBuffers.count, let srcBuffer = srcSet.rowVertexBuffers[srcSlot] else {
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                guard let dstBuffer = ensureDetachedRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                    bufferSets[setIdx].rowVertexCounts[dstSlot] = 0
+                    continue
+                }
+                let byteCount = srcCount * MemoryLayout<Vertex>.stride
+                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
+                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
+                for i in 0..<srcCount {
+                    verts[i].position.y += deltaY
+                }
+                bufferSets[setIdx].rowVertexCounts[dstSlot] = srcCount
+                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
+            }
+            for vacatedRow in rowStart..<(rowStart + shift) {
+                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
+                ensureRowStorageInSet(setIdx, slot)
+                bufferSets[setIdx].rowVertexCounts[slot] = 0
+                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
+            }
+        }
+
+        markDirtyRows(rowStart: rowStart, rowCount: rowEnd - rowStart)
+    }
+
+    private func ndcX(_ xPx: Float, drawableWidth: Float) -> Float {
+        return (xPx / max(1.0, drawableWidth)) * 2.0 - 1.0
+    }
+
+    private func ndcY(_ yPx: Float, drawableHeight: Float) -> Float {
+        return 1.0 - (yPx / max(1.0, drawableHeight)) * 2.0
+    }
+
+    private func appendBackgroundQuadVertices(
+        _ out: inout [Vertex],
+        x0: Float,
+        y0: Float,
+        x1: Float,
+        y1: Float,
+        drawableWidth: Float,
+        drawableHeight: Float,
+        bgRGB: UInt32
+    ) {
+        let r = Float((bgRGB >> 16) & 0xFF) / 255.0
+        let g = Float((bgRGB >> 8) & 0xFF) / 255.0
+        let b = Float(bgRGB & 0xFF) / 255.0
+        let color = simd_float4(r, g, b, 1.0)
+        let tl = Vertex(position: simd_float2(ndcX(x0, drawableWidth: drawableWidth), ndcY(y0, drawableHeight: drawableHeight)),
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let tr = Vertex(position: simd_float2(ndcX(x1, drawableWidth: drawableWidth), ndcY(y0, drawableHeight: drawableHeight)),
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let bl = Vertex(position: simd_float2(ndcX(x0, drawableWidth: drawableWidth), ndcY(y1, drawableHeight: drawableHeight)),
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let br = Vertex(position: simd_float2(ndcX(x1, drawableWidth: drawableWidth), ndcY(y1, drawableHeight: drawableHeight)),
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        out.append(contentsOf: [tl, bl, tr, tr, bl, br])
+    }
+
+    private func encodePendingMainRowScrollCopy(
+        commandBuffer: MTLCommandBuffer,
+        backTexture: MTLTexture,
+        drawableWidthPx: Int,
+        rowHeightPx: Int,
+        scroll: MainRowScroll,
+        logEnabled: Bool
+    ) -> (clearTopPx: Int, clearBottomPx: Int)? {
+        let shift = abs(scroll.rowsDelta)
+        let regionHeightRows = scroll.rowEnd - scroll.rowStart
+        guard shift > 0, shift < regionHeightRows else { return nil }
+        guard drawableWidthPx > 0, rowHeightPx > 0 else { return nil }
+        ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
+        guard let scratch = scrollScratchTexture,
+              let blit = commandBuffer.makeBlitCommandEncoder()
+        else { return nil }
+
+        let copyRows = regionHeightRows - shift
+        let copyHeightPx = copyRows * rowHeightPx
+        if copyHeightPx <= 0 {
+            blit.endEncoding()
+            return nil
+        }
+
+        let srcY = (scroll.rowsDelta > 0 ? scroll.rowStart + shift : scroll.rowStart) * rowHeightPx
+        let dstY = (scroll.rowsDelta > 0 ? scroll.rowStart : scroll.rowStart + shift) * rowHeightPx
+
+        let t0 = logEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let origin = MTLOrigin(x: 0, y: srcY, z: 0)
+        let size = MTLSize(width: drawableWidthPx, height: copyHeightPx, depth: 1)
+        blit.copy(from: backTexture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
+                  to: scratch, destinationSlice: 0, destinationLevel: 0, destinationOrigin: origin)
+        blit.copy(from: scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
+                  to: backTexture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: dstY, z: 0))
+        blit.endEncoding()
+        if logEnabled {
+            let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
+            let usStr = String(format: "%.1f", us)
+            ZonvieCore.appLog("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
+        }
+
+        if scroll.rowsDelta > 0 {
+            return ((scroll.rowEnd - shift) * rowHeightPx, scroll.rowEnd * rowHeightPx)
+        } else {
+            return (scroll.rowStart * rowHeightPx, (scroll.rowStart + shift) * rowHeightPx)
+        }
+    }
+
+    private func drawBackgroundClearBand(
+        _ encoder: MTLRenderCommandEncoder,
+        clearBand: (clearTopPx: Int, clearBottomPx: Int),
+        drawableWidth: Float,
+        drawableHeight: Float,
+        bgRGB: UInt32
+    ) {
+        let top = max(0, clearBand.clearTopPx)
+        let bottom = max(top, clearBand.clearBottomPx)
+        guard bottom > top else { return }
+        var verts: [Vertex] = []
+        verts.reserveCapacity(6)
+        appendBackgroundQuadVertices(
+            &verts,
+            x0: 0,
+            y0: Float(top),
+            x1: drawableWidth,
+            y1: Float(bottom),
+            drawableWidth: drawableWidth,
+            drawableHeight: drawableHeight,
+            bgRGB: bgRGB
+        )
+        verts.withUnsafeBytes { bytes in
+            encoder.setVertexBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        }
+    }
+
+    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+        guard isInFlush else {
+            ZonvieCore.appLog("[WARNING] applyMainRowScrollRaw called outside flush bracket")
+            return
+        }
+        guard rowsDelta != 0 else { return }
+        guard rowStart >= 0, rowEnd > rowStart else { return }
+        guard colStart == 0, colEnd == totalCols else { return }
+
+        let s = writeSetIndex
+        if canUseGpuMainRowScrollCopy() {
+            remapMainRowSlots(setIdx: s, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows)
+            bufferSets[s].pendingMainRowScroll = MainRowScroll(
+                rowStart: rowStart,
+                rowEnd: rowEnd,
+                colStart: colStart,
+                colEnd: colEnd,
+                rowsDelta: rowsDelta,
+                totalRows: totalRows,
+                totalCols: totalCols
+            )
+        } else {
+            bufferSets[s].pendingMainRowScroll = nil
+            cpuShiftMainRowBuffers(
+                setIdx: s,
+                rowStart: rowStart,
+                rowEnd: rowEnd,
+                rowsDelta: rowsDelta,
+                totalRows: totalRows,
+                totalCols: totalCols
+            )
+        }
     }
 
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0) {
@@ -2303,27 +2840,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // The write set is exclusively owned by the core thread during flush.
         let s = writeSetIndex
 
-        // Switch to row-buffer mode.
-        bufferSets[s].usingRowBuffers = true
-
-        // Track actual grid row count for markAllRowsDirty bounds.
-        if totalRows > 0 {
-            bufferSets[s].knownTotalRows = totalRows
-        }
-
-        // Handle grid resize: if totalRows is smaller than current row storage,
-        // shrink arrays to free memory (when significantly oversized).
-        if totalRows > 0 && totalRows < bufferSets[s].rowVertexBuffers.count {
-            if bufferSets[s].rowVertexBuffers.count > totalRows * 2 {
-                bufferSets[s].rowVertexBuffers.removeSubrange(totalRows...)
-                bufferSets[s].rowVertexBufferCaps.removeSubrange(totalRows...)
-                bufferSets[s].rowVertexCounts.removeSubrange(totalRows...)
-            } else {
-                for r in totalRows..<bufferSets[s].rowVertexBuffers.count {
-                    bufferSets[s].rowVertexCounts[r] = 0
-                }
-            }
-        }
+        prepareRowModeSetForWrite(s, totalRows: totalRows)
 
         // We currently assume Zig calls with rowCount == 1 (contract in Zig onFlush).
         guard rowCount > 0 else { return }
@@ -2333,43 +2850,40 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard row >= 0 && row < maxRowBuffers else { return }
 
         ensureRowStorageInSet(s, row)
+        guard row < bufferSets[s].rowLogicalToSlot.count else { return }
+        let slot = bufferSets[s].rowLogicalToSlot[row]
 
         // Ensure storage was actually allocated
-        guard row < bufferSets[s].rowVertexBuffers.count else { return }
+        guard slot >= 0 && slot < bufferSets[s].rowVertexBuffers.count else { return }
 
         guard count > 0, let validPtr = ptr else {
-            bufferSets[s].rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexCounts[slot] = 0
+            if slot < bufferSets[s].rowSlotSourceRows.count {
+                bufferSets[s].rowSlotSourceRows[slot] = row
+            }
             return
         }
 
         // bytes needed
-        guard let neededBytes = safeNeededBytes(vertexCount: count) else {
-            bufferSets[s].rowVertexCounts[row] = 0
+        guard safeNeededBytes(vertexCount: count) != nil else {
+            bufferSets[s].rowVertexCounts[slot] = 0
             return
         }
 
-        let srcRowBuffer = row < bufferSets[flushSourceSetIndex].rowVertexBuffers.count ? bufferSets[flushSourceSetIndex].rowVertexBuffers[row] : nil
-        let sharesCommitted = srcRowBuffer != nil && bufferSets[s].rowVertexBuffers[row] === srcRowBuffer
-        if sharesCommitted || bufferSets[s].rowVertexBuffers[row] == nil || neededBytes > bufferSets[s].rowVertexBufferCaps[row] {
-            guard let nextCap = growCapacity(current: bufferSets[s].rowVertexBufferCaps[row], needed: max(1, neededBytes)) else {
-                bufferSets[s].rowVertexCounts[row] = 0
-                return
-            }
-            bufferSets[s].rowVertexBufferCaps[row] = nextCap
-            bufferSets[s].rowVertexBuffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if bufferSets[s].rowVertexBuffers[row] == nil {
-                bufferSets[s].rowVertexBufferCaps[row] = 0
-                bufferSets[s].rowVertexCounts[row] = 0
-                return
-            }
+        guard let dstBuffer = ensureDetachedRowBufferInSet(s, row: slot, vertexCount: count) else {
+            bufferSets[s].rowVertexCounts[slot] = 0
+            return
         }
 
         // Copy vertices
-        if let vb = bufferSets[s].rowVertexBuffers[row] {
+        if let vb = Optional(dstBuffer) {
             memcpy(vb.contents(), validPtr, count * MemoryLayout<Vertex>.stride)
-            bufferSets[s].rowVertexCounts[row] = count
+            bufferSets[s].rowVertexCounts[slot] = count
+            if slot < bufferSets[s].rowSlotSourceRows.count {
+                bufferSets[s].rowSlotSourceRows[slot] = row
+            }
         } else {
-            bufferSets[s].rowVertexCounts[row] = 0
+            bufferSets[s].rowVertexCounts[slot] = 0
         }
     }
 

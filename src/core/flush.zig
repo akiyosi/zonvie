@@ -1101,21 +1101,6 @@ pub const FlushCtx = struct {
                         }
                     }
 
-                    // Initialize dynamic caches if not already done
-                    ctx.core.initHlCache() catch {
-                        ctx.core.log.write("[flush] Failed to initialize hl cache\n", .{});
-                    };
-                    ctx.core.initGlyphCache() catch {
-                        ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
-                    };
-
-                    // HL cache: direct-index for O(1) lookup
-                    // Uses heap-allocated buffers from NvimCore (sized by hl_cache_size config)
-                    const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
-                    const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
-                    const hl_cache_limit: u32 = @intCast(hl_valid.len);
-                    @memset(hl_valid, false);
-
                     // Performance counters for cache statistics
                     var perf_hl_cache_hits: u32 = 0;
                     var perf_hl_cache_misses: u32 = 0;
@@ -1126,6 +1111,59 @@ pub const FlushCtx = struct {
                     var perf_shape_cache_hits: u32 = 0;
                     var perf_shape_cache_misses: u32 = 0;
                     var perf_ascii_fast_path: u32 = 0;
+                    var perf_row_prep_hl_init_us: i64 = 0;
+                    var perf_row_prep_glyph_init_us: i64 = 0;
+                    var perf_row_prep_scroll_ensure_us: i64 = 0;
+                    var perf_row_prep_fast_path_check_us: i64 = 0;
+                    var perf_row_prep_regen_build_us: i64 = 0;
+                    var perf_row_prep_shift_us: i64 = 0;
+                    var perf_cached_emit_rows: u32 = 0;
+                    var perf_cached_emit_empty_rows: u32 = 0;
+                    var perf_cached_emit_cb_sum_us: i64 = 0;
+                    var perf_cached_emit_scan_us: i64 = 0;
+                    var perf_row_compose_sum_us: i64 = 0;
+                    var perf_row_bg_sum_us: i64 = 0;
+                    var perf_row_under_deco_sum_us: i64 = 0;
+                    var perf_row_glyph_sum_us: i64 = 0;
+                    var perf_row_strike_sum_us: i64 = 0;
+                    var perf_row_total_sum_us: i64 = 0;
+                    var perf_row_cache_store_sum_us: i64 = 0;
+                    var perf_row_cb_sum_us: i64 = 0;
+                    var perf_row_post_misc_sum_us: i64 = 0;
+                    var perf_row_count: u32 = 0;
+                    var perf_row_max_total_us: i64 = 0;
+                    var perf_row_max_total_idx: u32 = 0;
+                    var perf_row_max_glyph_us: i64 = 0;
+                    var perf_row_max_glyph_idx: u32 = 0;
+                    var perf_row_max_cb_us: i64 = 0;
+                    var perf_row_max_cb_idx: u32 = 0;
+
+                    // Initialize dynamic caches if not already done
+                    var t_prep_hl_init_start: i128 = 0;
+                    if (log_enabled) t_prep_hl_init_start = std.time.nanoTimestamp();
+                    ctx.core.initHlCache() catch {
+                        ctx.core.log.write("[flush] Failed to initialize hl cache\n", .{});
+                    };
+                    if (log_enabled) {
+                        const t_prep_hl_init_end = std.time.nanoTimestamp();
+                        perf_row_prep_hl_init_us = @intCast(@divTrunc(@max(0, t_prep_hl_init_end - t_prep_hl_init_start), 1000));
+                    }
+                    var t_prep_glyph_init_start: i128 = 0;
+                    if (log_enabled) t_prep_glyph_init_start = std.time.nanoTimestamp();
+                    ctx.core.initGlyphCache() catch {
+                        ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
+                    };
+                    if (log_enabled) {
+                        const t_prep_glyph_init_end = std.time.nanoTimestamp();
+                        perf_row_prep_glyph_init_us = @intCast(@divTrunc(@max(0, t_prep_glyph_init_end - t_prep_glyph_init_start), 1000));
+                    }
+
+                    // HL cache: direct-index for O(1) lookup
+                    // Uses heap-allocated buffers from NvimCore (sized by hl_cache_size config)
+                    const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
+                    const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
+                    const hl_cache_limit: u32 = @intCast(hl_valid.len);
+                    @memset(hl_valid, false);
                     // Glyph cache is persistent across flushes.
                     // It is only reset on font changes (see onGuifont).
                     // NOTE: Do NOT call resetGlyphCacheFlags() here. With Phase 2
@@ -1147,7 +1185,13 @@ pub const FlushCtx = struct {
                     // Ensure scroll cache is sized for row-mode flush.
                     // This prepares the cache so fallback path can populate it
                     // for future fast-path reuse.
+                    var t_prep_scroll_ensure_start: i128 = 0;
+                    if (log_enabled) t_prep_scroll_ensure_start = std.time.nanoTimestamp();
                     ctx.core.ensureScrollCache(rows) catch {};
+                    if (log_enabled) {
+                        const t_prep_scroll_ensure_end = std.time.nanoTimestamp();
+                        perf_row_prep_scroll_ensure_us = @intCast(@divTrunc(@max(0, t_prep_scroll_ensure_end - t_prep_scroll_ensure_start), 1000));
+                    }
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
@@ -1168,6 +1212,32 @@ pub const FlushCtx = struct {
                             perf_shape_cache_hits = 0;
                             perf_shape_cache_misses = 0;
                             perf_ascii_fast_path = 0;
+                            perf_row_prep_hl_init_us = 0;
+                            perf_row_prep_glyph_init_us = 0;
+                            perf_row_prep_scroll_ensure_us = 0;
+                            perf_row_prep_fast_path_check_us = 0;
+                            perf_row_prep_regen_build_us = 0;
+                            perf_row_prep_shift_us = 0;
+                            perf_cached_emit_rows = 0;
+                            perf_cached_emit_empty_rows = 0;
+                            perf_cached_emit_cb_sum_us = 0;
+                            perf_cached_emit_scan_us = 0;
+                            perf_row_compose_sum_us = 0;
+                            perf_row_bg_sum_us = 0;
+                            perf_row_under_deco_sum_us = 0;
+                            perf_row_glyph_sum_us = 0;
+                            perf_row_strike_sum_us = 0;
+                            perf_row_total_sum_us = 0;
+                            perf_row_cache_store_sum_us = 0;
+                            perf_row_cb_sum_us = 0;
+                            perf_row_post_misc_sum_us = 0;
+                            perf_row_count = 0;
+                            perf_row_max_total_us = 0;
+                            perf_row_max_total_idx = 0;
+                            perf_row_max_glyph_us = 0;
+                            perf_row_max_glyph_idx = 0;
+                            perf_row_max_cb_us = 0;
+                            perf_row_max_cb_idx = 0;
                             if (log_enabled) {
                                 log_dirty_rows = rows; // Retry processes all rows
                                 t_rows_start_ns = std.time.nanoTimestamp();
@@ -1177,6 +1247,8 @@ pub const FlushCtx = struct {
                         }
 
                     // Scroll-aware fast path eligibility check
+                    var t_prep_fast_path_check_start: i128 = 0;
+                    if (log_enabled) t_prep_fast_path_check_start = std.time.nanoTimestamp();
                     const scroll_check = checkScrollFastPath(
                         &ctx.core.grid,
                         effective_rebuild_all,
@@ -1184,6 +1256,10 @@ pub const FlushCtx = struct {
                         @intCast(scrolled_count),
                         cached_subgrid_count,
                     );
+                    if (log_enabled) {
+                        const t_prep_fast_path_check_end = std.time.nanoTimestamp();
+                        perf_row_prep_fast_path_check_us = @intCast(@divTrunc(@max(0, t_prep_fast_path_check_end - t_prep_fast_path_check_start), 1000));
+                    }
                     if (log_enabled and scrolled_count > 0) {
                         ctx.core.log.write(
                             "[scroll_debug] fast_path eligible={any} reason={d} touched={d}\n",
@@ -1199,6 +1275,8 @@ pub const FlushCtx = struct {
                     var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
 
                     if (use_scroll_fast_path) {
+                        var t_prep_regen_build_start: i128 = 0;
+                        if (log_enabled) t_prep_regen_build_start = std.time.nanoTimestamp();
                         // Add all touched rows (from grid_line after scroll)
                         const tc = ctx.core.grid.scroll_touched_count;
                         for (ctx.core.grid.scroll_touched_rows[0..tc]) |tr| {
@@ -1230,9 +1308,14 @@ pub const FlushCtx = struct {
                                 }
                             }
                         }
+                        if (log_enabled) {
+                            const t_prep_regen_build_end = std.time.nanoTimestamp();
+                            perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
+                        }
 
                         // --- Scroll cache: shift + y-adjust + validity check ---
                         const cache_ready = ctx.core.scroll_cache_rows == rows;
+                        var cached_empty_rows: u32 = 0;
 
                         if (cache_ready) {
                             // position[1] is NDC: ndc_y = 1.0 - (y_px / dh) * 2.0
@@ -1241,6 +1324,8 @@ pub const FlushCtx = struct {
                             const scroll_top: usize = @intCast(scroll_op.top + scroll_op.win_pos_row);
                             const scroll_bot: usize = @intCast(scroll_op.bot + scroll_op.win_pos_row);
 
+                            var t_prep_shift_start: i128 = 0;
+                            if (log_enabled) t_prep_shift_start = std.time.nanoTimestamp();
                             const shift_result = shiftScrollCacheAndValidate(
                                 ctx.core,
                                 scroll_top,
@@ -1250,6 +1335,11 @@ pub const FlushCtx = struct {
                                 rows,
                                 regen_rows[0..regen_count],
                             );
+                            if (log_enabled) {
+                                const t_prep_shift_end = std.time.nanoTimestamp();
+                                perf_row_prep_shift_us = @intCast(@divTrunc(@max(0, t_prep_shift_end - t_prep_shift_start), 1000));
+                            }
+                            cached_empty_rows = shift_result.empty_emit_count;
 
                             if (!shift_result.fast_path_ok) {
                                 use_scroll_fast_path = false;
@@ -1262,29 +1352,101 @@ pub const FlushCtx = struct {
                         // Record final fast path decision for perf logging
                         used_scroll_fast_path = use_scroll_fast_path and cache_ready;
 
-                        // Only emit cached rows if fast path is still active
+                        // Frontends that support main-row scroll shifting can update their
+                        // row storage in one callback and avoid per-row cached emission.
                         if (used_scroll_fast_path) {
-                            for (0..rows) |ri| {
-                                const row_idx: u32 = @intCast(ri);
-                                // Skip regen rows (will be composed below)
-                                var is_regen = false;
-                                for (regen_rows[0..regen_count]) |rr| {
-                                    if (rr == row_idx) {
-                                        is_regen = true;
-                                        break;
+                            if (cached_empty_rows == 0) {
+                                if (ctx.core.cb.on_main_row_scroll) |scroll_cb| {
+                                    scroll_cb(
+                                        ctx.core.ctx,
+                                        scroll_op.top + scroll_op.win_pos_row,
+                                        scroll_op.bot + scroll_op.win_pos_row,
+                                        scroll_op.left,
+                                        scroll_op.right,
+                                        scroll_op.rows,
+                                        rows,
+                                        cols,
+                                    );
+                                } else {
+                                    var t_cached_emit_scan_start: i128 = 0;
+                                    if (log_enabled) t_cached_emit_scan_start = std.time.nanoTimestamp();
+                                    for (0..rows) |ri| {
+                                        const row_idx: u32 = @intCast(ri);
+                                        // Skip regen rows (will be composed below)
+                                        var is_regen = false;
+                                        for (regen_rows[0..regen_count]) |rr| {
+                                            if (rr == row_idx) {
+                                                is_regen = true;
+                                                break;
+                                            }
+                                        }
+                                        if (is_regen) continue;
+
+                                        if (ctx.core.scroll_cache_valid.isSet(ri)) {
+                                            const cached = &ctx.core.scroll_cache.items[ri];
+                                            if (log_enabled) {
+                                                perf_cached_emit_rows += 1;
+                                                if (cached.items.len == 0) perf_cached_emit_empty_rows += 1;
+                                            }
+                                            // Always emit, even when len==0 (empty/bg-only row).
+                                            // Frontend retains previous content for rows with no callback,
+                                            // so we must send empty updates to clear stale content.
+                                            // len==0: pass null pointer with count 0.
+                                            // Frontend must handle vert_count==0 as "clear row".
+                                            const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
+                                            var t_cached_emit_cb_start: i128 = 0;
+                                            if (log_enabled) t_cached_emit_cb_start = std.time.nanoTimestamp();
+                                            row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
+                                            if (log_enabled) {
+                                                const t_cached_emit_cb_end = std.time.nanoTimestamp();
+                                                perf_cached_emit_cb_sum_us += @intCast(@divTrunc(@max(0, t_cached_emit_cb_end - t_cached_emit_cb_start), 1000));
+                                            }
+                                        }
+                                    }
+                                    if (log_enabled) {
+                                        const t_cached_emit_scan_end = std.time.nanoTimestamp();
+                                        perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
                                     }
                                 }
-                                if (is_regen) continue;
+                            } else {
+                                var t_cached_emit_scan_start: i128 = 0;
+                                if (log_enabled) t_cached_emit_scan_start = std.time.nanoTimestamp();
+                                for (0..rows) |ri| {
+                                    const row_idx: u32 = @intCast(ri);
+                                    // Skip regen rows (will be composed below)
+                                    var is_regen = false;
+                                    for (regen_rows[0..regen_count]) |rr| {
+                                        if (rr == row_idx) {
+                                            is_regen = true;
+                                            break;
+                                        }
+                                    }
+                                    if (is_regen) continue;
 
-                                if (ctx.core.scroll_cache_valid.isSet(ri)) {
-                                    const cached = &ctx.core.scroll_cache.items[ri];
-                                    // Always emit, even when len==0 (empty/bg-only row).
-                                    // Frontend retains previous content for rows with no callback,
-                                    // so we must send empty updates to clear stale content.
-                                    // len==0: pass null pointer with count 0.
-                                    // Frontend must handle vert_count==0 as "clear row".
-                                    const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
-                                    row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
+                                    if (ctx.core.scroll_cache_valid.isSet(ri)) {
+                                        const cached = &ctx.core.scroll_cache.items[ri];
+                                        if (log_enabled) {
+                                            perf_cached_emit_rows += 1;
+                                            if (cached.items.len == 0) perf_cached_emit_empty_rows += 1;
+                                        }
+                                        // Always emit, even when len==0 (empty/bg-only row).
+                                        // Frontend retains previous content for rows with no callback,
+                                        // so we must send empty updates to clear stale content.
+                                        // len==0: pass null pointer with count 0.
+                                        // Frontend must handle vert_count==0 as "clear row".
+                                        const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
+                                        var t_cached_emit_cb_start: i128 = 0;
+                                        if (log_enabled) t_cached_emit_cb_start = std.time.nanoTimestamp();
+                                        row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
+                                        if (log_enabled) {
+                                            const t_cached_emit_cb_end = std.time.nanoTimestamp();
+                                            perf_cached_emit_cb_sum_us += @intCast(@divTrunc(@max(0, t_cached_emit_cb_end - t_cached_emit_cb_start), 1000));
+                                        }
+                                    }
+                                }
+                                if (log_enabled) {
+                                    const t_cached_emit_scan_end = std.time.nanoTimestamp();
+                                    perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
                                 }
                             }
                         }
@@ -1319,6 +1481,11 @@ pub const FlushCtx = struct {
 
                         var out = &ctx.core.row_verts;
                         out.clearRetainingCapacity();
+                        var row_compose_us: i64 = 0;
+                        var row_bg_us: i64 = 0;
+                        var row_under_deco_us: i64 = 0;
+                        var row_glyph_us: i64 = 0;
+                        var row_strike_us: i64 = 0;
 
                         // Row-mode timing for composition measurement
                         var t_row_compose_start: i128 = 0;
@@ -2215,15 +2382,30 @@ pub const FlushCtx = struct {
                         // Log row timing for performance measurement
                         if (log_enabled) {
                             const t_row_strike_end = std.time.nanoTimestamp();
-                            const compose_us: i64 = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
-                            const bg_us: i64 = @intCast(@divTrunc(@max(0, t_row_bg_end - t_row_bg_start), 1000));
-                            const under_deco_us: i64 = @intCast(@divTrunc(@max(0, t_row_under_deco_end - t_row_under_deco_start), 1000));
-                            const glyph_us: i64 = @intCast(@divTrunc(@max(0, t_row_glyph_end - t_row_glyph_start), 1000));
-                            const strike_us: i64 = @intCast(@divTrunc(@max(0, t_row_strike_end - t_row_strike_start), 1000));
+                            row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
+                            row_bg_us = @intCast(@divTrunc(@max(0, t_row_bg_end - t_row_bg_start), 1000));
+                            row_under_deco_us = @intCast(@divTrunc(@max(0, t_row_under_deco_end - t_row_under_deco_start), 1000));
+                            row_glyph_us = @intCast(@divTrunc(@max(0, t_row_glyph_end - t_row_glyph_start), 1000));
+                            row_strike_us = @intCast(@divTrunc(@max(0, t_row_strike_end - t_row_strike_start), 1000));
                             const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_strike_end - t_row_compose_start), 1000));
+                            perf_row_compose_sum_us += row_compose_us;
+                            perf_row_bg_sum_us += row_bg_us;
+                            perf_row_under_deco_sum_us += row_under_deco_us;
+                            perf_row_glyph_sum_us += row_glyph_us;
+                            perf_row_strike_sum_us += row_strike_us;
+                            perf_row_total_sum_us += total_us;
+                            perf_row_count += 1;
+                            if (total_us > perf_row_max_total_us) {
+                                perf_row_max_total_us = total_us;
+                                perf_row_max_total_idx = r;
+                            }
+                            if (row_glyph_us > perf_row_max_glyph_us) {
+                                perf_row_max_glyph_us = row_glyph_us;
+                                perf_row_max_glyph_idx = r;
+                            }
                             ctx.core.log.write(
                                 "[perf] row_mode row={d} cols={d} compose_us={d} bg_us={d} under_deco_us={d} glyph_us={d} strike_us={d} total_us={d}\n",
-                                .{ r, cols, compose_us, bg_us, under_deco_us, glyph_us, strike_us, total_us },
+                                .{ r, cols, row_compose_us, row_bg_us, row_under_deco_us, row_glyph_us, row_strike_us, total_us },
                             );
                         }
 
@@ -2278,6 +2460,12 @@ pub const FlushCtx = struct {
                             break;
                         }
 
+                        var t_row_post_misc_before_cache_store: i128 = 0;
+                        var t_row_cache_store_end: i128 = 0;
+                        if (log_enabled) {
+                            t_row_post_misc_before_cache_store = std.time.nanoTimestamp();
+                        }
+
                         // Store composed vertices in scroll cache for future reuse
                         if (r < ctx.core.scroll_cache_rows) {
                             var cached_row = &ctx.core.scroll_cache.items[r];
@@ -2287,8 +2475,34 @@ pub const FlushCtx = struct {
                             ctx.core.scroll_cache_valid.set(r);
                         }
 
+                        var t_row_before_cb: i128 = 0;
+                        if (log_enabled) {
+                            t_row_cache_store_end = std.time.nanoTimestamp();
+                            t_row_before_cb = t_row_cache_store_end;
+                        }
+
                         // Contract: row_count == 1, grid_id == 1 for main window
                         row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
+
+                        if (log_enabled) {
+                            const t_row_after_cb = std.time.nanoTimestamp();
+                            const cache_store_us: i64 = @intCast(@divTrunc(@max(0, t_row_cache_store_end - t_row_post_misc_before_cache_store), 1000));
+                            const row_cb_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_before_cb), 1000));
+                            const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
+                            const known_total_us = row_compose_us + row_bg_us + row_under_deco_us + row_glyph_us + row_strike_us + cache_store_us + row_cb_us;
+                            const post_misc_us: i64 = @max(0, total_us - known_total_us);
+                            perf_row_cache_store_sum_us += cache_store_us;
+                            perf_row_cb_sum_us += row_cb_us;
+                            perf_row_post_misc_sum_us += post_misc_us;
+                            if (row_cb_us > perf_row_max_cb_us) {
+                                perf_row_max_cb_us = row_cb_us;
+                                perf_row_max_cb_idx = r;
+                            }
+                            ctx.core.log.write(
+                                "[perf] row_mode_post row={d} cache_store_us={d} row_cb_us={d} post_misc_us={d}\n",
+                                .{ r, cache_store_us, row_cb_us, post_misc_us },
+                            );
+                        }
                     }
                     break; // Normal exit from retry_loop
                     }
@@ -2321,6 +2535,47 @@ pub const FlushCtx = struct {
                         ctx.core.log.write(
                             "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any}\n",
                             .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us, used_scroll_fast_path },
+                        );
+                        ctx.core.log.write(
+                            "[perf] row_mode_breakdown rows={d} compose_sum_us={d} bg_sum_us={d} under_deco_sum_us={d} glyph_sum_us={d} strike_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_glyph_row={d} max_glyph_us={d} max_cb_row={d} max_cb_us={d}\n",
+                            .{
+                                perf_row_count,
+                                perf_row_compose_sum_us,
+                                perf_row_bg_sum_us,
+                                perf_row_under_deco_sum_us,
+                                perf_row_glyph_sum_us,
+                                perf_row_strike_sum_us,
+                                perf_row_cache_store_sum_us,
+                                perf_row_cb_sum_us,
+                                perf_row_post_misc_sum_us,
+                                perf_row_total_sum_us,
+                                perf_row_max_total_idx,
+                                perf_row_max_total_us,
+                                perf_row_max_glyph_idx,
+                                perf_row_max_glyph_us,
+                                perf_row_max_cb_idx,
+                                perf_row_max_cb_us,
+                            },
+                        );
+                        ctx.core.log.write(
+                            "[perf] row_mode_prep hl_init_us={d} glyph_init_us={d} scroll_ensure_us={d} fast_path_check_us={d} regen_build_us={d} shift_us={d}\n",
+                            .{
+                                perf_row_prep_hl_init_us,
+                                perf_row_prep_glyph_init_us,
+                                perf_row_prep_scroll_ensure_us,
+                                perf_row_prep_fast_path_check_us,
+                                perf_row_prep_regen_build_us,
+                                perf_row_prep_shift_us,
+                            },
+                        );
+                        ctx.core.log.write(
+                            "[perf] row_mode_cached_emit rows={d} empty_rows={d} scan_us={d} row_cb_sum_us={d}\n",
+                            .{
+                                perf_cached_emit_rows,
+                                perf_cached_emit_empty_rows,
+                                perf_cached_emit_scan_us,
+                                perf_cached_emit_cb_sum_us,
+                            },
                         );
                         // Cache statistics: helps tune cache sizes and identify bottlenecks
                         ctx.core.log.write(

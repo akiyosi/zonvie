@@ -211,6 +211,25 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
+/* Main row-buffer scroll fast path notification.
+   The core calls this when it can preserve previously submitted main-row content
+   by shifting existing row buffers instead of resubmitting every reused row.
+   row_start/row_end are main-grid row indices in [row_start, row_end), cols are
+   a column range in [col_start, col_end), and rows_delta follows Neovim grid_scroll
+   semantics (positive = content moves up, negative = content moves down).
+   After this callback, the frontend should expect on_vertices_row only for
+   vacated / regenerated rows within the scrolled region. */
+typedef void (*zonvie_on_main_row_scroll_fn)(
+    void* ctx,
+    uint32_t row_start,
+    uint32_t row_end,
+    uint32_t col_start,
+    uint32_t col_end,
+    int32_t rows_delta,
+    uint32_t total_rows,
+    uint32_t total_cols
+);
+
 /*
   Partial vertices update:
   - If (flags & ZONVIE_VERT_UPDATE_MAIN) == 0, the frontend MUST keep previous main vertices.
@@ -726,6 +745,11 @@ typedef struct zonvie_callbacks {
 
     /* ASCII fast path table callback (NULL = no fast path, always use shaping). */
     zonvie_get_ascii_table_fn on_get_ascii_table;
+
+    /* Main row-buffer scroll fast path notification.
+       Optional optimization used by row-mode frontends to shift existing main-row
+       buffers instead of receiving cached rows one by one via on_vertices_row. */
+    zonvie_on_main_row_scroll_fn on_main_row_scroll;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
