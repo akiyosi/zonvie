@@ -140,7 +140,7 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     var r1: u32 = (bot_u + (row_h - 1)) / row_h; // ceil
 
     // Clamp to current grid rows to avoid out-of-bounds (e.g. r == rows).
-    const max_rows: u32 = app.rows;
+    const max_rows: u32 = app.surface.rows;
     if (max_rows != 0) {
         if (r0 > max_rows) r0 = max_rows;
         if (r1 > max_rows) r1 = max_rows;
@@ -148,13 +148,176 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
 
     var r: u32 = r0;
     while (r < r1) : (r += 1) {
-        _ = app.dirty_rows.put(app.alloc, r, {}) catch {};
+        _ = app.surface.dirty_rows.put(app.alloc, r, {}) catch {};
+    }
+
+    // TBS: also mark rows dirty in flush_dirty (if in flush).
+    if (app.tbs.is_in_flush) {
+        var rr: u32 = r0;
+        while (rr < r1) : (rr += 1) {
+            if (rr < app.tbs.flush_dirty.bit_length) {
+                app.tbs.flush_dirty.set(rr);
+            }
+        }
     }
 }
 
-fn shiftVertsY(verts: []app_mod.Vertex, delta_y: f32) void {
-    for (verts) |*v| {
-        v.position[1] += delta_y;
+/// Remove DECO_CURSOR vertices from a vertex list in-place.
+fn stripCursorVerts(verts: *std.ArrayListUnmanaged(app_mod.Vertex)) void {
+    var write: usize = 0;
+    for (verts.items) |v| {
+        if ((v.deco_flags & app_mod.DECO_CURSOR) == 0) {
+            verts.items[write] = v;
+            write += 1;
+        }
+    }
+    verts.items.len = write;
+}
+
+/// Swap and shift row vertex buffers for a scroll region.
+/// Shared between onMainRowScroll and onGridRowScroll.
+/// Swaps RowVerts structs to follow scroll direction. Moved rows keep their
+/// existing VB data (origin_row tracks where vertices were generated; the draw
+/// path applies viewport Y translation). Only vacated rows are invalidated.
+/// When row_valid is non-null, updates the validity bitset (main window only).
+fn swapAndShiftRows(
+    row_verts: []app_mod.RowVerts,
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    row_valid: ?*std.DynamicBitSetUnmanaged,
+) void {
+    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
+    const start_idx: usize = @intCast(row_start);
+    const end_idx: usize = @intCast(row_end);
+    const shift: usize = @intCast(abs_rows);
+
+    if (rows_delta > 0) {
+        var dst: usize = start_idx;
+        while (dst + shift < end_idx) : (dst += 1) {
+            const src = dst + shift;
+            std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
+            // No shiftVertsY or gen increment — VB is reused via viewport Y offset.
+            if (row_valid) |rv| {
+                if (src < rv.bit_length and rv.isSet(src)) {
+                    rv.set(dst);
+                } else if (dst < rv.bit_length) {
+                    rv.unset(dst);
+                }
+            }
+        }
+        var vacated: usize = end_idx - shift;
+        while (vacated < end_idx) : (vacated += 1) {
+            row_verts[vacated].verts.clearRetainingCapacity();
+            row_verts[vacated].gen +%= 1;
+            if (row_valid) |rv| {
+                if (vacated < rv.bit_length) rv.unset(vacated);
+            }
+        }
+    } else {
+        var dst: usize = end_idx;
+        while (dst > start_idx + shift) {
+            dst -= 1;
+            const src = dst - shift;
+            std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
+            // No shiftVertsY or gen increment — VB is reused via viewport Y offset.
+            if (row_valid) |rv| {
+                if (src < rv.bit_length and rv.isSet(src)) {
+                    rv.set(dst);
+                } else if (dst < rv.bit_length) {
+                    rv.unset(dst);
+                }
+            }
+        }
+        var vacated: usize = start_idx;
+        while (vacated < start_idx + shift) : (vacated += 1) {
+            row_verts[vacated].verts.clearRetainingCapacity();
+            row_verts[vacated].gen +%= 1;
+            if (row_valid) |rv| {
+                if (vacated < rv.bit_length) rv.unset(vacated);
+            }
+        }
+    }
+}
+
+/// Remap slot indices in row_map for a scroll region. Physical data does not move.
+/// Vacated rows get their slots cleared (verts.clearRetainingCapacity + ver bump).
+/// ref_counts do not change (same VertexSet, just index rearrangement).
+fn remapRowSlots(
+    row_map: []app_mod.RowMapping,
+    pool: *app_mod.SlotPool,
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+) void {
+    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
+    const start_idx: usize = @intCast(row_start);
+    const end_idx: usize = @intCast(row_end);
+    const shift: usize = @intCast(abs_rows);
+
+    if (rows_delta > 0) {
+        // Scroll up: save vacated slots from top of region
+        var saved: [256]app_mod.RowMapping = undefined;
+        const save_count = @min(shift, 256);
+        var si: usize = 0;
+        while (si < save_count) : (si += 1) {
+            saved[si] = row_map[start_idx + si];
+        }
+        // Shift mappings down
+        var dst: usize = start_idx;
+        while (dst + shift < end_idx) : (dst += 1) {
+            row_map[dst] = row_map[dst + shift];
+        }
+        // Place saved mappings in vacated region, clear their verts
+        var vacated: usize = end_idx - shift;
+        var vi: usize = 0;
+        while (vacated < end_idx) : ({
+            vacated += 1;
+            vi += 1;
+        }) {
+            if (vi < save_count) {
+                row_map[vacated] = saved[vi];
+            }
+            // Clear vacated slot contents (keep slot allocated for reuse)
+            if (row_map[vacated].slot != app_mod.SLOT_NONE) {
+                const slot = &pool.slots.items[row_map[vacated].slot];
+                slot.verts.clearRetainingCapacity();
+                slot.ver +%= 1;
+                slot.origin_row = @intCast(vacated);
+            }
+        }
+    } else {
+        // Scroll down: save vacated slots from bottom of region
+        var saved: [256]app_mod.RowMapping = undefined;
+        const save_count = @min(shift, 256);
+        var si: usize = 0;
+        while (si < save_count) : (si += 1) {
+            saved[si] = row_map[end_idx - shift + si];
+        }
+        // Shift mappings up
+        var dst: usize = end_idx;
+        while (dst > start_idx + shift) {
+            dst -= 1;
+            row_map[dst] = row_map[dst - shift];
+        }
+        // Place saved mappings in vacated region, clear their verts
+        var vacated: usize = start_idx;
+        var vi: usize = 0;
+        while (vacated < start_idx + shift) : ({
+            vacated += 1;
+            vi += 1;
+        }) {
+            if (vi < save_count) {
+                row_map[vacated] = saved[vi];
+            }
+            // Clear vacated slot contents
+            if (row_map[vacated].slot != app_mod.SLOT_NONE) {
+                const slot = &pool.slots.items[row_map[vacated].slot];
+                slot.verts.clearRetainingCapacity();
+                slot.ver +%= 1;
+                slot.origin_row = @intCast(vacated);
+            }
+        }
     }
 }
 
@@ -165,6 +328,41 @@ fn recomputeRowValidCount(app: *App) void {
         if (app.row_valid.isSet(i)) count += 1;
     }
     app.row_valid_count = count;
+}
+
+fn ensureRowStorageGeneric(
+    alloc: std.mem.Allocator,
+    row_verts: *std.ArrayListUnmanaged(app_mod.RowVerts),
+    row: u32,
+) bool {
+    const need: usize = @intCast(row + 1);
+    if (row_verts.items.len < need) {
+        const old_len = row_verts.items.len;
+        row_verts.resize(alloc, need) catch return false;
+        var i = old_len;
+        while (i < need) : (i += 1) {
+            row_verts.items[i] = .{};
+        }
+    }
+    return row < row_verts.items.len;
+}
+
+fn storeSurfaceRowVerts(
+    alloc: std.mem.Allocator,
+    row_verts: *std.ArrayListUnmanaged(app_mod.RowVerts),
+    row: u32,
+    verts_ptr: ?[*]const app_mod.Vertex,
+    vert_count: usize,
+) bool {
+    if (!ensureRowStorageGeneric(alloc, row_verts, row)) return false;
+    var rv = &row_verts.items[@intCast(row)];
+    rv.verts.clearRetainingCapacity();
+    if (verts_ptr != null and vert_count != 0) {
+        rv.verts.appendSlice(alloc, verts_ptr.?[0..vert_count]) catch return false;
+    }
+    rv.gen +%= 1;
+    rv.origin_row = row; // Vertices generated for this logical row position.
+    return true;
 }
 
 pub fn appendRowsFromUpdateRegion(
@@ -278,30 +476,43 @@ pub fn onVertices(
         app.mu.lock();
         defer app.mu.unlock();
 
-    app.main_verts.clearRetainingCapacity();
-    app.cursor_verts.clearRetainingCapacity();
+    app.surface.verts.clearRetainingCapacity();
+    app.surface.cursor_verts.clearRetainingCapacity();
 
     // On OOM, skip ALL vertex copies (all-or-nothing to avoid drawing
     // cursor-only frames) but still fall through to InvalidateRect
     // so the screen can retry on the next frame.
-    const main_ok = if (app.main_verts.ensureTotalCapacity(app.alloc, main_count)) true else |_| false;
+    const main_ok = if (app.surface.verts.ensureTotalCapacity(app.alloc, main_count)) true else |_| false;
     const cursor_ok = if (main_ok)
-        (if (app.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count)) true else |_| false)
+        (if (app.surface.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count)) true else |_| false)
     else
         false;
     if (main_ok and cursor_ok) {
-        app.main_verts.appendSliceAssumeCapacity(main_ptr[0..main_count]);
-        app.cursor_verts.appendSliceAssumeCapacity(cursor_ptr[0..cursor_count]);
+        app.surface.verts.appendSliceAssumeCapacity(main_ptr[0..main_count]);
+        app.surface.cursor_verts.appendSliceAssumeCapacity(cursor_ptr[0..cursor_count]);
     }
 
-    if (app.row_mode) {
-        app.row_mode = false;
+    if (app.surface.row_mode) {
+        app.surface.row_mode = false;
     }
 
-    if (app.hwnd) |hwnd| {
-        _ = c.InvalidateRect(hwnd, null, c.FALSE);
-        app.paint_full = true;
+    // TBS: write to write set.
+    if (app.tbs.is_in_flush) {
+        const ws = app.tbs.writeSet();
+        ws.row_mode = false;
+        ws.flat_verts.clearRetainingCapacity();
+        ws.cursor_verts.clearRetainingCapacity();
+        if (main_ok and cursor_ok) {
+            ws.flat_verts.appendSlice(app.alloc, main_ptr[0..main_count]) catch {};
+            ws.cursor_verts.appendSlice(app.alloc, cursor_ptr[0..cursor_count]) catch {};
+        }
+        app.tbs.flush_paint_full = true;
+    }
+
+    if (app.hwnd) |_| {
+        // InvalidateRect deferred to onFlushEnd for coalescing.
         app.paint_rects.clearRetainingCapacity();
+        app.flush_needs_invalidate = true;
     }
 }
 
@@ -322,45 +533,40 @@ pub fn onVerticesPartial(
 
     app.mu.lock();
 
-    var row_mode = app.row_mode;
+    var row_mode = app.surface.row_mode;
 
-    // Track whether we already invalidated something specific.
-    var did_invalidate: bool = false;
     // Track if cursor was updated (for blink update after unlock)
     var cursor_updated: bool = false;
 
     // Flags specification: keep the side that is not updated
     if ((flags & app_mod.VERT_UPDATE_MAIN) != 0) {
         if (row_mode) {
-            app.row_mode = false;
+            app.surface.row_mode = false;
             row_mode = false;
         }
         // Note: We don't set content_rows_dirty here.
         // For non-row-mode, full repaints are triggered anyway.
         // For row-mode, WM_PAINT determines if it's cursor-only.
 
-        app.main_verts.clearRetainingCapacity();
+        app.surface.verts.clearRetainingCapacity();
         if (main_ptr != null and main_count != 0) {
-            app.main_verts.appendSlice(app.alloc, main_ptr.?[0..main_count]) catch {};
+            app.surface.verts.appendSlice(app.alloc, main_ptr.?[0..main_count]) catch {};
         }
 
-        // Non-row-mode: main update implies screen update; invalidate whole client.
-        // Row-mode: main_verts is not used for drawing; do not force full invalidate here.
+        // Non-row-mode: main update implies screen update.
+        // Row-mode: main_verts is not used for drawing; do not force full paint here.
+        // InvalidateRect deferred to onFlushEnd for coalescing.
         if (!row_mode) {
-            if (app.hwnd) |hwnd| {
-                _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                did_invalidate = true;
-                app.paint_full = true;
-                app.paint_rects.clearRetainingCapacity();
-            }
+            app.paint_rects.clearRetainingCapacity();
         }
+        app.flush_needs_invalidate = true;
     }
 
     if ((flags & app_mod.VERT_UPDATE_CURSOR) != 0) {
         // compute old rect before overwriting cursor_verts
         const old_rc = app.last_cursor_rect_px;
 
-        app.cursor_verts.clearRetainingCapacity();
+        app.surface.cursor_verts.clearRetainingCapacity();
         if (cursor_ptr != null and cursor_count != 0) {
             const slice = cursor_ptr.?[0..cursor_count];
 
@@ -372,7 +578,7 @@ pub fn onVerticesPartial(
                     .{ v0.position[0], v0.position[1], v0.color[0], v0.color[1], v0.color[2], v0.color[3] },
                 );
             }
-            app.cursor_verts.appendSlice(app.alloc, slice) catch {};
+            app.surface.cursor_verts.appendSlice(app.alloc, slice) catch {};
 
             if (app.hwnd) |hwnd| {
                 // Compute viewport-aware cursor rect matching D3D11 viewport.
@@ -411,22 +617,15 @@ pub fn onVerticesPartial(
                     if (!app.cursor_overlay_active) {
                         app.cursor_overlay_active = true;
                         app.need_full_seed.store(true, .seq_cst);
-                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                        app.paint_full = true;
+                        app.tbs.flush_paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
                     }
+                    // Record damage rects for WM_PAINT dirty-rect drawing.
+                    // InvalidateRect deferred to onFlushEnd.
                     if (old_rc) |r0| {
-                        _ = c.InvalidateRect(hwnd, &r0, c.FALSE);
-                        did_invalidate = true;
-
-                        // NEW: record exact damage rect we requested
                         app.paint_rects.append(app.alloc, r0) catch {};
                     }
                     if (new_rc) |r1| {
-                        _ = c.InvalidateRect(hwnd, &r1, c.FALSE);
-                        did_invalidate = true;
-
-                        // NEW: record exact damage rect we requested
                         app.paint_rects.append(app.alloc, r1) catch {};
                     }
                     if (old_rc) |r0| {
@@ -437,64 +636,75 @@ pub fn onVerticesPartial(
                     }
 
                 } else {
-                    // Non-row-mode: still try to invalidate only cursor union instead of full screen.
-                    if (old_rc != null and new_rc != null) {
-                        var u = unionRect(old_rc.?, new_rc.?);
-                        _ = c.InvalidateRect(hwnd, &u, c.FALSE);
-                        did_invalidate = true;
-                    } else if (old_rc) |r0| {
-                        _ = c.InvalidateRect(hwnd, &r0, c.FALSE);
-                        did_invalidate = true;
-                    } else if (new_rc) |r1| {
-                        _ = c.InvalidateRect(hwnd, &r1, c.FALSE);
-                        did_invalidate = true;
-                    }
+                    // Non-row-mode: dirty state tracked via paint_full.
+                    // InvalidateRect deferred to onFlushEnd.
                 }
             }
         } else {
             // no cursor verts -> clear last rect
-            app.last_cursor_rect_px = null;
+            // If cursor was already absent (old_rc == null), nothing changed
+            // on the main window — skip dirty marking and invalidation.
+            // This prevents unnecessary main window repaints when the cursor
+            // is on an external grid and that grid scrolls (cursor_rev bumps
+            // but the main window cursor state is unchanged).
+            if (old_rc == null) {
+                // No visual change on main window — skip entirely.
+            } else {
+                app.last_cursor_rect_px = null;
 
-            // If cursor disappeared, invalidate old cursor rect only (if any).
-            if (app.hwnd) |hwnd| {
-                if (old_rc) |r0| {
-                    _ = c.InvalidateRect(hwnd, &r0, c.FALSE);
-                    did_invalidate = true;
+                // Track dirty rows for cursor erasure.
+                // InvalidateRect deferred to onFlushEnd.
+                if (row_mode) {
+                    markDirtyRowsByRect(app, old_rc.?);
                 }
-            }
-            if (row_mode) {
-                if (old_rc) |r0| {
-                    markDirtyRowsByRect(app, r0);
-                }
+                // cursor verts updated => bump generation
+                app.cursor_gen +%= 1;
+                cursor_updated = true;
+                app.flush_needs_invalidate = true;
             }
         }
 
-        // NEW: cursor verts updated => bump generation
-        app.cursor_gen +%= 1;
-        cursor_updated = true;
+        if (cursor_ptr != null and cursor_count != 0) {
+            // cursor verts updated => bump generation
+            app.cursor_gen +%= 1;
+            cursor_updated = true;
+            app.flush_needs_invalidate = true;
+        }
     }
 
-    // If nothing was invalidated (should be rare):
-    // - Non-row-mode: request a repaint (fallback to full client).
-    // - Row-mode: DO NOT full-invalidate here; row updates come via onVerticesRow and
-    //   cursor updates via onVerticesPartial(cursor). A full invalidate here defeats dirty-rect rendering.
-    if (!did_invalidate) {
-        if (!row_mode) {
-            if (app.hwnd) |hwnd| {
-                _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                app.paint_full = true;
-                app.paint_rects.clearRetainingCapacity();
+    // TBS: write to write set.
+    if (app.tbs.is_in_flush) {
+        const ws = app.tbs.writeSet();
+        if ((flags & app_mod.VERT_UPDATE_MAIN) != 0) {
+            ws.row_mode = false;
+            ws.flat_verts.clearRetainingCapacity();
+            if (main_ptr != null and main_count != 0) {
+                ws.flat_verts.appendSlice(app.alloc, main_ptr.?[0..main_count]) catch {};
+            }
+            app.tbs.flush_paint_full = true;
+        }
+        if ((flags & app_mod.VERT_UPDATE_CURSOR) != 0) {
+            ws.cursor_verts.clearRetainingCapacity();
+            if (cursor_ptr != null and cursor_count != 0) {
+                ws.cursor_verts.appendSlice(app.alloc, cursor_ptr.?[0..cursor_count]) catch {};
+                // Set cursor row from app.cursor for drawCursorOverlay.
+                ws.last_cursor_row = if (app.cursor) |cur| @intCast(cur.row) else null;
+            } else {
+                ws.last_cursor_row = null;
             }
         }
     }
 
     // Get hwnd before unlock
     const hwnd_for_blink = app.hwnd;
+    // Always post blink update when cursor flag is set (covers cursor on external grid
+    // where main grid gets cursor_count=0 but blink settings may have changed via mode_change).
+    const blink_update_needed = cursor_updated or ((flags & app_mod.VERT_UPDATE_CURSOR) != 0);
 
     app.mu.unlock();
 
     // Post message to update cursor blinking (avoid deadlock by doing it on UI thread)
-    if (cursor_updated) {
+    if (blink_update_needed) {
         if (hwnd_for_blink) |hwnd| {
             _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
         }
@@ -527,9 +737,9 @@ pub fn onRenderPlan(
     app.mu.lock();
     defer app.mu.unlock();
 
-    if (rows != app.rows or cols != app.cols) {
-        app.rows = rows;
-        app.cols = cols;
+    if (rows != app.surface.rows or cols != app.surface.cols) {
+        app.surface.rows = rows;
+        app.surface.cols = cols;
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
@@ -543,13 +753,30 @@ pub fn onRenderPlan(
         }
         // Clear old row vertex data to prevent ghost rendering from stale vertices.
         // Each RowVerts entry's verts array is cleared; GPU VBs will be re-uploaded.
-        for (app.row_verts.items) |*rv| {
+        for (app.surface.row_verts.items) |*rv| {
             rv.verts.clearRetainingCapacity();
             rv.gen +%= 1; // Invalidate any cached GPU upload
         }
     } else {
-        app.rows = rows;
-        app.cols = cols;
+        app.surface.rows = rows;
+        app.surface.cols = cols;
+    }
+
+    // TBS: update write set rows/cols.
+    if (app.tbs.is_in_flush) {
+        const ws = app.tbs.writeSet();
+        if (rows != ws.rows or cols != ws.cols) {
+            ws.rows = rows;
+            ws.cols = cols;
+            // Release all old slot references and resize row_map.
+            ws.releaseAllSlots(app.alloc, &app.tbs.pool);
+            ws.row_map.resize(app.alloc, rows) catch {};
+            for (ws.row_map.items) |*m| {
+                m.slot = app_mod.SLOT_NONE;
+            }
+            app.tbs.flush_dirty.resize(app.alloc, rows, false) catch {};
+            app.tbs.flush_paint_full = true;
+        }
     }
 
     // NOTE: cursor_ptr may be null => treat as disabled/none
@@ -592,9 +819,9 @@ pub fn onVerticesRow(
                 cur_enabled,
                 cur_row,
                 cur_col,
-                app.rows,
+                app.surface.rows,
                 app.row_valid_count,
-                app.row_verts.items.len,
+                app.surface.row_verts.items.len,
             },
         );
     }
@@ -678,38 +905,155 @@ pub fn onVerticesRow(
     }
 
     // Handle external grids (grid_id != 1) separately
-    // External grids use their own vertex storage (ext_win.verts or pending_external_verts)
+    // External grids use their own vertex storage (ext_win.surface.verts or pending_external_verts)
     if (grid_id != 1) {
         if (applog.isEnabled()) applog.appLog(
             "[win] on_vertices_row external grid_id={d} row_start={d} vert_count={d} total_rows={d} total_cols={d}\n",
             .{ grid_id, row_start, vert_count, total_rows, total_cols },
         );
 
+        // Cursor layer: core sends cursor as separate on_vertices_row
+        // with VERT_UPDATE_CURSOR flag. Append cursor verts to the target
+        // row so they are drawn as part of content (same as pre-refactor).
+        // Next content update for this row will replace everything via
+        // storeSurfaceRowVerts, clearing old cursor verts.
+        const is_cursor_update = (flags & 2) != 0; // VERT_UPDATE_CURSOR
+
         // Try to find existing external window for this grid
         if (app.external_windows.getPtr(grid_id)) |ext_win| {
             // Skip windows that are pending close
             if (ext_win.is_pending_close) return;
-
-            // Window exists - store vertices
-            // Clear verts when row 0 is received (start of new frame)
-            if (row_start == 0) {
-                ext_win.verts.clearRetainingCapacity();
-                ext_win.vert_count = 0;
+            if (is_cursor_update) {
+                if (ext_win.surface.row_mode) {
+                    // Row-mode: store cursor verts separately (same pattern as main window).
+                    // Mark old cursor row dirty so it gets redrawn to erase the cursor overlay.
+                    if (ext_win.surface.last_cursor_row) |old_row| {
+                        if (old_row != row_start) {
+                            _ = ext_win.surface.dirty_rows.put(app.alloc, old_row, {}) catch {};
+                        }
+                    }
+                    ext_win.surface.cursor_verts.clearRetainingCapacity();
+                    if (verts_ptr != null and vert_count != 0) {
+                        ext_win.surface.cursor_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch return;
+                        ext_win.surface.last_cursor_row = row_start;
+                        // Mark new cursor row dirty so it triggers a redraw with cursor overlay.
+                        _ = ext_win.surface.dirty_rows.put(app.alloc, row_start, {}) catch {};
+                    } else {
+                        ext_win.surface.last_cursor_row = null;
+                    }
+                } else {
+                    // Flat-mode: append cursor verts to flat vert array (legacy path).
+                    if (verts_ptr != null and vert_count != 0) {
+                        ext_win.surface.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch return;
+                        ext_win.vert_count = ext_win.surface.verts.items.len;
+                        ext_win.surface.last_cursor_row = row_start;
+                    } else {
+                        ext_win.surface.last_cursor_row = null;
+                    }
+                }
+                ext_win.needs_redraw = true;
+                // TBS: write cursor to write set.
+                if (ext_win.tbs.is_in_flush) {
+                    const ws = ext_win.tbs.writeSet();
+                    const dirty_len = ext_win.tbs.flush_dirty.bit_length;
+                    // Mark old cursor row dirty in TBS so paint redraws it (erases ghost).
+                    // Always mark when cursor moves OR disappears (verts_ptr == null).
+                    if (ws.last_cursor_row) |old_row| {
+                        const cursor_removed = (verts_ptr == null or vert_count == 0);
+                        const cursor_moved = if (!cursor_removed) (old_row != @as(u32, @intCast(row_start))) else false;
+                        if (cursor_removed or cursor_moved) {
+                            if (old_row < dirty_len) {
+                                ext_win.tbs.flush_dirty.set(old_row);
+                            }
+                        }
+                    }
+                    ws.cursor_verts.clearRetainingCapacity();
+                    if (verts_ptr != null and vert_count != 0) {
+                        ws.cursor_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch {};
+                        ws.last_cursor_row = row_start;
+                        // Mark new cursor row dirty to trigger redraw with cursor overlay.
+                        if (row_start < dirty_len) {
+                            ext_win.tbs.flush_dirty.set(row_start);
+                        }
+                    } else {
+                        ws.last_cursor_row = null;
+                    }
+                    // No flush_paint_full: cursor is overlay, only dirty rows need redraw.
+                }
+                // InvalidateRect deferred to onFlushEnd.
+                return;
             }
 
-            // Append this row's vertices
-            if (verts_ptr != null and vert_count != 0) {
-                ext_win.verts.ensureTotalCapacity(app.alloc, ext_win.verts.items.len + vert_count) catch return;
-                ext_win.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
-                ext_win.vert_count = ext_win.verts.items.len;
-            }
-
-            // Check if size changed before updating
-            const size_changed = (ext_win.rows != total_rows or ext_win.cols != total_cols);
-
-            ext_win.rows = total_rows;
-            ext_win.cols = total_cols;
+            const size_changed = (ext_win.surface.rows != total_rows or ext_win.surface.cols != total_cols);
+            ext_win.surface.rows = total_rows;
+            ext_win.surface.cols = total_cols;
             ext_win.needs_redraw = true;
+            if (size_changed) {
+                ext_win.surface.paint_full = true;
+                if (ext_win.tbs.is_in_flush) {
+                    ext_win.tbs.flush_paint_full = true;
+                }
+            }
+
+            if (row_count == 1) {
+                ext_win.surface.row_mode = true;
+                ext_win.surface.verts.clearRetainingCapacity();
+                ext_win.surface.clearExtraRows(total_rows);
+                if (!storeSurfaceRowVerts(app.alloc, &ext_win.surface.row_verts, row_start, verts_ptr, vert_count)) {
+                    return;
+                }
+                _ = ext_win.surface.dirty_rows.put(app.alloc, row_start, {}) catch {};
+                ext_win.recomputeVertCount();
+                // TBS: COW detach + write to slot, mark dirty.
+                if (ext_win.tbs.is_in_flush) {
+                    const ws = ext_win.tbs.writeSet();
+                    ws.row_mode = true;
+                    ws.rows = total_rows;
+                    ws.cols = total_cols;
+                    ws.ensureRowStorage(app.alloc, row_start);
+                    if (ext_win.tbs.cowDetachRow(app.alloc, row_start)) |slot| {
+                        slot.verts.clearRetainingCapacity();
+                        if (verts_ptr != null and vert_count != 0) {
+                            slot.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch {};
+                        }
+                        slot.origin_row = row_start;
+                        slot.ver +%= 1;
+                    }
+                    if (row_start < ext_win.tbs.flush_dirty.bit_length) {
+                        ext_win.tbs.flush_dirty.set(row_start);
+                    } else if (total_rows > ext_win.tbs.flush_dirty.bit_length) {
+                        ext_win.tbs.flush_dirty.resize(app.alloc, total_rows, false) catch {};
+                        if (row_start < ext_win.tbs.flush_dirty.bit_length) {
+                            ext_win.tbs.flush_dirty.set(row_start);
+                        }
+                    }
+                }
+            } else {
+                ext_win.surface.row_mode = false;
+                if (row_start == 0) {
+                    ext_win.surface.verts.clearRetainingCapacity();
+                    ext_win.vert_count = 0;
+                }
+                if (verts_ptr != null and vert_count != 0) {
+                    ext_win.surface.verts.ensureTotalCapacity(app.alloc, ext_win.surface.verts.items.len + vert_count) catch return;
+                    ext_win.surface.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
+                    ext_win.vert_count = ext_win.surface.verts.items.len;
+                }
+                // TBS: write flat verts to write set.
+                if (ext_win.tbs.is_in_flush) {
+                    const ws = ext_win.tbs.writeSet();
+                    ws.row_mode = false;
+                    ws.rows = total_rows;
+                    ws.cols = total_cols;
+                    if (row_start == 0) {
+                        ws.flat_verts.clearRetainingCapacity();
+                    }
+                    if (verts_ptr != null and vert_count != 0) {
+                        ws.flat_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch {};
+                    }
+                    ext_win.tbs.flush_paint_full = true;
+                }
+            }
 
             // Resize popupmenu window if size changed (keep top-left position)
             // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
@@ -746,8 +1090,7 @@ pub fn onVerticesRow(
                 }
             }
 
-            // Invalidate window to trigger repaint
-            _ = c.InvalidateRect(ext_win.hwnd, null, 0);
+            // InvalidateRect deferred to onFlushEnd for coalescing.
 
             if (applog.isEnabled()) applog.appLog(
                 "[win] on_vertices_row external grid_id={d} updated ext_win vert_count={d}\n",
@@ -764,29 +1107,61 @@ pub fn onVerticesRow(
                 }
             }
 
+            // Handle cursor update for pending entries (same logic as ext_win above)
+            if (is_cursor_update) {
+                if (found_idx) |idx| {
+                    const pv = &app.pending_external_verts.items[idx];
+                    if (verts_ptr != null and vert_count != 0) {
+                        const cursor_slice = verts_ptr.?[0..vert_count];
+                        if (pv.surface.row_mode) {
+                            if (!ensureRowStorageGeneric(app.alloc, &pv.surface.row_verts, row_start)) return;
+                            pv.surface.row_verts.items[row_start].verts.appendSlice(app.alloc, cursor_slice) catch return;
+                            pv.surface.row_verts.items[row_start].gen +%= 1;
+                        } else {
+                            pv.surface.verts.appendSlice(app.alloc, cursor_slice) catch return;
+                        }
+                    }
+                }
+                // No pending entry yet means no content rows either; cursor alone is not useful.
+                return;
+            }
+
             if (found_idx) |idx| {
                 // Update existing pending entry
                 const pv = &app.pending_external_verts.items[idx];
-                // Clear when row 0 is received
-                if (row_start == 0) {
-                    pv.verts.clearRetainingCapacity();
+                pv.surface.rows = total_rows;
+                pv.surface.cols = total_cols;
+                if (row_count == 1) {
+                    pv.surface.row_mode = true;
+                    pv.surface.verts.clearRetainingCapacity();
+                    pv.surface.clearExtraRows(total_rows);
+                    if (!storeSurfaceRowVerts(app.alloc, &pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
+                        return;
+                    }
+                } else {
+                    pv.surface.row_mode = false;
+                    if (row_start == 0) {
+                        pv.surface.verts.clearRetainingCapacity();
+                    }
+                    if (verts_ptr != null and vert_count != 0) {
+                        pv.surface.verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len + vert_count) catch return;
+                        pv.surface.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
+                    }
                 }
-                if (verts_ptr != null and vert_count != 0) {
-                    pv.verts.ensureTotalCapacity(app.alloc, pv.verts.items.len + vert_count) catch return;
-                    pv.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
-                }
-                pv.rows = total_rows;
-                pv.cols = total_cols;
             } else {
                 // Create new pending entry
                 var new_pv = app_mod.PendingExternalVertices{
                     .grid_id = grid_id,
-                    .rows = total_rows,
-                    .cols = total_cols,
+                    .surface = .{ .rows = total_rows, .cols = total_cols },
                 };
-                if (verts_ptr != null and vert_count != 0) {
-                    new_pv.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
-                    new_pv.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
+                if (row_count == 1) {
+                    new_pv.surface.row_mode = true;
+                    if (!storeSurfaceRowVerts(app.alloc, &new_pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
+                        return;
+                    }
+                } else if (verts_ptr != null and vert_count != 0) {
+                    new_pv.surface.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
+                    new_pv.surface.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
                 }
                 app.pending_external_verts.append(app.alloc, new_pv) catch return;
             }
@@ -804,15 +1179,15 @@ pub fn onVerticesRow(
         app.row_mode_max_row_end = end_row_hint;
         if (applog.isEnabled()) applog.appLog(
             "[win] on_vertices_row max_row_end={d} rows={d} row_verts_len={d}\n",
-            .{ app.row_mode_max_row_end, app.rows, app.row_verts.items.len },
+            .{ app.row_mode_max_row_end, app.surface.rows, app.surface.row_verts.items.len },
         );
     }
 
-    // Update app.rows based on total_rows from core (handles both growth and shrink)
-    if (total_rows != app.rows) {
-        const old_rows = app.rows;
-        app.rows = total_rows;
-        app.cols = total_cols;
+    // Update app.surface.rows based on total_rows from core (handles both growth and shrink)
+    if (total_rows != app.surface.rows) {
+        const old_rows = app.surface.rows;
+        app.surface.rows = total_rows;
+        app.surface.cols = total_cols;
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
@@ -824,7 +1199,7 @@ pub fn onVerticesRow(
             app.row_valid.unsetAll();
         }
         // Clear old row vertex data to prevent ghost rendering from stale vertices.
-        for (app.row_verts.items) |*rv| {
+        for (app.surface.row_verts.items) |*rv| {
             rv.verts.clearRetainingCapacity();
             rv.gen +%= 1;
         }
@@ -834,6 +1209,23 @@ pub fn onVerticesRow(
             "[win] on_vertices_row resize old={d} new={d} row_valid={d}\n",
             .{ old_rows, total_rows, app.row_valid_count },
         );
+    }
+
+    // TBS: update write set rows/cols and resize flush_dirty on dimension change.
+    if (app.tbs.is_in_flush) {
+        const write_set = app.tbs.writeSet();
+        write_set.row_mode = true;
+        if (total_rows != write_set.rows) {
+            // Release all old slot references and resize row_map.
+            write_set.releaseAllSlots(app.alloc, &app.tbs.pool);
+            write_set.row_map.resize(app.alloc, total_rows) catch {};
+            for (write_set.row_map.items) |*m| {
+                m.slot = app_mod.SLOT_NONE;
+            }
+            write_set.rows = total_rows;
+            write_set.cols = total_cols;
+            app.tbs.flush_dirty.resize(app.alloc, total_rows, false) catch {};
+        }
     }
 
     // Row callback is meaningful only when MAIN is updated.
@@ -849,36 +1241,26 @@ pub fn onVerticesRow(
 
     // Mark row-mode and remember which rows are dirty.
     // When we enter row-mode for the first time, request a one-time full seed.
-    if (!app.row_mode) {
-        app.row_mode = true;
+    if (!app.surface.row_mode) {
+        app.surface.row_mode = true;
         app.need_full_seed.store(true, .seq_cst);
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
-        if (app.rows != 0) {
-            app.row_valid.resize(app.alloc, @intCast(app.rows), false) catch {};
+        if (app.surface.rows != 0) {
+            app.row_valid.resize(app.alloc, @intCast(app.surface.rows), false) catch {};
             app.row_valid.unsetAll();
         }
     } else {
-        app.row_mode = true;
+        app.surface.row_mode = true;
     }
 
-    // Mark rows dirty (now gated by MAIN flag).
-    // Clamp to [0, app.rows) to avoid index==rows.
-    const max_rows: u32 = app.rows;
+    // Clamp to [0, app.surface.rows) to avoid index==rows.
+    const max_rows: u32 = app.surface.rows;
 
     if (max_rows != 0 and row_start >= max_rows) {
         return;
     }
-
-    const end_row_unclamped: u32 = row_start + row_count;
-    const end_row: u32 = if (max_rows != 0 and end_row_unclamped > max_rows) max_rows else end_row_unclamped;
-
-    var r: u32 = row_start;
-    while (r < end_row) : (r += 1) {
-        _ = app.dirty_rows.put(app.alloc, r, {}) catch {};
-    }
-
 
     if (row_count == 1) {
         // Single-row path (normal case): store vertices for this row.
@@ -889,19 +1271,25 @@ pub fn onVerticesRow(
             return;
         }
 
-        app.ensureRowStorage(row);
+        if (!storeSurfaceRowVerts(app.alloc, &app.surface.row_verts, row, verts_ptr, vert_count)) return;
 
-        // Verify row storage was allocated (may fail if row >= max_row_buffers)
-        if (row >= app.row_verts.items.len) return;
-
-        var rv = &app.row_verts.items[@intCast(row)];
-        rv.verts.clearRetainingCapacity();
-
-        if (verts_ptr != null and vert_count != 0) {
-            rv.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch {};
+        // TBS: COW detach + write to slot, mark flush_dirty.
+        if (app.tbs.is_in_flush) {
+            const ws = app.tbs.writeSet();
+            ws.row_mode = true;
+            ws.ensureRowStorage(app.alloc, row);
+            if (app.tbs.cowDetachRow(app.alloc, row)) |slot| {
+                slot.verts.clearRetainingCapacity();
+                if (verts_ptr != null and vert_count != 0) {
+                    slot.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch {};
+                }
+                slot.origin_row = row;
+                slot.ver +%= 1;
+            }
+            if (row < app.tbs.flush_dirty.bit_length) {
+                app.tbs.flush_dirty.set(row);
+            }
         }
-
-        rv.gen +%= 1;
     } else if (row_count > 1) {
         // Multi-row path: the vertex array covers multiple rows but we cannot
         // split it per-row (no per-row vertex boundaries in the API).
@@ -922,35 +1310,19 @@ pub fn onVerticesRow(
     }
 
     // Mark the row valid only when we have exact single-row vertex data.
-    if (app.rows != 0 and row_count == 1) {
+    if (app.surface.rows != 0 and row_count == 1) {
         const idx: usize = @intCast(row_start);
         if (idx < app.row_valid.bit_length and !app.row_valid.isSet(idx)) {
             app.row_valid.set(idx);
             app.row_valid_count += 1;
         }
-        if (app.row_valid_count == app.rows) {
-            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{app.rows});
+        if (app.row_valid_count == app.surface.rows) {
+            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{app.surface.rows});
         }
     }
 
-    if (app.hwnd) |hwnd| {
-        // Invalidate only the affected row rectangle in pixels.
-        const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
-        const row_h_px_u32 = app_mod.rowHeightPxFromClient(hwnd, app.rows, fallback_row_h);
-        const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
-
-        var rc: c.RECT = .{
-            .left = 0,
-            .top = @intCast(@as(i32, @intCast(row_start)) * row_h_px),
-            .right = 0, // will be set to client.right below
-            .bottom = @intCast(@as(i32, @intCast(row_start + row_count)) * row_h_px),
-        };
-        var client: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &client);
-        rc.right = client.right;
-
-        _ = c.InvalidateRect(hwnd, &rc, c.FALSE);
-    }
+    // InvalidateRect deferred to onFlushEnd for coalescing.
+    app.flush_needs_invalidate = true;
 }
 
 pub fn onMainRowScroll(
@@ -970,9 +1342,9 @@ pub fn onMainRowScroll(
     if (rows_delta == 0 or row_end <= row_start) return;
     if (col_start != 0 or col_end != total_cols) return;
 
-    if (total_rows != app.rows) {
-        app.rows = total_rows;
-        app.cols = total_cols;
+    if (total_rows != app.surface.rows) {
+        app.surface.rows = total_rows;
+        app.surface.cols = total_cols;
         if (total_rows != 0) {
             app.row_valid.resize(app.alloc, @intCast(total_rows), false) catch {};
             app.row_valid.unsetAll();
@@ -982,8 +1354,8 @@ pub fn onMainRowScroll(
         app.row_valid_count = 0;
         app.row_layout_gen +%= 1;
     } else {
-        app.rows = total_rows;
-        app.cols = total_cols;
+        app.surface.rows = total_rows;
+        app.surface.cols = total_cols;
     }
 
     if (total_rows == 0) return;
@@ -993,90 +1365,278 @@ pub fn onMainRowScroll(
     const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
     if (abs_rows == 0 or abs_rows >= region_height) return;
 
-    app.row_mode = true;
+    app.surface.row_mode = true;
     if (app.row_valid.bit_length < total_rows) {
         app.row_valid.resize(app.alloc, @intCast(total_rows), false) catch {};
     }
 
     const last_row: u32 = row_end - 1;
     app.ensureRowStorage(last_row);
-    if (last_row >= app.row_verts.items.len) return;
+    if (last_row >= app.surface.row_verts.items.len) return;
 
-    const content_h: f32 = @floatFromInt(@max(@as(u32, 1), app.rows * (app.cell_h_px + app.linespace_px)));
-    const row_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
-    const delta_y: f32 = @as(f32, @floatFromInt(rows_delta)) * row_h / content_h * 2.0;
-
-    const start_idx: usize = @intCast(row_start);
-    const end_idx: usize = @intCast(row_end);
-    const shift: usize = @intCast(abs_rows);
-
-    if (rows_delta > 0) {
-        var dst: usize = start_idx;
-        while (dst + shift < end_idx) : (dst += 1) {
-            const src = dst + shift;
-            std.mem.swap(app_mod.RowVerts, &app.row_verts.items[dst], &app.row_verts.items[src]);
-            shiftVertsY(app.row_verts.items[dst].verts.items, delta_y);
-            app.row_verts.items[dst].gen +%= 1;
-            if (src < app.row_valid.bit_length and app.row_valid.isSet(src)) {
-                app.row_valid.set(dst);
-            } else if (dst < app.row_valid.bit_length) {
-                app.row_valid.unset(dst);
-            }
-        }
-        var vacated: usize = end_idx - shift;
-        while (vacated < end_idx) : (vacated += 1) {
-            app.row_verts.items[vacated].verts.clearRetainingCapacity();
-            app.row_verts.items[vacated].gen +%= 1;
-            if (vacated < app.row_valid.bit_length) app.row_valid.unset(vacated);
-        }
-    } else {
-        var dst: usize = end_idx;
-        while (dst > start_idx + shift) {
-            dst -= 1;
-            const src = dst - shift;
-            std.mem.swap(app_mod.RowVerts, &app.row_verts.items[dst], &app.row_verts.items[src]);
-            shiftVertsY(app.row_verts.items[dst].verts.items, delta_y);
-            app.row_verts.items[dst].gen +%= 1;
-            if (src < app.row_valid.bit_length and app.row_valid.isSet(src)) {
-                app.row_valid.set(dst);
-            } else if (dst < app.row_valid.bit_length) {
-                app.row_valid.unset(dst);
-            }
-        }
-        var vacated: usize = start_idx;
-        while (vacated < start_idx + shift) : (vacated += 1) {
-            app.row_verts.items[vacated].verts.clearRetainingCapacity();
-            app.row_verts.items[vacated].gen +%= 1;
-            if (vacated < app.row_valid.bit_length) app.row_valid.unset(vacated);
-        }
-    }
+    swapAndShiftRows(app.surface.row_verts.items, row_start, row_end, rows_delta, &app.row_valid);
 
     recomputeRowValidCount(app);
-
-    var row: u32 = row_start;
-    while (row < row_end) : (row += 1) {
-        _ = app.dirty_rows.put(app.alloc, row, {}) catch {};
-    }
 
     if (row_end > app.row_mode_max_row_end) {
         app.row_mode_max_row_end = row_end;
     }
 
-    if (app.hwnd) |hwnd| {
-        const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
-        const row_h_px_u32 = app_mod.rowHeightPxFromClient(hwnd, app.rows, fallback_row_h);
-        const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
+    // TBS: remap slot indices in write set (no physical data move).
+    if (app.tbs.is_in_flush) {
+        const ws = app.tbs.writeSet();
+        ws.row_mode = true;
+        ws.rows = total_rows;
+        ws.cols = total_cols;
+        const ws_last_row = row_end - 1;
+        ws.ensureRowStorage(app.alloc, ws_last_row);
+        if (ws_last_row < ws.row_map.items.len) {
+            remapRowSlots(ws.row_map.items, &app.tbs.pool, row_start, row_end, rows_delta);
+            // Ensure flush_dirty is sized for total_rows before setting bits.
+            if (app.tbs.flush_dirty.bit_length < total_rows) {
+                app.tbs.flush_dirty.resize(app.alloc, total_rows, false) catch {};
+            }
+            // Mark only vacated rows dirty in flush_dirty.
+            // Non-vacated rows are shifted by DXGI Present1 scroll
+            // (pScrollRect/pScrollOffset) at present time.
+            if (rows_delta > 0) {
+                var sr: u32 = row_end - abs_rows;
+                while (sr < row_end) : (sr += 1) {
+                    if (sr < app.tbs.flush_dirty.bit_length) {
+                        app.tbs.flush_dirty.set(sr);
+                    }
+                }
+            } else {
+                var sr: u32 = row_start;
+                while (sr < row_start + abs_rows) : (sr += 1) {
+                    if (sr < app.tbs.flush_dirty.bit_length) {
+                        app.tbs.flush_dirty.set(sr);
+                    }
+                }
+            }
+        }
+    }
 
-        var rc: c.RECT = .{
-            .left = 0,
-            .top = @intCast(@as(i32, @intCast(row_start)) * row_h_px),
-            .right = 0,
-            .bottom = @intCast(@as(i32, @intCast(row_end)) * row_h_px),
-        };
-        var client: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &client);
-        rc.right = client.right;
-        _ = c.InvalidateRect(hwnd, &rc, c.FALSE);
+    // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
+    // This ensures scroll state is atomically visible with the corresponding committed set.
+    const row_h: i32 = @intCast(@max(1, app.cell_h_px + app.linespace_px));
+    const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
+    const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
+    // rows_delta > 0 means content scrolls up (j-key), so pixels shift up (negative dy).
+    // rows_delta < 0 means content scrolls down (k-key), so pixels shift down (positive dy).
+    const delta_px: i32 = -rows_delta * row_h;
+    // right is set to 0 here; WM_PAINT fills it with the actual client width.
+    const new_rect = c.RECT{
+        .left = 0,
+        .top = scroll_top_px,
+        .right = 0,
+        .bottom = scroll_bot_px,
+    };
+
+    if (app.tbs.flush_scroll_rect) |existing| {
+        // Multiple scrolls in same flush: accumulate if same region.
+        if (existing.left == new_rect.left and existing.right == new_rect.right and
+            existing.top == new_rect.top and existing.bottom == new_rect.bottom)
+        {
+            app.tbs.flush_scroll_dy_px += delta_px;
+            app.tbs.flush_vb_shift += rows_delta;
+        } else {
+            // Different region: invalidate scroll optimization (full redraw).
+            app.tbs.flush_scroll_rect = null;
+            app.tbs.flush_scroll_dy_px = 0;
+            app.tbs.flush_vb_shift = 0;
+            app.tbs.flush_paint_full = true;
+            // Re-mark all rows dirty as fallback.
+            var sr: u32 = row_start;
+            while (sr < row_end) : (sr += 1) {
+                if (sr < app.tbs.flush_dirty.bit_length) {
+                    app.tbs.flush_dirty.set(sr);
+                }
+            }
+        }
+    } else {
+        app.tbs.flush_scroll_rect = new_rect;
+        app.tbs.flush_scroll_dy_px = delta_px;
+        app.tbs.flush_vb_shift = rows_delta;
+    }
+
+    // InvalidateRect deferred to onFlushEnd for coalescing.
+    app.flush_needs_invalidate = true;
+}
+
+/// Shift row vertex buffers for external grid scroll.
+/// Same row-swap + Y-shift logic as onMainRowScroll, but operates on
+/// ext_win.surface.row_verts and has no row_valid/dirty_rows tracking.
+pub fn onGridRowScroll(
+    ctx: ?*anyopaque,
+    grid_id: i64,
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    col_end: u32,
+    rows_delta: i32,
+    total_rows: u32,
+    total_cols: u32,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.mu.lock();
+    defer app.mu.unlock();
+
+    if (rows_delta == 0 or row_end <= row_start) return;
+    if (col_start != 0 or col_end != total_cols) return;
+
+    const ext_win = app.external_windows.getPtr(grid_id) orelse return;
+    if (ext_win.is_pending_close) return;
+    if (!ext_win.surface.row_mode) return;
+
+    ext_win.surface.rows = total_rows;
+    ext_win.surface.cols = total_cols;
+
+    if (total_rows == 0) return;
+    if (row_start >= total_rows or row_end > total_rows) return;
+
+    const region_height: u32 = row_end - row_start;
+    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
+    if (abs_rows == 0 or abs_rows >= region_height) return;
+
+    const last_row: u32 = row_end - 1;
+    if (!ensureRowStorageGeneric(app.alloc, &ext_win.surface.row_verts, last_row)) return;
+
+    swapAndShiftRows(ext_win.surface.row_verts.items, row_start, row_end, rows_delta, null);
+
+    // Update last_cursor_row to follow the scroll shift.
+    // If the cursor row moved into the vacated region, it was cleared.
+    // Cursor verts are stored separately, so just clear them (core will re-send).
+    if (ext_win.surface.last_cursor_row) |cr| {
+        if (cr >= row_start and cr < row_end) {
+            ext_win.surface.cursor_verts.clearRetainingCapacity();
+            ext_win.surface.last_cursor_row = null;
+        }
+    }
+
+    // TBS: remap slot indices in write set (no physical data move).
+    if (ext_win.tbs.is_in_flush) {
+        const ws = ext_win.tbs.writeSet();
+        if (ws.row_mode) {
+            ws.rows = total_rows;
+            ws.cols = total_cols;
+            ws.ensureRowStorage(app.alloc, last_row);
+            if (last_row < ws.row_map.items.len) {
+                remapRowSlots(ws.row_map.items, &ext_win.tbs.pool, row_start, row_end, rows_delta);
+            }
+            if (ws.last_cursor_row) |cr| {
+                if (cr >= row_start and cr < row_end) {
+                    ws.cursor_verts.clearRetainingCapacity();
+                    ws.last_cursor_row = null;
+                }
+            }
+            // Mark only vacated rows dirty (same as onMainRowScroll).
+            // back_tex is persistent, so non-vacated rows retain correct content.
+            if (ext_win.tbs.flush_dirty.bit_length < total_rows) {
+                ext_win.tbs.flush_dirty.resize(app.alloc, total_rows, false) catch {};
+            }
+            if (rows_delta > 0) {
+                var sr: u32 = row_end - abs_rows;
+                while (sr < row_end) : (sr += 1) {
+                    if (sr < ext_win.tbs.flush_dirty.bit_length) {
+                        ext_win.tbs.flush_dirty.set(sr);
+                    }
+                }
+            } else {
+                var sr: u32 = row_start;
+                while (sr < row_start + abs_rows) : (sr += 1) {
+                    if (sr < ext_win.tbs.flush_dirty.bit_length) {
+                        ext_win.tbs.flush_dirty.set(sr);
+                    }
+                }
+            }
+        }
+    }
+
+    // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
+    const row_h: i32 = @intCast(@max(1, app.cell_h_px + app.linespace_px));
+    const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
+    const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
+    const delta_px: i32 = -rows_delta * row_h;
+    const new_rect = c.RECT{ .left = 0, .top = scroll_top_px, .right = 0, .bottom = scroll_bot_px };
+
+    if (ext_win.tbs.flush_scroll_rect) |existing| {
+        if (existing.left == new_rect.left and existing.right == new_rect.right and
+            existing.top == new_rect.top and existing.bottom == new_rect.bottom)
+        {
+            ext_win.tbs.flush_scroll_dy_px += delta_px;
+            ext_win.tbs.flush_vb_shift += rows_delta;
+        } else {
+            // Different region: invalidate scroll optimization.
+            ext_win.tbs.flush_scroll_rect = null;
+            ext_win.tbs.flush_scroll_dy_px = 0;
+            ext_win.tbs.flush_vb_shift = 0;
+            ext_win.tbs.flush_paint_full = true;
+        }
+    } else {
+        ext_win.tbs.flush_scroll_rect = new_rect;
+        ext_win.tbs.flush_scroll_dy_px = delta_px;
+        ext_win.tbs.flush_vb_shift = rows_delta;
+    }
+
+    ext_win.recomputeVertCount();
+    ext_win.needs_redraw = true;
+    // InvalidateRect deferred to onFlushEnd for coalescing.
+}
+
+/// Called at the start of each flush cycle (core thread, on_flush_begin callback).
+/// Prepares triple-buffered write sets for all surfaces. If any surface lacks
+/// a free set (UI still reading) or alloc fails, aborts the flush.
+pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
+    const ctxp = ctx orelse return;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return;
+    const app: *App = @ptrFromInt(ctx_bits);
+
+    // Phase 1: Pre-flight — check all surfaces have a free set.
+    var can_flush = app.tbs.hasFreeSet();
+    if (can_flush) {
+        app.mu.lock();
+        var it = app.external_windows.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.tbs.hasFreeSet()) {
+                can_flush = false;
+                break;
+            }
+        }
+        app.mu.unlock();
+    }
+
+    if (!can_flush) {
+        if (app.corep) |corep| app_mod.zonvie_core_abort_flush(corep);
+        return;
+    }
+
+    // Phase 2: beginFlush on all surfaces.
+    var ok = app.tbs.beginFlush(app.alloc);
+    if (ok) {
+        app.mu.lock();
+        var it = app.external_windows.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.tbs.beginFlush(app.alloc)) {
+                ok = false;
+                break;
+            }
+        }
+        app.mu.unlock();
+    }
+
+    if (!ok) {
+        // Partial success: cancel all surfaces.
+        app.tbs.cancelFlush();
+        app.mu.lock();
+        var it2 = app.external_windows.iterator();
+        while (it2.next()) |entry| {
+            entry.value_ptr.tbs.cancelFlush();
+        }
+        app.mu.unlock();
+        if (app.corep) |corep| app_mod.zonvie_core_abort_flush(corep);
+        return;
     }
 }
 
@@ -1103,6 +1663,17 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         }
     }
 
+    // Commit triple-buffered write sets (is_in_flush==false → no-op after abort).
+    app.tbs.commitFlush(app.alloc);
+    {
+        app.mu.lock();
+        var ext_it = app.external_windows.iterator();
+        while (ext_it.next()) |entry| {
+            entry.value_ptr.tbs.commitFlush(app.alloc);
+        }
+        app.mu.unlock();
+    }
+
     // Coalesce: only post if not already pending (atomic CAS: false -> true)
     if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
         // CAS succeeded: we own the pending slot
@@ -1117,11 +1688,40 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         }
     }
 
-    // Ensure the window repaints after flush (needed for glow config changes
-    // that arrive via RPC response outside the normal vertex submission path).
-    // InvalidateRect is idempotent and cheap; WM_PAINT is coalesced by Windows.
-    if (app.hwnd) |hwnd| {
+    // Coalesce all per-callback dirty state into a single InvalidateRect per
+    // window.  Individual vertex callbacks (onVerticesRow, onVerticesPartial,
+    // onMainRowScroll, onGridRowScroll) no longer call InvalidateRect directly;
+    // they only accumulate dirty state (dirty_rows, paint_full, needs_redraw,
+    // flush_needs_invalidate).  This prevents mid-flush WM_PAINT from drawing
+    // incomplete frames, and skips InvalidateRect entirely for flushes that
+    // carry no visual changes (e.g. msg_showcmd-only flushes).
+    app.mu.lock();
+    const main_dirty = app.flush_needs_invalidate;
+    app.flush_needs_invalidate = false;
+    const main_hwnd = if (main_dirty) app.hwnd else null;
+    // Collect dirty external window HWNDs under lock.
+    // Bounded array avoids allocation on the flush hot path.
+    var ext_hwnds: [64]c.HWND = undefined;
+    var ext_hwnd_count: usize = 0;
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.needs_redraw) {
+            if (entry.value_ptr.hwnd) |ext_hwnd| {
+                if (ext_hwnd_count < ext_hwnds.len) {
+                    ext_hwnds[ext_hwnd_count] = ext_hwnd;
+                    ext_hwnd_count += 1;
+                }
+            }
+        }
+    }
+    app.mu.unlock();
+
+    // InvalidateRect outside of lock — triggers a single WM_PAINT per window.
+    if (main_hwnd) |hwnd| {
         _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    }
+    for (ext_hwnds[0..ext_hwnd_count]) |ext_hwnd| {
+        _ = c.InvalidateRect(ext_hwnd, null, 0);
     }
 }
 
@@ -1562,8 +2162,8 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
         if (ext_win.is_pending_close) continue;
 
-        const rows = ext_win.rows;
-        const cols = ext_win.cols;
+        const rows = ext_win.surface.rows;
+        const cols = ext_win.surface.cols;
 
         var content_w: c_int = @intCast(cols * cell_w);
         var content_h: c_int = @intCast(rows * cell_h);
@@ -1606,7 +2206,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app_mod.updateLayoutToCore(h, app);
         _ = c.InvalidateRect(h, null, 0);
         app.mu.lock();
-        app.paint_full = true;
+        app.surface.paint_full = true;
         app.paint_rects.clearRetainingCapacity();
         // Trigger full seed to clear back buffer and sync all swapchain buffers.
         // This ensures gutter areas (outside the new grid) are properly cleared.
@@ -1647,8 +2247,8 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 
         if (ext_win.is_pending_close) continue;
 
-        const rows = ext_win.rows;
-        const cols = ext_win.cols;
+        const rows = ext_win.surface.rows;
+        const cols = ext_win.surface.cols;
 
         var content_w: c_int = @intCast(cols * cell_w);
         var content_h: c_int = @intCast(rows * cell_h);
@@ -1692,7 +2292,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         app_mod.updateLayoutToCore(h, app);
         _ = c.InvalidateRect(h, null, 0);
         app.mu.lock();
-        app.paint_full = true;
+        app.surface.paint_full = true;
         app.paint_rects.clearRetainingCapacity();
         // Trigger full seed to clear back buffer and sync all swapchain buffers.
         // This ensures gutter areas (outside the new grid) are properly cleared.

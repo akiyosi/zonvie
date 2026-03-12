@@ -194,52 +194,91 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     var col: i32 = 0;
     const grid_id = app_mod.zonvie_core_get_cursor_position(corep, &row, &col);
 
-    const cached = app.getVisibleGridsCached(corep.?);
-
-    var screen_row: i32 = row;
-    var screen_col: i32 = col;
-
-    // Find the grid and add startRow/startCol
-    for (cached.grids[0..cached.count]) |grid| {
-        if (grid.grid_id == grid_id) {
-            screen_row = grid.start_row + row;
-            screen_col = grid.start_col + col;
-            break;
+    // Check if cursor is on an external window's grid (e.g. ext-cmdline).
+    // If so, we need to calculate screen coordinates via that window, then convert
+    // back to the IME hwnd's client coordinates. Otherwise the candidate window
+    // appears behind the topmost external window and is invisible.
+    var ext_hwnd: ?c.HWND = null;
+    {
+        app.mu.lock();
+        defer app.mu.unlock();
+        if (app.external_windows.get(grid_id)) |ew| {
+            ext_hwnd = ew.hwnd;
         }
     }
 
-    // Calculate pixel position relative to content area
-    const x: c.LONG = @intCast(screen_col * @as(i32, @intCast(cell_w)));
-    const cursor_y: c.LONG = @intCast(screen_row * row_h);
+    if (ext_hwnd) |ehwnd| {
+        // Cursor is on an external grid — position via that window's client area.
+        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
+        const cmdline_x_offset: c.LONG = if (is_cmdline)
+            @intCast(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT)
+        else
+            0;
+        const cmdline_y_offset: c.LONG = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING) else 0;
 
-    // Candidate window should appear immediately below the overlay (cell_h, not row_h)
-    const below_overlay_y: c.LONG = cursor_y + @as(c.LONG, @intCast(cell_h));
+        // Grid-local pixel position within the external window's client area
+        const local_x: c.LONG = col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset;
+        const local_cursor_y: c.LONG = row * row_h + cmdline_y_offset;
+        const local_below_y: c.LONG = local_cursor_y + @as(c.LONG, @intCast(cell_h));
 
-    // When ext_tabline is enabled on main window, content is rendered below the tabbar.
-    // IME context is associated with main window, so we need to add tabline height
-    // to convert content-relative coordinates to main window coordinates.
-    // External windows don't have a tabbar, so only apply offset for main window.
-    var adjusted_cursor_y = cursor_y;
-    var adjusted_below_overlay_y = below_overlay_y;
-    const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
-    if (ext_tabline_enabled and is_main_window) {
-        const tab_h = app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-        adjusted_cursor_y += tab_h;
-        adjusted_below_overlay_y += tab_h;
+        // Convert external window client coords → screen → IME hwnd client coords
+        var pt_cursor: c.POINT = .{ .x = local_x, .y = local_cursor_y };
+        var pt_below: c.POINT = .{ .x = local_x, .y = local_below_y };
+        _ = c.ClientToScreen(ehwnd, &pt_cursor);
+        _ = c.ClientToScreen(ehwnd, &pt_below);
+        _ = c.ScreenToClient(hwnd, &pt_cursor);
+        _ = c.ScreenToClient(hwnd, &pt_below);
+
+        var cf: c.COMPOSITIONFORM = undefined;
+        cf.dwStyle = c.CFS_POINT;
+        cf.ptCurrentPos = .{ .x = pt_cursor.x, .y = pt_cursor.y };
+        _ = c.ImmSetCompositionWindow(himc, &cf);
+
+        var candidate_form: c.CANDIDATEFORM = undefined;
+        candidate_form.dwIndex = 0;
+        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
+        candidate_form.ptCurrentPos = .{ .x = pt_below.x, .y = pt_below.y };
+        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
+    } else {
+        // Cursor is on a main-window grid — use startRow/startCol offset.
+        const cached = app.getVisibleGridsCached(corep.?);
+
+        var screen_row: i32 = row;
+        var screen_col: i32 = col;
+
+        for (cached.grids[0..cached.count]) |grid| {
+            if (grid.grid_id == grid_id) {
+                screen_row = grid.start_row + row;
+                screen_col = grid.start_col + col;
+                break;
+            }
+        }
+
+        const x: c.LONG = @intCast(screen_col * @as(i32, @intCast(cell_w)));
+        const cursor_y: c.LONG = @intCast(screen_row * row_h);
+        const below_overlay_y: c.LONG = cursor_y + @as(c.LONG, @intCast(cell_h));
+
+        // When ext_tabline is enabled on main window, content is rendered below the tabbar.
+        var adjusted_cursor_y = cursor_y;
+        var adjusted_below_overlay_y = below_overlay_y;
+        const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
+        if (ext_tabline_enabled and is_main_window) {
+            const tab_h = app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
+            adjusted_cursor_y += tab_h;
+            adjusted_below_overlay_y += tab_h;
+        }
+
+        var cf: c.COMPOSITIONFORM = undefined;
+        cf.dwStyle = c.CFS_POINT;
+        cf.ptCurrentPos = .{ .x = x, .y = adjusted_cursor_y };
+        _ = c.ImmSetCompositionWindow(himc, &cf);
+
+        var candidate_form: c.CANDIDATEFORM = undefined;
+        candidate_form.dwIndex = 0;
+        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
+        candidate_form.ptCurrentPos = .{ .x = x, .y = adjusted_below_overlay_y };
+        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
     }
-
-    // Set composition window position (at cursor)
-    var cf: c.COMPOSITIONFORM = undefined;
-    cf.dwStyle = c.CFS_POINT;
-    cf.ptCurrentPos = .{ .x = x, .y = adjusted_cursor_y };
-    _ = c.ImmSetCompositionWindow(himc, &cf);
-
-    // Set candidate window position (immediately below overlay)
-    var candidate_form: c.CANDIDATEFORM = undefined;
-    candidate_form.dwIndex = 0;
-    candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-    candidate_form.ptCurrentPos = .{ .x = x, .y = adjusted_below_overlay_y };
-    _ = c.ImmSetCandidateWindow(himc, &candidate_form);
 }
 
 /// Disable IME input (switch to direct input mode).
@@ -451,10 +490,12 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
         .y = screen_row * @as(c.LONG, @intCast(row_h)) + cmdline_y_offset,
     };
-    // Use content_hwnd for coordinate conversion when it exists (content_hwnd is positioned below tabline).
-    // When content_hwnd is null but ext_tabline is enabled on main window, add tabline height manually.
-    const coord_hwnd = if (content_hwnd) |ch| ch else hwnd;
-    if (content_hwnd == null and ext_tabline_enabled and !is_external_window) {
+    // For external windows, always use their own hwnd for coordinate conversion
+    // (grid-local coords are relative to the external window's client area).
+    // For main window, use content_hwnd when it exists (positioned below tabline),
+    // or add tabline height manually if content_hwnd is null.
+    const coord_hwnd = if (is_external_window) hwnd else if (content_hwnd) |ch| ch else hwnd;
+    if (!is_external_window and content_hwnd == null and ext_tabline_enabled) {
         pt.y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
     }
     _ = c.ClientToScreen(coord_hwnd, &pt);

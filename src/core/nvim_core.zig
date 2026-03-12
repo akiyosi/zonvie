@@ -271,6 +271,19 @@ pub const Callbacks = struct {
         total_rows: u32,
         total_cols: u32,
     ) callconv(.c) void = null,
+
+    // External grid (sub-grid) row-buffer scroll fast path notification
+    on_grid_row_scroll: ?*const fn (
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -2116,10 +2129,13 @@ pub const Core = struct {
     }
 
     /// Request resize of a specific grid (for external windows).
-    /// Sets the initial target size for NDC viewport calculation.
-    /// The target is later updated by grid_resize events to match Neovim's actual size.
+    /// Request Neovim to resize an external grid.
+    /// Does NOT update external_grid_target_sizes here — the authoritative
+    /// update happens in grid_resize (redraw_handler.zig) when Neovim confirms
+    /// the new size. Updating target_sizes eagerly would cause viewport_rows
+    /// to temporarily mismatch the NDC baked into existing row vertices (e.g.
+    /// frontend requests 44 rows but Neovim keeps 45 including winbar).
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
-        self.grid.external_grid_target_sizes.put(self.alloc, grid_id, .{ .rows = rows, .cols = cols }) catch {};
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
         };

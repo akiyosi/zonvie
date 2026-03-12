@@ -116,7 +116,7 @@ const updateRowsColsFromClientForce = app_mod.updateRowsColsFromClientForce;
 
 fn updateRowsColsFromClient(hwnd: c.HWND, app: *App) void {
     // Only use client-derived rows/cols as a bootstrap before core provides them.
-    if (app.rows != 0 or app.cols != 0) {
+    if (app.surface.rows != 0 or app.surface.cols != 0) {
         return;
     }
     updateRowsColsFromClientForce(hwnd, app);
@@ -140,23 +140,23 @@ pub export fn WndProc(
 ) callconv(.winapi) c.LRESULT {
     switch (msg) {
         c.WM_NCCREATE => {
-            applog.appLog("WM_NCCREATE hwnd={*} wParam={d} lParam=0x{x}", .{ hwnd, wParam, @as(usize, @bitCast(lParam)) });
+            if (applog.isEnabled()) applog.appLog("WM_NCCREATE hwnd={*} wParam={d} lParam=0x{x}", .{ hwnd, wParam, @as(usize, @bitCast(lParam)) });
 
             const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
-            applog.appLog("  CREATESTRUCTW ptr={*} lpCreateParams={*}", .{ cs, cs.lpCreateParams });
+            if (applog.isEnabled()) applog.appLog("  CREATESTRUCTW ptr={*} lpCreateParams={*}", .{ cs, cs.lpCreateParams });
 
             const lp = cs.lpCreateParams orelse {
-                applog.appLog("  lpCreateParams is null -> fail", .{});
+                if (applog.isEnabled()) applog.appLog("  lpCreateParams is null -> fail", .{});
                 return 0;
             };
-            applog.appLog("  lpCreateParams={*}", .{lp});
+            if (applog.isEnabled()) applog.appLog("  lpCreateParams={*}", .{lp});
 
             const app: *App = @ptrCast(@alignCast(lp));
-            applog.appLog("  app ptr={*} align={d}", .{ app, @alignOf(App) });
+            if (applog.isEnabled()) applog.appLog("  app ptr={*} align={d}", .{ app, @alignOf(App) });
 
             app.owned_by_hwnd = true;
             setApp(hwnd, app);
-            applog.appLog("  GWLP_USERDATA set", .{});
+            if (applog.isEnabled()) applog.appLog("  GWLP_USERDATA set", .{});
             return 1;
         },
 
@@ -177,9 +177,9 @@ pub export fn WndProc(
                         params.rgrc[0].top += frame_y;
                         params.rgrc[0].right -= frame_x;
                         params.rgrc[0].bottom -= frame_y;
-                        applog.appLog("[win] WM_NCCALCSIZE: maximized, inset by frame=({d},{d})\n", .{ frame_x, frame_y });
+                        if (applog.isEnabled()) applog.appLog("[win] WM_NCCALCSIZE: maximized, inset by frame=({d},{d})\n", .{ frame_x, frame_y });
                     } else {
-                        applog.appLog("[win] WM_NCCALCSIZE: extending client area into titlebar\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[win] WM_NCCALCSIZE: extending client area into titlebar\n", .{});
                     }
                     return 0;
                 }
@@ -291,12 +291,10 @@ pub export fn WndProc(
         },
 
         c.WM_CREATE => {
-            if (builtin.mode == .Debug and !applog.isEnabled()) {
-                // Force early logging in debug builds to capture init crashes.
-                applog.setEnabled(true);
-            }
+            // Debug builds no longer force logging on by default.
+            // Use --log <path> or [log] config to enable.
 
-            applog.appLog("WM_CREATE: begin (deferred init)", .{});
+            if (applog.isEnabled()) applog.appLog("WM_CREATE: begin (deferred init)", .{});
             if (getApp(hwnd)) |app| {
                 app.hwnd = hwnd;
                 app.ui_thread_id = c.GetCurrentThreadId();
@@ -307,7 +305,7 @@ pub export fn WndProc(
                 const initial_dpi = GetDpiForWindow(hwnd);
                 if (initial_dpi > 0) {
                     app.dpi_scale = @as(f32, @floatFromInt(initial_dpi)) / 96.0;
-                    applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
                 }
 
                 // DWM custom titlebar: trigger frame recalculation (titlebar mode only)
@@ -323,7 +321,7 @@ pub export fn WndProc(
                         rc.bottom - rc.top,
                         c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE,
                     );
-                    applog.appLog("[win] WM_CREATE: triggered SWP_FRAMECHANGED for custom titlebar\n", .{});
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: triggered SWP_FRAMECHANGED for custom titlebar\n", .{});
 
                     // NOTE: content_hwnd is NOT created anymore.
                     // D3D11 renders to parent window directly, including tabline area.
@@ -342,7 +340,7 @@ pub export fn WndProc(
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
 
-                applog.appLog("WM_CREATE: end (posted deferred init)", .{});
+                if (applog.isEnabled()) applog.appLog("WM_CREATE: end (posted deferred init)", .{});
             }
             return 0;
         },
@@ -357,16 +355,18 @@ pub export fn WndProc(
 
                 // Log first paint with content timing (startup performance)
                 if (!app.first_paint_logged and app.renderer != null) {
-                    var first_paint_t: c.LARGE_INTEGER = undefined;
-                    _ = c.QueryPerformanceCounter(&first_paint_t);
-                    const first_paint_ms = @divTrunc((first_paint_t.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
-                    applog.appLog("[TIMING] First WM_PAINT (renderer ready): {d}ms from main()\n", .{first_paint_ms});
+                    if (log_enabled) {
+                        var first_paint_t: c.LARGE_INTEGER = undefined;
+                        _ = c.QueryPerformanceCounter(&first_paint_t);
+                        const first_paint_ms = @divTrunc((first_paint_t.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+                        applog.appLog("[TIMING] First WM_PAINT (renderer ready): {d}ms from main()\n", .{first_paint_ms});
+                    }
                     app.first_paint_logged = true;
                 }
 
                 // If renderer not yet initialized (deferred init pending), just fill with black
                 if (app.renderer == null) {
-                    applog.appLog("[win] WM_PAINT: renderer not ready, filling black", .{});
+                    if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling black", .{});
                     const hdc = ps.hdc;
                     const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
                     _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
@@ -397,7 +397,7 @@ pub export fn WndProc(
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     {
                         app.mu.lock();
-                        app.paint_full = true;
+                        app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
                         app.mu.unlock();
                     }
@@ -416,18 +416,33 @@ pub export fn WndProc(
                     t_snapshot_start_ns = std.time.nanoTimestamp();
                 }
 
+                // Step 1: TBS acquire (rotation_mu short lock).
+                // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
+                const tbs_snapshot = app.tbs.acquireForPaint();
+                defer {
+                    const needs_reinvalidate = app.tbs.releaseFromPaint(tbs_snapshot.committed_index);
+                    if (needs_reinvalidate) {
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+                }
+                const committed = &app.tbs.sets[tbs_snapshot.committed_index];
+
+                // Step 2: UI metadata snapshot (app.mu short lock).
                 app.mu.lock();
-                if (app.rows == 0) {
+                if (app.surface.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
                 }
-                // Snapshot state under lock.
 
-                const row_mode = app.row_mode;
+                // Read vertex-related state from TBS committed set (refcount-protected, lock-free).
+                const row_mode = committed.row_mode;
+                const rows_snapshot: u32 = committed.rows;
+                const row_verts_len: u32 = @intCast(committed.row_map.items.len);
+                const main_verts_len_snapshot: u32 = @intCast(committed.flat_verts.items.len);
+
+                // Read UI metadata under app.mu.
                 const seed_pending_snapshot = app.seed_pending;
                 const row_valid_count_snapshot = app.row_valid_count;
-                const rows_snapshot: u32 = app.rows;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
-                const main_verts_len_snapshot: u32 = @intCast(app.main_verts.items.len);
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
 
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
@@ -456,14 +471,14 @@ pub export fn WndProc(
                         // Resize D3D atlas texture if dimensions changed (render-thread-owned)
                         if (gpu_ptr) |g| {
                             g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch {
-                                applog.appLog("[win] FATAL: D3D atlas texture recreation failed, skipping frame\n", .{});
+                                if (log_enabled) applog.appLog("[win] FATAL: D3D atlas texture recreation failed, skipping frame\n", .{});
                                 if (app.hwnd) |h| _ = c.PostMessageW(h, c.WM_CLOSE, 0, 0);
                                 app.mu.unlock();
                                 return 0;
                             };
                         }
                         app.need_full_seed.store(true, .seq_cst);
-                        app.paint_full = true;
+                        app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
                         // After atlas reset, external window paints may consume
                         // shared pending_uploads before the main window sees them.
@@ -472,20 +487,18 @@ pub export fn WndProc(
                     }
                 }
 
+                // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
+                // The bitset iterator yields sorted, unique row indices — no dedup needed.
                 var dirty_row_keys: std.ArrayListUnmanaged(u32) = .{};
                 defer dirty_row_keys.deinit(app.alloc);
 
                 if (row_mode) {
-                    var it = app.dirty_rows.keyIterator();
-                    while (it.next()) |k| {
-                        dirty_row_keys.append(app.alloc, k.*) catch break;
+                    var dit = app.tbs.paint_dirty_snapshot.iterator(.{});
+                    while (dit.next()) |row_idx| {
+                        dirty_row_keys.append(app.alloc, @intCast(row_idx)) catch break;
                     }
                 }
-                // Clear dirty rows set now (we have the snapshot).
-                app.dirty_rows.clearRetainingCapacity();
 
-                // Also snapshot row_verts length (for logging / bounds).
-                const row_verts_len: u32 = @intCast(app.row_verts.items.len);
                 var effective_rows: u32 = rows_snapshot;
                 var rows_mismatch: bool = false;
                 if (row_mode and row_mode_max_row_end_snapshot != 0 and row_mode_max_row_end_snapshot < effective_rows) {
@@ -500,8 +513,7 @@ pub export fn WndProc(
                 paint_rects_snapshot.appendSlice(app.alloc, app.paint_rects.items) catch {};
                 app.paint_rects.clearRetainingCapacity();
 
-                const paint_full_snapshot = app.paint_full;
-                app.paint_full = false;
+                const paint_full_snapshot = tbs_snapshot.paint_full;
 
                 app.mu.unlock();
 
@@ -534,14 +546,12 @@ pub export fn WndProc(
                     if (gpu_ptr) |g| {
                         g.lockContext();
                         defer g.unlockContext();
-                        // After atlas reset, upload the full atlas first to cover
-                        // any entries that were discarded when base_seq advanced.
-                        if (app.atlas_full_upload_needed) {
-                            a.uploadFullAtlasToD3D(g);
+                        const need_full = app.atlas_full_upload_needed;
+                        if (need_full) {
                             app.atlas_full_upload_needed = false;
                             if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
                         }
-                        const new_cursor = a.flushPendingAtlasUploadsSinceToD3D(g, app.atlas_upload_cursor);
+                        const new_cursor = app_mod.flushAtlasUploads(a, g, app.atlas_upload_cursor, need_full);
                         if (new_cursor != app.atlas_upload_cursor) atlas_uploaded = true;
                         app.atlas_upload_cursor = new_cursor;
                     }
@@ -610,15 +620,11 @@ pub export fn WndProc(
                     // The core computes NDC using grid_rows * cell_h (snapped to cell boundaries),
                     // so the D3D11 viewport must use the same snapped height to prevent sub-pixel
                     // misalignment between vertex positions and scissor rects (which causes stripes).
-                    const content_height: u32 = blk: {
-                        const cell_total_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
-                        const client_h: u32 = @intCast(@max(1, client_for_content.bottom - client_for_content.top));
-                        const y_off: u32 = content_y_offset orelse 0;
-                        const drawable_h: u32 = if (client_h > y_off) client_h - y_off else 0;
-                        const snapped: u32 = (drawable_h / cell_total_h) * cell_total_h;
-                        // Match core's @max(1, grid_rows) guarantee: at least 1 row tall
-                        break :blk @max(snapped, cell_total_h);
-                    };
+                    const content_height: u32 = app_mod.snappedContentHeight(
+                        @intCast(@max(1, client_for_content.bottom - client_for_content.top)),
+                        app.cell_h_px + app.linespace_px,
+                        content_y_offset orelse 0,
+                    );
 
                     // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
                     // This avoids DWM composition issues by keeping GDI rendering offscreen
@@ -636,7 +642,7 @@ pub export fn WndProc(
                     }
 
                     if (!row_mode) {
-                        // Non-row mode: snapshot vertex data under lock, then draw outside lock.
+                        // Non-row mode: read from TBS committed set (refcount-protected, lock-free).
                         // IMPORTANT: Do NOT hold app.mu during drawEx.
                         // drawEx calls DXGI Present which can pump Win32 messages internally.
                         // If a re-entrant message handler tries app.mu.lock() on the same thread
@@ -649,17 +655,16 @@ pub export fn WndProc(
                         defer local_cursor.deinit(app.alloc);
                         var non_row_draw = false;
                         {
-                            app.mu.lock();
-                            defer app.mu.unlock();
-                            if (!app.row_mode) {
+                            // TBS committed set is safe to read (refcount protects from rotation).
+                            if (!committed.row_mode) {
                                 non_row_draw = blk: {
-                                    local_main.appendSlice(app.alloc, app.main_verts.items) catch |e| {
-                                        applog.appLog("[win] WM_PAINT(non-row) main snapshot failed: {any}\n", .{e});
+                                    local_main.appendSlice(app.alloc, committed.flat_verts.items) catch |e| {
+                                        if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) main snapshot failed: {any}\n", .{e});
                                         break :blk false;
                                     };
                                     if (app.cursor_blink_state) {
-                                        local_cursor.appendSlice(app.alloc, app.cursor_verts.items) catch |e| {
-                                            applog.appLog("[win] WM_PAINT(non-row) cursor snapshot failed: {any}\n", .{e});
+                                        local_cursor.appendSlice(app.alloc, committed.cursor_verts.items) catch |e| {
+                                            if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) cursor snapshot failed: {any}\n", .{e});
                                             break :blk false;
                                         };
                                     }
@@ -674,7 +679,7 @@ pub export fn WndProc(
                             if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                             } else |e| {
-                                applog.appLog("gpu.draw failed: {any}\n", .{e});
+                                if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
                             }
                         }
                     } else {
@@ -685,79 +690,36 @@ pub export fn WndProc(
                             t_row_start_ns = std.time.nanoTimestamp();
                         }
 
-                        // Build list of rows to draw.
-                        // Rule:
-                        // - After resize seed OR dirty==null (full redraw request), draw ALL cached rows.
-                        // - Otherwise draw only dirty rows.
-                        // Use persistent buffer to avoid per-frame alloc/free.
+                        // Build sorted, deduplicated list of rows to draw.
                         const rows_to_draw = &app.wm_paint_rows_to_draw;
-                        rows_to_draw.clearRetainingCapacity();
 
                         const force_full_rows =
                             did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot or glow_enabled;
 
-                        // Pre-allocate capacity based on expected row count
-                        const max_rows = @max(effective_rows, @max(row_verts_len, @as(u32, @intCast(dirty_row_keys.items.len))));
-                        rows_to_draw.ensureTotalCapacity(app.alloc, max_rows) catch {};
+                        const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
+                        const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
 
-                        if (force_full_rows) {
-                            // Full redraw request
-                            var irow: u32 = 0;
-                            const n: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
-                            while (irow < n) : (irow += 1) {
-                                rows_to_draw.append(app.alloc, irow) catch break;
-                            }
-                        } else if (dirty_row_keys.items.len != 0) {
-                            // Normal path: use explicit dirty rows
-                            rows_to_draw.appendSlice(app.alloc, dirty_row_keys.items) catch {};
-                        } else {
-                            // Nothing to draw
-                        }
-
-                        // ---- normalize rows_to_draw (MUST be < row_verts_len AND < rows_snapshot) ----
-                        //
-                        // Some paths (ceil division / region union / external dirty keys) can yield r == row_verts_len.
-                        // That would crash later as an out-of-bounds row index, so clamp here unconditionally.
-                        // Also filter out rows >= rows_snapshot to prevent drawing stale rows when grid shrinks.
-                        if (rows_to_draw.items.len != 0) {
-                            // First: filter to valid range [0, min(row_verts_len, rows_snapshot))
-                            const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
-                            var w: usize = 0;
-                            var i: usize = 0;
-                            while (i < rows_to_draw.items.len) : (i += 1) {
-                                const r = rows_to_draw.items[i];
-                                if (r < max_valid_row) {
-                                    rows_to_draw.items[w] = r;
-                                    w += 1;
-                                }
-                            }
-                            rows_to_draw.items.len = w;
-
-                            // Second: sort + unique (duplicates can happen)
-                            if (rows_to_draw.items.len != 0) {
-                                std.sort.pdq(u32, rows_to_draw.items, {}, comptime std.sort.asc(u32));
-
-                                w = 0;
-                                i = 0;
-                                while (i < rows_to_draw.items.len) : (i += 1) {
-                                    const r = rows_to_draw.items[i];
-                                    if (w == 0 or rows_to_draw.items[w - 1] != r) {
-                                        rows_to_draw.items[w] = r;
-                                        w += 1;
-                                    }
-                                }
-                                rows_to_draw.items.len = w;
-                            }
-                        }
-                        // ---- end normalize rows_to_draw ----
+                        app_mod.computeRowsToDraw(
+                            app.alloc,
+                            rows_to_draw,
+                            force_full_rows,
+                            dirty_row_keys.items,
+                            total_rows_for_enum,
+                            max_valid_row,
+                        );
 
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
                         if (atlas_uploaded and rows_to_draw.items.len == 0) {
                             app.mu.lock();
-                            app.paint_full = true;
+                            app.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
                             app.mu.unlock();
+                            {
+                                app.tbs.rotation_mu.lock();
+                                app.tbs.pending_paint_full = true;
+                                app.tbs.rotation_mu.unlock();
+                            }
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
 
@@ -792,24 +754,9 @@ pub export fn WndProc(
                         }
 
                         // --- Build present dirty from actual drawn row_rc + cursor_rc (don't use rcPaint) ---
-                        var cursor_verts_snapshot: []const core.Vertex = &[_]core.Vertex{};
-                        // Snapshot cursor verts into a stable buffer (avoid races with callbacks).
-                        {
-                            app.mu.lock();
-                            defer app.mu.unlock();
-                            app.row_tmp_verts.clearRetainingCapacity();
-                            const cur = app.cursor_verts.items;
-                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cur.len});
-                            if (cur.len != 0) {
-                                app.row_tmp_verts.ensureTotalCapacity(app.alloc, cur.len) catch {
-                                    applog.appLog("[win] WM_PAINT(row) cursor snapshot ensure cap failed\n", .{});
-                                };
-                                app.row_tmp_verts.appendSlice(app.alloc, cur) catch {
-                                    applog.appLog("[win] WM_PAINT(row) cursor snapshot append failed\n", .{});
-                                };
-                                cursor_verts_snapshot = app.row_tmp_verts.items;
-                            }
-                        }
+                        // Read cursor verts from TBS committed set (refcount-protected, lock-free).
+                        const cursor_verts_snapshot: []const core.Vertex = committed.cursor_verts.items;
+                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cursor_verts_snapshot.len});
                         // Use content_hwnd size when it exists (D3D11 is bound to content_hwnd)
                         var client: c.RECT = undefined;
                         const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
@@ -935,7 +882,7 @@ pub export fn WndProc(
                         // This ensures the gutter is properly cleared in all swapchain buffers
                         // during partial present, preventing ghost artifacts from stale content.
                         // Use the actual maximum y coordinate from present_rects to handle cases
-                        // where app.rows is stale (e.g., after font/linespace changes).
+                        // where app.surface.rows is stale (e.g., after font/linespace changes).
                         if (present_rects.items.len != 0) {
                             var max_y: i32 = 0;
                             for (present_rects.items) |r| {
@@ -1092,23 +1039,15 @@ pub export fn WndProc(
                         // row-setup drawEx is the ONLY drawEx in row-mode WM_PAINT.
                         // When did_need_seed is true, we must NOT preserve old back buffer contents,
                         // so integrate "seed-clear" behavior here (no extra drawEx).
+                        // With TBS, committed set is read-only — only clear row_valid under app.mu.
                         app.mu.lock();
+
                         const seed_clear = did_need_seed or app.seed_clear_pending;
                         if (seed_clear) {
                             app.seed_clear_pending = false;
-                            // Only clear row vertex data for rows BEYOND the current grid size.
-                            // This prevents stale rows from being drawn in the gutter area when
-                            // the grid has shrunk (e.g., after font/linespace change).
-                            // IMPORTANT: Do NOT clear rows within the current grid - they contain
-                            // valid data that should be drawn.
-                            const current_rows = app.rows;
-                            var clear_idx: usize = current_rows;
-                            while (clear_idx < app.row_verts.items.len) : (clear_idx += 1) {
-                                app.row_verts.items[clear_idx].verts.clearRetainingCapacity();
-                                app.row_verts.items[clear_idx].gen +%= 1;
-                            }
                             // Only unset validity for rows beyond current grid
-                            clear_idx = current_rows;
+                            const current_rows = committed.rows;
+                            var clear_idx: usize = current_rows;
                             while (clear_idx < app.row_valid.bit_length) : (clear_idx += 1) {
                                 if (app.row_valid.isSet(clear_idx)) {
                                     app.row_valid.unset(clear_idx);
@@ -1134,297 +1073,131 @@ pub export fn WndProc(
                             },
                         );
 
-                        g.drawEx(
-                            &[_]core.Vertex{},
-                            &[_]core.Vertex{},
-                            null,
-                            .{
-                                .present = false,
-                                .preserve_on_null_dirty = preserve_back,
-                                .content_width = content_width,
-                                .content_y_offset = content_y_offset,
-                                .content_x_offset = content_x_offset,
-                                .sidebar_right_width = sidebar_right_width,
-                                .content_height = content_height,
-                                .tabbar_bg_color = tabbar_bg_color,
-                            },
-                        ) catch |e| {
-                            applog.appLog("gpu.drawEx(row-setup) failed: {any}\n", .{e});
+                        const row_draw_params = app_mod.RowModeDrawParams{
+                            .content_height = content_height,
+                            .row_h_px = row_h_px,
+                            .x_offset = content_x_offset_i32,
+                            .y_offset = content_y_offset_i32,
+                            .content_right = content_right_i32,
+                            .preserve_back = preserve_back,
+                            .use_row_scissor = !seed_pending_snapshot,
+                            .glow_enabled = glow_enabled,
+                            .content_width = content_width,
+                            .content_y_offset = content_y_offset,
+                            .content_x_offset = content_x_offset,
+                            .sidebar_right_width = sidebar_right_width,
+                            .tabbar_bg_color = tabbar_bg_color,
                         };
+
+                        // Bloom: collect row verts, draw after row VBs
+                        var bloom_verts: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        defer bloom_verts.deinit(app.alloc);
+
+                        // Ensure row_vbs array covers committed set's row count.
+                        {
+                            const need_len = committed.row_map.items.len;
+                            if (app.row_vbs.items.len < need_len) {
+                                const old_len = app.row_vbs.items.len;
+                                app.row_vbs.resize(app.alloc, need_len) catch {};
+                                for (app.row_vbs.items[old_len..]) |*rvb| {
+                                    rvb.* = .{};
+                                }
+                            }
+                        }
+
+                        // Apply scroll pixel shift (row_vbs shift + cursor ghost + back_tex shift).
+                        // Scroll state is bundled in PaintSnapshot, atomically consistent with committed set.
+                        var scroll_shift_result = app_mod.ScrollShiftResult{};
+                        if (preserve_back) {
+                            if (tbs_snapshot.scroll_rect) |sr| {
+                                scroll_shift_result = app_mod.applyScrollShift(
+                                    g,
+                                    app.alloc,
+                                    app.row_vbs.items,
+                                    rows_to_draw,
+                                    sr,
+                                    tbs_snapshot.scroll_dy_px,
+                                    tbs_snapshot.vb_shift,
+                                    &app.last_painted_cursor_row,
+                                    row_h_px,
+                                    effective_rows,
+                                    content_y_offset_i32,
+                                );
+                            }
+                        } else {
+                            // No scroll shift, but still apply pending vb shift to avoid stale state.
+                            if (tbs_snapshot.vb_shift != 0) {
+                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, 0, @intCast(app.row_vbs.items.len));
+                            }
+                        }
+
+                        // TBS lock-free draw: committed set is protected by refcount,
+                        // no app.mu needed during VB upload + draw.
+                        const row_draw_result = app_mod.drawRowModeSetupAndRowsFromSlots(
+                            g,
+                            app.alloc,
+                            committed.row_map.items,
+                            &app.tbs.pool,
+                            app.row_vbs.items,
+                            rows_to_draw.items,
+                            &bloom_verts,
+                            row_draw_params,
+                        ) catch |e| blk: {
+                            if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
+                            break :blk app_mod.RowModeDrawResult{};
+                        };
+
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d}\n",
                             .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len },
                         );
 
-                        var drawn_rows: u32 = 0;
-                        var skipped_empty: u32 = 0;
-                        var first_empty_row: ?u32 = null;
-                        // log
-                        var log_vb_upload_rows: u32 = 0;
-                        var log_vb_upload_rows_bytes: u64 = 0;
-                        // perf timing
-                        var log_vb_upload_ns: i128 = 0;
-                        var log_draw_vb_ns: i128 = 0;
+                        const drawn_rows = row_draw_result.metrics.drawn_rows;
+                        const skipped_empty = row_draw_result.metrics.skipped_empty;
+                        const first_empty_row = row_draw_result.metrics.first_empty_row;
+                        const log_vb_upload_rows = row_draw_result.metrics.vb_upload_rows;
+                        const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
+                        const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
+                        const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
+                        const ctx_ptr = row_draw_result.ctx_ptr;
+                        const rs_set_sc_fn = row_draw_result.rs_set_sc_fn;
 
-                        var ctx_ptr: ?*c.ID3D11DeviceContext = null;
-                        var rs_set_sc_fn: ?*const fn (?*c.ID3D11DeviceContext, c.UINT, [*c]const c.D3D11_RECT) callconv(.c) void = null;
-
-                        // Bloom: collect row verts under lock, draw after lock release
-                        var bloom_verts: std.ArrayListUnmanaged(core.Vertex) = .{};
-                        defer bloom_verts.deinit(app.alloc);
-
-                        {
-                            const ctx = g.ctx orelse null;
-                            if (ctx == null) {
-                                if (log_enabled) applog.appLog("gpu ctx null in WM_PAINT(row)\n", .{});
-                            } else {
-                                ctx_ptr = ctx.?;
-                                const ctx_vtbl = ctx.?.*.lpVtbl;
-                                rs_set_sc_fn = ctx_vtbl.*.RSSetScissorRects orelse null;
-
-                                app.mu.lock();
-                                defer app.mu.unlock();
-
-                                const use_row_scissor = !seed_pending_snapshot;
-                                if (!use_row_scissor) {
-                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) seed_pending: scissor=full\n", .{});
-                                    if (rs_set_sc_fn) |f| {
-                                        var sc_full: c.D3D11_RECT = .{
-                                            .left = content_x_offset_i32,
-                                            .top = content_y_offset_i32,
-                                            .right = content_right_i32,
-                                            .bottom = client.bottom,
-                                        };
-                                        if (log_enabled and content_x_offset_i32 != 0) {
-                                            applog.appLog(
-                                                "[win] WM_PAINT(row) seed scissor adjusted left={d} right={d} content_width={any}\n",
-                                                .{ sc_full.left, sc_full.right, content_width },
-                                            );
-                                        }
-                                        f(ctx.?, 1, &sc_full);
-                                    }
-                                }
-
-                                var i: usize = 0;
-                                while (i < rows_to_draw.items.len) : (i += 1) {
-                                    const row = rows_to_draw.items[i];
-                                    if (row >= app.row_verts.items.len) {
-                                        skipped_empty += 1;
-                                        continue;
-                                    }
-
-                                    var rv = &app.row_verts.items[@intCast(row)];
-                                    const src = rv.verts.items;
-                                    if (src.len == 0) {
-                                        skipped_empty += 1;
-                                        if (first_empty_row == null) {
-                                            first_empty_row = @intCast(row);
-                                        }
-                                        continue;
-                                    }
-
-                                    if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(core.Vertex)) {
-                                        const log_need_bytes_row: usize = src.len * @sizeOf(core.Vertex);
-
-                                        const t_upload_start = if (log_enabled) std.time.nanoTimestamp() else 0;
-
-                                        g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, log_need_bytes_row) catch |e| {
-                                            applog.appLog("ensureExternalVertexBuffer failed row={d}: {any}\n", .{ row, e });
-                                            continue;
-                                        };
-                                        g.uploadVertsToVB(rv.vb.?, src) catch |e| {
-                                            applog.appLog("uploadVertsToVB failed row={d}: {any}\n", .{ row, e });
-                                            continue;
-                                        };
-
-                                        if (log_enabled) {
-                                            log_vb_upload_ns += std.time.nanoTimestamp() - t_upload_start;
-                                        }
-
-                                        // log: count successful uploads
-                                        log_vb_upload_rows += 1;
-                                        log_vb_upload_rows_bytes += @as(u64, @intCast(log_need_bytes_row));
-
-                                        rv.uploaded_gen = rv.gen;
-                                    }
-
-                                    // Add content offsets for ext_tabline (scissor is in screen coords)
-                                    const y_offset: i32 = content_y_offset_i32;
-                                    const x_offset: i32 = content_x_offset_i32;
-                                    const top: i32 = y_offset + @as(i32, @intCast(row)) * row_h_px;
-                                    const bottom: i32 = top + row_h_px;
-                                    const row_rc: c.RECT = .{ .left = x_offset, .top = top, .right = client.right, .bottom = bottom };
-
-                                    if (use_row_scissor) {
-                                        if (rs_set_sc_fn) |f| {
-                                            var sc: c.D3D11_RECT = .{
-                                                .left = row_rc.left,
-                                                .top = row_rc.top,
-                                                .right = @min(row_rc.right, content_right_i32),
-                                                .bottom = row_rc.bottom,
-                                            };
-                                            if (log_enabled and content_x_offset_i32 != 0 and row == 0 and i == 0) {
-                                                applog.appLog(
-                                                    "[win] WM_PAINT(row) row scissor adjusted left={d} right={d} content_right={d} client_right={d}\n",
-                                                    .{ sc.left, sc.right, content_right_i32, client.right },
-                                                );
-                                            }
-                                            f(ctx.?, 1, &sc);
-                                        }
-                                    }
-
-                                    const t_draw_start = if (log_enabled) std.time.nanoTimestamp() else 0;
-
-                                    g.drawVB(rv.vb.?, src.len) catch |e| {
-                                        applog.appLog("drawVB failed row={d}: {any}\n", .{ row, e });
-                                        continue;
-                                    };
-
-                                    if (log_enabled) {
-                                        log_draw_vb_ns += std.time.nanoTimestamp() - t_draw_start;
-                                    }
-
-                                    drawn_rows += 1;
-                                }
-
-                                if (log_enabled) {
-                                    applog.appLog(
-                                        "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
-                                        .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
-                                    );
-                                    if (first_empty_row) |erow| {
-                                        applog.appLog(
-                                            "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
-                                            .{ erow, rows_snapshot, row_verts_len },
-                                        );
-                                    }
-                                }
-
-                                // Collect all row verts for bloom extract (under lock)
-                                if (glow_enabled) {
-                                    var ri: usize = 0;
-                                    while (ri < app.row_verts.items.len) : (ri += 1) {
-                                        const rv_bloom = &app.row_verts.items[ri];
-                                        if (rv_bloom.verts.items.len > 0) {
-                                            bloom_verts.appendSlice(app.alloc, rv_bloom.verts.items) catch {};
-                                        }
-                                    }
-                                }
+                        if (log_enabled) {
+                            applog.appLog(
+                                "[win] WM_PAINT(row-vb) drawn_rows={d} skipped_empty={d} rows_to_draw={d}\n",
+                                .{ drawn_rows, skipped_empty, rows_to_draw.items.len },
+                            );
+                            if (first_empty_row) |erow| {
+                                applog.appLog(
+                                    "[win] WM_PAINT(row-vb) WARN empty_row={d} rows={d} row_verts_len={d}\n",
+                                    .{ erow, rows_snapshot, row_verts_len },
+                                );
                             }
                         }
 
-                        // --- log: per-frame upload counts ---
-                        var log_vb_upload_cursor: u32 = 0;
-                        var log_vb_upload_cursor_bytes: u64 = 0;
-
-                        if (cursor_verts_snapshot.len != 0) {
-                            // Ensure + upload cursor VB only when cursor verts changed (rendered in Present step).
-                            const need_bytes: usize = cursor_verts_snapshot.len * @sizeOf(core.Vertex);
-                            g.ensureExternalVertexBuffer(&app.cursor_vb, &app.cursor_vb_bytes, need_bytes) catch |e| {
-                                applog.appLog("ensureExternalVertexBuffer failed cursor: {any}\n", .{e});
-                            };
-
-                            if (app.cursor_vb) |vb| {
-                                // Always upload cursor VB each frame to avoid race condition:
-                                // cursor_verts_snapshot is taken at WM_PAINT start, but onVerticesPartial
-                                // callback may arrive during paint with new cursor data. The generation
-                                // check could pass with stale snapshot data. 288 bytes/frame is negligible.
-                                g.uploadVertsToVB(vb, cursor_verts_snapshot) catch |e| {
-                                    applog.appLog("uploadVertsToVB failed cursor: {any}\n", .{e});
-                                };
-
-                                log_vb_upload_cursor += 1;
-                                log_vb_upload_cursor_bytes += @as(u64, @intCast(need_bytes));
-                            }
-                        }
-
-                        if (cursor_verts_snapshot.len != 0) {
-                            if (app.cursor_vb) |vb| {
-                                if (ctx_ptr != null) {
-                                    if (rs_set_sc_fn) |f| {
-                                        // Compute scissor bounds matching content viewport (absolute coords)
-                                        const sc_x_off: c.LONG = if (content_x_offset) |off| @intCast(off) else 0;
-                                        const sc_y_off: c.LONG = if (content_y_offset) |off| @intCast(off) else 0;
-                                        // content_width is viewport-relative; add x_off for absolute coords
-                                        const sc_right: c.LONG = if (content_width) |cw| sc_x_off + @as(c.LONG, @intCast(cw)) else client.right;
-                                        if (cursor_rc_opt) |cr| {
-                                            // cursor_rc_opt is already transformed to viewport coords
-                                            var sc: c.D3D11_RECT = .{
-                                                .left = cr.left,
-                                                .top = cr.top,
-                                                .right = @min(cr.right, sc_right),
-                                                .bottom = cr.bottom,
-                                            };
-                                            f(ctx_ptr, 1, &sc);
-                                        } else {
-                                            var sc: c.D3D11_RECT = .{
-                                                .left = sc_x_off,
-                                                .top = sc_y_off,
-                                                .right = sc_right,
-                                                .bottom = client.bottom,
-                                            };
-                                            f(ctx_ptr, 1, &sc);
-                                        }
-                                    }
-
-                                    // Only draw cursor if blink state is visible
-                                    if (app.cursor_blink_state) {
-                                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) drawing cursor verts={d}\n", .{cursor_verts_snapshot.len});
-                                        g.drawVB(vb, cursor_verts_snapshot.len) catch |e| {
-                                            applog.appLog("drawVB failed cursor: {any}\n", .{e});
-                                        };
-                                    } else {
-                                        if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor hidden (blink off)\n", .{});
-                                        // Redraw cursor row to clear cursor from back_tex
-                                        if (cursor_rc_opt) |cr| {
-                                            if (row_h_px > 0) {
-                                                const cursor_row: usize = @intCast(@divFloor(@max(0, cr.top - content_y_offset_i32), row_h_px));
-                                                if (log_enabled) applog.appLog("[win] WM_PAINT(row) redrawing cursor_row={d} to clear\n", .{cursor_row});
-                                                if (cursor_row < app.row_verts.items.len) {
-                                                    const rv = &app.row_verts.items[cursor_row];
-                                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_row rv.vb={} src.len={d}\n", .{ rv.vb != null, rv.verts.items.len });
-                                                    if (rv.vb) |row_vb| {
-                                                        const src = rv.verts.items;
-                                                        if (src.len > 0) {
-                                                            // Set scissor to row
-                                                            const top_px: i32 = content_y_offset_i32 + @as(i32, @intCast(cursor_row)) * row_h_px;
-                                                            const bottom_px: i32 = top_px + row_h_px;
-                                                            var sc: c.D3D11_RECT = .{
-                                                                .left = content_x_offset_i32,
-                                                                .top = top_px,
-                                                                .right = content_right_i32,
-                                                                .bottom = bottom_px,
-                                                            };
-                                                            if (rs_set_sc_fn) |f| {
-                                                                f(ctx_ptr, 1, &sc);
-                                                            }
-                                                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) drawing cursor_row={d} verts={d}\n", .{ cursor_row, src.len });
-                                                            g.drawVB(row_vb, src.len) catch |e| {
-                                                                applog.appLog("drawVB failed cursor_row clear: {any}\n", .{e});
-                                                            };
-                                                        }
-                                                    }
-                                                } else {
-                                                    if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_row={d} out of range (len={d})\n", .{ cursor_row, app.row_verts.items.len });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            if (log_enabled) applog.appLog("[win] WM_PAINT(row) NO cursor (snapshot empty)\n", .{});
-                        }
+                        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
+                        app_mod.drawCursorOverlay(g, .{
+                            .cursor_verts = cursor_verts_snapshot,
+                            .cursor_row = committed.last_cursor_row,
+                            .cursor_vb = &app.cursor_vb,
+                            .cursor_vb_bytes = &app.cursor_vb_bytes,
+                            .row_vbs = app.row_vbs.items,
+                            .row_map = committed.row_map.items,
+                            .pool = &app.tbs.pool,
+                            .blink_visible = app.cursor_blink_state,
+                            .x_offset = content_x_offset_i32,
+                            .y_offset = content_y_offset_i32,
+                            .content_right = content_right_i32,
+                            .content_height = content_height,
+                            .row_h_px = row_h_px,
+                            .ctx_ptr = ctx_ptr,
+                            .rs_set_sc_fn = rs_set_sc_fn,
+                            .last_painted_cursor_row = &app.last_painted_cursor_row,
+                        });
 
                         // Post-process bloom (neon glow) for row-mode
-                        if (glow_enabled and bloom_verts.items.len > 0) {
-                            const bloom_vp_x: u32 = content_x_offset orelse 0;
-                            const bloom_vp_y: u32 = content_y_offset orelse 0;
-                            const bloom_sidebar_r: u32 = sidebar_right_width orelse 0;
-                            const bloom_base_w: u32 = content_width orelse g.width;
-                            const bloom_vp_w: u32 = if (bloom_base_w > bloom_vp_x + bloom_sidebar_r) bloom_base_w - bloom_vp_x - bloom_sidebar_r else 1;
-                            const bloom_vp_h: u32 = content_height;
-                            g.drawBloomFromVerts(bloom_verts.items, cursor_verts_snapshot, glow_intensity, bloom_vp_x, bloom_vp_y, bloom_vp_w, bloom_vp_h);
+                        if (glow_enabled) {
+                            app_mod.drawBloomOverlay(g, bloom_verts.items, cursor_verts_snapshot, glow_intensity, row_draw_params);
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {
@@ -1460,8 +1233,8 @@ pub export fn WndProc(
                                     log_present_rects_area_px,
                                     log_vb_upload_rows,
                                     log_vb_upload_rows_bytes,
-                                    log_vb_upload_cursor,
-                                    log_vb_upload_cursor_bytes,
+                                    @as(u32, if (cursor_verts_snapshot.len != 0) 1 else 0),
+                                    @as(u64, cursor_verts_snapshot.len * @sizeOf(core.Vertex)),
                                 },
                             );
                         }
@@ -1474,7 +1247,7 @@ pub export fn WndProc(
                         var rows_current: u32 = 0;
                         app.mu.lock();
                         layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
-                        rows_current = app.rows;
+                        rows_current = committed.rows;
                         app.mu.unlock();
 
                         const allow_present = blk: {
@@ -1515,31 +1288,20 @@ pub export fn WndProc(
                             break :blk true;
                         };
 
+                        // When scrollBackTex shifted back_tex content, the entire scroll
+                        // region changed in back_tex. Add it to present_rects so the
+                        // CopySubresourceRegion in present copies the shifted pixels
+                        // to all swapchain buffers.
+                        if (scroll_shift_result.scroll_rect) |sr| {
+                            present_rects.append(app.alloc, sr) catch {};
+                        }
+
                         if (allow_present) {
                             // Draw scrollbar overlay before present
                             if (app.config.scrollbar.enabled and app.scrollbar_alpha > 0.001) {
                                 var scrollbar_verts: [12]core.Vertex = undefined;
                                 const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
-                                if (scrollbar_vert_count > 0) {
-                                    // Reset viewport and scissor to full screen for scrollbar
-                                    // (needed when content_width is smaller than window width)
-                                    g.setFullViewport();
-
-                                    // Ensure scrollbar VB
-                                    const need_bytes = scrollbar_vert_count * @sizeOf(core.Vertex);
-                                    g.ensureExternalVertexBuffer(&app.scrollbar_vb, &app.scrollbar_vb_bytes, need_bytes) catch |e| {
-                                        applog.appLog("ensureExternalVertexBuffer scrollbar failed: {any}\n", .{e});
-                                    };
-
-                                    if (app.scrollbar_vb) |vb| {
-                                        g.uploadVertsToVB(vb, scrollbar_verts[0..scrollbar_vert_count]) catch |e| {
-                                            applog.appLog("uploadVertsToVB scrollbar failed: {any}\n", .{e});
-                                        };
-                                        g.drawVB(vb, scrollbar_vert_count) catch |e| {
-                                            applog.appLog("drawVB scrollbar failed: {any}\n", .{e});
-                                        };
-                                    }
-                                }
+                                app_mod.drawScrollbarOverlay(g, &app.scrollbar_vb, &app.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
                             }
 
                             // When seed_clear is true, the back buffer was just cleared.
@@ -1551,25 +1313,39 @@ pub export fn WndProc(
                             const present_rects_slice: []const c.RECT =
                                 if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
+                            // Present1 scroll params: disabled for now.
+                            // back_tex pixel shift (scrollBackTex) already handles the retained
+                            // content shift. Adding pScrollRect/pScrollOffset to Present1 would
+                            // cause a double-shift since we CopySubresourceRegion back_tex→bb.
+
                             if (g.presentFromBackRectsWithCursorNoResize(
                                 present_rects_slice,
                                 app.cursor_vb,
                                 cursor_verts_snapshot.len,
                                 cursor_rc_opt,
                                 force_full_present,
+                                null,
+                                null,
                             )) {
                                 render_ok = true;
+                                // last_painted_cursor_row is tracked by drawCursorOverlay above.
                             } else |e| {
-                                applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
+                                if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
                             }
 
                             if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
                                 app.mu.lock();
                                 app.seed_pending = false;
-                                app.paint_full = true;
+                                app.surface.paint_full = true;
                                 app.paint_rects.clearRetainingCapacity();
                                 app.seed_clear_pending = true;
                                 app.mu.unlock();
+                                // Also set TBS pending_paint_full for next paint cycle.
+                                {
+                                    app.tbs.rotation_mu.lock();
+                                    app.tbs.pending_paint_full = true;
+                                    app.tbs.rotation_mu.unlock();
+                                }
                                 if (log_enabled) applog.appLog(
                                     "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
                                     .{ effective_rows, effective_row_valid_count },
@@ -1628,8 +1404,13 @@ pub export fn WndProc(
                 // WM_PAINT will retry a full redraw instead of showing stale content.
                 if (!render_ok) {
                     app.mu.lock();
-                    app.paint_full = true;
+                    app.surface.paint_full = true;
                     app.mu.unlock();
+                    {
+                        app.tbs.rotation_mu.lock();
+                        app.tbs.pending_paint_full = true;
+                        app.tbs.rotation_mu.unlock();
+                    }
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                 }
 
@@ -1646,7 +1427,7 @@ pub export fn WndProc(
         0x02E0 => { // WM_DPICHANGED
             if (getApp(hwnd)) |app| {
                 const new_dpi: u32 = @as(u32, @intCast(wParam & 0xFFFF)); // LOWORD
-                applog.appLog("[win] WM_DPICHANGED: new_dpi={d}\n", .{new_dpi});
+                if (applog.isEnabled()) applog.appLog("[win] WM_DPICHANGED: new_dpi={d}\n", .{new_dpi});
 
                 // Update app-level DPI scale
                 app.dpi_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
@@ -1722,19 +1503,21 @@ pub export fn WndProc(
                 var rc: c.RECT = undefined;
                 _ = c.GetClientRect(hwnd, &rc);
 
-                applog.appLog(
-                    "[win] WM_SIZE wParam={d} client=({d},{d})-({d},{d}) need_full_seed=1 atlas={s} gpu={s} resize_ns={d}\n",
-                    .{
-                        @as(u32, @intCast(wParam)),
-                        rc.left,
-                        rc.top,
-                        rc.right,
-                        rc.bottom,
-                        if (app.atlas != null) "Y" else "N",
-                        if (app.renderer != null) "Y" else "N",
-                        app.last_resize_ns,
-                    },
-                );
+                if (applog.isEnabled()) {
+                    applog.appLog(
+                        "[win] WM_SIZE wParam={d} client=({d},{d})-({d},{d}) need_full_seed=1 atlas={s} gpu={s} resize_ns={d}\n",
+                        .{
+                            @as(u32, @intCast(wParam)),
+                            rc.left,
+                            rc.top,
+                            rc.right,
+                            rc.bottom,
+                            if (app.atlas != null) "Y" else "N",
+                            if (app.renderer != null) "Y" else "N",
+                            app.last_resize_ns,
+                        },
+                    );
+                }
 
                 // 2) core layout update must be outside lock (can re-enter via callbacks).
                 updateLayoutToCore(hwnd, app);
@@ -1771,7 +1554,7 @@ pub export fn WndProc(
                 }
                 {
                     app.mu.lock();
-                    app.paint_full = true;
+                    app.surface.paint_full = true;
                     app.paint_rects.clearRetainingCapacity();
                     app.mu.unlock();
                 }
@@ -1802,7 +1585,7 @@ pub export fn WndProc(
                 // Do NOT take app.mu here: SendMessageW can re-enter while WM_PAINT holds app.mu.
                 if (app.atlas) |*a| {
                     const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
-                        applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: atlasEnsureGlyphEntry ERROR: {any}", .{err});
+                        if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: atlasEnsureGlyphEntry ERROR: {any}", .{err});
                         return 0;
                     };
                     out_entry.* = e;
@@ -1819,14 +1602,14 @@ pub export fn WndProc(
                     return 1;
                 }
 
-                applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: renderer is null", .{});
+                if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: renderer is null", .{});
                 return 0;
             }
             return 0;
         },
 
         WM_APP_CREATE_EXTERNAL_WINDOW => {
-            applog.appLog("[win] WM_APP_CREATE_EXTERNAL_WINDOW received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_CREATE_EXTERNAL_WINDOW received\n", .{});
             if (getApp(hwnd)) |app| {
                 // Update external window colors (border/icon) before creating windows
                 // This ensures colors are available for popupmenu even if cmdline wasn't shown
@@ -1849,7 +1632,7 @@ pub export fn WndProc(
         },
 
         WM_APP_CURSOR_GRID_CHANGED => {
-            applog.appLog("[win] WM_APP_CURSOR_GRID_CHANGED received grid_id={d}\n", .{wParam});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_CURSOR_GRID_CHANGED received grid_id={d}\n", .{wParam});
             if (getApp(hwnd)) |app| {
                 const grid_id: i64 = @bitCast(wParam);
 
@@ -1866,14 +1649,14 @@ pub export fn WndProc(
 
                 // Only activate windows on actual grid changes
                 if (!is_grid_change) {
-                    applog.appLog("[win] cursor stayed on same grid_id={d}, no activation change\n", .{grid_id});
+                    if (applog.isEnabled()) applog.appLog("[win] cursor stayed on same grid_id={d}, no activation change\n", .{grid_id});
                     return 0;
                 }
 
                 if (ext_hwnd) |eh| {
                     // Cursor moved to external grid - activate that window
                     _ = c.SetForegroundWindow(eh);
-                    applog.appLog("[win] activated external window for grid_id={d}\n", .{grid_id});
+                    if (applog.isEnabled()) applog.appLog("[win] activated external window for grid_id={d}\n", .{grid_id});
                 } else {
                     // Cursor moved to main grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
@@ -1881,12 +1664,12 @@ pub export fn WndProc(
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
                     // will handle cursor rendering as part of the normal draw.
                     app.mu.lock();
-                    const has_pending = app.dirty_rows.count() > 0 or app.paint_full or app.paint_rects.items.len > 0;
+                    const has_pending = app.paint_rects.items.len > 0;
                     app.mu.unlock();
                     if (!has_pending) {
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
-                    applog.appLog("[win] activated main window (cursor on grid_id={d}) pending={}\n", .{ grid_id, has_pending });
+                    if (applog.isEnabled()) applog.appLog("[win] activated main window (cursor on grid_id={d}) pending={}\n", .{ grid_id, has_pending });
                 }
             }
             return 0;
@@ -1894,7 +1677,7 @@ pub export fn WndProc(
 
         WM_APP_CLOSE_EXTERNAL_WINDOW => {
             const grid_id: i64 = @bitCast(wParam);
-            applog.appLog("[win] WM_APP_CLOSE_EXTERNAL_WINDOW received grid_id={d}\n", .{grid_id});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_CLOSE_EXTERNAL_WINDOW received grid_id={d}\n", .{grid_id});
             if (getApp(hwnd)) |app| {
                 external_windows.closeExternalWindowOnUIThread(app, grid_id);
             }
@@ -1902,7 +1685,7 @@ pub export fn WndProc(
         },
 
         WM_APP_MSG_SHOW => {
-            applog.appLog("[win] WM_APP_MSG_SHOW received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_MSG_SHOW received\n", .{});
             if (getApp(hwnd)) |app| {
                 // Process all pending messages
                 app.mu.lock();
@@ -1990,7 +1773,7 @@ pub export fn WndProc(
         },
 
         WM_APP_MSG_CLEAR => {
-            applog.appLog("[win] WM_APP_MSG_CLEAR received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_MSG_CLEAR received\n", .{});
             if (getApp(hwnd)) |app| {
                 // Kill auto-hide timer
                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
@@ -2004,7 +1787,7 @@ pub export fn WndProc(
 
         WM_APP_MINI_UPDATE => {
             const mini_id: MiniWindowId = @enumFromInt(@as(u2, @truncate(wParam)));
-            applog.appLog("[win] WM_APP_MINI_UPDATE received: {s}\n", .{@tagName(mini_id)});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_MINI_UPDATE received: {s}\n", .{@tagName(mini_id)});
             if (getApp(hwnd)) |app| {
                 messages.updateMiniWindows(app);
             }
@@ -2029,7 +1812,7 @@ pub export fn WndProc(
         },
 
         WM_APP_CLIPBOARD_GET => {
-            applog.appLog("[win] WM_APP_CLIPBOARD_GET received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_CLIPBOARD_GET received\n", .{});
             if (getApp(hwnd)) |app| {
                 dialogs.handleClipboardGetOnUIThread(app);
             }
@@ -2037,7 +1820,7 @@ pub export fn WndProc(
         },
 
         WM_APP_CLIPBOARD_SET => {
-            applog.appLog("[win] WM_APP_CLIPBOARD_SET received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_CLIPBOARD_SET received\n", .{});
             if (getApp(hwnd)) |app| {
                 dialogs.handleClipboardSetOnUIThread(app);
             }
@@ -2045,7 +1828,7 @@ pub export fn WndProc(
         },
 
         WM_APP_SSH_AUTH_PROMPT => {
-            applog.appLog("[win] WM_APP_SSH_AUTH_PROMPT received\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_SSH_AUTH_PROMPT received\n", .{});
             if (getApp(hwnd)) |app| {
                 dialogs.handleSSHAuthPromptOnUIThread(app);
             }
@@ -2203,14 +1986,14 @@ pub export fn WndProc(
 
         c.WM_TIMER => {
             if (wParam == TIMER_MSG_AUTOHIDE) {
-                applog.appLog("[win] WM_TIMER: message window auto-hide\n", .{});
+                if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: message window auto-hide\n", .{});
                 // Kill the timer and hide message window
                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                 if (getApp(hwnd)) |app| {
                     messages.hideMessageWindow(app);
                 }
             } else if (wParam == TIMER_MINI_AUTOHIDE) {
-                applog.appLog("[win] WM_TIMER: mini window auto-hide\n", .{});
+                if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: mini window auto-hide\n", .{});
                 // Kill the timer and hide mini window (showmode slot)
                 _ = c.KillTimer(hwnd, TIMER_MINI_AUTOHIDE);
                 if (getApp(hwnd)) |app| {
@@ -2240,14 +2023,14 @@ pub export fn WndProc(
                     }
                 }
             } else if (wParam == TIMER_CURSOR_BLINK) {
-                applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
+                if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
                 if (getApp(hwnd)) |app| {
                     input.handleCursorBlinkTimer(hwnd, app);
                 }
             } else if (wParam == TIMER_DEVCONTAINER_POLL) {
                 // Poll for devcontainer up completion
                 if (dialogs.g_devcontainer_up_done.load(.seq_cst)) {
-                    applog.appLog("[win] WM_TIMER: devcontainer up completed\n", .{});
+                    if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: devcontainer up completed\n", .{});
                     _ = c.KillTimer(hwnd, TIMER_DEVCONTAINER_POLL);
 
                     if (getApp(hwnd)) |app| {
@@ -2272,15 +2055,15 @@ pub export fn WndProc(
                                 }
                                 writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
                                 nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                                applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
+                                if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
                                 // Start nvim
                                 const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                                 defer if (nvim_path_z) |p| app.alloc.free(p);
                                 const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                                applog.appLog("[win] starting neovim via devcontainer exec\n", .{});
+                                if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec\n", .{});
                                 const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
-                                applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
+                                if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
@@ -2292,7 +2075,7 @@ pub export fn WndProc(
                             // Failure: hide dialog and show error
                             dialogs.hideDevcontainerProgressDialog();
                             app.devcontainer_up_pending = false;
-                            applog.appLog("[win] devcontainer up failed\n", .{});
+                            if (applog.isEnabled()) applog.appLog("[win] devcontainer up failed\n", .{});
                             // TODO: show error message to user
                         }
                     }
@@ -2305,7 +2088,7 @@ pub export fn WndProc(
                 }
             } else if (wParam == TIMER_QUIT_TIMEOUT) {
                 // Neovim not responding to quit request - show force quit dialog
-                applog.appLog("[win] WM_TIMER: quit timeout - Neovim not responding\n", .{});
+                if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: quit timeout - Neovim not responding\n", .{});
                 _ = c.KillTimer(hwnd, TIMER_QUIT_TIMEOUT);
                 if (getApp(hwnd)) |app| {
                     app.quit_pending = false;
@@ -2320,15 +2103,18 @@ pub export fn WndProc(
         },
 
         WM_APP_DEFERRED_INIT => {
-            applog.appLog("[win] WM_APP_DEFERRED_INIT: begin", .{});
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_DEFERRED_INIT: begin", .{});
 
             // Timing measurement for startup diagnostics
+            const deferred_log_enabled = applog.isEnabled();
             var freq: c.LARGE_INTEGER = undefined;
             var t0: c.LARGE_INTEGER = undefined;
             var t1: c.LARGE_INTEGER = undefined;
             var t2: c.LARGE_INTEGER = undefined;
-            _ = c.QueryPerformanceFrequency(&freq);
-            _ = c.QueryPerformanceCounter(&t0);
+            if (deferred_log_enabled) {
+                _ = c.QueryPerformanceFrequency(&freq);
+                _ = c.QueryPerformanceCounter(&t0);
+            }
 
             if (getApp(hwnd)) |app| {
                 // ============================================================
@@ -2377,18 +2163,22 @@ pub export fn WndProc(
                     .on_shape_text_run = callbacks.onShapeTextRun,
                     .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
                     .on_get_ascii_table = callbacks.onGetAsciiTable,
+                    .on_flush_begin = callbacks.onFlushBegin,
                     .on_flush_end = callbacks.onFlushEnd,
                     .on_main_row_scroll = callbacks.onMainRowScroll,
+                    .on_grid_row_scroll = callbacks.onGridRowScroll,
                 };
-                applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
+                if (deferred_log_enabled) applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
 
-                applog.appLog("  core_create callbacks ptr ctx(app)={*}", .{app});
-                _ = c.QueryPerformanceCounter(&t1);
+                if (deferred_log_enabled) applog.appLog("  core_create callbacks ptr ctx(app)={*}", .{app});
+                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
-                _ = c.QueryPerformanceCounter(&t2);
-                const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
-                applog.appLog("  core_create -> corep={*}", .{app.corep});
+                if (deferred_log_enabled) {
+                    _ = c.QueryPerformanceCounter(&t2);
+                    const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
+                    applog.appLog("  core_create -> corep={*}", .{app.corep});
+                }
 
                 // Load config into core for message routing
                 if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
@@ -2397,45 +2187,45 @@ pub export fn WndProc(
                     if (config_path_z) |cpath| {
                         defer app.alloc.free(cpath);
                         const load_result = core.zonvie_core_load_config(app.corep, cpath.ptr);
-                        applog.appLog("[win] zonvie_core_load_config({s}) = {d}\n", .{ config_path, load_result });
+                        if (deferred_log_enabled) applog.appLog("[win] zonvie_core_load_config({s}) = {d}\n", .{ config_path, load_result });
                     }
                 } else |_| {
-                    applog.appLog("[win] no config path found, using defaults\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] no config path found, using defaults\n", .{});
                 }
 
                 // Configure core settings
                 setLogEnabledViaCore(app, app.config.log.enabled);
                 if (app.ext_cmdline_enabled) {
-                    applog.appLog("[win] enabling ext_cmdline\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_cmdline\n", .{});
                     core.zonvie_core_set_ext_cmdline(app.corep, 1);
                 }
                 if (app.config.popup.external) {
-                    applog.appLog("[win] enabling ext_popupmenu\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_popupmenu\n", .{});
                     core.zonvie_core_set_ext_popupmenu(app.corep, 1);
                 }
                 if (app.ext_messages_enabled) {
-                    applog.appLog("[win] enabling ext_messages\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_messages\n", .{});
                     core.zonvie_core_set_ext_messages(app.corep, 1);
                 }
                 if (app.ext_tabline_enabled) {
-                    applog.appLog("[win] enabling ext_tabline\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_tabline\n", .{});
                     core.zonvie_core_set_ext_tabline(app.corep, 1);
                     // Note: Child window approach doesn't work with D3D11
                     // D3D11 renders on top of GDI child windows
                     // We'll draw tabline using GDI after D3D11 Present instead
                 }
                 if (app.ext_windows_enabled) {
-                    applog.appLog("[win] enabling ext_windows\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_windows\n", .{});
                     core.zonvie_core_set_ext_windows(app.corep, 1);
                 }
                 core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-                applog.appLog("[win] set opacity={d:.2}\n", .{app.config.window.opacity});
+                if (deferred_log_enabled) applog.appLog("[win] set opacity={d:.2}\n", .{app.config.window.opacity});
                 core.zonvie_core_set_glyph_cache_size(
                     app.corep,
                     app.config.performance.glyph_cache_ascii_size,
                     app.config.performance.glyph_cache_non_ascii_size,
                 );
-                applog.appLog("[win] set glyph_cache_size ascii={d} non_ascii={d}\n", .{
+                if (deferred_log_enabled) applog.appLog("[win] set glyph_cache_size ascii={d} non_ascii={d}\n", .{
                     app.config.performance.glyph_cache_ascii_size,
                     app.config.performance.glyph_cache_non_ascii_size,
                 });
@@ -2445,12 +2235,12 @@ pub export fn WndProc(
                 if (app.renderer) |*g| {
                     const max_tex = g.maxTextureSize();
                     if (atlas_cfg > max_tex) {
-                        applog.appLog("[win] atlas_size {d} exceeds D3D max {d}, clamping\n", .{ atlas_cfg, max_tex });
+                        if (deferred_log_enabled) applog.appLog("[win] atlas_size {d} exceeds D3D max {d}, clamping\n", .{ atlas_cfg, max_tex });
                         atlas_size_clamped = max_tex;
                     }
                 }
                 core.zonvie_core_set_atlas_size(app.corep, atlas_size_clamped);
-                applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
+                if (deferred_log_enabled) applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
 
                 // Build nvim command and start nvim (runs in background thread)
                 var nvim_cmd_buf: [1024]u8 = undefined;
@@ -2479,10 +2269,10 @@ pub export fn WndProc(
                     }
                     writer.writeAll(" --shell-type login -- nvim --embed") catch {};
                     nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                    applog.appLog("[win] WSL mode enabled, command: {s}\n", .{nvim_cmd_slice});
+                    if (deferred_log_enabled) applog.appLog("[win] WSL mode enabled, command: {s}\n", .{nvim_cmd_slice});
                 } else if (app.ssh_mode) {
                     if (app.ssh_host) |host| {
-                        applog.appLog("[win] SSH mode: building SSH command, host={s}\n", .{host});
+                        if (deferred_log_enabled) applog.appLog("[win] SSH mode: building SSH command, host={s}\n", .{host});
                         var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
                         const writer = fbs.writer();
                         // Always use ssh-askpass prefix for GUI dialog (password or key passphrase)
@@ -2503,7 +2293,7 @@ pub export fn WndProc(
                         const remote_nvim = app.cli_nvim_path orelse "nvim";
                         writer.print(" {s} \"'{s}'\" --headless --embed", .{ host, remote_nvim }) catch {};
                         nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                        applog.appLog("[win] SSH command: {s}\n", .{nvim_cmd_slice});
+                        if (deferred_log_enabled) applog.appLog("[win] SSH command: {s}\n", .{nvim_cmd_slice});
 
                         // Always set up SSH_ASKPASS for on-demand password/passphrase dialog
                         // SSH will call SSH_ASKPASS only when it needs authentication
@@ -2531,12 +2321,12 @@ pub export fn WndProc(
                         _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS_REQUIRE"), std.unicode.utf8ToUtf16LeStringLiteral("force"));
                         _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("DISPLAY"), std.unicode.utf8ToUtf16LeStringLiteral("dummy:0"));
                     } else {
-                        applog.appLog("[win] SSH mode enabled but no host specified\n", .{});
+                        if (deferred_log_enabled) applog.appLog("[win] SSH mode enabled but no host specified\n", .{});
                         nvim_cmd_slice = quoted_nvim;
                     }
                 } else if (app.devcontainer_mode) devcontainer_block: {
                     if (app.devcontainer_workspace) |workspace| {
-                        applog.appLog("[win] devcontainer mode: workspace={s}, rebuild={}\n", .{ workspace, app.devcontainer_rebuild });
+                        if (deferred_log_enabled) applog.appLog("[win] devcontainer mode: workspace={s}, rebuild={}\n", .{ workspace, app.devcontainer_rebuild });
 
                         if (app.devcontainer_rebuild) {
                             // Rebuild mode: show progress dialog and run devcontainer up in background
@@ -2548,7 +2338,7 @@ pub export fn WndProc(
 
                             // Start background thread for devcontainer up
                             const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
-                                applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
+                                if (deferred_log_enabled) applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
                                 dialogs.hideDevcontainerProgressDialog();
                                 nvim_cmd_slice = quoted_nvim;
                                 break :devcontainer_block;
@@ -2560,10 +2350,10 @@ pub export fn WndProc(
 
                             // Start polling timer
                             _ = c.SetTimer(hwnd, TIMER_DEVCONTAINER_POLL, DEVCONTAINER_POLL_INTERVAL, null);
-                            applog.appLog("[win] devcontainer poll timer started\n", .{});
+                            if (deferred_log_enabled) applog.appLog("[win] devcontainer poll timer started\n", .{});
 
                             // Skip nvim startup - will be done after devcontainer up completes
-                            applog.appLog("[win] devcontainer up started in background, skipping nvim startup\n", .{});
+                            if (deferred_log_enabled) applog.appLog("[win] devcontainer up started in background, skipping nvim startup\n", .{});
 
                             // Initialize renderers anyway (they're needed for the window)
                             // But skip zonvie_core_start until devcontainer up completes
@@ -2584,10 +2374,10 @@ pub export fn WndProc(
                             }
                             writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
                             nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                            applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
+                            if (deferred_log_enabled) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
                         }
                     } else {
-                        applog.appLog("[win] devcontainer mode enabled but no workspace specified\n", .{});
+                        if (deferred_log_enabled) applog.appLog("[win] devcontainer mode enabled but no workspace specified\n", .{});
                         nvim_cmd_slice = quoted_nvim;
                     }
                 } else {
@@ -2608,7 +2398,7 @@ pub export fn WndProc(
                             }
                         }
                         nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                        applog.appLog("[win] Added nvim extra args, command: {s}\n", .{nvim_cmd_slice});
+                        if (deferred_log_enabled) applog.appLog("[win] Added nvim extra args, command: {s}\n", .{nvim_cmd_slice});
                     } else {
                         nvim_cmd_slice = quoted_nvim;
                     }
@@ -2619,47 +2409,51 @@ pub export fn WndProc(
                     const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                     defer if (nvim_path_z) |p| app.alloc.free(p);
                     const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                    applog.appLog("[win] starting neovim: path={s}\n", .{nvim_cmd_slice});
-                    _ = c.QueryPerformanceCounter(&t1);
+                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s}\n", .{nvim_cmd_slice});
+                    if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                     const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
-                    _ = c.QueryPerformanceCounter(&t2);
-                    const core_start_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
-                    applog.appLog("  core_start -> {d}", .{start_ok});
+                    if (deferred_log_enabled) {
+                        _ = c.QueryPerformanceCounter(&t2);
+                        const core_start_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                        applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
+                        applog.appLog("  core_start -> {d}", .{start_ok});
+                    }
 
                     // Close devcontainer progress dialog if shown (for non-rebuild mode)
                     if (app.devcontainer_mode and !app.devcontainer_rebuild) {
                         dialogs.hideDevcontainerProgressDialog();
                     }
                 } else {
-                    applog.appLog("[win] nvim startup skipped, waiting for devcontainer up\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] nvim startup skipped, waiting for devcontainer up\n", .{});
                 }
 
                 // ============================================================
                 // PHASE 2: Initialize renderers (runs in parallel with nvim spawn)
                 // ============================================================
-                applog.appLog("  renderer create...", .{});
+                if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
 
                 // 1) Atlas builder (DirectWrite + CPU atlas)
                 // Font priority: config.font.family > OS default (Consolas)
                 const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
                 const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
-                applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
+                if (deferred_log_enabled) applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
 
-                _ = c.QueryPerformanceCounter(&t1);
+                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const atlas = dwrite_d2d.Renderer.init(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
-                    applog.appLog("dwrite_d2d.Renderer.init failed: {any}\n", .{e});
+                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.init failed: {any}\n", .{e});
                     app.atlas = null;
                     app.renderer = null;
                     return 0;
                 };
-                _ = c.QueryPerformanceCounter(&t2);
-                const dwrite_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                applog.appLog("  [TIMING] dwrite_d2d.Renderer.init: {d}ms", .{dwrite_ms});
+                if (deferred_log_enabled) {
+                    _ = c.QueryPerformanceCounter(&t2);
+                    const dwrite_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.init: {d}ms", .{dwrite_ms});
+                }
 
                 // Set initial DPI scale from renderer
                 app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
-                applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
+                if (deferred_log_enabled) applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
 
                 // 2) GPU renderer (D3D11)
                 // When ext_tabline is enabled, use content child window for D3D11 rendering
@@ -2667,27 +2461,29 @@ pub export fn WndProc(
                     app.content_hwnd.?
                 else
                     hwnd;
-                applog.appLog("[win] D3D11 target hwnd: {s}\n", .{if (render_hwnd == hwnd) "main" else "content child"});
+                if (deferred_log_enabled) applog.appLog("[win] D3D11 target hwnd: {s}\n", .{if (render_hwnd == hwnd) "main" else "content child"});
 
-                _ = c.QueryPerformanceCounter(&t1);
+                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
-                    applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
+                    if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
                     var tmp = atlas;
                     tmp.deinit(); // avoid leak
                     app.atlas = null;
                     app.renderer = null;
                     return 0;
                 };
-                _ = c.QueryPerformanceCounter(&t2);
-                const d3d_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                applog.appLog("  [TIMING] d3d11.Renderer.init: {d}ms", .{d3d_ms});
+                if (deferred_log_enabled) {
+                    _ = c.QueryPerformanceCounter(&t2);
+                    const d3d_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] d3d11.Renderer.init: {d}ms", .{d3d_ms});
+                }
 
                 app.mu.lock();
                 app.atlas = atlas;
                 app.renderer = gpu;
                 app.mu.unlock();
 
-                applog.appLog("  renderer created ok", .{});
+                if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
 
                 if (app.atlas) |*a| {
                     app.cell_w_px = a.cellW();
@@ -2702,7 +2498,7 @@ pub export fn WndProc(
                     app.mu.unlock();
 
                     if (pending_count > 0) {
-                        applog.appLog("  [TIMING] processing {d} pending glyphs", .{pending_count});
+                        if (deferred_log_enabled) applog.appLog("  [TIMING] processing {d} pending glyphs", .{pending_count});
                         app.mu.lock();
                         defer app.mu.unlock();
                         if (app.atlas) |*a| {
@@ -2726,9 +2522,11 @@ pub export fn WndProc(
                 // Update layout after renderer is ready
                 updateLayoutToCore(hwnd, app);
 
-                _ = c.QueryPerformanceCounter(&t2);
-                const total_ms = @divTrunc((t2.QuadPart - t0.QuadPart) * 1000, freq.QuadPart);
-                applog.appLog("[win] WM_APP_DEFERRED_INIT: end (total {d}ms)", .{total_ms});
+                if (deferred_log_enabled) {
+                    _ = c.QueryPerformanceCounter(&t2);
+                    const total_ms = @divTrunc((t2.QuadPart - t0.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("[win] WM_APP_DEFERRED_INIT: end (total {d}ms)", .{total_ms});
+                }
 
                 // Force a repaint now that renderer is ready
                 _ = c.InvalidateRect(hwnd, null, 0);
@@ -2833,7 +2631,7 @@ pub export fn WndProc(
 
         // --- IME message handling ---
         c.WM_IME_STARTCOMPOSITION => {
-            applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
             if (getApp(hwnd)) |app| {
                 app.mu.lock();
                 app.ime_composing = true;
@@ -2852,7 +2650,7 @@ pub export fn WndProc(
         },
 
         c.WM_IME_COMPOSITION => {
-            applog.appLog("[IME] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
             if (getApp(hwnd)) |app| {
                 const himc = c.ImmGetContext(hwnd);
                 if (himc != null) {
@@ -2875,7 +2673,7 @@ pub export fn WndProc(
 
                             // Convert to UTF-8 for display
                             input.updateImeCompositionUtf8(app);
-                            applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
+                            if (applog.isEnabled()) applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
                             app.mu.unlock();
                         } else {
                             app.mu.lock();
@@ -2912,7 +2710,7 @@ pub export fn WndProc(
                     // Always try to get COMPATTR, not just when flag is set
                     {
                         const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
-                        applog.appLog("[IME] GCS_COMPATTR attr_len={d} lparam_has_flag={d}\n", .{
+                        if (applog.isEnabled()) applog.appLog("[IME] GCS_COMPATTR attr_len={d} lparam_has_flag={d}\n", .{
                             attr_len,
                             @intFromBool((lparam_u & c.GCS_COMPATTR) != 0),
                         });
@@ -2922,11 +2720,13 @@ pub export fn WndProc(
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
 
                             // Debug: log all attributes
-                            applog.appLog("[IME] COMPATTR len={d} attrs=", .{len});
-                            for (0..len) |idx| {
-                                applog.appLog("{x} ", .{attr_buf[idx]});
+                            if (applog.isEnabled()) {
+                                applog.appLog("[IME] COMPATTR len={d} attrs=", .{len});
+                                for (0..len) |idx| {
+                                    applog.appLog("{x} ", .{attr_buf[idx]});
+                                }
+                                applog.appLog("\n", .{});
                             }
-                            applog.appLog("\n", .{});
 
                             // Find target clause (ATTR_TARGET_CONVERTED or ATTR_TARGET_NOTCONVERTED)
                             // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
@@ -2947,7 +2747,7 @@ pub export fn WndProc(
                                     app.ime_target_end = i + 1;
                                 }
                             }
-                            applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
+                            if (applog.isEnabled()) applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
                             app.mu.unlock();
                         }
                     }
@@ -3809,7 +3609,7 @@ pub export fn WndProc(
                     // This doesn't cause glass overlay issues because the margin is only 1 pixel.
                     const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
                     _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
-                    applog.appLog("[win] WM_ACTIVATE: DwmExtendFrameIntoClientArea applied for shadow\n", .{});
+                    if (applog.isEnabled()) applog.appLog("[win] WM_ACTIVATE: DwmExtendFrameIntoClientArea applied for shadow\n", .{});
                 }
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -3899,7 +3699,7 @@ pub export fn WndProc(
                         app.tabline_state.pressed_window_btn != null;
 
                     if (had_state) {
-                        applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
                         tabline_mod.destroyDragPreviewWindow(app);
                         app.tabline_state.cancelDrag();
                         app.tabline_state.close_button_pressed = null;

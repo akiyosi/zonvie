@@ -622,11 +622,11 @@ pub fn updateExtFloatPositions(app: *App) void {
 
     // Copy window info
     const msg_show_hwnd: ?c.HWND = if (msg_show_entry) |e| e.hwnd else null;
-    const msg_show_rows: u32 = if (msg_show_entry) |e| e.rows else 0;
-    const msg_show_cols: u32 = if (msg_show_entry) |e| e.cols else 0;
+    const msg_show_rows: u32 = if (msg_show_entry) |e| e.surface.rows else 0;
+    const msg_show_cols: u32 = if (msg_show_entry) |e| e.surface.cols else 0;
     const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
-    const msg_history_rows: u32 = if (msg_history_entry) |e| e.rows else 0;
-    const msg_history_cols: u32 = if (msg_history_entry) |e| e.cols else 0;
+    const msg_history_rows: u32 = if (msg_history_entry) |e| e.surface.rows else 0;
+    const msg_history_cols: u32 = if (msg_history_entry) |e| e.surface.cols else 0;
     // When using DWM custom titlebar, client area extends into the titlebar.
     // Compute offset to position floats below the custom titlebar area.
     const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)

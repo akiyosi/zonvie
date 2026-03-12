@@ -928,9 +928,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Check for external window changes and notify frontend
         const new_ext_grids = self.notifyExternalWindowChanges();
 
-        // Generate and send vertices for all external grids
-        // Force render if new grids were added (to show initial content)
-        self.sendExternalGridVertices(new_ext_grids);
+        // Generate vertices for newly added external grids only.
+        // Existing grids are handled inside the flush bracket (onFlush defer)
+        // to ensure vertices arrive before commitFlush on the frontend.
+        if (new_ext_grids) {
+            self.sendExternalGridVertices(true);
+        }
 
         // Check IME off request (from mode_change event)
         if (self.grid.ime_off_requested) {

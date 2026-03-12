@@ -467,12 +467,24 @@ pub const ModeInfo = struct {
     blink_off_ms: u32 = 0,   // off time for blink cycle (ms)
 };
 
+pub const ScrollDelta = struct {
+    top: u32,
+    bot: u32,
+    left: u32,
+    right: u32,
+    rows: i32,
+    cols: i32,
+};
+
 pub const GridBuf = struct {
     rows: u32 = 0,
     cols: u32 = 0,
     cells: []Cell = &[_]Cell{},
     dirty: bool = true, // Dirty flag for external grid vertex updates
     dirty_rows: std.DynamicBitSetUnmanaged = .{}, // Row-level dirty tracking for partial updates
+    last_scroll_op: ?ScrollDelta = null, // Per-GridBuf scroll tracking for on_grid_row_scroll
+    scroll_fast_path_blocked: bool = false, // True when multiple scrolls in same batch
+    prev_cursor_row: ?u32 = null, // Previous cursor row (grid-relative) for erasing old cursor
 
     fn deinit(self: *GridBuf, alloc: std.mem.Allocator) void {
         self.dirty_rows.deinit(alloc);
@@ -643,12 +655,25 @@ pub const GridBuf = struct {
             }
         }
 
-        // Mark all affected rows as dirty for partial updates
+        // Mark only vacated rows as dirty — non-vacated rows are just shifted
+        // and the frontend's row slot remapping handles the visual shift.
+        // grid_line events will mark truly-changed rows dirty separately.
         if (self.dirty_rows.bit_length > 0) {
-            var rr: u32 = top;
-            while (rr < bot) : (rr += 1) {
-                if (rr < self.dirty_rows.bit_length) {
-                    self.dirty_rows.set(rr);
+            if (rows > 0) {
+                // Scroll up: vacated band is [bot-shift, bot)
+                var rr: u32 = bot - shift;
+                while (rr < bot) : (rr += 1) {
+                    if (rr < self.dirty_rows.bit_length) {
+                        self.dirty_rows.set(rr);
+                    }
+                }
+            } else {
+                // Scroll down: vacated band is [top, top+shift)
+                var rr: u32 = top;
+                while (rr < top + shift) : (rr += 1) {
+                    if (rr < self.dirty_rows.bit_length) {
+                        self.dirty_rows.set(rr);
+                    }
                 }
             }
         }
@@ -658,6 +683,9 @@ pub const GridBuf = struct {
     /// Clear dirty flags after vertex generation
     pub fn clearDirty(self: *GridBuf) void {
         self.dirty = false;
+        self.last_scroll_op = null;
+        self.scroll_fast_path_blocked = false;
+        self.prev_cursor_row = null;
         if (self.dirty_rows.bit_length > 0) {
             self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, false);
         }
@@ -1042,6 +1070,23 @@ pub const Grid = struct {
         self.dirty_all = true;
     }
 
+    /// Shift previously-recorded touched rows by a new scroll delta.
+    /// Rows that scroll out of the [top, bot) region are removed.
+    /// Coordinates are in main grid space (win_pos_row already applied).
+    fn shiftTouchedRows(self: *Grid, scroll_rows: i32, top: u32, bot: u32, win_pos_row: u32) void {
+        const main_top: i32 = @intCast(top + win_pos_row);
+        const main_bot: i32 = @intCast(bot + win_pos_row);
+        var write: u8 = 0;
+        for (self.scroll_touched_rows[0..self.scroll_touched_count]) |tr| {
+            const shifted: i32 = @as(i32, @intCast(tr)) - scroll_rows;
+            if (shifted >= main_top and shifted < main_bot) {
+                self.scroll_touched_rows[write] = @intCast(shifted);
+                write += 1;
+            }
+        }
+        self.scroll_touched_count = write;
+    }
+
     /// Record a row touched by grid_line while a pending_scroll is active.
     /// Uses main grid coordinates. Deduplicates entries.
     /// On overflow, invalidates pending_scroll (too many touched rows for fast path).
@@ -1258,28 +1303,36 @@ pub const Grid = struct {
     }
 
     pub fn resizeGrid(self: *Grid, grid_id: i64, rows: u32, cols: u32) !void {
-        defer self.content_rev +%= 1;
-    
         if (grid_id == 1) {
+            self.content_rev +%= 1;
             try self.resize(rows, cols);
-            self.markAllDirty(); // NEW
+            self.markAllDirty();
             return;
         }
         const sg = try self.getOrCreateSub(grid_id);
         try sg.resize(self.alloc, rows, cols);
-    
-        self.markAllDirty(); // NEW: subgrid size change affects composed screen
+
+        // Only affect main grid state for composited grids (in win_pos).
+        // External grids (not in win_pos) are rendered independently.
+        if (self.win_pos.contains(grid_id)) {
+            self.content_rev +%= 1;
+            self.markAllDirty();
+        }
     }
-    
+
     pub fn clearGrid(self: *Grid, grid_id: i64) void {
-        defer self.content_rev +%= 1;
-    
         if (grid_id == 1) {
+            self.content_rev +%= 1;
             self.clear();
             self.markAllDirty();
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| sg.clear();
+
+        // Only affect main grid state for composited grids.
+        if (self.win_pos.contains(grid_id)) {
+            self.content_rev +%= 1;
+        }
     }
     
     pub fn putCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
@@ -1291,16 +1344,16 @@ pub const Grid = struct {
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             const changed = sg.putCell(row, col, cp, hl);
             if (changed) {
-                self.content_rev +%= 1;
                 if (self.win_pos.get(grid_id)) |p| {
+                    // Composited on main grid: affect main grid dirty state
+                    self.content_rev +%= 1;
                     const tr = p.row + row;
                     self.markDirtyRow(tr);
-                    // Record touched row for scroll-aware flush (main grid coordinate)
                     self.recordScrollTouchedRow(tr);
-                } else {
-                    // position unknown -> safest
-                    self.markAllDirty();
                 }
+                // External grids (not in win_pos) do not affect main grid
+                // content_rev or dirty state.
+
                 // Advance cursor_rev if cursor is on this cell (to update cursor text)
                 if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
                     self.cursor_rev +%= 1;
@@ -1315,16 +1368,6 @@ pub const Grid = struct {
         top: u32, bot: u32, left: u32, right: u32,
         rows: i32, cols: i32,
     ) void {
-        defer self.content_rev +%= 1;
-
-        // Multiple scrolls in one batch are too complex for the fast path.
-        // Keep the latest pending_scroll for diagnostics/offset clearing, but block
-        // fast-path eligibility until the batch is flushed.
-        if (self.pending_scroll != null) {
-            self.scroll_fast_path_blocked = true;
-            self.scroll_touched_count = 0;
-        }
-
         // Advance cursor_rev if cursor is in scroll region (cursor text may change)
         if (self.cursor_grid == grid_id and
             self.cursor_row >= top and self.cursor_row < bot and
@@ -1334,10 +1377,25 @@ pub const Grid = struct {
         }
 
         if (grid_id == 1) {
+            self.content_rev +%= 1;
+            if (self.pending_scroll) |*ps| {
+                if (ps.grid_id == grid_id and ps.top == top and ps.bot == bot and
+                    ps.left == left and ps.right == right and cols == 0)
+                {
+                    // Same grid, same region: accumulate scroll delta.
+                    // Shift previously-recorded touched rows by the new scroll amount.
+                    self.shiftTouchedRows(rows, top, bot, 0);
+                    self.scroll(top, bot, left, right, rows, cols);
+                    self.recordScrolledGrid(grid_id);
+                    ps.rows += rows;
+                    return;
+                }
+                // Different grid or region: block fast path.
+                self.scroll_fast_path_blocked = true;
+                self.scroll_touched_count = 0;
+            }
             self.scroll(top, bot, left, right, rows, cols);
-            // Record scroll event for frontend notification (pixel offset clearing)
             self.recordScrolledGrid(grid_id);
-            // Record pending scroll for scroll-aware flush optimization
             self.pending_scroll = .{
                 .grid_id = grid_id,
                 .top = top, .bot = bot, .left = left, .right = right,
@@ -1350,23 +1408,43 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll(top, bot, left, right, rows, cols);
-            const win_pos_row: u32 = if (self.win_pos.get(grid_id)) |p| p.row else 0;
-            if (self.win_pos.get(grid_id)) |p| {
-                self.markDirtyRect(p.row + top, p.row + bot);
-            } else {
-                self.markAllDirty();
+            // Multiple scrolls in same batch block the fast path (same as main grid)
+            if (sg.last_scroll_op != null) {
+                sg.scroll_fast_path_blocked = true;
             }
-            // Record pending scroll for scroll-aware flush optimization
-            self.pending_scroll = .{
-                .grid_id = grid_id,
+            sg.last_scroll_op = .{
                 .top = top, .bot = bot, .left = left, .right = right,
                 .rows = rows, .cols = cols,
-                .target_rows = sg.rows, .target_cols = sg.cols,
-                .win_pos_row = win_pos_row,
             };
-            self.scroll_touched_count = 0;
+            if (self.win_pos.get(grid_id)) |p| {
+                self.content_rev +%= 1;
+                if (self.pending_scroll) |*ps| {
+                    if (ps.grid_id == grid_id and ps.top == top and ps.bot == bot and
+                        ps.left == left and ps.right == right and cols == 0)
+                    {
+                        // Same grid, same region: accumulate scroll delta.
+                        self.shiftTouchedRows(rows, top, bot, p.row);
+                        self.markDirtyRect(p.row + top, p.row + bot);
+                        ps.rows += rows;
+                        return;
+                    }
+                    // Different grid or region: block fast path.
+                    self.scroll_fast_path_blocked = true;
+                    self.scroll_touched_count = 0;
+                }
+                self.markDirtyRect(p.row + top, p.row + bot);
+                self.pending_scroll = .{
+                    .grid_id = grid_id,
+                    .top = top, .bot = bot, .left = left, .right = right,
+                    .rows = rows, .cols = cols,
+                    .target_rows = sg.rows, .target_cols = sg.cols,
+                    .win_pos_row = p.row,
+                };
+                self.scroll_touched_count = 0;
+            }
+            // External grids (not in win_pos) do not affect main grid
+            // content_rev, dirty state, or pending_scroll.
 
-            // Record scroll event for frontend notification (pixel offset clearing)
             self.recordScrolledGrid(grid_id);
         }
     }
@@ -1391,8 +1469,13 @@ pub const Grid = struct {
     }
     
     pub fn noteGridLine(self: *Grid, grid_id: i64) void {
-        // Advance rev to indicate something affected rendering order/content (including grid_id==1)
-        defer self.content_rev +%= 1;
+        // Only advance content_rev for grids composited on the main window.
+        // grid_id==1 is the global grid (always composited).
+        // Other grids are composited when they have a win_pos entry.
+        // External grids (not in win_pos) don't affect main window rendering.
+        if (grid_id == 1 or self.win_pos.contains(grid_id)) {
+            self.content_rev +%= 1;
+        }
 
         if (grid_id == 1) return;
 
@@ -1400,12 +1483,6 @@ pub const Grid = struct {
             self.layer_order_counter +%= 1;
             layer.order = self.layer_order_counter;
         }
-
-        // NOTE: Dirty marking is handled by putCellGrid on a per-row basis.
-        // Previously this marked the entire sub-grid dirty, which caused
-        // performance issues (e.g., tig j/k navigation marking 44 rows dirty
-        // when only 3 rows changed). Row-level dirty tracking in putCellGrid
-        // is sufficient for correct rendering.
     }
 
     pub fn destroyGrid(self: *Grid, grid_id: i64) void {
@@ -1479,10 +1556,6 @@ pub const Grid = struct {
         compindex: i64,
         anchor_grid: i64,
     ) !void {
-        // if (grid_id == 1) return;
-        // try self.win_pos.put(self.alloc, grid_id, .{ .row = row, .col = col });
-        // try self.win_layer.put(self.alloc, grid_id, .{ .zindex = zindex, .compindex = compindex });
-
         if (grid_id == 1) return;
 
         // Store grid_id -> winid mapping (skip for grids without a real window, e.g. msg_set_pos)
@@ -1494,8 +1567,23 @@ pub const Grid = struct {
         // This allows a grid to transition from external back to float.
         _ = self.external_grids.remove(grid_id);
 
+        // Mark old position dirty if this float is moving
+        const old_pos_opt = self.win_pos.get(grid_id);
+        if (old_pos_opt) |old_pos| {
+            if (old_pos.anchor_grid == 1) {
+                const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
+                self.markDirtyRect(old_pos.row, old_pos.row + h_old);
+            }
+        }
+
         try self.win_pos.put(self.alloc, grid_id, .{ .row = row, .col = col, .anchor_grid = anchor_grid });
-        
+
+        // Mark new position dirty so row-mode recomposes with float overlay
+        if (anchor_grid == 1) {
+            const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
+            self.markDirtyRect(row, row + h_new);
+        }
+
         // Preserve existing order if present.
         var ord: u64 = 0;
         if (self.win_layer.get(grid_id)) |old| {
@@ -1616,6 +1704,10 @@ pub const Grid = struct {
                 0;
             self.prev_cursor_row = win_offset + self.cursor_row;
             self.prev_cursor_grid = self.cursor_grid;
+
+            // Note: sub_grid prev_cursor_row is NOT set here because external
+            // grids render cursor as a separate layer (not inline in row vertices),
+            // so no row regeneration is needed when cursor moves.
         }
 
         self.cursor_grid = grid_id;

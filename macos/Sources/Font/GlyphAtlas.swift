@@ -539,7 +539,7 @@ final class GlyphAtlas {
             return nil
         }
 
-        let scalarChar = UnicodeScalar(scalar).map { String($0) } ?? "?"
+        let scalarChar = ZonvieCore.appLogEnabled ? (UnicodeScalar(scalar).map { String($0) } ?? "?") : ""
 
         // 1) Try base font first
         if let gid = glyphID(in: font, scalar: scalar) {

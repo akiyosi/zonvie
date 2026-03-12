@@ -141,7 +141,7 @@ fn dumpBlobAsText(prefix: []const u8, b: ?*ID3DBlob) void {
 
     const bytes = @as([*]const u8, @ptrCast(ptr))[0..sz];
     // Customize this to match your logging function
-    applog.appLog("{s}{s}\n", .{ prefix, bytes });
+    if (applog.isEnabled()) applog.appLog("{s}{s}\n", .{ prefix, bytes });
 }
 
 pub const Renderer = struct {
@@ -169,6 +169,9 @@ pub const Renderer = struct {
     // Persistent back buffer (like macOS backBuffer)
     back_tex: ?*c.ID3D11Texture2D = null,
     back_rtv: ?*c.ID3D11RenderTargetView = null,
+
+    // Staging texture for back_tex scroll (same size/format, lazily created)
+    scroll_staging_tex: ?*c.ID3D11Texture2D = null,
 
     // Pipeline
     vs: ?*c.ID3D11VertexShader = null,
@@ -334,16 +337,19 @@ pub const Renderer = struct {
     
         safeRelease(&self.back_rtv);
         safeRelease(&self.back_tex);
+        safeRelease(&self.scroll_staging_tex);
 
-        applog.appLog(
-            "[d3d] resize: after release bb_tex=0x{x} bb_rtv=0x{x} back_tex=0x{x} back_rtv=0x{x}\n",
-            .{
-                if (self.bb_tex) |p| @intFromPtr(p) else 0,
-                if (self.bb_rtv) |p| @intFromPtr(p) else 0,
-                if (self.back_tex) |p| @intFromPtr(p) else 0,
-                if (self.back_rtv) |p| @intFromPtr(p) else 0,
-            },
-        );
+        if (applog.isEnabled()) {
+            applog.appLog(
+                "[d3d] resize: after release bb_tex=0x{x} bb_rtv=0x{x} back_tex=0x{x} back_rtv=0x{x}\n",
+                .{
+                    if (self.bb_tex) |p| @intFromPtr(p) else 0,
+                    if (self.bb_rtv) |p| @intFromPtr(p) else 0,
+                    if (self.back_tex) |p| @intFromPtr(p) else 0,
+                    if (self.back_rtv) |p| @intFromPtr(p) else 0,
+                },
+            );
+        }
     
         var i: usize = 0;
         while (i < MaxSwapchainBuffers) : (i += 1) {
@@ -463,6 +469,7 @@ pub const Renderer = struct {
         }
         safeRelease(&self.back_rtv);
         safeRelease(&self.back_tex);
+        safeRelease(&self.scroll_staging_tex);
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -1243,6 +1250,8 @@ pub const Renderer = struct {
         cursor_vert_count: usize,
         cursor_scissor: ?c.RECT,
         force_full_copy: bool,
+        scroll_rect: ?*const c.RECT,
+        scroll_offset: ?*const c.POINT,
     ) !void {
         const ctx = self.ctx orelse return error.NoContext;
         const sc = self.swapchain orelse return error.NoSwapchain;
@@ -1359,6 +1368,14 @@ pub const Renderer = struct {
                     params.DirtyRectsCount = @intCast(rects.len);
                     params.pDirtyRects = @constCast(rects.ptr);
                 }
+                if (!force_full_copy_effective) {
+                    if (scroll_rect) |sr| {
+                        params.pScrollRect = @constCast(sr);
+                    }
+                    if (scroll_offset) |so| {
+                        params.pScrollOffset = @constCast(so);
+                    }
+                }
                 hrp = present1(sc1p, 0, 0, &params);
                 if (c.FAILED(hrp)) {
                     if (applog.isEnabled()) applog.appLog("[d3d] Present1 FAILED hr=0x{x}, disabling swapchain1\n", .{ @as(u32, @bitCast(hrp)) });
@@ -1463,7 +1480,7 @@ pub const Renderer = struct {
             var tex: ?*c.ID3D11Texture2D = null;
             var hr = create_tex(device, &tex_desc, &init_data, &tex);
             if (c.FAILED(hr) or tex == null) {
-                applog.appLog("[d3d] updateTablineTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
                 return error.CreateTexture2DFailed;
             }
 
@@ -1482,7 +1499,7 @@ pub const Renderer = struct {
             var srv: ?*c.ID3D11ShaderResourceView = null;
             hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
             if (c.FAILED(hr) or srv == null) {
-                applog.appLog("[d3d] updateTablineTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
                 safeRelease(&tex);
                 return error.CreateSRVFailed;
             }
@@ -1492,7 +1509,7 @@ pub const Renderer = struct {
             self.tabline_width = width;
             self.tabline_height = height;
 
-            applog.appLog("[d3d] updateTablineTexture: created texture {d}x{d}\n", .{ width, height });
+            if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: created texture {d}x{d}\n", .{ width, height });
         } else {
             // Update existing texture
             const tex = self.tabline_tex orelse return;
@@ -1602,7 +1619,7 @@ pub const Renderer = struct {
             var tex: ?*c.ID3D11Texture2D = null;
             var hr = create_tex(device, &tex_desc, &init_data, &tex);
             if (c.FAILED(hr) or tex == null) {
-                applog.appLog("[d3d] updateSidebarTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
                 return error.CreateTexture2DFailed;
             }
 
@@ -1620,7 +1637,7 @@ pub const Renderer = struct {
             var srv: ?*c.ID3D11ShaderResourceView = null;
             hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
             if (c.FAILED(hr) or srv == null) {
-                applog.appLog("[d3d] updateSidebarTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+                if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
                 safeRelease(&tex);
                 return error.CreateSRVFailed;
             }
@@ -1630,7 +1647,7 @@ pub const Renderer = struct {
             self.sidebar_width_tex = width;
             self.sidebar_height_tex = height;
 
-            applog.appLog("[d3d] updateSidebarTexture: created texture {d}x{d}\n", .{ width, height });
+            if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: created texture {d}x{d}\n", .{ width, height });
         } else {
             const tex = self.sidebar_tex orelse return;
             const ctx_vtbl = ctx.*.lpVtbl;
@@ -1721,10 +1738,12 @@ pub const Renderer = struct {
         if (get_msg_opt == null or get_msg_opt.? == null) {
             const n: u64 = get_num(q);
             if (n != 0) {
-                applog.appLog(
-                    "[d3d][infoq] {s}: {d} message(s) but GetMessage is not available in this header/toolchain; cannot dump details.\n",
-                    .{ tag, n },
-                );
+                if (applog.isEnabled()) {
+                    applog.appLog(
+                        "[d3d][infoq] {s}: {d} message(s) but GetMessage is not available in this header/toolchain; cannot dump details.\n",
+                        .{ tag, n },
+                    );
+                }
                 clear(q);
             }
             return;
@@ -1735,7 +1754,7 @@ pub const Renderer = struct {
         const n: u64 = get_num(q);
         if (n == 0) return;
     
-        applog.appLog("[d3d][infoq] {s}: {d} message(s)\n", .{ tag, n });
+        if (applog.isEnabled()) applog.appLog("[d3d][infoq] {s}: {d} message(s)\n", .{ tag, n });
     
         var i: u64 = 0;
         while (i < n) : (i += 1) {
@@ -1745,23 +1764,25 @@ pub const Renderer = struct {
     
             var tmp_buf: [2048]u8 = undefined;
             if (len > tmp_buf.len) {
-                applog.appLog("[d3d][infoq]   msg[{d}] too large (len={d})\n", .{ i, len });
+                if (applog.isEnabled()) applog.appLog("[d3d][infoq]   msg[{d}] too large (len={d})\n", .{ i, len });
                 continue;
             }
     
             const msg: *c.D3D11_MESSAGE = @ptrCast(@alignCast(&tmp_buf));
             const hr = get_msg(q, i, msg, &len);
             if (c.FAILED(hr)) {
-                applog.appLog("[d3d][infoq]   msg[{d}] GetMessage failed hr=0x{x}\n", .{ i, @as(u32, @bitCast(hr)) });
+                if (applog.isEnabled()) applog.appLog("[d3d][infoq]   msg[{d}] GetMessage failed hr=0x{x}\n", .{ i, @as(u32, @bitCast(hr)) });
                 continue;
             }
     
             const desc_ptr: [*:0]const u8 = @ptrCast(msg.pDescription);
             // NOTE: Some toolchains don't have Severity as enum, so output as u32
-            applog.appLog(
-                "[d3d][infoq]   {d}: sev={d} id={d} {s}\n",
-                .{ i, @as(u32, @bitCast(msg.Severity)), msg.ID, desc_ptr },
-            );
+            if (applog.isEnabled()) {
+                applog.appLog(
+                    "[d3d][infoq]   {d}: sev={d} id={d} {s}\n",
+                    .{ i, @as(u32, @bitCast(msg.Severity)), msg.ID, desc_ptr },
+                );
+            }
         }
     
         clear(q);
@@ -2076,10 +2097,10 @@ pub const Renderer = struct {
 
             if (use_transparency) {
                 // Use CreateSwapChainForComposition for transparency (works with WS_EX_NOREDIRECTIONBITMAP)
-                applog.appLog("[d3d] Attempting CreateSwapChainForComposition...\n", .{});
+                if (applog.isEnabled()) applog.appLog("[d3d] Attempting CreateSwapChainForComposition...\n", .{});
                 if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
                     hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
-                    applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
+                    if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
                     if (!c.FAILED(hr) and sc1 != null) {
                         const sc1_vtbl = sc1.?.lpVtbl;
                         if (sc1_vtbl.*.QueryInterface) |sc_qi| {
@@ -2087,7 +2108,7 @@ pub const Renderer = struct {
                         }
                     }
                 } else {
-                    applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
+                    if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
                 }
             } else {
                 // Use CreateSwapChainForHwnd for normal windows
@@ -2105,21 +2126,21 @@ pub const Renderer = struct {
         }
 
         // Initialize DirectComposition for transparency
-        applog.appLog("[d3d] transparency: use_transparency={} sc1={} dxgi_dev={}\n", .{ use_transparency, sc1 != null, dxgi_dev != null });
+        if (applog.isEnabled()) applog.appLog("[d3d] transparency: use_transparency={} sc1={} dxgi_dev={}\n", .{ use_transparency, sc1 != null, dxgi_dev != null });
         if (use_transparency and sc1 != null and dxgi_dev != null) {
             var dcomp_dev: ?*IDCompositionDevice = null;
             const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
-            applog.appLog("[d3d] DCompositionCreateDevice hr=0x{x} dev=0x{x}\n", .{ @as(u32, @bitCast(dcomp_hr)), if (dcomp_dev) |d| @intFromPtr(d) else 0 });
+            if (applog.isEnabled()) applog.appLog("[d3d] DCompositionCreateDevice hr=0x{x} dev=0x{x}\n", .{ @as(u32, @bitCast(dcomp_hr)), if (dcomp_dev) |d| @intFromPtr(d) else 0 });
 
             if (!c.FAILED(dcomp_hr) and dcomp_dev != null) {
                 self.dcomp_device = dcomp_dev;
                 const vtbl = dcomp_dev.?.lpVtbl;
-                applog.appLog("[d3d] dcomp lpVtbl=0x{x}\n", .{@intFromPtr(vtbl)});
+                if (applog.isEnabled()) applog.appLog("[d3d] dcomp lpVtbl=0x{x}\n", .{@intFromPtr(vtbl)});
 
                 // Create target for HWND (direct call without optional unwrapping)
                 var dcomp_target: ?*IDCompositionTarget = null;
                 const target_hr = vtbl.CreateTargetForHwnd(dcomp_dev.?, self.hwnd, c.TRUE, &dcomp_target);
-                applog.appLog("[d3d] CreateTargetForHwnd hr=0x{x}\n", .{@as(u32, @bitCast(target_hr))});
+                if (applog.isEnabled()) applog.appLog("[d3d] CreateTargetForHwnd hr=0x{x}\n", .{@as(u32, @bitCast(target_hr))});
 
                 if (!c.FAILED(target_hr) and dcomp_target != null) {
                     self.dcomp_target = dcomp_target;
@@ -2127,7 +2148,7 @@ pub const Renderer = struct {
                     // Create visual (direct call)
                     var dcomp_visual: ?*IDCompositionVisual = null;
                     const visual_hr = vtbl.CreateVisual(dcomp_dev.?, &dcomp_visual);
-                    applog.appLog("[d3d] CreateVisual hr=0x{x}\n", .{@as(u32, @bitCast(visual_hr))});
+                    if (applog.isEnabled()) applog.appLog("[d3d] CreateVisual hr=0x{x}\n", .{@as(u32, @bitCast(visual_hr))});
 
                     if (!c.FAILED(visual_hr) and dcomp_visual != null) {
                         self.dcomp_visual = dcomp_visual;
@@ -2142,7 +2163,7 @@ pub const Renderer = struct {
                         // Commit changes (direct call)
                         _ = vtbl.Commit(dcomp_dev.?);
 
-                        applog.appLog("[d3d] DirectComposition setup complete\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[d3d] DirectComposition setup complete\n", .{});
                     }
                 }
             }
@@ -2250,15 +2271,15 @@ pub const Renderer = struct {
                 _ = infoq.?.lpVtbl.*.SetBreakOnSeverity.?(infoq.?, c.D3D11_MESSAGE_SEVERITY_CORRUPTION, c.TRUE);
                 _ = infoq.?.lpVtbl.*.SetBreakOnSeverity.?(infoq.?, c.D3D11_MESSAGE_SEVERITY_ERROR, c.TRUE);
         
-                applog.appLog("[d3d] InfoQueue enabled\n", .{});
+                if (applog.isEnabled()) applog.appLog("[d3d] InfoQueue enabled\n", .{});
             } else {
-                applog.appLog("[d3d] InfoQueue NOT available (debug layer missing?)\n", .{});
+                if (applog.isEnabled()) applog.appLog("[d3d] InfoQueue NOT available (debug layer missing?)\n", .{});
             }
 
             // Query ID3D11Debug (optional: can be used for ReportLiveDeviceObjects)
             if (!c.FAILED(qi2(unk, &c.IID_ID3D11Debug, @ptrCast(&dbg))) and dbg != null) {
                 self.dbg = dbg;
-                applog.appLog("[d3d] ID3D11Debug available\n", .{});
+                if (applog.isEnabled()) applog.appLog("[d3d] ID3D11Debug available\n", .{});
             }
         }
     }
@@ -2301,10 +2322,12 @@ pub const Renderer = struct {
         const get_desc = tex_vtbl.*.GetDesc orelse return error.D3DGetBackBufferDescFailed;
         get_desc(tex, &desc);
 
-        applog.appLog(
-            "[d3d] bb_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
-            .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
-        );
+        if (applog.isEnabled()) {
+            applog.appLog(
+                "[d3d] bb_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
+                .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
+            );
+        }
         
         desc.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
         desc.Usage = c.D3D11_USAGE_DEFAULT;
@@ -2321,10 +2344,12 @@ pub const Renderer = struct {
         if (c.FAILED(hr_back) or back == null) return error.D3DCreateBackTexFailed;
         
 
-        applog.appLog(
-            "[d3d] back_tex_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
-            .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
-        );
+        if (applog.isEnabled()) {
+            applog.appLog(
+                "[d3d] back_tex_desc: {d}x{d} fmt={d} sample={d}/{d} bind=0x{x} usage={d}\n",
+                .{ desc.Width, desc.Height, @as(u32, desc.Format), desc.SampleDesc.Count, desc.SampleDesc.Quality, desc.BindFlags, @as(u32, desc.Usage) },
+            );
+        }
 
         self.back_tex = back;
 
@@ -2342,6 +2367,102 @@ pub const Renderer = struct {
         if (c.FAILED(hr_back_rtv) or back_rtv == null) return error.D3DCreateBackRTVFailed;
         
         self.back_rtv = back_rtv;
+    }
+
+    /// Shift the retained content in back_tex by `dy_px` pixels vertically.
+    /// Positive dy_px = content moves down (scroll up / rows_delta < 0).
+    /// Negative dy_px = content moves up (scroll down / rows_delta > 0).
+    /// Uses a staging texture to avoid overlapping self-copy.
+    pub fn scrollBackTex(self: *Renderer, scroll_rect: c.RECT, dy_px: i32) void {
+        if (dy_px == 0) return;
+        const ctx = self.ctx orelse return;
+        const back_tex = self.back_tex orelse return;
+        const dev = self.device orelse return;
+
+        const w: u32 = self.width;
+        const h: u32 = self.height;
+        if (w == 0 or h == 0) return;
+
+        // Clamp scroll_rect to texture bounds
+        const sr_left: u32 = @intCast(@max(0, scroll_rect.left));
+        const sr_top: u32 = @intCast(@max(0, scroll_rect.top));
+        const sr_right: u32 = @intCast(@min(@as(i32, @intCast(w)), scroll_rect.right));
+        const sr_bottom: u32 = @intCast(@min(@as(i32, @intCast(h)), scroll_rect.bottom));
+        if (sr_left >= sr_right or sr_top >= sr_bottom) return;
+
+        // Source region: the part of scroll_rect that will be preserved after shift
+        var src_top: u32 = undefined;
+        var src_bottom: u32 = undefined;
+        var dst_y: u32 = undefined;
+
+        if (dy_px > 0) {
+            // Content moves down: source is top portion, destination is shifted down
+            const shift: u32 = @intCast(dy_px);
+            if (shift >= sr_bottom - sr_top) return; // shift larger than region
+            src_top = sr_top;
+            src_bottom = sr_bottom - shift;
+            dst_y = sr_top + shift;
+        } else {
+            // Content moves up: source is bottom portion, destination is shifted up
+            const shift: u32 = @intCast(-dy_px);
+            if (shift >= sr_bottom - sr_top) return;
+            src_top = sr_top + shift;
+            src_bottom = sr_bottom;
+            dst_y = sr_top;
+        }
+
+        // Lazy-create staging texture matching back_tex format and dimensions
+        if (self.scroll_staging_tex == null) {
+            // Query back_tex format to ensure CopySubresourceRegion compatibility
+            var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+            const back_vtbl = back_tex.*.lpVtbl;
+            const get_desc = back_vtbl.*.GetDesc orelse return;
+            get_desc(back_tex, &back_desc);
+
+            var desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            desc.Width = w;
+            desc.Height = h;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = back_desc.Format;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = c.D3D11_USAGE_DEFAULT;
+            desc.BindFlags = 0; // staging only, no bind needed
+
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return;
+            var staging: ?*c.ID3D11Texture2D = null;
+            const hr = create_tex(dev, &desc, null, @ptrCast(&staging));
+            if (c.FAILED(hr) or staging == null) return;
+            self.scroll_staging_tex = staging;
+        }
+
+        const staging_tex = self.scroll_staging_tex.?;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return;
+
+        // Step 1: Copy source region from back_tex to staging
+        const src_box: c.D3D11_BOX = .{
+            .left = sr_left,
+            .top = src_top,
+            .front = 0,
+            .right = sr_right,
+            .bottom = src_bottom,
+            .back = 1,
+        };
+        const staging_res: *c.ID3D11Resource = @ptrCast(staging_tex);
+        const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
+        copy_sub(ctx, staging_res, 0, sr_left, src_top, 0, back_res, 0, &src_box);
+
+        // Step 2: Copy from staging back to back_tex at shifted position
+        copy_sub(ctx, back_res, 0, sr_left, dst_y, 0, staging_res, 0, &src_box);
+
+        if (applog.isEnabled()) {
+            applog.appLog(
+                "[d3d] scrollBackTex dy={d} src_top={d} src_bot={d} dst_y={d} rect=({d},{d},{d},{d})\n",
+                .{ dy_px, src_top, src_bottom, dst_y, sr_left, sr_top, sr_right, sr_bottom },
+            );
+        }
     }
 
     fn ensureGlowTextures(self: *Renderer) void {

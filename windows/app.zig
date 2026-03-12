@@ -69,6 +69,7 @@ pub const zonvie_core_send_command = core.zonvie_core_send_command;
 pub const zonvie_core_set_background_opacity = core.zonvie_core_set_background_opacity;
 pub const zonvie_core_perf_now_ns = core.zonvie_core_perf_now_ns;
 pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;
+pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
 
 // Re-export additional core types used by sub-modules
 pub const Callbacks = core.Callbacks;
@@ -225,15 +226,503 @@ pub const PendingExternalWindow = struct {
     start_col: i32,
 };
 
-/// Pending vertices for an external window that hasn't been created yet
+/// CPU-side surface state shared between external windows and pending
+/// external vertices. Holds vertex storage, grid dimensions, dirty
+/// tracking, and cursor row info. GPU resources (VBs, scratch buffers)
+/// remain on the owning window struct.
+pub const SurfaceState = struct {
+    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_verts: std.ArrayListUnmanaged(RowVerts) = .{},
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_mode: bool = false,
+    dirty_rows: std.AutoHashMapUnmanaged(u32, void) = .{},
+    paint_full: bool = true,
+    rows: u32 = 0,
+    cols: u32 = 0,
+    last_cursor_row: ?u32 = null,
+
+    pub fn ensureRowStorage(self: *SurfaceState, alloc: std.mem.Allocator, row: u32) void {
+        const need: usize = @intCast(row + 1);
+        if (self.row_verts.items.len >= need) return;
+        const old_len = self.row_verts.items.len;
+        self.row_verts.resize(alloc, need) catch return;
+        var i = old_len;
+        while (i < need) : (i += 1) {
+            self.row_verts.items[i] = .{};
+        }
+    }
+
+    pub fn clearExtraRows(self: *SurfaceState, needed_rows: u32) void {
+        const start: usize = @intCast(needed_rows);
+        if (start >= self.row_verts.items.len) return;
+        for (self.row_verts.items[start..]) |*rv| {
+            rv.verts.clearRetainingCapacity();
+        }
+    }
+
+    pub fn recomputeVertCount(self: *const SurfaceState) usize {
+        var total: usize = 0;
+        for (self.row_verts.items) |rv| {
+            total += rv.verts.items.len;
+        }
+        return total;
+    }
+
+    /// Free CPU-side allocations only. GPU resources (VBs) are owned by the
+    /// window struct and must be released separately.
+    pub fn deinitCpuState(self: *SurfaceState, alloc: std.mem.Allocator) void {
+        self.cursor_verts.deinit(alloc);
+        self.dirty_rows.deinit(alloc);
+        self.verts.deinit(alloc);
+        for (self.row_verts.items) |*rv| {
+            rv.verts.deinit(alloc);
+        }
+        self.row_verts.deinit(alloc);
+    }
+};
+
+// =========================================================================
+// Triple-buffered surface types
+// =========================================================================
+
+/// One frame's worth of CPU-side vertex data (main grid or external window).
+/// Three of these rotate inside TripleBufferedSurface.
+/// Row data is accessed via row_map → SlotPool indirection (COW shared slots).
+pub const VertexSet = struct {
+    row_map: std.ArrayListUnmanaged(RowMapping) = .{}, // logical row → physical slot index
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    flat_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_mode: bool = false,
+    rows: u32 = 0,
+    cols: u32 = 0,
+    last_cursor_row: ?u32 = null,
+
+    pub fn ensureRowStorage(self: *VertexSet, alloc: std.mem.Allocator, row: u32) void {
+        const need: usize = @intCast(row + 1);
+        if (self.row_map.items.len >= need) return;
+        const old_len = self.row_map.items.len;
+        self.row_map.resize(alloc, need) catch return;
+        var i = old_len;
+        while (i < need) : (i += 1) {
+            self.row_map.items[i] = .{};
+        }
+    }
+
+    /// Release all slots in this set's row_map via pool, then clear the map.
+    pub fn releaseAllSlots(self: *VertexSet, alloc: std.mem.Allocator, pool: *SlotPool) void {
+        for (self.row_map.items) |*m| {
+            if (m.slot != SLOT_NONE) {
+                pool.release(alloc, m.slot);
+                m.slot = SLOT_NONE;
+            }
+        }
+    }
+
+    /// Recompute total vertex count by summing slot verts.
+    pub fn recomputeVertCount(self: *const VertexSet, pool: *const SlotPool) usize {
+        var total: usize = 0;
+        for (self.row_map.items) |m| {
+            if (m.slot != SLOT_NONE) {
+                total += pool.slots.items[m.slot].verts.items.len;
+            }
+        }
+        return total;
+    }
+
+    /// Free VertexSet-owned arrays. Slot memory is owned by SlotPool.
+    /// Caller must releaseAllSlots before calling this.
+    pub fn deinitCpu(self: *VertexSet, alloc: std.mem.Allocator) void {
+        self.cursor_verts.deinit(alloc);
+        self.flat_verts.deinit(alloc);
+        self.row_map.deinit(alloc);
+    }
+};
+
+/// Snapshot returned by acquireForPaint.
+pub const PaintSnapshot = struct {
+    committed_index: u8,
+    paint_full: bool,
+    /// Scroll state bundled with this committed set (consumed atomically).
+    scroll_rect: ?c.RECT = null,
+    scroll_dy_px: i32 = 0,
+    vb_shift: i32 = 0,
+};
+
+/// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
+///
+/// Protocol:
+///  - Core thread calls beginFlush/commitFlush around vertex generation.
+///  - UI thread calls acquireForPaint/releaseFromPaint around WM_PAINT.
+///  - rotation_mu protects index rotation and dirty state (short critical sections only).
+///  - Vertex data in the write set is accessed lock-free by the core thread during flush.
+///  - Vertex data in the committed set is accessed lock-free by the UI thread during paint.
+pub const TripleBufferedSurface = struct {
+    pub const SET_COUNT = 3;
+    sets: [SET_COUNT]VertexSet = .{ .{}, .{}, .{} },
+    pool: SlotPool = .{}, // Shared slot pool across all sets
+
+    // --- rotation_mu protects these fields ---
+    rotation_mu: std.Thread.Mutex = .{},
+    write_index: u8 = 0,
+    committed_index: u8 = 1,
+    flush_source_index: u8 = 1,
+    is_in_flush: bool = false,
+    commit_rev: u64 = 0,
+
+    // Per-set UI read refcount (rotation_mu protected).
+    // Re-entrant WM_PAINT: DXGIs Present/ResizeBuffers can pump messages,
+    // causing same-thread re-entrant WM_PAINT. A simple bool would break
+    // when the inner paint releases the outer paints protection.
+    ui_read_refcount: [SET_COUNT]u32 = .{ 0, 0, 0 },
+
+    // Dirty state accumulation (rotation_mu protected, WM_PAINT clears).
+    pending_dirty: std.DynamicBitSetUnmanaged = .{},
+    pending_paint_full: bool = true,
+
+    // Flush-local dirty state (core thread only, no lock needed).
+    flush_dirty: std.DynamicBitSetUnmanaged = .{},
+    flush_paint_full: bool = false,
+
+    // Flush-local scroll state (core thread only, no lock needed).
+    // Accumulated by onMainRowScroll / onGridRowScroll during a single flush.
+    flush_scroll_rect: ?c.RECT = null,
+    flush_scroll_dy_px: i32 = 0,
+    flush_vb_shift: i32 = 0,
+
+    // Pending scroll state (rotation_mu protected).
+    // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
+    pending_scroll_rect: ?c.RECT = null,
+    pending_scroll_dy_px: i32 = 0,
+    pending_vb_shift: i32 = 0,
+
+    // Paint-time dirty snapshot (rotation_mu protected, persistent, no per-paint alloc).
+    paint_dirty_snapshot: std.DynamicBitSetUnmanaged = .{},
+    paint_nesting: u32 = 0,
+
+    /// Check if a free set exists (read-only, short lock).
+    pub fn hasFreeSet(self: *TripleBufferedSurface) bool {
+        self.rotation_mu.lock();
+        defer self.rotation_mu.unlock();
+        const ci = self.committed_index;
+        for (0..SET_COUNT) |i| {
+            const idx: u8 = @intCast(i);
+            if (idx != ci and self.ui_read_refcount[i] == 0) return true;
+        }
+        return false;
+    }
+
+    /// Begin a flush cycle. Picks a free write set and shallow-copies slot
+    /// mappings from committed (COW — ~130 bytes for 65 rows instead of ~620KB).
+    /// Returns false on alloc failure or no free set (caller should abort flush).
+    pub fn beginFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) bool {
+        var picked: ?u8 = null;
+        var ci: u8 = undefined;
+
+        {
+            self.rotation_mu.lock();
+            defer self.rotation_mu.unlock();
+            ci = self.committed_index;
+            for (0..SET_COUNT) |i| {
+                const idx: u8 = @intCast(i);
+                if (idx != ci and self.ui_read_refcount[i] == 0) {
+                    picked = idx;
+                    break;
+                }
+            }
+            if (picked == null) return false;
+            self.write_index = picked.?;
+            self.flush_source_index = ci;
+        }
+
+        const wi = picked.?;
+
+        // Shallow copy from flush_source to write set.
+        if (!self.shallowCopyVertexSet(alloc, wi, ci)) return false;
+
+        // Clear flush-local dirty state.
+        if (self.flush_dirty.bit_length > 0) {
+            self.flush_dirty.unsetAll();
+        }
+        self.flush_paint_full = false;
+
+        // Clear flush-local scroll state.
+        self.flush_scroll_rect = null;
+        self.flush_scroll_dy_px = 0;
+        self.flush_vb_shift = 0;
+
+        self.is_in_flush = true;
+        return true;
+    }
+
+    /// Cancel a flush (reset is_in_flush without committing).
+    pub fn cancelFlush(self: *TripleBufferedSurface) void {
+        self.is_in_flush = false;
+    }
+
+    /// Commit the write set as the new committed set.
+    pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
+        if (!self.is_in_flush) return;
+
+        self.rotation_mu.lock();
+        defer self.rotation_mu.unlock();
+
+        // Merge flush_dirty into pending_dirty.
+        if (self.flush_dirty.bit_length > 0) {
+            if (self.pending_dirty.bit_length != self.flush_dirty.bit_length) {
+                // Resize pending_dirty to match flush_dirty.
+                self.pending_dirty.resize(alloc, self.flush_dirty.bit_length, false) catch {
+                    self.pending_paint_full = true;
+                    self.flush_dirty.unsetAll();
+                    self.committed_index = self.write_index;
+                    self.commit_rev +%= 1;
+                    self.is_in_flush = false;
+                    return;
+                };
+                // Resize paint_dirty_snapshot if no paint is active.
+                if (self.paint_nesting == 0) {
+                    self.paint_dirty_snapshot.resize(alloc, self.flush_dirty.bit_length, false) catch {
+                        self.pending_paint_full = true;
+                    };
+                }
+                // else: deferred to next acquireForPaint when nesting=0
+            }
+
+            // Bitwise OR merge: pending_dirty |= flush_dirty
+            if (self.pending_dirty.bit_length == self.flush_dirty.bit_length) {
+                self.mergeDirtyBits();
+            } else {
+                // Length mismatch after resize attempt — fall back to full paint.
+                self.pending_paint_full = true;
+            }
+        }
+
+        if (self.flush_paint_full) {
+            self.pending_paint_full = true;
+        }
+
+        // Merge flush scroll state into pending scroll (same region = accumulate, different = invalidate).
+        if (self.flush_scroll_rect) |flush_rect| {
+            if (self.pending_scroll_rect) |pending_rect| {
+                if (pending_rect.left == flush_rect.left and pending_rect.right == flush_rect.right and
+                    pending_rect.top == flush_rect.top and pending_rect.bottom == flush_rect.bottom)
+                {
+                    self.pending_scroll_dy_px += self.flush_scroll_dy_px;
+                    self.pending_vb_shift += self.flush_vb_shift;
+                } else {
+                    // Different scroll region: invalidate optimization, fall back to full paint.
+                    self.pending_scroll_rect = null;
+                    self.pending_scroll_dy_px = 0;
+                    self.pending_vb_shift = 0;
+                    self.pending_paint_full = true;
+                }
+            } else {
+                self.pending_scroll_rect = flush_rect;
+                self.pending_scroll_dy_px = self.flush_scroll_dy_px;
+                self.pending_vb_shift = self.flush_vb_shift;
+            }
+        }
+
+        self.committed_index = self.write_index;
+        self.commit_rev +%= 1;
+        self.is_in_flush = false;
+    }
+
+    /// Get the current write set (core thread, during flush only).
+    pub fn writeSet(self: *TripleBufferedSurface) *VertexSet {
+        return &self.sets[self.write_index];
+    }
+
+    /// Acquire the committed set for painting. Returns snapshot info.
+    /// Caller must call releaseFromPaint when done.
+    pub fn acquireForPaint(self: *TripleBufferedSurface) PaintSnapshot {
+        self.rotation_mu.lock();
+        defer self.rotation_mu.unlock();
+
+        const ci = self.committed_index;
+        self.ui_read_refcount[ci] += 1;
+
+        var paint_full: bool = false;
+
+        if (self.paint_nesting == 0) {
+            // Outermost paint: snapshot dirty state.
+            if (self.paint_dirty_snapshot.bit_length != self.pending_dirty.bit_length) {
+                // Size mismatch — fall back to full paint, clear pending.
+                self.pending_paint_full = true;
+                self.pending_dirty.unsetAll();
+            } else if (self.pending_dirty.bit_length > 0) {
+                // Copy pending_dirty → paint_dirty_snapshot (memcpy of backing words).
+                self.copyDirtySnapshot();
+                self.pending_dirty.unsetAll();
+            }
+            paint_full = self.pending_paint_full;
+            self.pending_paint_full = false;
+        }
+        // Re-entrant paint: do not overwrite snapshot. paint_full=false → inner paint is no-op.
+
+        // Consume pending scroll state atomically with committed index.
+        var scroll_rect: ?c.RECT = null;
+        var scroll_dy_px: i32 = 0;
+        var vb_shift: i32 = 0;
+        if (self.paint_nesting == 0) {
+            scroll_rect = self.pending_scroll_rect;
+            scroll_dy_px = self.pending_scroll_dy_px;
+            vb_shift = self.pending_vb_shift;
+            self.pending_scroll_rect = null;
+            self.pending_scroll_dy_px = 0;
+            self.pending_vb_shift = 0;
+        }
+
+        self.paint_nesting += 1;
+        return .{
+            .committed_index = ci,
+            .paint_full = paint_full,
+            .scroll_rect = scroll_rect,
+            .scroll_dy_px = scroll_dy_px,
+            .vb_shift = vb_shift,
+        };
+    }
+
+    /// Release the committed set after painting. Returns true if
+    /// InvalidateRect is needed (pending dirty accumulated during paint).
+    pub fn releaseFromPaint(self: *TripleBufferedSurface, index: u8) bool {
+        self.rotation_mu.lock();
+        defer self.rotation_mu.unlock();
+        self.ui_read_refcount[index] -= 1;
+        self.paint_nesting -= 1;
+        // When nesting returns to 0, check if new dirty state accumulated.
+        const needs_reinvalidate = (self.paint_nesting == 0) and
+            (self.pending_dirty.count() > 0 or self.pending_paint_full);
+        return needs_reinvalidate;
+    }
+
+    // --- Internal helpers ---
+
+    /// Compute the number of mask words for a given bit_length.
+    fn numMasks(bit_length: usize) usize {
+        return (bit_length + (@bitSizeOf(usize) - 1)) / @bitSizeOf(usize);
+    }
+
+    /// Shallow-copy slot mappings from src set to dst set (COW).
+    /// Only copies the u16 row_map array + retains slots. ~130 bytes for 65 rows.
+    /// Returns false on alloc failure.
+    fn shallowCopyVertexSet(self: *TripleBufferedSurface, alloc: std.mem.Allocator, dst_idx: u8, src_idx: u8) bool {
+        const dst = &self.sets[dst_idx];
+        const src = &self.sets[src_idx];
+
+        // Release dst's old slot references first.
+        dst.releaseAllSlots(alloc, &self.pool);
+
+        // Copy scalar fields (no alloc).
+        dst.row_mode = src.row_mode;
+        dst.rows = src.rows;
+        dst.cols = src.cols;
+        dst.last_cursor_row = src.last_cursor_row;
+
+        // Shallow copy row_map (u16 array).
+        const src_len = src.row_map.items.len;
+        dst.row_map.resize(alloc, src_len) catch return false;
+        @memcpy(dst.row_map.items[0..src_len], src.row_map.items[0..src_len]);
+
+        // Retain all slot references for dst.
+        for (dst.row_map.items) |m| {
+            self.pool.retain(m.slot);
+        }
+
+        // Cursor verts: always full copy (small, ~6-12 verts).
+        dst.cursor_verts.clearRetainingCapacity();
+        dst.cursor_verts.appendSlice(alloc, src.cursor_verts.items) catch return false;
+
+        // Flat verts: always full copy (non-row-mode only).
+        dst.flat_verts.clearRetainingCapacity();
+        dst.flat_verts.appendSlice(alloc, src.flat_verts.items) catch return false;
+
+        return true;
+    }
+
+    /// COW detach: prepare a slot for exclusive write access.
+    /// If ref_count > 1, allocate a new slot and release the old one.
+    /// Returns a pointer to the exclusively-owned RowSlot, or null on OOM.
+    pub fn cowDetachRow(self: *TripleBufferedSurface, alloc: std.mem.Allocator, row: u32) ?*RowSlot {
+        const vs = self.writeSet();
+        if (row >= vs.row_map.items.len) return null;
+        const mapping = &vs.row_map.items[row];
+        const old_slot = mapping.slot;
+
+        if (old_slot == SLOT_NONE) {
+            // New slot needed.
+            const new_idx = self.pool.acquireSlot(alloc) orelse return null;
+            mapping.slot = new_idx;
+            self.pool.retain(new_idx);
+            return &self.pool.slots.items[new_idx];
+        }
+
+        if (self.pool.slots.items[old_slot].ref_count > 1) {
+            // COW: allocate new slot, release old.
+            const new_idx = self.pool.acquireSlot(alloc) orelse return null;
+            self.pool.release(alloc, old_slot);
+            mapping.slot = new_idx;
+            self.pool.retain(new_idx);
+            return &self.pool.slots.items[new_idx];
+        }
+
+        // Exclusive ownership — write in place.
+        return &self.pool.slots.items[old_slot];
+    }
+
+    /// OR-merge flush_dirty into pending_dirty (same bit_length assumed).
+    fn mergeDirtyBits(self: *TripleBufferedSurface) void {
+        const pd_n = numMasks(self.pending_dirty.bit_length);
+        const fd_n = numMasks(self.flush_dirty.bit_length);
+        if (pd_n == 0 or fd_n == 0) return;
+        const len = @min(pd_n, fd_n);
+        for (0..len) |i| {
+            self.pending_dirty.masks[i] |= self.flush_dirty.masks[i];
+        }
+    }
+
+    /// Copy pending_dirty bits to paint_dirty_snapshot (same bit_length assumed).
+    fn copyDirtySnapshot(self: *TripleBufferedSurface) void {
+        const dst_n = numMasks(self.paint_dirty_snapshot.bit_length);
+        const src_n = numMasks(self.pending_dirty.bit_length);
+        if (dst_n == 0 or src_n == 0) return;
+        const len = @min(dst_n, src_n);
+        for (0..len) |i| {
+            self.paint_dirty_snapshot.masks[i] = self.pending_dirty.masks[i];
+        }
+        // Clear any trailing words in dst.
+        if (dst_n > len) {
+            for (len..dst_n) |i| {
+                self.paint_dirty_snapshot.masks[i] = 0;
+            }
+        }
+    }
+
+    /// Free all resources.
+    pub fn deinit(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
+        // Release all slot references from each set.
+        for (&self.sets) |*set| {
+            set.releaseAllSlots(alloc, &self.pool);
+            set.deinitCpu(alloc);
+        }
+        // Free slot pool (vertex memory lives in slots).
+        self.pool.deinit(alloc);
+        self.pending_dirty.deinit(alloc);
+        self.flush_dirty.deinit(alloc);
+        self.paint_dirty_snapshot.deinit(alloc);
+    }
+};
+
+/// Pending vertices for an external window that hasn't been created yet.
+/// Uses SurfaceState (legacy RowVerts) since TBS is not set up until window creation.
 pub const PendingExternalVertices = struct {
     grid_id: i64,
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
-    rows: u32,
-    cols: u32,
+    surface: SurfaceState,
 
     pub fn deinit(self: *PendingExternalVertices, alloc: std.mem.Allocator) void {
-        self.verts.deinit(alloc);
+        for (self.surface.row_verts.items) |*rv| {
+            if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        }
+        self.surface.deinitCpuState(alloc);
     }
 };
 
@@ -261,7 +750,7 @@ pub const TrayIcon = struct {
         if (!self.added) {
             _ = c.Shell_NotifyIconW(c.NIM_ADD, &self.nid);
             self.added = true;
-            applog.appLog("[tray] added tray icon\n", .{});
+            if (applog.isEnabled()) applog.appLog("[tray] added tray icon\n", .{});
         }
     }
 
@@ -269,7 +758,7 @@ pub const TrayIcon = struct {
         if (self.added) {
             _ = c.Shell_NotifyIconW(c.NIM_DELETE, &self.nid);
             self.added = false;
-            applog.appLog("[tray] removed tray icon\n", .{});
+            if (applog.isEnabled()) applog.appLog("[tray] removed tray icon\n", .{});
         }
     }
 
@@ -298,7 +787,7 @@ pub const TrayIcon = struct {
         @memcpy(self.nid.szInfo[0 .. msg_len + 1], msg_buf[0 .. msg_len + 1]);
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
-        applog.appLog("[tray] showBalloon: title='{s}' msg='{s}'\n", .{ title, msg_text });
+        if (applog.isEnabled()) applog.appLog("[tray] showBalloon: title='{s}' msg='{s}'\n", .{ title, msg_text });
     }
 };
 
@@ -475,6 +964,96 @@ pub const TablineState = struct {
     }
 };
 
+/// CPU-side per-row vertex data. GPU VBs are stored separately in RowVB
+/// (owned by the UI thread) so that the core thread can write vertices
+/// without touching GPU resources.
+pub const RowVertsCPU = struct {
+    verts: std.ArrayListUnmanaged(Vertex) = .{},
+
+    // CPU-side generation increments when verts are replaced by onVerticesRow().
+    gen: u64 = 0,
+
+    // Logical row index that vertices were generated for. Used to compute viewport
+    // Y translation at draw time when a row moves due to grid_scroll without
+    // vertex regeneration (same pattern as macOS rowSlotSourceRows).
+    origin_row: u32 = 0,
+};
+
+/// GPU-side per-row vertex buffer (D3D11). Owned exclusively by the UI thread.
+pub const RowVB = struct {
+    vb: ?*c.ID3D11Buffer = null,
+    vb_bytes: usize = 0,
+    // Slot identity + version for upload detection (replaces uploaded_gen).
+    // Upload is needed when uploaded_slot != mapping.slot or uploaded_ver != slot.ver.
+    uploaded_slot: u16 = SLOT_NONE,
+    uploaded_ver: u64 = 0,
+};
+
+// =========================================================================
+// Slot-based COW types (slot remapping + reference sharing)
+// =========================================================================
+
+/// Sentinel value for "no slot assigned".
+pub const SLOT_NONE: u16 = std.math.maxInt(u16);
+
+/// Physical row slot. Ref-counted vertex buffer shared across VertexSets.
+pub const RowSlot = struct {
+    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    ref_count: u16 = 0, // 0=unused, 1=exclusive, 2+=shared
+    origin_row: u32 = 0, // Logical row at vertex generation time (viewport Y translation)
+    ver: u64 = 0, // Content version (incremented on each write)
+};
+
+/// Logical-to-physical row mapping (one per logical row per VertexSet).
+pub const RowMapping = struct {
+    slot: u16 = SLOT_NONE,
+};
+
+/// Pool of physical row slots shared across all VertexSets in a TBS.
+pub const SlotPool = struct {
+    slots: std.ArrayListUnmanaged(RowSlot) = .{},
+    free_list: std.ArrayListUnmanaged(u16) = .{},
+
+    /// Acquire an unused slot. Returns null on OOM.
+    pub fn acquireSlot(self: *SlotPool, alloc: std.mem.Allocator) ?u16 {
+        if (self.free_list.items.len > 0) {
+            return self.free_list.pop();
+        }
+        // Grow pool by one slot.
+        const idx: u16 = @intCast(self.slots.items.len);
+        self.slots.append(alloc, .{}) catch return null;
+        return idx;
+    }
+
+    /// Increment ref_count for a slot.
+    pub fn retain(self: *SlotPool, idx: u16) void {
+        if (idx == SLOT_NONE) return;
+        self.slots.items[idx].ref_count += 1;
+    }
+
+    /// Decrement ref_count. If it reaches 0, return slot to free_list.
+    pub fn release(self: *SlotPool, alloc: std.mem.Allocator, idx: u16) void {
+        if (idx == SLOT_NONE) return;
+        const slot = &self.slots.items[idx];
+        if (slot.ref_count > 0) {
+            slot.ref_count -= 1;
+        }
+        if (slot.ref_count == 0) {
+            self.free_list.append(alloc, idx) catch {};
+        }
+    }
+
+    pub fn deinit(self: *SlotPool, alloc: std.mem.Allocator) void {
+        for (self.slots.items) |*s| {
+            s.verts.deinit(alloc);
+        }
+        self.slots.deinit(alloc);
+        self.free_list.deinit(alloc);
+    }
+};
+
+/// Legacy combined struct for backward compatibility during migration.
+/// Contains both CPU vertex data and GPU VB resources.
 pub const RowVerts = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .{},
 
@@ -486,6 +1065,16 @@ pub const RowVerts = struct {
     gen: u64 = 0,
     // Last uploaded generation to vb.
     uploaded_gen: u64 = 0,
+
+    // Logical row index that vertices were generated for. Used to compute viewport
+    // Y translation at draw time when a row moves due to grid_scroll without
+    // vertex regeneration (same pattern as macOS rowSlotSourceRows).
+    origin_row: u32 = 0,
+};
+
+pub const PaintRowRange = struct {
+    start: usize,
+    count: usize,
 };
 
 /// External window state for win_external_pos grids
@@ -493,12 +1082,17 @@ pub const ExternalWindow = struct {
     hwnd: c.HWND,
     win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+
+    // Shared CPU-side surface state (vertices, grid dims, dirty tracking).
+    surface: SurfaceState = .{},
+
+    // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
+    tbs: TripleBufferedSurface = .{},
+
+    // GPU vertex buffers (not in SurfaceState — ownership/deinit stays here).
     vb: ?*c.ID3D11Buffer = null,
     vb_bytes: usize = 0,
     vert_count: usize = 0,
-    rows: u32 = 0,
-    cols: u32 = 0,
     needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
@@ -510,6 +1104,15 @@ pub const ExternalWindow = struct {
     h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
+    flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .{}, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
+
+    // Per-window GPU vertex buffers for cursor and scrollbar overlays (row-mode rendering).
+    cursor_vb: ?*c.ID3D11Buffer = null,
+    cursor_vb_bytes: usize = 0,
+    // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    scrollbar_vb: ?*c.ID3D11Buffer = null,
+    scrollbar_vb_bytes: usize = 0,
 
     // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
     suppress_resize_callback: bool = false,
@@ -521,6 +1124,10 @@ pub const ExternalWindow = struct {
     // DXGI operations can pump Win32 messages, so close could be triggered during paint.
     // This counter ensures ext_win isn't freed until all paint operations complete.
     paint_ref_count: u32 = 0,
+
+    // Scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
+    // See TripleBufferedSurface.
+    last_painted_cursor_row: ?u32 = null,
 
     // Scrollbar state for external windows
     scrollbar_visible: bool = false,
@@ -539,6 +1146,11 @@ pub const ExternalWindow = struct {
     // Scratch buffer for vertex copy during paint (avoids per-frame alloc).
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
     paint_scratch: std.ArrayListUnmanaged(Vertex) = .{},
+    paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .{},
+
+    pub fn recomputeVertCount(self: *ExternalWindow) void {
+        self.vert_count = self.surface.recomputeVertCount();
+    }
 
     pub fn deinit(self: *ExternalWindow, alloc: std.mem.Allocator) void {
         // Clear user data first to prevent WndProc from accessing App during destruction
@@ -549,13 +1161,1085 @@ pub const ExternalWindow = struct {
 
         // Now safe to release D3D resources
         self.paint_scratch.deinit(alloc);
-        self.verts.deinit(alloc);
+        self.paint_row_ranges.deinit(alloc);
+        self.flat_draw_scratch.deinit(alloc);
+        // Release GPU VBs from row_verts before deinitCpuState frees the list.
+        for (self.surface.row_verts.items) |*rv| {
+            if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        }
+        self.surface.deinitCpuState(alloc);
+        // Release GPU VBs from TBS row_vbs.
+        for (self.row_vbs.items) |*rvb| {
+            if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        }
+        self.row_vbs.deinit(alloc);
+        self.tbs.deinit(alloc); // Handles slot release + pool deinit
         if (self.vb) |vb| {
+            _ = vb.lpVtbl.*.Release.?(vb);
+        }
+        if (self.cursor_vb) |vb| {
+            _ = vb.lpVtbl.*.Release.?(vb);
+        }
+        if (self.scrollbar_vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
         }
         self.renderer.deinit();
     }
 };
+
+// =========================================================================
+// Shared surface helpers (used by both main window and external windows)
+// =========================================================================
+
+/// Build a sorted, deduplicated list of row indices to draw.
+///
+/// When `force_full` is true, enumerates all rows in [0, total_rows).
+/// Otherwise uses the provided `dirty_row_keys`.
+/// All indices are clamped to [0, max_valid_row) and deduplicated.
+pub fn computeRowsToDraw(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u32),
+    force_full: bool,
+    dirty_row_keys: []const u32,
+    total_rows: u32,
+    max_valid_row: u32,
+) void {
+    out.clearRetainingCapacity();
+
+    const cap = if (force_full) total_rows else @as(u32, @intCast(dirty_row_keys.len));
+    out.ensureTotalCapacity(alloc, cap) catch {};
+
+    if (force_full) {
+        var r: u32 = 0;
+        const n: u32 = @min(total_rows, max_valid_row);
+        while (r < n) : (r += 1) {
+            out.append(alloc, r) catch break;
+        }
+        return; // Already in order, no duplicates possible.
+    }
+
+    // Dirty-row path: filter to valid range, then sort + dedup.
+    for (dirty_row_keys) |k| {
+        if (k < max_valid_row) {
+            out.append(alloc, k) catch break;
+        }
+    }
+
+    if (out.items.len <= 1) return;
+
+    std.sort.pdq(u32, out.items, {}, comptime std.sort.asc(u32));
+
+    // Deduplicate in-place.
+    var w: usize = 1;
+    var i: usize = 1;
+    while (i < out.items.len) : (i += 1) {
+        if (out.items[i] != out.items[w - 1]) {
+            out.items[w] = out.items[i];
+            w += 1;
+        }
+    }
+    out.items.len = w;
+}
+
+pub fn snapshotSurfaceVerts(
+    alloc: std.mem.Allocator,
+    scratch: *std.ArrayListUnmanaged(Vertex),
+    row_mode: bool,
+    row_verts: []const RowVerts,
+    flat_verts: []const Vertex,
+    vert_count: usize,
+) bool {
+    scratch.clearRetainingCapacity();
+    scratch.ensureTotalCapacity(alloc, vert_count) catch return false;
+
+    if (row_mode) {
+        for (row_verts) |rv| {
+            if (rv.verts.items.len == 0) continue;
+            scratch.appendSliceAssumeCapacity(rv.verts.items);
+        }
+    } else {
+        scratch.appendSliceAssumeCapacity(flat_verts[0..vert_count]);
+    }
+    return true;
+}
+
+pub fn snapshotSurfaceRows(
+    alloc: std.mem.Allocator,
+    scratch: *std.ArrayListUnmanaged(Vertex),
+    row_ranges: *std.ArrayListUnmanaged(PaintRowRange),
+    row_mode: bool,
+    row_verts: []const RowVerts,
+    flat_verts: []const Vertex,
+    vert_count: usize,
+) bool {
+    scratch.clearRetainingCapacity();
+    row_ranges.clearRetainingCapacity();
+    scratch.ensureTotalCapacity(alloc, vert_count) catch return false;
+
+    if (row_mode) {
+        row_ranges.ensureTotalCapacity(alloc, row_verts.len) catch return false;
+        var start: usize = 0;
+        for (row_verts) |rv| {
+            const count = rv.verts.items.len;
+            if (count == 0) continue;
+            scratch.appendSliceAssumeCapacity(rv.verts.items);
+            row_ranges.appendAssumeCapacity(.{ .start = start, .count = count });
+            start += count;
+        }
+    } else {
+        scratch.appendSliceAssumeCapacity(flat_verts[0..vert_count]);
+    }
+    return true;
+}
+
+pub fn ensureRowVBReady(
+    g: *d3d11.Renderer,
+    rv: *RowVerts,
+    src: []const Vertex,
+) !bool {
+    if (src.len == 0) return false;
+
+    if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(Vertex)) {
+        const need_bytes = src.len * @sizeOf(Vertex);
+        try g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes);
+        try g.uploadVertsToVB(rv.vb.?, src);
+        rv.uploaded_gen = rv.gen;
+        return true;
+    }
+
+    return false;
+}
+
+/// Upload slot vertex data to a separate RowVB, comparing slot identity + version.
+/// Used by TBS-based paint path where CPU verts and GPU VBs are separate arrays.
+pub fn ensureRowVBReadyFromSlot(
+    g: *d3d11.Renderer,
+    vb: *RowVB,
+    mapping: RowMapping,
+    pool: *const SlotPool,
+) !bool {
+    if (mapping.slot == SLOT_NONE) return false;
+    const slot = &pool.slots.items[mapping.slot];
+    const src = slot.verts.items;
+    if (src.len == 0) return false;
+
+    if (vb.uploaded_slot != mapping.slot or vb.uploaded_ver != slot.ver or vb.vb == null or vb.vb_bytes < src.len * @sizeOf(Vertex)) {
+        const need_bytes = src.len * @sizeOf(Vertex);
+        try g.ensureExternalVertexBuffer(&vb.vb, &vb.vb_bytes, need_bytes);
+        try g.uploadVertsToVB(vb.vb.?, src);
+        vb.uploaded_slot = mapping.slot;
+        vb.uploaded_ver = slot.ver;
+        return true;
+    }
+
+    return false;
+}
+
+/// Shift the row_vbs array to match a scroll delta.
+/// After scroll up by N (delta > 0): row_vbs[i] = row_vbs[i+N], vacated tail entries reset.
+/// After scroll down by N (delta < 0): row_vbs[i] = row_vbs[i-N], vacated head entries reset.
+/// This keeps uploaded_slot aligned with row_map so VBs don't need re-upload for shifted rows.
+pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) void {
+    if (delta == 0) return;
+    const start: usize = @intCast(row_start);
+    const end: usize = @min(@as(usize, @intCast(row_end)), row_vbs.len);
+    if (start >= end) return;
+    const region = row_vbs[start..end];
+    const abs_delta: usize = @intCast(if (delta < 0) -delta else delta);
+    if (abs_delta >= region.len) {
+        // Entire region shifted out: reset all.
+        for (region) |*vb| {
+            vb.uploaded_slot = SLOT_NONE;
+            vb.uploaded_ver = 0;
+        }
+        return;
+    }
+
+    if (delta > 0) {
+        // Scroll up: row_vbs[start] gets row_vbs[start + abs_delta], etc.
+        // Save VBs that scroll off (at the top of the region).
+        var saved: [64]RowVB = undefined;
+        for (0..abs_delta) |s| {
+            saved[s] = region[s];
+        }
+        var i: usize = 0;
+        while (i + abs_delta < region.len) : (i += 1) {
+            region[i] = region[i + abs_delta];
+        }
+        // Vacated tail entries: reuse saved VBs (keep GPU buffer, reset upload state).
+        for (0..abs_delta) |s| {
+            region[region.len - abs_delta + s] = saved[s];
+            region[region.len - abs_delta + s].uploaded_slot = SLOT_NONE;
+            region[region.len - abs_delta + s].uploaded_ver = 0;
+        }
+    } else {
+        // Scroll down: row_vbs[end-1] gets row_vbs[end-1-abs_delta], etc.
+        var saved: [64]RowVB = undefined;
+        for (0..abs_delta) |s| {
+            saved[s] = region[region.len - 1 - s];
+        }
+        var i: usize = region.len;
+        while (i > abs_delta) {
+            i -= 1;
+            region[i] = region[i - abs_delta];
+        }
+        // Vacated head entries: reuse saved VBs.
+        for (0..abs_delta) |s| {
+            region[start + s] = saved[s];
+            region[start + s].uploaded_slot = SLOT_NONE;
+            region[start + s].uploaded_ver = 0;
+        }
+    }
+}
+
+/// Scroll state consumed by paint. Returned by consumeScrollState / applyScrollShift.
+pub const ScrollShiftResult = struct {
+    /// The scroll region rect (in back_tex coords). null if no scroll was applied.
+    scroll_rect: ?c.RECT = null,
+};
+
+/// Apply scroll pixel shift to back_tex, shift row_vbs, and add cursor ghost
+/// rows to rows_to_draw.  Shared between main window and external windows.
+///
+/// Parameters:
+///   g:                   Renderer owning back_tex
+///   alloc:               Allocator for rows_to_draw appends
+///   row_vbs:             GPU VB tracking array to shift
+///   rows_to_draw:        Dirty row list (modified: cursor ghost rows appended)
+///   scroll_rect:         Scroll region in row-relative pixels (`.right` = 0 means "fill with renderer width")
+///   scroll_dy_px:        Pixel shift amount (negative = content moves up, positive = down)
+///   vb_shift_rows:       Row-unit shift for row_vbs (same sign convention as grid_scroll rows_delta)
+///   last_cursor_row_ptr: Pointer to last painted cursor row tracker (read + cleared)
+///   row_h_px:            Row height in pixels
+///   effective_rows:      Total valid row count
+///   y_offset:            Content Y offset in back_tex pixels (e.g. tabbar height). 0 for ext windows.
+pub fn applyScrollShift(
+    g: *d3d11.Renderer,
+    alloc: std.mem.Allocator,
+    row_vbs: []RowVB,
+    rows_to_draw: *std.ArrayListUnmanaged(u32),
+    scroll_rect: c.RECT,
+    scroll_dy_px: i32,
+    vb_shift_rows: i32,
+    last_cursor_row_ptr: *?u32,
+    row_h_px: i32,
+    effective_rows: u32,
+    y_offset: i32,
+) ScrollShiftResult {
+    if (scroll_dy_px == 0) return .{};
+
+    // 1. Shift row_vbs to keep VB upload state aligned with row_map.
+    if (vb_shift_rows != 0) {
+        shiftRowVBs(row_vbs, vb_shift_rows, 0, @intCast(row_vbs.len));
+    }
+
+    // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to rows_to_draw.
+    if (last_cursor_row_ptr.*) |prev_cr| {
+        if (row_h_px > 0) {
+            const scroll_rows: i32 = @divTrunc(scroll_dy_px, row_h_px);
+            const shifted_row: i32 = @as(i32, @intCast(prev_cr)) + scroll_rows;
+            if (shifted_row >= 0 and shifted_row < @as(i32, @intCast(effective_rows))) {
+                const sr_u32: u32 = @intCast(shifted_row);
+                appendRowSorted(alloc, rows_to_draw, sr_u32);
+            }
+            if (prev_cr < effective_rows) {
+                appendRowSorted(alloc, rows_to_draw, prev_cr);
+            }
+        }
+    }
+    last_cursor_row_ptr.* = null;
+
+    // 3. Fill in scroll rect and apply pixel shift on back_tex.
+    var filled = scroll_rect;
+    if (filled.right == 0) {
+        filled.right = @intCast(g.width);
+    }
+    filled.top += y_offset;
+    filled.bottom += y_offset;
+
+    g.scrollBackTex(filled, scroll_dy_px);
+
+    if (applog.isEnabled()) {
+        applog.appLog(
+            "[perf] applyScrollShift dy={d} vb_shift={d} rect=({d},{d},{d},{d})\n",
+            .{ scroll_dy_px, vb_shift_rows, filled.left, filled.top, filled.right, filled.bottom },
+        );
+    }
+
+    return .{ .scroll_rect = filled };
+}
+
+/// Insert a row into a sorted rows_to_draw list if not already present.
+fn appendRowSorted(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32), row: u32) void {
+    for (list.items) |r| {
+        if (r == row) return;
+    }
+    list.append(alloc, row) catch return;
+    std.sort.insertion(u32, list.items, {}, std.sort.asc(u32));
+}
+
+/// Draw rows from slot-based row_map with separate RowVB GPU buffers.
+/// This is the TBS-equivalent of drawSurfaceRowsVB.
+pub fn drawSurfaceRowsVBFromSlots(
+    g: *d3d11.Renderer,
+    row_map: []const RowMapping,
+    pool: *const SlotPool,
+    row_vbs: []RowVB,
+    rows_to_draw: ?[]const u32,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+    rs_set_vp_fn: ?RSSetViewportsFn,
+    base_vp: BaseViewport,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    row_h_px: i32,
+    log_enabled: bool,
+    metrics: *SurfaceRowDrawMetrics,
+) void {
+    const row_count: usize = if (rows_to_draw) |rows| rows.len else row_map.len;
+    var vp_dirty = false;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const row: u32 = if (rows_to_draw) |rows| rows[i] else @intCast(i);
+        if (row >= row_map.len or row >= row_vbs.len) {
+            metrics.skipped_empty += 1;
+            continue;
+        }
+
+        const mapping = row_map[@intCast(row)];
+        if (mapping.slot == SLOT_NONE) {
+            metrics.skipped_empty += 1;
+            if (metrics.first_empty_row == null) {
+                metrics.first_empty_row = row;
+            }
+            continue;
+        }
+
+        const slot = &pool.slots.items[mapping.slot];
+        const src = slot.verts.items;
+        if (src.len == 0) {
+            metrics.skipped_empty += 1;
+            if (metrics.first_empty_row == null) {
+                metrics.first_empty_row = row;
+            }
+            continue;
+        }
+
+        const vb = &row_vbs[@intCast(row)];
+        if (vb.uploaded_slot != mapping.slot or vb.uploaded_ver != slot.ver or vb.vb == null or vb.vb_bytes < src.len * @sizeOf(Vertex)) {
+            const need_bytes = src.len * @sizeOf(Vertex);
+            const t_upload_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+            _ = ensureRowVBReadyFromSlot(g, vb, mapping, pool) catch {
+                metrics.skipped_empty += 1;
+                continue;
+            };
+            if (log_enabled) {
+                metrics.vb_upload_ns += std.time.nanoTimestamp() - t_upload_start;
+            }
+            metrics.vb_upload_rows += 1;
+            metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
+        }
+
+        if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
+            const top = y_offset + @as(i32, @intCast(row)) * row_h_px;
+            const bottom = top + row_h_px;
+            var sc: c.D3D11_RECT = .{
+                .left = x_offset,
+                .top = top,
+                .right = content_right,
+                .bottom = bottom,
+            };
+            rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+
+            if (rs_set_vp_fn) |vp_fn| {
+                const origin_i32: i32 = @intCast(slot.origin_row);
+                const row_i32: i32 = @intCast(row);
+                const row_delta = row_i32 - origin_i32;
+                if (row_delta != 0) {
+                    const delta_px: f32 = @floatFromInt(row_delta * row_h_px);
+                    var vp: c.D3D11_VIEWPORT = .{
+                        .TopLeftX = base_vp.x,
+                        .TopLeftY = base_vp.y + delta_px,
+                        .Width = base_vp.w,
+                        .Height = base_vp.h,
+                        .MinDepth = 0,
+                        .MaxDepth = 1,
+                    };
+                    vp_fn(ctx_ptr, 1, &vp);
+                    vp_dirty = true;
+                } else if (vp_dirty) {
+                    var vp: c.D3D11_VIEWPORT = .{
+                        .TopLeftX = base_vp.x,
+                        .TopLeftY = base_vp.y,
+                        .Width = base_vp.w,
+                        .Height = base_vp.h,
+                        .MinDepth = 0,
+                        .MaxDepth = 1,
+                    };
+                    vp_fn(ctx_ptr, 1, &vp);
+                    vp_dirty = false;
+                }
+            }
+        }
+
+        const t_draw_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+        g.drawVB(vb.vb.?, src.len) catch {
+            metrics.skipped_empty += 1;
+            continue;
+        };
+        if (log_enabled) {
+            metrics.draw_vb_ns += std.time.nanoTimestamp() - t_draw_start;
+        }
+        metrics.drawn_rows += 1;
+    }
+
+    // Restore base viewport if modified.
+    if (vp_dirty) {
+        if (rs_set_vp_fn) |vp_fn| {
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = base_vp.x,
+                .TopLeftY = base_vp.y,
+                .Width = base_vp.w,
+                .Height = base_vp.h,
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            vp_fn(ctx_ptr, 1, &vp);
+        }
+    }
+}
+
+/// Shared row-mode rendering with TBS (slot-based COW + separate RowVB array).
+/// Same as drawRowModeSetupAndRows but uses slot indirection for zero-copy beginFlush.
+/// Does NOT hold app_mu during VB upload (lock-free via TBS refcount).
+pub fn drawRowModeSetupAndRowsFromSlots(
+    g: *d3d11.Renderer,
+    alloc: std.mem.Allocator,
+    row_map: []const RowMapping,
+    pool: *const SlotPool,
+    row_vbs: []RowVB,
+    rows_to_draw: []const u32,
+    bloom_verts: *std.ArrayListUnmanaged(Vertex),
+    params: RowModeDrawParams,
+) !RowModeDrawResult {
+    const log_enabled = applog.isEnabled();
+
+    // 1. drawEx: bind RTV, clear if needed, set viewport to content_height.
+    try g.drawEx(
+        &[_]Vertex{},
+        &[_]Vertex{},
+        null,
+        .{
+            .present = false,
+            .preserve_on_null_dirty = params.preserve_back,
+            .content_height = params.content_height,
+            .content_width = params.content_width,
+            .content_y_offset = params.content_y_offset,
+            .content_x_offset = params.content_x_offset,
+            .sidebar_right_width = params.sidebar_right_width,
+            .tabbar_bg_color = params.tabbar_bg_color,
+        },
+    );
+
+    // 2. Get D3D context and function pointers.
+    var result = RowModeDrawResult{};
+    var rs_set_vp_fn: ?RSSetViewportsFn = null;
+    if (g.ctx) |ctx_val| {
+        result.ctx_ptr = ctx_val;
+        result.rs_set_sc_fn = ctx_val.*.lpVtbl.*.RSSetScissorRects;
+        rs_set_vp_fn = ctx_val.*.lpVtbl.*.RSSetViewports;
+    }
+
+    const vp_x_offset = params.content_x_offset orelse 0;
+    const vp_y_offset = params.content_y_offset orelse 0;
+    const sidebar_r_w = params.sidebar_right_width orelse 0;
+    const base_w = params.content_width orelse g.width;
+    const vp_width = if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
+    const base_vp = BaseViewport{
+        .x = @floatFromInt(vp_x_offset),
+        .y = @floatFromInt(vp_y_offset),
+        .w = @floatFromInt(vp_width),
+        .h = @floatFromInt(params.content_height),
+    };
+
+    // 3. Draw row VBs (no app_mu needed — TBS refcount protects data).
+    if (!params.use_row_scissor) {
+        if (log_enabled) applog.appLog("[row-mode] full scissor (no per-row)\n", .{});
+        if (result.rs_set_sc_fn) |f| {
+            var sc_full: c.D3D11_RECT = .{
+                .left = params.x_offset,
+                .top = params.y_offset,
+                .right = params.content_right,
+                .bottom = @intCast(g.height),
+            };
+            f(result.ctx_ptr, 1, &sc_full);
+        }
+    }
+
+    drawSurfaceRowsVBFromSlots(
+        g,
+        row_map,
+        pool,
+        row_vbs,
+        rows_to_draw,
+        if (params.use_row_scissor) result.ctx_ptr else null,
+        if (params.use_row_scissor) result.rs_set_sc_fn else null,
+        if (params.use_row_scissor) rs_set_vp_fn else null,
+        base_vp,
+        params.x_offset,
+        params.y_offset,
+        params.content_right,
+        params.row_h_px,
+        log_enabled,
+        &result.metrics,
+    );
+
+    // Collect all row verts for bloom extract.
+    if (params.glow_enabled) {
+        const vp_h: f32 = base_vp.h;
+        for (row_map, 0..) |m, row_index| {
+            if (m.slot == SLOT_NONE) continue;
+            const slot = &pool.slots.items[m.slot];
+            if (slot.verts.items.len == 0) continue;
+            const origin_i32: i32 = @intCast(slot.origin_row);
+            const row_i32: i32 = @intCast(row_index);
+            const row_delta = row_i32 - origin_i32;
+            if (row_delta == 0) {
+                bloom_verts.appendSlice(alloc, slot.verts.items) catch {};
+            } else {
+                const delta_px: f32 = @floatFromInt(row_delta * params.row_h_px);
+                const ndc_shift: f32 = -2.0 * delta_px / vp_h;
+                const base_len = bloom_verts.items.len;
+                bloom_verts.appendSlice(alloc, slot.verts.items) catch continue;
+                for (bloom_verts.items[base_len..]) |*v| {
+                    v.position[1] += ndc_shift;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Flush pending atlas uploads to a D3D renderer.
+/// Both main window WM_PAINT and external window paintExternalWindow
+/// call this inside their respective gpu.lockContext() scopes.
+/// Returns the new upload cursor value.
+pub fn flushAtlasUploads(
+    atlas: *dwrite_d2d.Renderer,
+    gpu: *d3d11.Renderer,
+    upload_cursor: u64,
+    need_full_upload: bool,
+) u64 {
+    if (need_full_upload) {
+        atlas.uploadFullAtlasToD3D(gpu);
+    }
+    return atlas.flushPendingAtlasUploadsSinceToD3D(gpu, upload_cursor);
+}
+
+/// Snap client height to cell grid boundaries (at least 1 row).
+/// Used by both main window and external window to compute D3D11 viewport
+/// content_height that matches core's NDC vertex generation.
+pub fn snappedContentHeight(client_h: u32, cell_total_h_px: u32, y_offset: u32) u32 {
+    const safe_cell_h: u32 = @max(1, cell_total_h_px);
+    const drawable_h: u32 = if (client_h > y_offset) client_h - y_offset else 0;
+    const snapped: u32 = (drawable_h / safe_cell_h) * safe_cell_h;
+    return @max(snapped, safe_cell_h);
+}
+
+/// Draw external surface in flat (non-row) mode using gpu.draw().
+/// Filters out cursor vertices when cursor_visible=false.
+/// Appends scrollbar_verts if non-empty.
+/// Uses caller-provided scratch buffer to avoid per-paint heap allocation.
+/// IMPORTANT: scratch must NOT alias verts (e.g. do not pass paint_scratch
+/// if verts points into paint_scratch.items).
+pub fn drawExternalSurfaceFlat(
+    gpu: *d3d11.Renderer,
+    scratch: *std.ArrayListUnmanaged(Vertex),
+    alloc: std.mem.Allocator,
+    verts: []const Vertex,
+    vert_count: usize,
+    cursor_visible: bool,
+    scrollbar_verts: []const Vertex,
+    glow_enabled: bool,
+    glow_intensity: f32,
+) !void {
+    const draw_opts: d3d11.Renderer.DrawOpts = .{
+        .present = false, // Caller (paintExternalWindow) handles present via presentOnlyFromBack
+        .glow_enabled = glow_enabled,
+        .glow_intensity = glow_intensity,
+    };
+
+    const needs_filter = !cursor_visible;
+    const needs_scrollbar = scrollbar_verts.len > 0;
+
+    if (!needs_filter and !needs_scrollbar) {
+        try gpu.drawEx(verts[0..vert_count], &[_]Vertex{}, null, draw_opts);
+        return;
+    }
+
+    scratch.clearRetainingCapacity();
+    scratch.ensureTotalCapacity(alloc, vert_count + scrollbar_verts.len) catch {
+        try gpu.drawEx(verts[0..vert_count], &[_]Vertex{}, null, draw_opts);
+        return;
+    };
+
+    if (needs_filter) {
+        for (verts[0..vert_count]) |v| {
+            if ((v.deco_flags & DECO_CURSOR) == 0) {
+                scratch.appendAssumeCapacity(v);
+            }
+        }
+    } else {
+        scratch.appendSliceAssumeCapacity(verts[0..vert_count]);
+    }
+
+    if (needs_scrollbar) {
+        scratch.appendSliceAssumeCapacity(scrollbar_verts);
+    }
+
+    try gpu.drawEx(scratch.items, &[_]Vertex{}, null, draw_opts);
+}
+
+/// Parameters for shared row-mode draw sequence (drawEx setup + drawSurfaceRowsVB + bloom collect).
+/// Used by both main window WM_PAINT and external window paint path.
+pub const RowModeDrawParams = struct {
+    content_height: u32,
+    row_h_px: i32,
+    x_offset: i32 = 0,
+    y_offset: i32 = 0,
+    content_right: i32,
+    preserve_back: bool,
+    use_row_scissor: bool = true,
+    glow_enabled: bool = false,
+    // DrawEx viewport options (null = use full renderer dimensions)
+    content_width: ?u32 = null,
+    content_y_offset: ?u32 = null,
+    content_x_offset: ?u32 = null,
+    sidebar_right_width: ?u32 = null,
+    tabbar_bg_color: ?[4]f32 = null,
+
+    /// Compute bloom viewport from these params.
+    pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
+        const vp_x: u32 = if (self.content_x_offset) |off| off else 0;
+        const vp_y: u32 = if (self.content_y_offset) |off| off else 0;
+        const sidebar_r: u32 = self.sidebar_right_width orelse 0;
+        const base_w: u32 = self.content_width orelse renderer_width;
+        const vp_w: u32 = if (base_w > vp_x + sidebar_r) base_w - vp_x - sidebar_r else 1;
+        return .{ .x = vp_x, .y = vp_y, .w = vp_w, .h = self.content_height };
+    }
+};
+
+pub const RSSetScissorRectsFn = *const fn (?*c.ID3D11DeviceContext, c.UINT, [*c]const c.D3D11_RECT) callconv(.c) void;
+
+pub const RowModeDrawResult = struct {
+    ctx_ptr: ?*c.ID3D11DeviceContext = null,
+    rs_set_sc_fn: ?RSSetScissorRectsFn = null,
+    metrics: SurfaceRowDrawMetrics = .{},
+};
+
+/// Shared row-mode rendering: drawEx setup → drawSurfaceRowsVB → bloom verts collection.
+/// Caller must hold gpu.lockContext(). app_mu is locked internally during row VB draw.
+/// row_verts_list is accessed under app_mu to avoid use-after-free from concurrent reallocation.
+/// If params.glow_enabled, bloom_verts is populated with all row vertices (under lock).
+/// Caller is responsible for cursor overlay, scrollbar overlay, bloom post-process, and present.
+pub fn drawRowModeSetupAndRows(
+    g: *d3d11.Renderer,
+    alloc: std.mem.Allocator,
+    app_mu: *std.Thread.Mutex,
+    row_verts_list: *std.ArrayListUnmanaged(RowVerts),
+    rows_to_draw: []const u32,
+    bloom_verts: *std.ArrayListUnmanaged(Vertex),
+    params: RowModeDrawParams,
+) !RowModeDrawResult {
+    const log_enabled = applog.isEnabled();
+
+    // 1. drawEx: bind RTV, clear if needed, set viewport to content_height.
+    try g.drawEx(
+        &[_]Vertex{},
+        &[_]Vertex{},
+        null,
+        .{
+            .present = false,
+            .preserve_on_null_dirty = params.preserve_back,
+            .content_height = params.content_height,
+            .content_width = params.content_width,
+            .content_y_offset = params.content_y_offset,
+            .content_x_offset = params.content_x_offset,
+            .sidebar_right_width = params.sidebar_right_width,
+            .tabbar_bg_color = params.tabbar_bg_color,
+        },
+    );
+
+    // 2. Get D3D context, RSSetScissorRects and RSSetViewports function pointers.
+    var result = RowModeDrawResult{};
+    var rs_set_vp_fn: ?RSSetViewportsFn = null;
+    if (g.ctx) |ctx_val| {
+        result.ctx_ptr = ctx_val;
+        result.rs_set_sc_fn = ctx_val.*.lpVtbl.*.RSSetScissorRects;
+        rs_set_vp_fn = ctx_val.*.lpVtbl.*.RSSetViewports;
+    }
+
+    // Compute base viewport matching what drawEx set (for per-row viewport Y translation).
+    const vp_x_offset = params.content_x_offset orelse 0;
+    const vp_y_offset = params.content_y_offset orelse 0;
+    const sidebar_r_w = params.sidebar_right_width orelse 0;
+    const base_w = params.content_width orelse g.width;
+    const vp_width = if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
+    const base_vp = BaseViewport{
+        .x = @floatFromInt(vp_x_offset),
+        .y = @floatFromInt(vp_y_offset),
+        .w = @floatFromInt(vp_width),
+        .h = @floatFromInt(params.content_height),
+    };
+
+    // 3. Lock, read row_verts slice, draw row VBs, collect bloom verts, unlock.
+    {
+        app_mu.lock();
+        defer app_mu.unlock();
+
+        const row_verts = row_verts_list.items;
+
+        // When per-row scissor is disabled (e.g. seed mode), set a full-content scissor
+        // to prevent drawing outside the content area.
+        if (!params.use_row_scissor) {
+            if (log_enabled) applog.appLog("[row-mode] full scissor (no per-row)\n", .{});
+            if (result.rs_set_sc_fn) |f| {
+                var sc_full: c.D3D11_RECT = .{
+                    .left = params.x_offset,
+                    .top = params.y_offset,
+                    .right = params.content_right,
+                    .bottom = @intCast(g.height),
+                };
+                f(result.ctx_ptr, 1, &sc_full);
+            }
+        }
+
+        drawSurfaceRowsVB(
+            g,
+            row_verts,
+            rows_to_draw,
+            if (params.use_row_scissor) result.ctx_ptr else null,
+            if (params.use_row_scissor) result.rs_set_sc_fn else null,
+            if (params.use_row_scissor) rs_set_vp_fn else null,
+            base_vp,
+            params.x_offset,
+            params.y_offset,
+            params.content_right,
+            params.row_h_px,
+            log_enabled,
+            &result.metrics,
+        );
+
+        // Collect all row verts for bloom extract (under lock).
+        // When scroll reuse is active, origin_row may differ from the draw row.
+        // drawSurfaceRowsVB compensates via viewport Y offset, but bloom renders
+        // with a fixed viewport, so we must adjust NDC Y coordinates here.
+        if (params.glow_enabled) {
+            const vp_h: f32 = base_vp.h;
+            for (row_verts, 0..) |*rv, row_index| {
+                if (rv.verts.items.len == 0) continue;
+                const origin_i32: i32 = @intCast(rv.origin_row);
+                const row_i32: i32 = @intCast(row_index);
+                const row_delta = row_i32 - origin_i32;
+                if (row_delta == 0) {
+                    bloom_verts.appendSlice(alloc, rv.verts.items) catch {};
+                } else {
+                    // Shift NDC Y to match the viewport offset applied at draw time.
+                    // Viewport TopLeftY += delta_px moves content DOWN on screen.
+                    // Equivalent NDC adjustment: Y -= 2 * delta_px / viewport_height.
+                    const delta_px: f32 = @floatFromInt(row_delta * params.row_h_px);
+                    const ndc_shift: f32 = -2.0 * delta_px / vp_h;
+                    const base_len = bloom_verts.items.len;
+                    bloom_verts.appendSlice(alloc, rv.verts.items) catch continue;
+                    for (bloom_verts.items[base_len..]) |*v| {
+                        v.position[1] += ndc_shift;
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+pub const SurfaceRowDrawMetrics = struct {
+    drawn_rows: u32 = 0,
+    skipped_empty: u32 = 0,
+    first_empty_row: ?u32 = null,
+    vb_upload_rows: u32 = 0,
+    vb_upload_rows_bytes: u64 = 0,
+    vb_upload_ns: i128 = 0,
+    draw_vb_ns: i128 = 0,
+};
+
+pub const RSSetViewportsFn = *const fn (?*c.ID3D11DeviceContext, c.UINT, [*c]const c.D3D11_VIEWPORT) callconv(.c) void;
+
+/// Base viewport state for per-row viewport Y translation.
+/// When origin_row != current draw row, the viewport TopLeftY is offset to
+/// reuse the existing VB without re-uploading (same pattern as macOS shader translation).
+pub const BaseViewport = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+pub fn drawSurfaceRowsVB(
+    g: *d3d11.Renderer,
+    row_verts: []RowVerts,
+    rows_to_draw: ?[]const u32,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+    rs_set_vp_fn: ?RSSetViewportsFn,
+    base_vp: BaseViewport,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    row_h_px: i32,
+    log_enabled: bool,
+    metrics: *SurfaceRowDrawMetrics,
+) void {
+    const row_count: usize = if (rows_to_draw) |rows| rows.len else row_verts.len;
+    var vp_dirty = false; // Track whether viewport was modified from base
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const row: u32 = if (rows_to_draw) |rows| rows[i] else @intCast(i);
+        if (row >= row_verts.len) {
+            metrics.skipped_empty += 1;
+            continue;
+        }
+
+        const rv = &row_verts[@intCast(row)];
+        const src = rv.verts.items;
+        if (src.len == 0) {
+            metrics.skipped_empty += 1;
+            if (metrics.first_empty_row == null) {
+                metrics.first_empty_row = row;
+            }
+            continue;
+        }
+
+        if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(Vertex)) {
+            const need_bytes = src.len * @sizeOf(Vertex);
+            const t_upload_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+            _ = ensureRowVBReady(g, rv, src) catch {
+                metrics.skipped_empty += 1;
+                continue;
+            };
+            if (log_enabled) {
+                metrics.vb_upload_ns += std.time.nanoTimestamp() - t_upload_start;
+            }
+            metrics.vb_upload_rows += 1;
+            metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
+        }
+
+        if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
+            const top = y_offset + @as(i32, @intCast(row)) * row_h_px;
+            const bottom = top + row_h_px;
+            var sc: c.D3D11_RECT = .{
+                .left = x_offset,
+                .top = top,
+                .right = content_right,
+                .bottom = bottom,
+            };
+            rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+
+            // Viewport Y translation: reuse VB from a different row position.
+            // origin_row records where the vertices were generated. If it differs
+            // from the current draw row, offset the viewport to compensate.
+            // Sign: row > origin_row means vertex was generated for a higher row
+            // (smaller Y in screen coords), so shift viewport UP (negative delta).
+            // D3D11 viewport: TopLeftY + delta moves rendered pixels DOWN when delta > 0.
+            // macOS equivalent: translationY = (sourceRow - logicalRow) * cellH / vpH * 2.0
+            if (rs_set_vp_fn) |vp_fn| {
+                const origin_i32: i32 = @intCast(rv.origin_row);
+                const row_i32: i32 = @intCast(row);
+                const row_delta = row_i32 - origin_i32;
+                if (row_delta != 0) {
+                    const delta_px: f32 = @floatFromInt(row_delta * row_h_px);
+                    var vp: c.D3D11_VIEWPORT = .{
+                        .TopLeftX = base_vp.x,
+                        .TopLeftY = base_vp.y + delta_px,
+                        .Width = base_vp.w,
+                        .Height = base_vp.h,
+                        .MinDepth = 0,
+                        .MaxDepth = 1,
+                    };
+                    vp_fn(ctx_ptr, 1, &vp);
+                    vp_dirty = true;
+                } else if (vp_dirty) {
+                    // Restore base viewport.
+                    var vp: c.D3D11_VIEWPORT = .{
+                        .TopLeftX = base_vp.x,
+                        .TopLeftY = base_vp.y,
+                        .Width = base_vp.w,
+                        .Height = base_vp.h,
+                        .MinDepth = 0,
+                        .MaxDepth = 1,
+                    };
+                    vp_fn(ctx_ptr, 1, &vp);
+                    vp_dirty = false;
+                }
+            }
+        }
+
+        const t_draw_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+        g.drawVB(rv.vb.?, src.len) catch {
+            metrics.skipped_empty += 1;
+            continue;
+        };
+        if (log_enabled) {
+            metrics.draw_vb_ns += std.time.nanoTimestamp() - t_draw_start;
+        }
+        metrics.drawn_rows += 1;
+    }
+
+    // Restore base viewport if it was modified during the last row.
+    if (vp_dirty) {
+        if (rs_set_vp_fn) |vp_fn| {
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = base_vp.x,
+                .TopLeftY = base_vp.y,
+                .Width = base_vp.w,
+                .Height = base_vp.h,
+                .MinDepth = 0,
+                .MaxDepth = 1,
+            };
+            vp_fn(ctx_ptr, 1, &vp);
+        }
+    }
+}
+
+/// Shared cursor overlay: upload cursor VB, draw cursor (blink on) or redraw row (blink off).
+/// Used by both main window and external window paint paths after row VB drawing.
+/// Updates last_painted_cursor_row for scroll ghost erasure tracking.
+pub const CursorOverlayParams = struct {
+    cursor_verts: []const Vertex,
+    cursor_row: ?u32,
+    cursor_vb: *?*c.ID3D11Buffer,
+    cursor_vb_bytes: *usize,
+    row_vbs: []RowVB,
+    row_map: []const RowMapping,
+    pool: *const SlotPool,
+    blink_visible: bool,
+    x_offset: i32 = 0,
+    y_offset: i32 = 0,
+    content_right: i32,
+    content_height: u32,
+    row_h_px: i32,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+    last_painted_cursor_row: *?u32,
+};
+
+pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
+    const log_enabled = applog.isEnabled();
+
+    if (p.cursor_verts.len == 0) {
+        // No cursor verts — clear tracking.
+        p.last_painted_cursor_row.* = null;
+        if (log_enabled) applog.appLog("[cursor-overlay] no cursor verts\n", .{});
+        return;
+    }
+
+    if (p.row_h_px <= 0) return;
+
+    // 1. Upload cursor verts to VB.
+    const need_bytes: usize = p.cursor_verts.len * @sizeOf(Vertex);
+    g.ensureExternalVertexBuffer(p.cursor_vb, p.cursor_vb_bytes, need_bytes) catch return;
+    const vb = p.cursor_vb.* orelse return;
+    g.uploadVertsToVB(vb, p.cursor_verts) catch return;
+
+    // 2. Resolve cursor row: use explicit value or compute from vertex NDC positions.
+    const cursor_row: u32 = p.cursor_row orelse blk: {
+        // Compute from cursor vertex center Y (NDC → pixel → row).
+        var min_y: f32 = p.cursor_verts[0].position[1];
+        var max_y: f32 = min_y;
+        for (p.cursor_verts[1..]) |v| {
+            if (v.position[1] < min_y) min_y = v.position[1];
+            if (v.position[1] > max_y) max_y = v.position[1];
+        }
+        const center_ndc_y = (min_y + max_y) * 0.5;
+        const h_f: f32 = @floatFromInt(p.content_height);
+        const pixel_y: f32 = (1.0 - center_ndc_y) * 0.5 * h_f;
+        const row_i: i32 = @intFromFloat(@floor(pixel_y / @as(f32, @floatFromInt(p.row_h_px))));
+        if (row_i < 0) break :blk 0;
+        break :blk @intCast(row_i);
+    };
+
+    // 3. Set scissor to cursor row.
+    if (p.rs_set_sc_fn) |f| {
+        const top_px: i32 = p.y_offset + @as(i32, @intCast(cursor_row)) * p.row_h_px;
+        const bottom_px: i32 = top_px + p.row_h_px;
+        var sc: c.D3D11_RECT = .{
+            .left = p.x_offset,
+            .top = top_px,
+            .right = p.content_right,
+            .bottom = bottom_px,
+        };
+        f(p.ctx_ptr, 1, &sc);
+    }
+
+    // 4. Blink on: draw cursor VB. Blink off: redraw row VB to erase cursor.
+    if (p.blink_visible) {
+        if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
+        g.drawVB(vb, p.cursor_verts.len) catch {};
+    } else {
+        if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
+        if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
+            const rvb = &p.row_vbs[cursor_row];
+            const mapping = p.row_map[cursor_row];
+            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slots.items[mapping.slot].verts.items.len else 0;
+            if (rvb.vb) |row_vb| {
+                if (slot_verts_len > 0) {
+                    g.drawVB(row_vb, slot_verts_len) catch {};
+                }
+            }
+        }
+    }
+
+    // 5. Update tracking for scroll ghost erasure.
+    if (p.blink_visible) {
+        p.last_painted_cursor_row.* = cursor_row;
+    } else {
+        p.last_painted_cursor_row.* = null;
+    }
+}
+
+/// Draw scrollbar overlay into the current render target.
+/// Uploads scrollbar vertices to a dedicated VB and draws them at full viewport.
+/// Used by both main window and external window paint paths after row/flat drawing.
+pub fn drawScrollbarOverlay(
+    g: *d3d11.Renderer,
+    vb_ptr: *?*c.ID3D11Buffer,
+    vb_bytes_ptr: *usize,
+    scrollbar_verts: []const Vertex,
+) void {
+    if (scrollbar_verts.len == 0) return;
+    g.setFullViewport();
+    const need_bytes = scrollbar_verts.len * @sizeOf(Vertex);
+    g.ensureExternalVertexBuffer(vb_ptr, vb_bytes_ptr, need_bytes) catch return;
+    const vb = vb_ptr.* orelse return;
+    g.uploadVertsToVB(vb, scrollbar_verts) catch return;
+    g.drawVB(vb, scrollbar_verts.len) catch {};
+}
+
+/// Draw bloom/glow post-process overlay.
+/// Applies neon glow effect using the provided bloom and cursor vertices.
+/// Caller decides which cursor verts to pass (e.g. empty slice when cursor is blink-hidden).
+pub fn drawBloomOverlay(
+    g: *d3d11.Renderer,
+    bloom_verts: []const Vertex,
+    cursor_verts: []const Vertex,
+    glow_intensity: f32,
+    draw_params: RowModeDrawParams,
+) void {
+    if (bloom_verts.len == 0) return;
+    const bvp = draw_params.bloomViewport(g.width);
+    g.drawBloomFromVerts(bloom_verts, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
+}
 
 /// Pending glyph entry for deferred atlas population
 /// (used when glyph is requested before atlas is ready)
@@ -656,14 +2340,21 @@ pub const App = struct {
     // Keep the exact C-compatible layout for renderer: core.TextRun (scalars is a pointer).
     text_runs: std.ArrayListUnmanaged(TextRun) = .{},
 
-    // Vertices path (match macOS)
-    main_verts: std.ArrayListUnmanaged(Vertex) = .{},
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    // Main surface vertex state (shared structure with external windows).
+    // paint_full=false: main window uses explicit dirty tracking; external windows default to true.
+    surface: SurfaceState = .{ .paint_full = false },
+
+    // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
+    tbs: TripleBufferedSurface = .{},
+    // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
+    // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
     last_cursor_rect_px: ?c.RECT = null,
-
-    // Row-mode vertex storage (like macOS rowVertexBuffers/Counts)
-    row_verts: std.ArrayListUnmanaged(RowVerts) = .{},
+    // Row index where cursor was last painted into back_tex.
+    // Used by scrollBackTex to erase cursor ghost before shifting.
+    last_painted_cursor_row: ?u32 = null,
 
     // Scratch buffer for WM_PAINT(row): per-row vertex copy.
     // Reused to avoid per-paint alloc/free.
@@ -682,13 +2373,15 @@ pub const App = struct {
 
     cursor: ?Cursor = null,
 
-    dirty_rows: std.AutoHashMapUnmanaged(u32, void) = .{},
-    row_mode: bool = false,
     row_mode_max_row_end: u32 = 0,
 
     // ---- NEW: self-managed damage queue (avoid OS update region dependency) ----
     paint_rects: std.ArrayListUnmanaged(c.RECT) = .{},
-    paint_full: bool = false,
+
+    // Set by vertex callbacks when dirty state changes during a flush.
+    // Checked and cleared by onFlushEnd to decide whether to InvalidateRect.
+    // Skips InvalidateRect for flushes with no visual changes (e.g. msg_showcmd-only).
+    flush_needs_invalidate: bool = false,
 
     // Scrollbar update coalescing: set by on_flush_end (core thread), cleared by WM_APP_UPDATE_SCROLLBAR (UI thread).
     scrollbar_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -728,9 +2421,6 @@ pub const App = struct {
     row_valid: std.DynamicBitSetUnmanaged = .{},
     row_valid_count: u32 = 0,
     row_layout_gen: u64 = 0,
-
-    rows: u32 = 0,
-    cols: u32 = 0,
 
     linespace_px: u32 = 0,
 
@@ -892,16 +2582,16 @@ pub const App = struct {
         }
 
         const need: usize = @intCast(row + 1);
-        if (self.row_verts.items.len >= need) return;
+        if (self.surface.row_verts.items.len >= need) return;
 
         // grow row_verts to (row+1)
-        const old_len = self.row_verts.items.len;
-        self.row_verts.resize(self.alloc, need) catch return;
+        const old_len = self.surface.row_verts.items.len;
+        self.surface.row_verts.resize(self.alloc, need) catch return;
 
         // init new slots
         var i: usize = old_len;
         while (i < need) : (i += 1) {
-            self.row_verts.items[i] = .{};
+            self.surface.row_verts.items[i] = .{};
         }
     }
 
@@ -910,13 +2600,13 @@ pub const App = struct {
         if (needed_rows == 0) return;
         const needed: usize = @intCast(needed_rows);
         // Only shrink if array is more than 2x the needed size
-        if (self.row_verts.items.len > needed * 2) {
+        if (self.surface.row_verts.items.len > needed * 2) {
             // Free excess RowVerts' inner arrays
-            for (self.row_verts.items[needed..]) |*rv| {
+            for (self.surface.row_verts.items[needed..]) |*rv| {
                 rv.verts.deinit(self.alloc);
             }
-            self.row_verts.shrinkRetainingCapacity(needed);
-            if (applog.isEnabled()) applog.appLog("[win] shrunk row_verts from {d} to {d}\n", .{ self.row_verts.items.len + (self.row_verts.items.len - needed), needed });
+            self.surface.row_verts.shrinkRetainingCapacity(needed);
+            if (applog.isEnabled()) applog.appLog("[win] shrunk row_verts from {d} to {d}\n", .{ self.surface.row_verts.items.len + (self.surface.row_verts.items.len - needed), needed });
         }
     }
 
@@ -1054,22 +2744,25 @@ pub const App = struct {
         // Bg spans
         self.bg_spans.deinit(self.alloc);
 
-        self.main_verts.deinit(self.alloc);
-        self.cursor_verts.deinit(self.alloc);
-
-        // Row-mode vertex storage
-        for (self.row_verts.items) |*rv| {
-            // Release per-row VB if any
+        // Main surface: release GPU VBs from row_verts, then CPU state
+        for (self.surface.row_verts.items) |*rv| {
             if (rv.vb) |p| {
                 const rel = p.*.lpVtbl.*.Release orelse null;
                 if (rel) |f| _ = f(p);
-                rv.vb = null;
-                rv.vb_bytes = 0;
             }
-
-            rv.verts.deinit(self.alloc);
         }
-        self.row_verts.deinit(self.alloc);
+        self.surface.deinitCpuState(self.alloc);
+
+        // Triple-buffered surface cleanup (handles slot release + pool deinit)
+        self.tbs.deinit(self.alloc);
+        // Release GPU VBs for TBS row_vbs
+        for (self.row_vbs.items) |*vb| {
+            if (vb.vb) |p| {
+                const rel = p.*.lpVtbl.*.Release orelse null;
+                if (rel) |f| _ = f(p);
+            }
+        }
+        self.row_vbs.deinit(self.alloc);
 
         // WM_PAINT(row) scratch
         self.row_tmp_verts.deinit(self.alloc);
@@ -1084,8 +2777,6 @@ pub const App = struct {
             self.cursor_vb = null;
             self.cursor_vb_bytes = 0;
         }
-
-        self.dirty_rows.deinit(self.alloc);
 
         // IME state cleanup
         self.ime_composition_str.deinit(self.alloc);
@@ -1423,7 +3114,7 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const cw: u32 = @max(1, app.cell_w_px);
     const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
 
-    applog.appLog(
+    if (applog.isEnabled()) applog.appLog(
         "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
         .{ w, h, cw, ch },
     );
@@ -1476,9 +3167,9 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     const rows: u32 = @intCast(@max(1, h / ch));
     const cols: u32 = @intCast(@max(1, w / cw));
 
-    if (rows != app.rows or cols != app.cols) {
-        app.rows = rows;
-        app.cols = cols;
+    if (rows != app.surface.rows or cols != app.surface.cols) {
+        app.surface.rows = rows;
+        app.surface.cols = cols;
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
@@ -1491,11 +3182,11 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
             app.row_valid.unsetAll();
         }
         // Clear old row vertex data to prevent ghost rendering from stale vertices.
-        for (app.row_verts.items) |*rv| {
+        for (app.surface.row_verts.items) |*rv| {
             rv.verts.clearRetainingCapacity();
             rv.gen +%= 1;
         }
-        applog.appLog(
+        if (applog.isEnabled()) applog.appLog(
             "[win] bootstrap rows/cols from client rows={d} cols={d} cell={d}x{d} client={d}x{d} row_mode_max_row_end=0\n",
             .{ rows, cols, cw, ch, w, h },
         );

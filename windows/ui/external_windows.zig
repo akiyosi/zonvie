@@ -10,6 +10,516 @@ const input = @import("../input.zig");
 const messages = @import("messages.zig");
 const core = @import("zonvie_core");
 
+const ExternalSurfaceKind = enum {
+    normal,
+    cmdline,
+    popupmenu,
+    msg_show,
+    msg_history,
+};
+
+fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
+    return switch (grid_id) {
+        app_mod.CMDLINE_GRID_ID => .cmdline,
+        app_mod.POPUPMENU_GRID_ID => .popupmenu,
+        app_mod.MESSAGE_GRID_ID => .msg_show,
+        app_mod.MSG_HISTORY_GRID_ID => .msg_history,
+        else => .normal,
+    };
+}
+
+fn drawDecoratedExternalSurface(
+    kind: ExternalSurfaceKind,
+    g: *d3d11.Renderer,
+    app: *App,
+    grid_id: i64,
+    verts: []const app_mod.Vertex,
+    vert_count: usize,
+    cmdline_firstc: u8,
+    glow_enabled: bool,
+    glow_intensity: f32,
+) !void {
+    switch (kind) {
+        .cmdline => {
+            const window_w: f32 = @floatFromInt(g.width);
+            const window_h: f32 = @floatFromInt(g.height);
+
+            app.mu.lock();
+            const ext_win_relookup = app.external_windows.getPtr(grid_id);
+            const content_rows = if (ext_win_relookup) |ew| ew.surface.rows else 0;
+            const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
+            const cell_w = app.cell_w_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
+            const hide_cursor_for_ime = app.ime_composing;
+            const border_r = app.cmdline_border_color[0];
+            const border_g = app.cmdline_border_color[1];
+            const border_b = app.cmdline_border_color[2];
+            const icon_r = app.cmdline_icon_color[0];
+            const icon_g = app.cmdline_icon_color[1];
+            const icon_b = app.cmdline_icon_color[2];
+            app.mu.unlock();
+
+            if (content_rows == 0 or content_cols == 0) return;
+
+            const content_w: f32 = @floatFromInt(content_cols * cell_w);
+            const content_h: f32 = @floatFromInt(content_rows * cell_h);
+            if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
+                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                return;
+            }
+
+            const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
+            const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
+            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
+            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
+            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
+            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
+            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
+            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+
+            const extra_verts = 6 + 24 + 20;
+            var cmdline_verts = try app.alloc.alloc(app_mod.Vertex, vert_count + extra_verts);
+            defer app.alloc.free(cmdline_verts);
+
+            var orig_bg_r: f32 = 0.0;
+            var orig_bg_g: f32 = 0.0;
+            var orig_bg_b: f32 = 0.0;
+            var found_bg_vertex = false;
+            for (verts[0..vert_count]) |v| {
+                if (v.texCoord[0] < 0) {
+                    orig_bg_r = v.color[0];
+                    orig_bg_g = v.color[1];
+                    orig_bg_b = v.color[2];
+                    found_bg_vertex = true;
+                    break;
+                }
+            }
+            if (!found_bg_vertex) {
+                app.mu.lock();
+                if (app.external_windows.getPtr(grid_id)) |ew| {
+                    if (ew.cached_bg_color) |cached| {
+                        orig_bg_r = cached[0];
+                        orig_bg_g = cached[1];
+                        orig_bg_b = cached[2];
+                    }
+                }
+                app.mu.unlock();
+            } else {
+                app.mu.lock();
+                if (app.external_windows.getPtr(grid_id)) |ew| {
+                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                }
+                app.mu.unlock();
+            }
+
+            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
+            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg_tex: [2]f32 = .{ -1.0, -1.0 };
+            var bg_idx: usize = 0;
+            bg_idx = app_mod.addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
+
+            const tolerance: f32 = 0.005;
+            for (verts[0..vert_count], 0..) |v, i| {
+                const dest_idx = bg_idx + i;
+                cmdline_verts[dest_idx] = v;
+                cmdline_verts[dest_idx].position[0] = v.position[0] * scale_x + offset_x;
+                cmdline_verts[dest_idx].position[1] = v.position[1] * scale_y + offset_y;
+                if ((v.deco_flags & core.DECO_CURSOR) != 0) {
+                    if (hide_cursor_for_ime) cmdline_verts[dest_idx].color[3] = 0.0;
+                    continue;
+                }
+                if (v.texCoord[0] < 0) {
+                    const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
+                        @abs(v.color[1] - orig_bg_g) < tolerance and
+                        @abs(v.color[2] - orig_bg_b) < tolerance;
+                    if (matches_bg) cmdline_verts[dest_idx].color[3] = 0.0;
+                }
+            }
+
+            var extra_idx: usize = bg_idx + vert_count;
+            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
+            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
+            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
+            const border_tex: [2]f32 = .{ -1.0, -1.0 };
+            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+
+            const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
+            const icon_x_px: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT);
+            const icon_y_px: f32 = (window_h - @as(f32, @floatFromInt(app_mod.CMDLINE_ICON_SIZE))) / 2.0;
+            const icon_size_px: f32 = @floatFromInt(app_mod.CMDLINE_ICON_SIZE);
+            const icon_x_ndc: f32 = icon_x_px / (window_w / 2.0) - 1.0;
+            const icon_y_ndc: f32 = 1.0 - icon_y_px / (window_h / 2.0);
+            const icon_w_ndc: f32 = icon_size_px / (window_w / 2.0);
+            const icon_h_ndc: f32 = icon_size_px / (window_h / 2.0);
+            if (cmdline_firstc == '/' or cmdline_firstc == '?') {
+                extra_idx = app_mod.addSearchIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
+            } else {
+                extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
+            }
+
+            try g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
+            if (glow_enabled) {
+                g.drawBloomFromVerts(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
+            }
+        },
+        .popupmenu => {
+            const window_w: f32 = @floatFromInt(g.width);
+            const window_h: f32 = @floatFromInt(g.height);
+            if (!(window_w > 0 and window_h > 0)) {
+                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                return;
+            }
+
+            const extra_verts = 24;
+            var pum_verts = try app.alloc.alloc(app_mod.Vertex, vert_count + extra_verts);
+            defer app.alloc.free(pum_verts);
+            @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
+
+            app.mu.lock();
+            const border_r = app.cmdline_border_color[0];
+            const border_g = app.cmdline_border_color[1];
+            const border_b = app.cmdline_border_color[2];
+            app.mu.unlock();
+
+            var extra_idx: usize = vert_count;
+            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
+            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
+            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
+            const border_tex: [2]f32 = .{ -1.0, -1.0 };
+            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+
+            try g.draw(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
+            if (glow_enabled) {
+                g.drawBloomFromVerts(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
+            }
+        },
+        .msg_show, .msg_history => {
+            const window_w: f32 = @floatFromInt(g.width);
+            const window_h: f32 = @floatFromInt(g.height);
+
+            app.mu.lock();
+            const ext_win_relookup2 = app.external_windows.getPtr(grid_id);
+            const content_rows = if (ext_win_relookup2) |ew| ew.surface.rows else 0;
+            const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
+            const cell_w = app.cell_w_px;
+            const cell_h = app.cell_h_px + app.linespace_px;
+            app.mu.unlock();
+            if (content_rows == 0 or content_cols == 0) return;
+
+            const content_w: f32 = @floatFromInt(content_cols * cell_w);
+            const content_h: f32 = @floatFromInt(content_rows * cell_h);
+            if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
+                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                return;
+            }
+
+            const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
+            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
+            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
+            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
+            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
+            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
+            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+
+            var msg_verts = try app.alloc.alloc(app_mod.Vertex, vert_count + 6);
+            defer app.alloc.free(msg_verts);
+
+            var orig_bg_r: f32 = 0.0;
+            var orig_bg_g: f32 = 0.0;
+            var orig_bg_b: f32 = 0.0;
+            var found_bg_vertex = false;
+            for (verts[0..vert_count]) |v| {
+                if (v.texCoord[0] < 0) {
+                    orig_bg_r = v.color[0];
+                    orig_bg_g = v.color[1];
+                    orig_bg_b = v.color[2];
+                    found_bg_vertex = true;
+                    break;
+                }
+            }
+            if (!found_bg_vertex) {
+                app.mu.lock();
+                if (app.external_windows.getPtr(grid_id)) |ew| {
+                    if (ew.cached_bg_color) |cached| {
+                        orig_bg_r = cached[0];
+                        orig_bg_g = cached[1];
+                        orig_bg_b = cached[2];
+                    }
+                }
+                app.mu.unlock();
+            } else {
+                app.mu.lock();
+                if (app.external_windows.getPtr(grid_id)) |ew| {
+                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
+                }
+                app.mu.unlock();
+            }
+
+            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
+            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg_tex: [2]f32 = .{ -1.0, -1.0 };
+            var bg_idx: usize = 0;
+            bg_idx = app_mod.addRectVerts(msg_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
+
+            const tolerance: f32 = 0.005;
+            for (verts[0..vert_count], 0..) |v, i| {
+                msg_verts[bg_idx + i] = v;
+                msg_verts[bg_idx + i].position[0] = v.position[0] * scale_x + offset_x;
+                msg_verts[bg_idx + i].position[1] = v.position[1] * scale_y + offset_y;
+                if ((v.deco_flags & core.DECO_CURSOR) != 0) continue;
+                if (v.texCoord[0] < 0) {
+                    const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
+                        @abs(v.color[1] - orig_bg_g) < tolerance and
+                        @abs(v.color[2] - orig_bg_b) < tolerance;
+                    if (matches_bg) msg_verts[bg_idx + i].color[3] = 0.0;
+                }
+            }
+
+            const msg_total = bg_idx + vert_count;
+            try g.draw(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null);
+            if (glow_enabled) {
+                g.drawBloomFromVerts(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
+            }
+        },
+        .normal => unreachable,
+    }
+}
+
+fn drawNormalExternalSurface(
+    g: *d3d11.Renderer,
+    app: *App,
+    ext_win: *app_mod.ExternalWindow,
+    tbs_committed: *const app_mod.VertexSet,
+    grid_id: i64,
+    verts: []const app_mod.Vertex,
+    vert_count: usize,
+    cursor_blink_visible: bool,
+    scrollbar_alpha: f32,
+    dirty_row_keys: []u32,
+    force_full: bool,
+    glow_enabled: bool,
+    glow_intensity: f32,
+    tbs_snap: app_mod.PaintSnapshot,
+) !void {
+    const log_enabled = applog.isEnabled();
+
+    // Row-mode path: use per-row VB rendering with scissor (same as main window).
+    if (tbs_committed.row_mode) {
+        try drawNormalExternalSurfaceRowMode(
+            g,
+            app,
+            ext_win,
+            tbs_committed,
+            grid_id,
+            cursor_blink_visible,
+            scrollbar_alpha,
+            dirty_row_keys,
+            force_full,
+            glow_enabled,
+            glow_intensity,
+            tbs_snap,
+        );
+        return;
+    }
+
+    // Flat-mode fallback: snapshot-based flat draw (decorated surfaces or non-row-mode).
+    if (log_enabled) applog.appLog("[win] drawNormalExternalSurface: flat mode grid_id={d}\n", .{grid_id});
+
+    var scrollbar_verts: [12]app_mod.Vertex = undefined;
+    var scrollbar_vert_count: usize = 0;
+
+    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
+        scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
+            app,
+            scrollbar_alpha,
+            grid_id,
+            @intCast(g.width),
+            @intCast(g.height),
+            &scrollbar_verts,
+        );
+    }
+
+    try app_mod.drawExternalSurfaceFlat(
+        g,
+        &ext_win.flat_draw_scratch,
+        app.alloc,
+        verts,
+        vert_count,
+        cursor_blink_visible,
+        scrollbar_verts[0..scrollbar_vert_count],
+        glow_enabled,
+        glow_intensity,
+    );
+}
+
+/// Row-mode VB rendering for normal external windows.
+/// Uses TBS committed set + drawRowModeSetupAndRowsFromSlots for lock-free rendering.
+/// Then handles cursor overlay, scrollbar overlay, and bloom post-process.
+fn drawNormalExternalSurfaceRowMode(
+    g: *d3d11.Renderer,
+    app: *App,
+    ext_win: *app_mod.ExternalWindow,
+    tbs_committed: *const app_mod.VertexSet,
+    grid_id: i64,
+    cursor_blink_visible: bool,
+    scrollbar_alpha: f32,
+    dirty_row_keys: []u32,
+    force_full: bool,
+    glow_enabled: bool,
+    glow_intensity: f32,
+    tbs_snap: app_mod.PaintSnapshot,
+) !void {
+    const log_enabled = applog.isEnabled();
+    const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
+    const row_h_px: i32 = @intCast(fallback_row_h);
+    const content_right: i32 = @intCast(g.width);
+
+    // back_tex is persistent, so we only need to redraw dirty rows.
+    // The full back_tex→swapchain copy in presentOnlyFromBack handles
+    // FLIP_SEQUENTIAL buffer rotation (swapchain buffers don't retain
+    // previous content, but back_tex does).
+    const force_full_rows = force_full;
+
+    // Build sorted, deduplicated rows_to_draw list.
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .{};
+    defer rows_to_draw.deinit(app.alloc);
+
+    const ext_rows = tbs_committed.rows;
+    app_mod.computeRowsToDraw(
+        app.alloc,
+        &rows_to_draw,
+        force_full_rows,
+        dirty_row_keys,
+        ext_rows,
+        ext_rows, // max_valid_row = total rows (no row_verts_len / rows mismatch on ext)
+    );
+
+    const has_cursor = tbs_committed.cursor_verts.items.len > 0;
+    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor) {
+        if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
+        return;
+    }
+
+    const draw_params = app_mod.RowModeDrawParams{
+        .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
+        .row_h_px = row_h_px,
+        .content_right = content_right,
+        .preserve_back = !force_full_rows,
+        .glow_enabled = glow_enabled,
+    };
+
+    var bloom_verts: std.ArrayListUnmanaged(app_mod.Vertex) = .{};
+    defer bloom_verts.deinit(app.alloc);
+
+    // Ensure row_vbs array covers committed set's row count.
+    {
+        const need_len = tbs_committed.row_map.items.len;
+        if (ext_win.row_vbs.items.len < need_len) {
+            const old_len = ext_win.row_vbs.items.len;
+            ext_win.row_vbs.resize(app.alloc, need_len) catch {};
+            for (ext_win.row_vbs.items[old_len..]) |*rvb| {
+                rvb.* = .{};
+            }
+        }
+    }
+
+    // Apply scroll pixel shift (shared with main window).
+    // Scroll state is bundled in tbs_snap, atomically consistent with committed set.
+    if (!force_full_rows) {
+        if (tbs_snap.scroll_rect) |sr| {
+            _ = app_mod.applyScrollShift(
+                g,
+                app.alloc,
+                ext_win.row_vbs.items,
+                &rows_to_draw,
+                sr,
+                tbs_snap.scroll_dy_px,
+                tbs_snap.vb_shift,
+                &ext_win.last_painted_cursor_row,
+                row_h_px,
+                ext_rows,
+                0, // no content_y_offset for external windows
+            );
+        }
+    } else {
+        // Consume pending shift state to avoid stale accumulation.
+        if (tbs_snap.vb_shift != 0) {
+            app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, 0, @intCast(ext_win.row_vbs.items.len));
+        }
+    }
+
+    // TBS lock-free draw: committed set is protected by refcount,
+    // no app.mu needed during VB upload + draw.
+    const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
+        g,
+        app.alloc,
+        tbs_committed.row_map.items,
+        &ext_win.tbs.pool,
+        ext_win.row_vbs.items,
+        rows_to_draw.items,
+        &bloom_verts,
+        draw_params,
+    );
+
+    if (log_enabled) {
+        applog.appLog(
+            "[win] drawNormalExtRowMode: grid_id={d} drawn={d} skipped={d} rows_to_draw={d}\n",
+            .{ grid_id, result.metrics.drawn_rows, result.metrics.skipped_empty, rows_to_draw.items.len },
+        );
+    }
+
+    // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
+    app_mod.drawCursorOverlay(g, .{
+        .cursor_verts = tbs_committed.cursor_verts.items,
+        .cursor_row = tbs_committed.last_cursor_row,
+        .cursor_vb = &ext_win.cursor_vb,
+        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
+        .row_vbs = ext_win.row_vbs.items,
+        .row_map = tbs_committed.row_map.items,
+        .pool = &ext_win.tbs.pool,
+        .blink_visible = cursor_blink_visible,
+        .content_right = content_right,
+        .content_height = draw_params.content_height,
+        .row_h_px = row_h_px,
+        .ctx_ptr = result.ctx_ptr,
+        .rs_set_sc_fn = result.rs_set_sc_fn,
+        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
+    });
+
+    // Scrollbar overlay.
+    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
+        var scrollbar_verts: [12]app_mod.Vertex = undefined;
+        const scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
+            app,
+            scrollbar_alpha,
+            grid_id,
+            @intCast(g.width),
+            @intCast(g.height),
+            &scrollbar_verts,
+        );
+        app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+    }
+
+    // Bloom/glow post-process.
+    // Cursor verts are stored separately (not in row_verts/bloom_verts).
+    // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
+    if (glow_enabled) {
+        const bloom_cursor = if (cursor_blink_visible) ext_win.flat_draw_scratch.items else &[_]app_mod.Vertex{};
+        app_mod.drawBloomOverlay(g, bloom_verts.items, bloom_cursor, glow_intensity, draw_params);
+    }
+}
+
 pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_external_window: grid_id={d} win={d} rows={d} cols={d} pos=({d},{d})\n", .{ grid_id, win, rows, cols, start_row, start_col });
@@ -170,8 +680,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 const px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)));
 
                 pos_x = client_pt.x + px_x;
-                // For popupmenu: position 1 row above the anchor position
-                pos_y = client_pt.y + px_y - if (is_popupmenu) @as(c_int, @intCast(cell_h)) else 0;
+                if (is_popupmenu) {
+                    pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, ahwnd);
+                } else {
+                    pos_y = client_pt.y + px_y;
+                }
                 if (applog.isEnabled()) applog.appLog("[win] external window position from anchor ext_win={d}: ({d},{d}) cell=({d},{d})\n", .{ req.win, pos_x, pos_y, req.start_col, req.start_row });
             }
         } else if (app.hwnd) |main_hwnd| {
@@ -192,8 +705,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 }
 
                 pos_x = client_pt.x + px_x;
-                // For popupmenu: position 1 row above the anchor position
-                pos_y = client_pt.y + px_y - if (is_popupmenu) @as(c_int, @intCast(cell_h)) else 0;
+                if (is_popupmenu) {
+                    pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, main_hwnd);
+                } else {
+                    pos_y = client_pt.y + px_y;
+                }
                 if (applog.isEnabled()) applog.appLog("[win] external window position from win_pos: ({d},{d}) cell=({d},{d}) ext_tabline={}\n", .{ pos_x, pos_y, req.start_col, req.start_row, app.ext_tabline_enabled });
             }
         }
@@ -363,8 +879,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         .hwnd = hwnd.?,
         .win_id = req.win,
         .renderer = renderer,
-        .rows = req.rows,
-        .cols = req.cols,
+        .surface = .{ .rows = req.rows, .cols = req.cols },
     };
 
     app.external_windows.put(app.alloc, req.grid_id, ext_window) catch |e| {
@@ -415,17 +930,70 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     if (pending_idx) |idx| {
         const pv = &app.pending_external_verts.items[idx];
-        if (applog.isEnabled()) applog.appLog("[win] applying pending vertices for grid_id={d}: vert_count={d}\n", .{ req.grid_id, pv.verts.items.len });
+        if (applog.isEnabled()) applog.appLog("[win] applying pending vertices for grid_id={d}: vert_count={d} row_mode={}\n", .{ req.grid_id, pv.surface.verts.items.len, pv.surface.row_mode });
 
         if (app.external_windows.getPtr(req.grid_id)) |ext_win| {
-            // Copy vertices from pending to window
-            ext_win.verts.clearRetainingCapacity();
-            ext_win.verts.ensureTotalCapacity(app.alloc, pv.verts.items.len) catch {};
-            ext_win.verts.appendSliceAssumeCapacity(pv.verts.items);
-            ext_win.vert_count = pv.verts.items.len;
-            ext_win.rows = pv.rows;
-            ext_win.cols = pv.cols;
+            ext_win.surface.row_mode = pv.surface.row_mode;
+            ext_win.surface.rows = pv.surface.rows;
+            ext_win.surface.cols = pv.surface.cols;
             ext_win.needs_redraw = true;
+
+            if (pv.surface.row_mode) {
+                ext_win.surface.verts.clearRetainingCapacity();
+                var row_idx: usize = 0;
+                while (row_idx < pv.surface.row_verts.items.len) : (row_idx += 1) {
+                    ext_win.surface.ensureRowStorage(app.alloc, @intCast(row_idx));
+                    ext_win.surface.row_verts.items[row_idx].verts.clearRetainingCapacity();
+                    if (pv.surface.row_verts.items[row_idx].verts.items.len != 0) {
+                        ext_win.surface.row_verts.items[row_idx].verts.appendSlice(app.alloc, pv.surface.row_verts.items[row_idx].verts.items) catch {};
+                    }
+                    // Copy gen and origin_row so VB upload and viewport Y
+                    // translation work correctly for pending rows.
+                    ext_win.surface.row_verts.items[row_idx].gen = pv.surface.row_verts.items[row_idx].gen;
+                    ext_win.surface.row_verts.items[row_idx].origin_row = pv.surface.row_verts.items[row_idx].origin_row;
+                }
+                ext_win.surface.clearExtraRows(pv.surface.rows);
+                ext_win.recomputeVertCount();
+            } else {
+                ext_win.surface.verts.clearRetainingCapacity();
+                ext_win.surface.verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch {};
+                ext_win.surface.verts.appendSliceAssumeCapacity(pv.surface.verts.items);
+                ext_win.vert_count = pv.surface.verts.items.len;
+            }
+
+            // TBS: seed the initial committed set so paintExternalWindow can read data immediately.
+            // The ext_win was just created; no flush has committed data to TBS yet.
+            {
+                const ci = ext_win.tbs.committed_index;
+                const cs = &ext_win.tbs.sets[ci];
+                cs.row_mode = pv.surface.row_mode;
+                cs.rows = pv.surface.rows;
+                cs.cols = pv.surface.cols;
+                if (pv.surface.row_mode) {
+                    cs.ensureRowStorage(app.alloc, @intCast(if (pv.surface.row_verts.items.len > 0) pv.surface.row_verts.items.len - 1 else 0));
+                    var ri: usize = 0;
+                    while (ri < pv.surface.row_verts.items.len) : (ri += 1) {
+                        if (ri < cs.row_map.items.len) {
+                            // Allocate a slot and copy pending verts into it.
+                            const new_idx = ext_win.tbs.pool.acquireSlot(app.alloc) orelse continue;
+                            ext_win.tbs.pool.retain(new_idx);
+                            const slot = &ext_win.tbs.pool.slots.items[new_idx];
+                            slot.verts.clearRetainingCapacity();
+                            if (pv.surface.row_verts.items[ri].verts.items.len != 0) {
+                                slot.verts.appendSlice(app.alloc, pv.surface.row_verts.items[ri].verts.items) catch {};
+                            }
+                            slot.origin_row = pv.surface.row_verts.items[ri].origin_row;
+                            slot.ver = pv.surface.row_verts.items[ri].gen;
+                            cs.row_map.items[ri] = .{ .slot = new_idx };
+                        }
+                    }
+                } else {
+                    cs.flat_verts.clearRetainingCapacity();
+                    cs.flat_verts.appendSlice(app.alloc, pv.surface.verts.items) catch {};
+                }
+                // Mark full paint so first acquireForPaint triggers full draw.
+                ext_win.tbs.pending_paint_full = true;
+            }
 
             // Trigger redraw
             _ = c.InvalidateRect(ext_win.hwnd, null, 0);
@@ -571,15 +1139,17 @@ pub fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const app_m
         if (ext_win.is_pending_close) return;
 
         // Check if size changed (for window resize)
-        const size_changed = (ext_win.rows != rows or ext_win.cols != cols);
+        const size_changed = (ext_win.surface.rows != rows or ext_win.surface.cols != cols);
 
         // Window exists, copy vertices to it
-        ext_win.verts.clearRetainingCapacity();
-        ext_win.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
-        ext_win.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
+        ext_win.surface.row_mode = false;
+        ext_win.surface.clearExtraRows(0);
+        ext_win.surface.verts.clearRetainingCapacity();
+        ext_win.surface.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
+        ext_win.surface.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
         ext_win.vert_count = vert_count;
-        ext_win.rows = rows;
-        ext_win.cols = cols;
+        ext_win.surface.rows = rows;
+        ext_win.surface.cols = cols;
         ext_win.needs_redraw = true;
 
         // Note: Background color adjustment for cmdline is done in paintExternalWindow
@@ -692,20 +1262,21 @@ pub fn onExternalVertices(ctx: ?*anyopaque, grid_id: i64, verts: ?[*]const app_m
         if (found_idx) |idx| {
             // Update existing pending entry
             const pv = &app.pending_external_verts.items[idx];
-            pv.verts.clearRetainingCapacity();
-            pv.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
-            pv.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
-            pv.rows = rows;
-            pv.cols = cols;
+            pv.surface.row_mode = false;
+            pv.surface.clearExtraRows(0);
+            pv.surface.verts.clearRetainingCapacity();
+            pv.surface.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
+            pv.surface.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
+            pv.surface.rows = rows;
+            pv.surface.cols = cols;
         } else {
             // Create new pending entry
             var new_pv = app_mod.PendingExternalVertices{
                 .grid_id = grid_id,
-                .rows = rows,
-                .cols = cols,
+                .surface = .{ .row_mode = false, .rows = rows, .cols = cols },
             };
-            new_pv.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
-            new_pv.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
+            new_pv.surface.verts.ensureTotalCapacity(app.alloc, vert_count) catch return;
+            new_pv.surface.verts.appendSliceAssumeCapacity(verts.?[0..vert_count]);
             app.pending_external_verts.append(app.alloc, new_pv) catch return;
         }
     }
@@ -1261,22 +1832,24 @@ pub export fn ExternalWndProc(
                 if (himc != null) {
                     defer _ = c.ImmReleaseContext(hwnd, himc);
 
-                    app.mu.lock();
-                    defer app.mu.unlock();
-
                     // Get composition string
                     if ((lParam & c.GCS_COMPSTR) != 0) {
                         const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
                         if (byte_len > 0) {
                             const char_len: usize = @intCast(@divTrunc(byte_len, 2));
+                            app.mu.lock();
                             app.ime_composition_str.resize(app.alloc, char_len) catch {
+                                app.mu.unlock();
                                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
                             input.updateImeCompositionUtf8(app);
+                            app.mu.unlock();
                         } else {
+                            app.mu.lock();
                             app.ime_composition_str.clearRetainingCapacity();
                             app.ime_composition_utf8.clearRetainingCapacity();
+                            app.mu.unlock();
                         }
                     }
 
@@ -1285,17 +1858,22 @@ pub export fn ExternalWndProc(
                         const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
                         if (clause_byte_len > 0) {
                             const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
+                            app.mu.lock();
                             app.ime_clause_info.resize(app.alloc, clause_count) catch {
+                                app.mu.unlock();
                                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
+                            app.mu.unlock();
                         }
                     }
 
                     // Get cursor position
                     if ((lParam & c.GCS_CURSORPOS) != 0) {
                         const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        if (cursor_pos >= 0) app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
+                        app.mu.lock();
+                        app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
+                        app.mu.unlock();
                     }
 
                     // Get target clause (same logic as main window)
@@ -1308,6 +1886,7 @@ pub export fn ExternalWndProc(
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
 
                             // Find target clause (ATTR_TARGET_CONVERTED=0x01 or ATTR_TARGET_NOTCONVERTED=0x03)
+                            app.mu.lock();
                             app.ime_target_start = 0;
                             app.ime_target_end = 0;
                             var found_start: bool = false;
@@ -1322,11 +1901,13 @@ pub export fn ExternalWndProc(
                                     app.ime_target_end = i + 1;
                                 }
                             }
+                            app.mu.unlock();
                         }
                     }
                 }
 
-                // Update preedit overlay
+                // Update preedit overlay (must be called WITHOUT app.mu held,
+                // because updateImePreeditOverlay acquires app.mu internally).
                 input.updateImePreeditOverlay(hwnd, app);
             }
             // Let DefWindowProc handle for default IME processing
@@ -1460,13 +2041,13 @@ pub fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
                 // the window is being destroyed. We cannot call closeExternalWindowOnUIThread
                 // directly here because that would destroy the window before EndPaint completes.
                 // Leave is_pending_close=true; the window will be cleaned up at process exit.
-                applog.appLog("[win] finishExternalWindowPaint: PostMessageW failed for grid_id={d}, deferring to shutdown\n", .{grid_id});
+                if (applog.isEnabled()) applog.appLog("[win] finishExternalWindowPaint: PostMessageW failed for grid_id={d}, deferring to shutdown\n", .{grid_id});
             }
         } else {
             // Main window is gone (shutdown scenario). We cannot PostMessage, and calling
             // closeExternalWindowOnUIThread directly would destroy the window before EndPaint.
             // Leave is_pending_close=true; the window will be cleaned up at process exit.
-            applog.appLog("[win] finishExternalWindowPaint: main hwnd is null, deferring close for grid_id={d} to shutdown\n", .{grid_id});
+            if (applog.isEnabled()) applog.appLog("[win] finishExternalWindowPaint: main hwnd is null, deferring close for grid_id={d} to shutdown\n", .{grid_id});
         }
     }
 }
@@ -1534,12 +2115,12 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     };
 
     const grid_id = found_grid_id;
-    const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-    const is_popupmenu = (grid_id == app_mod.POPUPMENU_GRID_ID);
-    const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
-    const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
+    const surface_kind = classifyExternalSurface(grid_id);
 
-    if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow found ext_win vert_count={d} grid_id={d} is_cmdline={} is_popupmenu={} is_msg_show={} is_msg_history={}\n", .{ ext_win.vert_count, grid_id, is_cmdline, is_popupmenu, is_msg_show, is_msg_history });
+    if (applog.isEnabled()) applog.appLog(
+        "[win] paintExternalWindow found ext_win vert_count={d} grid_id={d} kind={s}\n",
+        .{ ext_win.vert_count, grid_id, @tagName(surface_kind) },
+    );
 
     // Skip painting if window is pending close (renderer may be freed soon)
     if (ext_win.is_pending_close) {
@@ -1560,26 +2141,58 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     ext_win.paint_ref_count += 1;
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: paint_ref_count++ -> {d}\n", .{ext_win.paint_ref_count});
 
+    // TBS: acquire committed set for painting (lock-free vertex reads).
+    const tbs_snapshot = ext_win.tbs.acquireForPaint();
+    defer {
+        const needs_reinvalidate = ext_win.tbs.releaseFromPaint(tbs_snapshot.committed_index);
+        if (needs_reinvalidate) {
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+    }
+    const tbs_committed = &ext_win.tbs.sets[tbs_snapshot.committed_index];
+
     // Get renderer and atlas
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
-    // Copy vertex data to per-window scratch buffer while holding the lock.
-    // Per-window (not shared) to avoid re-entrancy corruption when DXGI Present
-    // pumps Win32 messages and triggers another external window's WM_PAINT.
+    // Determine rendering mode from TBS committed set.
+    const tbs_row_mode = tbs_committed.row_mode;
+    const is_row_mode_normal = tbs_row_mode and surface_kind == .normal;
+
+    // Snapshot vertex data. Row-mode normal surfaces use TBS committed set
+    // (lock-free via refcount). Decorated surfaces and flat-mode still need snapshot.
     const vert_count = ext_win.vert_count;
-    ext_win.paint_scratch.clearRetainingCapacity();
-    ext_win.paint_scratch.ensureTotalCapacity(app.alloc, vert_count) catch {
-        ext_win.paint_ref_count -= 1;
-        app.mu.unlock();
-        applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
-        return;
-    };
-    ext_win.paint_scratch.appendSliceAssumeCapacity(ext_win.verts.items[0..vert_count]);
+    if (!is_row_mode_normal) {
+        if (!app_mod.snapshotSurfaceRows(
+            app.alloc,
+            &ext_win.paint_scratch,
+            &ext_win.paint_row_ranges,
+            ext_win.surface.row_mode,
+            ext_win.surface.row_verts.items,
+            ext_win.surface.verts.items,
+            vert_count,
+        )) {
+            ext_win.paint_ref_count -= 1;
+            app.mu.unlock();
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
+            return;
+        }
+    }
 
     const cursor_blink_visible = ext_win.cursor_blink_state;
     ext_win.needs_redraw = false;
+
+    // Dirty state snapshot from TBS (row-mode normal windows only).
+    var dirty_row_keys: std.ArrayListUnmanaged(u32) = .{};
+    if (is_row_mode_normal) {
+        var dit = ext_win.tbs.paint_dirty_snapshot.iterator(.{});
+        while (dit.next()) |row_idx| {
+            dirty_row_keys.append(app.alloc, @intCast(row_idx)) catch break;
+        }
+    }
+    const ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
+    ext_win.surface.paint_full = false;
 
     // Check if renderer resize is needed (deferred from onExternalVertices to avoid deadlock)
     const needs_resize = ext_win.needs_renderer_resize;
@@ -1601,7 +2214,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         ext_win.atlas_version = current_atlas_version;
     }
 
+    // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
+
     app.mu.unlock();
+
+    defer dirty_row_keys.deinit(app.alloc);
+
+    // Query glow state from core (thread-safe, no lock needed)
+    const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
+    const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
 
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
@@ -1619,7 +2240,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         // freeing ext_win and invalidating our `g` pointer. We must re-validate after resize.
         if (needs_resize) {
             g.resize() catch |e| {
-                applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
             };
 
             // After resize, DXGI may have pumped messages. Check if ext_win was closed.
@@ -1627,528 +2248,77 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             const still_valid = app.external_windows.contains(grid_id);
             app.mu.unlock();
             if (!still_valid) {
-                applog.appLog("[win] paintExternalWindow: ext_win was closed during resize, aborting\n", .{});
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: ext_win was closed during resize, aborting\n", .{});
                 return;
             }
         }
 
-        applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
+        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
 
         // Upload atlas to external window's D3D context.
         // Uses since-based cursor so each window independently tracks its
         // position in the append-only pending_uploads queue.
         if (atlas_ptr) |a| {
             if (need_full_atlas_upload) {
-                applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
-                a.uploadFullAtlasToD3D(g);
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
             }
-            ext_win.atlas_upload_cursor = a.flushPendingAtlasUploadsSinceToD3D(g, ext_win.atlas_upload_cursor);
+            ext_win.atlas_upload_cursor = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
         }
 
-        if (is_cmdline) {
-            // For cmdline: transform vertices to content area and add border/icon
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
-
-            // Get content size from ext_win (need to re-lock and re-lookup to avoid use-after-free)
-            app.mu.lock();
-            const ext_win_relookup = app.external_windows.getPtr(grid_id);
-            const content_rows = if (ext_win_relookup) |ew| ew.rows else 0;
-            const content_cols = if (ext_win_relookup) |ew| ew.cols else 0;
-            const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
-            const hide_cursor_for_ime = app.ime_composing;
-            app.mu.unlock();
-
-            // If window was closed, skip rendering
-            if (content_rows == 0 or content_cols == 0) {
-                applog.appLog("[win] paintExternalWindow: ext_win removed during paint, skipping\n", .{});
+        if (surface_kind != .normal) {
+            drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, glow_enabled, glow_intensity) catch |e| {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow decorated draw failed: {any}\n", .{e});
                 return;
-            }
-
-            const content_w: f32 = @floatFromInt(content_cols * cell_w);
-            const content_h: f32 = @floatFromInt(content_rows * cell_h);
-
-            if (window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0) {
-                // Content area position in pixels
-                const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
-                const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
-
-                // Convert content area bounds to NDC
-                const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-                const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-                const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-                const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-
-                // Calculate scale and offset for vertex transformation
-                // Original vertices are in -1.0 to 1.0 (content area)
-                // New vertices should map to content area within window
-                const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-                const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-                const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-                const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
-
-                // Create transformed vertices (allocate temporary buffer)
-                // Extra verts: 6 for full-window background, 24 for border (4 rects * 6 verts), 20 for icon (SDF: 12 for search, 6 for chevron)
-                const extra_verts = 6 + 24 + 20;
-                var cmdline_verts = app.alloc.alloc(app_mod.Vertex, vert_count + extra_verts) catch {
-                    applog.appLog("[win] paintExternalWindow: failed to alloc cmdline verts\n", .{});
-                    return;
-                };
-                defer app.alloc.free(cmdline_verts);
-
-                // Extract background color from first background vertex (texCoord.x < 0)
-                // This matches macOS approach: use actual grid background color, not Normal highlight
-                var orig_bg_r: f32 = 0.0;
-                var orig_bg_g: f32 = 0.0;
-                var orig_bg_b: f32 = 0.0;
-                var found_bg_vertex = false;
-                for (verts[0..vert_count]) |v| {
-                    if (v.texCoord[0] < 0) {
-                        orig_bg_r = v.color[0];
-                        orig_bg_g = v.color[1];
-                        orig_bg_b = v.color[2];
-                        found_bg_vertex = true;
-                        break;
-                    }
-                }
-
-                applog.appLog("[win] cmdline bg: found={} orig=({d:.3},{d:.3},{d:.3})\n", .{ found_bg_vertex, orig_bg_r, orig_bg_g, orig_bg_b });
-
-                // If no background vertex found, use cached color (persists across redraws)
-                // This prevents color flickering when cmdline content changes
-                // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
-                if (!found_bg_vertex) {
-                    app.mu.lock();
-                    if (app.external_windows.getPtr(grid_id)) |ew| {
-                        if (ew.cached_bg_color) |cached| {
-                            orig_bg_r = cached[0];
-                            orig_bg_g = cached[1];
-                            orig_bg_b = cached[2];
-                            applog.appLog("[win] cmdline bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
-                        }
-                    }
-                    app.mu.unlock();
-                } else {
-                    // Update cache with new background color
-                    // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
-                    app.mu.lock();
-                    if (app.external_windows.getPtr(grid_id)) |ew| {
-                        ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                    }
-                    app.mu.unlock();
-                }
-
-                // Apply HSB adjustment for cmdline background visibility (same as macOS)
-                // Dark colors become slightly lighter, light colors become slightly darker
-                const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-                const adj_bg_r = adjusted[0];
-                const adj_bg_g = adjusted[1];
-                const adj_bg_b = adjusted[2];
-
-                // First, add full-window background quad (drawn first, covers entire window)
-                var bg_idx: usize = 0;
-                const opacity = app.config.window.opacity;
-                const bg_color: [4]f32 = .{ adj_bg_r, adj_bg_g, adj_bg_b, opacity };
-                const bg_tex: [2]f32 = .{ -1.0, -1.0 };
-                bg_idx = app_mod.addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
-
-                // Copy and transform original vertices after background
-                // Make grid cell background vertices transparent (alpha=0) so only full-window bg shows
-                // But preserve cursor vertices (marked with DECO_CURSOR flag)
-                const tolerance: f32 = 0.005;
-                for (verts[0..vert_count], 0..) |v, i| {
-                    const dest_idx = bg_idx + i;
-
-                    // Copy vertex data and transform position
-                    cmdline_verts[dest_idx] = v;
-                    cmdline_verts[dest_idx].position[0] = v.position[0] * scale_x + offset_x;
-                    cmdline_verts[dest_idx].position[1] = v.position[1] * scale_y + offset_y;
-
-                    // Handle cursor vertices (marked with DECO_CURSOR flag)
-                    // When IME is composing, hide cursor by setting alpha to 0
-                    if ((v.deco_flags & core.DECO_CURSOR) != 0) {
-                        if (hide_cursor_for_ime) {
-                            cmdline_verts[dest_idx].color[3] = 0.0;
-                        }
-                        continue;
-                    }
-
-                    // Make background vertices fully transparent, but only if they match the original bg color
-                    // This preserves cursor and other colored elements
-                    if (v.texCoord[0] < 0) {
-                        const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
-                            @abs(v.color[1] - orig_bg_g) < tolerance and
-                            @abs(v.color[2] - orig_bg_b) < tolerance;
-                        if (matches_bg) {
-                            cmdline_verts[dest_idx].color[3] = 0.0;
-                        }
-                    }
-                }
-                var extra_idx: usize = bg_idx + vert_count;
-
-                // Use cached border/icon colors from app state.
-                // We avoid calling zonvie_core_get_hl_by_name here because it can crash
-                // when called during linespace changes (DXGI message pump triggers WM_PAINT
-                // while core is in an inconsistent state).
-                // The colors are updated via updateCmdlineColors() when highlights change.
-                app.mu.lock();
-                const border_r = app.cmdline_border_color[0];
-                const border_g = app.cmdline_border_color[1];
-                const border_b = app.cmdline_border_color[2];
-                const icon_r = app.cmdline_icon_color[0];
-                const icon_g = app.cmdline_icon_color[1];
-                const icon_b = app.cmdline_icon_color[2];
-                app.mu.unlock();
-
-                // Add border vertices (4 rectangles forming a frame)
-                const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-                const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-                const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-                const border_tex: [2]f32 = .{ -1.0, -1.0 };
-
-                extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id); // Top
-                extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id); // Bottom
-                extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id); // Left
-                extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id); // Right
-
-                // Add icon based on cmdline_firstc
-                const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
-                const icon_x_px: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT);
-                const icon_y_px: f32 = (window_h - @as(f32, @floatFromInt(app_mod.CMDLINE_ICON_SIZE))) / 2.0;
-                const icon_size_px: f32 = @floatFromInt(app_mod.CMDLINE_ICON_SIZE);
-                const icon_x_ndc: f32 = icon_x_px / (window_w / 2.0) - 1.0;
-                const icon_y_ndc: f32 = 1.0 - icon_y_px / (window_h / 2.0);
-                const icon_w_ndc: f32 = icon_size_px / (window_w / 2.0);
-                const icon_h_ndc: f32 = icon_size_px / (window_h / 2.0);
-
-                // Draw icon based on cmdline mode:
-                // '/' or '?' -> search (magnifying glass)
-                // ':' or anything else -> command (chevron)
-                if (cmdline_firstc == '/' or cmdline_firstc == '?') {
-                    extra_idx = app_mod.addSearchIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
-                } else {
-                    extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
-                }
-
-                g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow cmdline draw failed: {any}\n", .{e});
-                    return;
-                };
-            } else {
-                // Fallback: draw original vertices
-                g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                    return;
-                };
-            }
-        } else if (is_popupmenu) {
-            // For popupmenu: add border around window (same style as cmdline)
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
-
-            if (window_w > 0 and window_h > 0) {
-                // 24 for border (4 rects * 6 verts)
-                const extra_verts = 24;
-                var pum_verts = app.alloc.alloc(app_mod.Vertex, vert_count + extra_verts) catch {
-                    applog.appLog("[win] paintExternalWindow: failed to alloc popupmenu verts\n", .{});
-                    return;
-                };
-                defer app.alloc.free(pum_verts);
-
-                // Copy original vertices
-                @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
-                var extra_idx: usize = vert_count;
-
-                // Use cached border color (same as cmdline - Search highlight bg)
-                // Avoids calling zonvie_core_get_hl_by_name during paint which can crash
-                // when linespace changes trigger DXGI message pumping
-                app.mu.lock();
-                const border_r = app.cmdline_border_color[0];
-                const border_g = app.cmdline_border_color[1];
-                const border_b = app.cmdline_border_color[2];
-                app.mu.unlock();
-
-                // Add border vertices (4 rectangles forming a frame)
-                const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-                const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-                const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-                const border_tex: [2]f32 = .{ -1.0, -1.0 };
-
-                // Top border
-                extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-                // Bottom border
-                extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-                // Left border
-                extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-                // Right border
-                extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-
-                applog.appLog("[win] paintExternalWindow popupmenu: total_verts={d} (orig={d} + border={d})\n", .{ extra_idx, vert_count, extra_idx - vert_count });
-
-                g.draw(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow popupmenu draw failed: {any}\n", .{e});
-                    return;
-                };
-            } else {
-                // Fallback: draw original vertices
-                g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                    return;
-                };
-            }
-        } else if (is_msg_show or is_msg_history) {
-            // For msg_show/msg_history: apply transparency and padding like cmdline (but no border/icon)
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
-
-            // Get content size from ext_win (need to re-lock and re-lookup to avoid use-after-free)
-            app.mu.lock();
-            const ext_win_relookup2 = app.external_windows.getPtr(grid_id);
-            const content_rows = if (ext_win_relookup2) |ew| ew.rows else 0;
-            const content_cols = if (ext_win_relookup2) |ew| ew.cols else 0;
-            const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
-            app.mu.unlock();
-
-            // If window was closed, skip rendering
-            if (content_rows == 0 or content_cols == 0) {
-                applog.appLog("[win] paintExternalWindow: msg ext_win removed during paint, skipping\n", .{});
+            };
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
+            g.presentOnlyFromBack(null) catch |e| {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
                 return;
-            }
+            };
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
+            return;
+        }
 
-            const content_w: f32 = @floatFromInt(content_cols * cell_w);
-            const content_h: f32 = @floatFromInt(content_rows * cell_h);
-
-            if (window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0) {
-                // Content area position in pixels (centered with padding)
-                const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-                const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-
-                // Convert content area bounds to NDC
-                const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-                const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-                const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-                const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-
-                // Calculate scale and offset for vertex transformation
-                // Original vertices are in -1.0 to 1.0 (content area)
-                // New vertices should map to content area within window
-                const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-                const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-                const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-                const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
-
-                // Extra verts: 6 for full-window background
-                const extra_verts = 6;
-                var msg_verts = app.alloc.alloc(app_mod.Vertex, vert_count + extra_verts) catch {
-                    applog.appLog("[win] paintExternalWindow: failed to alloc msg verts\n", .{});
-                    return;
-                };
-                defer app.alloc.free(msg_verts);
-
-                // Extract background color from first background vertex (texCoord.x < 0)
-                var orig_bg_r: f32 = 0.0;
-                var orig_bg_g: f32 = 0.0;
-                var orig_bg_b: f32 = 0.0;
-                var found_bg_vertex = false;
-                for (verts[0..vert_count]) |v| {
-                    if (v.texCoord[0] < 0) {
-                        orig_bg_r = v.color[0];
-                        orig_bg_g = v.color[1];
-                        orig_bg_b = v.color[2];
-                        found_bg_vertex = true;
-                        break;
-                    }
-                }
-
-                applog.appLog("[win] msg bg: found={} orig=({d:.3},{d:.3},{d:.3})\n", .{ found_bg_vertex, orig_bg_r, orig_bg_g, orig_bg_b });
-
-                // If no background vertex found, use cached color (persists across redraws)
-                // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
-                if (!found_bg_vertex) {
-                    app.mu.lock();
-                    if (app.external_windows.getPtr(grid_id)) |ew| {
-                        if (ew.cached_bg_color) |cached| {
-                            orig_bg_r = cached[0];
-                            orig_bg_g = cached[1];
-                            orig_bg_b = cached[2];
-                            applog.appLog("[win] msg bg: using cached=({d:.3},{d:.3},{d:.3})\n", .{ orig_bg_r, orig_bg_g, orig_bg_b });
-                        }
-                    }
-                    app.mu.unlock();
-                } else {
-                    // Update cache with new background color
-                    // IMPORTANT: Must re-lookup ext_win from HashMap since original pointer may be invalid
-                    app.mu.lock();
-                    if (app.external_windows.getPtr(grid_id)) |ew| {
-                        ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                    }
-                    app.mu.unlock();
-                }
-
-                // Apply HSB adjustment for background visibility (same as cmdline)
-                const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-                const adj_bg_r = adjusted[0];
-                const adj_bg_g = adjusted[1];
-                const adj_bg_b = adjusted[2];
-
-                applog.appLog("[win] msg bg: adjusted=({d:.3},{d:.3},{d:.3})\n", .{ adj_bg_r, adj_bg_g, adj_bg_b });
-
-                // First, add full-window background quad (drawn first, covers entire window)
-                var bg_idx: usize = 0;
-                const bg_color: [4]f32 = .{ adj_bg_r, adj_bg_g, adj_bg_b, app.config.window.opacity };
-                const bg_tex: [2]f32 = .{ -1.0, -1.0 };
-                bg_idx = app_mod.addRectVerts(msg_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
-
-                // Copy and transform original vertices after background
-                // Make grid cell background vertices transparent (alpha=0) so only full-window bg shows
-                // But preserve cursor vertices (marked with DECO_CURSOR flag)
-                // Use tight tolerance to avoid accidentally making cursor transparent
-                const tolerance: f32 = 0.005;
-                for (verts[0..vert_count], 0..) |v, i| {
-                    msg_verts[bg_idx + i] = v;
-                    msg_verts[bg_idx + i].position[0] = v.position[0] * scale_x + offset_x;
-                    msg_verts[bg_idx + i].position[1] = v.position[1] * scale_y + offset_y;
-
-                    // Skip cursor vertices (marked with DECO_CURSOR flag)
-                    if ((v.deco_flags & core.DECO_CURSOR) != 0) {
-                        continue;
-                    }
-
-                    // Make background vertices fully transparent, but only if they match the original bg color
-                    // This preserves cursor and other colored elements
-                    if (v.texCoord[0] < 0) {
-                        const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
-                            @abs(v.color[1] - orig_bg_g) < tolerance and
-                            @abs(v.color[2] - orig_bg_b) < tolerance;
-                        if (matches_bg) {
-                            msg_verts[bg_idx + i].color[3] = 0.0;
-                        }
-                    }
-                }
-                const total_verts = bg_idx + vert_count;
-
-                applog.appLog("[win] paintExternalWindow msg: total_verts={d} (orig={d} + bg={d})\n", .{ total_verts, vert_count, bg_idx });
-
-                g.draw(msg_verts[0..total_verts], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow msg draw failed: {any}\n", .{e});
-                    return;
-                };
-            } else {
-                // Fallback: draw original vertices
-                g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                    applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                    return;
-                };
-            }
-        } else {
-            // Normal external window (detached grid): draw vertices with optional scrollbar
-            // Get scrollbar vertices if enabled
-            var scrollbar_verts: [12]app_mod.Vertex = undefined;
-            var scrollbar_vert_count: usize = 0;
-
-            // Check if scrollbar should be drawn (use copied scrollbar_alpha to avoid use-after-free)
-            if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
-                scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
+        switch (surface_kind) {
+            .normal => {
+                drawNormalExternalSurface(
+                    g,
                     app,
-                    scrollbar_alpha,
+                    ext_win,
+                    tbs_committed,
                     grid_id,
-                    @intCast(g.width),
-                    @intCast(g.height),
-                    &scrollbar_verts,
-                );
-            }
-
-            // Filter out cursor vertices if blink state is off
-            if (!cursor_blink_visible) {
-                // Count non-cursor vertices
-                var filtered_count: usize = 0;
-                for (verts[0..vert_count]) |v| {
-                    if ((v.deco_flags & core.DECO_CURSOR) == 0) {
-                        filtered_count += 1;
-                    }
-                }
-
-                if (filtered_count < vert_count or scrollbar_vert_count > 0) {
-                    // Allocate temporary buffer for filtered vertices + scrollbar
-                    const total_count = filtered_count + scrollbar_vert_count;
-                    var combined_verts = app.alloc.alloc(app_mod.Vertex, total_count) catch {
-                        // Fallback to drawing all vertices
-                        g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                            applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                            return;
-                        };
-                        return;
-                    };
-                    defer app.alloc.free(combined_verts);
-
-                    // Copy non-cursor vertices
-                    var idx: usize = 0;
-                    for (verts[0..vert_count]) |v| {
-                        if ((v.deco_flags & core.DECO_CURSOR) == 0) {
-                            combined_verts[idx] = v;
-                            idx += 1;
-                        }
-                    }
-
-                    // Append scrollbar vertices
-                    if (scrollbar_vert_count > 0) {
-                        @memcpy(combined_verts[idx .. idx + scrollbar_vert_count], scrollbar_verts[0..scrollbar_vert_count]);
-                    }
-
-                    g.draw(combined_verts[0..total_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                        return;
-                    };
-                } else {
-                    // No cursor vertices to filter and no scrollbar
-                    g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                        return;
-                    };
-                }
-            } else {
-                // Cursor is visible - draw all vertices with scrollbar
-                if (scrollbar_vert_count > 0) {
-                    const total_count = vert_count + scrollbar_vert_count;
-                    var combined_verts = app.alloc.alloc(app_mod.Vertex, total_count) catch {
-                        // Fallback to drawing without scrollbar
-                        g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                            applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                            return;
-                        };
-                        return;
-                    };
-                    defer app.alloc.free(combined_verts);
-
-                    @memcpy(combined_verts[0..vert_count], verts[0..vert_count]);
-                    @memcpy(combined_verts[vert_count .. vert_count + scrollbar_vert_count], scrollbar_verts[0..scrollbar_vert_count]);
-
-                    g.draw(combined_verts[0..total_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                        return;
-                    };
-                } else {
-                    g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null) catch |e| {
-                        applog.appLog("[win] paintExternalWindow draw failed: {any}\n", .{e});
-                        return;
-                    };
-                }
-            }
+                    verts,
+                    vert_count,
+                    cursor_blink_visible,
+                    scrollbar_alpha,
+                    dirty_row_keys.items,
+                    ext_paint_full,
+                    glow_enabled,
+                    glow_intensity,
+                    tbs_snapshot,
+                ) catch |e| {
+                    if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
+                    return;
+                };
+            },
+            else => unreachable,
         }
 
-        applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
+        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
 
-        // Present the rendered content (draw only renders to back buffer)
+        // Always full-present for external windows. They are small enough
+        // that the full back→front copy cost is negligible, and partial
+        // present (presentOnlyFromBackRectsNoResize) causes black regions
+        // with DXGI flip-model triple buffering because non-covered areas
+        // of the front buffer retain stale/uninitialized content.
         g.presentOnlyFromBack(null) catch |e| {
-            applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
             return;
         };
 
-        applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
+        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
     } else {
-        applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
+        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
     }
 }
 
@@ -2281,6 +2451,33 @@ fn findInDirection(infos: []const WindowInfo, ref_grid: i64, direction: i32, cou
 
     const idx: usize = if (count > 0) @intCast(count - 1) else 0;
     return if (idx < cand_count) candidates[idx] else candidates[0];
+}
+
+/// Calculate popupmenu Y position, preferring below the anchor cell.
+/// Falls back to above if below would go off-screen.
+/// Mirrors macOS popupmenuWindowRect() logic adapted to Windows coords (Y-down).
+fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd: c.HWND) c_int {
+    const below_y = anchor_top + cell_h;
+    const above_y = anchor_top - popup_h;
+
+    // Get work area (screen minus taskbar) for the monitor containing ref_hwnd
+    var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+    const monitor = c.MonitorFromWindow(ref_hwnd, c.MONITOR_DEFAULTTONEAREST);
+    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) {
+        const screen_bottom = monitor_info.rcWork.bottom;
+        const screen_top = monitor_info.rcWork.top;
+
+        // Prefer below; if it overflows screen bottom, try above
+        if (below_y + popup_h <= screen_bottom) {
+            return below_y;
+        } else if (above_y >= screen_top) {
+            return above_y;
+        }
+    }
+
+    // Fallback: below
+    return below_y;
 }
 
 fn absI32(v: i32) i32 {

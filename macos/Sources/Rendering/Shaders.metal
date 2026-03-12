@@ -422,22 +422,17 @@ fragment float4 ps_copy(CopyVSOut in [[stage_in]],
 /// Glow extract: render only DECO_GLOW glyphs with their original foreground color.
 /// Non-glow vertices and non-glyph vertices are discarded.
 /// Output is premultiplied alpha (color.rgb * coverage, coverage).
+///
+/// No scroll clipping here — unlike ps_main, the bloom blur naturally fades
+/// glow at edges, so hard-clipping at content bounds creates unnatural seams
+/// at margin/grid boundaries (especially visible on cmdline and float windows).
 fragment float4 ps_glow_extract(VSOut in [[stage_in]],
                                  texture2d<float> tex [[texture(0)]],
-                                 sampler samp [[sampler(0)]],
-                                 constant DrawableSize& drawableSize [[buffer(0)]]) {
+                                 sampler samp [[sampler(0)]]) {
     // Only extract DECO_GLOW flagged glyphs
     if (!(in.deco_flags & DECO_GLOW)) discard_fragment();
     // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
     if (in.uv.x < 0.0) discard_fragment();
-
-    // Scroll clip (same logic as ps_main)
-    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
-    if (in.was_content > 0.5) {
-        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
-            discard_fragment();
-        }
-    }
 
     float cov = tex.sample(samp, in.uv).r;
     return float4(in.color.rgb * cov, cov);

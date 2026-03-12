@@ -230,6 +230,26 @@ typedef void (*zonvie_on_main_row_scroll_fn)(
     uint32_t total_cols
 );
 
+/* External grid (sub-grid) row scroll notification.
+   Notifies the frontend that a sub-grid received a grid_scroll event.
+   Fired once per grid per flush batch, only when a single scroll occurred
+   in that batch (multiple scrolls in one batch are suppressed).
+   This is a best-effort hint — the consumer MUST perform its own eligibility
+   checks (e.g. abs(rows_delta) == 1, full-width region, no horizontal scroll)
+   before applying any fast-path optimization such as row remapping or GPU blit.
+   Fired after abort check, before clearDirty. */
+typedef void (*zonvie_on_grid_row_scroll_fn)(
+    void* ctx,
+    int64_t grid_id,
+    uint32_t row_start,
+    uint32_t row_end,
+    uint32_t col_start,
+    uint32_t col_end,
+    int32_t rows_delta,
+    uint32_t total_rows,
+    uint32_t total_cols
+);
+
 /*
   Partial vertices update:
   - If (flags & ZONVIE_VERT_UPDATE_MAIN) == 0, the frontend MUST keep previous main vertices.
@@ -750,6 +770,11 @@ typedef struct zonvie_callbacks {
        Optional optimization used by row-mode frontends to shift existing main-row
        buffers instead of receiving cached rows one by one via on_vertices_row. */
     zonvie_on_main_row_scroll_fn on_main_row_scroll;
+
+    /* External grid (sub-grid) row scroll notification (best-effort hint).
+       Suppressed when multiple scrolls occur in the same batch.
+       Consumer must validate eligibility before applying optimizations. */
+    zonvie_on_grid_row_scroll_fn on_grid_row_scroll;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

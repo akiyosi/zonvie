@@ -418,41 +418,41 @@ pub fn main() u8 {
 
         if (std.mem.eql(u8, arg, "--extcmdline")) {
             ext_cmdline_enabled = true;
-            applog.appLog("[win] --extcmdline flag detected (override config)\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --extcmdline flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--extpopup")) {
             ext_popup_enabled = true;
-            applog.appLog("[win] --extpopup flag detected (override config)\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --extpopup flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--extmessages")) {
             ext_messages_enabled = true;
-            applog.appLog("[win] --extmessages flag detected (override config)\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --extmessages flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--exttabline")) {
             ext_tabline_enabled = true;
-            applog.appLog("[win] --exttabline flag detected (override config)\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --exttabline flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--extwindows")) {
             ext_windows_enabled = true;
-            applog.appLog("[win] --extwindows flag detected (override config)\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --extwindows flag detected (override config)\n", .{});
         } else if (std.mem.eql(u8, arg, "--nvim")) {
             if (i + 1 < args.len) {
                 cli_nvim_path = args[i + 1];
                 i += 1; // skip the path argument
             }
-            applog.appLog("[win] --nvim flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --nvim flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--nvim=")) {
             cli_nvim_path = arg[7..]; // after "--nvim="
-            applog.appLog("[win] --nvim flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --nvim flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--log")) {
             if (i + 1 < args.len) {
                 cli_log_path = args[i + 1];
                 i += 1; // skip the path argument
             }
-            applog.appLog("[win] --log flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --log flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--wsl")) {
             wsl_mode = true;
-            applog.appLog("[win] --wsl flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --wsl flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--wsl=")) {
             wsl_mode = true;
             wsl_distro = arg[6..]; // after "--wsl="
-            applog.appLog("[win] --wsl={s} flag detected\n", .{wsl_distro.?});
+            if (applog.isEnabled()) applog.appLog("[win] --wsl={s} flag detected\n", .{wsl_distro.?});
         } else if (std.mem.startsWith(u8, arg, "--ssh=")) {
             ssh_mode = true;
             const value = arg[6..]; // after "--ssh="
@@ -468,20 +468,20 @@ pub fn main() u8 {
             } else {
                 ssh_host = value;
             }
-            applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
+            if (applog.isEnabled()) applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg[15..]; // after "--ssh-identity="
-            applog.appLog("[win] --ssh-identity flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--devcontainer=")) {
             devcontainer_mode = true;
             devcontainer_workspace = arg[15..]; // after "--devcontainer="
-            applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
+            if (applog.isEnabled()) applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
         } else if (std.mem.startsWith(u8, arg, "--devcontainer-config=")) {
             devcontainer_config = arg[22..]; // after "--devcontainer-config="
-            applog.appLog("[win] --devcontainer-config flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
             devcontainer_rebuild = true;
-            applog.appLog("[win] --devcontainer-rebuild flag detected\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] --devcontainer-rebuild flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             // Already handled above, skip
         } else {
@@ -504,33 +504,35 @@ pub fn main() u8 {
         if (std.mem.indexOfScalar(u8, path, '\'') != null or
             std.mem.indexOfScalar(u8, path, '"') != null)
         {
-            applog.appLog("[win] ERROR: --nvim path contains quote characters. Ignoring --nvim.\n", .{});
+            if (applog.isEnabled()) applog.appLog("[win] ERROR: --nvim path contains quote characters. Ignoring --nvim.\n", .{});
             std.debug.print("Error: --nvim path must not contain quote characters (' or \"). Ignoring --nvim.\n", .{});
             cli_nvim_path = null;
         }
     }
 
     // Log config info (after applog is enabled)
-    applog.appLog("[TIMING] Config.load: {d}ms\n", .{config_ms});
-    applog.appLog("[win] Config path: {s}\n", .{config_result.path orelse "(none)"});
-    applog.appLog("[win] Config loaded: neovim.path={s}, font.family={s}, font.size={d}, cmdline.external={}, log.enabled={}\n", .{
-        config.neovim.path,
-        config.font.family,
-        config.font.size,
-        config.cmdline.external,
-        config.log.enabled,
-    });
-    applog.appLog("[win] Config messages: external={}, routes_count={d}, routes_allocated={}\n", .{
-        config.messages.external,
-        config.messages.routes.len,
-        config.routes_allocated,
-    });
+    if (applog.isEnabled()) {
+        applog.appLog("[TIMING] Config.load: {d}ms\n", .{config_ms});
+        applog.appLog("[win] Config path: {s}\n", .{config_result.path orelse "(none)"});
+        applog.appLog("[win] Config loaded: neovim.path={s}, font.family={s}, font.size={d}, cmdline.external={}, log.enabled={}\n", .{
+            config.neovim.path,
+            config.font.family,
+            config.font.size,
+            config.cmdline.external,
+            config.log.enabled,
+        });
+        applog.appLog("[win] Config messages: external={}, routes_count={d}, routes_allocated={}\n", .{
+            config.messages.external,
+            config.messages.routes.len,
+            config.routes_allocated,
+        });
+    }
 
     // SSH mode: no early password dialog
     // SSH_ASKPASS mechanism handles password/passphrase on demand (when SSH requests it)
     const early_ssh_password: ?[]const u8 = null;
     if (ssh_mode) {
-        applog.appLog("[win] SSH mode: using SSH_ASKPASS for on-demand authentication\n", .{});
+        if (applog.isEnabled()) applog.appLog("[win] SSH mode: using SSH_ASKPASS for on-demand authentication\n", .{});
     }
 
     const class_name: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieWin");
@@ -580,7 +582,7 @@ pub fn main() u8 {
     const opacity = app.config.window.opacity;
     config = .{};
 
-    applog.appLog("[win] opacity={d:.2}\n", .{opacity});
+    if (applog.isEnabled()) applog.appLog("[win] opacity={d:.2}\n", .{opacity});
 
     // Use WS_EX_NOREDIRECTIONBITMAP for DirectComposition-based transparency
     const dwExStyle: c.DWORD = if (opacity < 1.0) c.WS_EX_NOREDIRECTIONBITMAP else 0;
@@ -602,7 +604,7 @@ pub fn main() u8 {
     );
     _ = c.QueryPerformanceCounter(&t2);
     const createwin_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
-    applog.appLog("[TIMING] CreateWindowExW: {d}ms\n", .{createwin_ms});
+    if (applog.isEnabled()) applog.appLog("[TIMING] CreateWindowExW: {d}ms\n", .{createwin_ms});
 
     if (hwnd == null) {
         if (!app.owned_by_hwnd) {

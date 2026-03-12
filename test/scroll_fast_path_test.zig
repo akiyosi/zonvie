@@ -108,7 +108,7 @@ test "touched row overflow invalidates pending_scroll" {
     try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
 }
 
-test "second scrollGrid invalidates pending_scroll" {
+test "second scrollGrid accumulates when same grid and region" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
@@ -116,11 +116,24 @@ test "second scrollGrid invalidates pending_scroll" {
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
     try std.testing.expect(g.pending_scroll != null);
 
-    // Second scroll in same batch
+    // Second scroll in same batch, same grid+region: accumulate, not blocked
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
     try std.testing.expect(g.pending_scroll != null);
+    try std.testing.expect(!g.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(i32, 2), g.pending_scroll.?.rows);
+}
+
+test "second scrollGrid blocks when different grid" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+    try std.testing.expect(g.pending_scroll != null);
+
+    // Scroll on main grid (different grid_id): blocks fast path
+    g.scrollGrid(1, 1, 42, 0, 80, 1, 0);
     try std.testing.expect(g.scroll_fast_path_blocked);
-    try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
 }
 
 test "clearScrollState resets all scroll tracking" {
@@ -217,16 +230,18 @@ test "ineligible: scrolled_count != 1" {
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_scroll_batch, result.reason);
 }
 
-test "ineligible: blocked by repeated scroll in same batch" {
+test "eligible: accumulated same-grid scroll in same batch" {
     const alloc = std.testing.allocator;
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
+    // Second scroll accumulates (same grid+region), not blocked
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+    try std.testing.expect(!g.scroll_fast_path_blocked);
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
-    try std.testing.expect(!result.eligible);
-    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.blocked_batch, result.reason);
+    try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(@as(i32, 2), result.scroll_op.?.rows);
 }
 
 test "ineligible: grid_id < 2" {
@@ -241,11 +256,21 @@ test "ineligible: grid_id < 2" {
     try std.testing.expect(!result.eligible);
 }
 
-test "ineligible: multi-row scroll (3 rows within region)" {
+test "eligible: multi-row scroll (3 rows within half region)" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
-    g.scrollGrid(2, 1, 42, 0, 80, 3, 0); // 3 rows, region height=41
+    g.scrollGrid(2, 1, 42, 0, 80, 3, 0); // 3 rows, region height=41, 3 <= 41/2
+
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    try std.testing.expect(result.eligible);
+}
+
+test "ineligible: multi-row scroll exceeds half region" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+    g.scrollGrid(2, 1, 42, 0, 80, 21, 0); // 21 rows, region height=41, 21 > 41/2=20
 
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
     try std.testing.expect(!result.eligible);

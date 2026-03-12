@@ -60,6 +60,10 @@ pub const RenderCells = struct {
     style_flags_arr: std.ArrayListUnmanaged(u8) = .{},
     overline_arr: std.ArrayListUnmanaged(u8) = .{},
     glow_arr: std.ArrayListUnmanaged(u8) = .{},
+    /// Per-cell base decoration flags (e.g. DECO_SCROLLABLE).
+    /// Pre-populated by the caller before generateRowVertices so the
+    /// unified 5-pass pipeline does not need scroll-flag computation.
+    deco_base_flags: std.ArrayListUnmanaged(u32) = .{},
 
     pub fn ensureTotalCapacity(self: *RenderCells, alloc: std.mem.Allocator, n: usize) !void {
         try self.scalars.ensureTotalCapacity(alloc, n);
@@ -70,6 +74,7 @@ pub const RenderCells = struct {
         try self.style_flags_arr.ensureTotalCapacity(alloc, n);
         try self.overline_arr.ensureTotalCapacity(alloc, n);
         try self.glow_arr.ensureTotalCapacity(alloc, n);
+        try self.deco_base_flags.ensureTotalCapacity(alloc, n);
     }
 
     pub fn setLen(self: *RenderCells, n: usize) void {
@@ -81,6 +86,7 @@ pub const RenderCells = struct {
         self.style_flags_arr.items.len = n;
         self.overline_arr.items.len = n;
         self.glow_arr.items.len = n;
+        self.deco_base_flags.items.len = n;
     }
 
     pub fn clearRetainingCapacity(self: *RenderCells) void {
@@ -92,6 +98,7 @@ pub const RenderCells = struct {
         self.style_flags_arr.clearRetainingCapacity();
         self.overline_arr.clearRetainingCapacity();
         self.glow_arr.clearRetainingCapacity();
+        self.deco_base_flags.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *RenderCells, alloc: std.mem.Allocator) void {
@@ -103,6 +110,7 @@ pub const RenderCells = struct {
         self.style_flags_arr.deinit(alloc);
         self.overline_arr.deinit(alloc);
         self.glow_arr.deinit(alloc);
+        self.deco_base_flags.deinit(alloc);
     }
 
     /// Write a single cell at index i.
@@ -114,6 +122,18 @@ pub const RenderCells = struct {
         self.grid_ids.items[i] = gid;
         self.style_flags_arr.items[i] = flags;
         self.overline_arr.items[i] = overline;
+    }
+
+    /// Write a single cell at index i, including deco base flags.
+    pub inline fn setWithDeco(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8, overline: u8, deco: u32) void {
+        self.scalars.items[i] = scalar;
+        self.fg_rgbs.items[i] = fg;
+        self.bg_rgbs.items[i] = bg;
+        self.sp_rgbs.items[i] = sp;
+        self.grid_ids.items[i] = gid;
+        self.style_flags_arr.items[i] = flags;
+        self.overline_arr.items[i] = overline;
+        self.deco_base_flags.items[i] = deco;
     }
 };
 
@@ -436,7 +456,9 @@ pub fn checkScrollFastPath(
         if (ps.rows == std.math.minInt(i32)) break :blk region_height;
         break :blk @intCast(if (ps.rows < 0) -ps.rows else ps.rows);
     };
-    if (abs_rows != 1 or region_height <= 1)
+    // Allow accumulated multi-row scroll (up to half the region height).
+    // Beyond that, too many vacated rows make fast path less beneficial.
+    if (abs_rows == 0 or abs_rows > region_height / 2 or region_height <= 1)
         return .{ .eligible = false, .reason = .multi_row_scroll, .scroll_op = ps };
     if (ps.cols != 0)
         return .{ .eligible = false, .reason = .horizontal_scroll, .scroll_op = ps };
@@ -487,8 +509,14 @@ pub fn shiftScrollCacheAndValidate(
     // For shift > 1, multiple rows scroll off and multiple rows become vacant.
     if (scroll_rows_raw > 0) {
         const shift: usize = @intCast(scroll_rows_raw);
+        if (shift > total_rows or shift > scroll_bot - scroll_top) {
+            return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+        }
         // Save scrolled-off row buffers for reuse at vacated positions
-        var saved_bufs: [16]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        var saved_bufs: [64]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        if (shift > saved_bufs.len) {
+            return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+        }
         for (0..shift) |s| {
             saved_bufs[s] = core.scroll_cache.items[scroll_top + s];
         }
@@ -513,8 +541,14 @@ pub fn shiftScrollCacheAndValidate(
         }
     } else if (scroll_rows_raw < 0) {
         const shift: usize = @intCast(-scroll_rows_raw);
+        if (shift > total_rows or shift > scroll_bot - scroll_top) {
+            return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+        }
         // Save scrolled-off row buffers for reuse at vacated positions
-        var saved_bufs: [16]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        var saved_bufs: [64]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        if (shift > saved_bufs.len) {
+            return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+        }
         for (0..shift) |s| {
             saved_bufs[s] = core.scroll_cache.items[scroll_bot - 1 - s];
         }
@@ -578,6 +612,927 @@ pub fn shiftScrollCacheAndValidate(
     };
 }
 
+// ---------------------------------------------------------------------------
+// VertexHelpers: shared vertex generation utilities for both main grid and
+// external grid pipelines.  Extracted to file level so the 5-pass row
+// generation function can be shared.
+// ---------------------------------------------------------------------------
+pub const VH = struct {
+    inline fn ndc(x: f32, y: f32, vw: f32, vh: f32) [2]f32 {
+        const nx = (x / vw) * 2.0 - 1.0;
+        const ny = 1.0 - (y / vh) * 2.0;
+        return .{ nx, ny };
+    }
+
+    /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
+    inline fn ndc4(x0: f32, y0: f32, x1: f32, y1: f32, vw: f32, vh: f32) [4][2]f32 {
+        const V4 = @Vector(4, f32);
+        const xs = V4{ x0, x1, x0, x1 };
+        const ys = V4{ y0, y0, y1, y1 };
+        const nxs = xs / @as(V4, @splat(vw)) * @as(V4, @splat(2.0)) - @as(V4, @splat(1.0));
+        const nys = @as(V4, @splat(1.0)) - ys / @as(V4, @splat(vh)) * @as(V4, @splat(2.0));
+        return .{
+            .{ nxs[0], nys[0] },
+            .{ nxs[1], nys[1] },
+            .{ nxs[2], nys[2] },
+            .{ nxs[3], nys[3] },
+        };
+    }
+
+    /// SIMD-accelerated RGB→float4 conversion.
+    inline fn rgb(v: u32) [4]f32 {
+        return rgba(v, 1.0);
+    }
+
+    /// SIMD-accelerated RGBA→float4 conversion.
+    inline fn rgba(v: u32, alpha: f32) [4]f32 {
+        const V4u32 = @Vector(4, u32);
+        const V4f32 = @Vector(4, f32);
+        const vv: V4u32 = @splat(v);
+        const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
+        const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
+        var arr: [4]f32 = floats;
+        arr[3] = alpha;
+        return arr;
+    }
+
+    const solid_uv: [2]f32 = .{ -1.0, -1.0 };
+
+    fn pushSolidQuad(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        alloc: std.mem.Allocator,
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        col: [4]f32,
+        vw: f32, vh: f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) !void {
+        const pts = ndc4(x0, y0, x1, y1, vw, vh);
+        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+        try out.ensureUnusedCapacity(alloc, 6);
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
+    fn pushSolidQuadAssumeCapacity(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        col: [4]f32,
+        vw: f32, vh: f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) void {
+        const pts = ndc4(x0, y0, x1, y1, vw, vh);
+        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    fn pushGlyphQuadAssumeCapacity(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32,
+        col: [4]f32,
+        vw: f32, vh: f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) void {
+        const pts = ndc4(x0, y0, x1, y1, vw, vh);
+        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    fn pushDecoQuad(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        alloc: std.mem.Allocator,
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        col: [4]f32,
+        vw: f32, vh: f32,
+        grid_id: i64,
+        deco_flags: u32,
+        deco_phase: f32,
+    ) !void {
+        const pts = ndc4(x0, y0, x1, y1, vw, vh);
+        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+        // UV coordinates for decorations:
+        // - UV.x = -1 (sentinel for solid/decoration)
+        // - UV.y = local Y position within quad (0.0 at top, 1.0 at bottom)
+        const uv_top: [2]f32 = .{ -1.0, 0.0 };
+        const uv_bottom: [2]f32 = .{ -1.0, 1.0 };
+
+        try out.ensureUnusedCapacity(alloc, 6);
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+
+        v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+    }
+
+    fn pushDecoQuadAssumeCapacity(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        col: [4]f32,
+        vw: f32, vh: f32,
+        grid_id: i64,
+        deco_flags: u32,
+        deco_phase: f32,
+    ) void {
+        const pts = ndc4(x0, y0, x1, y1, vw, vh);
+        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+
+        const uv_top: [2]f32 = .{ -1.0, 0.0 };
+        const uv_bottom: [2]f32 = .{ -1.0, 1.0 };
+
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+
+        v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+    }
+};
+
+/// Parameters for the unified 5-pass row vertex generation.
+pub const RowGenParams = struct {
+    row: u32,
+    cols: u32,
+    vw: f32,
+    vh: f32,
+    cell_w: f32,
+    cell_h: f32,
+    top_pad: f32,
+    default_bg: u32,
+    blur_enabled: bool,
+    background_opacity: f32,
+    is_cmdline: bool,
+    glow_enabled: bool,
+};
+
+/// Unified 5-pass row vertex generation shared by main grid (row_mode) and
+/// external grid paths.  Caller must pre-populate `core.row_cells` (including
+/// `deco_base_flags`) before calling.  Returns `true` when a glyph miss was
+/// detected (caller may want to log / flag for retry).
+pub fn generateRowVertices(
+    core: *Core,
+    p: RowGenParams,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+) !bool {
+    const rc = &core.row_cells;
+    const r = p.row;
+    const cols = p.cols;
+    const cellW = p.cell_w;
+    const cellH = p.cell_h;
+    const topPad = p.top_pad;
+    const vw = p.vw;
+    const vh = p.vh;
+    var had_glyph_miss: bool = false;
+
+    // ── Pass 1: Background (run-length by bgRGB + grid_id) ──────────
+    {
+        var c: u32 = 0;
+        while (c < cols) {
+            const run_bg = rc.bg_rgbs.items[@intCast(c)];
+            const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_start = c;
+
+            const end: u32 = @intCast(@min(
+                simdFindRunEndU32(rc.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
+                simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+            ));
+
+            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+            const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
+            const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
+            const y1: f32 = y0 + cellH;
+
+            const bg_alpha: f32 = if (run_bg == p.default_bg)
+                (if (p.blur_enabled) (if (p.is_cmdline) 0.0 else 0.5) else p.background_opacity)
+            else
+                1.0;
+            const scroll_flag = rc.deco_base_flags.items[@intCast(c)];
+            try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), vw, vh, run_grid_id, scroll_flag);
+            c = end;
+        }
+    }
+
+    // ── Pass 2: Under-decorations (underline, underdouble, undercurl, underdotted, underdashed) ──
+    {
+        var c: u32 = 0;
+        while (c < cols) {
+            const cell_style_flags = rc.style_flags_arr.items[@intCast(c)];
+            const under_deco_mask = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
+            if (cell_style_flags & under_deco_mask == 0) {
+                c += 1;
+                continue;
+            }
+
+            const run_start = c;
+            const run_flags = cell_style_flags;
+            const run_sp = rc.sp_rgbs.items[@intCast(c)];
+            const run_fg = rc.fg_rgbs.items[@intCast(c)];
+            const run_grid_id = rc.grid_ids.items[@intCast(c)];
+
+            const run_end: u32 = @intCast(@min(
+                simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
+                @min(
+                    simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
+                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                ),
+            ));
+
+            const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
+            const deco_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+
+            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+            const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+            const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
+
+            if (run_flags & STYLE_UNDERLINE != 0) {
+                const uy0 = row_y + cellH - 2.0;
+                const uy1 = uy0 + 1.0;
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
+            }
+
+            if (run_flags & STYLE_UNDERDOUBLE != 0) {
+                const uy0_1 = row_y + cellH - 6.0;
+                const uy1_1 = uy0_1 + 1.0;
+                const uy0_2 = row_y + cellH - 2.0;
+                const uy1_2 = uy0_2 + 1.0;
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0_1, x1, uy1_1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0_2, x1, uy1_2, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
+            }
+
+            if (run_flags & STYLE_UNDERCURL != 0) {
+                const uy0 = row_y + cellH - 4.0;
+                const uy1 = row_y + cellH;
+                const phase: f32 = @floatFromInt(run_start);
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERCURL | deco_scroll_flag, phase);
+            }
+
+            if (run_flags & STYLE_UNDERDOTTED != 0) {
+                const uy0 = row_y + cellH - 2.0;
+                const uy1 = uy0 + 1.0;
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERDOTTED | deco_scroll_flag, 0);
+            }
+
+            if (run_flags & STYLE_UNDERDASHED != 0) {
+                const uy0 = row_y + cellH - 2.0;
+                const uy1 = uy0 + 1.0;
+                try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERDASHED | deco_scroll_flag, 0);
+            }
+
+            c = run_end;
+        }
+    }
+
+    // ── Pass 3: Glyphs ──────────────────────────────────────────────
+    const ensure_base = core.cb.on_atlas_ensure_glyph;
+    const ensure_styled = core.cb.on_atlas_ensure_glyph_styled;
+    const shape_text_run = core.cb.on_shape_text_run;
+    const has_shaping = shape_text_run != null and core.isPhase2Atlas() and core.cb.on_rasterize_glyph_by_id != null;
+
+    // Local aliases for glyph caches
+    const glyph_cache_ascii = core.glyph_cache_ascii;
+    const glyph_valid_ascii = core.glyph_valid_ascii;
+    const glyph_cache_non_ascii = core.glyph_cache_non_ascii;
+    const glyph_keys_non_ascii = core.glyph_keys_non_ascii;
+    const GLYPH_CACHE_ASCII_SIZE = core.glyph_cache_ascii_size;
+    const GLYPH_CACHE_NON_ASCII_SIZE = core.glyph_cache_non_ascii_size;
+    const glyph_cache_id = core.glyph_cache_by_id;
+    const glyph_keys_id = core.glyph_keys_by_id;
+
+    if (has_shaping or ensure_base != null or ensure_styled != null or core.isPhase2Atlas()) {
+        // Pre-allocate vertex capacity for entire row (worst case: 1 glyph quad per column)
+        try out.ensureUnusedCapacity(core.alloc, cols * 6);
+        var c: u32 = 0;
+        while (c < cols) {
+            const run_fg = rc.fg_rgbs.items[@intCast(c)];
+            const run_bg = rc.bg_rgbs.items[@intCast(c)];
+            const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_start = c;
+
+            const base_end = @min(
+                simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
+                @min(
+                    simdFindRunEndU32(rc.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
+                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+                ),
+            );
+            const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
+            const end: u32 = @intCast(if (p.glow_enabled)
+                @min(base_end, simdFindRunEndU8(rc.glow_arr.items, @intCast(c), @intCast(cols), run_glow))
+            else
+                base_end);
+            const has_ink = simdHasInkInRange(rc.scalars.items, @intCast(c), @intCast(end));
+
+            if (has_ink) {
+                const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
+                const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
+                const fg = VH.rgb(run_fg);
+                const glyph_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+                const run_has_glow = run_glow != 0;
+
+                if (has_shaping) {
+                    // --- Text-run shaping path ---
+                    const run_len = end - run_start;
+                    const first_style = rc.style_flags_arr.items[@intCast(run_start)];
+                    const c_style: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                        @as(u32, if (first_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                    const style_index: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) @as(u32, 1) else 0) +
+                        @as(u32, if (first_style & STYLE_ITALIC != 0) @as(u32, 2) else 0);
+
+                    // Collect scalars (skip wide char continuations) and track column widths
+                    core.shaping_scalars.clearRetainingCapacity();
+                    core.shaping_col_widths.clearRetainingCapacity();
+                    core.shaping_scalars.ensureTotalCapacity(core.alloc, run_len) catch {
+                        c = end;
+                        continue;
+                    };
+                    core.shaping_col_widths.ensureTotalCapacity(core.alloc, run_len) catch {
+                        c = end;
+                        continue;
+                    };
+                    // SIMD fast path: if no wide chars (no zero scalars), bulk copy
+                    if (simdAllNonZero(rc.scalars.items, @intCast(run_start), @intCast(end))) {
+                        @memcpy(core.shaping_scalars.items.ptr[0..run_len], rc.scalars.items[@intCast(run_start)..@intCast(end)]);
+                        core.shaping_scalars.items.len = run_len;
+                        @memset(core.shaping_col_widths.items.ptr[0..run_len], 1);
+                        core.shaping_col_widths.items.len = run_len;
+                    } else {
+                        var si: u32 = run_start;
+                        while (si < end) : (si += 1) {
+                            const s = rc.scalars.items[@intCast(si)];
+                            if (s == 0) {
+                                continue;
+                            }
+                            core.shaping_scalars.appendAssumeCapacity(s);
+                            const col_w: u32 = if (si + 1 < end and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
+                            core.shaping_col_widths.appendAssumeCapacity(col_w);
+                        }
+                    }
+
+                    const scalar_count = core.shaping_scalars.items.len;
+                    if (scalar_count == 0) {
+                        c = end;
+                        continue;
+                    }
+
+                    // ASCII fast path: skip HarfBuzz for printable ASCII runs
+                    const bufs = &core.shaping_bufs;
+                    var final_glyph_count: usize = 0;
+                    var used_ascii_fast_path = false;
+
+                    if (core.loadAsciiTables()) {
+                        const is_ascii_safe = ascii_chk: {
+                            const scalars = core.shaping_scalars.items[0..scalar_count];
+                            if (!simdAllAsciiPrintable(scalars, scalar_count)) break :ascii_chk false;
+                            if (scalar_count == 1) break :ascii_chk true;
+                            const trigs = &core.ascii_lig_triggers[style_index];
+                            for (scalars) |s| {
+                                if (trigs[@intCast(s)] != 0) break :ascii_chk false;
+                            }
+                            break :ascii_chk true;
+                        };
+                        if (is_ascii_safe) {
+                            bufs.ensureCapacity(core.alloc, scalar_count) catch {
+                                c = end;
+                                continue;
+                            };
+                            bufs.setLen(scalar_count);
+                            const gids = &core.ascii_glyph_ids[style_index];
+                            const xadvs = &core.ascii_x_advances[style_index];
+                            @memset(bufs.x_off.items[0..scalar_count], 0);
+                            @memset(bufs.y_off.items[0..scalar_count], 0);
+                            simdFillSequential(bufs.clusters.items.ptr, scalar_count);
+                            for (0..scalar_count) |i| {
+                                const s: usize = @intCast(core.shaping_scalars.items[i]);
+                                bufs.glyph_ids.items[i] = gids[s];
+                                bufs.x_adv.items[i] = xadvs[s];
+                            }
+                            final_glyph_count = scalar_count;
+                            used_ascii_fast_path = true;
+                        }
+                    }
+
+                    if (!used_ascii_fast_path) {
+                    // Shape cache lookup / callback
+                    const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], c_style);
+                    const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], c_style);
+                    const sc_set_base = (sc_hash1 & (@as(u64, core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
+                    const sc_font_gen = core.font_generation;
+
+                    var sc_cache_hit = false;
+
+                    if (core.shape_cache) |sc_cache| {
+                        for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                            const sc_entry = &sc_cache[sc_set_base + sc_way];
+                            if (sc_entry.key_hash == sc_hash1 and
+                                sc_entry.key_hash2 == sc_hash2 and
+                                sc_entry.font_gen == sc_font_gen and
+                                sc_entry.scalar_count == @as(u32, @intCast(scalar_count)) and
+                                sc_entry.glyph_count > 0 and
+                                sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
+                            {
+                                final_glyph_count = sc_entry.glyph_count;
+                                bufs.ensureCapacity(core.alloc, final_glyph_count) catch {
+                                    c = end;
+                                    continue;
+                                };
+                                bufs.setLen(final_glyph_count);
+                                @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
+                                @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
+                                @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
+                                @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
+                                @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
+                                sc_cache_hit = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!sc_cache_hit) {
+                        bufs.ensureCapacity(core.alloc, scalar_count) catch {
+                            c = end;
+                            continue;
+                        };
+                        bufs.setLen(scalar_count);
+
+                        const glyph_count = shape_text_run.?(
+                            core.ctx,
+                            core.shaping_scalars.items.ptr,
+                            scalar_count,
+                            c_style,
+                            bufs.glyph_ids.items.ptr,
+                            bufs.clusters.items.ptr,
+                            bufs.x_adv.items.ptr,
+                            bufs.x_off.items.ptr,
+                            bufs.y_off.items.ptr,
+                            scalar_count,
+                        );
+
+                        if (glyph_count == 0) {
+                            c = end;
+                            continue;
+                        }
+
+                        final_glyph_count = glyph_count;
+                        if (glyph_count > scalar_count) {
+                            bufs.ensureCapacity(core.alloc, glyph_count) catch {
+                                c = end;
+                                continue;
+                            };
+                            bufs.setLen(glyph_count);
+                            final_glyph_count = shape_text_run.?(
+                                core.ctx,
+                                core.shaping_scalars.items.ptr,
+                                scalar_count,
+                                c_style,
+                                bufs.glyph_ids.items.ptr,
+                                bufs.clusters.items.ptr,
+                                bufs.x_adv.items.ptr,
+                                bufs.x_off.items.ptr,
+                                bufs.y_off.items.ptr,
+                                glyph_count,
+                            );
+                            if (final_glyph_count == 0) {
+                                c = end;
+                                continue;
+                            }
+                        }
+
+                        // Store in cache if result fits
+                        if (final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
+                            if (core.shape_cache) |sc_cache| {
+                                var sc_store_way: usize = 0;
+                                for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                                    if (sc_cache[sc_set_base + sc_way].key_hash == 0) {
+                                        sc_store_way = sc_way;
+                                        break;
+                                    }
+                                }
+                                const sc_store = &sc_cache[sc_set_base + sc_store_way];
+                                sc_store.key_hash = sc_hash1;
+                                sc_store.key_hash2 = sc_hash2;
+                                sc_store.font_gen = sc_font_gen;
+                                sc_store.scalar_count = @intCast(scalar_count);
+                                sc_store.glyph_count = @intCast(final_glyph_count);
+                                @memcpy(sc_store.glyph_ids[0..final_glyph_count], bufs.glyph_ids.items[0..final_glyph_count]);
+                                @memcpy(sc_store.clusters[0..final_glyph_count], bufs.clusters.items[0..final_glyph_count]);
+                                @memcpy(sc_store.x_adv[0..final_glyph_count], bufs.x_adv.items[0..final_glyph_count]);
+                                @memcpy(sc_store.x_off[0..final_glyph_count], bufs.x_off.items[0..final_glyph_count]);
+                                @memcpy(sc_store.y_off[0..final_glyph_count], bufs.y_off.items[0..final_glyph_count]);
+                            }
+                        }
+                    }
+                    } // end !used_ascii_fast_path
+
+                    // Iterate shaped glyphs — ensure capacity for .notdef expansion
+                    out.ensureUnusedCapacity(core.alloc, (final_glyph_count + scalar_count) * 6) catch {
+                        c = end;
+                        continue;
+                    };
+                    var penX: f32 = baseX;
+
+                    var gi: usize = 0;
+                    while (gi < final_glyph_count) : (gi += 1) {
+                        const gid = bufs.glyph_ids.items[gi];
+                        const this_cluster = bufs.clusters.items[gi];
+                        const next_cluster = if (gi + 1 < final_glyph_count) bufs.clusters.items[gi + 1] else @as(u32, @intCast(scalar_count));
+
+                        if (gid == 0) {
+                            // .notdef glyph — per-scalar fallback
+                            var ci: u32 = this_cluster;
+                            while (ci < next_cluster) : (ci += 1) {
+                                const fb_scalar = core.shaping_scalars.items[@intCast(ci)];
+                                const fb_col_w = core.shaping_col_widths.items[@intCast(ci)];
+                                if (fb_scalar == 32) {
+                                    penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
+                                    continue;
+                                }
+                                if (block_elements.isBlockElement(fb_scalar)) {
+                                    const blk_w = @as(f32, @floatFromInt(fb_col_w)) * cellW;
+                                    const blk_geo = block_elements.getBlockGeometry(fb_scalar);
+                                    if (blk_geo.count > 0) {
+                                        const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                        out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                            penX += blk_w;
+                                            continue;
+                                        };
+                                        for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                            VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                        }
+                                    }
+                                    penX += blk_w;
+                                    continue;
+                                }
+                                if (core.ensureGlyphPhase2(fb_scalar, c_style)) |fb_ge| {
+                                    if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
+                                        const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
+                                        const fb_gx0: f32 = penX + fb_ge.bbox_origin_px[0];
+                                        const fb_gx1: f32 = fb_gx0 + fb_ge.bbox_size_px[0];
+                                        const fb_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
+                                        const fb_gy1: f32 = fb_gy0 + fb_ge.bbox_size_px[1];
+
+                                        const fb_uv0: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_min[1] };
+                                        const fb_uv1: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_min[1] };
+                                        const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
+                                        const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
+
+                                        const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                        VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
+                                    }
+                                }
+                                penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
+                            }
+                            continue;
+                        }
+
+                        // Skip space glyphs
+                        if (next_cluster == this_cluster + 1) {
+                            const sp_scalar = core.shaping_scalars.items[@intCast(this_cluster)];
+                            if (sp_scalar == 0x20) {
+                                penX += @as(f32, @floatFromInt(core.shaping_col_widths.items[@intCast(this_cluster)])) * cellW;
+                                continue;
+                            }
+                            if (block_elements.isBlockElement(sp_scalar)) {
+                                const blk_cols = core.shaping_col_widths.items[@intCast(this_cluster)];
+                                const blk_w = @as(f32, @floatFromInt(blk_cols)) * cellW;
+                                const blk_geo = block_elements.getBlockGeometry(sp_scalar);
+                                if (blk_geo.count > 0) {
+                                    const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                    out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                        penX += blk_w;
+                                        continue;
+                                    };
+                                    for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                        VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                    }
+                                }
+                                penX += blk_w;
+                                continue;
+                            }
+                        }
+
+                        // Glyph-ID cache lookup
+                        var ge: c_api.GlyphEntry = undefined;
+                        const glyph_ok = gid_blk: {
+                            if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
+                                const key = (@as(u64, gid) << 2) | @as(u64, style_index);
+                                const hash_val = (gid *% 2654435761) ^ style_index;
+                                const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
+                                if (glyph_keys_id.?[hash_idx] == key) {
+                                    ge = glyph_cache_id.?[hash_idx];
+                                    break :gid_blk true;
+                                }
+                                if (core.ensureGlyphByID(gid, c_style)) |entry| {
+                                    ge = entry;
+                                    glyph_cache_id.?[hash_idx] = entry;
+                                    glyph_keys_id.?[hash_idx] = key;
+                                    break :gid_blk true;
+                                }
+                                break :gid_blk false;
+                            }
+                            if (core.ensureGlyphByID(gid, c_style)) |entry| {
+                                ge = entry;
+                                break :gid_blk true;
+                            }
+                            break :gid_blk false;
+                        };
+
+                        if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
+                            const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
+                            const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
+                            const baselineY: f32 = baseY + ge.ascent_px;
+
+                            const gx0: f32 = penX + ge.bbox_origin_px[0] + x_off_px;
+                            const gx1: f32 = gx0 + ge.bbox_size_px[0];
+                            const gy0: f32 = (baselineY + y_off_px) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                            const gy1: f32 = gy0 + ge.bbox_size_px[1];
+
+                            const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
+                            const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
+                            const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
+                            const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
+
+                            const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                            VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
+                        }
+
+                        // Advance pen using column widths
+                        {
+                            const cl_span = next_cluster - this_cluster;
+                            const cluster_cols: u32 = if (cl_span == 1)
+                                core.shaping_col_widths.items[@intCast(this_cluster)]
+                            else blk: {
+                                var sum: u32 = 0;
+                                var cwi: u32 = this_cluster;
+                                while (cwi < next_cluster) : (cwi += 1) {
+                                    sum += core.shaping_col_widths.items[@intCast(cwi)];
+                                }
+                                break :blk sum;
+                            };
+                            penX += @as(f32, @floatFromInt(cluster_cols)) * cellW;
+                        }
+                    }
+                } else {
+                    // --- Per-cell glyph path (fallback when shaping unavailable) ---
+                    var penX: f32 = baseX;
+
+                    var col_i: u32 = run_start;
+                    while (col_i < end) : (col_i += 1) {
+                        const cell_scalar = rc.scalars.items[@intCast(col_i)];
+                        const cell_style_flags = rc.style_flags_arr.items[@intCast(col_i)];
+                        const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
+                        if (scalar == 32) {
+                            penX += cellW;
+                            continue;
+                        }
+                        if (block_elements.isBlockElement(scalar)) {
+                            const blk_geo = block_elements.getBlockGeometry(scalar);
+                            if (blk_geo.count > 0) {
+                                const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
+                                out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
+                                    penX += cellW;
+                                    continue;
+                                };
+                                for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
+                                }
+                            }
+                            penX += cellW;
+                            continue;
+                        }
+
+                        var ge: c_api.GlyphEntry = undefined;
+                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                        const style_index: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
+                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
+                        const glyph_ok = blk: {
+                            if (scalar < 128 and glyph_cache_ascii != null and glyph_valid_ascii != null) {
+                                const cache_key: usize = scalar * 4 + style_index;
+                                if (cache_key < GLYPH_CACHE_ASCII_SIZE) {
+                                    if (glyph_valid_ascii.?[cache_key]) {
+                                        ge = glyph_cache_ascii.?[cache_key];
+                                        break :blk true;
+                                    }
+                                    const ok = if (core.isPhase2Atlas()) cb: {
+                                        const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                        if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
+                                            ge = entry;
+                                            break :cb true;
+                                        }
+                                        break :cb false;
+                                    } else if (style_mask != 0 and ensure_styled != null) cb: {
+                                        const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                        break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
+                                    } else if (ensure_base) |ensure| cb: {
+                                        break :cb ensure(core.ctx, scalar, &ge) != 0;
+                                    } else false;
+                                    if (ok) {
+                                        glyph_cache_ascii.?[cache_key] = ge;
+                                        glyph_valid_ascii.?[cache_key] = true;
+                                    }
+                                    break :blk ok;
+                                }
+                            }
+                            if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
+                                const key = (@as(u64, scalar) << 2) | @as(u64, style_index);
+                                const hash_val = (scalar *% 2654435761) ^ style_index;
+                                const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
+                                if (glyph_keys_non_ascii.?[hash_idx] == key) {
+                                    ge = glyph_cache_non_ascii.?[hash_idx];
+                                    break :blk true;
+                                }
+                                const ok = if (core.isPhase2Atlas()) cb: {
+                                    const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                    if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
+                                        ge = entry;
+                                        break :cb true;
+                                    }
+                                    break :cb false;
+                                } else if (style_mask != 0 and ensure_styled != null) cb: {
+                                    const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                    break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
+                                } else if (ensure_base) |ensure| cb: {
+                                    break :cb ensure(core.ctx, scalar, &ge) != 0;
+                                } else false;
+                                if (ok) {
+                                    glyph_cache_non_ascii.?[hash_idx] = ge;
+                                    glyph_keys_non_ascii.?[hash_idx] = key;
+                                }
+                                break :blk ok;
+                            }
+                            const ok = if (core.isPhase2Atlas()) cb: {
+                                const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
+                                    ge = entry;
+                                    break :cb true;
+                                }
+                                break :cb false;
+                            } else if (style_mask != 0 and ensure_styled != null) cb: {
+                                const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
+                            } else if (ensure_base) |ensure| cb: {
+                                break :cb ensure(core.ctx, scalar, &ge) != 0;
+                            } else false;
+                            break :blk ok;
+                        };
+                        if (!glyph_ok) {
+                            had_glyph_miss = true;
+                            if (core.missing_glyph_log_count < 16) {
+                                core.log.write(
+                                    "glyph_missing row={d} col={d} scalar=0x{x}\n",
+                                    .{ r, col_i, scalar },
+                                );
+                                core.missing_glyph_log_count += 1;
+                            }
+                            penX += cellW;
+                            continue;
+                        }
+
+                        const baselineY: f32 = baseY + ge.ascent_px;
+                        const gx0: f32 = penX + ge.bbox_origin_px[0];
+                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
+                        const gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
+
+                        const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
+                        const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
+                        const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
+                        const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
+
+                        if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
+                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                            VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, pc_glyph_deco);
+                        }
+
+                        penX += cellW;
+                    }
+                } // end else (per-cell fallback)
+            }
+
+            c = end;
+        }
+    }
+
+    // ── Pass 4: Strikethrough ───────────────────────────────────────
+    {
+        var c: u32 = 0;
+        while (c < cols) {
+            const c_style_flags = rc.style_flags_arr.items[@intCast(c)];
+            if (c_style_flags & STYLE_STRIKETHROUGH == 0) {
+                c += 1;
+                continue;
+            }
+
+            const run_start = c;
+            const run_flags = c_style_flags;
+            const run_sp = rc.sp_rgbs.items[@intCast(c)];
+            const run_fg = rc.fg_rgbs.items[@intCast(c)];
+            const run_grid_id = rc.grid_ids.items[@intCast(c)];
+
+            const run_end: u32 = @intCast(@min(
+                simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
+                @min(
+                    simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
+                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                ),
+            ));
+
+            const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
+            const strike_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+            const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+            const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
+
+            const sy0 = row_y + cellH * 0.5 - 0.5;
+            const sy1 = sy0 + 1.0;
+            try VH.pushDecoQuad(out, core.alloc, x0, sy0, x1, sy1, deco_color, vw, vh, run_grid_id, c_api.DECO_STRIKETHROUGH | strike_scroll_flag, 0);
+
+            c = run_end;
+        }
+    }
+
+    // ── Pass 5: Overline ────────────────────────────────────────────
+    {
+        var c: u32 = 0;
+        while (c < cols) {
+            if (rc.overline_arr.items[@intCast(c)] == 0) {
+                c += 1;
+                continue;
+            }
+
+            const run_start = c;
+            const run_sp = rc.sp_rgbs.items[@intCast(c)];
+            const run_fg = rc.fg_rgbs.items[@intCast(c)];
+            const run_grid_id = rc.grid_ids.items[@intCast(c)];
+
+            var run_end: u32 = c + 1;
+            while (run_end < cols) : (run_end += 1) {
+                if (rc.overline_arr.items[@intCast(run_end)] == 0) break;
+                if (rc.sp_rgbs.items[@intCast(run_end)] != run_sp) break;
+                if (rc.grid_ids.items[@intCast(run_end)] != run_grid_id) break;
+                if (run_sp == highlight.Highlights.SP_NOT_SET and
+                    rc.fg_rgbs.items[@intCast(run_end)] != run_fg) break;
+            }
+
+            const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
+            const ol_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
+            const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+            const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
+
+            const oy0 = row_y;
+            const oy1 = oy0 + 1.0;
+            try VH.pushDecoQuad(out, core.alloc, x0, oy0, x1, oy1, deco_color, vw, vh, run_grid_id, c_api.DECO_OVERLINE | ol_scroll_flag, 0);
+
+            c = run_end;
+        }
+    }
+
+    return had_glyph_miss;
+}
+
 pub const FlushCtx = struct {
     core: *Core,
 
@@ -634,6 +1589,15 @@ pub const FlushCtx = struct {
                 cb(ctx.core.ctx);
             }
         }
+        // Generate external grid vertices inside the flush bracket (LIFO: runs
+        // before on_flush_end). This ensures the frontend receives vertex data
+        // before commitFlush, preventing draw() from rendering remapped slots
+        // with stale vertex content.
+        defer {
+            if (!ctx.core.flush_aborted) {
+                sendExternalGridVertices(ctx.core, false);
+            }
+        }
 
         // If frontend aborted, skip all vertex/atlas work.
         // Grid scroll events are NOT dispatched or cleared — they are preserved
@@ -646,6 +1610,51 @@ pub const FlushCtx = struct {
                 cb(ctx.core.ctx, grid_id);
             }
         }
+
+        // Dispatch per-grid row scroll notifications for external grids.
+        // Fires at the same dispatch point as on_grid_scroll (after abort check).
+        // Skipped when multiple scrolls occurred in the same batch (fast path ineligible).
+        // Also skipped when float windows are anchored to the grid, because the core
+        // composites float content into the grid's row vertices — GPU-blitting old pixels
+        // would shift stale overlay content to wrong positions.
+        // last_scroll_op is cleared later by sg.clearDirty(), not here.
+        if (ctx.core.cb.on_grid_row_scroll) |scroll_cb| {
+            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
+                if (grid_id < 2) continue;
+                if (ctx.core.grid.sub_grids.getPtr(grid_id)) |sg| {
+                    if (sg.scroll_fast_path_blocked) continue;
+
+                    // Check for float windows anchored to this grid
+                    var has_float_overlay = false;
+                    var wp_it = ctx.core.grid.win_pos.iterator();
+                    while (wp_it.next()) |wp_entry| {
+                        if (wp_entry.value_ptr.anchor_grid == grid_id) {
+                            has_float_overlay = true;
+                            break;
+                        }
+                    }
+                    if (has_float_overlay) continue;
+
+                    if (sg.last_scroll_op) |op| {
+                        // Clamp scroll region to viewport dimensions.
+                        // External grids may have sg.rows > viewport_rows due to
+                        // margin rows (e.g. winbar). The frontend's texture and blit
+                        // only cover viewport_rows, so unclamped parameters would cause
+                        // out-of-bounds blit reads and wrong vacated rows.
+                        const ext_target = ctx.core.grid.external_grid_target_sizes.get(grid_id);
+                        const vp_rows = if (ext_target) |t| t.rows else sg.rows;
+                        const vp_cols = if (ext_target) |t| t.cols else sg.cols;
+                        const clamped_bot = @min(op.bot, vp_rows);
+                        if (clamped_bot > op.top) {
+                            scroll_cb(ctx.core.ctx, grid_id,
+                                op.top, clamped_bot, op.left, op.right,
+                                op.rows, vp_rows, vp_cols);
+                        }
+                    }
+                }
+            }
+        }
+
         ctx.core.grid.clearScrolledGrids();
 
         // Check msg_show throttle timeout for external commands
@@ -1122,10 +2131,6 @@ pub const FlushCtx = struct {
                     var perf_cached_emit_cb_sum_us: i64 = 0;
                     var perf_cached_emit_scan_us: i64 = 0;
                     var perf_row_compose_sum_us: i64 = 0;
-                    var perf_row_bg_sum_us: i64 = 0;
-                    var perf_row_under_deco_sum_us: i64 = 0;
-                    var perf_row_glyph_sum_us: i64 = 0;
-                    var perf_row_strike_sum_us: i64 = 0;
                     var perf_row_total_sum_us: i64 = 0;
                     var perf_row_cache_store_sum_us: i64 = 0;
                     var perf_row_cb_sum_us: i64 = 0;
@@ -1133,8 +2138,6 @@ pub const FlushCtx = struct {
                     var perf_row_count: u32 = 0;
                     var perf_row_max_total_us: i64 = 0;
                     var perf_row_max_total_idx: u32 = 0;
-                    var perf_row_max_glyph_us: i64 = 0;
-                    var perf_row_max_glyph_idx: u32 = 0;
                     var perf_row_max_cb_us: i64 = 0;
                     var perf_row_max_cb_idx: u32 = 0;
 
@@ -1170,14 +2173,6 @@ pub const FlushCtx = struct {
                     // (core-managed atlas), clearing the cache every flush causes
                     // every glyph to be re-rasterized every frame, filling the atlas
                     // and triggering constant atlas resets.
-
-                    // Get dynamic cache references (fallback to empty if not initialized)
-                    const glyph_cache_ascii = ctx.core.glyph_cache_ascii;
-                    const glyph_valid_ascii = ctx.core.glyph_valid_ascii;
-                    const glyph_cache_non_ascii = ctx.core.glyph_cache_non_ascii;
-                    const glyph_keys_non_ascii = ctx.core.glyph_keys_non_ascii;
-                    const GLYPH_CACHE_ASCII_SIZE = ctx.core.glyph_cache_ascii_size;
-                    const GLYPH_CACHE_NON_ASCII_SIZE = ctx.core.glyph_cache_non_ascii_size;
 
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
@@ -1223,10 +2218,6 @@ pub const FlushCtx = struct {
                             perf_cached_emit_cb_sum_us = 0;
                             perf_cached_emit_scan_us = 0;
                             perf_row_compose_sum_us = 0;
-                            perf_row_bg_sum_us = 0;
-                            perf_row_under_deco_sum_us = 0;
-                            perf_row_glyph_sum_us = 0;
-                            perf_row_strike_sum_us = 0;
                             perf_row_total_sum_us = 0;
                             perf_row_cache_store_sum_us = 0;
                             perf_row_cb_sum_us = 0;
@@ -1234,8 +2225,6 @@ pub const FlushCtx = struct {
                             perf_row_count = 0;
                             perf_row_max_total_us = 0;
                             perf_row_max_total_idx = 0;
-                            perf_row_max_glyph_us = 0;
-                            perf_row_max_glyph_idx = 0;
                             perf_row_max_cb_us = 0;
                             perf_row_max_cb_idx = 0;
                             if (log_enabled) {
@@ -1482,10 +2471,6 @@ pub const FlushCtx = struct {
                         var out = &ctx.core.row_verts;
                         out.clearRetainingCapacity();
                         var row_compose_us: i64 = 0;
-                        var row_bg_us: i64 = 0;
-                        var row_under_deco_us: i64 = 0;
-                        var row_glyph_us: i64 = 0;
-                        var row_strike_us: i64 = 0;
 
                         // Row-mode timing for composition measurement
                         var t_row_compose_start: i128 = 0;
@@ -1594,818 +2579,59 @@ pub const FlushCtx = struct {
                             }
                         }
 
-                        // Row-mode timing for background measurement
+                        // Populate deco_base_flags via computeScrollFlag
+                        for (0..cols) |ci| {
+                            const gid = row_cells.grid_ids.items[ci];
+                            row_cells.deco_base_flags.items[ci] = Helpers.computeScrollFlag(r, gid, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
+                        }
+
+                        // Row-mode timing
                         var t_row_compose_end: i128 = 0;
-                        var t_row_bg_start: i128 = 0;
+                        var t_row_gen_start: i128 = 0;
                         if (log_enabled) {
                             t_row_compose_end = std.time.nanoTimestamp();
-                            t_row_bg_start = t_row_compose_end;
+                            t_row_gen_start = t_row_compose_end;
                         }
 
-                        // 1) Background: run-length by bgRGB and grid_id for this row
-                        {
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const run_bg = row_cells.bg_rgbs.items[@intCast(c)];
-                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
-                                const run_start = c;
-
-                                const end: u32 = @intCast(@min(
-                                    simdFindRunEndU32(row_cells.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
-                                    simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
-                                ));
-
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
-                                const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
-                                const y1: f32 = y0 + cellH;
-
-                                // Use semi-transparent alpha for default background (blur/transparency)
-                                const bg_alpha: f32 = if (run_bg == ctx.core.hl.default_bg)
-                                    (if (ctx.core.blur_enabled) 0.5 else ctx.core.background_opacity)
-                                else
-                                    1.0;
-                                const scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                try Helpers.pushSolidQuad(out, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id, scroll_flag);
-                                c = end;
-                            }
-                        }
-
-                        // Row-mode timing for performance measurement
-                        var t_row_bg_end: i128 = 0;
-                        var t_row_under_deco_start: i128 = 0;
-                        if (log_enabled) {
-                            t_row_bg_end = std.time.nanoTimestamp();
-                            t_row_under_deco_start = t_row_bg_end;
-                        }
-
-                        // 2) Under-decorations (drawn behind glyphs): underline, underdouble, undercurl, underdotted, underdashed
-                        {
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const cell_style_flags = row_cells.style_flags_arr.items[@intCast(c)];
-                                const under_deco_mask = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
-                                if (cell_style_flags & under_deco_mask == 0) {
-                                    c += 1;
-                                    continue;
-                                }
-
-                                // Find run of cells with same decoration style
-                                const run_start = c;
-                                const run_flags = cell_style_flags;
-                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
-                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
-                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
-
-                                const run_end: u32 = @intCast(@min(
-                                    simdFindRunEndU8(row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
-                                    @min(
-                                        simdFindRunEndU32(row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
-                                    ),
-                                ));
-
-                                // Use special color if set, otherwise foreground
-                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                const deco_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
-
-                                // Underline: 1px line at bottom of cell
-                                if (run_flags & STYLE_UNDERLINE != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
-                                }
-
-                                // Underdouble: 2 lines at bottom with clear gap
-                                if (run_flags & STYLE_UNDERDOUBLE != 0) {
-                                    const y0_1 = row_y + cellH - 6.0;
-                                    const y1_1 = y0_1 + 1.0;
-                                    const y0_2 = row_y + cellH - 2.0;
-                                    const y1_2 = y0_2 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
-                                }
-
-                                // Undercurl: wavy line (shader-based)
-                                if (run_flags & STYLE_UNDERCURL != 0) {
-                                    const y0 = row_y + cellH - 4.0;
-                                    const y1 = row_y + cellH;
-                                    const phase: f32 = @floatFromInt(run_start);
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL | deco_scroll_flag, phase);
-                                }
-
-                                // Underdotted: dotted line (shader-based)
-                                if (run_flags & STYLE_UNDERDOTTED != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED | deco_scroll_flag, 0);
-                                }
-
-                                // Underdashed: dashed line (shader-based)
-                                if (run_flags & STYLE_UNDERDASHED != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED | deco_scroll_flag, 0);
-                                }
-
-                                c = run_end;
-                            }
-                        }
-
-                        var t_row_under_deco_end: i128 = 0;
-                        var t_row_glyph_start: i128 = 0;
-                        if (log_enabled) {
-                            t_row_under_deco_end = std.time.nanoTimestamp();
-                            t_row_glyph_start = t_row_under_deco_end;
-                        }
-
-                        // 3) Glyphs: same as main path, but only this row
-                        const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
-                        const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
-                        const shape_text_run = ctx.core.cb.on_shape_text_run;
-                        const has_shaping = shape_text_run != null and ctx.core.isPhase2Atlas() and ctx.core.cb.on_rasterize_glyph_by_id != null;
-                        if (has_shaping or ensure_base != null or ensure_styled != null or ctx.core.isPhase2Atlas()) {
-                            // Pre-allocate vertex capacity for entire row's glyphs + glow
-                            // (worst case: 1 glyph per column × 6 vertices per quad + 6 glow per column)
-                            try out.ensureUnusedCapacity(ctx.core.alloc, cols * 6);
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
-                                const run_bg = row_cells.bg_rgbs.items[@intCast(c)];
-                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
-                                const run_start = c;
-
-                                const base_end = @min(
-                                    simdFindRunEndU32(row_cells.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
-                                    @min(
-                                        simdFindRunEndU32(row_cells.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
-                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
-                                    ),
-                                );
-                                const run_glow: u8 = if (glow_enabled) row_cells.glow_arr.items[@intCast(c)] else 0;
-                                const end: u32 = @intCast(if (glow_enabled)
-                                    @min(base_end, simdFindRunEndU8(row_cells.glow_arr.items, @intCast(c), @intCast(cols), run_glow))
-                                else
-                                    base_end);
-                                const has_ink = simdHasInkInRange(row_cells.scalars.items, @intCast(c), @intCast(end));
-
-                                if (has_ink) {
-                                    const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
-                                    const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
-                                    const fg = Helpers.rgb(run_fg);
-                                    const glyph_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                    const run_has_glow = run_glow != 0;
-
-                                    if (has_shaping) {
-                                        // --- Text-run shaping path (Phase B: ligatures) ---
-                                        // 1) Collect scalars for this HL run
-                                        const run_len = end - run_start;
-                                        // Determine style flags from first cell in run (uniform within HL run)
-                                        const first_style = row_cells.style_flags_arr.items[@intCast(run_start)];
-                                        const c_style: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                            @as(u32, if (first_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                        const style_index: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                                            @as(u32, if (first_style & STYLE_ITALIC != 0) @as(u32, 2) else 0);
-
-                                        // Collect scalars (skip wide char continuations) and track column widths
-                                        ctx.core.shaping_scalars.clearRetainingCapacity();
-                                        ctx.core.shaping_col_widths.clearRetainingCapacity();
-                                        ctx.core.shaping_scalars.ensureTotalCapacity(ctx.core.alloc, run_len) catch {
-                                            c = end;
-                                            continue;
-                                        };
-                                        ctx.core.shaping_col_widths.ensureTotalCapacity(ctx.core.alloc, run_len) catch {
-                                            c = end;
-                                            continue;
-                                        };
-                                        // SIMD fast path: if no wide chars (no zero scalars), bulk copy
-                                        if (simdAllNonZero(row_cells.scalars.items, @intCast(run_start), @intCast(end))) {
-                                            @memcpy(ctx.core.shaping_scalars.items.ptr[0..run_len], row_cells.scalars.items[@intCast(run_start)..@intCast(end)]);
-                                            ctx.core.shaping_scalars.items.len = run_len;
-                                            @memset(ctx.core.shaping_col_widths.items.ptr[0..run_len], 1);
-                                            ctx.core.shaping_col_widths.items.len = run_len;
-                                        } else {
-                                            var si: u32 = run_start;
-                                            while (si < end) : (si += 1) {
-                                                const s = row_cells.scalars.items[@intCast(si)];
-                                                if (s == 0) {
-                                                    continue;
-                                                }
-                                                ctx.core.shaping_scalars.appendAssumeCapacity(s);
-                                                const col_w: u32 = if (si + 1 < end and row_cells.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
-                                                ctx.core.shaping_col_widths.appendAssumeCapacity(col_w);
-                                            }
-                                        }
-
-                                        const scalar_count = ctx.core.shaping_scalars.items.len;
-                                        if (scalar_count == 0) {
-                                            c = end;
-                                            continue;
-                                        }
-
-                                        // 2) ASCII fast path: skip HarfBuzz for runs with only
-                                        //    printable ASCII characters. Single-char runs always
-                                        //    use fast path (ligatures need ≥2 chars, calt needs
-                                        //    context). Multi-char runs skip triggers.
-                                        //    Note: uses per-codepoint advances (no GPOS pair kerning),
-                                        //    which is correct for monospace terminal fonts.
-                                        const bufs = &ctx.core.shaping_bufs;
-                                        var final_glyph_count: usize = 0;
-                                        var used_ascii_fast_path = false;
-
-                                        if (ctx.core.loadAsciiTables()) {
-                                            const is_ascii_safe = ascii_chk: {
-                                                const scalars = ctx.core.shaping_scalars.items[0..scalar_count];
-                                                // SIMD range check: all in [0x20, 0x7E]
-                                                if (!simdAllAsciiPrintable(scalars, scalar_count)) break :ascii_chk false;
-                                                // Single-char runs: always safe (no context for calt/liga)
-                                                if (scalar_count == 1) break :ascii_chk true;
-                                                // Multi-char: check ligature triggers
-                                                const trigs = &ctx.core.ascii_lig_triggers[style_index];
-                                                for (scalars) |s| {
-                                                    if (trigs[@intCast(s)] != 0) break :ascii_chk false;
-                                                }
-                                                break :ascii_chk true;
-                                            };
-                                            if (is_ascii_safe) {
-                                                bufs.ensureCapacity(ctx.core.alloc, scalar_count) catch {
-                                                    c = end;
-                                                    continue;
-                                                };
-                                                bufs.setLen(scalar_count);
-                                                const gids = &ctx.core.ascii_glyph_ids[style_index];
-                                                const xadvs = &ctx.core.ascii_x_advances[style_index];
-                                                // Batch zero-fill x_off and y_off (compiles to SIMD memset)
-                                                @memset(bufs.x_off.items[0..scalar_count], 0);
-                                                @memset(bufs.y_off.items[0..scalar_count], 0);
-                                                // Sequential cluster fill (SIMD 4-wide)
-                                                simdFillSequential(bufs.clusters.items.ptr, scalar_count);
-                                                // Table lookups (gather - must be scalar)
-                                                for (0..scalar_count) |i| {
-                                                    const s: usize = @intCast(ctx.core.shaping_scalars.items[i]);
-                                                    bufs.glyph_ids.items[i] = gids[s];
-                                                    bufs.x_adv.items[i] = xadvs[s];
-                                                }
-                                                final_glyph_count = scalar_count;
-                                                used_ascii_fast_path = true;
-                                                perf_ascii_fast_path += 1;
-                                            }
-                                        }
-
-                                        if (!used_ascii_fast_path) {
-                                        // Shape cache lookup / callback
-                                        const sc_hash1 = nvim_core.shapeCacheHash(ctx.core.shaping_scalars.items[0..scalar_count], c_style);
-                                        const sc_hash2 = nvim_core.shapeCacheHash2(ctx.core.shaping_scalars.items[0..scalar_count], c_style);
-                                        const sc_set_base = (sc_hash1 & (@as(u64, ctx.core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
-                                        const sc_font_gen = ctx.core.font_generation;
-
-                                        var sc_cache_hit = false;
-
-                                        // Check both ways of the set
-                                        if (ctx.core.shape_cache) |sc_cache| {
-                                            for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
-                                                const sc_entry = &sc_cache[sc_set_base + sc_way];
-                                                if (sc_entry.key_hash == sc_hash1 and
-                                                    sc_entry.key_hash2 == sc_hash2 and
-                                                    sc_entry.font_gen == sc_font_gen and
-                                                    sc_entry.scalar_count == @as(u32, @intCast(scalar_count)) and
-                                                    sc_entry.glyph_count > 0 and
-                                                    sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
-                                                {
-                                                    // Cache hit
-                                                    final_glyph_count = sc_entry.glyph_count;
-                                                    bufs.ensureCapacity(ctx.core.alloc, final_glyph_count) catch {
-                                                        c = end;
-                                                        continue;
-                                                    };
-                                                    bufs.setLen(final_glyph_count);
-                                                    @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
-                                                    @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
-                                                    @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
-                                                    @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
-                                                    @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
-                                                    sc_cache_hit = true;
-                                                    perf_shape_cache_hits += 1;
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        if (!sc_cache_hit) {
-                                            // Cache miss: call shape callback
-                                            perf_shape_cache_misses += 1;
-                                            bufs.ensureCapacity(ctx.core.alloc, scalar_count) catch {
-                                                c = end;
-                                                continue;
-                                            };
-                                            bufs.setLen(scalar_count);
-
-                                            const glyph_count = shape_text_run.?(
-                                                ctx.core.ctx,
-                                                ctx.core.shaping_scalars.items.ptr,
-                                                scalar_count,
-                                                c_style,
-                                                bufs.glyph_ids.items.ptr,
-                                                bufs.clusters.items.ptr,
-                                                bufs.x_adv.items.ptr,
-                                                bufs.x_off.items.ptr,
-                                                bufs.y_off.items.ptr,
-                                                scalar_count,
-                                            );
-
-                                            if (glyph_count == 0) {
-                                                c = end;
-                                                continue;
-                                            }
-
-                                            final_glyph_count = glyph_count;
-                                            if (glyph_count > scalar_count) {
-                                                bufs.ensureCapacity(ctx.core.alloc, glyph_count) catch {
-                                                    c = end;
-                                                    continue;
-                                                };
-                                                bufs.setLen(glyph_count);
-                                                final_glyph_count = shape_text_run.?(
-                                                    ctx.core.ctx,
-                                                    ctx.core.shaping_scalars.items.ptr,
-                                                    scalar_count,
-                                                    c_style,
-                                                    bufs.glyph_ids.items.ptr,
-                                                    bufs.clusters.items.ptr,
-                                                    bufs.x_adv.items.ptr,
-                                                    bufs.x_off.items.ptr,
-                                                    bufs.y_off.items.ptr,
-                                                    glyph_count,
-                                                );
-                                                if (final_glyph_count == 0) {
-                                                    c = end;
-                                                    continue;
-                                                }
-                                            }
-
-                                            // Store in cache if result fits
-                                            if (final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
-                                                if (ctx.core.shape_cache) |sc_cache| {
-                                                    // Prefer empty slot, else overwrite way 0
-                                                    var sc_store_way: usize = 0;
-                                                    for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
-                                                        if (sc_cache[sc_set_base + sc_way].key_hash == 0) {
-                                                            sc_store_way = sc_way;
-                                                            break;
-                                                        }
-                                                    }
-                                                    const sc_store = &sc_cache[sc_set_base + sc_store_way];
-                                                    sc_store.key_hash = sc_hash1;
-                                                    sc_store.key_hash2 = sc_hash2;
-                                                    sc_store.font_gen = sc_font_gen;
-                                                    sc_store.scalar_count = @intCast(scalar_count);
-                                                    sc_store.glyph_count = @intCast(final_glyph_count);
-                                                    @memcpy(sc_store.glyph_ids[0..final_glyph_count], bufs.glyph_ids.items[0..final_glyph_count]);
-                                                    @memcpy(sc_store.clusters[0..final_glyph_count], bufs.clusters.items[0..final_glyph_count]);
-                                                    @memcpy(sc_store.x_adv[0..final_glyph_count], bufs.x_adv.items[0..final_glyph_count]);
-                                                    @memcpy(sc_store.x_off[0..final_glyph_count], bufs.x_off.items[0..final_glyph_count]);
-                                                    @memcpy(sc_store.y_off[0..final_glyph_count], bufs.y_off.items[0..final_glyph_count]);
-                                                }
-                                            }
-                                        }
-                                        } // end !used_ascii_fast_path
-
-                                        // 3) Iterate shaped glyphs
-                                        // Ensure capacity for this run's glyphs. The per-row cols*6
-                                        // pre-allocation covers typical cases, but shaping expansion
-                                        // (glyph_count > scalar_count) or .notdef fallback can exceed it.
-                                        // Worst case: non-.notdef → 1 quad/glyph (final_glyph_count),
-                                        // .notdef → 1 quad/scalar in cluster (up to scalar_count total).
-                                        out.ensureUnusedCapacity(ctx.core.alloc, (final_glyph_count + scalar_count) * 6) catch {
-                                            c = end;
-                                            continue;
-                                        };
-                                        var penX: f32 = baseX;
-                                        const glyph_cache_id = ctx.core.glyph_cache_by_id;
-                                        const glyph_keys_id = ctx.core.glyph_keys_by_id;
-
-                                        var gi: usize = 0;
-                                        while (gi < final_glyph_count) : (gi += 1) {
-                                            const gid = bufs.glyph_ids.items[gi];
-                                            // Cluster-based pen advance using column widths
-                                            const this_cluster = bufs.clusters.items[gi];
-                                            const next_cluster = if (gi + 1 < final_glyph_count) bufs.clusters.items[gi + 1] else @as(u32, @intCast(scalar_count));
-
-                                            if (gid == 0) {
-                                                // .notdef glyph — fall back to per-scalar path (has CoreText font fallback)
-                                                var ci: u32 = this_cluster;
-                                                while (ci < next_cluster) : (ci += 1) {
-                                                    const fb_scalar = ctx.core.shaping_scalars.items[@intCast(ci)];
-                                                    const fb_col_w = ctx.core.shaping_col_widths.items[@intCast(ci)];
-                                                    if (fb_scalar == 32) {
-                                                        penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
-                                                        continue;
-                                                    }
-                                                    // Block element: geometric rendering (no atlas)
-                                                    if (block_elements.isBlockElement(fb_scalar)) {
-                                                        const blk_w = @as(f32, @floatFromInt(fb_col_w)) * cellW;
-                                                        const blk_geo = block_elements.getBlockGeometry(fb_scalar);
-                                                        if (blk_geo.count > 0) {
-                                                            const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                                            out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                                                penX += blk_w;
-                                                                continue;
-                                                            };
-                                                            for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                                                Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, glyph_scroll_flag);
-                                                            }
-                                                        }
-                                                        penX += blk_w;
-                                                        continue;
-                                                    }
-                                                    if (ctx.core.ensureGlyphPhase2(fb_scalar, c_style)) |fb_ge| {
-                                                        if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
-                                                            const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
-                                                            const fb_gx0: f32 = penX + fb_ge.bbox_origin_px[0];
-                                                            const fb_gx1: f32 = fb_gx0 + fb_ge.bbox_size_px[0];
-                                                            const fb_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
-                                                            const fb_gy1: f32 = fb_gy0 + fb_ge.bbox_size_px[1];
-
-                                                            const fb_uv0: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_min[1] };
-                                                            const fb_uv1: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_min[1] };
-                                                            const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
-                                                            const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
-
-                                                            const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                                            Helpers.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, dw, dh, run_grid_id, fb_glyph_deco);
-                                                        }
-                                                    }
-                                                    penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
-                                                }
-                                                continue;
-                                            }
-
-                                            // Skip space glyphs: no bitmap, just advance pen
-                                            if (next_cluster == this_cluster + 1) {
-                                                const sp_scalar = ctx.core.shaping_scalars.items[@intCast(this_cluster)];
-                                                if (sp_scalar == 0x20) {
-                                                    penX += @as(f32, @floatFromInt(ctx.core.shaping_col_widths.items[@intCast(this_cluster)])) * cellW;
-                                                    continue;
-                                                }
-                                                // Block element: geometric rendering (no atlas)
-                                                if (block_elements.isBlockElement(sp_scalar)) {
-                                                    const blk_cols = ctx.core.shaping_col_widths.items[@intCast(this_cluster)];
-                                                    const blk_w = @as(f32, @floatFromInt(blk_cols)) * cellW;
-                                                    const blk_geo = block_elements.getBlockGeometry(sp_scalar);
-                                                    if (blk_geo.count > 0) {
-                                                        const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                                        out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                                            penX += blk_w;
-                                                            continue;
-                                                        };
-                                                        for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                                            Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, glyph_scroll_flag);
-                                                        }
-                                                    }
-                                                    penX += blk_w;
-                                                    continue;
-                                                }
-                                            }
-
-                                            // Glyph-ID cache lookup
-                                            var ge: c_api.GlyphEntry = undefined;
-                                            const glyph_ok = gid_blk: {
-                                                if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                                    const key = (@as(u64, gid) << 2) | @as(u64, style_index);
-                                                    const hash_val = (gid *% 2654435761) ^ style_index;
-                                                    const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                                                    if (glyph_keys_id.?[hash_idx] == key) {
-                                                        ge = glyph_cache_id.?[hash_idx];
-                                                        break :gid_blk true;
-                                                    }
-                                                    // Cache miss: rasterize by glyph ID
-                                                    if (ctx.core.ensureGlyphByID(gid, c_style)) |entry| {
-                                                        ge = entry;
-                                                        glyph_cache_id.?[hash_idx] = entry;
-                                                        glyph_keys_id.?[hash_idx] = key;
-                                                        break :gid_blk true;
-                                                    }
-                                                    break :gid_blk false;
-                                                }
-                                                // No cache: rasterize directly
-                                                if (ctx.core.ensureGlyphByID(gid, c_style)) |entry| {
-                                                    ge = entry;
-                                                    break :gid_blk true;
-                                                }
-                                                break :gid_blk false;
-                                            };
-
-                                            if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                                const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
-                                                const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
-                                                const baselineY: f32 = baseY + ge.ascent_px;
-
-                                                const gx0: f32 = penX + ge.bbox_origin_px[0] + x_off_px;
-                                                const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                                const gy0: f32 = (baselineY + y_off_px) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                                const gy1: f32 = gy0 + ge.bbox_size_px[1];
-
-                                                const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                                                const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                                                const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                                                const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
-
-                                                const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                                Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, glyph_deco);
-                                            }
-
-                                            // Advance pen using column widths (correct for wide chars)
-                                            {
-                                                const cl_span = next_cluster - this_cluster;
-                                                const cluster_cols: u32 = if (cl_span == 1)
-                                                    ctx.core.shaping_col_widths.items[@intCast(this_cluster)]
-                                                else blk: {
-                                                    var sum: u32 = 0;
-                                                    var cwi: u32 = this_cluster;
-                                                    while (cwi < next_cluster) : (cwi += 1) {
-                                                        sum += ctx.core.shaping_col_widths.items[@intCast(cwi)];
-                                                    }
-                                                    break :blk sum;
-                                                };
-                                                penX += @as(f32, @floatFromInt(cluster_cols)) * cellW;
-                                            }
-                                        }
-                                    } else {
-                                        // --- Existing per-cell glyph path (fallback) ---
-                                        var penX: f32 = baseX;
-
-                                    var col_i: u32 = run_start;
-                                    while (col_i < end) : (col_i += 1) {
-                                        const cell_scalar = row_cells.scalars.items[@intCast(col_i)];
-                                        const cell_style_flags = row_cells.style_flags_arr.items[@intCast(col_i)];
-                                        const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
-                                        if (scalar == 32) {
-                                            penX += cellW;
-                                            continue;
-                                        }
-                                        // Block element: geometric rendering (no atlas)
-                                        if (block_elements.isBlockElement(scalar)) {
-                                            const blk_geo = block_elements.getBlockGeometry(scalar);
-                                            if (blk_geo.count > 0) {
-                                                const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                                out.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                                    penX += cellW;
-                                                    continue;
-                                                };
-                                                for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                                    Helpers.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, Helpers.rgb(run_fg), dw, dh, run_grid_id, glyph_scroll_flag);
-                                                }
-                                            }
-                                            penX += cellW;
-                                            continue;
-                                        }
-
-                                        var ge: c_api.GlyphEntry = undefined;
-                                        // Use styled callback for bold/italic if available
-                                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
-                                        // Compute style index: 0=none, 1=bold, 2=italic, 3=bold+italic
-                                        const style_index: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
-                                        // GlyphEntry cache lookup for ASCII characters (using dynamic cache)
-                                        const glyph_ok = blk: {
-                                            // Check dynamic cache for ASCII (0-127)
-                                            if (scalar < 128 and glyph_cache_ascii != null and glyph_valid_ascii != null) {
-                                                const cache_key: usize = scalar * 4 + style_index;
-                                                if (cache_key < GLYPH_CACHE_ASCII_SIZE) {
-                                                    if (glyph_valid_ascii.?[cache_key]) {
-                                                        perf_glyph_ascii_hits += 1;
-                                                        ge = glyph_cache_ascii.?[cache_key];
-                                                        break :blk true;
-                                                    }
-                                                    // Cache miss: call callback
-                                                    perf_glyph_ascii_misses += 1;
-                                                    const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                        const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                        if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                                            ge = entry;
-                                                            break :cb true;
-                                                        }
-                                                        break :cb false;
-                                                    } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                        const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                        break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
-                                                    } else if (ensure_base) |ensure| cb: {
-                                                        break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
-                                                    } else false;
-                                                    if (ok) {
-                                                        glyph_cache_ascii.?[cache_key] = ge;
-                                                        glyph_valid_ascii.?[cache_key] = true;
-                                                    }
-                                                    break :blk ok;
-                                                }
-                                            }
-                                            // Non-ASCII or cache not initialized: use hash table cache
-                                            if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                                const key = (@as(u64, scalar) << 2) | @as(u64, style_index);
-                                                // FNV-1a inspired hash
-                                                const hash_val = (scalar *% 2654435761) ^ style_index;
-                                                const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                                                if (glyph_keys_non_ascii.?[hash_idx] == key) {
-                                                    perf_glyph_nonascii_hits += 1;
-                                                    ge = glyph_cache_non_ascii.?[hash_idx];
-                                                    break :blk true;
-                                                }
-                                                // Cache miss: call callback
-                                                perf_glyph_nonascii_misses += 1;
-                                                const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                    const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                    if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                                        ge = entry;
-                                                        break :cb true;
-                                                    }
-                                                    break :cb false;
-                                                } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                    const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                    break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
-                                                } else if (ensure_base) |ensure| cb: {
-                                                    break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
-                                                } else false;
-                                                if (ok) {
-                                                    glyph_cache_non_ascii.?[hash_idx] = ge;
-                                                    glyph_keys_non_ascii.?[hash_idx] = key;
-                                                }
-                                                break :blk ok;
-                                            }
-                                            // No cache available: call callback directly
-                                            const ok = if (ctx.core.isPhase2Atlas()) cb: {
-                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                                    ge = entry;
-                                                    break :cb true;
-                                                }
-                                                break :cb false;
-                                            } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                break :cb ensure_styled.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
-                                            } else if (ensure_base) |ensure| cb: {
-                                                break :cb ensure(ctx.core.ctx, scalar, &ge) != 0;
-                                            } else false;
-                                            break :blk ok;
-                                        };
-                                        if (!glyph_ok) {
-                                            had_glyph_miss = true;
-                                            if (ctx.core.missing_glyph_log_count < 16) {
-                                                ctx.core.log.write(
-                                                    "glyph_missing row={d} col={d} scalar=0x{x}\n",
-                                                    .{ r, col_i, scalar },
-                                                );
-                                                ctx.core.missing_glyph_log_count += 1;
-                                            }
-                                            penX += cellW;
-                                            continue;
-                                        }
-
-                                        const baselineY: f32 = baseY + ge.ascent_px;
-
-                                        const gx0: f32 = penX + ge.bbox_origin_px[0];
-                                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                        const gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
-
-                                        const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                                        const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                                        const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                                        const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
-
-                                        if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                            Helpers.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, pc_glyph_deco);
-                                        }
-
-                                        penX += cellW;
-                                    }
-                                    } // end else (per-cell fallback)
-                                }
-
-                                c = end;
-                            }
-                        }
-
-                        var t_row_glyph_end: i128 = 0;
-                        var t_row_strike_start: i128 = 0;
-                        if (log_enabled) {
-                            t_row_glyph_end = std.time.nanoTimestamp();
-                            t_row_strike_start = t_row_glyph_end;
-                        }
-
-                        // 4) Strikethrough (drawn on top of glyphs)
-                        {
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const c_style_flags = row_cells.style_flags_arr.items[@intCast(c)];
-                                if (c_style_flags & STYLE_STRIKETHROUGH == 0) {
-                                    c += 1;
-                                    continue;
-                                }
-
-                                const run_start = c;
-                                const run_flags = c_style_flags;
-                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
-                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
-                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
-
-                                const run_end: u32 = @intCast(@min(
-                                    simdFindRunEndU8(row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
-                                    @min(
-                                        simdFindRunEndU32(row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                                        simdFindRunEndI64(row_cells.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
-                                    ),
-                                ));
-
-                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                const strike_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
-
-                                const y0 = row_y + cellH * 0.5 - 0.5;
-                                const y1 = y0 + 1.0;
-                                try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH | strike_scroll_flag, 0);
-
-                                c = run_end;
-                            }
-                        }
-
-                        // 5) Overline (line at top of cell)
-                        {
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                if (row_cells.overline_arr.items[@intCast(c)] == 0) {
-                                    c += 1;
-                                    continue;
-                                }
-
-                                const run_start = c;
-                                const run_sp = row_cells.sp_rgbs.items[@intCast(c)];
-                                const run_fg = row_cells.fg_rgbs.items[@intCast(c)];
-                                const run_grid_id = row_cells.grid_ids.items[@intCast(c)];
-
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    if (row_cells.overline_arr.items[@intCast(run_end)] == 0) break;
-                                    if (row_cells.sp_rgbs.items[@intCast(run_end)] != run_sp) break;
-                                    if (row_cells.grid_ids.items[@intCast(run_end)] != run_grid_id) break;
-                                    // When sp is unset, color falls back to fg — break on fg change
-                                    if (run_sp == highlight.Highlights.SP_NOT_SET and
-                                        row_cells.fg_rgbs.items[@intCast(run_end)] != run_fg) break;
-                                }
-
-                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                const ol_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
-
-                                const y0 = row_y;
-                                const y1 = y0 + 1.0;
-                                try Helpers.pushDecoQuad(out, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_OVERLINE | ol_scroll_flag, 0);
-
-                                c = run_end;
-                            }
-                        }
-
+                        // Unified 5-pass vertex generation.
+                        // On error (e.g. buffer allocation failure), skip this row
+                        // so partial vertices are not cached or sent to the frontend.
+                        // markAllDirty at the end of the flush ensures a retry.
+                        const row_gen_result = generateRowVertices(ctx.core, .{
+                            .row = r,
+                            .cols = cols,
+                            .vw = dw,
+                            .vh = dh,
+                            .cell_w = cellW,
+                            .cell_h = cellH,
+                            .top_pad = topPad,
+                            .default_bg = ctx.core.hl.default_bg,
+                            .blur_enabled = ctx.core.blur_enabled,
+                            .background_opacity = ctx.core.background_opacity,
+                            .is_cmdline = false,
+                            .glow_enabled = glow_enabled,
+                        }, out) catch {
+                            out.clearRetainingCapacity();
+                            had_glyph_miss = true;
+                            continue;
+                        };
+                        had_glyph_miss = had_glyph_miss or row_gen_result;
                         // Log row timing for performance measurement
                         if (log_enabled) {
-                            const t_row_strike_end = std.time.nanoTimestamp();
+                            const t_row_gen_end = std.time.nanoTimestamp();
                             row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
-                            row_bg_us = @intCast(@divTrunc(@max(0, t_row_bg_end - t_row_bg_start), 1000));
-                            row_under_deco_us = @intCast(@divTrunc(@max(0, t_row_under_deco_end - t_row_under_deco_start), 1000));
-                            row_glyph_us = @intCast(@divTrunc(@max(0, t_row_glyph_end - t_row_glyph_start), 1000));
-                            row_strike_us = @intCast(@divTrunc(@max(0, t_row_strike_end - t_row_strike_start), 1000));
-                            const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_strike_end - t_row_compose_start), 1000));
+                            const gen_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_gen_start), 1000));
+                            const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_compose_start), 1000));
                             perf_row_compose_sum_us += row_compose_us;
-                            perf_row_bg_sum_us += row_bg_us;
-                            perf_row_under_deco_sum_us += row_under_deco_us;
-                            perf_row_glyph_sum_us += row_glyph_us;
-                            perf_row_strike_sum_us += row_strike_us;
                             perf_row_total_sum_us += total_us;
                             perf_row_count += 1;
                             if (total_us > perf_row_max_total_us) {
                                 perf_row_max_total_us = total_us;
                                 perf_row_max_total_idx = r;
                             }
-                            if (row_glyph_us > perf_row_max_glyph_us) {
-                                perf_row_max_glyph_us = row_glyph_us;
-                                perf_row_max_glyph_idx = r;
-                            }
                             ctx.core.log.write(
-                                "[perf] row_mode row={d} cols={d} compose_us={d} bg_us={d} under_deco_us={d} glyph_us={d} strike_us={d} total_us={d}\n",
-                                .{ r, cols, row_compose_us, row_bg_us, row_under_deco_us, row_glyph_us, row_strike_us, total_us },
+                                "[perf] row_mode row={d} cols={d} compose_us={d} gen_us={d} total_us={d}\n",
+                                .{ r, cols, row_compose_us, gen_us, total_us },
                             );
                         }
 
@@ -2489,7 +2715,7 @@ pub const FlushCtx = struct {
                             const cache_store_us: i64 = @intCast(@divTrunc(@max(0, t_row_cache_store_end - t_row_post_misc_before_cache_store), 1000));
                             const row_cb_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_before_cb), 1000));
                             const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
-                            const known_total_us = row_compose_us + row_bg_us + row_under_deco_us + row_glyph_us + row_strike_us + cache_store_us + row_cb_us;
+                            const known_total_us = row_compose_us + cache_store_us + row_cb_us;
                             const post_misc_us: i64 = @max(0, total_us - known_total_us);
                             perf_row_cache_store_sum_us += cache_store_us;
                             perf_row_cb_sum_us += row_cb_us;
@@ -2537,22 +2763,16 @@ pub const FlushCtx = struct {
                             .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us, used_scroll_fast_path },
                         );
                         ctx.core.log.write(
-                            "[perf] row_mode_breakdown rows={d} compose_sum_us={d} bg_sum_us={d} under_deco_sum_us={d} glyph_sum_us={d} strike_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_glyph_row={d} max_glyph_us={d} max_cb_row={d} max_cb_us={d}\n",
+                            "[perf] row_mode_breakdown rows={d} compose_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_cb_row={d} max_cb_us={d}\n",
                             .{
                                 perf_row_count,
                                 perf_row_compose_sum_us,
-                                perf_row_bg_sum_us,
-                                perf_row_under_deco_sum_us,
-                                perf_row_glyph_sum_us,
-                                perf_row_strike_sum_us,
                                 perf_row_cache_store_sum_us,
                                 perf_row_cb_sum_us,
                                 perf_row_post_misc_sum_us,
                                 perf_row_total_sum_us,
                                 perf_row_max_total_idx,
                                 perf_row_max_total_us,
-                                perf_row_max_glyph_idx,
-                                perf_row_max_glyph_us,
                                 perf_row_max_cb_idx,
                                 perf_row_max_cb_us,
                             },
@@ -3629,14 +3849,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     };
     // Glyph cache is persistent across flushes (same as row_mode path).
 
-    // Get glyph cache references
-    const glyph_cache_ascii = self.glyph_cache_ascii;
-    const glyph_valid_ascii = self.glyph_valid_ascii;
-    const glyph_cache_non_ascii = self.glyph_cache_non_ascii;
-    const glyph_keys_non_ascii = self.glyph_keys_non_ascii;
-    const GLYPH_CACHE_ASCII_SIZE = self.glyph_cache_ascii_size;
-    const GLYPH_CACHE_NON_ASCII_SIZE = self.glyph_cache_non_ascii_size;
-
     // Track atlas reset across all external grids.
     // If any grid triggers a reset, already-sent grids also have stale UVs.
     var ext_saw_atlas_reset_any: bool = false;
@@ -3676,8 +3888,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Reset hl_cache for this grid
         cache.reset();
 
-        // Check if we need full redraw or can use dirty_rows
-        const need_full_redraw = force_render or force_redraw_this or cursor_affected or cursor_moved_within;
+        // Full redraw only for forced operations, not cursor-only changes.
+        // Cursor rows are handled via regen_rows (fast path) or dirty_rows marking below.
+        const need_full_redraw = force_render or force_redraw_this;
 
         // NDC viewport: use target dimensions which are kept in sync with grid_resize.
         // This ensures NDC always matches the actual grid data dimensions.
@@ -3688,11 +3901,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         const grid_h: f32 = @as(f32, @floatFromInt(viewport_rows)) * cellH;
 
         // Debug: count non-space cells
-        var non_space_count: u32 = 0;
-        var glyph_success_count: u32 = 0;
-        var glyph_fail_count: u32 = 0;
-        var sample_cps: [10]u32 = .{0} ** 10;
-        var sample_idx: usize = 0;
+        // (glyph statistics now tracked inside generateRowVertices; retained
+        //  as zero stubs for debug logging compatibility)
 
         ext_verts.clearRetainingCapacity();
 
@@ -3713,8 +3923,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             self.log.write("[ext_grid] WARN: failed to pre-allocate {d} vertices\n", .{est_verts});
             continue; // Skip this grid if we can't allocate
         };
-
-        const solid_uv: [2]f32 = .{ -1.0, -1.0 };
 
         // Create composite cell array - copy external grid cells and overlay float windows
         // This approach ensures float windows completely overwrite (not blend with) the underlying cells
@@ -3842,46 +4050,140 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         var ext_saw_atlas_reset: bool = false;
         var ext_retried: bool = false;
+        var ext_had_row_error: bool = false;
+
+        // Determine external grid scroll fast path eligibility (before retry loop).
+        // When eligible, we skip non-dirty rows even when sg.dirty is set,
+        // because scroll() now only marks vacated rows dirty.
+        const ext_scroll_fast_path: bool = blk: {
+            if (force_render or need_full_redraw) break :blk false;
+            const op = sg.last_scroll_op orelse break :blk false;
+            if (sg.scroll_fast_path_blocked) break :blk false;
+            const abs_rows: u32 = @intCast(@abs(op.rows));
+            if (abs_rows != 1) break :blk false;
+            if (op.cols != 0) break :blk false;
+            const region_height: u32 = op.bot -| op.top;
+            if (region_height <= 1) break :blk false;
+            if (op.left != 0 or op.right != sg.cols) break :blk false;
+            if (op.bot > sg.rows) break :blk false;
+            break :blk true;
+        };
+
+        // When a scroll happened but the fast path is not usable (multiple
+        // scrolls in one batch, or scroll delta > 1), the frontend won't
+        // receive on_grid_row_scroll (no row slot remap) and GPU scroll
+        // copy is disabled for external grids. All shifted rows need full
+        // vertex regeneration — dirty_rows only covers vacated rows.
+        const ext_scroll_needs_full_regen: bool =
+            !ext_scroll_fast_path and (sg.scroll_fast_path_blocked or
+            (if (sg.last_scroll_op) |op| @abs(op.rows) > 1 else false));
+
+        // Cursor is rendered as a separate layer (after row loop), NOT inline
+        // in row vertices. This eliminates cursor ghost artifacts during GPU
+        // scroll copy. No prev_cursor_row tracking needed for row regeneration.
+
+        // Build regen_rows set for scroll fast path (mirrors main grid approach).
+        // Pre-compute which rows need regeneration: dirty_rows only (no cursor rows).
+        var regen_rows: [12]u32 = undefined;
+        var regen_count: u32 = 0;
+        var use_ext_scroll_fast_path = ext_scroll_fast_path;
+
+        if (ext_scroll_fast_path) {
+            // Add all dirty rows within viewport bounds.
+            // Rows beyond viewport_rows are invisible (outside NDC viewport)
+            // and should not be included in the regen set.
+            for (0..viewport_rows) |ri| {
+                const r: u32 = @intCast(ri);
+                if (sg.dirty_rows.bit_length > r and sg.dirty_rows.isSet(ri)) {
+                    if (regen_count < regen_rows.len) {
+                        regen_rows[regen_count] = r;
+                        regen_count += 1;
+                    } else {
+                        // Too many dirty rows for fast path — fall back
+                        use_ext_scroll_fast_path = false;
+                        break;
+                    }
+                }
+            }
+            // When viewport_rows < sg.rows (margin rows present), the Neovim
+            // dirty bitmap marks the out-of-bounds vacated row (e.g. row 44
+            // for sg.rows=45, viewport_rows=44). The frontend scroll callback
+            // receives the clamped region, so its vacated row is within the
+            // viewport. Add the clamped vacated row to regen if not already
+            // present. Without this, the vacated row gets no vertex data and
+            // renders blank after the GPU scroll blit.
+            if (use_ext_scroll_fast_path and viewport_rows < sg.rows) {
+                const op = sg.last_scroll_op.?;
+                const clamped_bot = @min(op.bot, viewport_rows);
+                const vacated: u32 = if (op.rows > 0) clamped_bot -| 1 else op.top;
+                var found = false;
+                for (regen_rows[0..regen_count]) |rr| {
+                    if (rr == vacated) { found = true; break; }
+                }
+                if (!found) {
+                    if (regen_count < regen_rows.len) {
+                        regen_rows[regen_count] = vacated;
+                        regen_count += 1;
+                    } else {
+                        use_ext_scroll_fast_path = false;
+                    }
+                }
+            }
+        }
 
         ext_retry: while (true) {
             if (ext_retried) {
                 // Reset per-pass state for clean retry
-                non_space_count = 0;
-                glyph_success_count = 0;
-                glyph_fail_count = 0;
-                sample_idx = 0;
                 cache.reset(); // Resets perf counters + hl_valid (hl_valid reset is harmless)
+                ext_had_row_error = false;
             }
             const ext_effective_rebuild = ext_retried;
 
-        for (0..sg.rows) |row_idx| {
+        // Iterate only up to viewport_rows (not sg.rows).
+        // Rows beyond viewport_rows are outside the NDC viewport and
+        // produce clipped vertices. Matching the vertex loop to the
+        // viewport ensures the frontend receives data only for drawable
+        // rows — the same invariant the main window always satisfies.
+        for (0..viewport_rows) |row_idx| {
             const row: u32 = @intCast(row_idx);
 
             // Compute scrollable flag for this row in the external grid
             const ext_scrollable: u32 = if (row >= ext_margins.top and row < sg.rows -| ext_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
-            // Skip clean rows unless full redraw needed or cursor is on this row
-            const is_cursor_row = if (cursor_row) |cr| cr == row else false;
-            if (!need_full_redraw and !ext_effective_rebuild and !is_cursor_row) {
-                // Check dirty_rows bitmap (also respect dirty flag which is set on resize/clear)
-                // When dirty=true (after resize), all rows should be redrawn
-                if (!sg.dirty and sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(@as(usize, row))) {
-                    continue; // Row is clean, skip it
+            // Row skip logic — mirrors main grid approach:
+            // Fast path: only compose rows in regen set (dirty + cursor rows).
+            // Fallback: check dirty_rows bitmap.
+            // When scroll happened but fast path is ineligible, regenerate all
+            // rows because the frontend has no GPU blit or row slot remap to
+            // shift the non-vacated rows visually.
+            if (use_ext_scroll_fast_path and !ext_retried) {
+                var in_regen = false;
+                for (regen_rows[0..regen_count]) |rr| {
+                    if (rr == row) { in_regen = true; break; }
+                }
+                if (!in_regen) continue;
+            } else if (!need_full_redraw and !ext_effective_rebuild and !ext_scroll_needs_full_regen) {
+                if (sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(@as(usize, row))) {
+                    continue;
                 }
             }
-
-            const row_y: f32 = @as(f32, @floatFromInt(row)) * cellH;
 
             // Clear buffer for this row
             ext_verts.clearRetainingCapacity();
 
             // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
             const row_est = @as(usize, sg.cols) * 24 + 12;
-            ext_verts.ensureTotalCapacity(self.alloc, row_est) catch continue;
+            ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
+                ext_had_row_error = true;
+                continue;
+            };
 
             // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
             self.row_cells.clearRetainingCapacity();
-            self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch continue;
+            self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
+                ext_had_row_error = true;
+                continue;
+            };
             self.row_cells.setLen(sg.cols);
 
             const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
@@ -3900,886 +4202,156 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 }
             }
 
-            // Pass 1: Background (run-length optimized)
-            {
-                var c: u32 = 0;
-                while (c < sg.cols) {
-                    const run_bg = self.row_cells.bg_rgbs.items[c];
-                    const run_start = c;
+            // Populate deco_base_flags: uniform ext_scrollable for external grids
+            @memset(self.row_cells.deco_base_flags.items[0..sg.cols], ext_scrollable);
 
-                    const end: u32 = @intCast(simdFindRunEndU32(self.row_cells.bg_rgbs.items, @intCast(c), @intCast(sg.cols), run_bg));
+            // Unified 5-pass vertex generation
+            _ = generateRowVertices(self, .{
+                .row = row,
+                .cols = sg.cols,
+                .vw = grid_w,
+                .vh = grid_h,
+                .cell_w = cellW,
+                .cell_h = cellH,
+                .top_pad = topPad,
+                .default_bg = default_bg,
+                .blur_enabled = self.blur_enabled,
+                .background_opacity = self.background_opacity,
+                .is_cmdline = is_cmdline,
+                .glow_enabled = ext_glow_enabled,
+            }, ext_verts) catch {
+                ext_verts.clearRetainingCapacity();
+                ext_had_row_error = true;
+                continue;
+            };
+            // Cursor rendering moved to separate layer (after row loop)
 
-                    const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                    const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
-                    const y0: f32 = row_y;
-                    const y1: f32 = row_y + cellH;
-
-                    const bg_alpha: f32 = if (run_bg == default_bg)
-                        (if (self.blur_enabled) (if (is_cmdline) 0.0 else 0.5) else self.background_opacity)
-                    else
-                        1.0;
-                    const bg_col = Helpers.rgba(run_bg, bg_alpha);
-
-                    const bg_pts = Helpers.ndc4(x0, y0, x1, y1, grid_w, grid_h);
-                    const tl = bg_pts[0]; const tr = bg_pts[1]; const bl = bg_pts[2]; const br = bg_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = tl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = tr, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = br, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = bl, .texCoord = solid_uv, .color = bg_col, .grid_id = grid_id, .deco_flags = ext_scrollable, .deco_phase = 0 });
-
-                    c = end;
+            // CHECK: atlas reset happened during glyph processing for this row.
+            // Already-sent rows have stale UVs → need to restart or abort.
+            if (self.atlas_reset_during_flush) {
+                ext_saw_atlas_reset = true;
+                ext_saw_atlas_reset_any = true;
+                self.atlas_reset_during_flush = false; // Clear for retry
+                if (!ext_retried) {
+                    ext_retried = true;
+                    use_ext_scroll_fast_path = false; // Retry needs full redraw
+                    continue :ext_retry; // Restart this grid's row loop from row 0
                 }
+                // 2nd reset: clear all sent rows (match main grid behavior)
+                for (0..viewport_rows) |clear_ri| {
+                    row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
+                }
+                break; // Abort remaining rows
             }
 
-            // Pass 2: Under-decorations (underline, undercurl, etc.)
-            {
-                const under_deco_mask: u8 = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
-                var c: u32 = 0;
-                while (c < sg.cols) {
-                    const ext_cell_sf = self.row_cells.style_flags_arr.items[c];
-                    if (ext_cell_sf & under_deco_mask == 0) {
-                        c += 1;
-                        continue;
-                    }
-
-                    const run_start = c;
-                    const run_flags = ext_cell_sf;
-                    const run_sp = self.row_cells.sp_rgbs.items[c];
-                    const run_fg = self.row_cells.fg_rgbs.items[c];
-
-                    const run_end: u32 = @intCast(@min(
-                        simdFindRunEndU8(self.row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(sg.cols), run_flags),
-                        simdFindRunEndU32(self.row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(sg.cols), run_sp),
-                    ));
-
-                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                    const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                    const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-
-                    // Underline
-                    if (run_flags & STYLE_UNDERLINE != 0) {
-                        const uy0 = row_y + cellH - 2.0;
-                        const uy1 = uy0 + 1.0;
-                        const ul_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
-                        const utl = ul_pts[0]; const utr = ul_pts[1]; const ubl = ul_pts[2]; const ubr = ul_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                    }
-
-                    // Underdouble
-                    if (run_flags & STYLE_UNDERDOUBLE != 0) {
-                        const uy0_1 = row_y + cellH - 6.0;
-                        const uy1_1 = uy0_1 + 1.0;
-                        const uy0_2 = row_y + cellH - 2.0;
-                        const uy1_2 = uy0_2 + 1.0;
-                        // First line
-                        const ud1_pts = Helpers.ndc4(x0, uy0_1, x1, uy1_1, grid_w, grid_h);
-                        var utl = ud1_pts[0]; var utr = ud1_pts[1]; var ubl = ud1_pts[2]; var ubr = ud1_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        // Second line
-                        const ud2_pts = Helpers.ndc4(x0, uy0_2, x1, uy1_2, grid_w, grid_h);
-                        utl = ud2_pts[0]; utr = ud2_pts[1]; ubl = ud2_pts[2]; ubr = ud2_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERLINE | ext_scrollable, .deco_phase = 0 });
-                    }
-
-                    // Undercurl
-                    if (run_flags & STYLE_UNDERCURL != 0) {
-                        const uy0 = row_y + cellH - 4.0;
-                        const uy1 = row_y + cellH;
-                        const phase: f32 = @floatFromInt(run_start);
-                        const uc_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
-                        const utl = uc_pts[0]; const utr = uc_pts[1]; const ubl = uc_pts[2]; const ubr = uc_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERCURL | ext_scrollable, .deco_phase = phase });
-                    }
-
-                    // Underdotted
-                    if (run_flags & STYLE_UNDERDOTTED != 0) {
-                        const uy0 = row_y + cellH - 2.0;
-                        const uy1 = uy0 + 1.0;
-                        const udt_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
-                        const utl = udt_pts[0]; const utr = udt_pts[1]; const ubl = udt_pts[2]; const ubr = udt_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDOTTED | ext_scrollable, .deco_phase = 0 });
-                    }
-
-                    // Underdashed
-                    if (run_flags & STYLE_UNDERDASHED != 0) {
-                        const uy0 = row_y + cellH - 2.0;
-                        const uy1 = uy0 + 1.0;
-                        const uda_pts = Helpers.ndc4(x0, uy0, x1, uy1, grid_w, grid_h);
-                        const utl = uda_pts[0]; const utr = uda_pts[1]; const ubl = uda_pts[2]; const ubr = uda_pts[3];
-                        ext_verts.appendAssumeCapacity(.{ .position = utl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = utr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                        ext_verts.appendAssumeCapacity(.{ .position = ubl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_UNDERDASHED | ext_scrollable, .deco_phase = 0 });
-                    }
-
-                    c = run_end;
-                }
+            // Send this row's vertices
+            // Pass viewport dimensions (target size) instead of sg dimensions so that
+            // the frontend's scroll offset calculation matches the NDC viewport used here.
+            if (ext_verts.items.len > 0) {
+                row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
             }
+        }
+        break :ext_retry; // Normal exit from retry loop
+        }
 
-            // Pass 3: Glyphs (with glyph_cache)
-            const ensure_base = self.cb.on_atlas_ensure_glyph;
-            const ensure_styled = self.cb.on_atlas_ensure_glyph_styled;
-            const ext_shape_text_run = self.cb.on_shape_text_run;
-            const ext_has_shaping = ext_shape_text_run != null and self.isPhase2Atlas() and self.cb.on_rasterize_glyph_by_id != null;
+        // --- Cursor layer: send cursor vertices as separate on_vertices_row with CURSOR flag ---
+        // This keeps cursor independent of row buffers, so GPU scroll copy
+        // cannot create cursor ghosts.
+        if (cursor_row) |cur_row| {
+            if (cur_row < sg.rows and cursor_col < sg.cols) {
+                ext_verts.clearRetainingCapacity();
+                // Estimate: 6 cursor bg + 6 cursor text + block element quads
+                ext_verts.ensureTotalCapacity(self.alloc, 48) catch {};
 
-            if (ext_has_shaping) {
-                // --- Text-run shaping path for external grids ---
-                // Process by HL runs (same fg + style) to enable ligature shaping
-                var ec: u32 = 0;
-                while (ec < sg.cols) {
-                    const run_fg_ext = self.row_cells.fg_rgbs.items[ec];
-                    const run_sf_ext = self.row_cells.style_flags_arr.items[ec];
-                    const run_glow_ext: u8 = if (ext_glow_enabled) self.row_cells.glow_arr.items[ec] else 0;
-                    const run_start_ext = ec;
+                const cx0 = @as(f32, @floatFromInt(cursor_col)) * cellW;
+                const cy0 = @as(f32, @floatFromInt(cur_row)) * cellH;
 
-                    // Find end of HL run (same fg + style flags, + glow when enabled)
-                    var run_end_ext = ec + 1;
-                    while (run_end_ext < sg.cols) : (run_end_ext += 1) {
-                        if (self.row_cells.fg_rgbs.items[run_end_ext] != run_fg_ext or
-                            self.row_cells.style_flags_arr.items[run_end_ext] != run_sf_ext) break;
-                        if (ext_glow_enabled and self.row_cells.glow_arr.items[run_end_ext] != run_glow_ext) break;
+                var is_double_width = false;
+                if (cursor_col + 1 < sg.cols) {
+                    const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
+                    if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
+                        is_double_width = true;
                     }
-
-                    // Check if run has any ink
-                    var has_ink_ext = false;
-                    for (run_start_ext..run_end_ext) |ci| {
-                        const sc = self.row_cells.scalars.items[ci];
-                        if (sc != 0 and sc != 32 and sc != ' ') {
-                            has_ink_ext = true;
-                            break;
-                        }
-                    }
-
-                    if (has_ink_ext) {
-                        const c_style_ext: u32 = @as(u32, if (run_sf_ext & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                            @as(u32, if (run_sf_ext & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                        const style_index_ext: u32 = @as(u32, if (run_sf_ext & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                            @as(u32, if (run_sf_ext & STYLE_ITALIC != 0) @as(u32, 2) else 0);
-
-                        // Collect scalars and track column widths
-                        self.shaping_scalars.clearRetainingCapacity();
-                        self.shaping_col_widths.clearRetainingCapacity();
-                        const run_len_ext = run_end_ext - run_start_ext;
-                        self.shaping_scalars.ensureTotalCapacity(self.alloc, run_len_ext) catch {
-                            ec = run_end_ext;
-                            continue;
-                        };
-                        self.shaping_col_widths.ensureTotalCapacity(self.alloc, run_len_ext) catch {
-                            ec = run_end_ext;
-                            continue;
-                        };
-                        // SIMD fast path: if no wide chars (no zero scalars), bulk copy
-                        if (simdAllNonZero(self.row_cells.scalars.items, run_start_ext, run_end_ext)) {
-                            @memcpy(self.shaping_scalars.items.ptr[0..run_len_ext], self.row_cells.scalars.items[run_start_ext..run_end_ext]);
-                            self.shaping_scalars.items.len = run_len_ext;
-                            @memset(self.shaping_col_widths.items.ptr[0..run_len_ext], 1);
-                            self.shaping_col_widths.items.len = run_len_ext;
-                        } else {
-                            for (run_start_ext..run_end_ext) |ci| {
-                                const sc = self.row_cells.scalars.items[ci];
-                                if (sc == 0) continue;
-                                self.shaping_scalars.appendAssumeCapacity(sc);
-                                const ext_col_w: u32 = if (ci + 1 < run_end_ext and self.row_cells.scalars.items[ci + 1] == 0) 2 else 1;
-                                self.shaping_col_widths.appendAssumeCapacity(ext_col_w);
-                            }
-                        }
-
-                        const ext_scalar_count = self.shaping_scalars.items.len;
-                        if (ext_scalar_count == 0) {
-                            ec = run_end_ext;
-                            continue;
-                        }
-
-                        // ASCII fast path for external grids
-                        // Single-char runs always safe; multi-char skips triggers.
-                        const ext_bufs = &self.shaping_bufs;
-                        var final_ext_glyph_count: usize = 0;
-                        var used_ext_ascii_fast_path = false;
-
-                        if (self.loadAsciiTables()) {
-                            const ext_ascii_ok = ext_ascii_chk: {
-                                const ext_scalars = self.shaping_scalars.items[0..ext_scalar_count];
-                                // SIMD range check: all in [0x20, 0x7E]
-                                if (!simdAllAsciiPrintable(ext_scalars, ext_scalar_count)) break :ext_ascii_chk false;
-                                if (ext_scalar_count == 1) break :ext_ascii_chk true;
-                                const ext_trigs = &self.ascii_lig_triggers[style_index_ext];
-                                for (ext_scalars) |s| {
-                                    if (ext_trigs[@intCast(s)] != 0) break :ext_ascii_chk false;
-                                }
-                                break :ext_ascii_chk true;
-                            };
-                            if (ext_ascii_ok) {
-                                ext_bufs.ensureCapacity(self.alloc, ext_scalar_count) catch {
-                                    ec = run_end_ext;
-                                    continue;
-                                };
-                                ext_bufs.setLen(ext_scalar_count);
-                                const ext_gids = &self.ascii_glyph_ids[style_index_ext];
-                                const ext_xadvs = &self.ascii_x_advances[style_index_ext];
-                                // Batch zero-fill x_off and y_off (compiles to SIMD memset)
-                                @memset(ext_bufs.x_off.items[0..ext_scalar_count], 0);
-                                @memset(ext_bufs.y_off.items[0..ext_scalar_count], 0);
-                                // Sequential cluster fill (SIMD 4-wide)
-                                simdFillSequential(ext_bufs.clusters.items.ptr, ext_scalar_count);
-                                // Table lookups (gather - must be scalar)
-                                for (0..ext_scalar_count) |i| {
-                                    const s: usize = @intCast(self.shaping_scalars.items[i]);
-                                    ext_bufs.glyph_ids.items[i] = ext_gids[s];
-                                    ext_bufs.x_adv.items[i] = ext_xadvs[s];
-                                }
-                                final_ext_glyph_count = ext_scalar_count;
-                                used_ext_ascii_fast_path = true;
-                            }
-                        }
-
-                        if (!used_ext_ascii_fast_path) {
-                        // Shape cache lookup / callback
-                        const ext_sc_hash1 = nvim_core.shapeCacheHash(self.shaping_scalars.items[0..ext_scalar_count], c_style_ext);
-                        const ext_sc_hash2 = nvim_core.shapeCacheHash2(self.shaping_scalars.items[0..ext_scalar_count], c_style_ext);
-                        const ext_sc_set_base = (ext_sc_hash1 & (@as(u64, self.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
-                        const ext_sc_font_gen = self.font_generation;
-
-                        var ext_sc_cache_hit = false;
-
-                        // Check both ways of the set
-                        if (self.shape_cache) |ext_sc_cache| {
-                            for (0..nvim_core.SHAPE_CACHE_WAYS) |ext_sc_way| {
-                                const ext_sc_entry = &ext_sc_cache[ext_sc_set_base + ext_sc_way];
-                                if (ext_sc_entry.key_hash == ext_sc_hash1 and
-                                    ext_sc_entry.key_hash2 == ext_sc_hash2 and
-                                    ext_sc_entry.font_gen == ext_sc_font_gen and
-                                    ext_sc_entry.scalar_count == @as(u32, @intCast(ext_scalar_count)) and
-                                    ext_sc_entry.glyph_count > 0 and
-                                    ext_sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
-                                {
-                                    final_ext_glyph_count = ext_sc_entry.glyph_count;
-                                    ext_bufs.ensureCapacity(self.alloc, final_ext_glyph_count) catch {
-                                        ec = run_end_ext;
-                                        continue;
-                                    };
-                                    ext_bufs.setLen(final_ext_glyph_count);
-                                    @memcpy(ext_bufs.glyph_ids.items[0..final_ext_glyph_count], ext_sc_entry.glyph_ids[0..final_ext_glyph_count]);
-                                    @memcpy(ext_bufs.clusters.items[0..final_ext_glyph_count], ext_sc_entry.clusters[0..final_ext_glyph_count]);
-                                    @memcpy(ext_bufs.x_adv.items[0..final_ext_glyph_count], ext_sc_entry.x_adv[0..final_ext_glyph_count]);
-                                    @memcpy(ext_bufs.x_off.items[0..final_ext_glyph_count], ext_sc_entry.x_off[0..final_ext_glyph_count]);
-                                    @memcpy(ext_bufs.y_off.items[0..final_ext_glyph_count], ext_sc_entry.y_off[0..final_ext_glyph_count]);
-                                    ext_sc_cache_hit = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!ext_sc_cache_hit) {
-                            ext_bufs.ensureCapacity(self.alloc, ext_scalar_count) catch {
-                                ec = run_end_ext;
-                                continue;
-                            };
-                            ext_bufs.setLen(ext_scalar_count);
-
-                            const ext_glyph_count = ext_shape_text_run.?(
-                                self.ctx,
-                                self.shaping_scalars.items.ptr,
-                                ext_scalar_count,
-                                c_style_ext,
-                                ext_bufs.glyph_ids.items.ptr,
-                                ext_bufs.clusters.items.ptr,
-                                ext_bufs.x_adv.items.ptr,
-                                ext_bufs.x_off.items.ptr,
-                                ext_bufs.y_off.items.ptr,
-                                ext_scalar_count,
-                            );
-
-                            if (ext_glyph_count == 0) {
-                                ec = run_end_ext;
-                                continue;
-                            }
-
-                            final_ext_glyph_count = ext_glyph_count;
-                            if (ext_glyph_count > ext_scalar_count) {
-                                ext_bufs.ensureCapacity(self.alloc, ext_glyph_count) catch {
-                                    ec = run_end_ext;
-                                    continue;
-                                };
-                                ext_bufs.setLen(ext_glyph_count);
-                                final_ext_glyph_count = ext_shape_text_run.?(
-                                    self.ctx,
-                                    self.shaping_scalars.items.ptr,
-                                    ext_scalar_count,
-                                    c_style_ext,
-                                    ext_bufs.glyph_ids.items.ptr,
-                                    ext_bufs.clusters.items.ptr,
-                                    ext_bufs.x_adv.items.ptr,
-                                    ext_bufs.x_off.items.ptr,
-                                    ext_bufs.y_off.items.ptr,
-                                    ext_glyph_count,
-                                );
-                                if (final_ext_glyph_count == 0) {
-                                    ec = run_end_ext;
-                                    continue;
-                                }
-                            }
-
-                            // Store in cache if result fits
-                            if (final_ext_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
-                                if (self.shape_cache) |ext_sc_cache| {
-                                    var ext_sc_store_way: usize = 0;
-                                    for (0..nvim_core.SHAPE_CACHE_WAYS) |ext_sc_way| {
-                                        if (ext_sc_cache[ext_sc_set_base + ext_sc_way].key_hash == 0) {
-                                            ext_sc_store_way = ext_sc_way;
-                                            break;
-                                        }
-                                    }
-                                    const ext_sc_store = &ext_sc_cache[ext_sc_set_base + ext_sc_store_way];
-                                    ext_sc_store.key_hash = ext_sc_hash1;
-                                    ext_sc_store.key_hash2 = ext_sc_hash2;
-                                    ext_sc_store.font_gen = ext_sc_font_gen;
-                                    ext_sc_store.scalar_count = @intCast(ext_scalar_count);
-                                    ext_sc_store.glyph_count = @intCast(final_ext_glyph_count);
-                                    @memcpy(ext_sc_store.glyph_ids[0..final_ext_glyph_count], ext_bufs.glyph_ids.items[0..final_ext_glyph_count]);
-                                    @memcpy(ext_sc_store.clusters[0..final_ext_glyph_count], ext_bufs.clusters.items[0..final_ext_glyph_count]);
-                                    @memcpy(ext_sc_store.x_adv[0..final_ext_glyph_count], ext_bufs.x_adv.items[0..final_ext_glyph_count]);
-                                    @memcpy(ext_sc_store.x_off[0..final_ext_glyph_count], ext_bufs.x_off.items[0..final_ext_glyph_count]);
-                                    @memcpy(ext_sc_store.y_off[0..final_ext_glyph_count], ext_bufs.y_off.items[0..final_ext_glyph_count]);
-                                }
-                            }
-                        }
-                        } // end !used_ext_ascii_fast_path
-
-                        if (final_ext_glyph_count > 0) {
-                            // Ensure capacity: .notdef (gid==0) expands 1 glyph to
-                            // up to cluster_span quads. Worst case total across all
-                            // glyphs = final_ext_glyph_count + ext_scalar_count.
-                            ext_verts.ensureUnusedCapacity(self.alloc, (final_ext_glyph_count + ext_scalar_count) * 6) catch {
-                                ec = run_end_ext;
-                                continue;
-                            };
-                            var ext_penX: f32 = @as(f32, @floatFromInt(run_start_ext)) * cellW;
-                            const ext_fg_col = Helpers.rgb(run_fg_ext);
-                            const ext_run_has_glow = run_glow_ext != 0;
-                            const ext_glyph_cache_id = self.glyph_cache_by_id;
-                            const ext_glyph_keys_id = self.glyph_keys_by_id;
-
-                            var egi: usize = 0;
-                            while (egi < final_ext_glyph_count) : (egi += 1) {
-                                const egid = ext_bufs.glyph_ids.items[egi];
-                                const this_cl = ext_bufs.clusters.items[egi];
-                                const next_cl = if (egi + 1 < final_ext_glyph_count) ext_bufs.clusters.items[egi + 1] else @as(u32, @intCast(ext_scalar_count));
-
-                                if (egid == 0) {
-                                    // .notdef glyph — fall back to per-scalar path (has CoreText font fallback)
-                                    var eci: u32 = this_cl;
-                                    while (eci < next_cl) : (eci += 1) {
-                                        const efb_scalar = self.shaping_scalars.items[@intCast(eci)];
-                                        const efb_col_w = self.shaping_col_widths.items[@intCast(eci)];
-                                        if (efb_scalar == 32) {
-                                            ext_penX += @as(f32, @floatFromInt(efb_col_w)) * cellW;
-                                            continue;
-                                        }
-                                        // Block element: geometric rendering (no atlas)
-                                        if (block_elements.isBlockElement(efb_scalar)) {
-                                            const eblk_w = @as(f32, @floatFromInt(efb_col_w)) * cellW;
-                                            const eblk_geo = block_elements.getBlockGeometry(efb_scalar);
-                                            if (eblk_geo.count > 0) {
-                                                ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
-                                                    ext_penX += eblk_w;
-                                                    continue;
-                                                };
-                                                for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
-                                                    Helpers.pushSolidQuadAssumeCapacity(ext_verts, ext_penX + rect.x0 * eblk_w, row_y + rect.y0 * cellH, ext_penX + rect.x1 * eblk_w, row_y + rect.y1 * cellH, ext_fg_col, grid_w, grid_h, grid_id, ext_scrollable);
-                                                }
-                                            }
-                                            ext_penX += eblk_w;
-                                            continue;
-                                        }
-                                        if (self.ensureGlyphPhase2(efb_scalar, c_style_ext)) |efb_ge| {
-                                            if (efb_ge.bbox_size_px[0] > 0 and efb_ge.bbox_size_px[1] > 0) {
-                                                glyph_success_count += 1;
-                                                const efb_baseY = row_y + topPad;
-                                                const efb_baselineY = efb_baseY + efb_ge.ascent_px;
-
-                                                const efb_gx0 = ext_penX + efb_ge.bbox_origin_px[0];
-                                                const efb_gx1 = efb_gx0 + efb_ge.bbox_size_px[0];
-                                                const efb_gy0 = efb_baselineY - (efb_ge.bbox_origin_px[1] + efb_ge.bbox_size_px[1]);
-                                                const efb_gy1 = efb_gy0 + efb_ge.bbox_size_px[1];
-
-                                                const efb_deco: u32 = ext_scrollable | (if (ext_run_has_glow) c_api.DECO_GLOW else 0);
-                                                const efb_pts = Helpers.ndc4(efb_gx0, efb_gy0, efb_gx1, efb_gy1, grid_w, grid_h);
-                                                const efb_tl = efb_pts[0]; const efb_tr = efb_pts[1]; const efb_bl = efb_pts[2]; const efb_br = efb_pts[3];
-
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_tr, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_br, .texCoord = .{ efb_ge.uv_max[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                                ext_verts.appendAssumeCapacity(.{ .position = efb_bl, .texCoord = .{ efb_ge.uv_min[0], efb_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = efb_deco, .deco_phase = 0 });
-                                            }
-                                        } else {
-                                            glyph_fail_count += 1;
-                                        }
-                                        ext_penX += @as(f32, @floatFromInt(efb_col_w)) * cellW;
-                                    }
-                                    continue;
-                                }
-
-                                // Skip space glyphs: no bitmap, just advance pen
-                                if (next_cl == this_cl + 1) {
-                                    const esp_scalar = self.shaping_scalars.items[@intCast(this_cl)];
-                                    if (esp_scalar == 0x20) {
-                                        ext_penX += @as(f32, @floatFromInt(self.shaping_col_widths.items[@intCast(this_cl)])) * cellW;
-                                        continue;
-                                    }
-                                    // Block element: geometric rendering (no atlas)
-                                    if (block_elements.isBlockElement(esp_scalar)) {
-                                        const eblk_cols = self.shaping_col_widths.items[@intCast(this_cl)];
-                                        const eblk_w = @as(f32, @floatFromInt(eblk_cols)) * cellW;
-                                        const eblk_geo = block_elements.getBlockGeometry(esp_scalar);
-                                        if (eblk_geo.count > 0) {
-                                            ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
-                                                ext_penX += eblk_w;
-                                                continue;
-                                            };
-                                            for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
-                                                Helpers.pushSolidQuadAssumeCapacity(ext_verts, ext_penX + rect.x0 * eblk_w, row_y + rect.y0 * cellH, ext_penX + rect.x1 * eblk_w, row_y + rect.y1 * cellH, ext_fg_col, grid_w, grid_h, grid_id, ext_scrollable);
-                                            }
-                                        }
-                                        ext_penX += eblk_w;
-                                        continue;
-                                    }
-                                }
-
-                                // Glyph-ID cache lookup
-                                var ext_ge: c_api.GlyphEntry = undefined;
-                                const ext_glyph_ok = ext_gid_blk: {
-                                    if (ext_glyph_cache_id != null and ext_glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                        const ext_key = (@as(u64, egid) << 2) | @as(u64, style_index_ext);
-                                        const ext_hash_val = (egid *% 2654435761) ^ style_index_ext;
-                                        const ext_hash_idx = @as(usize, ext_hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                                        if (ext_glyph_keys_id.?[ext_hash_idx] == ext_key) {
-                                            ext_ge = ext_glyph_cache_id.?[ext_hash_idx];
-                                            break :ext_gid_blk true;
-                                        }
-                                        if (self.ensureGlyphByID(egid, c_style_ext)) |entry| {
-                                            ext_ge = entry;
-                                            ext_glyph_cache_id.?[ext_hash_idx] = entry;
-                                            ext_glyph_keys_id.?[ext_hash_idx] = ext_key;
-                                            break :ext_gid_blk true;
-                                        }
-                                        break :ext_gid_blk false;
-                                    }
-                                    if (self.ensureGlyphByID(egid, c_style_ext)) |entry| {
-                                        ext_ge = entry;
-                                        break :ext_gid_blk true;
-                                    }
-                                    break :ext_gid_blk false;
-                                };
-
-                                if (ext_glyph_ok and ext_ge.bbox_size_px[0] > 0 and ext_ge.bbox_size_px[1] > 0) {
-                                    glyph_success_count += 1;
-                                    const ext_x_off_px = vertexgen.fixed26_6ToPx(ext_bufs.x_off.items[egi]);
-                                    const ext_y_off_px = vertexgen.fixed26_6ToPx(ext_bufs.y_off.items[egi]);
-                                    const ext_baseY = row_y + topPad;
-                                    const ext_baselineY = ext_baseY + ext_ge.ascent_px;
-
-                                    const egx0 = ext_penX + ext_ge.bbox_origin_px[0] + ext_x_off_px;
-                                    const egx1 = egx0 + ext_ge.bbox_size_px[0];
-                                    const egy0 = (ext_baselineY + ext_y_off_px) - (ext_ge.bbox_origin_px[1] + ext_ge.bbox_size_px[1]);
-                                    const egy1 = egy0 + ext_ge.bbox_size_px[1];
-
-                                    const eg_deco: u32 = ext_scrollable | (if (ext_run_has_glow) c_api.DECO_GLOW else 0);
-                                    const eg_pts = Helpers.ndc4(egx0, egy0, egx1, egy1, grid_w, grid_h);
-                                    const egtl = eg_pts[0]; const egtr = eg_pts[1]; const egbl = eg_pts[2]; const egbr = eg_pts[3];
-
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egtr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_min[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbr, .texCoord = .{ ext_ge.uv_max[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = egbl, .texCoord = .{ ext_ge.uv_min[0], ext_ge.uv_max[1] }, .color = ext_fg_col, .grid_id = grid_id, .deco_flags = eg_deco, .deco_phase = 0 });
-                                } else if (!ext_glyph_ok) {
-                                    glyph_fail_count += 1;
-                                }
-
-                                // Advance pen using column widths (correct for wide chars)
-                                {
-                                    const ext_cl_span = next_cl - this_cl;
-                                    const ext_cluster_cols: u32 = if (ext_cl_span == 1)
-                                        self.shaping_col_widths.items[@intCast(this_cl)]
-                                    else blk: {
-                                        var sum: u32 = 0;
-                                        var ecwi: u32 = this_cl;
-                                        while (ecwi < next_cl) : (ecwi += 1) {
-                                            sum += self.shaping_col_widths.items[@intCast(ecwi)];
-                                        }
-                                        break :blk sum;
-                                    };
-                                    ext_penX += @as(f32, @floatFromInt(ext_cluster_cols)) * cellW;
-                                }
-                            }
-                        }
-                    }
-
-                    ec = run_end_ext;
                 }
-            } else {
-            // --- Existing per-cell glyph path (fallback) ---
-            for (0..sg.cols) |col_idx| {
-                const col: u32 = @intCast(col_idx);
-                const cell_sc = self.row_cells.scalars.items[col];
-                const cell_sf = self.row_cells.style_flags_arr.items[col];
-                const scalar: u32 = if (cell_sc == 0) 32 else cell_sc;
+                const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
 
-                if (scalar == ' ' or scalar == 32) continue;
+                const pct_u32 = @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100));
+                const pct: f32 = @floatFromInt(pct_u32);
+                const tW = cellW * pct / 100.0;
+                const tH = cellH * pct / 100.0;
 
-                // Block element: geometric rendering (no atlas)
-                if (block_elements.isBlockElement(scalar)) {
-                    const eblk_x0: f32 = @as(f32, @floatFromInt(col)) * cellW;
-                    const eblk_geo = block_elements.getBlockGeometry(scalar);
-                    if (eblk_geo.count > 0) {
-                        const eblk_col = Helpers.rgb(self.row_cells.fg_rgbs.items[col]);
-                        ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch continue;
-                        for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
-                            Helpers.pushSolidQuadAssumeCapacity(ext_verts, eblk_x0 + rect.x0 * cellW, row_y + rect.y0 * cellH, eblk_x0 + rect.x1 * cellW, row_y + rect.y1 * cellH, eblk_col, grid_w, grid_h, grid_id, ext_scrollable);
-                        }
-                    }
-                    continue;
+                const crx0: f32 = cx0;
+                var cry0: f32 = cy0;
+                var crx1: f32 = cx0 + cursor_width;
+                const cry1: f32 = cy0 + cellH;
+
+                self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
+                    @tagName(self.grid.cursor_shape), pct_u32, self.grid.cursor_style_enabled,
+                });
+
+                switch (self.grid.cursor_shape) {
+                    .vertical => crx1 = cx0 + tW,
+                    .horizontal => cry0 = cy0 + (cellH - tH),
+                    .block => {},
                 }
 
-                if (sample_idx < 10) {
-                    sample_cps[sample_idx] = scalar;
-                    sample_idx += 1;
-                }
-                non_space_count += 1;
+                // Cursor background quad
+                const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
+                    self.hl.get(self.grid.cursor_attr_id).bg
+                else
+                    self.hl.default_fg;
+                const cursor_color = Helpers.rgb(cursor_bg);
 
-                const x0: f32 = @as(f32, @floatFromInt(col)) * cellW;
-                const style_mask: u32 = @as(u32, cell_sf & (STYLE_BOLD | STYLE_ITALIC));
-                const style_index: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) @as(u32, 1) else 0) +
-                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) @as(u32, 2) else 0);
+                const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
+                const ctl = c_pts[0]; const ctr = c_pts[1]; const cbl = c_pts[2]; const cbr = c_pts[3];
 
-                var ge: c_api.GlyphEntry = undefined;
+                ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
 
-                // Glyph cache lookup (same logic as row_mode)
-                const glyph_ok = blk: {
-                    // Check ASCII cache (scalar < 128)
-                    if (scalar < 128 and glyph_cache_ascii != null and glyph_valid_ascii != null) {
-                        const cache_key: usize = scalar * 4 + style_index;
-                        if (cache_key < GLYPH_CACHE_ASCII_SIZE) {
-                            if (glyph_valid_ascii.?[cache_key]) {
-                                cache.perf_glyph_ascii_hits += 1;
-                                ge = glyph_cache_ascii.?[cache_key];
-                                break :blk true;
-                            }
-                            // Cache miss: call callback
-                            cache.perf_glyph_ascii_misses += 1;
-                            const ok = if (self.isPhase2Atlas()) cb: {
-                                const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                    ge = entry;
-                                    break :cb true;
+                // Cursor text for block cursor
+                if (self.grid.cursor_shape == .block) {
+                    const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
+                    if (cell_idx < sg.cells.len) {
+                        const cursor_cell = sg.cells[cell_idx];
+                        if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
+                            if (block_elements.isBlockElement(cursor_cell.cp)) {
+                                const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
+                                if (eblk_geo.count > 0) {
+                                    const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
+                                        self.hl.get(self.grid.cursor_attr_id).fg
+                                    else
+                                        self.hl.default_bg;
+                                    const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
+                                    if (ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6)) {
+                                        for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
+                                            Helpers.pushSolidQuadAssumeCapacity(ext_verts, cx0 + rect.x0 * cursor_width, cy0 + rect.y0 * cellH, cx0 + rect.x1 * cursor_width, cy0 + rect.y1 * cellH, eblk_fg_col, grid_w, grid_h, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
+                                        }
+                                    } else |_| {}
                                 }
-                                break :cb false;
-                            } else if (style_mask != 0 and ensure_styled != null) cb: {
-                                const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
-                            } else if (ensure_base) |ensure| cb: {
-                                break :cb ensure(self.ctx, scalar, &ge) != 0;
-                            } else false;
-                            if (ok) {
-                                glyph_cache_ascii.?[cache_key] = ge;
-                                glyph_valid_ascii.?[cache_key] = true;
-                            }
-                            break :blk ok;
-                        }
-                    }
-                    // Non-ASCII: use hash table cache
-                    if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                        const key = (@as(u64, scalar) << 2) | @as(u64, style_index);
-                        const hash_val = (scalar *% 2654435761) ^ style_index;
-                        const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                        if (glyph_keys_non_ascii.?[hash_idx] == key) {
-                            cache.perf_glyph_nonascii_hits += 1;
-                            ge = glyph_cache_non_ascii.?[hash_idx];
-                            break :blk true;
-                        }
-                        // Cache miss: call callback
-                        cache.perf_glyph_nonascii_misses += 1;
-                        const ok = if (self.isPhase2Atlas()) cb: {
-                            const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                            if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                ge = entry;
-                                break :cb true;
-                            }
-                            break :cb false;
-                        } else if (style_mask != 0 and ensure_styled != null) cb: {
-                            const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                            break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
-                        } else if (ensure_base) |ensure| cb: {
-                            break :cb ensure(self.ctx, scalar, &ge) != 0;
-                        } else false;
-                        if (ok) {
-                            glyph_cache_non_ascii.?[hash_idx] = ge;
-                            glyph_keys_non_ascii.?[hash_idx] = key;
-                        }
-                        break :blk ok;
-                    }
-                    // No cache: call callback directly
-                    const ok = if (self.isPhase2Atlas()) cb: {
-                        const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                            @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                        if (self.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                            ge = entry;
-                            break :cb true;
-                        }
-                        break :cb false;
-                    } else if (style_mask != 0 and ensure_styled != null) cb: {
-                        const c_style: u32 = @as(u32, if (cell_sf & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                            @as(u32, if (cell_sf & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                        break :cb ensure_styled.?(self.ctx, scalar, c_style, &ge) != 0;
-                    } else if (ensure_base) |ensure| cb: {
-                        break :cb ensure(self.ctx, scalar, &ge) != 0;
-                    } else false;
-                    break :blk ok;
-                };
-
-                if (glyph_ok) {
-                    glyph_success_count += 1;
-                    const glyph_col = Helpers.rgb(self.row_cells.fg_rgbs.items[col]);
-
-                    const baseY = row_y + topPad;
-                    const baselineY = baseY + ge.ascent_px;
-                    const gx0 = x0 + ge.bbox_origin_px[0];
-                    const gx1 = gx0 + ge.bbox_size_px[0];
-                    const gy0 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                    const gy1 = gy0 + ge.bbox_size_px[1];
-
-                    const pc_ext_deco: u32 = ext_scrollable | (if (ext_glow_enabled and self.row_cells.glow_arr.items[col] != 0) c_api.DECO_GLOW else 0);
-                    const g_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
-                    const gtl = g_pts[0]; const gtr = g_pts[1]; const gbl = g_pts[2]; const gbr = g_pts[3];
-
-                    const uv_x0 = ge.uv_min[0];
-                    const uv_y0 = ge.uv_min[1];
-                    const uv_x1 = ge.uv_max[0];
-                    const uv_y1 = ge.uv_max[1];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = glyph_col, .grid_id = grid_id, .deco_flags = pc_ext_deco, .deco_phase = 0 });
-                } else {
-                    glyph_fail_count += 1;
-                }
-            }
-            } // end else (per-cell fallback)
-
-            // Pass 4: Strikethrough
-            {
-                var c: u32 = 0;
-                while (c < sg.cols) {
-                    const st_sf = self.row_cells.style_flags_arr.items[c];
-                    if (st_sf & STYLE_STRIKETHROUGH == 0) {
-                        c += 1;
-                        continue;
-                    }
-
-                    const run_start = c;
-                    const run_flags = st_sf;
-                    const run_sp = self.row_cells.sp_rgbs.items[c];
-                    const run_fg = self.row_cells.fg_rgbs.items[c];
-
-                    const run_end: u32 = @intCast(@min(
-                        simdFindRunEndU8(self.row_cells.style_flags_arr.items, @intCast(c + 1), @intCast(sg.cols), run_flags),
-                        simdFindRunEndU32(self.row_cells.sp_rgbs.items, @intCast(c + 1), @intCast(sg.cols), run_sp),
-                    ));
-
-                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                    const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                    const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                    const sy0 = row_y + cellH * 0.5 - 0.5;
-                    const sy1 = sy0 + 1.0;
-
-                    const s_pts = Helpers.ndc4(x0, sy0, x1, sy1, grid_w, grid_h);
-                    const stl = s_pts[0]; const str = s_pts[1]; const sbl = s_pts[2]; const sbr = s_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = stl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = str, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = sbl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_STRIKETHROUGH | ext_scrollable, .deco_phase = 0 });
-
-                    c = run_end;
-                }
-            }
-
-            // Pass 5: Overline (line at top of cell)
-            {
-                var c: u32 = 0;
-                while (c < sg.cols) {
-                    if (self.row_cells.overline_arr.items[c] == 0) {
-                        c += 1;
-                        continue;
-                    }
-
-                    const run_start = c;
-                    const run_sp = self.row_cells.sp_rgbs.items[c];
-                    const run_fg = self.row_cells.fg_rgbs.items[c];
-
-                    var run_end: u32 = c + 1;
-                    while (run_end < sg.cols) : (run_end += 1) {
-                        if (self.row_cells.overline_arr.items[run_end] == 0) break;
-                        if (self.row_cells.sp_rgbs.items[run_end] != run_sp) break;
-                        if (run_sp == highlight.Highlights.SP_NOT_SET and
-                            self.row_cells.fg_rgbs.items[run_end] != run_fg) break;
-                    }
-
-                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                    const ox0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                    const ox1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                    const oy0 = row_y;
-                    const oy1 = oy0 + 1.0;
-
-                    const o_pts = Helpers.ndc4(ox0, oy0, ox1, oy1, grid_w, grid_h);
-                    const otl = o_pts[0]; const otr = o_pts[1]; const obl = o_pts[2]; const obr = o_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = otl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = otr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = obl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = otr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = obr, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = obl, .texCoord = solid_uv, .color = deco_color, .grid_id = grid_id, .deco_flags = c_api.DECO_OVERLINE | ext_scrollable, .deco_phase = 0 });
-
-                    c = run_end;
-                }
-            }
-
-            // Cursor rendering if cursor is on this row
-            if (cursor_row) |cur_row| {
-                if (cur_row == row and cursor_col < sg.cols) {
-                    const cx0 = @as(f32, @floatFromInt(cursor_col)) * cellW;
-                    const cy0 = row_y;
-
-                    var is_double_width = false;
-                    if (cursor_col + 1 < sg.cols) {
-                        const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
-                        if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
-                            is_double_width = true;
-                        }
-                    }
-                    const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
-
-                    const pct_u32 = @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100));
-                    const pct: f32 = @floatFromInt(pct_u32);
-                    const tW = cellW * pct / 100.0;
-                    const tH = cellH * pct / 100.0;
-
-                    const crx0: f32 = cx0;
-                    var cry0: f32 = cy0;
-                    var crx1: f32 = cx0 + cursor_width;
-                    const cry1: f32 = cy0 + cellH;
-
-                    self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
-                        @tagName(self.grid.cursor_shape), pct_u32, self.grid.cursor_style_enabled,
-                    });
-
-                    switch (self.grid.cursor_shape) {
-                        .vertical => crx1 = cx0 + tW,
-                        .horizontal => cry0 = cy0 + (cellH - tH),
-                        .block => {},
-                    }
-
-                    // Resolve cursor colors (same as main grid)
-                    const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
-                        self.hl.get(self.grid.cursor_attr_id).bg
-                    else
-                        self.hl.default_fg; // attr_id == 0: swap default colors (per Nvim spec)
-                    const cursor_color = Helpers.rgb(cursor_bg);
-
-                    const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
-                    const ctl = c_pts[0]; const ctr = c_pts[1]; const cbl = c_pts[2]; const cbr = c_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-
-                    // Cursor text for block cursor
-                    if (self.grid.cursor_shape == .block) {
-                        const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
-                        if (cell_idx < sg.cells.len) {
-                            const cursor_cell = sg.cells[cell_idx];
-                            if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
-                                // Block element under cursor: geometric rendering
-                                if (block_elements.isBlockElement(cursor_cell.cp)) {
-                                    const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
-                                    if (eblk_geo.count > 0) {
-                                        const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
-                                            self.hl.get(self.grid.cursor_attr_id).fg
-                                        else
-                                            self.hl.default_bg;
-                                        const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
-                                        if (ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6)) {
-                                            for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
-                                                Helpers.pushSolidQuadAssumeCapacity(ext_verts, cx0 + rect.x0 * cursor_width, cy0 + rect.y0 * cellH, cx0 + rect.x1 * cursor_width, cy0 + rect.y1 * cellH, eblk_fg_col, grid_w, grid_h, grid_id, c_api.DECO_SCROLLABLE);
-                                            }
-                                        } else |_| {}
-                                    }
-                                } else {
+                            } else {
                                 var glyph_entry: c_api.GlyphEntry = undefined;
                                 var glyph_ok: c_int = -1;
 
-                                // Resolve style_flags for the cell under the cursor
                                 const ext_cursor_resolved = self.hl.getWithStyles(cursor_cell.hl);
-                                const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
                                 const ext_cursor_c_style: u32 =
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
-                                // Matches main rendering path: Phase 2 → styled → base
                                 if (self.isPhase2Atlas()) {
                                     if (self.ensureGlyphPhase2(cursor_cell.cp, ext_cursor_c_style)) |entry| {
                                         glyph_entry = entry;
                                         glyph_ok = 1;
                                     }
-                                } else if (ext_cursor_style != 0 and self.cb.on_atlas_ensure_glyph_styled != null) {
-                                    if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
+                                } else if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
+                                    const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                                    if (ext_cursor_style != 0) {
                                         glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
+                                    } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
+                                        glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
                                     }
                                 } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
                                     glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
@@ -4801,52 +4373,37 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     const cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
                                         self.hl.get(self.grid.cursor_attr_id).fg
                                     else
-                                        self.hl.default_bg; // attr_id == 0: swap default colors (per Nvim spec)
+                                        self.hl.default_bg;
                                     const text_col = Helpers.rgb(cursor_fg);
 
                                     const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
                                     const gtl = cg_pts[0]; const gtr = cg_pts[1]; const gbl = cg_pts[2]; const gbr = cg_pts[3];
 
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
                                 }
-                                } // end else (non-block-element ext cursor glyph)
                             }
                         }
                     }
                 }
-            }
 
-            // CHECK: atlas reset happened during glyph processing for this row.
-            // Already-sent rows have stale UVs → need to restart or abort.
-            if (self.atlas_reset_during_flush) {
-                ext_saw_atlas_reset = true;
-                ext_saw_atlas_reset_any = true;
-                self.atlas_reset_during_flush = false; // Clear for retry
-                if (!ext_retried) {
-                    ext_retried = true;
-                    continue :ext_retry; // Restart this grid's row loop from row 0
-                }
-                break; // Abort remaining rows (2nd reset in same grid)
+                // Send cursor vertices as separate layer (flags = CURSOR)
+                row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
+                self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
             }
-
-            // Send this row's vertices
-            // Pass viewport dimensions (target size) instead of sg dimensions so that
-            // the frontend's scroll offset calculation matches the NDC viewport used here.
-            if (ext_verts.items.len > 0) {
-                row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
-            }
-        }
-        break :ext_retry; // Normal exit from retry loop
+        } else if (cursor_was_on_this_grid and !cursor_on_this_grid) {
+            // Cursor left this grid: send empty cursor to clear previous cursor
+            row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
+            self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
         }
 
         // Debug log glyph statistics
-        self.log.write("[ext_grid_row] grid_id={d} rows={d} cols={d} non_space={d} glyph_ok={d} glyph_fail={d}\n", .{
-            grid_id, sg.rows, sg.cols, non_space_count, glyph_success_count, glyph_fail_count,
+        self.log.write("[ext_grid_row] grid_id={d} rows={d} cols={d} scroll_fast_path={} regen_count={d}\n", .{
+            grid_id, sg.rows, sg.cols, use_ext_scroll_fast_path, regen_count,
         });
 
         // Log cache performance for this grid
@@ -4859,6 +4416,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         // Clear dirty flags after sending (both dirty and dirty_rows)
         sg.clearDirty();
+        // If a row failed (allocation error), re-mark the grid dirty
+        // so the failed rows get regenerated on the next flush.
+        if (ext_had_row_error) {
+            sg.dirty = true;
+        }
         // If atlas was reset during this grid's rendering, re-mark dirty
         // so it gets re-rendered with correct UVs next flush.
         if (ext_saw_atlas_reset) {
@@ -5542,14 +5104,14 @@ pub fn sendPopupmenuShow(self: *Core) void {
         }
     }
 
-    // Register as external grid with position
-    // For cmdline completion (grid_id < 0 or -1), use special positioning
-    // For buffer completion, position 2 rows below anchor (1 for cursor line, 1 for spacing)
+    // Register as external grid with position.
+    // popupmenu_show reports the anchor cell directly. The frontend decides
+    // whether to place the popupmenu below that row or flip it above.
     const is_cmdline_completion = (anchor_grid < 0 or anchor_grid == -1);
     const start_row: i32 = if (is_cmdline_completion)
         -1 // Special marker for cmdline completion (Swift will position above cmdline)
     else
-        anchor_row + 2; // 2 rows below: 1 for current line, 1 for spacing
+        anchor_row;
     const start_col: i32 = anchor_col;
 
     self.grid.external_grids.put(self.alloc, pum_grid_id, .{

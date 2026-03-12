@@ -146,7 +146,7 @@ pub const Renderer = struct {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
-        _ = c.QueryPerformanceFrequency(&freq);
+        if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
 
         var self: Renderer = .{
             .alloc = alloc,
@@ -162,7 +162,7 @@ pub const Renderer = struct {
         }
 
         // D2D factory
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         var d2d_factory: ?*c.ID2D1Factory = null;
         const hr_d2d = c.D2D1CreateFactory(
             c.D2D1_FACTORY_TYPE_MULTI_THREADED,
@@ -173,11 +173,13 @@ pub const Renderer = struct {
         if (hr_d2d != 0 or d2d_factory == null) return error.D2DFactoryCreateFailed;
         self.d2d_factory = d2d_factory;
         errdefer safeRelease(self.d2d_factory);
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         // DWrite factory
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         var dw_factory: ?*c.IDWriteFactory = null;
         const hr_dw = c.DWriteCreateFactory(
             c.DWRITE_FACTORY_TYPE_SHARED,
@@ -187,30 +189,36 @@ pub const Renderer = struct {
         if (hr_dw != 0 or dw_factory == null) return error.DWriteFactoryCreateFailed;
         self.dwrite_factory = dw_factory;
         errdefer safeRelease(self.dwrite_factory);
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING] DWriteCreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] DWriteCreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         // Create render target for hwnd
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         try self.recreateRenderTarget();
         errdefer safeRelease(self.rt);
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         // Get DPI for the window (Per-Monitor DPI Aware V2)
         const window_dpi = GetDpiForWindow(hwnd);
         self.dpi = if (window_dpi > 0) window_dpi else 96;
-        applog.appLog("[d2d] window DPI: {d}\n", .{self.dpi});
+        if (applog.isEnabled()) applog.appLog("[d2d] window DPI: {d}\n", .{self.dpi});
 
         // Initial font (from config or OS default)
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         self.setFontUtf8(initial_font, initial_pt) catch |e| {
             // Fallback to OS default if initial font fails
-            applog.appLog("[d2d] initial font '{s}' failed: {any}, trying Consolas\n", .{ initial_font, e });
+            if (applog.isEnabled()) applog.appLog("[d2d] initial font '{s}' failed: {any}, trying Consolas\n", .{ initial_font, e });
             try self.setFontUtf8("Consolas", 14.0);
         };
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING] setFontUtf8: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] setFontUtf8: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         return self;
     }
@@ -247,7 +255,7 @@ pub const Renderer = struct {
 
     /// Reset atlas when full - clears glyph caches and restarts packing
     fn resetAtlas(self: *Renderer) void {
-        applog.appLog("[atlas] resetAtlas: clearing {d} glyphs + {d} styled glyphs\n", .{
+        if (applog.isEnabled()) applog.appLog("[atlas] resetAtlas: clearing {d} glyphs + {d} styled glyphs\n", .{
             self.glyph_map.count(),
             self.styled_glyph_map.count(),
         });
@@ -304,7 +312,7 @@ pub const Renderer = struct {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
-        _ = c.QueryPerformanceFrequency(&freq);
+        if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
 
         safeRelease(self.rt);
         self.rt = null;
@@ -342,15 +350,17 @@ pub const Renderer = struct {
         const vtbl = factory.lpVtbl.*;
         const create_fn = vtbl.CreateHwndRenderTarget orelse return error.D2DFactoryMissingCreateHwndRenderTarget;
 
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         const hr = create_fn(
             factory,
             &rt_props,
             &hwnd_props,
             &rt,
         );
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING]   CreateHwndRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING]   CreateHwndRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         if (hr != 0 or rt == null) return error.D2DCreateHwndRenderTargetFailed;
 
@@ -360,10 +370,12 @@ pub const Renderer = struct {
             self.rt = null;
         }
 
-        _ = c.QueryPerformanceCounter(&t0);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         try self.createAtlasResources();
-        _ = c.QueryPerformanceCounter(&t1);
-        applog.appLog("[d2d] [TIMING]   createAtlasResources: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING]   createAtlasResources: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         // Invalidate GSUB cache on device recreation (conservative; font faces may
         // still be valid, but atlas and glyph state have been reset).
@@ -419,13 +431,15 @@ pub const Renderer = struct {
                 &bmp,
             );
         } else {
-            applog.appLog("[d2d] CreateBitmap missing on vtbl\n", .{});
+            if (applog.isEnabled()) applog.appLog("[d2d] CreateBitmap missing on vtbl\n", .{});
             return error.CreateAtlasFailed;
         };
         
         if (c.FAILED(hr) or bmp == null) {
-            const hr_u: u32 = @bitCast(hr);
-            applog.appLog("[d2d] CreateBitmap(A8) FAILED hr=0x{x} bmp={*}\n", .{ hr_u, bmp });
+            if (applog.isEnabled()) {
+                const hr_u: u32 = @bitCast(hr);
+                applog.appLog("[d2d] CreateBitmap(A8) FAILED hr=0x{x} bmp={*}\n", .{ hr_u, bmp });
+            }
             return error.CreateAtlasFailed;
         }
 
@@ -1348,7 +1362,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         if (self.atlas_cpu.items.len != total) {
             self.atlas_cpu.resize(self.alloc, total) catch {
                 // Resize failed: keep old dimensions, just clear and reset
-                applog.appLog("[atlas] recreateAtlasTexture: resize to {d}x{d} failed, keeping {d}x{d}\n", .{ atlas_w, atlas_h, self.atlas_w, self.atlas_h });
+                if (applog.isEnabled()) applog.appLog("[atlas] recreateAtlasTexture: resize to {d}x{d} failed, keeping {d}x{d}\n", .{ atlas_w, atlas_h, self.atlas_w, self.atlas_h });
                 self.glyph_map.clearRetainingCapacity();
                 self.styled_glyph_map.clearRetainingCapacity();
                 self.atlas_next_x = 1;
@@ -2144,7 +2158,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
                     const hr_cf = make_face_fn(bold_font.?, &new_bold_face);
                     if (!c.FAILED(hr_cf)) {
                         self.bold_font_face = new_bold_face;
-                        applog.appLog("[dwrite] Bold font face created (lazy)\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold font face created (lazy)\n", .{});
                     }
                 }
                 safeRelease(bold_font);
@@ -2168,7 +2182,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
                     const hr_cf = make_face_fn(italic_font.?, &new_italic_face);
                     if (!c.FAILED(hr_cf)) {
                         self.italic_font_face = new_italic_face;
-                        applog.appLog("[dwrite] Italic font face created (lazy)\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[dwrite] Italic font face created (lazy)\n", .{});
                     }
                 }
                 safeRelease(italic_font);
@@ -2192,7 +2206,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
                     const hr_cf = make_face_fn(bold_italic_font.?, &new_bold_italic_face);
                     if (!c.FAILED(hr_cf)) {
                         self.bold_italic_font_face = new_bold_italic_face;
-                        applog.appLog("[dwrite] Bold+Italic font face created (lazy)\n", .{});
+                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold+Italic font face created (lazy)\n", .{});
                     }
                 }
                 safeRelease(bold_italic_font);
@@ -2253,7 +2267,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
 
         const old_dpi = self.dpi;
         self.dpi = new_dpi;
-        applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
+        if (applog.isEnabled()) applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
 
         // Re-scale font_em_size and metrics proportionally
         const scale: f32 = @as(f32, @floatFromInt(new_dpi)) / @as(f32, @floatFromInt(old_dpi));
@@ -2709,16 +2723,16 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         out_x_advances: [*]i32,
         out_lig_triggers: [*]u8,
     ) bool {
-        applog.appLog("[ascii_table] getAsciiTableDWrite start style={d}\n", .{style_flags});
+        if (applog.isEnabled()) applog.appLog("[ascii_table] getAsciiTableDWrite start style={d}\n", .{style_flags});
         self.mu.lock();
         defer self.mu.unlock();
 
         const face = self.selectFontFace(style_flags) orelse {
-            applog.appLog("[ascii_table] selectFontFace returned null style={d}\n", .{style_flags});
+            if (applog.isEnabled()) applog.appLog("[ascii_table] selectFontFace returned null style={d}\n", .{style_flags});
             return false;
         };
         const fvtbl = face.lpVtbl.*;
-        applog.appLog("[ascii_table] selectFontFace done style={d}\n", .{style_flags});
+        if (applog.isEnabled()) applog.appLog("[ascii_table] selectFontFace done style={d}\n", .{style_flags});
 
         // --- 1) Glyph IDs: batch cmap lookup ---
         var codepoints: [128]c.UINT32 = undefined;
@@ -2732,7 +2746,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         for (0..128) |i| {
             out_glyph_ids[i] = glyph_ids_u16[i];
         }
-        applog.appLog("[ascii_table] GetGlyphIndicesW done style={d}\n", .{style_flags});
+        if (applog.isEnabled()) applog.appLog("[ascii_table] GetGlyphIndicesW done style={d}\n", .{style_flags});
 
         // --- 2) X Advances: design units → 26.6 fixed-point pixels ---
         var glyph_metrics: [128]c.DWRITE_GLYPH_METRICS = undefined;
@@ -2765,7 +2779,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
                 out_x_advances[i] = @intFromFloat(adv_du * scale);
             }
         }
-        applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
+        if (applog.isEnabled()) applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
 
         // --- 3) Lig Triggers: check GSUB cache first, then parse if needed ---
         // Search ALL cache slots by font_face_ptr so that different styles sharing
@@ -2778,11 +2792,11 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         } else null;
 
         if (cache_hit) |idx| {
-            applog.appLog("[ascii_table] GSUB cache hit style={d} slot={d}\n", .{ style_flags, idx });
+            if (applog.isEnabled()) applog.appLog("[ascii_table] GSUB cache hit style={d} slot={d}\n", .{ style_flags, idx });
             @memcpy(out_lig_triggers[0..128], &self.gsub_cache[idx].lig_triggers);
         } else {
             // Cache miss: parse GSUB and store result
-            applog.appLog("[ascii_table] detectLigTriggersFromGSUB start style={d}\n", .{style_flags});
+            if (applog.isEnabled()) applog.appLog("[ascii_table] detectLigTriggersFromGSUB start style={d}\n", .{style_flags});
             detectLigTriggersFromGSUB(
                 face,
                 &glyph_ids_u16,
@@ -2790,7 +2804,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
                 self.font_feature_count,
                 out_lig_triggers,
             );
-            applog.appLog("[ascii_table] detectLigTriggersFromGSUB done style={d}\n", .{style_flags});
+            if (applog.isEnabled()) applog.appLog("[ascii_table] detectLigTriggersFromGSUB done style={d}\n", .{style_flags});
 
             // Store in the slot corresponding to this style (evicts previous entry for this slot).
             const store_slot = style_flags & 3;
@@ -2973,10 +2987,10 @@ fn detectLigTriggersFromGSUB(
     var table_ctx: ?*anyopaque = null;
     var exists: c.BOOL = c.FALSE;
 
-    applog.appLog("[gsub] TryGetFontTable calling\n", .{});
+    if (applog.isEnabled()) applog.appLog("[gsub] TryGetFontTable calling\n", .{});
     const try_fn = fvtbl.TryGetFontTable orelse return;
     const hr = try_fn(face, gsub_tag, &table_data, &table_size, &table_ctx, &exists);
-    applog.appLog("[gsub] TryGetFontTable returned hr=0x{x} exists={d} size={d}\n", .{ @as(u32, @bitCast(hr)), @as(u32, @intFromBool(exists != c.FALSE)), table_size });
+    if (applog.isEnabled()) applog.appLog("[gsub] TryGetFontTable returned hr=0x{x} exists={d} size={d}\n", .{ @as(u32, @bitCast(hr)), @as(u32, @intFromBool(exists != c.FALSE)), table_size });
     if (c.FAILED(hr) or exists == c.FALSE or table_data == null or table_size < 10) {
         // Release context if obtained
         if (table_ctx != null) {
@@ -3063,7 +3077,7 @@ fn detectLigTriggersFromGSUB(
     for (0..@min(lookup_count, MAX_LOOKUPS)) |li| {
         if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) != 0) active_count += 1;
     }
-    applog.appLog("[gsub] feature_count={d} lookup_count={d} active_lookups={d} tbl_size={d}\n", .{ feature_count, lookup_count, active_count, table_size });
+    if (applog.isEnabled()) applog.appLog("[gsub] feature_count={d} lookup_count={d} active_lookups={d} tbl_size={d}\n", .{ feature_count, lookup_count, active_count, table_size });
 
     for (0..lookup_count) |li| {
         if (li >= MAX_LOOKUPS) break;
@@ -3084,7 +3098,7 @@ fn detectLigTriggersFromGSUB(
             processSubtable(tbl, sub_abs, lk_type, ascii_gids, out_triggers, 0);
         }
     }
-    applog.appLog("[gsub] parsing complete\n", .{});
+    if (applog.isEnabled()) applog.appLog("[gsub] parsing complete\n", .{});
 }
 
 fn encodeUtf16Scalar(scalar: u32, out: *[2]u16) usize {

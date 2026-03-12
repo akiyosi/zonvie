@@ -19,9 +19,7 @@ final class MetalTerminalView: MTKView {
     }
 
     // Coalesce setNeedsDisplay to at most once per runloop tick, and union dirty rects.
-    private var redrawPending = false
-    private var pendingRedrawRect: NSRect? = nil
-    private let redrawLock = NSLock()
+    private let redrawScheduler = SurfaceRedrawScheduler()
     private var lastCursorDirtyRectPx: NSRect? = nil
 
     private static var dirtyLogEnabled: Bool { ZonvieCore.appLogEnabled }
@@ -212,10 +210,7 @@ final class MetalTerminalView: MTKView {
 
     /// Called after actual drawing runs in MTKViewDelegate.draw(in:)
     func didDrawFrame() {
-        redrawLock.lock()
-        pendingRedrawRect = nil
-        redrawPending = false
-        redrawLock.unlock()
+        redrawScheduler.didDrawFrame()
         dirtyLog("didDrawFrame: redrawPending reset to false")
     }
 
@@ -229,57 +224,10 @@ final class MetalTerminalView: MTKView {
             ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
             core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
         }
-        redrawLock.lock()
-
-        if let rect {
-            if let cur = pendingRedrawRect {
-                pendingRedrawRect = cur.union(rect)
-            } else {
-                pendingRedrawRect = rect
-            }
-        } else {
-            // nil means "full redraw requested"
-            pendingRedrawRect = nil
-        }
-
-        if redrawPending {
-            redrawLock.unlock()
-            return
-        }
-        redrawPending = true
-        redrawLock.unlock()
-
-        // Inline closure to perform the actual setNeedsDisplay
-        let doSetNeedsDisplay: () -> Void = { [weak self] in
+        redrawScheduler.requestRedraw(rect: rect, bounds: bounds, window: window) { [weak self] redrawRect in
             guard let self else { return }
-            if self.window == nil { return }
-            // Skip redraw for minimized windows to avoid drawable access issues.
-            // Reset redrawPending so future requests are not permanently blocked.
-            if self.window?.isMiniaturized == true {
-                self.redrawLock.lock()
-                self.redrawPending = false
-                self.redrawLock.unlock()
-                return
-            }
-
-            self.redrawLock.lock()
-            let r = self.pendingRedrawRect  // ★ Don't clear here
-            self.redrawLock.unlock()
-
-            dirtyLog("setNeedsDisplay(out): r=\(String(describing: r)) bounds=\(self.bounds) isFlipped=\(self.isFlipped) windowScale=\(self.window?.backingScaleFactor ?? -1)")
-
-            if let r {
-                self.setNeedsDisplay(r)
-            } else {
-                self.setNeedsDisplay(self.bounds)
-            }
-        }
-
-        // Execute directly if already on main thread, otherwise dispatch with high priority
-        if Thread.isMainThread {
-            doSetNeedsDisplay()
-        } else {
-            DispatchQueue.main.async(qos: .userInteractive, execute: doSetNeedsDisplay)
+            dirtyLog("setNeedsDisplay(out): r=\(String(describing: redrawRect)) bounds=\(self.bounds) isFlipped=\(self.isFlipped) windowScale=\(self.window?.backingScaleFactor ?? -1)")
+            self.setNeedsDisplay(redrawRect)
         }
     }
 

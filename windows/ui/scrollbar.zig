@@ -733,6 +733,12 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     const corep = app.corep;
     if (corep == null) return;
 
+    // Skip main window scrollbar update when cursor is on an external grid.
+    // External windows have their own scrollbar; the main window scrollbar
+    // should only reflect viewports of grids composited on the main window.
+    const cursor_grid = app_mod.zonvie_core_get_cursor_position(corep, null, null);
+    if (cursor_grid > 1 and app.external_windows.contains(cursor_grid)) return;
+
     // Get current viewport info
     var vp: app_mod.ViewportInfo = undefined;
     if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) == 0) return;

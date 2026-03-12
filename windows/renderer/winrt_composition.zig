@@ -116,7 +116,7 @@ fn loadWinRTFunctions() bool {
     // Load combase.dll
     const combase = c.LoadLibraryW(&[_:0]c.WCHAR{ 'c', 'o', 'm', 'b', 'a', 's', 'e', '.', 'd', 'l', 'l' });
     if (combase == null) {
-        applog.appLog("[winrt] Failed to load combase.dll\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to load combase.dll\n", .{});
         return false;
     }
 
@@ -126,25 +126,25 @@ fn loadWinRTFunctions() bool {
     g_WindowsDeleteString = @ptrCast(c.GetProcAddress(combase, "WindowsDeleteString"));
 
     if (g_RoInitialize == null or g_RoActivateInstance == null or g_WindowsCreateString == null) {
-        applog.appLog("[winrt] Failed to get combase.dll functions\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to get combase.dll functions\n", .{});
         return false;
     }
-    applog.appLog("[winrt] WindowsCreateString=0x{x}\n", .{@intFromPtr(g_WindowsCreateString)});
+    if (applog.isEnabled()) applog.appLog("[winrt] WindowsCreateString=0x{x}\n", .{@intFromPtr(g_WindowsCreateString)});
 
     // Load CoreMessaging.dll
     const coremessaging = c.LoadLibraryW(&[_:0]c.WCHAR{ 'C', 'o', 'r', 'e', 'M', 'e', 's', 's', 'a', 'g', 'i', 'n', 'g', '.', 'd', 'l', 'l' });
     if (coremessaging == null) {
-        applog.appLog("[winrt] Failed to load CoreMessaging.dll\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to load CoreMessaging.dll\n", .{});
         return false;
     }
 
     g_CreateDispatcherQueueController = @ptrCast(c.GetProcAddress(coremessaging, "CreateDispatcherQueueController"));
     if (g_CreateDispatcherQueueController == null) {
-        applog.appLog("[winrt] Failed to get CreateDispatcherQueueController\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to get CreateDispatcherQueueController\n", .{});
         return false;
     }
 
-    applog.appLog("[winrt] WinRT functions loaded successfully\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] WinRT functions loaded successfully\n", .{});
     return true;
 }
 
@@ -165,36 +165,36 @@ fn createHStringFromPtr(ptr: [*]const u16, len: u32) HSTRING {
 
     const func = g_WindowsCreateString orelse return null;
 
-    applog.appLog("[winrt] createHString: ptr=0x{x} len={d}\n", .{ @intFromPtr(ptr), len });
+    if (applog.isEnabled()) applog.appLog("[winrt] createHString: ptr=0x{x} len={d}\n", .{ @intFromPtr(ptr), len });
 
     const hr = func(ptr, len, &hstring);
 
     if (c.FAILED(hr)) {
-        applog.appLog("[winrt] WindowsCreateString failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] WindowsCreateString failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return null;
     }
 
-    applog.appLog("[winrt] WindowsCreateString ok, hstring=0x{x}\n", .{@intFromPtr(hstring)});
+    if (applog.isEnabled()) applog.appLog("[winrt] WindowsCreateString ok, hstring=0x{x}\n", .{@intFromPtr(hstring)});
     return hstring;
 }
 
 /// Initialize WinRT Composition for backdrop blur
 pub fn init(hwnd: c.HWND) bool {
-    applog.appLog("[winrt] Initializing WinRT Composition\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] Initializing WinRT Composition\n", .{});
 
     // Load WinRT functions dynamically
     if (!loadWinRTFunctions()) {
-        applog.appLog("[winrt] Failed to load WinRT functions\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to load WinRT functions\n", .{});
         return false;
     }
 
     // Initialize WinRT
     var hr = g_RoInitialize.?(RO_INIT_SINGLETHREADED);
     if (c.FAILED(hr) and hr != @as(c.HRESULT, @bitCast(@as(u32, 0x80010106)))) { // RPC_E_CHANGED_MODE is OK
-        applog.appLog("[winrt] RoInitialize failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] RoInitialize failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return false;
     }
-    applog.appLog("[winrt] RoInitialize ok\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] RoInitialize ok\n", .{});
 
     // Create DispatcherQueue (required for Compositor)
     const options = DispatcherQueueOptions{
@@ -205,10 +205,10 @@ pub fn init(hwnd: c.HWND) bool {
 
     hr = g_CreateDispatcherQueueController.?(&options, &g_state.dispatcher_queue_controller);
     if (c.FAILED(hr)) {
-        applog.appLog("[winrt] CreateDispatcherQueueController failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] CreateDispatcherQueueController failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return false;
     }
-    applog.appLog("[winrt] CreateDispatcherQueueController ok\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] CreateDispatcherQueueController ok\n", .{});
 
     // Create Compositor via RoActivateInstance
     // Class name: "Windows.UI.Composition.Compositor" (34 chars)
@@ -216,7 +216,7 @@ pub fn init(hwnd: c.HWND) bool {
     const hstr = createHStringFromPtr(&class_name, 34);
 
     if (hstr == null) {
-        applog.appLog("[winrt] Failed to create HSTRING for Compositor class\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] Failed to create HSTRING for Compositor class\n", .{});
         return false;
     }
     defer {
@@ -227,10 +227,10 @@ pub fn init(hwnd: c.HWND) bool {
 
     hr = g_RoActivateInstance.?(hstr, &g_state.compositor);
     if (c.FAILED(hr) or g_state.compositor == null) {
-        applog.appLog("[winrt] RoActivateInstance(Compositor) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] RoActivateInstance(Compositor) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return false;
     }
-    applog.appLog("[winrt] RoActivateInstance(Compositor) ok: 0x{x}\n", .{@intFromPtr(g_state.compositor)});
+    if (applog.isEnabled()) applog.appLog("[winrt] RoActivateInstance(Compositor) ok: 0x{x}\n", .{@intFromPtr(g_state.compositor)});
 
     // Query for ICompositorDesktopInterop
     hr = g_state.compositor.?.lpVtbl.QueryInterface(
@@ -239,10 +239,10 @@ pub fn init(hwnd: c.HWND) bool {
         @ptrCast(&g_state.desktop_interop),
     );
     if (c.FAILED(hr) or g_state.desktop_interop == null) {
-        applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return false;
     }
-    applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) ok\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) ok\n", .{});
 
     // Query for ICompositorInterop (for swapchain surface)
     hr = g_state.compositor.?.lpVtbl.QueryInterface(
@@ -251,10 +251,10 @@ pub fn init(hwnd: c.HWND) bool {
         @ptrCast(&g_state.compositor_interop),
     );
     if (c.FAILED(hr) or g_state.compositor_interop == null) {
-        applog.appLog("[winrt] QueryInterface(ICompositorInterop) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorInterop) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         // Not fatal, continue
     } else {
-        applog.appLog("[winrt] QueryInterface(ICompositorInterop) ok\n", .{});
+        if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorInterop) ok\n", .{});
     }
 
     // Create DesktopWindowTarget
@@ -265,13 +265,13 @@ pub fn init(hwnd: c.HWND) bool {
         &g_state.desktop_target,
     );
     if (c.FAILED(hr) or g_state.desktop_target == null) {
-        applog.appLog("[winrt] CreateDesktopWindowTarget failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
+        if (applog.isEnabled()) applog.appLog("[winrt] CreateDesktopWindowTarget failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
         return false;
     }
-    applog.appLog("[winrt] CreateDesktopWindowTarget ok: 0x{x}\n", .{@intFromPtr(g_state.desktop_target)});
+    if (applog.isEnabled()) applog.appLog("[winrt] CreateDesktopWindowTarget ok: 0x{x}\n", .{@intFromPtr(g_state.desktop_target)});
 
     g_state.initialized = true;
-    applog.appLog("[winrt] WinRT Composition initialized successfully\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] WinRT Composition initialized successfully\n", .{});
 
     // TODO: Create backdrop brush and sprite visual
     // This requires more WinRT interface definitions (ICompositor2, ISpriteVisual, etc.)
@@ -309,7 +309,7 @@ pub fn deinit() void {
     }
 
     g_state.initialized = false;
-    applog.appLog("[winrt] WinRT Composition cleaned up\n", .{});
+    if (applog.isEnabled()) applog.appLog("[winrt] WinRT Composition cleaned up\n", .{});
 }
 
 /// Check if WinRT Composition is available and initialized

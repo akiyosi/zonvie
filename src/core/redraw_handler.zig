@@ -478,11 +478,12 @@ pub fn handleRedraw(
                 try grid.resizeGrid(grid_id, height, width);
 
                 // Update external grid target size so NDC viewport matches the actual grid.
-                // Neovim controls grid dimensions (<C-w>+, :resize, etc.) and the
-                // frontend resizes the OS window to match.
-                if (grid.external_grid_target_sizes.getPtr(grid_id)) |target| {
-                    target.rows = height;
-                    target.cols = width;
+                // Only for grids that are actual external windows (ext_windows splits
+                // or UI-extension grids like popupmenu/messages). Float windows
+                // (e.g. Telescope) must NOT get entries here — they render on the
+                // main grid and their NDC uses sg.rows/sg.cols directly.
+                if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
+                    grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width }) catch {};
                 }
 
                 if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });

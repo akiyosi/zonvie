@@ -226,44 +226,86 @@ final class ZonvieCore {
                         totalRows: Int(totalRows)
                     )
                 } else {
-                    // External grid: copy vertex data on RPC thread, then dispatch
-                    // all dictionary access and submission to main thread.
-                    // This ensures externalGridViews is only accessed from main thread.
-                    let vertexArray: [zonvie_vertex]? = if let verts = verts, vertCount > 0 {
-                        Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
-                    } else {
-                        nil
-                    }
+                    // External grid: submit vertices directly from core thread.
+                    // ExternalGridView's triple-buffered methods are thread-safe.
                     let rs = Int(rowStart)
                     let rc = Int(rowCount)
+                    let fl = flags
                     let tr = Int(totalRows)
                     let tc = Int(totalCols)
 
-                    DispatchQueue.main.async { [weak core] in
-                        guard let core = core else { return }
+                    core.externalGridViewsLock.lock()
+                    let gridView = core.externalGridViews[gridId]
+                    core.externalGridViewsLock.unlock()
 
-                        if let gridView = core.externalGridViews[gridId] {
-                            if let vertexArray = vertexArray {
-                                vertexArray.withUnsafeBufferPointer { buffer in
+                    if let gridView = gridView {
+                        let kind = core.classifyExternalGridKind(gridId)
+                        if kind == .normal {
+                            // Normal grid hot path: pass raw pointer directly (zero-copy).
+                            // The pointer is valid for the duration of this callback.
+                            gridView.submitVerticesRowRaw(
+                                rowStart: rs,
+                                rowCount: rc,
+                                ptr: verts,
+                                count: Int(vertCount),
+                                flags: fl,
+                                totalRows: tr,
+                                totalCols: tc
+                            )
+                            // First-row config (UI work) deferred to main thread
+                            if rs == 0 && fl & 2 == 0 {
+                                // Copy vertex data for main-thread config extraction
+                                let configVerts: [zonvie_vertex]? = if let verts = verts, vertCount > 0 {
+                                    Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                                } else {
+                                    nil
+                                }
+                                if let configVerts = configVerts {
+                                    DispatchQueue.main.async { [weak core] in
+                                        guard let core = core else { return }
+                                        configVerts.withUnsafeBufferPointer { buffer in
+                                            if let baseAddr = buffer.baseAddress {
+                                                core.configureExternalGridFromRow(
+                                                    gridId: gridId,
+                                                    gridView: gridView,
+                                                    verts: baseAddr,
+                                                    vertCount: buffer.count,
+                                                    rows: totalRows,
+                                                    cols: totalCols
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Decorated grid: copy + adjust vertex colors, then submit.
+                            // Decorated grids (cmdline, popup, messages) are not scroll-critical.
+                            if let verts = verts, vertCount > 0 {
+                                let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                                let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
+                                prepared.vertices.withUnsafeBufferPointer { buffer in
                                     gridView.submitVerticesRowRaw(
                                         rowStart: rs,
                                         rowCount: rc,
                                         ptr: buffer.baseAddress,
                                         count: buffer.count,
+                                        flags: fl,
                                         totalRows: tr,
                                         totalCols: tc
                                     )
                                 }
-
-                                // On first row, configure background color and window layout
-                                if rs == 0 {
-                                    vertexArray.withUnsafeBufferPointer { buffer in
-                                        if let baseAddr = buffer.baseAddress {
-                                            core.configureExternalGridFromRow(
+                                // First-row config for decorated grids
+                                if rs == 0 && fl & 2 == 0 {
+                                    if let bgColor = prepared.bgColor {
+                                        DispatchQueue.main.async { [weak core] in
+                                            guard let core = core else { return }
+                                            guard let window = core.externalWindows[gridId] else { return }
+                                            core.applyExternalGridConfig(
                                                 gridId: gridId,
+                                                window: window,
                                                 gridView: gridView,
-                                                verts: baseAddr,
-                                                vertCount: buffer.count,
+                                                bgColor: bgColor,
                                                 rows: totalRows,
                                                 cols: totalCols
                                             )
@@ -271,30 +313,92 @@ final class ZonvieCore {
                                     }
                                 }
                             } else {
-                                // vertCount==0: submit empty row to clear it
                                 gridView.submitVerticesRowRaw(
                                     rowStart: rs,
                                     rowCount: rc,
                                     ptr: nil,
                                     count: 0,
+                                    flags: fl,
                                     totalRows: tr,
                                     totalCols: tc
                                 )
                             }
-
-                            // NOTE: do NOT call gridView.requestRedraw() here.
-                            // External grid redraws are triggered from on_flush_end,
-                            // after commitFlush() has updated committedAtlasTexture.
-                            // Calling it here would race: the draw could sample the
-                            // old atlas while vertices already reference new UVs.
-                        } else if let vertexArray = vertexArray {
-                            // GridView not created yet - save vertices for later (per-row, non-empty only)
-                            ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(vertexArray.count) vertices for row \(rs)")
-                            if var existing = core.pendingExternalVertices[gridId] {
-                                existing.rowVertices[rs] = vertexArray
-                                core.pendingExternalVertices[gridId] = existing
-                            } else {
-                                core.pendingExternalVertices[gridId] = (rowVertices: [rs: vertexArray], rows: totalRows, cols: totalCols)
+                        }
+                        // NOTE: do NOT call gridView.requestRedraw() here.
+                        // External grid redraws are triggered from on_flush_end,
+                        // after commitFlush() has published the committed state.
+                    } else {
+                        // No gridView yet on core thread: copy vertex data and defer
+                        // to main thread. By the time this dispatch runs, the window
+                        // creation dispatch (also FIFO on main) may have completed,
+                        // so we re-check for the gridView.
+                        if let verts = verts, vertCount > 0 {
+                            let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                            DispatchQueue.main.async { [weak core] in
+                                guard let core = core else { return }
+                                let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
+                                // Re-check: gridView may exist now (window creation ran first in FIFO)
+                                if let gridView = core.externalGridViews[gridId] {
+                                    // Submit without flush bracket: write directly to committed set.
+                                    // A core-thread flush may be in progress concurrently, so we must
+                                    // NOT call beginFlush/commitFlush (would race on isInFlush and
+                                    // buffer set state). The non-flush path in submitVerticesRowRaw
+                                    // writes safely to the committed set under tripleBufferLock.
+                                    prepared.vertices.withUnsafeBufferPointer { buffer in
+                                        gridView.submitVerticesRowRaw(
+                                            rowStart: rs,
+                                            rowCount: rc,
+                                            ptr: buffer.baseAddress,
+                                            count: buffer.count,
+                                            flags: fl,
+                                            totalRows: tr,
+                                            totalCols: tc
+                                        )
+                                    }
+                                    if rs == 0 && fl & 2 == 0 {
+                                        if let bgColor = prepared.bgColor {
+                                            guard let window = core.externalWindows[gridId] else { return }
+                                            core.applyExternalGridConfig(
+                                                gridId: gridId,
+                                                window: window,
+                                                gridView: gridView,
+                                                bgColor: bgColor,
+                                                rows: totalRows,
+                                                cols: totalCols
+                                            )
+                                        } else {
+                                            prepared.vertices.withUnsafeBufferPointer { buffer in
+                                                if let baseAddr = buffer.baseAddress {
+                                                    core.configureExternalGridFromRow(
+                                                        gridId: gridId,
+                                                        gridView: gridView,
+                                                        verts: baseAddr,
+                                                        vertCount: buffer.count,
+                                                        rows: totalRows,
+                                                        cols: totalCols
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Bump commit revision and trigger redraw since we bypassed
+                                    // the flush bracket.
+                                    gridView.bumpRevisionAndRedraw()
+                                } else {
+                                    // Still no gridView: save to pending for window creation replay
+                                    if rs == 0, let bgColor = prepared.bgColor {
+                                        core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                    }
+                                    ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
+                                    if var existing = core.pendingExternalVertices[gridId] {
+                                        existing.rowVertices[rs] = prepared.vertices
+                                        existing.rows = totalRows
+                                        existing.cols = totalCols
+                                        core.pendingExternalVertices[gridId] = existing
+                                    } else {
+                                        core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
+                                    }
+                                }
                             }
                         }
                     }
@@ -533,6 +637,16 @@ final class ZonvieCore {
                 case .proceed:
                     break
                 }
+
+                // Begin flush bracket for external grids.
+                // Called directly from core thread — beginFlush() is thread-safe
+                // (uses tripleBufferLock internally).
+                me.externalGridViewsLock.lock()
+                let extViews = Array(me.externalGridViews.values)
+                me.externalGridViewsLock.unlock()
+                for gridView in extViews {
+                    gridView.beginFlush()
+                }
             },
             on_flush_end: { ctx in
                 guard let ctx else { return }
@@ -563,15 +677,21 @@ final class ZonvieCore {
                 // Ensure repaint after every flush (needed for glow config changes
                 // that arrive via RPC response outside the normal vertex submission path).
                 me.terminalView?.requestRedraw()
-                // Ensure external grids also repaint with the committed atlas.
-                // Their vertices may have been dispatched (async) before commitFlush
-                // updated committedAtlasTexture — this guarantees a redraw with the
-                // correct atlas even if a display refresh slipped in between.
-                // Dispatch to main because externalGridViews is main-thread-only state.
-                DispatchQueue.main.async { [weak me] in
-                    guard let me = me else { return }
-                    for (_, gridView) in me.externalGridViews {
-                        gridView.requestRedraw()
+                // Commit external grids directly from core thread — commitFlush()
+                // is thread-safe (uses tripleBufferLock). This eliminates async
+                // dispatch latency that caused smoothness gap vs main window.
+                me.externalGridViewsLock.lock()
+                let extViewsEnd = Array(me.externalGridViews.values)
+                me.externalGridViewsLock.unlock()
+                for gridView in extViewsEnd {
+                    gridView.commitFlush()
+                }
+                // requestRedraw → setNeedsDisplay must be on main thread (AppKit).
+                if !extViewsEnd.isEmpty {
+                    DispatchQueue.main.async {
+                        for gridView in extViewsEnd {
+                            gridView.requestRedraw()
+                        }
                     }
                 }
             },
@@ -665,6 +785,24 @@ final class ZonvieCore {
                     rowsDelta: Int(rowsDelta),
                     totalRows: Int(totalRows),
                     totalCols: Int(totalCols)
+                )
+            },
+
+            on_grid_row_scroll: { ctx, gridId, rowStart, rowEnd, colStart, colEnd, rowsDelta, totalRows, totalCols in
+                guard let ctx else { return }
+                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                let gid = Int64(gridId)
+                // Call applyRowScroll directly from core thread — it operates
+                // on the write set (owned by flush bracket) under tripleBufferLock.
+                core.externalGridViewsLock.lock()
+                let view = core.externalGridViews[gid]
+                core.externalGridViewsLock.unlock()
+                guard let view = view else { return }
+                view.applyRowScroll(
+                    rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                    colStart: Int(colStart), colEnd: Int(colEnd),
+                    rowsDelta: Int(rowsDelta),
+                    totalRows: Int(totalRows), totalCols: Int(totalCols)
                 )
             }
         )
@@ -1759,6 +1897,13 @@ final class ZonvieCore {
         cursorBlinkState = true
         cursorBlinkPhase = 0
 
+        // Propagate reset to all external grid views so they don't
+        // get stuck in blink-off state after a mode transition.
+        for (_, gridView) in externalGridViews {
+            gridView.cursorBlinkState = true
+            gridView.setNeedsDisplay(gridView.bounds)
+        }
+
         // If all blink values are 0, no blinking - cursor always visible
         if waitMs == 0 && onMs == 0 && offMs == 0 {
             ZonvieCore.appLog("[blink] all blink values are 0, no blinking")
@@ -2100,8 +2245,12 @@ final class ZonvieCore {
     /// When a window is hidden (e.g. tab switch), its position is saved here.
     /// On recreation, the saved position is used instead of Neovim's coordinates.
     private var savedExternalWindowPositions: [Int64: NSPoint] = [:]
-    /// Tracks external grid views (grid_id -> ExternalGridView)
+    /// Tracks external grid views (grid_id -> ExternalGridView).
+    /// Mutations happen on main thread only (window create/close).
+    /// Reads also happen from core thread (flush callbacks) under externalGridViewsLock.
     private var externalGridViews: [Int64: ExternalGridView] = [:]
+    /// Protects externalGridViews for cross-thread read access from core thread.
+    private let externalGridViewsLock = NSLock()
     /// Tracks external window delegates (grid_id -> ExternalWindowDelegate)
     private var externalWindowDelegates: [Int64: ExternalWindowDelegate] = [:]
     /// Pending background color configuration (applied when window is created)
@@ -2279,7 +2428,7 @@ final class ZonvieCore {
     private static let messageGridId: Int64 = -102
     /// Reserved grid ID for message history (must match MSG_HISTORY_GRID_ID in grid.zig)
     private static let msgHistoryGridId: Int64 = -103
-    private static let specialWindowCornerRadius: CGFloat = 8.0
+    private static let specialWindowCornerRadius: CGFloat = 4.0
     private static let specialWindowBorderLayerName = "ZonvieSpecialWindowBorder"
 
     /// Message window for ext_messages (top-right for echo/error/warning)
@@ -2330,6 +2479,8 @@ final class ZonvieCore {
     /// Tracks which grid the popupmenu is anchored to (set during popupmenu_show, cleared on hide)
     /// Used to prevent main window activation when popupmenu is on an external window
     private var popupmenuAnchorGrid: Int64? = nil
+    private var popupmenuAnchorRow: Int32? = nil
+    private var popupmenuAnchorCol: Int32? = nil
 
     /// Pending main window activation work item (can be cancelled by popupmenu_show)
     private var mainWindowActivationWorkItem: DispatchWorkItem? = nil
@@ -2363,439 +2514,114 @@ final class ZonvieCore {
             let cellW = CGFloat(renderer.cellWidthPx)
             let cellH = CGFloat(renderer.cellHeightPx)
             let scale = mainView.window?.backingScaleFactor ?? 1.0
-
-            var contentWidth = CGFloat(cols) * cellW / scale
-            let contentHeight = CGFloat(rows) * cellH / scale
-
-            // Determine if this is a special window (cmdline, popupmenu, msg_show, msg_history)
-            let isCmdline = (gridId == ZonvieCore.cmdlineGridId)
-            let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-            let isMsgShow = (gridId == ZonvieCore.messageGridId)
-            let isMsgHistory = (gridId == ZonvieCore.msgHistoryGridId)
+            let specialKind = self.classifyExternalGridKind(gridId)
+            let geometry = self.buildExternalWindowGeometry(
+                kind: specialKind,
+                rows: rows,
+                cols: cols,
+                cellW: cellW,
+                cellH: cellH,
+                scale: scale
+            )
 
             // Check if window already exists - reuse for popupmenu
             if let existingWindow = self.externalWindows[gridId],
                let existingGridView = self.externalGridViews[gridId] {
-                if isPopupmenu {
-                    // Reuse popupmenu window - just update size and position
-                    let windowWidth = contentWidth
-                    let windowHeight = contentHeight
-
-                    // Calculate new position
-                    var windowRect = existingWindow.frame
-                    let isCmdlineCompletion = (startRow == -1)
-
-                    if isCmdlineCompletion {
-                        // Position above cmdline window
-                        if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                            let cmdlineFrame = cmdlineWindow.frame
-                            let x = cmdlineFrame.origin.x + CGFloat(startCol) * cellW / scale
-                            let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
-                            windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                        }
-                    } else if win > 0, let anchorWindow = self.externalWindows[win],
-                              let anchorContentView = anchorWindow.contentView {
-                        // Completion on external window: position relative to content area
-                        anchorContentView.layoutSubtreeIfNeeded()
-                        let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
-                        let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
-
-                        let origin = gridToScreenOrigin(
-                            row: startRow, col: startCol,
-                            windowHeight: windowHeight,
-                            cellW: cellW, cellH: cellH, scale: scale,
-                            referenceFrame: anchorContentFrame
+                switch specialKind {
+                case .popupmenu:
+                    self.refreshDecoratedExternalWindow(
+                        gridId: gridId,
+                        window: existingWindow,
+                        gridView: existingGridView,
+                        rows: rows,
+                        cols: cols,
+                        preLayoutFrame: self.buildReusedDecoratedWindowFrame(
+                            kind: specialKind,
+                            existingWindow: existingWindow,
+                            win: win,
+                            startRow: startRow,
+                            startCol: startCol,
+                            mainView: mainView,
+                            cellW: cellW,
+                            cellH: cellH,
+                            scale: scale,
+                            geometry: geometry
                         )
-                        let screenTop = (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-
-                        let belowY = origin.y
-                        let pxY = CGFloat(startRow) * cellH / scale
-                        let aboveY = anchorContentFrame.origin.y + anchorContentFrame.height - pxY + (cellH / scale * 2)
-
-                        let y: CGFloat
-                        if belowY >= anchorContentFrame.origin.y {
-                            y = belowY
-                        } else if (aboveY + windowHeight) <= screenTop {
-                            y = aboveY
-                        } else {
-                            y = belowY
-                        }
-
-                        windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
-                    } else if let tvFrame = self.terminalViewScreenFrame() {
-                        // Buffer completion on main window: position relative to terminal view
-                        let origin = gridToScreenOrigin(
-                            row: startRow, col: startCol,
-                            windowHeight: windowHeight,
-                            cellW: cellW, cellH: cellH, scale: scale,
-                            referenceFrame: tvFrame
-                        )
-                        let screenTop = (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-
-                        // Position below cursor (default)
-                        let belowY = origin.y
-                        // Position above cursor (flipped)
-                        let pxY = CGFloat(startRow) * cellH / scale
-                        let aboveY = tvFrame.origin.y + tvFrame.height - pxY + (cellH / scale * 2)
-
-                        let y: CGFloat
-                        if belowY >= tvFrame.origin.y {
-                            y = belowY  // Fits within terminal view
-                        } else if (aboveY + windowHeight) <= screenTop {
-                            y = aboveY  // Flip above: fits on screen
-                        } else {
-                            y = belowY  // Neither fits: keep below to avoid cursor overlap
-                        }
-
-                        windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
-                    }
-
-                    existingWindow.setFrame(windowRect, display: false)
-                    existingGridView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-                    existingWindow.orderFront(nil)
-                    return
-                } else if isCmdline {
-                    // Cmdline window exists - reposition if promptWindow (confirm dialog) is visible
-                    let promptWinVisible = self.promptWindow?.isVisible == true
-
-                    if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
-                        // Temporarily position cmdline below confirm — suppress savedOrigin update
-                        if let cmdWin = existingWindow as? CmdlineWindow {
-                            cmdWin.suppressPositionSave = true
-                        }
-                        let promptFrame = promptWin.frame
-                        let screenFrame = screen.visibleFrame
-                        let appFrame = mainWindow.frame
-                        let containerWidth = existingWindow.frame.width
-                        let containerHeight = existingWindow.frame.height
-                        let x = appFrame.midX - containerWidth / 2
-                        var y = promptFrame.origin.y - 4 - containerHeight
-                        y = max(screenFrame.minY, y)
-
-                        existingWindow.setFrame(NSRect(x: x, y: y, width: containerWidth, height: containerHeight), display: false)
-                        ZonvieCore.appLog("[external_window] cmdline repositioned below prompt at (\(x), \(y))")
-                    } else {
-                        // Normal case: re-enable position saving
-                        if let cmdWin = existingWindow as? CmdlineWindow {
-                            cmdWin.suppressPositionSave = false
-                        }
-                    }
-                    existingWindow.orderFront(nil)
-                    return
-                } else if isMsgHistory {
-                    // Reuse msg_history window - update size and position (top-right)
-                    let windowWidth = contentWidth
-                    let windowHeight = contentHeight
-
-                    let targetFrame = getExtFloatTargetFrame()
-                    let x = targetFrame.maxX - windowWidth - 10
-                    let y = targetFrame.maxY - windowHeight - 10
-                    let windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                    existingWindow.setFrame(windowRect, display: false)
-                    existingGridView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-
-                    // Reposition msg_show window below msg_history if it exists
-                    if let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
-                       msgShowWindow.isVisible {
-                        let msgShowFrame = msgShowWindow.frame
-                        let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-                        let msgShowY = y - msgShowFrame.height - 4  // 4px gap below history (y is history's origin.y)
-                        msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: false)
-                        ZonvieCore.appLog("[external_window] repositioned msg_show below msg_history at (\(msgShowX),\(msgShowY))")
-                    }
-                    existingWindow.orderFront(nil)
-                    return
-                } else if isMsgShow {
-                    // Reuse msg_show window - position below msg_history if visible, otherwise top-right
-                    let windowWidth = contentWidth
-                    let windowHeight = contentHeight
-
-                    let targetFrame = getExtFloatTargetFrame()
-                    let x = targetFrame.maxX - windowWidth - 10
-                    var y = targetFrame.maxY - windowHeight - 10
-
-                    // If msg_history window is visible, position below it
-                    if let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId],
-                       msgHistoryWindow.isVisible {
-                        let historyFrame = msgHistoryWindow.frame
-                        y = historyFrame.origin.y - windowHeight - 4  // 4px gap below history
-                        ZonvieCore.appLog("[external_window] msg_show positioned below msg_history at (\(x),\(y))")
-                    }
-
-                    let windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                    existingWindow.setFrame(windowRect, display: false)
-                    existingGridView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-                    existingWindow.orderFront(nil)
-                    return
-                } else {
-                    // For other windows, just return
-                    return
-                }
-            }
-
-            let isSpecialWindow = isCmdline || isPopupmenu || isMsgShow || isMsgHistory
-
-            // Padding for cmdline window (from ZonvieConfig)
-            let cmdlinePadding: CGFloat = isCmdline ? ZonvieConfig.cmdlinePadding : 0.0
-            let popupmenuPadding: CGFloat = isPopupmenu ? 8.0 : 0.0
-            // Padding for msg_show/msg_history windows
-            let msgPadding: CGFloat = (isMsgShow || isMsgHistory) ? 8.0 : 0.0
-            // Shadow margin for cmdline window (allows shadow to extend beyond content)
-            let shadowMargin: CGFloat = isCmdline ? 150.0 : 0.0
-            // Icon area width for cmdline window
-            let cmdlineIconTotalWidth: CGFloat = isCmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
-
-            // Constrain cmdline width to screen width
-            if isCmdline, let screen = NSScreen.main {
-                let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
-                contentWidth = min(contentWidth, maxContentWidth)
-            }
-
-            let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2)
-            let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
-            let windowWidth = containerWidth + (shadowMargin * 2)
-            let windowHeight = containerHeight + (shadowMargin * 2)
-
-            // Create the external window with appropriate style
-            let windowRect: NSRect
-            let styleMask: NSWindow.StyleMask
-
-            if isCmdline {
-                // Cmdline window: borderless
-                styleMask = [.borderless]
-
-                // Check if promptWindow (confirm dialog) is visible
-                let promptWinVisible = self.promptWindow?.isVisible == true
-
-                if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
-                    // Position cmdline below promptWindow (confirm dialog)
-                    // This is a temporary position — do not save to savedOrigin.
-                    let promptFrame = promptWin.frame
-                    let screenFrame = screen.visibleFrame
-                    let appFrame = mainWindow.frame
-                    let x = appFrame.midX - containerWidth / 2
-                    var y = promptFrame.origin.y - 4 - containerHeight
-                    y = max(screenFrame.minY, y)
-                    windowRect = NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
-                    ZonvieCore.appLog("[external_window] cmdline positioned below prompt at (\(x), \(y))")
-                } else if let savedOrigin = CmdlineWindow.savedOrigin, let screen = NSScreen.main {
-                    // Use saved position, but ensure window stays on screen
-                    let screenFrame = screen.visibleFrame
-                    let x = max(screenFrame.minX, min(savedOrigin.x, screenFrame.maxX - containerWidth))
-                    let y = max(screenFrame.minY, min(savedOrigin.y, screenFrame.maxY - containerHeight))
-                    windowRect = NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
-                    ZonvieCore.appLog("[external_window] cmdline using saved position: (\(x), \(y))")
-                } else if let screen = NSScreen.main {
-                    // Default: center on screen
-                    let screenFrame = screen.visibleFrame
-                    let x = screenFrame.midX - containerWidth / 2
-                    let y = screenFrame.midY - containerHeight / 2
-                    windowRect = NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
-                } else {
-                    windowRect = NSRect(x: 100, y: 100, width: containerWidth, height: containerHeight)
-                }
-            } else if isPopupmenu {
-                // Popupmenu window: borderless, position near cursor
-                styleMask = [.borderless]
-
-                // Check if this is cmdline completion (startRow == -1)
-                let isCmdlineCompletion = (startRow == -1)
-
-                if isCmdlineCompletion {
-                    // Cmdline completion: position above the cmdline window
-                    if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                        let cmdlineFrame = cmdlineWindow.frame
-                        let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-                        let popupmenuPadding: CGFloat = 8.0
-                        // Position popupmenu so its bottom is at cmdline top (with small gap)
-                        let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
-                        let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0  // 4px gap above cmdline
-                        windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                        ZonvieCore.appLog("[external_window] popupmenu positioned above cmdline at (\(x),\(y))")
-                    } else {
-                        // Fallback: center on screen
-                        if let screen = NSScreen.main {
-                            let screenFrame = screen.visibleFrame
-                            let x = screenFrame.midX - windowWidth / 2
-                            let y = screenFrame.midY
-                            windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                        } else {
-                            windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
-                        }
-                    }
-                } else if win > 0, let anchorWindow = self.externalWindows[win],
-                          let anchorContentView = anchorWindow.contentView {
-                    // Completion on external window: position relative to content area (excludes title bar)
-                    anchorContentView.layoutSubtreeIfNeeded()
-                    let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
-                    let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
-
-                    let origin = gridToScreenOrigin(
-                        row: startRow, col: startCol,
-                        windowHeight: windowHeight,
-                        cellW: cellW, cellH: cellH, scale: scale,
-                        referenceFrame: anchorContentFrame
                     )
-                    let screenTop = (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-
-                    // Position below cursor (default)
-                    let belowY = origin.y
-                    // Position above cursor (flipped)
-                    let pxY = CGFloat(startRow) * cellH / scale
-                    let aboveY = anchorContentFrame.origin.y + anchorContentFrame.height - pxY + (cellH / scale * 2)
-
-                    let y: CGFloat
-                    if belowY >= anchorContentFrame.origin.y {
-                        y = belowY  // Fits within anchor window
-                    } else if (aboveY + windowHeight) <= screenTop {
-                        y = aboveY  // Flip above: fits on screen
-                    } else {
-                        y = belowY  // Neither fits: keep below to avoid cursor overlap
-                    }
-
-                    windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(origin.x),\(y)) relative to ext_win=\(win)")
-                } else if let tvFrame = self.terminalViewScreenFrame() {
-                    // Buffer completion: position relative to terminal view
-                    let origin = gridToScreenOrigin(
-                        row: startRow, col: startCol,
-                        windowHeight: windowHeight,
-                        cellW: cellW, cellH: cellH, scale: scale,
-                        referenceFrame: tvFrame
+                    return
+                case .cmdline:
+                    let preLayoutFrame = self.buildReusedDecoratedWindowFrame(
+                        kind: specialKind,
+                        existingWindow: existingWindow,
+                        win: win,
+                        startRow: startRow,
+                        startCol: startCol,
+                        mainView: mainView,
+                        cellW: cellW,
+                        cellH: cellH,
+                        scale: scale,
+                        geometry: geometry
                     )
-                    let screenTop = (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-
-                    // Position below cursor (default)
-                    let belowY = origin.y
-                    // Position above cursor (flipped)
-                    let pxY = CGFloat(startRow) * cellH / scale
-                    let aboveY = tvFrame.origin.y + tvFrame.height - pxY + (cellH / scale * 2)
-
-                    let y: CGFloat
-                    if belowY >= tvFrame.origin.y {
-                        y = belowY  // Fits within terminal view
-                    } else if (aboveY + windowHeight) <= screenTop {
-                        y = aboveY  // Flip above: fits on screen
-                    } else {
-                        y = belowY  // Neither fits: keep below to avoid cursor overlap
+                    if let cmdWin = existingWindow as? CmdlineWindow {
+                        cmdWin.suppressPositionSave = (preLayoutFrame != nil)
                     }
-
-                    windowRect = NSRect(x: origin.x, y: y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] popupmenu positioned at (\(origin.x),\(y)) from cursor pos (\(startRow),\(startCol))")
-                } else {
-                    windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
-                }
-            } else if isMsgHistory {
-                // Message history window: borderless, top-right position based on config
-                styleMask = [.borderless]
-                let targetFrame = getExtFloatTargetFrame()
-                let x = targetFrame.maxX - windowWidth - 10
-                let y = targetFrame.maxY - windowHeight - 10
-                windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                ZonvieCore.appLog("[external_window] msg_history positioned at (\(x),\(y))")
-            } else if isMsgShow {
-                // Message show window: borderless, position below msg_history if visible, otherwise top-right
-                styleMask = [.borderless]
-                let targetFrame = getExtFloatTargetFrame()
-                let x = targetFrame.maxX - windowWidth - 10
-                var y = targetFrame.maxY - windowHeight - 10
-
-                // If msg_history window is visible, position below it
-                if let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId],
-                   msgHistoryWindow.isVisible {
-                    let historyFrame = msgHistoryWindow.frame
-                    y = historyFrame.origin.y - windowHeight - 4  // 4px gap below history
-                    ZonvieCore.appLog("[external_window] msg_show positioned below msg_history at (\(x),\(y))")
-                } else {
-                    ZonvieCore.appLog("[external_window] msg_show positioned at (\(x),\(y))")
-                }
-
-                windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-            } else if let savedOrigin = self.savedExternalWindowPositions[gridId] {
-                // Restore saved position from previous tab switch
-                styleMask = [.titled, .closable, .resizable]
-                windowRect = NSRect(x: savedOrigin.x, y: savedOrigin.y, width: windowWidth, height: windowHeight)
-                ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(savedOrigin)")
-            } else if let pendingPos = self.pendingExternalWindowPosition {
-                // Tab externalization: use the pending position (mouse drop point)
-                styleMask = [.titled, .closable, .resizable]
-                // Position so the mouse is at the center of the title bar
-                let titleBarHeight: CGFloat = 28  // Standard macOS title bar height
-                let x = pendingPos.x - windowWidth / 2  // Center horizontally
-                let y = pendingPos.y - windowHeight - titleBarHeight / 2  // Title bar center at mouse Y
-                windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
-                self.pendingExternalWindowPosition = nil  // Clear after use
-            } else if startRow >= 0 && startCol >= 0 {
-                // Position relative to terminal view using win_pos
-                styleMask = [.titled, .closable, .resizable]
-                if let tvFrame = self.terminalViewScreenFrame() {
-                    let origin = gridToScreenOrigin(
-                        row: startRow, col: startCol,
-                        windowHeight: windowHeight,
-                        cellW: cellW, cellH: cellH, scale: scale,
-                        referenceFrame: tvFrame
+                    self.refreshDecoratedExternalWindow(
+                        gridId: gridId,
+                        window: existingWindow,
+                        gridView: existingGridView,
+                        rows: rows,
+                        cols: cols,
+                        preLayoutFrame: preLayoutFrame
                     )
-                    windowRect = NSRect(x: origin.x, y: origin.y, width: windowWidth, height: windowHeight)
-                    ZonvieCore.appLog("[external_window] positioned at (\(origin.x),\(origin.y)) from win_pos (\(startRow),\(startCol))")
-                } else {
-                    windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
+                    if let preLayoutFrame {
+                        ZonvieCore.appLog("[external_window] cmdline repositioned below prompt at (\(preLayoutFrame.origin.x), \(preLayoutFrame.origin.y))")
+                    }
+                    return
+                case .msgHistory:
+                    self.refreshDecoratedExternalWindow(
+                        gridId: gridId,
+                        window: existingWindow,
+                        gridView: existingGridView,
+                        rows: rows,
+                        cols: cols
+                    )
+                    return
+                case .msgShow:
+                    self.refreshDecoratedExternalWindow(
+                        gridId: gridId,
+                        window: existingWindow,
+                        gridView: existingGridView,
+                        rows: rows,
+                        cols: cols
+                    )
+                    return
+                case .normal:
+                    return
                 }
-            } else {
-                // Regular external window - default position
-                styleMask = [.titled, .closable, .resizable]
-                windowRect = NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
             }
 
-            // Use CmdlineWindow for cmdline to enable key events and IME input
-            let window: NSWindow
-            if isCmdline {
-                let cmdlineWindow = CmdlineWindow(
-                    contentRect: windowRect,
-                    styleMask: styleMask,
-                    backing: .buffered,
-                    defer: false
-                )
-                // Set self as delegate to track window movement
-                cmdlineWindow.delegate = cmdlineWindow
-                // Suppress position save when positioned relative to confirm dialog
-                cmdlineWindow.suppressPositionSave = (self.promptWindow?.isVisible == true)
-                window = cmdlineWindow
-            } else {
-                window = NSWindow(
-                    contentRect: windowRect,
-                    styleMask: styleMask,
-                    backing: .buffered,
-                    defer: false
-                )
-            }
+            let isSpecialWindow = self.isDecoratedExternalGridKind(specialKind)
 
-            if isCmdline {
-                // Cmdline-specific window settings
-                window.hasShadow = true
-                window.level = .floating  // Above other windows
-                window.isOpaque = false
-                window.backgroundColor = .clear  // Required for window transparency
-                window.isMovableByWindowBackground = true  // Allow drag to move
-                window.hidesOnDeactivate = true  // Hide when app loses focus
-            } else if isPopupmenu {
-                // Popupmenu-specific window settings (similar to cmdline)
-                window.hasShadow = true
-                window.level = .floating  // Above main window
-                window.isOpaque = false
-                window.backgroundColor = .clear  // Required for window transparency
-                window.hidesOnDeactivate = true  // Hide when app loses focus
-            } else if isMsgShow || isMsgHistory {
-                // Message show/history window settings (similar to cmdline/popupmenu)
-                window.hasShadow = true
-                window.level = .floating  // Above main window
-                window.isOpaque = false
-                window.backgroundColor = .clear  // Required for window transparency
-                window.hidesOnDeactivate = true  // Hide when app loses focus
-            } else {
-                window.title = "Window \(win)"
-            }
-            window.isReleasedWhenClosed = false
+            let styleMask = self.styleMaskForExternalWindow(kind: specialKind)
+            let windowRect = self.buildInitialExternalWindowRect(
+                kind: specialKind,
+                gridId: gridId,
+                win: win,
+                startRow: startRow,
+                startCol: startCol,
+                mainView: mainView,
+                cellW: cellW,
+                cellH: cellH,
+                scale: scale,
+                geometry: geometry
+            )
+
+            let window = self.makeExternalHostWindow(
+                kind: specialKind,
+                contentRect: windowRect,
+                styleMask: styleMask
+            )
+            self.applyExternalWindowSettings(window, kind: specialKind, win: win)
 
             // Create ExternalGridView with shared device, atlas, and pipelines
             // Using shared pipelines avoids shader compilation (10-50ms per window)
@@ -2816,10 +2642,7 @@ final class ZonvieCore {
                 return
             }
 
-            // DEBUG: Log blurEnabled value before creating ExternalGridView
             let blurEnabledForGrid = ZonvieConfig.shared.blurEnabled
-            ZonvieCore.appLog("[DEBUG-EXTGRID-CREATE] gridId=\(gridId) isSpecialWindow=\(isSpecialWindow) blurEnabled=\(blurEnabledForGrid) backgroundAlpha=\(ZonvieConfig.shared.backgroundAlpha) window.blur=\(ZonvieConfig.shared.window.blur)")
-
             guard let gridView = ExternalGridView(
                 gridId: gridId,
                 device: renderer.metalDevice,
@@ -2829,7 +2652,7 @@ final class ZonvieCore {
                 sharedGlyphPipeline: renderer.sharedGlyphPipeline,
                 sharedSampler: sharedSampler,
                 blurEnabled: blurEnabledForGrid,
-                isCmdline: isSpecialWindow  // Treat popupmenu same as cmdline for rendering
+                isDecoratedSurface: isSpecialWindow
             ) else {
                 ZonvieCore.appLog("[external_window] failed to create ExternalGridView")
                 return
@@ -2837,194 +2660,33 @@ final class ZonvieCore {
 
             gridView.mainTerminalView = mainView  // Enable key event forwarding
 
-            if isSpecialWindow {
-                // Special window (cmdline or popupmenu): minimal styling
-                // Create container view (no shadow margin - use window shadow instead)
-                let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight))
-                containerView.wantsLayer = true
-                containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
-                containerView.layer?.cornerCurve = .continuous
-                containerView.layer?.masksToBounds = true
+            self.attachExternalGridView(window: window, gridView: gridView, kind: specialKind, geometry: geometry)
 
-                // Set semi-transparent background on containerView for margin area
-                // gridView will be transparent so this color shows through uniformly
-                if ZonvieConfig.shared.blurEnabled {
-                    let opacity = ZonvieConfig.shared.backgroundAlpha
-                    containerView.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(opacity)).cgColor
-                } else {
-                    containerView.layer?.backgroundColor = NSColor.black.cgColor
-                }
+            self.installExternalWindowDelegateIfNeeded(
+                gridId: gridId,
+                kind: specialKind,
+                window: window,
+                cellW: cellW,
+                cellH: cellH
+            )
+            self.prepareExternalWindowForDisplay(window: window, kind: specialKind)
+            self.registerExternalWindow(
+                gridId: gridId,
+                kind: specialKind,
+                window: window,
+                gridView: gridView,
+                rows: rows,
+                cols: cols
+            )
+            self.activateExternalWindow(
+                gridId: gridId,
+                kind: specialKind,
+                window: window,
+                gridView: gridView
+            )
 
-                // Border using Search highlight color
-                let borderColor = self.getSearchHighlightColor()
-                self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
-
-                // Add icon view for cmdline window
-                if isCmdline {
-                    let iconView = NSImageView(frame: NSRect(
-                        x: ZonvieConfig.cmdlineIconMarginLeft,
-                        y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
-                        width: ZonvieConfig.cmdlineIconSize,
-                        height: ZonvieConfig.cmdlineIconSize
-                    ))
-                    iconView.imageScaling = .scaleProportionallyUpOrDown
-
-                    containerView.addSubview(iconView)
-                    self.cmdlineIconView = iconView
-
-                    // Set icon based on current firstc
-                    ZonvieCore.appLog("[cmdline] window created, firstc=\(self.cmdlineFirstc), calling updateCmdlineIcon()")
-                    self.updateCmdlineIcon()
-                }
-
-                // Position gridView with padding inside containerView (offset by icon width for cmdline)
-                // For cmdline: offset includes icon area; for msg_show/msg_history: use msgPadding
-                let gridViewX = cmdlinePadding + cmdlineIconTotalWidth + popupmenuPadding + msgPadding
-                let gridViewY = cmdlinePadding + popupmenuPadding + msgPadding
-                gridView.frame = NSRect(x: gridViewX, y: gridViewY, width: contentWidth, height: contentHeight)
-                containerView.addSubview(gridView)
-
-                // Resize window to container size
-                // For cmdline: use position from windowRect (already calculated above)
-                // For popupmenu: keep the position from windowRect (already set near cursor)
-                if isCmdline {
-                    // windowRect already has the correct position (below promptWindow or saved/centered)
-                    // Just resize to container size, keeping the position from windowRect
-                    window.setFrame(NSRect(x: windowRect.origin.x, y: windowRect.origin.y, width: containerWidth, height: containerHeight), display: false)
-                    ZonvieCore.appLog("[cmdline] final frame: \(window.frame)")
-                } else {
-                    // Popupmenu: just resize to container size, keep position from windowRect
-                    window.setContentSize(NSSize(width: containerWidth, height: containerHeight))
-                }
-
-                window.contentView = containerView
-                window.backgroundColor = .clear
-                window.isOpaque = false
-                window.hasShadow = true  // Use window's native shadow
-
-                // Apply CGSSetWindowBackgroundBlurRadius (same as main window)
-                if ZonvieConfig.shared.blurEnabled {
-                    ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
-                }
-            } else {
-                // Regular external window
-                gridView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-                window.contentView = gridView
-                if ZonvieConfig.shared.blurEnabled {
-                    window.isOpaque = false
-                    window.backgroundColor = .clear
-                }
-            }
-
-            // Set up delegate for resize handling (skip for special windows - non-resizable)
-            if !isSpecialWindow {
-                let delegate = ExternalWindowDelegate(
-                    core: self,
-                    gridId: gridId,
-                    cellWidthPx: cellW,
-                    cellHeightPx: cellH
-                )
-                window.delegate = delegate
-                self.externalWindowDelegates[gridId] = delegate
-            }
-
-            // Show the window without stealing key status.
-            // Activation is handled by onCursorGridChanged based on cursor position.
-            window.orderFront(nil)
-
-            // Apply blur using private API if enabled (but NOT for special windows)
-            if ZonvieConfig.shared.blurEnabled && !isSpecialWindow {
-                Self.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
-            }
-
-            self.externalWindows[gridId] = window
-            self.externalGridViews[gridId] = gridView
-            // Set lastCursorGrid and activate this window
-            self.lastCursorGrid = gridId
-            window.makeKeyAndOrderFront(nil)
-            if let gridView = self.externalGridViews[gridId] {
-                window.makeFirstResponder(gridView)
-            }
-            let windowType = isCmdline ? "cmdline" : (isPopupmenu ? "popupmenu" : "regular")
-            ZonvieCore.appLog("[external_window] created \(windowType) window for gridId=\(gridId)")
-
-            // Apply any pending vertices that were saved before gridView was created (per-row)
-            let pendingVerts = self.pendingExternalVertices.removeValue(forKey: gridId)
-            if let pendingVerts = pendingVerts {
-                let totalVertCount = pendingVerts.rowVertices.values.reduce(0) { $0 + $1.count }
-                ZonvieCore.appLog("[external_window] applying pending vertices for gridId=\(gridId) rows=\(pendingVerts.rowVertices.count) totalVerts=\(totalVertCount)")
-
-                // Apply each row's vertices
-                for (rowStart, vertices) in pendingVerts.rowVertices.sorted(by: { $0.key < $1.key }) {
-                    vertices.withUnsafeBufferPointer { buffer in
-                        gridView.submitVerticesRowRaw(
-                            rowStart: rowStart,
-                            rowCount: 1,
-                            ptr: buffer.baseAddress,
-                            count: buffer.count,
-                            totalRows: Int(pendingVerts.rows),
-                            totalCols: Int(pendingVerts.cols)
-                        )
-                    }
-                }
-
-                // Also extract and apply background color from first row's vertices
-                if let contentView = window.contentView,
-                   let firstRowVertices = pendingVerts.rowVertices[0] {
-                    for v in firstRowVertices {
-                        if v.texCoord.0 < 0 {
-                            let bgColor = NSColor(
-                                red: CGFloat(v.color.0),
-                                green: CGFloat(v.color.1),
-                                blue: CGFloat(v.color.2),
-                                alpha: CGFloat(v.color.3)
-                            )
-                            ZonvieCore.appLog("[external_window] applying bg color from pending vertices for gridId=\(gridId)")
-                            self.applyExternalGridConfig(
-                                gridId: gridId,
-                                window: window,
-                                containerView: contentView,
-                                gridView: gridView,
-                                bgColor: bgColor,
-                                rows: pendingVerts.rows,
-                                cols: pendingVerts.cols
-                            )
-                            break
-                        }
-                    }
-                }
-
-                gridView.requestRedraw()
-            }
-
-            // Apply any pending configuration that was saved before window was created (fallback)
-            if let pendingConfig = self.pendingExternalGridConfig.removeValue(forKey: gridId),
-               let contentView = window.contentView {
-                ZonvieCore.appLog("[external_window] applying pending config for gridId=\(gridId) bgColor=\(pendingConfig.bgColor)")
-                self.applyExternalGridConfig(
-                    gridId: gridId,
-                    window: window,
-                    containerView: contentView,
-                    gridView: gridView,
-                    bgColor: pendingConfig.bgColor,
-                    rows: pendingConfig.rows,
-                    cols: pendingConfig.cols
-                )
-            }
-
-            // If msg_history window was just created, reposition msg_show window below it
-            if isMsgHistory {
-                if let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
-                   msgShowWindow.isVisible {
-                    let targetFrame = getExtFloatTargetFrame()
-                    let historyFrame = window.frame
-                    let msgShowFrame = msgShowWindow.frame
-                    let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-                    let msgShowY = historyFrame.origin.y - msgShowFrame.height - 4  // 4px gap below history
-                    msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: false)
-                    ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(msgShowX),\(msgShowY))")
-                }
-            }
+            self.applyPendingExternalState(gridId: gridId, window: window, gridView: gridView)
+            self.repositionMessageShowBelowHistoryWindowIfNeeded(gridId: gridId, historyWindow: window)
 
             // Refresh main window's blur effect after external window is shown
             // DEBUG: This may cause blur to become stronger when external windows are shown
@@ -3090,8 +2752,7 @@ final class ZonvieCore {
         // (via on_vertices_row → DispatchQueue.main.async). Avoiding nested async
         // ensures resize completes before requestRedraw(), keeping drawable size
         // in sync with NDC viewport.
-        guard let window = self.externalWindows[gridId],
-              let containerView = window.contentView else {
+        guard let window = self.externalWindows[gridId] else {
             // Window not created yet - save pending config to apply later
             ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) window not found, saving pending config")
             self.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: rows, cols: cols)
@@ -3103,7 +2764,6 @@ final class ZonvieCore {
         self.applyExternalGridConfig(
             gridId: gridId,
             window: window,
-            containerView: containerView,
             gridView: gridView,
             bgColor: bgColor,
             rows: rows,
@@ -3116,40 +2776,20 @@ final class ZonvieCore {
     private func applyExternalGridConfig(
         gridId: Int64,
         window: NSWindow,
-        containerView: NSView,
         gridView: ExternalGridView,
         bgColor: NSColor,
         rows: UInt32,
         cols: UInt32
     ) {
-        let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
-                             gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-
-        // Update background color on the containerView and gridClearColor
-        if isSpecialGrid {
-            let adjustedBg = bgColor.adjustedForCmdlineBackground()
-
-            if ZonvieConfig.shared.blurEnabled {
-                gridView.gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(1.0).cgColor
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                adjustedBg.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
-                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
-            }
-        } else {
-            // Regular ext_windows grid: set clear color from vertex background.
-            // For regular grids, window.contentView = gridView (no separate containerView).
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = Double(ZonvieConfig.shared.backgroundAlpha)
-                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: opacity)
-            } else {
-                gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
-            }
+        if classifyExternalGridKind(gridId) != .normal {
+            updateDecoratedExternalGrid(
+                gridId: gridId,
+                gridView: gridView,
+                bgColor: bgColor,
+                rows: rows,
+                cols: cols
+            )
+            return
         }
 
         // Resize window based on content dimensions
@@ -3158,172 +2798,54 @@ final class ZonvieCore {
         let cellH = CGFloat(renderer.cellHeightPx)
         let scale = mainView.window?.backingScaleFactor ?? 1.0
 
-        if gridId == ZonvieCore.cmdlineGridId {
-            self.resizeCmdlineWindow(window: window, containerView: containerView, gridView: gridView,
-                                     rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale, bgColor: bgColor)
-        } else if gridId == ZonvieCore.popupmenuGridId {
-            self.resizePopupmenuWindow(window: window, containerView: containerView, gridView: gridView,
-                                       rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale)
-        } else if gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId {
-            self.resizeMessageWindow(window: window, containerView: containerView, gridView: gridView, gridId: gridId,
-                                     rows: rows, cols: cols, cellW: cellW, cellH: cellH, scale: scale)
-        } else {
-            // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
-            // Resize the OS window to match the grid size.
-
-            let contentWidth = CGFloat(cols) * cellW / scale
-            let contentHeight = CGFloat(rows) * cellH / scale
-
-            // Compare using row/col counts stored on the delegate to avoid floating-point drift.
-            // The delegate tracks the last-set rows/cols, so this is an exact integer comparison.
-            let delegate = window.delegate as? ExternalWindowDelegate
-            let lastRows = delegate?.lastGridRows ?? 0
-            let lastCols = delegate?.lastGridCols ?? 0
-            if rows != lastRows || cols != lastCols {
-                // Track the rows/cols we're about to set BEFORE setFrame, because
-                // setFrame may trigger windowDidResize synchronously or via RunLoop.
-                // The lastGridRows/lastGridCols check in windowDidResize prevents
-                // the callback from calling tryResizeGrid with stale window dimensions.
-                delegate?.lastGridRows = rows
-                delegate?.lastGridCols = cols
-                delegate?.suppressResizeCallback = true
-
-                // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
-                let oldFrame = window.frame
-                let oldTop = oldFrame.origin.y + oldFrame.height
-
-                // Use setContentSize approach: compute new frame from desired content rect
-                let contentRect = NSRect(x: oldFrame.origin.x, y: 0,
-                                         width: contentWidth, height: contentHeight)
-                let frameRect = window.frameRect(forContentRect: contentRect)
-                let newFrame = NSRect(x: oldFrame.origin.x, y: oldTop - frameRect.height,
-                                      width: frameRect.width, height: frameRect.height)
-                window.setFrame(newFrame, display: true)
-
-                // Update gridView frame to fill the new content area
-                gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-
-                delegate?.suppressResizeCallback = false
-
-                ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
-            }
-
-            // Set clear color so viewport-edge pixels match the grid background.
-            // For blur: use backgroundAlpha so edges match the semi-transparent content.
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
-            let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
-            gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
-        }
-    }
-
-    /// Resize cmdline window based on content dimensions.
-    private func resizeCmdlineWindow(window: NSWindow, containerView: NSView, gridView: ExternalGridView,
-                                     rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat, scale: CGFloat, bgColor: NSColor) {
-        // Update border color from Search highlight
-        let borderColor = self.getSearchHighlightColor()
-        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
-        containerView.layer?.cornerCurve = .continuous
-
-        let cmdlinePadding = ZonvieConfig.cmdlinePadding
-        let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
-
-        var contentWidth = CGFloat(cols) * cellW / scale
+        // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
+        // Resize the OS window to match the grid size.
+        let contentWidth = CGFloat(cols) * cellW / scale
         let contentHeight = CGFloat(rows) * cellH / scale
 
-        // TODO: Use window.screen instead of NSScreen.main for multi-display correctness.
-        if let screen = NSScreen.main {
-            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
-            contentWidth = min(contentWidth, maxContentWidth)
-        }
+        // Compare using row/col counts stored on the delegate to avoid floating-point drift.
+        // The delegate tracks the last-set rows/cols, so this is an exact integer comparison.
+        let delegate = window.delegate as? ExternalWindowDelegate
+        let lastRows = delegate?.lastGridRows ?? 0
+        let lastCols = delegate?.lastGridCols ?? 0
+        if rows != lastRows || cols != lastCols {
+            // Track the rows/cols we're about to set BEFORE setFrame, because
+            // setFrame may trigger windowDidResize synchronously or via RunLoop.
+            // The lastGridRows/lastGridCols check in windowDidResize prevents
+            // the callback from calling tryResizeGrid with stale window dimensions.
+            delegate?.lastGridRows = rows
+            delegate?.lastGridCols = cols
+            delegate?.suppressResizeCallback = true
 
-        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth
-        let containerHeight = contentHeight + (cmdlinePadding * 2)
+            // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
+            let oldFrame = window.frame
+            let oldTop = oldFrame.origin.y + oldFrame.height
 
-        let gridViewX = cmdlinePadding + cmdlineIconTotalWidth
-        gridView.frame = NSRect(x: gridViewX, y: cmdlinePadding, width: contentWidth, height: contentHeight)
-
-        if let iconView = self.cmdlineIconView {
-            iconView.frame = NSRect(
-                x: ZonvieConfig.cmdlineIconMarginLeft,
-                y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
-                width: ZonvieConfig.cmdlineIconSize,
-                height: ZonvieConfig.cmdlineIconSize
+            // Use setContentSize approach: compute new frame from desired content rect
+            let contentRect = NSRect(x: oldFrame.origin.x, y: 0, width: contentWidth, height: contentHeight)
+            let frameRect = window.frameRect(forContentRect: contentRect)
+            let newFrame = NSRect(
+                x: oldFrame.origin.x,
+                y: oldTop - frameRect.height,
+                width: frameRect.width,
+                height: frameRect.height
             )
+            window.setFrame(newFrame, display: true)
+
+            // Update gridView frame to fill the new content area
+            gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
+
+            delegate?.suppressResizeCallback = false
+
+            ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
         }
 
-        containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
-        self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
-
-        let oldFrame = window.frame
-        var newX = oldFrame.midX - containerWidth / 2
-        var newY = oldFrame.midY - containerHeight / 2
-
-        if let screen = NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            if containerWidth >= screenFrame.width * 0.9 {
-                newX = screenFrame.minX + (screenFrame.width - containerWidth) / 2
-            } else {
-                newX = max(screenFrame.minX, min(newX, screenFrame.maxX - containerWidth))
-            }
-            newY = max(screenFrame.minY, min(newY, screenFrame.maxY - containerHeight))
-        }
-
-        window.setFrame(NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight), display: true)
-    }
-
-    /// Resize popupmenu window based on content dimensions.
-    private func resizePopupmenuWindow(window: NSWindow, containerView: NSView, gridView: ExternalGridView,
-                                       rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat, scale: CGFloat) {
-        let popupmenuPadding: CGFloat = 8.0
-        let borderColor = self.getSearchHighlightColor()
-        let contentWidth = CGFloat(cols) * cellW / scale
-        let contentHeight = CGFloat(rows) * cellH / scale
-        let containerWidth = contentWidth + (popupmenuPadding * 2)
-        let containerHeight = contentHeight + (popupmenuPadding * 2)
-
-        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
-        containerView.layer?.cornerCurve = .continuous
-        gridView.frame = NSRect(x: popupmenuPadding, y: popupmenuPadding, width: contentWidth, height: contentHeight)
-        containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
-        self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
-
-        let oldFrame = window.frame
-        window.setFrame(NSRect(x: oldFrame.origin.x, y: oldFrame.origin.y, width: containerWidth, height: containerHeight), display: true)
-    }
-
-    /// Resize message window based on content dimensions.
-    private func resizeMessageWindow(window: NSWindow, containerView: NSView, gridView: ExternalGridView, gridId: Int64,
-                                     rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat, scale: CGFloat) {
-        let msgPadding: CGFloat = 8.0
-        let contentWidth = CGFloat(cols) * cellW / scale
-        let contentHeight = CGFloat(rows) * cellH / scale
-        let containerWidth = contentWidth + (msgPadding * 2)
-        let containerHeight = contentHeight + (msgPadding * 2)
-
-        gridView.frame = NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight)
-        containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
-
-        guard let mainWindow = self.terminalView?.window else { return }
-        let targetFrame = mainWindow.frame
-        let newX = targetFrame.maxX - containerWidth - 10
-        var newY = targetFrame.maxY - containerHeight - 40
-
-        if let screen = NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            newY = max(screenFrame.minY, min(newY, screenFrame.maxY - containerHeight))
-        }
-
-        window.setFrame(NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight), display: true)
-
-        if gridId == ZonvieCore.msgHistoryGridId {
-            if let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
-                let msgShowFrame = msgShowWindow.frame
-                let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-                let msgShowY = newY - msgShowFrame.height - 4
-                msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: true)
-            }
-        }
+        // Set clear color so viewport-edge pixels match the grid background.
+        // For blur: use backgroundAlpha so edges match the semi-transparent content.
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
+        gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
     }
 
     /// Called when an external grid is closed.
@@ -3334,7 +2856,9 @@ final class ZonvieCore {
             guard let self = self else { return }
 
             self.externalWindowDelegates.removeValue(forKey: gridId)
+            self.externalGridViewsLock.lock()
             self.externalGridViews.removeValue(forKey: gridId)
+            self.externalGridViewsLock.unlock()
             self.externalWindowWinIds.removeValue(forKey: gridId)
             if let window = self.externalWindows.removeValue(forKey: gridId) {
                 // Save window position for restoration on tab switch back
@@ -3649,87 +3173,9 @@ final class ZonvieCore {
         }
         ZonvieCore.appLog("[external_vertices] sample: bg=\(bgCount) glyph=\(glyphCount) (of \(min(vertCount, 100)) sampled)")
 
-        // Extract background color from first background vertex (for special windows)
-        let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
-                             gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-        var bgColor: NSColor? = nil
-        if isSpecialGrid {
-            // Find first background vertex (texCoord.x < 0)
-            for i in 0..<vertCount {
-                let v = verts[i]
-                if v.texCoord.0 < 0 {
-                    // Extract color from vertex (RGBA float)
-                    let r = CGFloat(v.color.0)
-                    let g = CGFloat(v.color.1)
-                    let b = CGFloat(v.color.2)
-                    let a = CGFloat(v.color.3)
-                    bgColor = NSColor(red: r, green: g, blue: b, alpha: a)
-                    let gridType: String
-                    switch gridId {
-                    case ZonvieCore.cmdlineGridId: gridType = "cmdline"
-                    case ZonvieCore.popupmenuGridId: gridType = "popupmenu"
-                    case ZonvieCore.messageGridId: gridType = "msg_show"
-                    case ZonvieCore.msgHistoryGridId: gridType = "msg_history"
-                    default: gridType = "unknown"
-                    }
-                    ZonvieCore.appLog("[external_vertices] \(gridType) bg color: r=\(r) g=\(g) b=\(b) a=\(a)")
-                    break
-                }
-            }
-        }
-
-        // Copy vertex data synchronously before dispatching to main thread.
-        // The verts pointer is only valid during this callback - Zig may reuse the buffer after we return.
-        let byteCount = vertCount * MemoryLayout<zonvie_vertex>.stride
-        var vertexDataCopy = Data(bytes: verts, count: byteCount)
-
-        // For special grids (cmdline, popupmenu, msg_show, msg_history), modify background vertex colors to adjusted color
-        if isSpecialGrid, let bgColor = bgColor {
-            let adjustedBg = bgColor.adjustedForCmdlineBackground()
-            var adjR: CGFloat = 0, adjG: CGFloat = 0, adjB: CGFloat = 0, adjA: CGFloat = 0
-            adjustedBg.usingColorSpace(.sRGB)?.getRed(&adjR, green: &adjG, blue: &adjB, alpha: &adjA)
-
-            // For special grids: gridView background is transparent (containerView provides the color)
-            // This ensures margin and cell areas have the same color
-            if ZonvieConfig.shared.blurEnabled {
-                adjA = 0.0
-            } else {
-                adjA = 1.0
-            }
-
-            ZonvieCore.appLog("[external_vertices] special grid color adjustment: blurEnabled=\(ZonvieConfig.shared.blurEnabled) adjR=\(adjR) adjG=\(adjG) adjB=\(adjB) adjA=\(adjA)")
-
-            // Get original background color for comparison
-            var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
-            bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
-
-            // Modify only vertices that match the original background color (not cursor)
-            // Use tight tolerance to avoid accidentally making cursor transparent
-            // Also skip vertices marked with DECO_CURSOR flag
-            vertexDataCopy.withUnsafeMutableBytes { rawBuffer in
-                let vertexPtr = rawBuffer.baseAddress!.bindMemory(to: zonvie_vertex.self, capacity: vertCount)
-                for i in 0..<vertCount {
-                    // Skip cursor vertices (marked with DECO_CURSOR flag)
-                    if (vertexPtr[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 {
-                        continue
-                    }
-                    if vertexPtr[i].texCoord.0 < 0 {
-                        // Check if this vertex color matches original bg (with tolerance)
-                        let vr = CGFloat(vertexPtr[i].color.0)
-                        let vg = CGFloat(vertexPtr[i].color.1)
-                        let vb = CGFloat(vertexPtr[i].color.2)
-                        let tolerance: CGFloat = 0.005
-                        if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
-                            // This is a background vertex - update its color
-                            vertexPtr[i].color.0 = Float(adjR)
-                            vertexPtr[i].color.1 = Float(adjG)
-                            vertexPtr[i].color.2 = Float(adjB)
-                            vertexPtr[i].color.3 = Float(adjA)
-                        }
-                    }
-                }
-            }
-        }
+        let prepared = prepareExternalVertexSubmission(gridId: gridId, verts: verts, vertCount: vertCount)
+        let bgColor = prepared.bgColor
+        let vertexDataCopy = prepared.vertexData
 
         // Submit vertices to the external grid view on main thread
         DispatchQueue.main.async { [weak self] in
@@ -3738,207 +3184,8 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[external_vertices] no grid view for gridId=\(gridId)")
                 return
             }
-
-            // Update special window (cmdline, popupmenu, msg_show, msg_history) background color
-            let isSpecialGridForBg = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
-                                      gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-            if isSpecialGridForBg,
-               let window = self.externalWindows[gridId],
-               let containerView = window.contentView {
-
-                // Update background color on the containerView (HSV adjusted for visibility)
-                if let bgColor = bgColor {
-                    let adjustedBg = bgColor.adjustedForCmdlineBackground()
-
-                    if ZonvieConfig.shared.blurEnabled {
-                        // For blur mode: gridView is fully transparent
-                        // containerView provides the semi-transparent background color
-                        // This ensures margin and cell areas have the same color
-                        gridView.gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-
-                        // Update containerView background color with adjusted color
-                        let opacity = ZonvieConfig.shared.backgroundAlpha
-                        containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(CGFloat(opacity)).cgColor
-                    } else {
-                        // Force opaque background when blur is disabled
-                        containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(1.0).cgColor
-                        let gridType: String
-                        switch gridId {
-                        case ZonvieCore.cmdlineGridId: gridType = "cmdline"
-                        case ZonvieCore.popupmenuGridId: gridType = "popupmenu"
-                        case ZonvieCore.messageGridId: gridType = "msg_show"
-                        case ZonvieCore.msgHistoryGridId: gridType = "msg_history"
-                        default: gridType = "unknown"
-                        }
-                        ZonvieCore.appLog("[external_vertices] \(gridType) containerView.backgroundColor set to opaque adjustedBg")
-
-                        // Update the Metal gridView's clear color
-                        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                        adjustedBg.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
-                        gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: 1.0)
-                    }
-                }
-            }
-
-            // Update cmdline window: resize and border
-            if gridId == ZonvieCore.cmdlineGridId,
-               let window = self.externalWindows[gridId],
-               let mainView = self.terminalView,
-               let containerView = window.contentView {
-
-                // Update border color from Search highlight
-                let borderColor = self.getSearchHighlightColor()
-                self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
-
-                // Resize window based on new content dimensions
-                let renderer = mainView.renderer!
-                let cellW = CGFloat(renderer.cellWidthPx)
-                let cellH = CGFloat(renderer.cellHeightPx)
-                let scale = mainView.window?.backingScaleFactor ?? 1.0
-
-                let cmdlinePadding = ZonvieConfig.cmdlinePadding
-                let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
-
-                var contentWidth = CGFloat(cols) * cellW / scale
-                let contentHeight = CGFloat(rows) * cellH / scale
-
-                // Constrain width to screen width
-                if let screen = NSScreen.main {
-                    let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
-                    contentWidth = min(contentWidth, maxContentWidth)
-                }
-
-                let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth
-                let containerHeight = contentHeight + (cmdlinePadding * 2)
-
-                // Update gridView frame inside containerView (offset by icon width)
-                let gridViewX = cmdlinePadding + cmdlineIconTotalWidth
-                if let gridView = self.externalGridViews[gridId] {
-                    gridView.frame = NSRect(x: gridViewX, y: cmdlinePadding, width: contentWidth, height: contentHeight)
-                }
-
-                // Update icon view position (vertically centered)
-                if let iconView = self.cmdlineIconView {
-                    iconView.frame = NSRect(
-                        x: ZonvieConfig.cmdlineIconMarginLeft,
-                        y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
-                        width: ZonvieConfig.cmdlineIconSize,
-                        height: ZonvieConfig.cmdlineIconSize
-                    )
-                }
-
-                // Update containerView frame (fills window)
-                containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
-
-                // Update window size while keeping center position, but ensure it stays on screen
-                let oldFrame = window.frame
-                let oldCenterX = oldFrame.midX
-                let oldCenterY = oldFrame.midY
-                var newX = oldCenterX - containerWidth / 2
-                var newY = oldCenterY - containerHeight / 2
-
-                // Clamp to screen bounds, center horizontally if near full width
-                if let screen = NSScreen.main {
-                    let screenFrame = screen.visibleFrame
-                    // If window is close to screen width, center it horizontally
-                    if containerWidth >= screenFrame.width * 0.9 {
-                        newX = screenFrame.minX + (screenFrame.width - containerWidth) / 2
-                    } else {
-                        newX = max(screenFrame.minX, min(newX, screenFrame.maxX - containerWidth))
-                    }
-                    newY = max(screenFrame.minY, min(newY, screenFrame.maxY - containerHeight))
-                }
-
-                window.setFrame(NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight), display: true)
-            }
-
-            // Update popupmenu window: resize based on new content dimensions
-            if gridId == ZonvieCore.popupmenuGridId,
-               let window = self.externalWindows[gridId],
-               let mainView = self.terminalView,
-               let containerView = window.contentView,
-               let gridView = self.externalGridViews[gridId] {
-
-                let renderer = mainView.renderer!
-                let cellW = CGFloat(renderer.cellWidthPx)
-                let cellH = CGFloat(renderer.cellHeightPx)
-                let scale = mainView.window?.backingScaleFactor ?? 1.0
-
-                let oldFrame = window.frame
-                let oldTop = oldFrame.origin.y + oldFrame.height
-
-                self.resizePopupmenuWindow(
-                    window: window,
-                    containerView: containerView,
-                    gridView: gridView,
-                    rows: rows,
-                    cols: cols,
-                    cellW: cellW,
-                    cellH: cellH,
-                    scale: scale
-                )
-
-                let newFrame = window.frame
-                let newY = oldTop - newFrame.height
-                window.setFrameOrigin(NSPoint(x: oldFrame.origin.x, y: newY))
-                ZonvieCore.appLog("[external_vertices] popupmenu resized: width=\(newFrame.width) height=\(newFrame.height)")
-            }
-
-            // Update msg_show/msg_history window: resize based on new content dimensions
-            let isMsgWindow = (gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-            if isMsgWindow,
-               let window = self.externalWindows[gridId],
-               let mainView = self.terminalView,
-               let containerView = window.contentView {
-
-                let renderer = mainView.renderer!
-                let cellW = CGFloat(renderer.cellWidthPx)
-                let cellH = CGFloat(renderer.cellHeightPx)
-                let scale = mainView.window?.backingScaleFactor ?? 1.0
-
-                let msgPadding: CGFloat = 8.0
-
-                let contentWidth = CGFloat(cols) * cellW / scale
-                let contentHeight = CGFloat(rows) * cellH / scale
-
-                let containerWidth = contentWidth + (msgPadding * 2)
-                let containerHeight = contentHeight + (msgPadding * 2)
-
-                // Update gridView frame inside containerView (centered with padding)
-                if let gridView = self.externalGridViews[gridId] {
-                    gridView.frame = NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight)
-                }
-
-                // Update containerView frame (fills window)
-                containerView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
-
-                // Update window size and position
-                let targetFrame = self.getExtFloatTargetFrame()
-                let newX = targetFrame.maxX - containerWidth - 10
-                var newY = targetFrame.maxY - containerHeight - 10
-
-                // If this is msg_show and msg_history exists, position below it
-                if gridId == ZonvieCore.messageGridId {
-                    if let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId] {
-                        let historyFrame = msgHistoryWindow.frame
-                        newY = historyFrame.origin.y - containerHeight - 4  // 4px gap below history
-                    }
-                }
-
-                window.setFrame(NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight), display: true)
-                let gridType = gridId == ZonvieCore.messageGridId ? "msg_show" : "msg_history"
-                ZonvieCore.appLog("[external_vertices] \(gridType) resized: width=\(containerWidth) height=\(containerHeight) y=\(newY)")
-
-                // If this is msg_history and msg_show exists, reposition msg_show below it
-                if gridId == ZonvieCore.msgHistoryGridId {
-                    if let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
-                        let msgShowFrame = msgShowWindow.frame
-                        let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-                        let msgShowY = newY - msgShowFrame.height - 4  // 4px gap below history
-                        msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: true)
-                        ZonvieCore.appLog("[external_vertices] repositioned msg_show below msg_history: y=\(msgShowY)")
-                    }
-                }
+            if self.classifyExternalGridKind(gridId) != .normal {
+                self.updateDecoratedExternalGrid(gridId: gridId, gridView: gridView, bgColor: bgColor, rows: rows, cols: cols)
             }
 
             vertexDataCopy.withUnsafeBytes { rawBuffer in
@@ -3952,6 +3199,1016 @@ final class ZonvieCore {
             }
             gridView.requestRedraw()
         }
+    }
+
+    private func prepareExternalVertexSubmission(
+        gridId: Int64,
+        verts: UnsafePointer<zonvie_vertex>,
+        vertCount: Int
+    ) -> (vertexData: Data, bgColor: NSColor?) {
+        let vertexArray = Array(UnsafeBufferPointer(start: verts, count: vertCount))
+        let prepared = prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
+        let byteCount = prepared.vertices.count * MemoryLayout<zonvie_vertex>.stride
+        let vertexDataCopy = prepared.vertices.withUnsafeBufferPointer {
+            Data(buffer: $0)
+        }
+        assert(vertexDataCopy.count == byteCount)
+        return (vertexDataCopy, prepared.bgColor)
+    }
+
+    private func prepareExternalVertexArray(
+        gridId: Int64,
+        vertices: [zonvie_vertex]
+    ) -> (vertices: [zonvie_vertex], bgColor: NSColor?) {
+        let kind = classifyExternalGridKind(gridId)
+        guard kind != .normal else { return (vertices, nil) }
+
+        var bgColor: NSColor? = nil
+        for v in vertices {
+            if v.texCoord.0 < 0 {
+                bgColor = NSColor(
+                    red: CGFloat(v.color.0),
+                    green: CGFloat(v.color.1),
+                    blue: CGFloat(v.color.2),
+                    alpha: CGFloat(v.color.3)
+                )
+                break
+            }
+        }
+
+        guard let bgColor else { return (vertices, nil) }
+
+        var adjustedVertices = vertices
+        let adjustedBg = bgColor.adjustedForCmdlineBackground()
+        var adjR: CGFloat = 0, adjG: CGFloat = 0, adjB: CGFloat = 0, adjA: CGFloat = 0
+        adjustedBg.usingColorSpace(.sRGB)?.getRed(&adjR, green: &adjG, blue: &adjB, alpha: &adjA)
+        adjA = ZonvieConfig.shared.blurEnabled ? 0.0 : 1.0
+
+        var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
+        bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
+
+        for i in adjustedVertices.indices {
+            if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
+            if adjustedVertices[i].texCoord.0 < 0 {
+                let vr = CGFloat(adjustedVertices[i].color.0)
+                let vg = CGFloat(adjustedVertices[i].color.1)
+                let vb = CGFloat(adjustedVertices[i].color.2)
+                let tolerance: CGFloat = 0.005
+                if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
+                    adjustedVertices[i].color.0 = Float(adjR)
+                    adjustedVertices[i].color.1 = Float(adjG)
+                    adjustedVertices[i].color.2 = Float(adjB)
+                    adjustedVertices[i].color.3 = Float(adjA)
+                }
+            }
+        }
+
+        return (adjustedVertices, bgColor)
+    }
+
+    private enum ExternalGridKind {
+        case normal
+        case cmdline
+        case popupmenu
+        case msgShow
+        case msgHistory
+    }
+
+    private func isDecoratedExternalGridKind(_ kind: ExternalGridKind) -> Bool {
+        kind != .normal
+    }
+
+    private func externalGridKindLogLabel(_ kind: ExternalGridKind) -> String {
+        switch kind {
+        case .cmdline:
+            return "cmdline"
+        case .popupmenu:
+            return "popupmenu"
+        case .msgShow:
+            return "msg_show"
+        case .msgHistory:
+            return "msg_history"
+        case .normal:
+            return "regular"
+        }
+    }
+
+    private struct DecoratedGridContext {
+        let window: NSWindow
+        let containerView: NSView
+        let renderer: MetalTerminalRenderer
+        let scale: CGFloat
+    }
+
+    private struct DecoratedExternalLayout {
+        let containerFrame: NSRect
+        let gridFrame: NSRect
+        let windowFrame: NSRect
+        let iconFrame: NSRect?
+        let linkedMsgShowFrame: NSRect?
+    }
+
+    private struct ExternalWindowGeometry {
+        let contentWidth: CGFloat
+        let contentHeight: CGFloat
+        let containerWidth: CGFloat
+        let containerHeight: CGFloat
+        let windowWidth: CGFloat
+        let windowHeight: CGFloat
+    }
+
+    private func makeExternalHostWindow(
+        kind: ExternalGridKind,
+        contentRect: NSRect,
+        styleMask: NSWindow.StyleMask
+    ) -> NSWindow {
+        switch kind {
+        case .cmdline:
+            let cmdlineWindow = CmdlineWindow(
+                contentRect: contentRect,
+                styleMask: styleMask,
+                backing: .buffered,
+                defer: false
+            )
+            cmdlineWindow.delegate = cmdlineWindow
+            cmdlineWindow.suppressPositionSave = (self.promptWindow?.isVisible == true)
+            return cmdlineWindow
+
+        case .normal, .popupmenu, .msgShow, .msgHistory:
+            return NSWindow(
+                contentRect: contentRect,
+                styleMask: styleMask,
+                backing: .buffered,
+                defer: false
+            )
+        }
+    }
+
+    private func applyExternalWindowSettings(
+        _ window: NSWindow,
+        kind: ExternalGridKind,
+        win: Int64
+    ) {
+        switch kind {
+        case .cmdline:
+            window.hasShadow = true
+            window.level = .floating
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.isMovableByWindowBackground = true
+            window.hidesOnDeactivate = true
+
+        case .popupmenu, .msgShow, .msgHistory:
+            window.hasShadow = true
+            window.level = .floating
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hidesOnDeactivate = true
+
+        case .normal:
+            window.title = "Window \(win)"
+        }
+
+        window.isReleasedWhenClosed = false
+    }
+
+    private func buildExternalWindowGeometry(
+        kind: ExternalGridKind,
+        rows: UInt32,
+        cols: UInt32,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat
+    ) -> ExternalWindowGeometry {
+        var contentWidth = CGFloat(cols) * cellW / scale
+        let contentHeight = CGFloat(rows) * cellH / scale
+
+        let cmdlinePadding: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlinePadding : 0.0
+        let popupmenuPadding: CGFloat = kind == .popupmenu ? 8.0 : 0.0
+        let msgPadding: CGFloat = (kind == .msgShow || kind == .msgHistory) ? 8.0 : 0.0
+        let shadowMargin: CGFloat = kind == .cmdline ? 150.0 : 0.0
+        let cmdlineIconTotalWidth: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
+
+        if kind == .cmdline, let screen = NSScreen.main {
+            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
+            contentWidth = min(contentWidth, maxContentWidth)
+        }
+
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2)
+        let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
+        let windowWidth = containerWidth + (shadowMargin * 2)
+        let windowHeight = containerHeight + (shadowMargin * 2)
+
+        return ExternalWindowGeometry(
+            contentWidth: contentWidth,
+            contentHeight: contentHeight,
+            containerWidth: containerWidth,
+            containerHeight: containerHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        )
+    }
+
+    private func styleMaskForExternalWindow(kind: ExternalGridKind) -> NSWindow.StyleMask {
+        switch kind {
+        case .normal:
+            return [.titled, .closable, .resizable]
+        case .cmdline, .popupmenu, .msgShow, .msgHistory:
+            return [.borderless]
+        }
+    }
+
+    private func attachExternalGridView(
+        window: NSWindow,
+        gridView: ExternalGridView,
+        kind: ExternalGridKind,
+        geometry: ExternalWindowGeometry
+    ) {
+        if kind != .normal {
+            self.installDecoratedExternalWindowShell(
+                kind: kind,
+                window: window,
+                gridView: gridView,
+                containerWidth: geometry.containerWidth,
+                containerHeight: geometry.containerHeight
+            )
+            return
+        }
+
+        gridView.frame = NSRect(x: 0, y: 0, width: geometry.windowWidth, height: geometry.windowHeight)
+        window.contentView = gridView
+        if ZonvieConfig.shared.blurEnabled {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        }
+    }
+
+    private func installExternalWindowDelegateIfNeeded(
+        gridId: Int64,
+        kind: ExternalGridKind,
+        window: NSWindow,
+        cellW: CGFloat,
+        cellH: CGFloat
+    ) {
+        guard kind == .normal else { return }
+
+        let delegate = ExternalWindowDelegate(
+            core: self,
+            gridId: gridId,
+            cellWidthPx: cellW,
+            cellHeightPx: cellH
+        )
+        window.delegate = delegate
+        self.externalWindowDelegates[gridId] = delegate
+    }
+
+    private func prepareExternalWindowForDisplay(window: NSWindow, kind: ExternalGridKind) {
+        window.orderFront(nil)
+        if ZonvieConfig.shared.blurEnabled && kind == .normal {
+            Self.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
+        }
+    }
+
+    private func registerExternalWindow(
+        gridId: Int64,
+        kind: ExternalGridKind,
+        window: NSWindow,
+        gridView: ExternalGridView,
+        rows: UInt32,
+        cols: UInt32
+    ) {
+        self.externalWindows[gridId] = window
+        self.externalGridViewsLock.lock()
+        self.externalGridViews[gridId] = gridView
+        self.externalGridViewsLock.unlock()
+        if kind != .normal {
+            self.updateDecoratedExternalGrid(gridId: gridId, gridView: gridView, bgColor: nil, rows: rows, cols: cols)
+        }
+    }
+
+    private func activateExternalWindow(
+        gridId: Int64,
+        kind: ExternalGridKind,
+        window: NSWindow,
+        gridView: ExternalGridView
+    ) {
+        self.lastCursorGrid = gridId
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(gridView)
+        let windowType = self.externalGridKindLogLabel(kind)
+        ZonvieCore.appLog("[external_window] created \(windowType) window for gridId=\(gridId)")
+    }
+
+    private func extractBackgroundColor(from vertices: [zonvie_vertex]) -> NSColor? {
+        for v in vertices {
+            if v.texCoord.0 < 0 {
+                return NSColor(
+                    red: CGFloat(v.color.0),
+                    green: CGFloat(v.color.1),
+                    blue: CGFloat(v.color.2),
+                    alpha: CGFloat(v.color.3)
+                )
+            }
+        }
+        return nil
+    }
+
+    private func extractPendingExternalBackgroundColor(
+        from rowVertices: [Int: [zonvie_vertex]]
+    ) -> NSColor? {
+        if let firstRowVertices = rowVertices[0], let bgColor = extractBackgroundColor(from: firstRowVertices) {
+            return bgColor
+        }
+
+        for vertices in rowVertices.values {
+            if let bgColor = extractBackgroundColor(from: vertices) {
+                return bgColor
+            }
+        }
+
+        return nil
+    }
+
+    private func applyPendingExternalState(
+        gridId: Int64,
+        window: NSWindow,
+        gridView: ExternalGridView
+    ) {
+        var requestedRedraw = false
+        let pendingConfig = self.pendingExternalGridConfig.removeValue(forKey: gridId)
+
+        if let pendingVerts = self.pendingExternalVertices.removeValue(forKey: gridId) {
+            let totalVertCount = pendingVerts.rowVertices.values.reduce(0) { $0 + $1.count }
+            ZonvieCore.appLog("[external_window] applying pending vertices for gridId=\(gridId) rows=\(pendingVerts.rowVertices.count) totalVerts=\(totalVertCount)")
+
+            for (rowStart, vertices) in pendingVerts.rowVertices.sorted(by: { $0.key < $1.key }) {
+                vertices.withUnsafeBufferPointer { buffer in
+                    gridView.submitVerticesRowRaw(
+                        rowStart: rowStart,
+                        rowCount: 1,
+                        ptr: buffer.baseAddress,
+                        count: buffer.count,
+                        flags: 1, // ZONVIE_VERT_UPDATE_MAIN
+                        totalRows: Int(pendingVerts.rows),
+                        totalCols: Int(pendingVerts.cols)
+                    )
+                }
+            }
+
+            if let pendingConfig {
+                ZonvieCore.appLog("[external_window] applying pending config for gridId=\(gridId) bgColor=\(pendingConfig.bgColor)")
+                self.applyExternalGridConfig(
+                    gridId: gridId,
+                    window: window,
+                    gridView: gridView,
+                    bgColor: pendingConfig.bgColor,
+                    rows: pendingConfig.rows,
+                    cols: pendingConfig.cols
+                )
+            } else if let bgColor = extractPendingExternalBackgroundColor(from: pendingVerts.rowVertices) {
+                ZonvieCore.appLog("[external_window] applying bg color from pending vertices for gridId=\(gridId)")
+                self.applyExternalGridConfig(
+                    gridId: gridId,
+                    window: window,
+                    gridView: gridView,
+                    bgColor: bgColor,
+                    rows: pendingVerts.rows,
+                    cols: pendingVerts.cols
+                )
+            }
+
+            requestedRedraw = true
+        } else if let pendingConfig {
+            ZonvieCore.appLog("[external_window] applying pending config for gridId=\(gridId) bgColor=\(pendingConfig.bgColor)")
+            self.applyExternalGridConfig(
+                gridId: gridId,
+                window: window,
+                gridView: gridView,
+                bgColor: pendingConfig.bgColor,
+                rows: pendingConfig.rows,
+                cols: pendingConfig.cols
+            )
+        }
+
+        if requestedRedraw {
+            gridView.requestRedraw()
+        }
+    }
+
+    private func repositionMessageShowBelowHistoryWindowIfNeeded(gridId: Int64, historyWindow: NSWindow) {
+        guard gridId == ZonvieCore.msgHistoryGridId,
+              let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
+              msgShowWindow.isVisible else { return }
+
+        let targetFrame = getExtFloatTargetFrame()
+        let historyFrame = historyWindow.frame
+        let msgShowFrame = msgShowWindow.frame
+        let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
+        let msgShowY = historyFrame.origin.y - msgShowFrame.height - 4
+        msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: false)
+        ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(msgShowX),\(msgShowY))")
+    }
+
+    private func buildInitialDecoratedWindowRect(
+        kind: ExternalGridKind,
+        win: Int64,
+        startRow: Int32,
+        startCol: Int32,
+        mainView: MetalTerminalView,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat,
+        containerWidth: CGFloat,
+        containerHeight: CGFloat,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat
+    ) -> NSRect {
+        switch kind {
+        case .cmdline:
+            let promptWinVisible = self.promptWindow?.isVisible == true
+            if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
+                let promptFrame = promptWin.frame
+                let screenFrame = screen.visibleFrame
+                let appFrame = mainWindow.frame
+                let x = appFrame.midX - containerWidth / 2
+                var y = promptFrame.origin.y - 4 - containerHeight
+                y = max(screenFrame.minY, y)
+                ZonvieCore.appLog("[external_window] cmdline positioned below prompt at (\(x), \(y))")
+                return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+            }
+
+            if let savedOrigin = CmdlineWindow.savedOrigin, let screen = NSScreen.main {
+                let screenFrame = screen.visibleFrame
+                let x = max(screenFrame.minX, min(savedOrigin.x, screenFrame.maxX - containerWidth))
+                let y = max(screenFrame.minY, min(savedOrigin.y, screenFrame.maxY - containerHeight))
+                ZonvieCore.appLog("[external_window] cmdline using saved position: (\(x), \(y))")
+                return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+            }
+
+            if let screen = NSScreen.main {
+                let screenFrame = screen.visibleFrame
+                let x = screenFrame.midX - containerWidth / 2
+                let y = screenFrame.midY - containerHeight / 2
+                return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+            }
+
+            return NSRect(x: 100, y: 100, width: containerWidth, height: containerHeight)
+
+        case .popupmenu:
+            let anchorRow = popupmenuAnchorRow ?? startRow
+            let anchorCol = popupmenuAnchorCol ?? startCol
+            let anchorGrid = popupmenuAnchorGrid
+            let isCmdlineCompletion = (anchorRow == -1)
+            if isCmdlineCompletion {
+                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
+                    let cmdlineFrame = cmdlineWindow.frame
+                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
+                    let popupmenuPadding: CGFloat = 8.0
+                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(anchorCol) * cellW / scale - popupmenuPadding
+                    let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
+                    ZonvieCore.appLog("[external_window] popupmenu positioned above cmdline at (\(x),\(y))")
+                    return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                }
+
+                if let screen = NSScreen.main {
+                    let screenFrame = screen.visibleFrame
+                    let x = screenFrame.midX - windowWidth / 2
+                    let y = screenFrame.midY
+                    return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                }
+
+                return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
+            }
+
+            if (anchorGrid ?? win) > 0,
+               let anchorWindow = self.externalWindows[anchorGrid ?? win],
+               let anchorContentView = anchorWindow.contentView {
+                anchorContentView.layoutSubtreeIfNeeded()
+                let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
+                let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+                let frame = popupmenuWindowRect(
+                    anchorRow: anchorRow,
+                    anchorCol: anchorCol,
+                    windowWidth: windowWidth,
+                    windowHeight: windowHeight,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale,
+                    referenceFrame: anchorContentFrame,
+                    screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                )
+                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) relative to ext_win=\(anchorGrid ?? win)")
+                return frame
+            }
+
+            if let tvFrame = self.terminalViewScreenFrame() {
+                let frame = popupmenuWindowRect(
+                    anchorRow: anchorRow,
+                    anchorCol: anchorCol,
+                    windowWidth: windowWidth,
+                    windowHeight: windowHeight,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale,
+                    referenceFrame: tvFrame,
+                    screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                )
+                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) from cursor pos (\(anchorRow),\(anchorCol))")
+                return frame
+            }
+
+            return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
+
+        case .msgHistory:
+            let targetFrame = getExtFloatTargetFrame()
+            let x = targetFrame.maxX - windowWidth - 10
+            let y = targetFrame.maxY - windowHeight - 10
+            ZonvieCore.appLog("[external_window] msg_history positioned at (\(x),\(y))")
+            return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+
+        case .msgShow:
+            let targetFrame = getExtFloatTargetFrame()
+            let x = targetFrame.maxX - windowWidth - 10
+            var y = targetFrame.maxY - windowHeight - 10
+            if let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId], msgHistoryWindow.isVisible {
+                let historyFrame = msgHistoryWindow.frame
+                y = historyFrame.origin.y - windowHeight - 4
+                ZonvieCore.appLog("[external_window] msg_show positioned below msg_history at (\(x),\(y))")
+            } else {
+                ZonvieCore.appLog("[external_window] msg_show positioned at (\(x),\(y))")
+            }
+            return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+
+        case .normal:
+            return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
+        }
+    }
+
+    private func buildInitialExternalWindowRect(
+        kind: ExternalGridKind,
+        gridId: Int64,
+        win: Int64,
+        startRow: Int32,
+        startCol: Int32,
+        mainView: MetalTerminalView,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat,
+        geometry: ExternalWindowGeometry
+    ) -> NSRect {
+        if isDecoratedExternalGridKind(kind) {
+            return buildInitialDecoratedWindowRect(
+                kind: kind,
+                win: win,
+                startRow: startRow,
+                startCol: startCol,
+                mainView: mainView,
+                cellW: cellW,
+                cellH: cellH,
+                scale: scale,
+                containerWidth: geometry.containerWidth,
+                containerHeight: geometry.containerHeight,
+                windowWidth: geometry.windowWidth,
+                windowHeight: geometry.windowHeight
+            )
+        }
+
+        if let savedOrigin = self.savedExternalWindowPositions[gridId] {
+            ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(savedOrigin)")
+            return NSRect(x: savedOrigin.x, y: savedOrigin.y, width: geometry.windowWidth, height: geometry.windowHeight)
+        }
+
+        if let pendingPos = self.pendingExternalWindowPosition {
+            let titleBarHeight: CGFloat = 28
+            let x = pendingPos.x - geometry.windowWidth / 2
+            let y = pendingPos.y - geometry.windowHeight - titleBarHeight / 2
+            self.pendingExternalWindowPosition = nil
+            ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
+            return NSRect(x: x, y: y, width: geometry.windowWidth, height: geometry.windowHeight)
+        }
+
+        if startRow >= 0 && startCol >= 0, let tvFrame = self.terminalViewScreenFrame() {
+            let origin = gridToScreenOrigin(
+                row: startRow,
+                col: startCol,
+                windowHeight: geometry.windowHeight,
+                cellW: cellW,
+                cellH: cellH,
+                scale: scale,
+                referenceFrame: tvFrame
+            )
+            ZonvieCore.appLog("[external_window] positioned at (\(origin.x),\(origin.y)) from win_pos (\(startRow),\(startCol))")
+            return NSRect(x: origin.x, y: origin.y, width: geometry.windowWidth, height: geometry.windowHeight)
+        }
+
+        return NSRect(x: 100, y: 100, width: geometry.windowWidth, height: geometry.windowHeight)
+    }
+
+    private func popupmenuWindowRect(
+        anchorRow: Int32,
+        anchorCol: Int32,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat,
+        referenceFrame: NSRect,
+        screenTop: CGFloat
+    ) -> NSRect {
+        let pxX = CGFloat(anchorCol) * cellW / scale
+        let pxY = CGFloat(anchorRow) * cellH / scale
+        let cellHeight = cellH / scale
+
+        let x = referenceFrame.origin.x + pxX
+        let belowY = referenceFrame.origin.y + referenceFrame.height - pxY - cellHeight - windowHeight
+        let aboveY = referenceFrame.origin.y + referenceFrame.height - pxY
+        let y: CGFloat
+        if belowY >= referenceFrame.origin.y {
+            y = belowY
+        } else if (aboveY + windowHeight) <= screenTop {
+            y = aboveY
+        } else {
+            y = belowY
+        }
+
+        return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+    }
+
+    private func buildReusedDecoratedWindowFrame(
+        kind: ExternalGridKind,
+        existingWindow: NSWindow,
+        win: Int64,
+        startRow: Int32,
+        startCol: Int32,
+        mainView: MetalTerminalView,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat,
+        geometry: ExternalWindowGeometry
+    ) -> NSRect? {
+        switch kind {
+        case .popupmenu:
+            let windowWidth = geometry.windowWidth
+            let windowHeight = geometry.windowHeight
+            var windowRect = existingWindow.frame
+            let anchorRow = popupmenuAnchorRow ?? startRow
+            let anchorCol = popupmenuAnchorCol ?? startCol
+            let anchorGrid = popupmenuAnchorGrid
+            let isCmdlineCompletion = (anchorRow == -1)
+
+            if isCmdlineCompletion {
+                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
+                    let cmdlineFrame = cmdlineWindow.frame
+                    let x = cmdlineFrame.origin.x + CGFloat(anchorCol) * cellW / scale
+                    let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
+                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                }
+                return windowRect
+            }
+
+            if (anchorGrid ?? win) > 0,
+               let anchorWindow = self.externalWindows[anchorGrid ?? win],
+               let anchorContentView = anchorWindow.contentView {
+                anchorContentView.layoutSubtreeIfNeeded()
+                let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
+                let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+                return popupmenuWindowRect(
+                    anchorRow: anchorRow,
+                    anchorCol: anchorCol,
+                    windowWidth: windowWidth,
+                    windowHeight: windowHeight,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale,
+                    referenceFrame: anchorContentFrame,
+                    screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                )
+            }
+
+            if let tvFrame = self.terminalViewScreenFrame() {
+                return popupmenuWindowRect(
+                    anchorRow: anchorRow,
+                    anchorCol: anchorCol,
+                    windowWidth: windowWidth,
+                    windowHeight: windowHeight,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale,
+                    referenceFrame: tvFrame,
+                    screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                )
+            }
+
+            return windowRect
+
+        case .cmdline:
+            guard self.promptWindow?.isVisible == true,
+                  let promptWin = self.promptWindow,
+                  let screen = NSScreen.main,
+                  let mainWindow = mainView.window else { return nil }
+            let promptFrame = promptWin.frame
+            let screenFrame = screen.visibleFrame
+            let appFrame = mainWindow.frame
+            let containerWidth = existingWindow.frame.width
+            let containerHeight = existingWindow.frame.height
+            let x = appFrame.midX - containerWidth / 2
+            var y = promptFrame.origin.y - 4 - containerHeight
+            y = max(screenFrame.minY, y)
+            return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+
+        case .msgShow, .msgHistory, .normal:
+            return nil
+        }
+    }
+
+    private func refreshDecoratedExternalWindow(
+        gridId: Int64,
+        window: NSWindow,
+        gridView: ExternalGridView,
+        rows: UInt32,
+        cols: UInt32,
+        preLayoutFrame: NSRect? = nil
+    ) {
+        if let preLayoutFrame {
+            window.setFrame(preLayoutFrame, display: false)
+        }
+        updateDecoratedExternalGrid(gridId: gridId, gridView: gridView, bgColor: nil, rows: rows, cols: cols)
+        window.orderFront(nil)
+    }
+
+    private func installDecoratedExternalWindowShell(
+        kind: ExternalGridKind,
+        window: NSWindow,
+        gridView: ExternalGridView,
+        containerWidth: CGFloat,
+        containerHeight: CGFloat
+    ) {
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight))
+        containerView.wantsLayer = true
+        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+        containerView.layer?.cornerCurve = .continuous
+        containerView.layer?.masksToBounds = true
+
+        if ZonvieConfig.shared.blurEnabled {
+            let opacity = ZonvieConfig.shared.backgroundAlpha
+            containerView.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(opacity)).cgColor
+        } else {
+            containerView.layer?.backgroundColor = NSColor.black.cgColor
+        }
+
+        if kind == .cmdline || kind == .popupmenu {
+            let borderColor = self.getSearchHighlightColor()
+            self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
+        }
+
+        if kind == .cmdline {
+            let iconView = NSImageView(frame: NSRect(
+                x: ZonvieConfig.cmdlineIconMarginLeft,
+                y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
+                width: ZonvieConfig.cmdlineIconSize,
+                height: ZonvieConfig.cmdlineIconSize
+            ))
+            iconView.imageScaling = .scaleProportionallyUpOrDown
+            containerView.addSubview(iconView)
+            self.cmdlineIconView = iconView
+            ZonvieCore.appLog("[cmdline] window created, firstc=\(self.cmdlineFirstc), calling updateCmdlineIcon()")
+            self.updateCmdlineIcon()
+        }
+
+        gridView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
+        containerView.addSubview(gridView)
+        window.contentView = containerView
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+
+        if ZonvieConfig.shared.blurEnabled {
+            ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
+        }
+    }
+
+    private func classifyExternalGridKind(_ gridId: Int64) -> ExternalGridKind {
+        switch gridId {
+        case ZonvieCore.cmdlineGridId: return .cmdline
+        case ZonvieCore.popupmenuGridId: return .popupmenu
+        case ZonvieCore.messageGridId: return .msgShow
+        case ZonvieCore.msgHistoryGridId: return .msgHistory
+        default: return .normal
+        }
+    }
+
+    private func updateDecoratedExternalGrid(
+        gridId: Int64,
+        gridView: ExternalGridView,
+        bgColor: NSColor?,
+        rows: UInt32,
+        cols: UInt32
+    ) {
+        let kind = classifyExternalGridKind(gridId)
+        guard kind != .normal else { return }
+        guard let context = makeDecoratedGridContext(gridId: gridId) else { return }
+
+        updateDecoratedBackground(context: context, gridView: gridView, bgColor: bgColor)
+        updateDecoratedWindowChrome(kind: kind, context: context)
+        updateDecoratedLayout(kind: kind, context: context, gridView: gridView, rows: rows, cols: cols)
+    }
+
+    private func makeDecoratedGridContext(gridId: Int64) -> DecoratedGridContext? {
+        guard let window = self.externalWindows[gridId],
+              let containerView = window.contentView,
+              let mainView = self.terminalView,
+              let renderer = mainView.renderer else { return nil }
+        let scale = mainView.window?.backingScaleFactor ?? 1.0
+        return DecoratedGridContext(window: window, containerView: containerView, renderer: renderer, scale: scale)
+    }
+
+    private func updateDecoratedBackground(context: DecoratedGridContext, gridView: ExternalGridView, bgColor: NSColor?) {
+        guard let bgColor else { return }
+
+        let adjustedBg = bgColor.adjustedForCmdlineBackground()
+        let containerAlpha = ZonvieConfig.shared.blurEnabled
+            ? CGFloat(ZonvieConfig.shared.backgroundAlpha)
+            : 1.0
+        context.containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(containerAlpha).cgColor
+
+        // Decorated surfaces always use alpha=0 clear color so the padding
+        // area outside the Metal viewport is transparent, letting the
+        // container background and icon views show through.
+        gridView.gridClearColor = makeSurfaceClearColor(
+            red: 0, green: 0, blue: 0,
+            blurEnabled: ZonvieConfig.shared.blurEnabled,
+            decoratedSurface: true
+        )
+    }
+
+    private func updateDecoratedWindowChrome(kind: ExternalGridKind, context: DecoratedGridContext) {
+        context.containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+        context.containerView.layer?.cornerCurve = .continuous
+
+        switch kind {
+        case .cmdline, .popupmenu:
+            let borderColor = self.getSearchHighlightColor()
+            self.updateSpecialWindowBorder(containerView: context.containerView, borderColor: borderColor, lineWidth: 1.0)
+        case .msgShow, .msgHistory, .normal:
+            break
+        }
+    }
+
+    private func updateDecoratedLayout(
+        kind: ExternalGridKind,
+        context: DecoratedGridContext,
+        gridView: ExternalGridView,
+        rows: UInt32,
+        cols: UInt32
+    ) {
+        let layout: DecoratedExternalLayout?
+        switch kind {
+        case .cmdline:
+            layout = buildDecoratedCmdlineLayout(context: context, rows: rows, cols: cols)
+        case .popupmenu:
+            layout = buildDecoratedPopupmenuLayout(context: context, rows: rows, cols: cols)
+        case .msgShow, .msgHistory:
+            layout = buildDecoratedMessageLayout(kind: kind, context: context, rows: rows, cols: cols)
+        case .normal:
+            layout = nil
+        }
+
+        guard let layout else { return }
+        applyDecoratedLayout(layout, context: context, gridView: gridView)
+    }
+
+    private func applyDecoratedLayout(
+        _ layout: DecoratedExternalLayout,
+        context: DecoratedGridContext,
+        gridView: ExternalGridView
+    ) {
+        // Expand MTKView to fill the entire container so bloom blur can bleed
+        // into the padding area around grid content.
+        gridView.frame = layout.containerFrame
+        gridView.viewportOriginPx = CGPoint(x: layout.gridFrame.origin.x, y: layout.gridFrame.origin.y)
+        context.containerView.frame = layout.containerFrame
+        if let iconFrame = layout.iconFrame, let iconView = self.cmdlineIconView {
+            iconView.frame = iconFrame
+        }
+        context.window.setFrame(layout.windowFrame, display: true)
+        if let linkedMsgShowFrame = layout.linkedMsgShowFrame,
+           let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
+            msgShowWindow.setFrame(linkedMsgShowFrame, display: true)
+        }
+    }
+
+    private func buildDecoratedCmdlineLayout(
+        context: DecoratedGridContext,
+        rows: UInt32,
+        cols: UInt32
+    ) -> DecoratedExternalLayout {
+        let cellW = CGFloat(context.renderer.cellWidthPx)
+        let cellH = CGFloat(context.renderer.cellHeightPx)
+        let cmdlinePadding = ZonvieConfig.cmdlinePadding
+        let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
+        var contentWidth = CGFloat(cols) * cellW / context.scale
+        let contentHeight = CGFloat(rows) * cellH / context.scale
+        if let screen = context.window.screen ?? NSScreen.main {
+            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
+            contentWidth = min(contentWidth, maxContentWidth)
+        }
+
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth
+        let containerHeight = contentHeight + (cmdlinePadding * 2)
+        let gridViewX = cmdlinePadding + cmdlineIconTotalWidth
+        let iconFrame = NSRect(
+            x: ZonvieConfig.cmdlineIconMarginLeft,
+            y: (containerHeight - ZonvieConfig.cmdlineIconSize) / 2,
+            width: ZonvieConfig.cmdlineIconSize,
+            height: ZonvieConfig.cmdlineIconSize
+        )
+
+        let oldFrame = context.window.frame
+        let oldCenterX = oldFrame.midX
+        let oldCenterY = oldFrame.midY
+        var newX = oldCenterX - containerWidth / 2
+        var newY = oldCenterY - containerHeight / 2
+        if let screen = context.window.screen ?? NSScreen.main {
+            let screenFrame = screen.visibleFrame
+            if containerWidth >= screenFrame.width * 0.9 {
+                newX = screenFrame.minX + (screenFrame.width - containerWidth) / 2
+            } else {
+                newX = max(screenFrame.minX, min(newX, screenFrame.maxX - containerWidth))
+            }
+            newY = max(screenFrame.minY, min(newY, screenFrame.maxY - containerHeight))
+        }
+
+        return DecoratedExternalLayout(
+            containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
+            gridFrame: NSRect(x: gridViewX, y: cmdlinePadding, width: contentWidth, height: contentHeight),
+            windowFrame: NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight),
+            iconFrame: iconFrame,
+            linkedMsgShowFrame: nil
+        )
+    }
+
+    private func buildDecoratedPopupmenuLayout(
+        context: DecoratedGridContext,
+        rows: UInt32,
+        cols: UInt32
+    ) -> DecoratedExternalLayout {
+        let cellW = CGFloat(context.renderer.cellWidthPx)
+        let cellH = CGFloat(context.renderer.cellHeightPx)
+        let oldFrame = context.window.frame
+        let oldTop = oldFrame.origin.y + oldFrame.height
+        let popupmenuPadding: CGFloat = 8.0
+        let contentWidth = CGFloat(cols) * cellW / context.scale
+        let contentHeight = CGFloat(rows) * cellH / context.scale
+        let containerWidth = contentWidth + (popupmenuPadding * 2)
+        let containerHeight = contentHeight + (popupmenuPadding * 2)
+        let newY = oldTop - containerHeight
+
+        return DecoratedExternalLayout(
+            containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
+            gridFrame: NSRect(x: popupmenuPadding, y: popupmenuPadding, width: contentWidth, height: contentHeight),
+            windowFrame: NSRect(x: oldFrame.origin.x, y: newY, width: containerWidth, height: containerHeight),
+            iconFrame: nil,
+            linkedMsgShowFrame: nil
+        )
+    }
+
+    private func buildDecoratedMessageLayout(
+        kind: ExternalGridKind,
+        context: DecoratedGridContext,
+        rows: UInt32,
+        cols: UInt32
+    ) -> DecoratedExternalLayout {
+        let cellW = CGFloat(context.renderer.cellWidthPx)
+        let cellH = CGFloat(context.renderer.cellHeightPx)
+        let msgPadding: CGFloat = 8.0
+        let contentWidth = CGFloat(cols) * cellW / context.scale
+        let contentHeight = CGFloat(rows) * cellH / context.scale
+        let containerWidth = contentWidth + (msgPadding * 2)
+        let containerHeight = contentHeight + (msgPadding * 2)
+
+        let targetFrame = self.getExtFloatTargetFrame()
+        let newX = targetFrame.maxX - containerWidth - 10
+        var newY = targetFrame.maxY - containerHeight - 10
+        var linkedMsgShowFrame: NSRect? = nil
+        if kind == .msgShow, let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId] {
+            let historyFrame = msgHistoryWindow.frame
+            newY = historyFrame.origin.y - containerHeight - 4
+        }
+
+        if kind == .msgHistory, let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
+            let msgShowFrame = msgShowWindow.frame
+            let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
+            let msgShowY = newY - msgShowFrame.height - 4
+            linkedMsgShowFrame = NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height)
+        }
+
+        return DecoratedExternalLayout(
+            containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
+            gridFrame: NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight),
+            windowFrame: NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight),
+            iconFrame: nil,
+            linkedMsgShowFrame: linkedMsgShowFrame
+        )
     }
 
     /// Called when cursor moves to a different grid.
@@ -4004,8 +4261,9 @@ final class ZonvieCore {
 
     private func updateSpecialWindowBorder(containerView: NSView, borderColor: NSColor, lineWidth: CGFloat) {
         guard let layer = containerView.layer else { return }
-
+        layer.mask = nil
         layer.borderWidth = 0.0
+        layer.borderColor = nil
 
         let borderLayer: CAShapeLayer
         if let existing = layer.sublayers?.first(where: { $0.name == Self.specialWindowBorderLayerName }) as? CAShapeLayer {
@@ -4019,17 +4277,17 @@ final class ZonvieCore {
             borderLayer = created
         }
 
+        let inset = lineWidth / 2.0
+        let borderRect = layer.bounds.insetBy(dx: inset, dy: inset)
+        let borderRadius = max(0.0, Self.specialWindowCornerRadius - inset)
         borderLayer.frame = layer.bounds
+        borderLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
         borderLayer.strokeColor = borderColor.cgColor
         borderLayer.lineWidth = lineWidth
-
-        let inset = lineWidth / 2.0
-        let radius = max(0.0, Self.specialWindowCornerRadius - inset)
-        let pathRect = layer.bounds.insetBy(dx: inset, dy: inset)
         borderLayer.path = CGPath(
-            roundedRect: pathRect,
-            cornerWidth: radius,
-            cornerHeight: radius,
+            roundedRect: borderRect,
+            cornerWidth: borderRadius,
+            cornerHeight: borderRadius,
             transform: nil
         )
     }
@@ -4277,11 +4535,12 @@ final class ZonvieCore {
         }
         ZonvieCore.appLog("[popupmenu_show] items=[\(itemsStr)] selected=\(selected) pos=(\(row),\(col)) grid=\(gridId)")
 
-        // Track anchor grid and cancel pending main window activation on main thread
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
             self.popupmenuAnchorGrid = gridId
+            self.popupmenuAnchorRow = row
+            self.popupmenuAnchorCol = col
 
             // Cancel any pending main window activation if popupmenu is anchored to external window
             if self.externalWindows[gridId] != nil {
@@ -4290,7 +4549,7 @@ final class ZonvieCore {
                 self.mainWindowActivationWorkItem = nil
                 ZonvieCore.appLog("[popupmenu] cancelled main window activation (anchor on ext grid \(gridId))")
             }
-            ZonvieCore.appLog("[popupmenu] anchor_grid set to \(gridId)")
+            ZonvieCore.appLog("[popupmenu] show: anchor_grid=\(gridId) anchor_row=\(row) anchor_col=\(col) items=\(itemCount)")
         }
     }
 
@@ -4298,6 +4557,8 @@ final class ZonvieCore {
         ZonvieCore.appLog("[popupmenu_hide]")
         DispatchQueue.main.async { [weak self] in
             self?.popupmenuAnchorGrid = nil
+            self?.popupmenuAnchorRow = nil
+            self?.popupmenuAnchorCol = nil
             ZonvieCore.appLog("[popupmenu] anchor_grid cleared")
         }
     }
