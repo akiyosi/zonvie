@@ -81,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: zonvie-windows-${{ matrix.arch }}-debug
-          path: zig-out/bin/zonvie.exe
+          path: windows/zig-out/zonvie.exe
 
   test:
     name: Run Tests

@@ -2,6 +2,7 @@ zig-out/
 zig-out-*/
 .zig-cache/
 macos/.derived/
+windows/zig-out/
 macos/libzonvie_core.a
 debug.log
 tmp/

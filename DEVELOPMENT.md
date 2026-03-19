@@ -115,7 +115,7 @@ zig build windows -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
 Binary output:
 
 ```text
-zig-out/bin/zonvie.exe
+windows/zig-out/zonvie.exe
 ```
 
 ## Architecture Overview

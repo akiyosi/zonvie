@@ -85,7 +85,9 @@ pub fn build(b: *std.Build) !void {
         win_exe.linkSystemLibrary("shell32");
     }
 
-    const install_win = b.addInstallArtifact(win_exe, .{});
+    const install_win = b.addInstallArtifact(win_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "../windows/zig-out" } },
+    });
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
