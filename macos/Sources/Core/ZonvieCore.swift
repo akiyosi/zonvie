@@ -2129,6 +2129,28 @@ final class ZonvieCore {
         }
     }
 
+    /// Check whether a named font family is available on the system.
+    private static func isFontAvailable(_ name: String) -> Bool {
+        let desc = CTFontDescriptorCreateWithAttributes(
+            [kCTFontFamilyNameAttribute: name] as CFDictionary
+        )
+        let matched = CTFontDescriptorCreateMatchingFontDescriptor(desc, nil)
+        return matched != nil
+    }
+
+    /// Parse a single guifont entry: "<name>\t<size>" or "<name>\t<size>\t<features>".
+    /// Returns (name, size, features) or nil if unparseable.
+    private static func parseGuiFontEntry(_ entry: String, configSize: Double) -> (String, Double, String)? {
+        let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        let name = String(parts[0])
+        guard !name.isEmpty else { return nil }
+        let parsedSize = Double(parts[1]) ?? 0
+        let size = parsedSize > 0 ? parsedSize : configSize
+        let features = parts.count >= 3 ? String(parts[2]) : ""
+        return (name, size, features)
+    }
+
     private func onGuiFont(bytes: UnsafePointer<UInt8>, len: Int) {
         guard let view = terminalView else { return }
 
@@ -2139,47 +2161,72 @@ final class ZonvieCore {
         let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
 
-        // Expect: "<name>\t<size>" or "<name>\t<size>\t<features>"
-        let parts = s.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
-        if parts.count >= 2 {
-            var name = String(parts[0])
-            let parsedSize = Double(parts[1]) ?? 0
-            // If size is 0 or invalid, use config size
-            let size = parsedSize > 0 ? parsedSize : configSize
-            let features = parts.count >= 3 ? String(parts[2]) : ""
+        // The payload may contain multiple newline-separated candidates
+        // (guifont fallback list).  Try each in order; use the first
+        // font family that is available on the system.
+        let candidates = s.split(separator: "\n", omittingEmptySubsequences: true)
 
-            // If guifont name is empty, use config font
-            if name.isEmpty {
-                name = configFont
-                Self.appLog("[onGuiFont] guifont empty, using config font '\(configFont)' size=\(size)")
+        var name: String = configFont
+        var size: Double = configSize
+        var features: String = ""
+        var found = false
+
+        for candidate in candidates {
+            guard let parsed = Self.parseGuiFontEntry(String(candidate), configSize: configSize) else {
+                continue
             }
-            Self.appLog("[onGuiFont] name='\(name)' size=\(size) features='\(features)'")
-
-            // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
-            // the same flush's vertex generation) uses the new font immediately.
-            // atlas.setFont() is thread-safe (protected by os_unfair_lock).
-            view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
-
-            // Notify core of new cell dimensions so vertex positions match
-            // the new glyph metrics. updateLayoutPx detects in_handle_redraw
-            // and takes the lock-free path (grid_mu already held by flush).
-            let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-            let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
-            let ds = view.currentDrawableSize
-            let dw = max(1, Int(ds.width))
-            let dh = max(1, Int(ds.height))
-            updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
-                           cellW: UInt32(cw), cellH: UInt32(ch))
-
-            // GUI-only updates (redraw, external window notify) can be async.
-            DispatchQueue.main.async { [weak self] in
-                view.requestRedraw()
-                self?.externalGridViews.values.forEach {
-                    $0.notifyFontChanged()
-                    $0.requestRedraw()
-                }
+            if Self.isFontAvailable(parsed.0) {
+                name = parsed.0
+                size = parsed.1
+                features = parsed.2
+                found = true
+                Self.appLog("[onGuiFont] selected '\(name)' size=\(size) features='\(features)'")
+                break
             }
-            return
+            Self.appLog("[onGuiFont] skipped unavailable font '\(parsed.0)'")
+        }
+
+        // Single-entry payload (no newline) — use as-is even if not "available"
+        // to preserve backward compatibility with direct :set guifont=... usage.
+        if !found && candidates.count == 1 {
+            if let parsed = Self.parseGuiFontEntry(String(candidates[0]), configSize: configSize) {
+                name = parsed.0
+                size = parsed.1
+                features = parsed.2
+                found = true
+                Self.appLog("[onGuiFont] single candidate, using '\(name)' size=\(size)")
+            }
+        }
+
+        if !found {
+            Self.appLog("[onGuiFont] no loadable font in list, using config font '\(configFont)' size=\(configSize)")
+        }
+
+        Self.appLog("[onGuiFont] name='\(name)' size=\(size) features='\(features)'")
+
+        // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
+        // the same flush's vertex generation) uses the new font immediately.
+        // atlas.setFont() is thread-safe (protected by os_unfair_lock).
+        view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
+
+        // Notify core of new cell dimensions so vertex positions match
+        // the new glyph metrics. updateLayoutPx detects in_handle_redraw
+        // and takes the lock-free path (grid_mu already held by flush).
+        let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+        let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let ds = view.currentDrawableSize
+        let dw = max(1, Int(ds.width))
+        let dh = max(1, Int(ds.height))
+        updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
+                       cellW: UInt32(cw), cellH: UInt32(ch))
+
+        // GUI-only updates (redraw, external window notify) can be async.
+        DispatchQueue.main.async { [weak self] in
+            view.requestRedraw()
+            self?.externalGridViews.values.forEach {
+                $0.notifyFontChanged()
+                $0.requestRedraw()
+            }
         }
     }
 

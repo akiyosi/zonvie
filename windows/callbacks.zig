@@ -2068,70 +2068,85 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     const config_font = if (app.config.font.family.len > 0) app.config.font.family else os_default_font;
     const config_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else default_font_pt;
 
-    var name: []const u8 = "";
+    // The payload may contain multiple newline-separated candidates
+    // (guifont fallback list).  Try each in order; use the first font
+    // that loads successfully via setFontUtf8WithFeatures.
+    var name: []const u8 = config_font;
     var pt: f32 = config_pt;
     var features_str: []const u8 = "";
 
-    if (bytes != null and len != 0) {
-        const s = bytes.?[0..len];
-        // Format: "<name>\t<size>" or "<name>\t<size>\t<features>"
-        if (std.mem.indexOfScalar(u8, s, '\t')) |tab1| {
-            name = s[0..tab1];
-            const after_name = s[tab1 + 1 ..];
-            // Look for second tab (features separator)
-            if (std.mem.indexOfScalar(u8, after_name, '\t')) |tab2| {
-                const size_str = after_name[0..tab2];
-                features_str = after_name[tab2 + 1 ..];
-                const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
-                pt = if (parsed_pt > 0) parsed_pt else config_pt;
-            } else {
-                const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
-                pt = if (parsed_pt > 0) parsed_pt else config_pt;
-            }
-        } else {
-            // No tab => treat as invalid; use config font.
-            if (applog.isEnabled()) applog.appLog("onGuiFont: invalid payload (no tab), using config font", .{});
-        }
-    } else {
+    if (bytes == null or len == 0) {
         if (applog.isEnabled()) applog.appLog("onGuiFont: empty payload, using config font", .{});
-    }
-
-    // If guifont name is empty, use config font
-    if (name.len == 0) {
-        name = config_font;
-        if (applog.isEnabled()) applog.appLog("onGuiFont: guifont empty, using config font '{s}'", .{config_font});
     }
 
     app.mu.lock();
 
     if (app.atlas) |*a| {
-        var applied_name: []const u8 = name;
-        var applied_pt: f32 = pt;
+        var applied_name: []const u8 = config_font;
+        var applied_pt: f32 = config_pt;
+        var font_set = false;
 
-        const try_primary = a.setFontUtf8WithFeatures(name, pt, features_str);
-        if (try_primary) |_| {} else |e| {
-            if (applog.isEnabled()) applog.appLog("onGuiFont: setFontUtf8 failed name='{s}' pt={d}: {any}", .{ name, pt, e });
+        if (bytes != null and len != 0) {
+            const s = bytes.?[0..len];
+            // Iterate newline-separated candidates
+            var line_it = std.mem.splitScalar(u8, s, '\n');
+            while (line_it.next()) |entry| {
+                if (entry.len == 0) continue;
 
-            // Fallback chain: config font -> OS default (features only apply to primary)
-            const fallback_name = if (std.mem.eql(u8, name, config_font)) os_default_font else config_font;
+                var cand_name: []const u8 = "";
+                var cand_pt: f32 = config_pt;
+                var cand_features: []const u8 = "";
 
-            const try_fb = a.setFontUtf8WithFeatures(fallback_name, pt, features_str);
-            if (try_fb) |_| {
-                applied_name = fallback_name;
-                applied_pt = pt;
-                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback applied name='{s}' pt={d}", .{ applied_name, applied_pt });
-            } else |e2| {
-                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback setFontUtf8 failed name='{s}' pt={d}: {any}", .{ fallback_name, pt, e2 });
-                // Last resort: try OS default if we haven't already
-                if (!std.mem.eql(u8, fallback_name, os_default_font)) {
-                    const try_os = a.setFontUtf8WithFeatures(os_default_font, pt, features_str);
-                    if (try_os) |_| {
-                        applied_name = os_default_font;
-                        applied_pt = pt;
-                        if (applog.isEnabled()) applog.appLog("onGuiFont: OS default applied name='{s}' pt={d}", .{ applied_name, applied_pt });
-                    } else |e3| {
-                        if (applog.isEnabled()) applog.appLog("onGuiFont: OS default setFontUtf8 failed: {any}", .{e3});
+                if (std.mem.indexOfScalar(u8, entry, '\t')) |tab1| {
+                    cand_name = entry[0..tab1];
+                    const after_name = entry[tab1 + 1 ..];
+                    if (std.mem.indexOfScalar(u8, after_name, '\t')) |tab2| {
+                        const size_str = after_name[0..tab2];
+                        cand_features = after_name[tab2 + 1 ..];
+                        const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
+                        cand_pt = if (parsed_pt > 0) parsed_pt else config_pt;
+                    } else {
+                        const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
+                        cand_pt = if (parsed_pt > 0) parsed_pt else config_pt;
                     }
+                } else {
+                    continue; // no tab => skip invalid entry
+                }
+
+                if (cand_name.len == 0) continue;
+
+                // Try loading this candidate
+                const try_result = a.setFontUtf8WithFeatures(cand_name, cand_pt, cand_features);
+                if (try_result) |_| {
+                    applied_name = cand_name;
+                    applied_pt = cand_pt;
+                    name = cand_name;
+                    pt = cand_pt;
+                    features_str = cand_features;
+                    font_set = true;
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: selected '{s}' pt={d}", .{ cand_name, cand_pt });
+                    break;
+                } else |e| {
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: skipped '{s}' pt={d}: {any}", .{ cand_name, cand_pt, e });
+                }
+            }
+        }
+
+        // If no candidate succeeded, fall back to config font -> OS default
+        if (!font_set) {
+            const try_config = a.setFontUtf8WithFeatures(config_font, config_pt, "");
+            if (try_config) |_| {
+                applied_name = config_font;
+                applied_pt = config_pt;
+                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback config font '{s}' pt={d}", .{ config_font, config_pt });
+            } else |_| {
+                const try_os = a.setFontUtf8WithFeatures(os_default_font, config_pt, "");
+                if (try_os) |_| {
+                    applied_name = os_default_font;
+                    applied_pt = config_pt;
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: fallback OS default '{s}' pt={d}", .{ os_default_font, config_pt });
+                } else |e3| {
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: OS default failed: {any}", .{e3});
                 }
             }
         }

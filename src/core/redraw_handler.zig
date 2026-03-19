@@ -1146,14 +1146,18 @@ pub fn handleRedraw(
                     const list = try parseGuiFontList(arena, raw);
                     if (log.cb != null) log.write("guifont: {d} candidate(s)\n", .{list.items.len});
 
-                    // Notify candidates in order. GUI can pick the first loadable one.
-                    // Now: each notification is "<name>\t<size>" (Zig-resolved).
-                    for (list.items) |cand| {
+                    // Build a single newline-separated string of all resolved
+                    // candidates and notify the frontend once.  The frontend
+                    // tries each entry in order and uses the first loadable font.
+                    var combined: std.ArrayListUnmanaged(u8) = .{};
+                    for (list.items, 0..) |cand, idx| {
                         const resolved = try parseGuiFontCandidate(arena, cand);
                         const msg = try formatResolvedGuiFont(arena, resolved);
                         if (log.cb != null) log.write("guifont resolved: '{s}'\n", .{msg});
-                        try guifont_fn(opt_ctx, msg);
+                        if (idx > 0) try combined.append(arena, '\n');
+                        try combined.appendSlice(arena, msg);
                     }
+                    try guifont_fn(opt_ctx, combined.items);
                 }
 
                 if (std.mem.eql(u8, opt_name, "linespace")) {
