@@ -1660,9 +1660,15 @@ pub const FlushCtx = struct {
         // Check msg_show throttle timeout for external commands
         ctx.core.checkMsgShowThrottleTimeout();
 
-        // Process cmdline changes BEFORE generating vertices
-        // This ensures cursor position is restored before vertex generation
+        // Process cmdline changes BEFORE generating vertices.
+        // This ensures cursor position is restored before vertex generation.
         notifyCmdlineChanges(ctx.core);
+
+        // Process popupmenu changes inside the flush bracket so ext-popupmenu
+        // vertices are generated from the current selection state in the same
+        // flush. If this runs after redraw.handleRedraw returns, the popupmenu
+        // grid lags one flush behind cmdline_show updates.
+        notifyPopupmenuChanges(ctx.core);
 
         var cursor_out: c_api.Cursor = .{
             .enabled = 0,

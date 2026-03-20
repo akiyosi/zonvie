@@ -682,9 +682,6 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // (cmdline is rendered as an external grid)
         self.notifyCmdlineChanges();
 
-        // Handle popupmenu changes (creates external float window via Lua API)
-        self.notifyPopupmenuChanges();
-
         // Handle message changes (ext_messages)
         self.notifyMessageChanges();
 

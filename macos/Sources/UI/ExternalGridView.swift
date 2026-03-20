@@ -404,8 +404,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     /// Apply row scroll notification from core.
-    /// Called on main thread via async dispatch from on_grid_row_scroll callback.
-    /// Performs row slot remapping on the write set and records pending scroll for GPU blit (Phase 3).
+    /// Called from the core/flush thread inside the flush bracket.
+    /// Performs row slot remapping on the write set and records pending scroll for GPU blit.
     func applyRowScroll(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
         ZonvieCore.appLog("[ext_applyRowScroll] gridId=\(gridId) rowStart=\(rowStart) rowEnd=\(rowEnd) rowsDelta=\(rowsDelta) isInFlush=\(isInFlush)")
         guard isInFlush else {
@@ -584,7 +584,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         drawableWidthPx: Int,
         rowHeightPx: Int,
         scroll: SurfaceRowScroll
-    ) -> (clearTopPx: Int, clearBottomPx: Int)? {
+    ) -> (
+        clearTopPx: Int,
+        clearBottomPx: Int,
+        vacatedRowStart: Int,
+        vacatedRowEnd: Int
+    )? {
         let shift = abs(scroll.rowsDelta)
         // Clamp rowEnd to the back buffer height. The scroll callback may report
         // sg.rows (e.g. 45 with winbar) while the drawable is only viewport_rows
@@ -627,9 +632,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         let texHeightPx = backTexture.height
         if scroll.rowsDelta > 0 {
-            return (min((clampedRowEnd - shift) * rowHeightPx, texHeightPx), min(clampedRowEnd * rowHeightPx, texHeightPx))
+            let vacatedRowStart = clampedRowEnd - shift
+            let vacatedRowEnd = clampedRowEnd
+            return (
+                min(vacatedRowStart * rowHeightPx, texHeightPx),
+                min(vacatedRowEnd * rowHeightPx, texHeightPx),
+                vacatedRowStart,
+                vacatedRowEnd
+            )
         } else {
-            return (scroll.rowStart * rowHeightPx, min((scroll.rowStart + shift) * rowHeightPx, texHeightPx))
+            let vacatedRowStart = scroll.rowStart
+            let vacatedRowEnd = min(scroll.rowStart + shift, clampedRowEnd)
+            return (
+                vacatedRowStart * rowHeightPx,
+                min(vacatedRowEnd * rowHeightPx, texHeightPx),
+                vacatedRowStart,
+                vacatedRowEnd
+            )
         }
     }
 
@@ -856,23 +875,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             )
 
             // GPU scroll copy eligibility:
-            // - must be row mode with a pending scroll
+            // - must be row mode with a pending scroll from the current commit
             // - must have presented at least once (back buffer has valid content)
-            // - single scroll delta (abs == 1 is ideal, but allow any single-flush delta)
-            // - not during smooth scrolling
-            // Float overlay detection: handled at the core dispatch level (flush.zig skips
-            // on_grid_row_scroll when float windows are anchored to the grid)
+            // - not during smooth scrolling / resize / glow rendering
+            // - not for decorated surfaces (viewport origin offset complicates reuse)
+            // Float overlay detection is handled at the core dispatch level
+            // (flush.zig skips on_grid_row_scroll when float windows are anchored to the grid).
             // Check glow early — it disables partial-redraw optimizations to
             // prevent additive bloom composite from accumulating brightness.
             let glowEnabled = mainTerminalView?.core?.isGlowEnabled() ?? false
 
-            // GPU scroll copy is disabled for external grids. The core's
-            // scroll_fast_path is always false for external grids, so every
-            // scrolled row gets full vertex regeneration. Enabling GPU blit +
-            // remapSurfaceRowSlots here causes translationY to accumulate
-            // without bound because the slot ring-buffer (maxRowBuffers=512)
-            // far exceeds the actual viewport row count.
-            let useGpuScrollCopy = false
+            let useGpuScrollCopy = rowMode
+                && hasNewCommit
+                && pendingScroll != nil
+                && hasPresentedOnce
+                && !hasScrollOffset
+                && !drawableSizeChanged
+                && !glowEnabled
+                && !isDecoratedSurface
 
             // Use 2-pass rendering when blur is enabled and pipelines are available
             let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
@@ -917,27 +937,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             var dirtyRows: [Int] = useGpuScrollCopy ? Array(submittedDirtyRows) : []
             if useGpuScrollCopy, let scroll = pendingScroll {
-                scrollClearBand = encodePendingScrollCopy(
+                let scrollCopy = encodePendingScrollCopy(
                     commandBuffer: cmd,
                     backTexture: backTex,
                     drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
                     rowHeightPx: Int(cellHi),
                     scroll: scroll
                 )
-
-                let shift = abs(scroll.rowsDelta)
-                if shift > 0 {
-                    let vacatedStart: Int
-                    let vacatedEnd: Int
-                    if scroll.rowsDelta > 0 {
-                        vacatedStart = scroll.rowEnd - shift
-                        vacatedEnd = scroll.rowEnd
-                    } else {
-                        vacatedStart = scroll.rowStart
-                        vacatedEnd = scroll.rowStart + shift
-                    }
+                if let scrollCopy {
+                    scrollClearBand = (
+                        clearTopPx: scrollCopy.clearTopPx,
+                        clearBottomPx: scrollCopy.clearBottomPx
+                    )
                     let dirtySet = Set(dirtyRows)
-                    for row in vacatedStart..<vacatedEnd {
+                    for row in scrollCopy.vacatedRowStart..<scrollCopy.vacatedRowEnd {
                         if !dirtySet.contains(row) {
                             dirtyRows.append(row)
                         }
