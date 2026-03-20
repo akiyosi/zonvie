@@ -1649,6 +1649,14 @@ final class MetalTerminalView: MTKView {
         // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
     }
 
+    /// Service shared smooth-scroll state for external windows that reuse the
+    /// main view's scroll offset storage but do not run the main view's
+    /// onPreDraw hook every frame.
+    func serviceSharedScrollStateForExternalView() {
+        processPendingScrollClears()
+        decayStaleScrollOffsets()
+    }
+
     /// Get scroll offset info for a specific grid (for external window shader update).
     /// Returns nil if the grid is not found.
     func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> MetalTerminalRenderer.ScrollOffsetInfo? {

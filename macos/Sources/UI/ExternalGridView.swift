@@ -88,6 +88,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // to avoid shared MTLBuffer GPU/CPU race.
     private var scrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var scrollOffsetActive: Bool = false
+    private var lastPresentedScrollOffsetData: MetalTerminalRenderer.ScrollOffset?
+    private var lastPresentedScrollOffsetActive: Bool = false
 
     // Accumulated scroll delta (consumed by draw, survives across flushes)
     // Protected by tripleBufferLock (accessed from both flush ops and draw)
@@ -812,24 +814,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let hasDirtyContent = hasNewCommit && !submittedDirtyRows.isEmpty
             let hasPendingScroll = hasNewCommit && pendingScroll != nil
 
-            // Process pending scroll clears before updating shader offset (sync with main window)
-            mainTerminalView?.processPendingScrollClears()
+            // Service shared scroll state before updating the ext-view shader.
+            // External windows reuse the main view's scroll offset storage but
+            // do not benefit from the main view's onPreDraw hook each frame.
+            mainTerminalView?.serviceSharedScrollStateForExternalView()
 
             // Update scroll offset before early exit check so smooth scroll
             // (trackpad sub-cell offset changes) can trigger a redraw even
             // when no new flush has occurred.
             let hasScrollOffset = updateScrollShaderOffset()
-            let scrollOffsetChanged: Bool = {
-                lock.lock()
-                defer { lock.unlock() }
-                return scrollOffsetActive
-            }()
+            let scrollOffsetChanged = hasScrollOffsetStateChangedSinceLastPresent()
+            let smoothScrolling = hasScrollOffset || wasScrollOffsetActiveInLastPresentedFrame()
 
             // Early exit: nothing changed
             let hasCursorUpdate = cursorDirty
             if hasCursorUpdate { cursorDirty = false }
 
-            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate {
+            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // Auto-pause: if no new content for several frames, switch to idle mode
                 activeDrawIdleFrames += 1
@@ -849,6 +850,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 && !hasPendingScroll
                 && !drawableSizeChanged
                 && !scrollOffsetChanged
+                && !smoothScrolling
                 && hasPresentedOnce
 
             // Compute viewport metrics early (needed for both row and non-row modes)
@@ -889,7 +891,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 && hasNewCommit
                 && pendingScroll != nil
                 && hasPresentedOnce
-                && !hasScrollOffset
+                && !smoothScrolling
                 && !drawableSizeChanged
                 && !glowEnabled
                 && !isDecoratedSurface
@@ -972,7 +974,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let cursorOnlyFrame = (hasCursorUpdate || isBlinkOnlyFrame) && dirtyRows.isEmpty && !hasNewCommit
             // Decorated surfaces (ext-cmdline) always clear: their viewport origin offset
             // means scissor rects for partial redraw don't align correctly.
-            let shouldReusePreviousContents = !isDecoratedSurface && !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || (!hasScrollOffset && hasAnyDirtyInRowMode))
+            let shouldReusePreviousContents = !isDecoratedSurface && !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || (!smoothScrolling && hasAnyDirtyInRowMode))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnce,
@@ -1098,7 +1100,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             useTwoPass: true
                         )
                     }
-                } else if hasScrollOffset {
+                } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
                     let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
@@ -1335,6 +1337,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             gpuSubmitted = true
 
             // Mark that we've presented at least once
+            markScrollOffsetStatePresented()
             hasPresentedOnce = true
             redrawScheduler.didDrawFrame()
             finishedRedraw = true
@@ -1372,20 +1375,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let cellHeightPx = Float(main.renderer.cellHeightPx)
         guard drawableHeight > 0 && cellHeightPx > 0 else { return false }
 
-        // Get scroll offset info from main view (includes margin data from core)
+        // Get scroll offset info from the main view's shared scroll state.
         if var info = main.getScrollOffsetInfo(gridId: gridId, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx) {
             // Clamp visual offset to prevent showing empty areas (black cracks) during scrolling
             let maxOffsetPx = cellHeightPx * 2.0
             info.offsetYPx = max(-maxOffsetPx, min(maxOffsetPx, info.offsetYPx))
 
-            // External window: grid always starts at top (Y = 1.0 in NDC)
-            // Override gridTopYNDC for external grids (unlike main window grids which may have startRow offset)
-            info.gridTopYNDC = 1.0
-
-            // Use shared computation logic from MetalTerminalRenderer
-            // Zig generates vertex NDC using (sg.rows * cellH) as viewport height, so we must match that
-            let viewportHeight = Float(info.gridRows) * cellHeightPx
-            var scrollOffset = MetalTerminalRenderer.computeScrollOffset(info: info, viewportHeight: viewportHeight, cellHeightPx: cellHeightPx)
+            // Use the drawable-based coordinate space, matching the fragment
+            // shader's screen-space clipping and the main window's calculation.
+            let scrollOffset = MetalTerminalRenderer.computeScrollOffset(
+                info: info,
+                viewportHeight: drawableHeight,
+                cellHeightPx: cellHeightPx
+            )
 
             ZonvieCore.appLog("[ExternalGridView] scroll offset: gridId=\(gridId) offsetPx=\(info.offsetYPx) marginTop=\(info.marginTop) marginBottom=\(info.marginBottom)")
 
@@ -1404,6 +1406,51 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             scrollOffsetActive = false
             return false  // No scroll offset
         }
+    }
+
+    private func scrollOffsetsEqual(
+        _ lhs: MetalTerminalRenderer.ScrollOffset?,
+        _ rhs: MetalTerminalRenderer.ScrollOffset?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (l?, r?):
+            let epsilon: Float = 0.0001
+            return l.grid_id == r.grid_id
+                && abs(l.offset_y - r.offset_y) < epsilon
+                && abs(l.content_top_y - r.content_top_y) < epsilon
+                && abs(l.content_bottom_y - r.content_bottom_y) < epsilon
+        default:
+            return false
+        }
+    }
+
+    private func hasScrollOffsetStateChangedSinceLastPresent() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if scrollOffsetActive != lastPresentedScrollOffsetActive {
+            return true
+        }
+        if !scrollOffsetActive {
+            return false
+        }
+        return !scrollOffsetsEqual(scrollOffsetData, lastPresentedScrollOffsetData)
+    }
+
+    private func wasScrollOffsetActiveInLastPresentedFrame() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPresentedScrollOffsetActive
+    }
+
+    private func markScrollOffsetStatePresented() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        lastPresentedScrollOffsetActive = scrollOffsetActive
+        lastPresentedScrollOffsetData = scrollOffsetData
     }
 
     // MARK: - Mouse Input
@@ -1622,7 +1669,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             if event.hasPreciseScrollingDeltas {
                 ZonvieCore.appLog("[ExternalGridView scroll] offset=\(newOffset)")
-                main.processPendingScrollClears()
+                main.serviceSharedScrollStateForExternalView()
                 updateScrollShaderOffset()
                 requestRedraw()
             }
