@@ -949,7 +949,9 @@ final class ZonvieCore {
         var devcontainerConfig: String? = nil
         var devcontainerRebuild: Bool = false
 
-        for arg in args {
+        var argIdx = 0
+        while argIdx < args.count {
+            let arg = args[argIdx]
             if arg.hasPrefix("--ssh=") {
                 let value = String(arg.dropFirst("--ssh=".count))
                 // Parse user@host:port format (port is after last colon, but only if it's numeric)
@@ -960,15 +962,36 @@ final class ZonvieCore {
                 } else {
                     sshHost = value
                 }
+            } else if arg == "--ssh" && argIdx + 1 < args.count {
+                // Space-separated: --ssh user@host[:port]
+                let value = args[argIdx + 1]
+                argIdx += 1
+                if let lastColon = value.lastIndex(of: ":"),
+                   let portPart = Int(value[value.index(after: lastColon)...]) {
+                    sshHost = String(value[..<lastColon])
+                    sshPort = portPart
+                } else {
+                    sshHost = value
+                }
             } else if arg.hasPrefix("--ssh-identity=") {
                 sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
+            } else if arg == "--ssh-identity" && argIdx + 1 < args.count {
+                sshIdentity = args[argIdx + 1]
+                argIdx += 1
             } else if arg.hasPrefix("--devcontainer=") {
                 devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
+            } else if arg == "--devcontainer" && argIdx + 1 < args.count {
+                devcontainerWorkspace = args[argIdx + 1]
+                argIdx += 1
             } else if arg.hasPrefix("--devcontainer-config=") {
                 devcontainerConfig = String(arg.dropFirst("--devcontainer-config=".count))
+            } else if arg == "--devcontainer-config" && argIdx + 1 < args.count {
+                devcontainerConfig = args[argIdx + 1]
+                argIdx += 1
             } else if arg == "--devcontainer-rebuild" {
                 devcontainerRebuild = true
             }
+            argIdx += 1
         }
 
         // Fall back to config if not specified via CLI
@@ -2274,8 +2297,27 @@ final class ZonvieCore {
     private func onExitFromNvim(exitCode: Int32) {
         ZonvieCore.exitCode = exitCode
         Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode), exiting now")
-        // Exit immediately - no async dispatch to avoid race conditions
-        Darwin.exit(exitCode)
+        // Use NSApp.stop() to break the run loop so app.run() returns to
+        // main.swift, where Darwin.exit(exitCode) preserves the exit code.
+        // NSApp.terminate() would call exit(0) internally, losing the code.
+        // Darwin.exit() directly would skip AppKit teardown and crash when
+        // DispatchSemaphore is disposed mid-wait (MTKView inflightSemaphore).
+        DispatchQueue.main.async {
+            NSApp.stop(nil)
+            // NSApp.stop requires a pending event to actually break the loop
+            let event = NSEvent.otherEvent(
+                with: .applicationDefined,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                subtype: 0,
+                data1: 0,
+                data2: 0
+            )
+            if let event { NSApp.postEvent(event, atStart: true) }
+        }
     }
 
     // MARK: - External Window Support

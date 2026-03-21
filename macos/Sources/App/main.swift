@@ -3,13 +3,16 @@ import Darwin
 import Metal
 
 
+// Ignore SIGPIPE to prevent crashes when nvim exits and pipes break
+signal(SIGPIPE, SIG_IGN)
+
 // Check for --nofork and --help early (before any other processing)
 let args = CommandLine.arguments
 let noforkMode = args.contains("--nofork")
 
 // Check if SSH or devcontainer mode (window should be hidden until auth completes)
-let sshModeEnabled = args.contains { $0.hasPrefix("--ssh=") }
-let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") }
+let sshModeEnabled = args.contains { $0.hasPrefix("--ssh=") || $0 == "--ssh" }
+let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") || $0 == "--devcontainer" }
 
 // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
 // zonvie-specific arguments:
@@ -58,6 +61,10 @@ do {
             i += 1
         } else if arg == "--log" {
             // Skip --log and its value
+            i += 2
+        } else if arg == "--ssh" || arg == "--ssh-identity" ||
+                  arg == "--devcontainer" || arg == "--devcontainer-config" {
+            // Skip space-separated value arguments (--ssh host, --devcontainer path, etc.)
             i += 2
         } else if arg.hasPrefix("--ssh=") || arg.hasPrefix("--ssh-identity=") ||
                   arg.hasPrefix("--devcontainer=") || arg.hasPrefix("--devcontainer-config=") {

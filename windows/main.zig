@@ -479,15 +479,52 @@ pub fn main() u8 {
                 ssh_host = value;
             }
             if (applog.isEnabled()) applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
+        } else if (std.mem.eql(u8, arg, "--ssh")) {
+            ssh_mode = true;
+            if (i + 1 < args.len) {
+                const value = args[i + 1];
+                i += 1;
+                if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
+                    const port_str = value[colon_idx + 1 ..];
+                    if (std.fmt.parseInt(u16, port_str, 10)) |port| {
+                        ssh_host = value[0..colon_idx];
+                        ssh_port = port;
+                    } else |_| {
+                        ssh_host = value;
+                    }
+                } else {
+                    ssh_host = value;
+                }
+            }
+            if (applog.isEnabled()) applog.appLog("[win] --ssh flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg[15..]; // after "--ssh-identity="
+            if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
+        } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
+            if (i + 1 < args.len) {
+                ssh_identity = args[i + 1];
+                i += 1;
+            }
             if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--devcontainer=")) {
             devcontainer_mode = true;
             devcontainer_workspace = arg[15..]; // after "--devcontainer="
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
+        } else if (std.mem.eql(u8, arg, "--devcontainer")) {
+            devcontainer_mode = true;
+            if (i + 1 < args.len) {
+                devcontainer_workspace = args[i + 1];
+                i += 1;
+            }
+            if (applog.isEnabled()) applog.appLog("[win] --devcontainer flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--devcontainer-config=")) {
             devcontainer_config = arg[22..]; // after "--devcontainer-config="
+            if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
+        } else if (std.mem.eql(u8, arg, "--devcontainer-config")) {
+            if (i + 1 < args.len) {
+                devcontainer_config = args[i + 1];
+                i += 1;
+            }
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
             devcontainer_rebuild = true;
