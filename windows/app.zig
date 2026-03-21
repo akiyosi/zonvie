@@ -1459,6 +1459,40 @@ pub fn applyScrollShift(
 
     g.scrollBackTex(filled, scroll_dy_px);
 
+    // 4. When multiple scroll flushes accumulate before a paint, the back buffer
+    //    shift leaves gap rows with stale pixels.  The per-flush dirty bitmap
+    //    only covers each flush's own vacated rows, but the accumulated shift
+    //    exposes abs(vb_shift_rows) rows that scrollBackTex could not fill from
+    //    valid source pixels.  Add those gap rows to rows_to_draw so they are
+    //    redrawn from the current slot data.
+    if (row_h_px > 0) {
+        const abs_shift: u32 = @intCast(if (vb_shift_rows < 0) -vb_shift_rows else vb_shift_rows);
+        if (abs_shift > 1) {
+            const region_top_row: u32 = @intCast(@divTrunc(filled.top - y_offset, row_h_px));
+            const region_bot_row: u32 = @intCast(@divTrunc(filled.bottom - y_offset, row_h_px));
+            const region_height: u32 = region_bot_row - region_top_row;
+
+            if (abs_shift >= region_height) {
+                // Accumulated shift covers the entire scroll region; scrollBackTex
+                // early-returned without copying anything.  Redraw every row in
+                // the region instead of computing a gap.
+                mergeContiguousRows(alloc, rows_to_draw, region_top_row, @min(region_bot_row, effective_rows));
+            } else if (vb_shift_rows > 0) {
+                // Scroll up (j-key): gap rows at bottom of scroll region.
+                // Gap rows form a contiguous range; merge them into the sorted
+                // rows_to_draw list in one pass to avoid repeated O(n) scans in
+                // appendRowSorted.
+                const gap_start: u32 = region_bot_row - abs_shift;
+                const gap_end: u32 = @min(region_bot_row, effective_rows);
+                mergeContiguousRows(alloc, rows_to_draw, gap_start, gap_end);
+            } else {
+                // Scroll down (k-key): gap rows at top of scroll region.
+                const gap_end: u32 = @min(region_top_row + abs_shift, effective_rows);
+                mergeContiguousRows(alloc, rows_to_draw, region_top_row, gap_end);
+            }
+        }
+    }
+
     if (applog.isEnabled()) {
         applog.appLog(
             "[perf] applyScrollShift dy={d} vb_shift={d} rect=({d},{d},{d},{d})\n",
@@ -1476,6 +1510,31 @@ fn appendRowSorted(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32),
     }
     list.append(alloc, row) catch return;
     std.sort.insertion(u32, list.items, {}, std.sort.asc(u32));
+}
+
+/// Merge a contiguous range [start, end) into a sorted rows_to_draw list,
+/// skipping rows already present.  Avoids per-row insertion sort by
+/// appending new rows and re-sorting once.
+fn mergeContiguousRows(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32), start: u32, end: u32) void {
+    if (start >= end) return;
+    var added: u32 = 0;
+    var r: u32 = start;
+    while (r < end) : (r += 1) {
+        var found = false;
+        for (list.items) |existing| {
+            if (existing == r) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            list.append(alloc, r) catch return;
+            added += 1;
+        }
+    }
+    if (added > 0) {
+        std.sort.insertion(u32, list.items, {}, std.sort.asc(u32));
+    }
 }
 
 /// Draw rows from slot-based row_map with separate RowVB GPU buffers.
