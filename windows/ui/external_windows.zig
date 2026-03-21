@@ -389,7 +389,7 @@ fn drawNormalExternalSurfaceRowMode(
     // The full back_tex→swapchain copy in presentOnlyFromBack handles
     // FLIP_SEQUENTIAL buffer rotation (swapchain buffers don't retain
     // previous content, but back_tex does).
-    const force_full_rows = force_full;
+    const force_full_rows = force_full or glow_enabled;
 
     // Build sorted, deduplicated rows_to_draw list.
     var rows_to_draw: std.ArrayListUnmanaged(u32) = .{};
