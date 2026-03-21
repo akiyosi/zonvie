@@ -264,6 +264,47 @@ int zonvie_ft_render_glyph(
   return 0;
 }
 
+int zonvie_ft_render_glyph_color(
+    zonvie_ft_hb_font* f,
+    uint32_t glyph_id,
+    const uint8_t** out_buffer,
+    int* out_width,
+    int* out_height,
+    int* out_pitch,
+    int* out_left,
+    int* out_top,
+    int32_t* out_advance_x_26_6,
+    int* out_bytes_per_pixel
+) {
+  if (!f || !f->ft_face) return -1;
+
+  // Try color rendering first (FT_LOAD_COLOR enables BGRA for color emoji)
+  if (FT_Load_Glyph(f->ft_face, glyph_id, FT_LOAD_COLOR) != 0) return -2;
+  if (FT_Render_Glyph(f->ft_face->glyph, FT_RENDER_MODE_NORMAL) != 0) return -3;
+
+  FT_GlyphSlot g = f->ft_face->glyph;
+  FT_Bitmap* bm = &g->bitmap;
+
+  if (out_buffer) *out_buffer = (const uint8_t*)bm->buffer;
+  if (out_width)  *out_width  = (int)bm->width;
+  if (out_height) *out_height = (int)bm->rows;
+  if (out_pitch)  *out_pitch  = (int)bm->pitch;
+  if (out_left)   *out_left   = (int)g->bitmap_left;
+  if (out_top)    *out_top    = (int)g->bitmap_top;
+  if (out_advance_x_26_6) *out_advance_x_26_6 = (int32_t)g->advance.x;
+
+  // Report pixel format: BGRA (4 bpp) for color emoji, gray (1 bpp) for outline glyphs
+  if (out_bytes_per_pixel) {
+    if (bm->pixel_mode == FT_PIXEL_MODE_BGRA) {
+      *out_bytes_per_pixel = 4;
+    } else {
+      *out_bytes_per_pixel = 1;
+    }
+  }
+
+  return 0;
+}
+
 int zonvie_ft_hb_get_ascii_glyph_ids(zonvie_ft_hb_font* f, uint32_t* out_glyph_ids) {
   if (!f || !f->ascii_tables_valid || !out_glyph_ids) return 0;
   memcpy(out_glyph_ids, f->ascii_glyph_ids, sizeof(f->ascii_glyph_ids));

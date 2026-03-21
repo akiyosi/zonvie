@@ -22,6 +22,7 @@ typedef struct zonvie_glyph_entry {
     float advance_px;
     float ascent_px;
     float descent_px;
+    uint32_t bytes_per_pixel;    /* 1=grayscale, 3=ClearType RGB, 4=RGBA color (emoji) */
 } zonvie_glyph_entry;
 
 /* Phase 2: Core-managed atlas - bitmap descriptor returned by frontend rasterizer.
@@ -177,6 +178,7 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_SCROLLABLE    (1u << 7)  /* Vertex is in scrollable content area (not margin) */
 #define ZONVIE_DECO_OVERLINE      (1u << 8)
 #define ZONVIE_DECO_GLOW          (1u << 9)  /* Neon glow halo around glyph */
+#define ZONVIE_DECO_COLOR_EMOJI   (1u << 10) /* Color glyph (emoji): sample RGBA, not coverage */
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];

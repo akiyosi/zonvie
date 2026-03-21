@@ -40,6 +40,7 @@ SamplerState samp0 : register(s0);
 #define DECO_STRIKETHROUGH (1u << 5)
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
+#define DECO_COLOR_EMOJI   (1u << 10)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -206,6 +207,12 @@ float4 PSMain(VSOut i) : SV_Target {
         // Regular solid color (background)
         return premultiply(i.col);
     }
+    // Color emoji: sample RGBA directly (premultiplied alpha from D2D)
+    if (i.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = atlasTex.Sample(samp0, i.uv);
+        return emoji;
+    }
+
     // Grayscale rendering with DirectWrite gamma correction (Windows Terminal style)
     float4 foreground = premultiply(i.col);
     float enhancedContrast = 1.0; // Default contrast boost
@@ -249,6 +256,12 @@ float4 PSGlowExtract(VSOut i) : SV_Target {
     if (!(i.deco_flags & DECO_GLOW)) discard;
     // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
     if (i.uv.x < 0.0) discard;
+
+    // Color emoji: use texture color directly
+    if (i.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = atlasTex.Sample(samp0, i.uv);
+        return float4(emoji.rgb, emoji.a);
+    }
 
     float4 tex = atlasTex.Sample(samp0, i.uv);
     float cov = dot(tex.rgb, float3(0.299, 0.587, 0.114));

@@ -60,6 +60,23 @@ int zonvie_ft_render_glyph(
     int32_t* out_advance_x_26_6
 );
 
+// Render a glyph with color support (FT_LOAD_COLOR).
+// For color glyphs (emoji), produces BGRA bitmap (bytes_per_pixel=4).
+// For non-color glyphs, falls back to grayscale (bytes_per_pixel=1).
+// The returned buffer pointer is valid until the next render call on the same font handle.
+int zonvie_ft_render_glyph_color(
+    zonvie_ft_hb_font* f,
+    uint32_t glyph_id,
+    const uint8_t** out_buffer,
+    int* out_width,
+    int* out_height,
+    int* out_pitch,
+    int* out_left,
+    int* out_top,
+    int32_t* out_advance_x_26_6,
+    int* out_bytes_per_pixel
+);
+
 // ASCII fast path: retrieve pre-computed tables for codepoints 0-127.
 // Returns 1 if tables are valid, 0 if not. Caller provides [128]-element buffers.
 int zonvie_ft_hb_get_ascii_glyph_ids(zonvie_ft_hb_font* f, uint32_t* out_glyph_ids);

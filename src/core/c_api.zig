@@ -81,6 +81,7 @@ pub const DECO_CURSOR: u32 = 1 << 6; // Marker for cursor vertices (not a decora
 pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area (not margin)
 pub const DECO_OVERLINE: u32 = 1 << 8;
 pub const DECO_GLOW: u32 = 1 << 9;
+pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, not coverage
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -134,6 +135,7 @@ pub const GlyphEntry = extern struct {
     advance_px: f32,
     ascent_px: f32,
     descent_px: f32,
+    bytes_per_pixel: u32 = 1, // 1=grayscale, 3=ClearType RGB, 4=RGBA color (emoji)
 };
 
 pub const AtlasEnsureGlyphFn = *const fn (

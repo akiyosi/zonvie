@@ -187,6 +187,13 @@ pub fn buildVerticesForTextRun(
                     const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                     try appendQuad(out_main, p0, p1, p2, p3, uv0, uv1, uv2, uv3, fg);
+                    // Tag color emoji vertices so the shader can sample RGBA
+                    if (ge.bytes_per_pixel >= 4) {
+                        const base = out_main.items.len - 6;
+                        for (out_main.items[base..out_main.items.len]) |*v| {
+                            v.deco_flags |= c_api.DECO_COLOR_EMOJI;
+                        }
+                    }
                 }
 
                 // Cluster-based pen advance in *cells*, matching Swift logic.

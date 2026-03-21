@@ -16,6 +16,13 @@ const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
 const block_elements = @import("block_elements.zig");
 
+// Emoji cluster context: set before ensureGlyphPhase2 so the frontend
+// rasterizer can access the full cluster text (for multi-scalar emoji
+// like flag sequences, ZWJ sequences, VS16 emoji).
+// Single-threaded: only written/read during flush on the core thread.
+pub var emoji_cluster_buf: [16]u32 = undefined;
+pub var emoji_cluster_len: u8 = 0;
+
 pub const GridEntry = struct {
     grid_id: i64,
     zindex: i64,
@@ -802,15 +809,24 @@ pub const RowGenParams = struct {
     glow_enabled: bool,
 };
 
+/// Stats returned from generateRowVertices for performance tracking.
+pub const RowGenStats = struct {
+    had_glyph_miss: bool = false,
+    shape_cache_hits: u32 = 0,
+    shape_cache_misses: u32 = 0,
+    ascii_fast_path_runs: u32 = 0,
+    shape_us: i64 = 0, // total microseconds spent in shape_text_run callback
+    shape_calls: u32 = 0, // number of shape_text_run callback invocations
+};
+
 /// Unified 5-pass row vertex generation shared by main grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
-/// `deco_base_flags`) before calling.  Returns `true` when a glyph miss was
-/// detected (caller may want to log / flag for retry).
+/// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
 pub fn generateRowVertices(
     core: *Core,
     p: RowGenParams,
     out: *std.ArrayListUnmanaged(c_api.Vertex),
-) !bool {
+) !RowGenStats {
     const rc = &core.row_cells;
     const r = p.row;
     const cols = p.cols;
@@ -819,7 +835,8 @@ pub fn generateRowVertices(
     const topPad = p.top_pad;
     const vw = p.vw;
     const vh = p.vh;
-    var had_glyph_miss: bool = false;
+    var stats = RowGenStats{};
+    const log_enabled = core.log.cb != null;
 
     // ── Pass 1: Background (run-length by bgRGB + grid_id) ──────────
     {
@@ -1045,6 +1062,7 @@ pub fn generateRowVertices(
                             }
                             final_glyph_count = scalar_count;
                             used_ascii_fast_path = true;
+                            stats.ascii_fast_path_runs += 1;
                         }
                     }
 
@@ -1079,18 +1097,21 @@ pub fn generateRowVertices(
                                 @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
                                 @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
                                 sc_cache_hit = true;
+                                stats.shape_cache_hits += 1;
                                 break;
                             }
                         }
                     }
 
                     if (!sc_cache_hit) {
+                        stats.shape_cache_misses += 1;
                         bufs.ensureCapacity(core.alloc, scalar_count) catch {
                             c = end;
                             continue;
                         };
                         bufs.setLen(scalar_count);
 
+                        const t_shape_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
                         const glyph_count = shape_text_run.?(
                             core.ctx,
                             core.shaping_scalars.items.ptr,
@@ -1103,6 +1124,11 @@ pub fn generateRowVertices(
                             bufs.y_off.items.ptr,
                             scalar_count,
                         );
+                        if (log_enabled) {
+                            const t_shape_end = std.time.nanoTimestamp();
+                            stats.shape_us += @intCast(@divTrunc(@max(0, t_shape_end - t_shape_start), 1000));
+                            stats.shape_calls += 1;
+                        }
 
                         if (glyph_count == 0) {
                             c = end;
@@ -1116,18 +1142,26 @@ pub fn generateRowVertices(
                                 continue;
                             };
                             bufs.setLen(glyph_count);
-                            final_glyph_count = shape_text_run.?(
-                                core.ctx,
-                                core.shaping_scalars.items.ptr,
-                                scalar_count,
-                                c_style,
-                                bufs.glyph_ids.items.ptr,
-                                bufs.clusters.items.ptr,
-                                bufs.x_adv.items.ptr,
-                                bufs.x_off.items.ptr,
-                                bufs.y_off.items.ptr,
-                                glyph_count,
-                            );
+                            {
+                                const t_shape2_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                final_glyph_count = shape_text_run.?(
+                                    core.ctx,
+                                    core.shaping_scalars.items.ptr,
+                                    scalar_count,
+                                    c_style,
+                                    bufs.glyph_ids.items.ptr,
+                                    bufs.clusters.items.ptr,
+                                    bufs.x_adv.items.ptr,
+                                    bufs.x_off.items.ptr,
+                                    bufs.y_off.items.ptr,
+                                    glyph_count,
+                                );
+                                if (log_enabled) {
+                                    const t_shape2_end = std.time.nanoTimestamp();
+                                    stats.shape_us += @intCast(@divTrunc(@max(0, t_shape2_end - t_shape2_start), 1000));
+                                    stats.shape_calls += 1;
+                                }
+                            }
                             if (final_glyph_count == 0) {
                                 c = end;
                                 continue;
@@ -1212,7 +1246,7 @@ pub fn generateRowVertices(
                                         const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
                                         const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
 
-                                        const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                        const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                         VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
                                     }
                                 }
@@ -1247,9 +1281,18 @@ pub fn generateRowVertices(
                             }
                         }
 
-                        // Glyph-ID cache lookup
+                        // Glyph-ID cache lookup.
+                        // Skip glyph-by-ID for .notdef (gid==0) and emoji codepoints.
+                        // Emoji should go through per-scalar fallback (ensureGlyphPhase2)
+                        // so the frontend can render with system color emoji
+                        // (D2D + Segoe UI Emoji on Windows, CoreGraphics on macOS).
                         var ge: c_api.GlyphEntry = undefined;
-                        const glyph_ok = gid_blk: {
+                        const first_scalar: u32 = core.shaping_scalars.items[@intCast(this_cluster)];
+                        const cluster_is_emoji = isEmojiPresentation(first_scalar) or clusterHasVS16(core, this_cluster, next_cluster);
+                        var glyph_ok = gid_blk: {
+                            if (gid == 0 or cluster_is_emoji) {
+                                break :gid_blk false;
+                            }
                             if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
                                 const key = (@as(u64, gid) << 2) | @as(u64, style_index);
                                 const hash_val = (gid *% 2654435761) ^ style_index;
@@ -1273,6 +1316,60 @@ pub fn generateRowVertices(
                             break :gid_blk false;
                         };
 
+                        // If glyph-by-ID failed or produced an empty bitmap, try per-scalar fallback.
+                        // For single-scalar clusters: always try fallback (handles .notdef, missing glyphs).
+                        // For multi-scalar clusters: try fallback if cluster is emoji
+                        // (ZWJ sequences, flag sequences, VS16 emoji need color emoji rendering).
+                        // Store full cluster scalars so the frontend rasterizer can render
+                        // the complete emoji sequence (not just the first scalar).
+                        const glyph_empty = glyph_ok and (ge.bbox_size_px[0] <= 0 or ge.bbox_size_px[1] <= 0);
+                        if ((!glyph_ok or glyph_empty) and (next_cluster == this_cluster + 1 or cluster_is_emoji)) {
+                            if (first_scalar != 0 and first_scalar != 0x20) {
+                                // Check non-ASCII glyph cache before rasterizing.
+                                // For single-scalar clusters and single-scalar emoji,
+                                // the scalar+style key is sufficient.
+                                const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) blk: {
+                                    const fb_key = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
+                                    const fb_hash = (first_scalar *% 2654435761) ^ style_index;
+                                    const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
+                                    if (glyph_keys_non_ascii.?[fb_idx] == fb_key) {
+                                        ge = glyph_cache_non_ascii.?[fb_idx];
+                                        break :blk true;
+                                    }
+                                    break :blk false;
+                                } else false;
+
+                                if (fb_cached) {
+                                    glyph_ok = true;
+                                } else {
+                                    // Set cluster context only for emoji clusters so the
+                                    // frontend rasterizer knows to use color emoji path.
+                                    if (cluster_is_emoji) {
+                                        const cl_len = @min(next_cluster - this_cluster, emoji_cluster_buf.len);
+                                        var ci: u32 = 0;
+                                        while (ci < cl_len) : (ci += 1) {
+                                            emoji_cluster_buf[ci] = core.shaping_scalars.items[@intCast(this_cluster + ci)];
+                                        }
+                                        emoji_cluster_len = @intCast(cl_len);
+                                    }
+                                    defer emoji_cluster_len = 0;
+
+                                    if (core.ensureGlyphPhase2(first_scalar, c_style)) |fb_ge| {
+                                        ge = fb_ge;
+                                        glyph_ok = true;
+                                        // Store in non-ASCII cache for subsequent rows
+                                        if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) {
+                                            const fb_key = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
+                                            const fb_hash = (first_scalar *% 2654435761) ^ style_index;
+                                            const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
+                                            glyph_cache_non_ascii.?[fb_idx] = fb_ge;
+                                            glyph_keys_non_ascii.?[fb_idx] = fb_key;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
                             const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
@@ -1288,7 +1385,7 @@ pub fn generateRowVertices(
                             const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
                             const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
-                            const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                            const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
                         }
 
@@ -1418,7 +1515,7 @@ pub fn generateRowVertices(
                             break :blk ok;
                         };
                         if (!glyph_ok) {
-                            had_glyph_miss = true;
+                            stats.had_glyph_miss = true;
                             if (core.missing_glyph_log_count < 16) {
                                 core.log.write(
                                     "glyph_missing row={d} col={d} scalar=0x{x}\n",
@@ -1442,7 +1539,7 @@ pub fn generateRowVertices(
                         const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, pc_glyph_deco);
                         }
 
@@ -1530,7 +1627,7 @@ pub fn generateRowVertices(
         }
     }
 
-    return had_glyph_miss;
+    return stats;
 }
 
 pub const FlushCtx = struct {
@@ -2603,7 +2700,7 @@ pub const FlushCtx = struct {
                         // On error (e.g. buffer allocation failure), skip this row
                         // so partial vertices are not cached or sent to the frontend.
                         // markAllDirty at the end of the flush ensures a retry.
-                        const row_gen_result = generateRowVertices(ctx.core, .{
+                        const row_gen_stats = generateRowVertices(ctx.core, .{
                             .row = r,
                             .cols = cols,
                             .vw = dw,
@@ -2621,7 +2718,10 @@ pub const FlushCtx = struct {
                             had_glyph_miss = true;
                             continue;
                         };
-                        had_glyph_miss = had_glyph_miss or row_gen_result;
+                        had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
+                        perf_shape_cache_hits += row_gen_stats.shape_cache_hits;
+                        perf_shape_cache_misses += row_gen_stats.shape_cache_misses;
+                        perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
                         // Log row timing for performance measurement
                         if (log_enabled) {
                             const t_row_gen_end = std.time.nanoTimestamp();
@@ -2636,8 +2736,8 @@ pub const FlushCtx = struct {
                                 perf_row_max_total_idx = r;
                             }
                             ctx.core.log.write(
-                                "[perf] row_mode row={d} cols={d} compose_us={d} gen_us={d} total_us={d}\n",
-                                .{ r, cols, row_compose_us, gen_us, total_us },
+                                "[perf] row_mode row={d} cols={d} compose_us={d} gen_us={d} shape_us={d} shape_calls={d} sc_hit={d} sc_miss={d} ascii={d} total_us={d}\n",
+                                .{ r, cols, row_compose_us, gen_us, row_gen_stats.shape_us, row_gen_stats.shape_calls, row_gen_stats.shape_cache_hits, row_gen_stats.shape_cache_misses, row_gen_stats.ascii_fast_path_runs, total_us },
                             );
                         }
 
@@ -3209,7 +3309,7 @@ pub const FlushCtx = struct {
 
                                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                                             const nr_glyph_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                            const nr_glyph_deco: u32 = nr_glyph_scroll | (if (nr_run_has_glow) c_api.DECO_GLOW else 0);
+                                            const nr_glyph_deco: u32 = nr_glyph_scroll | (if (nr_run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                             try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, nr_glyph_deco);
                                         }
 
@@ -3500,7 +3600,7 @@ pub const FlushCtx = struct {
                                         fg,
                                         dw, dh,
                                         cursor_grid_id, // cursor belongs to its actual grid
-                                        c_api.DECO_SCROLLABLE, // cursor is always in content area
+                                        c_api.DECO_SCROLLABLE | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0), // cursor is always in content area
                                     );
                                 }
                             }
@@ -6308,4 +6408,113 @@ pub fn countDisplayWidth(s: []const u8) u32 {
         }
     }
     return count;
+}
+
+/// Check if a cluster contains VS16 (U+FE0F, emoji presentation selector).
+/// When VS16 is present, even text-default codepoints (e.g., ☀ U+2600)
+/// should be rendered as color emoji.
+fn clusterHasVS16(core: *Core, this_cluster: u32, next_cluster: u32) bool {
+    if (next_cluster <= this_cluster + 1) return false;
+    var ci: u32 = this_cluster;
+    while (ci < next_cluster) : (ci += 1) {
+        if (core.shaping_scalars.items[@intCast(ci)] == 0xFE0F) return true;
+    }
+    return false;
+}
+/// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
+/// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
+/// renderers display as color emoji without an explicit VS16 selector.
+fn isEmojiPresentation(scalar: u32) bool {
+    return switch (scalar) {
+        // BMP: Emoji_Presentation=Yes (Unicode 15.1)
+        0x231A...0x231B,
+        0x23E9...0x23F3,
+        0x23F8...0x23FA,
+        0x25FD...0x25FE,
+        0x2614...0x2615,
+        0x2648...0x2653,
+        0x267F,
+        0x2693,
+        0x26A1,
+        0x26AA...0x26AB,
+        0x26BD...0x26BE,
+        0x26C4...0x26C5,
+        0x26CE,
+        0x26D4,
+        0x26EA,
+        0x26F2...0x26F3,
+        0x26F5,
+        0x26FA,
+        0x26FD,
+        0x2705,
+        0x270A...0x270B,
+        0x2728,
+        0x274C,
+        0x274E,
+        0x2753...0x2755,
+        0x2757,
+        0x2795...0x2797,
+        0x27A1,
+        0x27B0,
+        0x27BF,
+        0x2934...0x2935,
+        0x2B05...0x2B07,
+        0x2B1B...0x2B1C,
+        0x2B50,
+        0x2B55,
+        0x3030,
+        0x303D,
+        0x3297,
+        0x3299,
+        // SMP: Emoji_Presentation=Yes (Unicode 15.1)
+        0x1F004,
+        0x1F0CF,
+        0x1F18E,
+        0x1F191...0x1F19A,
+        0x1F1E6...0x1F1FF, // regional indicators
+        0x1F201,
+        0x1F21A,
+        0x1F22F,
+        0x1F232...0x1F236,
+        0x1F238...0x1F23A,
+        0x1F250...0x1F251,
+        0x1F300...0x1F320,
+        0x1F32D...0x1F335,
+        0x1F337...0x1F37C,
+        0x1F37E...0x1F393,
+        0x1F3A0...0x1F3CA,
+        0x1F3CF...0x1F3D3,
+        0x1F3E0...0x1F3F0,
+        0x1F3F4,
+        0x1F3F8...0x1F43E,
+        0x1F440,
+        0x1F442...0x1F4FC,
+        0x1F4FF...0x1F53D,
+        0x1F54B...0x1F54E,
+        0x1F550...0x1F567,
+        0x1F57A,
+        0x1F595...0x1F596,
+        0x1F5A4,
+        0x1F5FB...0x1F64F,
+        0x1F680...0x1F6C5,
+        0x1F6CC,
+        0x1F6D0...0x1F6D2,
+        0x1F6D5...0x1F6D7,
+        0x1F6DC...0x1F6DF,
+        0x1F6EB...0x1F6EC,
+        0x1F6F4...0x1F6FC,
+        0x1F7E0...0x1F7EB,
+        0x1F7F0,
+        0x1F90C...0x1F93A,
+        0x1F93C...0x1F945,
+        0x1F947...0x1F9FF,
+        0x1FA70...0x1FA7C,
+        0x1FA80...0x1FA89,
+        0x1FA8F...0x1FAC6,
+        0x1FACE...0x1FADC,
+        0x1FADF...0x1FAE9,
+        0x1FAF0...0x1FAF8,
+        => true,
+        else => false,
+    };
 }

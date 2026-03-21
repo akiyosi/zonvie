@@ -360,6 +360,7 @@ final class GlyphAtlas {
             zonvie_ft_hb_font_destroy(f.hbft)
         }
         fallbackFacesByURL.removeAll()
+        failedHbftURLs.removeAll()
         fallbackFontCache.removeAll()
         failedScalarCache.removeAll()
         scalarToGlyphIDCache.removeAll()
@@ -420,7 +421,7 @@ final class GlyphAtlas {
         // Build base font
         self.hbftFont = createHbFtFont_locked(for: font, px: px)
         if self.hbftFont == nil {
-            assertionFailure("zonvie_ft_hb_font_create failed for base font")
+            ZonvieCore.appLog("[rebuildHbFtFont] WARNING: hbft create failed for base font '\(fontName)' px=\(px), falling back to CoreGraphics-only rendering")
         }
 
         // Build bold variant
@@ -454,12 +455,15 @@ final class GlyphAtlas {
     }
 
     private func createHbFtFont_locked(for ctFont: CTFont, px: UInt32) -> OpaquePointer? {
+        let ctName = CTFontCopyPostScriptName(ctFont) as String
         let desc = CTFontCopyFontDescriptor(ctFont)
         guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL else {
+            ZonvieCore.appLog("[createHbFtFont] no URL for font '\(ctName)' px=\(px)")
             return nil
         }
 
         guard let data = try? Data(contentsOf: url) else {
+            ZonvieCore.appLog("[createHbFtFont] failed to read font file '\(url.path)' for '\(ctName)'")
             return nil
         }
 
@@ -468,6 +472,10 @@ final class GlyphAtlas {
         let created: OpaquePointer? = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OpaquePointer? in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
             return zonvie_ft_hb_font_create(base, raw.count, px, faceIndex)
+        }
+
+        if created == nil {
+            ZonvieCore.appLog("[createHbFtFont] zonvie_ft_hb_font_create returned nil for '\(ctName)' url='\(url.path)' size=\(data.count) px=\(px) faceIdx=\(faceIndex)")
         }
 
         return created
@@ -486,21 +494,31 @@ final class GlyphAtlas {
         return 0
     }
 
+    /// URL keys that failed hbft creation (e.g., Apple Color Emoji sbix).
+    /// Prevents repeated expensive Data(contentsOf:) loads.
+    private var failedHbftURLs: Set<String> = []
+
     private func ensureHbFtFace_locked(for ctFont: CTFont) -> HbFtFace? {
         let desc = CTFontCopyFontDescriptor(ctFont)
         guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL else {
             return nil
         }
-    
+
         let faceIndex = ctFontFaceIndex(ctFont)
         let urlKey = "\(url.absoluteString)#\(faceIndex)"
-    
+
         if let cached = fallbackFacesByURL[urlKey] {
             return cached
         }
 
+        // Skip URLs that already failed (avoids re-reading 188MB Apple Color Emoji.ttc)
+        if failedHbftURLs.contains(urlKey) {
+            return nil
+        }
+
         let loadStart = CFAbsoluteTimeGetCurrent()
         guard let data = try? Data(contentsOf: url) else {
+            failedHbftURLs.insert(urlKey)
             return nil
         }
         let loadEnd = CFAbsoluteTimeGetCurrent()
@@ -514,7 +532,11 @@ final class GlyphAtlas {
         }
         let createEnd = CFAbsoluteTimeGetCurrent()
 
-        guard let hbft = created else { return nil }
+        guard let hbft = created else {
+            ZonvieCore.appLog("[Atlas] hbft create FAILED for \(url.lastPathComponent) (cached as failed)")
+            failedHbftURLs.insert(urlKey)
+            return nil
+        }
 
         // Apply OpenType features to fallback font handle too
         applyFeatures_locked(to: hbft)
@@ -713,19 +735,46 @@ final class GlyphAtlas {
 
         guard let uni = UnicodeScalar(scalar) else { return nil }
         let s = String(uni) as CFString
+        let cfLen = CFStringGetLength(s)
         // Ask CoreText for a font that can render this string.
-        // Range is the whole string.
         let start = CFAbsoluteTimeGetCurrent()
-        let fb = CTFontCreateForString(base, s, CFRange(location: 0, length: 1))
+        let fb = CTFontCreateForString(base, s, CFRange(location: 0, length: cfLen))
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
         if elapsed > 1.0 {
             let scalarChar = String(uni)
             ZonvieCore.appLog("[Atlas] SLOW CTFontCreateForString: scalar=0x\(String(scalar, radix: 16)) '\(scalarChar)' took \(String(format: "%.1f", elapsed))ms")
         }
 
+        // CTFontCreateForString may return LastResort for emoji scalars
+        // when the base font is a Nerd Font. Explicitly try Apple Color Emoji.
+        var result = fb
+        let fbName = CTFontCopyPostScriptName(fb) as String
+        if fbName == "LastResort" || fbName == ".LastResort" {
+            if let emojiFont = emojiFont(size: CTFontGetSize(base)) {
+                // Verify the emoji font actually has this glyph
+                if glyphID(in: emojiFont, scalar: scalar) != nil {
+                    result = emojiFont
+                }
+            }
+        }
+
         // Cache the result for future lookups
-        fallbackFontCache[cacheKey] = fb
-        return fb
+        fallbackFontCache[cacheKey] = result
+        return result
+    }
+
+    /// Cached Apple Color Emoji CTFont for emoji fallback.
+    private var cachedEmojiFont: CTFont?
+    private var cachedEmojiFontSize: CGFloat = 0
+
+    private func emojiFont(size: CGFloat) -> CTFont? {
+        if let cached = cachedEmojiFont, cachedEmojiFontSize == size {
+            return cached
+        }
+        let f = CTFontCreateWithName("Apple Color Emoji" as CFString, size, nil)
+        cachedEmojiFont = f
+        cachedEmojiFontSize = size
+        return f
     }
 
     deinit {
@@ -765,7 +814,7 @@ final class GlyphAtlas {
 
     private func makeTexture(device: MTLDevice, w: Int, h: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r8Unorm,
+            pixelFormat: .rgba8Unorm,
             width: w,
             height: h,
             mipmapped: false
@@ -777,13 +826,14 @@ final class GlyphAtlas {
             return nil
         }
 
-        // Zero-clear: reuse persistent 1-row buffer
-        if zeroRow.count < w { zeroRow = Array<UInt8>(repeating: 0, count: w) }
+        // Zero-clear: reuse persistent 1-row buffer (RGBA = 4 bytes per pixel)
+        let rowBytes = w * 4
+        if zeroRow.count < rowBytes { zeroRow = Array<UInt8>(repeating: 0, count: rowBytes) }
         zeroRow.withUnsafeBytes { raw in
             guard let ptr = raw.baseAddress else { return }
             for row in 0..<h {
                 tex.replace(region: MTLRegionMake2D(0, row, w, 1),
-                            mipmapLevel: 0, withBytes: ptr, bytesPerRow: w)
+                            mipmapLevel: 0, withBytes: ptr, bytesPerRow: rowBytes)
             }
         }
         return tex
@@ -791,7 +841,7 @@ final class GlyphAtlas {
 
     private func rasterizeAndPack(hbft: OpaquePointer, glyphID: UInt32) -> Entry? {
         guard let tex = textures[1 - frontIndex] else { return nil }
-    
+
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0
         var h: Int32 = 0
@@ -799,8 +849,9 @@ final class GlyphAtlas {
         var left: Int32 = 0
         var top: Int32 = 0
         var adv26_6: Int32 = 0
-    
-        let r = zonvie_ft_render_glyph(
+        var bpp: Int32 = 1
+
+        let r = zonvie_ft_render_glyph_color(
             hbft,
             glyphID,
             &bufPtr,
@@ -809,11 +860,12 @@ final class GlyphAtlas {
             &pitch,
             &left,
             &top,
-            &adv26_6
+            &adv26_6,
+            &bpp
         )
-    
+
         let advancePx = Float(adv26_6) / 64.0
-    
+
         // Whitespace etc: nothing to pack/upload.
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
             return Entry(
@@ -825,15 +877,16 @@ final class GlyphAtlas {
                 advancePx: advancePx
             )
         }
-    
+
         let pad: Int = 1
         let iw = Int(w)
         let ih = Int(h)
         let ipitch = Int(pitch)
-    
+        let ibpp = Int(bpp)
+
         let packedW = iw + pad * 2
         let packedH = ih + pad * 2
-    
+
         // Allocate atlas rect (simple shelf packer).
         if nextX + packedW > atlasW {
             nextX = 1
@@ -844,14 +897,14 @@ final class GlyphAtlas {
             // Atlas full: reset once and continue packing into a fresh atlas.
             resetAtlas_locked()
         }
-    
+
         let rectX = nextX
         let rectY = nextY
         nextX += packedW
         rowH = max(rowH, packedH)
-    
-        // Copy FT bitmap into a padded buffer (top-left origin for texture upload).
-        let neededCount = packedW * packedH
+
+        // Copy FT bitmap into a padded RGBA buffer (top-left origin for texture upload).
+        let neededCount = packedW * packedH * 4  // RGBA = 4 bytes per pixel
 
         // Guard against extremely large glyphs that would exhaust memory
         if neededCount > maxScratchSize {
@@ -869,23 +922,47 @@ final class GlyphAtlas {
                 memset(base, 0, neededCount)
             }
         }
-    
+
         scratch.withUnsafeMutableBufferPointer { dst in
             guard let dstBase = dst.baseAddress else { return }
             guard let srcBase = bufPtr else { return }  // Safe unwrap
 
-            for row in 0..<ih {
-                let src = srcBase.advanced(by: row * ipitch)
-                let dstIndex = (row + pad) * packedW + pad
-                memcpy(dstBase.advanced(by: dstIndex), src, iw)
+            if ibpp == 4 {
+                // BGRA color bitmap (emoji) → convert to RGBA
+                for row in 0..<ih {
+                    let src = srcBase.advanced(by: row * ipitch)
+                    let dstRow = dstBase.advanced(by: (row + pad) * packedW * 4 + pad * 4)
+                    for col in 0..<iw {
+                        let si = col * 4
+                        let di = col * 4
+                        dstRow[di + 0] = src[si + 2]  // R ← B
+                        dstRow[di + 1] = src[si + 1]  // G ← G
+                        dstRow[di + 2] = src[si + 0]  // B ← R
+                        dstRow[di + 3] = src[si + 3]  // A ← A
+                    }
+                }
+            } else {
+                // Grayscale → expand to RGBA (coverage in all channels)
+                for row in 0..<ih {
+                    let src = srcBase.advanced(by: row * ipitch)
+                    let dstRow = dstBase.advanced(by: (row + pad) * packedW * 4 + pad * 4)
+                    for col in 0..<iw {
+                        let gray = src[col]
+                        let di = col * 4
+                        dstRow[di + 0] = gray  // R
+                        dstRow[di + 1] = gray  // G
+                        dstRow[di + 2] = gray  // B
+                        dstRow[di + 3] = gray  // A (coverage)
+                    }
+                }
             }
         }
-    
-        // Upload to texture.
+
+        // Upload to RGBA texture.
         scratch.withUnsafeBytes { raw in
             guard let baseAddr = raw.baseAddress else { return }  // Safe unwrap
             let region = MTLRegionMake2D(rectX, rectY, packedW, packedH)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: packedW)
+            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: packedW * 4)
         }
     
         // UV excludes padding.
@@ -933,7 +1010,7 @@ final class GlyphAtlas {
         return nil
     }
 
-    private func resolveHbftAndGlyph_locked(scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer, glyphID: UInt32)? {
+    private func resolveHbftAndGlyph_locked(scalar: UInt32, styleFlags: UInt32) -> (hbft: OpaquePointer?, glyphID: UInt32, ctFont: CTFont)? {
         let failKey = (UInt64(styleFlags) << 32) | UInt64(scalar)
         if failedScalarCache.contains(failKey) {
             return nil
@@ -968,11 +1045,11 @@ final class GlyphAtlas {
         // Otherwise use CTFont cmap (faster, no shaping overhead).
         if hasFeatures {
             if let gid = glyphIDViaShaping(hbft: hbft, scalar: scalar) {
-                return (hbft: hbft, glyphID: gid)
+                return (hbft: hbft, glyphID: gid, ctFont: fontToUse)
             }
         } else {
             if let gid = glyphID(in: fontToUse, scalar: scalar) {
-                return (hbft: hbft, glyphID: gid)
+                return (hbft: hbft, glyphID: gid, ctFont: fontToUse)
             }
         }
 
@@ -980,11 +1057,11 @@ final class GlyphAtlas {
         if fontToUse !== font, let baseHbft = hbftFont {
             if hasFeatures {
                 if let gid = glyphIDViaShaping(hbft: baseHbft, scalar: scalar) {
-                    return (hbft: baseHbft, glyphID: gid)
+                    return (hbft: baseHbft, glyphID: gid, ctFont: font)
                 }
             } else {
                 if let gid = glyphID(in: font, scalar: scalar) {
-                    return (hbft: baseHbft, glyphID: gid)
+                    return (hbft: baseHbft, glyphID: gid, ctFont: font)
                 }
             }
         }
@@ -994,23 +1071,116 @@ final class GlyphAtlas {
             failedScalarCache.insert(failKey)
             return nil
         }
-        guard let face = ensureHbFtFace_locked(for: fbCT) else {
-            failedScalarCache.insert(failKey)
-            return nil
+
+        // Try to create HarfBuzz/FreeType handle for the fallback font.
+        // This may fail for bitmap-only fonts (e.g., Apple Color Emoji sbix).
+        let face = ensureHbFtFace_locked(for: fbCT)
+        let fbHbft: OpaquePointer? = face?.hbft
+
+        if let fbHbft {
+            if hasFeatures {
+                if let gid = glyphIDViaShaping(hbft: fbHbft, scalar: scalar) {
+                    return (hbft: fbHbft, glyphID: gid, ctFont: fbCT)
+                }
+            } else {
+                if let gid = glyphID(in: fbCT, scalar: scalar) {
+                    return (hbft: fbHbft, glyphID: gid, ctFont: fbCT)
+                }
+            }
         }
 
-        if hasFeatures {
-            if let gid = glyphIDViaShaping(hbft: face.hbft, scalar: scalar) {
-                return (hbft: face.hbft, glyphID: gid)
-            }
-        } else {
-            if let gid = glyphID(in: fbCT, scalar: scalar) {
-                return (hbft: face.hbft, glyphID: gid)
-            }
+        // hbft unavailable (bitmap font) — return CTFont-only result for CoreGraphics fallback
+        if let gid = glyphID(in: fbCT, scalar: scalar) {
+            return (hbft: nil, glyphID: gid, ctFont: fbCT)
         }
 
         failedScalarCache.insert(failKey)
         return nil
+    }
+
+    /// CoreGraphics fallback for color emoji rendering.
+    /// FreeType cannot decode Apple Color Emoji sbix (PNG) tables without libpng.
+    /// Uses CTFont + CGContext to render the glyph into an RGBA bitmap.
+    /// Must be called with mu locked. Stores pixel data in rasterizeScratch.
+    private func renderGlyphWithCoreGraphics_locked(
+        ctFont: CTFont, glyphID: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+    ) -> Bool {
+        var glyph = CGGlyph(glyphID)
+
+        // Get glyph bounding rect
+        var boundingRect = CGRect.zero
+        CTFontGetBoundingRectsForGlyphs(ctFont, .default, &glyph, &boundingRect, 1)
+
+        // Skip empty glyphs
+        if boundingRect.width < 1 || boundingRect.height < 1 {
+            return false
+        }
+
+        // Get advance
+        var advance = CGSize.zero
+        CTFontGetAdvancesForGlyphs(ctFont, .default, &glyph, &advance, 1)
+
+        // Compute bitmap dimensions with padding
+        let pad: Int = 1
+        let bitmapW = Int(ceil(boundingRect.width)) + pad * 2
+        let bitmapH = Int(ceil(boundingRect.height)) + pad * 2
+        let rowBytes = bitmapW * 4
+
+        // Ensure scratch buffer is large enough
+        let needed = rowBytes * bitmapH
+        if rasterizeScratch.count < needed {
+            rasterizeScratch = Array(repeating: 0, count: needed)
+        }
+
+        // Zero the region we'll use
+        _ = rasterizeScratch.withUnsafeMutableBufferPointer { buf in
+            memset(buf.baseAddress!, 0, needed)
+        }
+
+        // Create RGBA CGContext and draw glyph — must happen while pointer is valid
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let drawOK = rasterizeScratch.withUnsafeMutableBufferPointer { buf -> Bool in
+            guard let ctx = CGContext(
+                data: buf.baseAddress,
+                width: bitmapW,
+                height: bitmapH,
+                bitsPerComponent: 8,
+                bytesPerRow: rowBytes,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue  // RGBA premultiplied
+            ) else {
+                return false
+            }
+
+            // Position the glyph: origin accounts for bbox offset + padding
+            let originX = CGFloat(pad) - boundingRect.origin.x
+            let originY = CGFloat(pad) - boundingRect.origin.y
+            var position = CGPoint(x: originX, y: originY)
+            var g = glyph
+
+            CTFontDrawGlyphs(ctFont, &g, &position, 1, ctx)
+            return true
+        }
+        if !drawOK { return false }
+
+        // Fill outBitmap
+        let bearingX = Int32(floor(boundingRect.origin.x)) - Int32(pad)
+        let bearingY = Int32(ceil(boundingRect.origin.y + boundingRect.height)) + Int32(pad)
+
+        rasterizeScratch.withUnsafeBufferPointer { buf in
+            outBitmap.pointee.pixels = buf.baseAddress
+        }
+        outBitmap.pointee.width = UInt32(bitmapW)
+        outBitmap.pointee.height = UInt32(bitmapH)
+        outBitmap.pointee.pitch = Int32(rowBytes)
+        outBitmap.pointee.bearing_x = bearingX
+        outBitmap.pointee.bearing_y = bearingY
+        outBitmap.pointee.advance_26_6 = Int32(advance.width * 64.0)
+        outBitmap.pointee.bytes_per_pixel = 4
+        outBitmap.pointee.ascent_px = ascentPx
+        outBitmap.pointee.descent_px = descentPx
+
+        return true
     }
 
     /// Phase 2: Rasterize a glyph without atlas packing.
@@ -1024,13 +1194,30 @@ final class GlyphAtlas {
             return false
         }
 
+        // No hbft handle (bitmap-only font like Apple Color Emoji) — go straight to CoreGraphics
+        if resolved.hbft == nil {
+            outBitmap.pointee.ascent_px = ascentPx
+            outBitmap.pointee.descent_px = descentPx
+            if renderGlyphWithCoreGraphics_locked(
+                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap
+            ) {
+                return true
+            }
+            outBitmap.pointee.pixels = nil
+            outBitmap.pointee.width = 0
+            outBitmap.pointee.height = 0
+            outBitmap.pointee.bytes_per_pixel = 1
+            return true
+        }
+
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
         var left: Int32 = 0, top: Int32 = 0, adv26_6: Int32 = 0
+        var bpp: Int32 = 1
 
-        let r = zonvie_ft_render_glyph(
+        let r = zonvie_ft_render_glyph_color(
             resolved.hbft, resolved.glyphID,
-            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6
+            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6, &bpp
         )
 
         outBitmap.pointee.bearing_x = left
@@ -1038,36 +1225,71 @@ final class GlyphAtlas {
         outBitmap.pointee.advance_26_6 = adv26_6
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
-        outBitmap.pointee.bytes_per_pixel = 1 // grayscale
 
+        // FreeType color rendering failed or produced empty bitmap.
+        // Fall back to CoreGraphics for color emoji (sbix/COLR fonts need libpng).
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
-            outBitmap.pointee.pixels = nil
-            outBitmap.pointee.width = 0
-            outBitmap.pointee.height = 0
-        } else {
-            // Copy bitmap data to stable buffer while under lock.
-            // This prevents use-after-free if main thread destroys FreeType font
-            // (via setBackingScale/rebuildFont_locked) between rasterizeOnly and uploadRegion.
-            let needed = Int(w) * Int(h)
-            if rasterizeScratch.count < needed {
-                rasterizeScratch = Array(repeating: 0, count: needed)
+            if renderGlyphWithCoreGraphics_locked(
+                ctFont: resolved.ctFont, glyphID: resolved.glyphID, outBitmap: outBitmap
+            ) {
+                return true
             }
-            let absPitch = abs(Int(pitch))
-            rasterizeScratch.withUnsafeMutableBufferPointer { dst in
-                guard let base = dst.baseAddress else { return }
-                for row in 0..<Int(h) {
-                    let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
-                    let src = bufPtr!.advanced(by: srcRow * absPitch)
-                    memcpy(base.advanced(by: row * Int(w)), src, Int(w))
+            // Also try grayscale FreeType as last resort
+            let r2 = zonvie_ft_render_glyph(
+                resolved.hbft!, resolved.glyphID,
+                &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6
+            )
+            outBitmap.pointee.bearing_x = left
+            outBitmap.pointee.bearing_y = top
+            outBitmap.pointee.advance_26_6 = adv26_6
+            if r2 != 0 || w <= 0 || h <= 0 || bufPtr == nil {
+                outBitmap.pointee.pixels = nil
+                outBitmap.pointee.width = 0
+                outBitmap.pointee.height = 0
+                outBitmap.pointee.bytes_per_pixel = 1
+                return true
+            }
+            bpp = 1
+        }
+
+        // Copy bitmap data to stable buffer while under lock.
+        // This prevents use-after-free if main thread destroys FreeType font
+        // (via setBackingScale/rebuildFont_locked) between rasterizeOnly and uploadRegion.
+        let ibpp = Int(bpp)
+        let rowBytes = Int(w) * ibpp
+        let needed = rowBytes * Int(h)
+        if rasterizeScratch.count < needed {
+            rasterizeScratch = Array(repeating: 0, count: needed)
+        }
+        let absPitch = abs(Int(pitch))
+        rasterizeScratch.withUnsafeMutableBufferPointer { dst in
+            guard let base = dst.baseAddress else { return }
+            for row in 0..<Int(h) {
+                let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
+                let src = bufPtr!.advanced(by: srcRow * absPitch)
+                if ibpp == 4 {
+                    // BGRA → RGBA conversion
+                    let dstRow = base.advanced(by: row * rowBytes)
+                    for col in 0..<Int(w) {
+                        let si = col * 4
+                        let di = col * 4
+                        dstRow[di + 0] = src[si + 2]  // R ← B
+                        dstRow[di + 1] = src[si + 1]  // G ← G
+                        dstRow[di + 2] = src[si + 0]  // B ← R
+                        dstRow[di + 3] = src[si + 3]  // A ← A
+                    }
+                } else {
+                    memcpy(base.advanced(by: row * rowBytes), src, rowBytes)
                 }
             }
-            rasterizeScratch.withUnsafeBufferPointer { buf in
-                outBitmap.pointee.pixels = buf.baseAddress
-            }
-            outBitmap.pointee.width = UInt32(w)
-            outBitmap.pointee.height = UInt32(h)
-            outBitmap.pointee.pitch = Int32(w)  // contiguous: pitch = width
         }
+        rasterizeScratch.withUnsafeBufferPointer { buf in
+            outBitmap.pointee.pixels = buf.baseAddress
+        }
+        outBitmap.pointee.width = UInt32(w)
+        outBitmap.pointee.height = UInt32(h)
+        outBitmap.pointee.pitch = Int32(rowBytes)
+        outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
 
         return true
     }
@@ -1086,6 +1308,23 @@ final class GlyphAtlas {
             return hbftItalic ?? hbftFont
         } else {
             return hbftFont
+        }
+    }
+
+    /// Select the appropriate CTFont for the given style flags.
+    /// Must be called with mu locked.
+    private func selectCtFont_locked(styleFlags: UInt32) -> CTFont {
+        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
+        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
+
+        if isBold && isItalic {
+            return boldItalicFont ?? boldFont ?? italicFont ?? font
+        } else if isBold {
+            return boldFont ?? font
+        } else if isItalic {
+            return italicFont ?? font
+        } else {
+            return font
         }
     }
 
@@ -1155,10 +1394,11 @@ final class GlyphAtlas {
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
         var left: Int32 = 0, top: Int32 = 0, adv26_6: Int32 = 0
+        var bpp: Int32 = 1
 
-        let r = zonvie_ft_render_glyph(
+        let r = zonvie_ft_render_glyph_color(
             hbft, glyphID,
-            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6
+            &bufPtr, &w, &h, &pitch, &left, &top, &adv26_6, &bpp
         )
 
         outBitmap.pointee.bearing_x = left
@@ -1166,15 +1406,24 @@ final class GlyphAtlas {
         outBitmap.pointee.advance_26_6 = adv26_6
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
-        outBitmap.pointee.bytes_per_pixel = 1 // grayscale
 
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
+            // FreeType color failed — try CoreGraphics fallback
+            let ctFontToUse = selectCtFont_locked(styleFlags: styleFlags)
+            if renderGlyphWithCoreGraphics_locked(
+                ctFont: ctFontToUse, glyphID: glyphID, outBitmap: outBitmap
+            ) {
+                return true
+            }
             outBitmap.pointee.pixels = nil
             outBitmap.pointee.width = 0
             outBitmap.pointee.height = 0
+            outBitmap.pointee.bytes_per_pixel = 1
         } else {
             // Copy bitmap data to stable buffer (same as rasterizeOnly)
-            let needed = Int(w) * Int(h)
+            let ibpp = Int(bpp)
+            let rowBytes = Int(w) * ibpp
+            let needed = rowBytes * Int(h)
             if rasterizeScratch.count < needed {
                 rasterizeScratch = Array(repeating: 0, count: needed)
             }
@@ -1184,7 +1433,20 @@ final class GlyphAtlas {
                 for row in 0..<Int(h) {
                     let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
                     let src = bufPtr!.advanced(by: srcRow * absPitch)
-                    memcpy(base.advanced(by: row * Int(w)), src, Int(w))
+                    if ibpp == 4 {
+                        // BGRA → RGBA conversion
+                        let dstRow = base.advanced(by: row * rowBytes)
+                        for col in 0..<Int(w) {
+                            let si = col * 4
+                            let di = col * 4
+                            dstRow[di + 0] = src[si + 2]  // R ← B
+                            dstRow[di + 1] = src[si + 1]  // G ← G
+                            dstRow[di + 2] = src[si + 0]  // B ← R
+                            dstRow[di + 3] = src[si + 3]  // A ← A
+                        }
+                    } else {
+                        memcpy(base.advanced(by: row * rowBytes), src, rowBytes)
+                    }
                 }
             }
             rasterizeScratch.withUnsafeBufferPointer { buf in
@@ -1192,7 +1454,8 @@ final class GlyphAtlas {
             }
             outBitmap.pointee.width = UInt32(w)
             outBitmap.pointee.height = UInt32(h)
-            outBitmap.pointee.pitch = Int32(w)
+            outBitmap.pointee.pitch = Int32(rowBytes)
+            outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
         }
 
         return true
@@ -1207,7 +1470,8 @@ final class GlyphAtlas {
         guard let tex, let pixels = bitmap.pointee.pixels else { return }
         let pitch = Int(bitmap.pointee.pitch)
         let absPitch = abs(pitch)
-        let needed = width * height
+        let bpp = Int(bitmap.pointee.bytes_per_pixel)
+        let needed = width * height * 4  // RGBA atlas
         if needed <= 0 { return }
 
         if scratch.count < needed {
@@ -1221,17 +1485,32 @@ final class GlyphAtlas {
 
         scratch.withUnsafeMutableBufferPointer { dst in
             guard let dstBase = dst.baseAddress else { return }
+            let srcWidth = min(width, Int(bitmap.pointee.width))
             for row in 0..<height {
                 let srcRow = pitch >= 0 ? row : (height - 1 - row)
                 let src = pixels.advanced(by: srcRow * absPitch)
-                memcpy(dstBase.advanced(by: row * width), src, min(width, Int(bitmap.pointee.width)))
+                let dstRow = dstBase.advanced(by: row * width * 4)
+                if bpp >= 4 {
+                    // RGBA data (already BGRA→RGBA converted by rasterizeOnly)
+                    memcpy(dstRow, src, srcWidth * 4)
+                } else {
+                    // Grayscale → expand to RGBA
+                    for col in 0..<srcWidth {
+                        let gray = src[col]
+                        let di = col * 4
+                        dstRow[di + 0] = gray  // R
+                        dstRow[di + 1] = gray  // G
+                        dstRow[di + 2] = gray  // B
+                        dstRow[di + 3] = gray  // A (coverage)
+                    }
+                }
             }
         }
 
         scratch.withUnsafeBytes { raw in
             guard let baseAddr = raw.baseAddress else { return }
             let region = MTLRegionMake2D(destX, destY, width, height)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: width)
+            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: width * 4)
         }
 
         atlasModified = true
@@ -1336,8 +1615,8 @@ final class GlyphAtlas {
         }
 
         if !syncedWasRecreate, let rect = syncedRect {
-            let bytesPerRow = rect.width
-            let totalBytes = rect.width * rect.height
+            let bytesPerRow = rect.width * 4  // RGBA = 4 bytes per pixel
+            let totalBytes = rect.width * rect.height * 4
             if totalBytes > 0 {
                 if backSyncScratch.count < totalBytes {
                     backSyncScratch = Array<UInt8>(repeating: 0, count: totalBytes)

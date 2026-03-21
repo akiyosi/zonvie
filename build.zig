@@ -83,6 +83,9 @@ pub fn build(b: *std.Build) !void {
         // --- Add: Registry + Shell for file associations ---
         win_exe.linkSystemLibrary("advapi32");
         win_exe.linkSystemLibrary("shell32");
+
+        // --- Timer resolution for reducing scheduler quantum ---
+        win_exe.linkSystemLibrary("winmm");
     }
 
     const install_win = b.addInstallArtifact(win_exe, .{

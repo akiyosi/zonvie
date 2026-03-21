@@ -12,6 +12,7 @@ using namespace metal;
 #define DECO_SCROLLABLE    (1u << 7)
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
+#define DECO_COLOR_EMOJI   (1u << 10)
 
 // Mask for visual decoration flags (excludes transport-only flags like SCROLLABLE)
 #define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE)
@@ -228,7 +229,13 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     // Do not flip V here (causes vertical flip)
     float2 uv = in.uv;
 
-    // R8Unorm atlas => coverage in .r
+    // Color emoji: sample RGBA directly (premultiplied alpha)
+    if (in.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = tex.sample(samp, uv);
+        return float4(emoji.rgb, emoji.a);
+    }
+
+    // Grayscale glyph: RGBA atlas stores coverage in .r (all channels equal)
     float cov = tex.sample(samp, uv).r;
 
     // Multiply alpha by coverage (text keeps full alpha)
@@ -373,6 +380,14 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
 
     // Glyph rendering: sample from atlas
     float2 uv = in.uv;
+
+    // Color emoji: sample RGBA directly
+    if (in.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = tex.sample(samp, uv);
+        return float4(emoji.rgb, emoji.a);
+    }
+
+    // Grayscale glyph: coverage in .r
     float cov = tex.sample(samp, uv).r;
     return float4(in.color.rgb, in.color.a * cov);
 }
@@ -433,6 +448,12 @@ fragment float4 ps_glow_extract(VSOut in [[stage_in]],
     if (!(in.deco_flags & DECO_GLOW)) discard_fragment();
     // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
     if (in.uv.x < 0.0) discard_fragment();
+
+    // Color emoji: use texture color directly
+    if (in.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = tex.sample(samp, in.uv);
+        return float4(emoji.rgb, emoji.a);
+    }
 
     float cov = tex.sample(samp, in.uv).r;
     return float4(in.color.rgb * cov, cov);

@@ -995,6 +995,7 @@ pub const Core = struct {
                 .advance_px = adv,
                 .ascent_px = bm.ascent_px,
                 .descent_px = bm.descent_px,
+                .bytes_per_pixel = bm.bytes_per_pixel,
             };
         }
 
@@ -1042,6 +1043,7 @@ pub const Core = struct {
             .advance_px = adv,
             .ascent_px = bm.ascent_px,
             .descent_px = bm.descent_px,
+            .bytes_per_pixel = bm.bytes_per_pixel,
         };
     }
 

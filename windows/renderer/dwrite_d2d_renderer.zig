@@ -57,7 +57,11 @@ pub const Renderer = struct {
     italic_font_face: ?*c.IDWriteFontFace = null,
     bold_italic_font_face: ?*c.IDWriteFontFace = null,
     styled_fonts_initialized: bool = false,
+    /// Cached result of COLR/CBDT/sbix table presence check.
+    /// null = not yet checked, true = font has color glyph tables.
+    has_color_tables: ?bool = null,
     font_em_size: f32 = 14.0,
+    emoji_font_size: f32 = 0, // scaled em size for Segoe UI Emoji (0 = not yet computed)
     base_point_size: f32 = 14.0, // original point size before DPI scaling
     dpi: u32 = 96,
     ascent_px: f32 = 0.0,
@@ -1177,6 +1181,352 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
     // --- Phase 2: Core-managed atlas ---
 
+    /// Check if the current base font face has color glyph tables (COLR, CBDT, sbix).
+    /// Result is cached per font face (reset on font change).
+    /// Caller must hold self.mu.
+    fn hasColorTables(self: *Renderer) bool {
+        if (self.has_color_tables) |cached| return cached;
+
+        const face = self.font_face orelse {
+            self.has_color_tables = false;
+            return false;
+        };
+        const fvtbl = face.lpVtbl.*;
+        const try_fn = fvtbl.TryGetFontTable orelse {
+            self.has_color_tables = false;
+            return false;
+        };
+
+        // Check COLR, CBDT, sbix, and SVG tables
+        const tag_names = [_]*const [4]u8{ "COLR", "CBDT", "sbix", "SVG " };
+        const tags = [_]u32{
+            packTag("COLR"),
+            packTag("CBDT"),
+            packTag("sbix"),
+            packTag("SVG "),
+        };
+        for (tags, 0..) |tag, ti| {
+            var data: ?*const anyopaque = null;
+            var size: c.UINT32 = 0;
+            var ctx: ?*anyopaque = null;
+            var exists: c.BOOL = c.FALSE;
+            const hr = try_fn(face, tag, &data, &size, &ctx, &exists);
+            if (applog.isEnabled()) {
+                applog.appLog("[color_tables] checking {s}: hr=0x{x} exists={d} size={d}\n", .{ tag_names[ti], @as(u32, @bitCast(hr)), @as(u32, @intFromBool(exists != c.FALSE)), size });
+            }
+            if (ctx != null) {
+                if (fvtbl.ReleaseFontTable) |rel_fn| rel_fn(face, ctx);
+            }
+            if (!c.FAILED(hr) and exists != c.FALSE and size > 0) {
+                if (applog.isEnabled()) applog.appLog("[color_tables] FOUND {s} table, size={d}\n", .{ tag_names[ti], size });
+                self.has_color_tables = true;
+                return true;
+            }
+        }
+        if (applog.isEnabled()) applog.appLog("[color_tables] no color tables found\n", .{});
+        self.has_color_tables = false;
+        return false;
+    }
+
+    /// Compute the DIP font size for Segoe UI Emoji that fits within cell_h_px.
+    /// Uses DWrite TextLayout to measure the actual line height, then scales down
+    /// if the emoji font's metrics exceed the cell height.
+    fn computeEmojiFontSize(self: *Renderer, dwrite_factory: *c.IDWriteFactory, cell_h_f: f32) f32 {
+        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+        const locale: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
+
+        // Create a temporary text format at font_em_size to measure
+        var tmp_fmt: ?*c.IDWriteTextFormat = null;
+        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return self.font_em_size;
+        const hr_tf = create_tf(dwrite_factory, emoji_font_name, null, c.DWRITE_FONT_WEIGHT_NORMAL, c.DWRITE_FONT_STYLE_NORMAL, c.DWRITE_FONT_STRETCH_NORMAL, self.font_em_size, locale, &tmp_fmt);
+        if (hr_tf != 0 or tmp_fmt == null) return self.font_em_size;
+        defer {
+            const base: *c.IUnknown = @ptrCast(tmp_fmt.?);
+            _ = base.lpVtbl.*.Release.?(base);
+        }
+
+        // Measure a sample emoji character
+        const sample: [2]c.WCHAR = .{ 0xD83D, 0xDE01 }; // U+1F601 😁
+        var layout: ?*c.IDWriteTextLayout = null;
+        const create_layout = dwrite_factory.lpVtbl.*.CreateTextLayout orelse return self.font_em_size;
+        const hr_layout = create_layout(dwrite_factory, &sample, 2, tmp_fmt.?, 1000.0, 1000.0, &layout);
+        if (hr_layout != 0 or layout == null) return self.font_em_size;
+        defer {
+            const base: *c.IUnknown = @ptrCast(layout.?);
+            _ = base.lpVtbl.*.Release.?(base);
+        }
+
+        var metrics: c.DWRITE_TEXT_METRICS = std.mem.zeroes(c.DWRITE_TEXT_METRICS);
+        const layout_ptr = layout.?;
+        const get_metrics = layout_ptr.lpVtbl.*.GetMetrics orelse return self.font_em_size;
+        if (get_metrics(layout_ptr, &metrics) != 0) return self.font_em_size;
+
+        const measured_h = metrics.height;
+        if (measured_h <= 0 or measured_h <= cell_h_f) return self.font_em_size;
+
+        // Scale down: emoji_size = font_em_size * (cell_h / measured_h)
+        return self.font_em_size * cell_h_f / measured_h;
+    }
+
+    /// D2D color emoji rendering: render a Unicode scalar (or cluster) via D2D
+    /// DrawTextW into a 32-bit BGRA DIB section, then copy to glyph_tmp as RGBA.
+    /// Returns true if color emoji was successfully rendered.
+    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, out_bitmap: *core.GlyphBitmap) bool {
+        // Use oversized buffer so emoji glyphs are not clipped.
+        // Emoji fonts often render taller than the cell height (ascent + descent
+        // can exceed em size). The actual glyph bounds are scanned afterwards and
+        // only the non-empty region is packed into the atlas.
+        const bmp_w: i32 = @intCast(self.cell_w_px * 3);
+        const bmp_h: i32 = @intCast(self.cell_h_px * 2);
+        if (bmp_w <= 0 or bmp_h <= 0) return false;
+
+        const d2d_factory = self.d2d_factory orelse return false;
+        const dwrite_factory = self.dwrite_factory orelse return false;
+
+        // Create memory DC + 32-bit BGRA DIB section for D2D DC render target
+        const hdc = c.CreateCompatibleDC(null);
+        if (hdc == null) return false;
+        defer _ = c.DeleteDC(hdc);
+
+        var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+        bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = bmp_w;
+        bmi.bmiHeader.biHeight = -bmp_h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = c.BI_RGB;
+
+        var bits: ?*anyopaque = null;
+        const hbm = c.CreateDIBSection(hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
+        if (hbm == null or bits == null) return false;
+        defer _ = c.DeleteObject(hbm);
+
+        _ = c.SelectObject(hdc, hbm);
+
+        // Create D2D DC render target
+        const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
+            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            .pixelFormat = .{
+                .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
+                .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            .dpiX = 0,
+            .dpiY = 0,
+            .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
+            .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+
+        var dc_rt: ?*c.ID2D1DCRenderTarget = null;
+        const create_fn = d2d_factory.lpVtbl.*.CreateDCRenderTarget orelse return false;
+        const hr_rt = create_fn(d2d_factory, &rtp, &dc_rt);
+        if (hr_rt != 0 or dc_rt == null) return false;
+        defer {
+            const base: *c.IUnknown = @ptrCast(dc_rt.?);
+            _ = base.lpVtbl.*.Release.?(base);
+        }
+
+        // Bind D2D render target to the memory DC
+        var bind_rect: c.RECT = .{ .left = 0, .top = 0, .right = bmp_w, .bottom = bmp_h };
+        const bind_fn = dc_rt.?.lpVtbl.*.BindDC orelse return false;
+        const hr_bind = bind_fn(dc_rt.?, hdc, &bind_rect);
+        if (hr_bind != 0) return false;
+
+        // Compute emoji font size on first use: measure the actual line height
+        // of Segoe UI Emoji at font_em_size and scale down if it exceeds cell_h_px.
+        const cell_h_f: f32 = @floatFromInt(self.cell_h_px);
+        if (self.emoji_font_size == 0) {
+            self.emoji_font_size = self.computeEmojiFontSize(dwrite_factory, cell_h_f);
+        }
+
+        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+        var text_format: ?*c.IDWriteTextFormat = null;
+        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return false;
+        const hr_tf = create_tf(
+            dwrite_factory,
+            emoji_font_name,
+            null, // font collection (system default)
+            c.DWRITE_FONT_WEIGHT_NORMAL,
+            c.DWRITE_FONT_STYLE_NORMAL,
+            c.DWRITE_FONT_STRETCH_NORMAL,
+            self.emoji_font_size,
+            std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
+            &text_format,
+        );
+        if (hr_tf != 0 or text_format == null) return false;
+        defer {
+            const base: *c.IUnknown = @ptrCast(text_format.?);
+            _ = base.lpVtbl.*.Release.?(base);
+        }
+
+        // Convert cluster scalars to UTF-16.
+        // If flush set a multi-scalar cluster context, use the full cluster;
+        // otherwise fall back to the single scalar argument.
+        const flush_mod = core.flush_mod;
+        const cluster_len = flush_mod.emoji_cluster_len;
+        var text_buf: [32]c.WCHAR = undefined; // max 16 scalars * 2 UTF-16 units
+        var text_len: u32 = 0;
+        if (cluster_len > 1) {
+            for (flush_mod.emoji_cluster_buf[0..cluster_len]) |sc| {
+                if (sc <= 0xFFFF) {
+                    if (text_len < text_buf.len) {
+                        text_buf[text_len] = @intCast(sc);
+                        text_len += 1;
+                    }
+                } else {
+                    const v = sc - 0x10000;
+                    if (text_len + 1 < text_buf.len) {
+                        text_buf[text_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
+                        text_buf[text_len + 1] = @intCast(0xDC00 + (v & 0x3FF));
+                        text_len += 2;
+                    }
+                }
+            }
+        } else {
+            if (scalar <= 0xFFFF) {
+                text_buf[0] = @intCast(scalar);
+                text_len = 1;
+            } else {
+                const v = scalar - 0x10000;
+                text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
+                text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
+                text_len = 2;
+            }
+        }
+
+        // Draw emoji using D2D DrawText (supports color emoji natively)
+        const rt_base: *c.ID2D1RenderTarget = @ptrCast(dc_rt.?);
+        const vtbl = rt_base.lpVtbl.*;
+
+        if (vtbl.BeginDraw) |f| f(rt_base);
+
+        // Clear to transparent
+        if (vtbl.Clear) |f| {
+            const transparent = c.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 0 };
+            f(rt_base, &transparent);
+        }
+
+        // Create white brush for text (D2D will override with color emoji colors)
+        var brush: ?*c.ID2D1SolidColorBrush = null;
+        if (vtbl.CreateSolidColorBrush) |f| {
+            const white = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
+            _ = f(rt_base, &white, null, &brush);
+        }
+        defer {
+            if (brush) |b| {
+                const base: *c.IUnknown = @ptrCast(b);
+                _ = base.lpVtbl.*.Release.?(base);
+            }
+        }
+
+        if (brush) |b| {
+            const layout_rect = c.D2D1_RECT_F{
+                .left = 0,
+                .top = 0,
+                .right = @floatFromInt(bmp_w),
+                .bottom = @floatFromInt(bmp_h),
+            };
+            if (vtbl.DrawTextW) |draw_fn| {
+                draw_fn(
+                    rt_base,
+                    &text_buf,
+                    text_len,
+                    text_format.?,
+                    &layout_rect,
+                    @ptrCast(b),
+                    c.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                    c.DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        }
+
+        var tag1: u64 = 0;
+        var tag2: u64 = 0;
+        if (vtbl.EndDraw) |f| {
+            const hr_end = f(rt_base, &tag1, &tag2);
+            if (hr_end != 0) {
+                return false;
+            }
+        }
+
+        // Scan the DIB to find the actual bounding box of non-zero pixels
+        const pixels_ptr: [*]const u8 = @ptrCast(bits.?);
+        const stride: usize = @intCast(bmp_w * 4);
+        var min_x: i32 = bmp_w;
+        var min_y: i32 = bmp_h;
+        var max_x: i32 = 0;
+        var max_y: i32 = 0;
+        var y: i32 = 0;
+        while (y < bmp_h) : (y += 1) {
+            var x_i: i32 = 0;
+            while (x_i < bmp_w) : (x_i += 1) {
+                const off: usize = @intCast(y * bmp_w * 4 + x_i * 4);
+                const b_val = pixels_ptr[off + 0];
+                const g_val = pixels_ptr[off + 1];
+                const r_val = pixels_ptr[off + 2];
+                // DIB alpha channel: GDI sets this for color emoji, 0 for non-rendered
+                const a_val = pixels_ptr[off + 3];
+                if (r_val != 0 or g_val != 0 or b_val != 0 or a_val != 0) {
+                    if (x_i < min_x) min_x = x_i;
+                    if (x_i >= max_x) max_x = x_i + 1;
+                    if (y < min_y) min_y = y;
+                    if (y >= max_y) max_y = y + 1;
+                }
+            }
+        }
+
+        if (max_x <= min_x or max_y <= min_y) return false; // nothing rendered
+
+        const gw: u32 = @intCast(max_x - min_x);
+        const gh: u32 = @intCast(max_y - min_y);
+
+        // Copy BGRA -> RGBA into glyph_tmp
+        const needed: usize = @as(usize, gw) * @as(usize, gh) * 4;
+        self.glyph_tmp.resize(self.alloc, needed) catch return false;
+
+        var dy: u32 = 0;
+        while (dy < gh) : (dy += 1) {
+            const src_y: usize = @intCast(@as(i32, @intCast(dy)) + min_y);
+            var dx: u32 = 0;
+            while (dx < gw) : (dx += 1) {
+                const src_x: usize = @intCast(@as(i32, @intCast(dx)) + min_x);
+                const src_off: usize = src_y * stride + src_x * 4;
+                const dst_off: usize = @as(usize, dy) * @as(usize, gw) * 4 + @as(usize, dx) * 4;
+
+                const b_val = pixels_ptr[src_off + 0];
+                const g_val = pixels_ptr[src_off + 1];
+                const r_val = pixels_ptr[src_off + 2];
+                var a_val = pixels_ptr[src_off + 3];
+
+                // GDI color emoji: alpha is set by the system.
+                // Monochrome text: alpha=0 but RGB may be non-zero.
+                // For monochrome, synthesize alpha from luminance.
+                if (a_val == 0 and (r_val != 0 or g_val != 0 or b_val != 0)) {
+                    a_val = @max(r_val, @max(g_val, b_val));
+                }
+
+                // BGRA → RGBA
+                self.glyph_tmp.items[dst_off + 0] = r_val;
+                self.glyph_tmp.items[dst_off + 1] = g_val;
+                self.glyph_tmp.items[dst_off + 2] = b_val;
+                self.glyph_tmp.items[dst_off + 3] = a_val;
+            }
+        }
+
+        out_bitmap.pixels = self.glyph_tmp.items.ptr;
+        out_bitmap.width = gw;
+        out_bitmap.height = gh;
+        out_bitmap.pitch = @intCast(gw * 4);
+        out_bitmap.bearing_x = min_x;
+        const ascent_i: i32 = @intFromFloat(@round(self.ascent_px));
+        out_bitmap.bearing_y = ascent_i - min_y;
+        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
+        out_bitmap.ascent_px = self.ascent_px;
+        out_bitmap.descent_px = self.descent_px;
+        out_bitmap.bytes_per_pixel = 4;
+
+        return true;
+    }
+
     /// Phase 2: Rasterize glyph via DWrite without atlas packing.
     /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
     pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
@@ -1209,6 +1559,25 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             return err;
         };
 
+
+        // Emoji codepoints: always prefer system color emoji (D2D + Segoe UI Emoji).
+        // Also check the cluster context: flush sets emoji_cluster_len > 0 for
+        // VS16-qualified and multi-scalar emoji clusters (e.g., ☀️ = U+2600 + FE0F).
+        const flush_mod = core.flush_mod;
+        if (isEmojiPresentation(scalar) or flush_mod.emoji_cluster_len > 0) {
+            if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+                return;
+            }
+        }
+
+        // .notdef (glyph_index==0): font doesn't have this glyph.
+        // Try GDI color emoji fallback for non-emoji non-ASCII scalars.
+        if (glyph_index == 0 and scalar > 0xFF) {
+            if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+                return;
+            }
+        }
+
         // glyph run analysis
         var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
         glyph_run.fontFace = face;
@@ -1238,10 +1607,28 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
         if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
 
-        const bw_i32: i32 = bounds.right - bounds.left;
-        const bh_i32: i32 = bounds.bottom - bounds.top;
-        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+        var bw_i32: i32 = bounds.right - bounds.left;
+        var bh_i32: i32 = bounds.bottom - bounds.top;
+        var bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+        var bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+        var use_aliased: bool = false;
+
+        // ClearType returns empty bounds for color emoji (no outline).
+        // Fallback to aliased (1 bpp grayscale) for monochrome emoji rendering.
+        if (bw == 0 or bh == 0) {
+            var aliased_bounds: c.RECT = std.mem.zeroes(c.RECT);
+            const hr_aliased = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &aliased_bounds);
+            if (!c.FAILED(hr_aliased)) {
+                bw_i32 = aliased_bounds.right - aliased_bounds.left;
+                bh_i32 = aliased_bounds.bottom - aliased_bounds.top;
+                bw = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+                bh = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+                if (bw > 0 and bh > 0) {
+                    bounds = aliased_bounds;
+                    use_aliased = true;
+                }
+            }
+        }
 
         // Fill common metrics
         out_bitmap.bearing_x = bounds.left;
@@ -1249,29 +1636,52 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
         out_bitmap.ascent_px = self.ascent_px;
         out_bitmap.descent_px = self.descent_px;
-        out_bitmap.bytes_per_pixel = 3; // ClearType RGB
 
         if (bw == 0 or bh == 0) {
+            // DWrite produced empty bitmap. For non-ASCII scalars this may be a
+            // color emoji that DWrite ClearType/aliased can't render.
+            // Try GDI color emoji fallback before giving up.
+            if (scalar > 0xFF) {
+                if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+                    return;
+                }
+            }
             // Empty glyph (space etc.)
             out_bitmap.pixels = null;
             out_bitmap.width = 0;
             out_bitmap.height = 0;
             out_bitmap.pitch = 0;
+            out_bitmap.bytes_per_pixel = 3;
             return;
         }
 
-        // Fetch ClearType 3x1 texture (RGB, 3 bytes per pixel)
-        const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
-        try self.glyph_tmp.resize(self.alloc, buf_size);
-
         const create_alpha_fn = atbl.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-        const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-        if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
 
-        out_bitmap.pixels = self.glyph_tmp.items.ptr;
-        out_bitmap.width = bw;
-        out_bitmap.height = bh;
-        out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+        if (use_aliased) {
+            // Aliased 1x1 texture (1 byte per pixel, grayscale)
+            const buf_size: usize = @as(usize, bw) * @as(usize, bh);
+            try self.glyph_tmp.resize(self.alloc, buf_size);
+            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+            out_bitmap.pixels = self.glyph_tmp.items.ptr;
+            out_bitmap.width = bw;
+            out_bitmap.height = bh;
+            out_bitmap.pitch = @as(i32, @intCast(bw));
+            out_bitmap.bytes_per_pixel = 1; // grayscale aliased
+        } else {
+            // ClearType 3x1 texture (RGB, 3 bytes per pixel)
+            const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
+            try self.glyph_tmp.resize(self.alloc, buf_size);
+            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+            out_bitmap.pixels = self.glyph_tmp.items.ptr;
+            out_bitmap.width = bw;
+            out_bitmap.height = bh;
+            out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+            out_bitmap.bytes_per_pixel = 3; // ClearType RGB
+        }
     }
 
     /// Phase 2: Upload glyph bitmap to atlas_cpu at (dest_x, dest_y).
@@ -1326,6 +1736,17 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                     self.atlas_cpu.items[dst_off + 1] = g;
                     self.atlas_cpu.items[dst_off + 2] = b;
                     self.atlas_cpu.items[dst_off + 3] = @max(r, @max(g, b));
+                }
+            } else if (bpp >= 4) {
+                // RGBA direct copy (color emoji)
+                var x: u32 = 0;
+                while (x < width) : (x += 1) {
+                    const dst_off = (dst_row_base + @as(usize, dest_x + x)) * 4;
+                    const src_off = src_row * pitch + @as(usize, x) * 4;
+                    self.atlas_cpu.items[dst_off + 0] = pixels[src_off + 0];
+                    self.atlas_cpu.items[dst_off + 1] = pixels[src_off + 1];
+                    self.atlas_cpu.items[dst_off + 2] = pixels[src_off + 2];
+                    self.atlas_cpu.items[dst_off + 3] = pixels[src_off + 3];
                 }
             } else {
                 // Grayscale or other: replicate to RGBA
@@ -1580,12 +2001,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                 continue;
             }
     
-            // Glyph quad: FillOpacityMask
+            // Glyph quad
             const u_min = std.math.clamp(min_u, 0.0, 1.0);
             const u_max = std.math.clamp(max_u, 0.0, 1.0);
             const v_min = std.math.clamp(min_v, 0.0, 1.0);
             const v_max = std.math.clamp(max_v, 0.0, 1.0);
-    
+
             if (u_max <= u_min or v_max <= v_min) {
                 if (i < 24 and log_active) {
                     applog.appLog(
@@ -1595,15 +2016,41 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                 }
                 continue;
             }
-    
+
             const src = c.D2D1_RECT_F{
                 .left = u_min * atlas_w,
                 .top = v_min * atlas_h,
                 .right = u_max * atlas_w,
                 .bottom = v_max * atlas_h,
             };
-    
-            if (rtv.FillOpacityMask) |fill_mask_fn| {
+
+            const is_color_emoji = (quad[0].deco_flags & core.DECO_COLOR_EMOJI) != 0;
+
+            if (is_color_emoji) {
+                // Color emoji: use DrawBitmap to render RGBA directly from atlas
+                if (rtv.DrawBitmap) |draw_bmp_fn| {
+                    if (i < 24 and log_active) {
+                        applog.appLog(
+                            "[d2d] quad{d} COLOR_EMOJI DrawBitmap dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
+                            .{
+                                i / 6,
+                                dst.left, dst.top, dst.right, dst.bottom,
+                                src.left, src.top, src.right, src.bottom,
+                            },
+                        );
+                    }
+
+                    draw_bmp_fn(
+                        rt,
+                        atlas,
+                        &dst,
+                        1.0, // opacity
+                        c.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        &src,
+                    );
+                }
+            } else if (rtv.FillOpacityMask) |fill_mask_fn| {
+                // Regular glyph: FillOpacityMask (alpha-only rendering with brush color)
                 if (i < 24 and log_active) {
                     applog.appLog(
                         "[d2d] quad{d} GLYPH FillOpacityMask dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
@@ -1614,7 +2061,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                         },
                     );
                 }
-    
+
                 fill_mask_fn(
                     rt,
                     atlas,
@@ -1623,7 +2070,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
                     &dst,
                     &src,
                 );
-    
+
                 if (i < 24 and log_active) {
                     applog.appLog("[d2d] quad{d} FillOpacityMask returned\n", .{ i / 6 });
                 }
@@ -1924,10 +2371,12 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.italic_font_face = null;
         self.bold_italic_font_face = null;
         self.styled_fonts_initialized = false;
+        self.has_color_tables = null; // reset — new font may differ
         new_fmt = null;
         new_face = null;
 
         self.font_em_size = scaled_size;
+        self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
         self.base_point_size = point_size;
         self.ascent_px = new_ascent_px;
         self.descent_px = new_descent_px;
@@ -2275,6 +2724,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         defer self.mu.unlock();
 
         self.font_em_size *= scale;
+        self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
         self.ascent_px *= scale;
         self.descent_px *= scale;
 
@@ -2540,6 +2990,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
             out_x_advance[i] = @intFromFloat(glyph_advances[i] * 64.0);
             out_x_offset[i] = @intFromFloat(glyph_offsets[i].advanceOffset * 64.0);
             out_y_offset[i] = @intFromFloat(glyph_offsets[i].ascenderOffset * 64.0);
+
+            // DEBUG: log non-ASCII glyph results from DWrite shaping
         }
 
         // Cluster map inversion: DWrite cluster_map[char_j] → first glyph for char j
@@ -2678,37 +3130,80 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
         if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
 
-        const bw_i32: i32 = bounds.right - bounds.left;
-        const bh_i32: i32 = bounds.bottom - bounds.top;
-        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+        var bw_i32: i32 = bounds.right - bounds.left;
+        var bh_i32: i32 = bounds.bottom - bounds.top;
+        var bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+        var bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+        var use_aliased: bool = false;
+
+
+        // ClearType returns empty bounds for color glyphs (COLR/sbix/CBDT).
+        // If font has color tables, return empty bitmap so the caller
+        // (flush.zig) falls through to per-scalar fallback → GDI color emoji.
+        if (bw == 0 or bh == 0) {
+            if (self.hasColorTables()) {
+                out_bitmap.pixels = null;
+                out_bitmap.width = 0;
+                out_bitmap.height = 0;
+                out_bitmap.pitch = 0;
+                out_bitmap.bytes_per_pixel = 0;
+                return;
+            }
+            // Non-color font: fallback to aliased (1 bpp grayscale).
+            var aliased_bounds: c.RECT = std.mem.zeroes(c.RECT);
+            const hr_aliased = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &aliased_bounds);
+            if (!c.FAILED(hr_aliased)) {
+                bw_i32 = aliased_bounds.right - aliased_bounds.left;
+                bh_i32 = aliased_bounds.bottom - aliased_bounds.top;
+                bw = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+                bh = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+                if (bw > 0 and bh > 0) {
+                    bounds = aliased_bounds;
+                    use_aliased = true;
+                }
+            }
+        }
 
         out_bitmap.bearing_x = bounds.left;
         out_bitmap.bearing_y = @as(i32, -bounds.top);
         out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
         out_bitmap.ascent_px = self.ascent_px;
         out_bitmap.descent_px = self.descent_px;
-        out_bitmap.bytes_per_pixel = 3;
 
         if (bw == 0 or bh == 0) {
             out_bitmap.pixels = null;
             out_bitmap.width = 0;
             out_bitmap.height = 0;
             out_bitmap.pitch = 0;
+            out_bitmap.bytes_per_pixel = 3;
             return;
         }
 
-        const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
-        try self.glyph_tmp.resize(self.alloc, buf_size);
-
         const create_alpha_fn = atbl_a.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-        const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-        if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
 
-        out_bitmap.pixels = self.glyph_tmp.items.ptr;
-        out_bitmap.width = bw;
-        out_bitmap.height = bh;
-        out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+        if (use_aliased) {
+            const buf_size: usize = @as(usize, bw) * @as(usize, bh);
+            try self.glyph_tmp.resize(self.alloc, buf_size);
+            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+            out_bitmap.pixels = self.glyph_tmp.items.ptr;
+            out_bitmap.width = bw;
+            out_bitmap.height = bh;
+            out_bitmap.pitch = @as(i32, @intCast(bw));
+            out_bitmap.bytes_per_pixel = 1; // grayscale aliased
+        } else {
+            const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
+            try self.glyph_tmp.resize(self.alloc, buf_size);
+            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+            out_bitmap.pixels = self.glyph_tmp.items.ptr;
+            out_bitmap.width = bw;
+            out_bitmap.height = bh;
+            out_bitmap.pitch = @as(i32, @intCast(bw * 3));
+            out_bitmap.bytes_per_pixel = 3; // ClearType RGB
+        }
     }
 
     // =========================================================================
@@ -2829,6 +3324,104 @@ fn safeRelease(p: anytype) void {
             _ = release_fn(unk);
         }
     }
+}
+
+/// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
+/// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
+/// renderers display as color emoji without an explicit VS16 selector.
+fn isEmojiPresentation(scalar: u32) bool {
+    return switch (scalar) {
+        // BMP: Emoji_Presentation=Yes (Unicode 15.1)
+        0x231A...0x231B,
+        0x23E9...0x23F3,
+        0x23F8...0x23FA,
+        0x25FD...0x25FE,
+        0x2614...0x2615,
+        0x2648...0x2653,
+        0x267F,
+        0x2693,
+        0x26A1,
+        0x26AA...0x26AB,
+        0x26BD...0x26BE,
+        0x26C4...0x26C5,
+        0x26CE,
+        0x26D4,
+        0x26EA,
+        0x26F2...0x26F3,
+        0x26F5,
+        0x26FA,
+        0x26FD,
+        0x2705,
+        0x270A...0x270B,
+        0x2728,
+        0x274C,
+        0x274E,
+        0x2753...0x2755,
+        0x2757,
+        0x2795...0x2797,
+        0x27A1,
+        0x27B0,
+        0x27BF,
+        0x2934...0x2935,
+        0x2B05...0x2B07,
+        0x2B1B...0x2B1C,
+        0x2B50,
+        0x2B55,
+        0x3030,
+        0x303D,
+        0x3297,
+        0x3299,
+        // SMP: Emoji_Presentation=Yes (Unicode 15.1)
+        0x1F004,
+        0x1F0CF,
+        0x1F18E,
+        0x1F191...0x1F19A,
+        0x1F1E6...0x1F1FF,
+        0x1F201,
+        0x1F21A,
+        0x1F22F,
+        0x1F232...0x1F236,
+        0x1F238...0x1F23A,
+        0x1F250...0x1F251,
+        0x1F300...0x1F320,
+        0x1F32D...0x1F335,
+        0x1F337...0x1F37C,
+        0x1F37E...0x1F393,
+        0x1F3A0...0x1F3CA,
+        0x1F3CF...0x1F3D3,
+        0x1F3E0...0x1F3F0,
+        0x1F3F4,
+        0x1F3F8...0x1F43E,
+        0x1F440,
+        0x1F442...0x1F4FC,
+        0x1F4FF...0x1F53D,
+        0x1F54B...0x1F54E,
+        0x1F550...0x1F567,
+        0x1F57A,
+        0x1F595...0x1F596,
+        0x1F5A4,
+        0x1F5FB...0x1F64F,
+        0x1F680...0x1F6C5,
+        0x1F6CC,
+        0x1F6D0...0x1F6D2,
+        0x1F6D5...0x1F6D7,
+        0x1F6DC...0x1F6DF,
+        0x1F6EB...0x1F6EC,
+        0x1F6F4...0x1F6FC,
+        0x1F7E0...0x1F7EB,
+        0x1F7F0,
+        0x1F90C...0x1F93A,
+        0x1F93C...0x1F945,
+        0x1F947...0x1F9FF,
+        0x1FA70...0x1FA7C,
+        0x1FA80...0x1FA89,
+        0x1FA8F...0x1FAC6,
+        0x1FACE...0x1FADC,
+        0x1FADF...0x1FAE9,
+        0x1FAF0...0x1FAF8,
+        => true,
+        else => false,
+    };
 }
 
 /// Pack a 4-char OpenType tag into u32 (little-endian, matching DWRITE_FONT_FEATURE_TAG).
