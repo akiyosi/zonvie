@@ -738,6 +738,18 @@ pub const App = struct {
     pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
     pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .{},
 
+    // ext_cmdline state
+    cmdline_firstc: u8 = 0,
+    cmdline_visible: bool = false,
+    cmdline_border_color: [3]f32 = .{ 1.0, 1.0, 0.0 }, // default yellow (Search bg)
+    cmdline_icon_color: [3]f32 = .{ 0.5, 0.5, 0.5 }, // default gray (Comment fg)
+
+    // ext_popupmenu state
+    popupmenu_visible: bool = false,
+    popupmenu_anchor_row: i32 = 0,
+    popupmenu_anchor_col: i32 = 0,
+    popupmenu_anchor_grid: i64 = 1,
+
     // UI extensions
     ext_cmdline_enabled: bool = false,
     ext_messages_enabled: bool = false,
@@ -839,3 +851,203 @@ pub const App = struct {
         return @intFromFloat(@as(f32, @floatFromInt(v)) * self.dpi_scale);
     }
 };
+
+// =========================================================================
+// Cmdline helper functions (matching Windows frontend)
+// =========================================================================
+
+/// Adjust brightness for cmdline background: darken if light, lighten if dark.
+pub fn adjustBrightnessForCmdline(r: f32, g: f32, b: f32) [3]f32 {
+    const max_c = @max(r, @max(g, b));
+    const min_c = @min(r, @min(g, b));
+    const delta = max_c - min_c;
+
+    var brightness = max_c;
+    var saturation: f32 = 0.0;
+    if (max_c > 0) saturation = delta / max_c;
+
+    var hue: f32 = 0.0;
+    if (delta > 0) {
+        if (max_c == r) {
+            hue = (g - b) / delta;
+            if (hue < 0) hue += 6.0;
+        } else if (max_c == g) {
+            hue = 2.0 + (b - r) / delta;
+        } else {
+            hue = 4.0 + (r - g) / delta;
+        }
+        hue /= 6.0;
+    }
+
+    if (brightness < 0.5) {
+        brightness = @min(brightness + 0.05, 1.0);
+    } else {
+        brightness = @max(brightness - 0.05, 0.0);
+    }
+
+    if (saturation == 0) return .{ brightness, brightness, brightness };
+
+    const h_sector = hue * 6.0;
+    const sector = @as(u32, @intFromFloat(h_sector)) % 6;
+    const f = h_sector - @as(f32, @floatFromInt(sector));
+    const p = brightness * (1.0 - saturation);
+    const q = brightness * (1.0 - saturation * f);
+    const t = brightness * (1.0 - saturation * (1.0 - f));
+
+    return switch (sector) {
+        0 => .{ brightness, t, p },
+        1 => .{ q, brightness, p },
+        2 => .{ p, brightness, t },
+        3 => .{ p, q, brightness },
+        4 => .{ t, p, brightness },
+        else => .{ brightness, p, q },
+    };
+}
+
+/// Add rectangle vertices (2 triangles = 6 vertices)
+pub fn addRectVerts(
+    verts: []Vertex,
+    start_idx: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [4]f32,
+    tex: [2]f32,
+    grid_id: i64,
+) usize {
+    const positions = [_][2]f32{
+        .{ x, y }, .{ x + w, y }, .{ x + w, y - h },
+        .{ x, y }, .{ x + w, y - h }, .{ x, y - h },
+    };
+
+    var idx = start_idx;
+    for (positions) |pos| {
+        verts[idx] = .{
+            .position = pos,
+            .texCoord = tex,
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = 0,
+        };
+        idx += 1;
+    }
+    return idx;
+}
+
+/// Add search icon (magnifying glass) vertices using SDF (12 vertices)
+pub fn addSearchIconVerts(
+    verts: []Vertex,
+    start_idx: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [4]f32,
+    grid_id: i64,
+) usize {
+    const margin = 0.15;
+    const safe_x = x + w * margin;
+    const safe_y = y - h * margin;
+    const safe_w = w * (1.0 - 2.0 * margin);
+    const safe_h = h * (1.0 - 2.0 * margin);
+
+    var idx = start_idx;
+
+    const quad_positions = [_][2]f32{
+        .{ safe_x, safe_y },
+        .{ safe_x + safe_w, safe_y },
+        .{ safe_x, safe_y - safe_h },
+        .{ safe_x + safe_w, safe_y },
+        .{ safe_x + safe_w, safe_y - safe_h },
+        .{ safe_x, safe_y - safe_h },
+    };
+    const local_uvs = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 1.0, 0.0 },
+        .{ 0.0, 1.0 },
+        .{ 1.0, 0.0 },
+        .{ 1.0, 1.0 },
+        .{ 0.0, 1.0 },
+    };
+
+    // Circle quad (uv.x = -2.0)
+    for (quad_positions, local_uvs) |pos, luv| {
+        verts[idx] = .{
+            .position = pos,
+            .texCoord = .{ -2.0, luv[0] },
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = luv[1],
+        };
+        idx += 1;
+    }
+
+    // Handle quad (uv.x = -4.0)
+    for (quad_positions, local_uvs) |pos, luv| {
+        verts[idx] = .{
+            .position = pos,
+            .texCoord = .{ -4.0, luv[0] },
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = luv[1],
+        };
+        idx += 1;
+    }
+
+    return idx;
+}
+
+/// Add chevron right icon (>) vertices using SDF (6 vertices)
+pub fn addChevronIconVerts(
+    verts: []Vertex,
+    start_idx: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [4]f32,
+    grid_id: i64,
+) usize {
+    const margin = 0.18;
+    const safe_x = x + w * margin;
+    const safe_y = y - h * margin;
+    const safe_w = w * (1.0 - 2.0 * margin);
+    const safe_h = h * (1.0 - 2.0 * margin);
+
+    var idx = start_idx;
+
+    const positions = [_][2]f32{
+        .{ safe_x, safe_y },
+        .{ safe_x + safe_w, safe_y },
+        .{ safe_x, safe_y - safe_h },
+        .{ safe_x + safe_w, safe_y },
+        .{ safe_x + safe_w, safe_y - safe_h },
+        .{ safe_x, safe_y - safe_h },
+    };
+    const local_uvs = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 1.0, 0.0 },
+        .{ 0.0, 1.0 },
+        .{ 1.0, 0.0 },
+        .{ 1.0, 1.0 },
+        .{ 0.0, 1.0 },
+    };
+
+    for (positions, local_uvs) |pos, luv| {
+        verts[idx] = .{
+            .position = pos,
+            .texCoord = .{ -3.0, luv[0] },
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = luv[1],
+        };
+        idx += 1;
+    }
+
+    return idx;
+}

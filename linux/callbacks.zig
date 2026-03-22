@@ -238,6 +238,15 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         app.mu.lock();
         var ext_it = app.external_windows.iterator();
         while (ext_it.next()) |entry| {
+            // Overlay grids (cmdline, popupmenu) may be created mid-flush
+            // so beginFlush was never called for them (is_in_flush=false).
+            // Force is_in_flush=true so commitFlush actually commits.
+            if (!entry.value_ptr.tbs.is_in_flush) {
+                const gid = entry.key_ptr.*;
+                if (gid == app_mod.CMDLINE_GRID_ID or gid == app_mod.POPUPMENU_GRID_ID) {
+                    entry.value_ptr.tbs.is_in_flush = true;
+                }
+            }
             entry.value_ptr.tbs.commitFlush(app.alloc);
         }
         app.mu.unlock();
@@ -341,14 +350,35 @@ pub fn onVerticesRow(
         });
     }
 
-    // Route to external window if grid_id > 1
-    if (grid_id > 1) {
+    // Route to external window if grid_id != 1 (main grid)
+    // External grids include both regular ext_windows (grid_id > 1) and
+    // special grids like cmdline (CMDLINE_GRID_ID = -100)
+    if (grid_id != 1) {
         app.mu.lock();
-        defer app.mu.unlock();
         if (app.external_windows.getPtr(grid_id)) |ext| {
             storeExternalRowVerts(app, ext, row_start, row_count, verts, vert_count, flags, total_rows, total_cols);
-            return;
+
+            // Overlay grids (cmdline, popupmenu): core may send vertices
+            // after on_flush_end because notifyCmdlineChanges/notifyPopupmenuChanges
+            // run outside the flush bracket in rpc_session.  The overlay tbs was
+            // created mid-flush so beginFlush was never called, leaving
+            // is_in_flush=false.  Force a commit when all data has arrived:
+            //   - cursor update (VERT_UPDATE_CURSOR) for cmdline
+            //   - last row for popupmenu (which has no cursor)
+            const is_overlay_grid = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID);
+            const is_cursor = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
+            const is_last_row = (row_start + row_count >= total_rows) and !is_cursor;
+            if (is_overlay_grid and (is_cursor or is_last_row)) {
+                if (!ext.tbs.is_in_flush) {
+                    ext.tbs.is_in_flush = true;
+                }
+                ext.tbs.commitFlush(app.alloc);
+                app.mu.unlock();
+                _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
+                return;
+            }
         }
+        app.mu.unlock();
         return;
     }
 
@@ -414,11 +444,22 @@ fn storeExternalRowVerts(
     total_rows: u32,
     total_cols: u32,
 ) void {
-    _ = flags;
     const vs = ext.tbs.writeSet();
     vs.row_mode = true;
     vs.rows = total_rows;
     vs.cols = total_cols;
+
+    // Cursor vertices are sent separately with VERT_UPDATE_CURSOR flag
+    if ((flags & app_mod.VERT_UPDATE_CURSOR) != 0) {
+        vs.cursor_verts.clearRetainingCapacity();
+        if (verts) |v| {
+            if (vert_count > 0) {
+                vs.cursor_verts.appendSlice(app.alloc, v[0..vert_count]) catch {};
+            }
+        }
+        ext.needs_redraw = true;
+        return;
+    }
 
     vs.ensureRowStorage(app.alloc, row_start + row_count -| 1);
 
@@ -727,6 +768,9 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) 
                 app.cell_w_px,
                 ch,
             );
+            // Cannot call zonvie_core_set_screen_cols from callback context
+            // (core holds grid_mu). Defer to GTK main thread.
+            _ = gtk_mod.g_idle_add(&idleUpdateScreenCols, @ptrCast(app));
         }
     }
 }
@@ -877,38 +921,150 @@ pub fn onSSHAuthPrompt(ctx: ?*anyopaque, prompt: [*]const u8, prompt_len: usize)
 }
 
 // =========================================================================
+// Screen cols for cmdline width clamping
+// =========================================================================
+
+/// Update core screen_cols so cmdline grid width is clamped to the available viewport.
+/// Must be called when drawable size or cell size changes.
+pub fn updateScreenCols(app: *App) void {
+    const corep = app.corep orelse return;
+    const cell_w = app.cell_w_px;
+    if (cell_w == 0) return;
+
+    const drawable_w = app.drawable_w_px;
+    if (drawable_w == 0) return;
+
+    // Subtract cmdline decoration overhead from available width
+    const overhead: u32 = app_mod.CMDLINE_PADDING * 2 +
+        app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
+    const avail_px: u32 = if (drawable_w > overhead) drawable_w - overhead else drawable_w;
+    const screen_cols: u32 = @max(40, avail_px / cell_w);
+    app_mod.zonvie_core_set_screen_cols(corep, screen_cols);
+}
+
+fn idleUpdateScreenCols(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    updateScreenCols(app);
+    return 0; // G_SOURCE_REMOVE
+}
+
+// =========================================================================
 // Cmdline callbacks (ext_cmdline)
 // =========================================================================
 
 pub fn onCmdlineShow(
     ctx: ?*anyopaque,
-    content: [*]const app_mod.CmdlineChunk,
-    content_count: usize,
-    pos: u32,
+    _: [*]const app_mod.CmdlineChunk, // content
+    _: usize, // content_count
+    _: u32, // pos
     firstc: u8,
-    prompt: [*]const u8,
-    prompt_len: usize,
-    indent: u32,
-    level: u32,
-    prompt_hl_id: u32,
+    _: [*]const u8, // prompt
+    _: usize, // prompt_len
+    _: u32, // indent
+    _: u32, // level
+    _: u32, // prompt_hl_id
 ) callconv(.c) void {
-    _ = ctx;
-    _ = content;
-    _ = content_count;
-    _ = pos;
-    _ = firstc;
-    _ = prompt;
-    _ = prompt_len;
-    _ = indent;
-    _ = level;
-    _ = prompt_hl_id;
-    // TODO: implement ext_cmdline show
+    const app = getApp(ctx) orelse return;
+    if (applog.isEnabled()) applog.appLog("[linux] on_cmdline_show: firstc={c}({d})\n", .{ firstc, firstc });
+
+    app.mu.lock();
+    app.cmdline_firstc = firstc;
+    app.cmdline_visible = true;
+    app.mu.unlock();
+
+    // Schedule cmdline color update on GTK main thread
+    // (cannot call core hl lookup from callback context — core lock is held)
+    _ = gtk_mod.g_idle_add(&idleUpdateCmdlineColors, @ptrCast(app));
 }
 
-pub fn onCmdlineHide(ctx: ?*anyopaque, level: u32) callconv(.c) void {
+pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
+    const app = getApp(ctx) orelse return;
+    if (applog.isEnabled()) applog.appLog("[linux] on_cmdline_hide\n", .{});
+
+    app.mu.lock();
+    app.cmdline_firstc = 0;
+    app.cmdline_visible = false;
+    app.mu.unlock();
+
+    // Request redraw to clear the overlay
+    if (app.gl_area) |area| {
+        _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
+        _ = area;
+    }
+}
+
+fn idleQueueRedraw(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    return 0; // remove idle source
+}
+
+fn idleUpdateCmdlineColors(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const corep = app.corep orelse return 0;
+
+    // Colors derived from core highlights (matching Windows/macOS):
+    //   Border: Search highlight background
+    //   Icon:   Comment highlight foreground
+    var border_r: f32 = 1.0;
+    var border_g: f32 = 1.0;
+    var border_b: f32 = 0.0; // default yellow
+    var icon_r: f32 = 0.5;
+    var icon_g: f32 = 0.5;
+    var icon_b: f32 = 0.5; // default gray
+
+    var fg_rgb: u32 = 0;
+    var bg_rgb: u32 = 0;
+
+    // Border color from Search highlight background
+    if (app_mod.zonvie_core_get_hl_by_name(corep, "Search", &fg_rgb, &bg_rgb) != 0) {
+        border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
+        border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
+        border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
+    }
+
+    // Icon color from Comment highlight foreground
+    if (app_mod.zonvie_core_get_hl_by_name(corep, "Comment", &fg_rgb, &bg_rgb) != 0) {
+        icon_r = @as(f32, @floatFromInt((fg_rgb >> 16) & 0xFF)) / 255.0;
+        icon_g = @as(f32, @floatFromInt((fg_rgb >> 8) & 0xFF)) / 255.0;
+        icon_b = @as(f32, @floatFromInt(fg_rgb & 0xFF)) / 255.0;
+    }
+
+    app.mu.lock();
+    app.cmdline_border_color = .{ border_r, border_g, border_b };
+    app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
+    app.mu.unlock();
+
+    // Trigger redraw
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    return 0; // remove idle source
+}
+
+pub fn onCmdlinePos(ctx: ?*anyopaque, _: u32, _: u32) callconv(.c) void {
     _ = ctx;
-    _ = level;
-    // TODO: implement ext_cmdline hide
+    // Cursor position update — rendering uses core-generated vertices, nothing extra needed
+}
+
+pub fn onCmdlineSpecialChar(ctx: ?*anyopaque, _: [*]const u8, _: usize, _: bool, _: u32) callconv(.c) void {
+    _ = ctx;
+    // Special character display handled by core grid
+}
+
+pub fn onCmdlineBlockShow(ctx: ?*anyopaque, _: [*]const core.CmdlineBlockLine, _: usize) callconv(.c) void {
+    _ = ctx;
+    // Block mode (multi-line cmdline) — TODO if needed
+}
+
+pub fn onCmdlineBlockAppend(ctx: ?*anyopaque, _: ?[*]const app_mod.CmdlineChunk, _: usize) callconv(.c) void {
+    _ = ctx;
+}
+
+pub fn onCmdlineBlockHide(ctx: ?*anyopaque) callconv(.c) void {
+    _ = ctx;
 }
 
 // =========================================================================
@@ -917,32 +1073,38 @@ pub fn onCmdlineHide(ctx: ?*anyopaque, level: u32) callconv(.c) void {
 
 pub fn onPopupmenuShow(
     ctx: ?*anyopaque,
-    items: ?*const anyopaque,
-    item_count: usize,
-    selected: i32,
+    _: ?*const anyopaque, // items
+    _: usize, // item_count
+    _: i32, // selected
     row: i32,
     col: i32,
     grid_id: i64,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = items;
-    _ = item_count;
-    _ = selected;
-    _ = row;
-    _ = col;
-    _ = grid_id;
-    // TODO: implement ext_popupmenu show
+    const app = getApp(ctx) orelse return;
+    if (applog.isEnabled()) applog.appLog("[linux] on_popupmenu_show: row={d} col={d} grid={d}\n", .{ row, col, grid_id });
+
+    app.mu.lock();
+    app.popupmenu_visible = true;
+    app.popupmenu_anchor_row = row;
+    app.popupmenu_anchor_col = col;
+    app.popupmenu_anchor_grid = grid_id;
+    app.mu.unlock();
 }
 
 pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
-    _ = ctx;
-    // TODO: implement ext_popupmenu hide
+    const app = getApp(ctx) orelse return;
+    if (applog.isEnabled()) applog.appLog("[linux] on_popupmenu_hide\n", .{});
+
+    app.mu.lock();
+    app.popupmenu_visible = false;
+    app.mu.unlock();
+
+    _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
 }
 
-pub fn onPopupmenuSelect(ctx: ?*anyopaque, selected: i32) callconv(.c) void {
+pub fn onPopupmenuSelect(ctx: ?*anyopaque, _: i32) callconv(.c) void {
     _ = ctx;
-    _ = selected;
-    // TODO: implement ext_popupmenu select
+    // Selection change is handled by core vertex generation
 }
 
 // =========================================================================
@@ -1076,6 +1238,37 @@ pub fn onExternalWindow(
 ) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
+    const is_overlay = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID);
+
+    if (is_overlay) {
+        // Cmdline and popupmenu grids are rendered as overlays on the main GLArea.
+        // Register in external_windows without creating a GtkWindow.
+        if (applog.isEnabled()) applog.appLog("[linux] onExternalWindow: overlay grid_id={d} rows={d} cols={d} start=({d},{d})\n", .{ grid_id, rows, cols, start_row, start_col });
+
+        app.mu.lock();
+        defer app.mu.unlock();
+
+        if (app.external_windows.getPtr(grid_id)) |ext| {
+            ext.rows = rows;
+            ext.cols = cols;
+        } else {
+            app.external_windows.put(app.alloc, grid_id, .{
+                .rows = rows,
+                .cols = cols,
+            }) catch {};
+        }
+
+        // Popupmenu: set visible and anchor from start_row/start_col
+        // (onPopupmenuShow may not be called by core)
+        if (grid_id == app_mod.POPUPMENU_GRID_ID) {
+            app.popupmenu_visible = true;
+            app.popupmenu_anchor_row = start_row;
+            app.popupmenu_anchor_col = start_col;
+            app.popupmenu_anchor_grid = win; // win field carries the anchor grid_id
+        }
+        return;
+    }
+
     app.mu.lock();
     defer app.mu.unlock();
 
@@ -1101,9 +1294,21 @@ fn idleCreateExternalWindow(user_data: ?*anyopaque) callconv(.c) c_int {
 
 pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = getApp(ctx) orelse return;
-    _ = grid_id;
-    // TODO: dispatch window destruction to GTK main thread
-    _ = app;
+
+    if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID) {
+        if (applog.isEnabled()) applog.appLog("[linux] onExternalWindowClose: overlay grid_id={d}\n", .{grid_id});
+        app.mu.lock();
+        if (app.external_windows.fetchRemove(grid_id)) |kv| {
+            var ext = kv.value;
+            ext.deinit(app.alloc);
+        }
+        if (grid_id == app_mod.CMDLINE_GRID_ID) app.cmdline_visible = false;
+        if (grid_id == app_mod.POPUPMENU_GRID_ID) app.popupmenu_visible = false;
+        app.mu.unlock();
+        return;
+    }
+
+    // TODO: dispatch window destruction to GTK main thread for regular ext_windows
 }
 
 pub fn onExternalVertices(
@@ -1114,20 +1319,26 @@ pub fn onExternalVertices(
     rows: u32,
     cols: u32,
 ) callconv(.c) void {
-    _ = rows;
-    _ = cols;
     const app = getApp(ctx) orelse return;
 
     app.mu.lock();
-    defer app.mu.unlock();
 
     if (app.external_windows.getPtr(grid_id)) |ext| {
+        ext.rows = rows;
+        ext.cols = cols;
         const vs = ext.tbs.writeSet();
         vs.flat_verts.clearRetainingCapacity();
         if (vert_count > 0) {
             vs.flat_verts.appendSlice(app.alloc, verts[0..vert_count]) catch {};
         }
         ext.needs_redraw = true;
+    }
+
+    app.mu.unlock();
+
+    // For overlay grids, queue a redraw of the main GLArea
+    if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID) {
+        _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
     }
 }
 

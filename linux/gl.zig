@@ -56,6 +56,7 @@ pub const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 pub const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
 pub const GL_TEXTURE_WRAP_T: GLenum = 0x2803;
+pub const GL_NEAREST: GLint = 0x2600;
 pub const GL_LINEAR: GLint = 0x2601;
 pub const GL_CLAMP_TO_EDGE: GLint = 0x812F;
 
