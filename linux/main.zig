@@ -193,6 +193,7 @@ fn onResize(area: ?*anyopaque, width: c_int, height: c_int, user_data: ?*anyopaq
             app.cell_w_px,
             ch,
         );
+        callbacks.updateScreenCols(app);
 
         // For sub-cell resizes (drawable pixels changed but rows/cols didn't),
         // updateLayoutPx won't trigger a Neovim resize or flush.
@@ -319,6 +320,11 @@ fn startCore(app: *App) void {
         .on_cursor_grid_changed = callbacks.onCursorGridChanged,
         .on_cmdline_show = callbacks.onCmdlineShow,
         .on_cmdline_hide = callbacks.onCmdlineHide,
+        .on_cmdline_pos = callbacks.onCmdlinePos,
+        .on_cmdline_special_char = callbacks.onCmdlineSpecialChar,
+        .on_cmdline_block_show = callbacks.onCmdlineBlockShow,
+        .on_cmdline_block_append = callbacks.onCmdlineBlockAppend,
+        .on_cmdline_block_hide = callbacks.onCmdlineBlockHide,
         .on_popupmenu_show = callbacks.onPopupmenuShow,
         .on_popupmenu_hide = callbacks.onPopupmenuHide,
         .on_popupmenu_select = callbacks.onPopupmenuSelect,

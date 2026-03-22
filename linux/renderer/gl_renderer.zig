@@ -185,8 +185,8 @@ pub fn createAtlasTexture(app: *App, atlas_w: u32, atlas_h: u32) void {
         gl.GL_UNSIGNED_BYTE,
         null, // cleared to zero
     );
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
@@ -274,8 +274,8 @@ fn createFboWithTexture(fbo: *u32, tex: *u32, w: u32, h: u32) void {
     gl.glGenTextures(1, tex);
     gl.glBindTexture(gl.GL_TEXTURE_2D, tex.*);
     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA16F, @intCast(w), @intCast(h), 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, null);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
 
@@ -425,7 +425,7 @@ pub fn render(app: *App, width: i32, height: i32) bool {
     } else if (vs.flat_verts.items.len > 0) {
         // Flat mode: single draw call
         gl.glUseProgram(app.gl_program_main);
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
 
         var vbo: gl.GLuint = 0;
         gl.glGenBuffers(1, &vbo);
@@ -444,7 +444,7 @@ pub fn render(app: *App, width: i32, height: i32) bool {
     // Draw cursor
     if (vs.cursor_verts.items.len > 0) {
         gl.glUseProgram(app.gl_program_main);
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
+        gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
 
         var cursor_vbo: gl.GLuint = 0;
         gl.glGenBuffers(1, &cursor_vbo);
@@ -460,6 +460,12 @@ pub fn render(app: *App, width: i32, height: i32) bool {
         gl.glDeleteBuffers(1, &cursor_vbo);
     }
 
+    // Draw cmdline overlay (ext_cmdline rendered on main GLArea)
+    renderCmdlineOverlay(app, w, h);
+
+    // Draw popupmenu overlay (ext_popupmenu rendered on main GLArea)
+    renderPopupmenuOverlay(app, w, h);
+
     gl.glBindVertexArray(0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
     gl.glDisable(gl.GL_BLEND);
@@ -467,11 +473,430 @@ pub fn render(app: *App, width: i32, height: i32) bool {
     return true;
 }
 
+/// Render ext_cmdline overlay on the main GLArea.
+/// The cmdline grid vertices are stored in external_windows[CMDLINE_GRID_ID]
+/// using row_mode (per-row slots in the TripleBufferedSurface pool).
+fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
+    app.mu.lock();
+    const visible = app.cmdline_visible;
+    const ext_ptr = app.external_windows.getPtr(app_mod.CMDLINE_GRID_ID);
+    if (!visible or ext_ptr == null) {
+        app.mu.unlock();
+        return;
+    }
+    const ext = ext_ptr.?;
+
+    // Acquire committed vertex set
+    const snapshot = ext.tbs.acquireForPaint();
+    const ext_vs = &ext.tbs.sets[snapshot.committed_index];
+
+    // Collect all row vertices into a flat list
+    var total_vert_count: usize = 0;
+    const row_count = ext_vs.row_map.items.len;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        total_vert_count += ext.tbs.pool.slots.items[mapping.slot].verts.items.len;
+    }
+    // Also check cursor verts
+    total_vert_count += ext_vs.cursor_verts.items.len;
+
+    if (total_vert_count == 0) {
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_rows = ext_vs.rows;
+    const content_cols = ext_vs.cols;
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
+    const firstc = app.cmdline_firstc;
+    const border_color = app.cmdline_border_color;
+    const icon_color = app.cmdline_icon_color;
+    app.mu.unlock();
+
+    if (content_rows == 0 or content_cols == 0) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const vp_w: f32 = @floatFromInt(viewport_w);
+    const vp_h: f32 = @floatFromInt(viewport_h);
+    if (!(vp_w > 0 and vp_h > 0)) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_w_px: f32 = @floatFromInt(content_cols * cell_w);
+    const content_h_px: f32 = @floatFromInt(content_rows * cell_h);
+
+    // Calculate total window dimensions including padding and icon
+    const icon_total_w: f32 = @floatFromInt(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
+    const padding: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+    const total_w_px: f32 = @min(content_w_px + icon_total_w + padding * 2.0, vp_w);
+    const total_h_px: f32 = content_h_px + padding * 2.0;
+
+    // Center horizontally, position at 1/3 from top
+    const box_x_px: f32 = (vp_w - total_w_px) / 2.0;
+    const box_y_px: f32 = vp_h / 3.0;
+
+    // Convert box position to NDC
+    const box_left_ndc: f32 = box_x_px / vp_w * 2.0 - 1.0;
+    const box_top_ndc: f32 = 1.0 - box_y_px / vp_h * 2.0;
+    const box_w_ndc: f32 = total_w_px / vp_w * 2.0;
+    const box_h_ndc: f32 = total_h_px / vp_h * 2.0;
+
+    // Content area within the box (offset by padding + icon)
+    const content_left_px: f32 = box_x_px + padding + icon_total_w;
+    const content_top_px: f32 = box_y_px + padding;
+
+    // Transform source vertices from their NDC space [-1, 1] to content area in viewport NDC
+    const content_w_ndc: f32 = content_w_px / vp_w * 2.0;
+    const content_h_ndc: f32 = content_h_px / vp_h * 2.0;
+    const content_left_ndc: f32 = content_left_px / vp_w * 2.0 - 1.0;
+    const content_top_ndc: f32 = 1.0 - content_top_px / vp_h * 2.0;
+
+    const scale_x: f32 = content_w_ndc / 2.0;
+    const scale_y: f32 = content_h_ndc / 2.0;
+    const offset_x: f32 = content_left_ndc + content_w_ndc / 2.0;
+    const offset_y: f32 = content_top_ndc - content_h_ndc / 2.0;
+
+    // Allocate: bg(6) + transformed verts + border(24) + icon(12)
+    const extra_count: usize = 6 + 24 + 12;
+    const total_alloc = total_vert_count + extra_count;
+    var cmdline_verts = app.alloc.alloc(Vertex, total_alloc) catch {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    };
+    defer app.alloc.free(cmdline_verts);
+
+    // Extract original background color from row vertices
+    var orig_bg_r: f32 = 0.0;
+    var orig_bg_g: f32 = 0.0;
+    var orig_bg_b: f32 = 0.0;
+    var found_bg = false;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (found_bg) break;
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        for (ext.tbs.pool.slots.items[mapping.slot].verts.items) |v| {
+            if (v.texCoord[0] < 0) {
+                orig_bg_r = v.color[0];
+                orig_bg_g = v.color[1];
+                orig_bg_b = v.color[2];
+                found_bg = true;
+                break;
+            }
+        }
+    }
+    if (!found_bg) {
+        const bg = app.default_bg;
+        orig_bg_r = @as(f32, @floatFromInt((bg >> 16) & 0xFF)) / 255.0;
+        orig_bg_g = @as(f32, @floatFromInt((bg >> 8) & 0xFF)) / 255.0;
+        orig_bg_b = @as(f32, @floatFromInt(bg & 0xFF)) / 255.0;
+    }
+
+    // Background fill (slightly adjusted brightness)
+    const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
+    const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], 1.0 };
+    const bg_tex: [2]f32 = .{ -1.0, -1.0 };
+    var idx: usize = 0;
+    idx = app_mod.addRectVerts(cmdline_verts, idx, box_left_ndc, box_top_ndc, box_w_ndc, box_h_ndc, bg_color, bg_tex, app_mod.CMDLINE_GRID_ID);
+
+    // Transform and copy content vertices from all rows
+    const tolerance: f32 = 0.005;
+    const deco_cursor = app_mod.DECO_CURSOR;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        for (ext.tbs.pool.slots.items[mapping.slot].verts.items) |v| {
+            var vert = v;
+            vert.position[0] = v.position[0] * scale_x + offset_x;
+            vert.position[1] = v.position[1] * scale_y + offset_y;
+
+            // Hide bg cells that match the original background
+            if ((v.deco_flags & deco_cursor) == 0 and v.texCoord[0] < 0) {
+                const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
+                    @abs(v.color[1] - orig_bg_g) < tolerance and
+                    @abs(v.color[2] - orig_bg_b) < tolerance;
+                if (matches_bg) vert.color[3] = 0.0;
+            }
+
+            if (idx < total_alloc) {
+                cmdline_verts[idx] = vert;
+                idx += 1;
+            }
+        }
+    }
+
+    // Also add cursor vertices
+    for (ext_vs.cursor_verts.items) |v| {
+        var vert = v;
+        vert.position[0] = v.position[0] * scale_x + offset_x;
+        vert.position[1] = v.position[1] * scale_y + offset_y;
+        if (idx < total_alloc) {
+            cmdline_verts[idx] = vert;
+            idx += 1;
+        }
+    }
+
+    // Border (4 edges)
+    const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (vp_w / 2.0);
+    const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (vp_h / 2.0);
+    const bc: [4]f32 = .{ border_color[0], border_color[1], border_color[2], 1.0 };
+    const bt: [2]f32 = .{ -1.0, -1.0 };
+    const gid = app_mod.CMDLINE_GRID_ID;
+    // Top
+    idx = app_mod.addRectVerts(cmdline_verts, idx, box_left_ndc, box_top_ndc, box_w_ndc, border_h_ndc, bc, bt, gid);
+    // Bottom
+    idx = app_mod.addRectVerts(cmdline_verts, idx, box_left_ndc, box_top_ndc - box_h_ndc + border_h_ndc, box_w_ndc, border_h_ndc, bc, bt, gid);
+    // Left
+    idx = app_mod.addRectVerts(cmdline_verts, idx, box_left_ndc, box_top_ndc - border_h_ndc, border_w_ndc, box_h_ndc - 2.0 * border_h_ndc, bc, bt, gid);
+    // Right
+    idx = app_mod.addRectVerts(cmdline_verts, idx, box_left_ndc + box_w_ndc - border_w_ndc, box_top_ndc - border_h_ndc, border_w_ndc, box_h_ndc - 2.0 * border_h_ndc, bc, bt, gid);
+
+    // Icon (search for / or ?, chevron otherwise)
+    const icon_size_px: f32 = @floatFromInt(app_mod.CMDLINE_ICON_SIZE);
+    const icon_x_px: f32 = box_x_px + padding + @as(f32, @floatFromInt(app_mod.CMDLINE_ICON_MARGIN_LEFT));
+    const icon_y_px: f32 = box_y_px + (total_h_px - icon_size_px) / 2.0;
+    const icon_x_ndc: f32 = icon_x_px / (vp_w / 2.0) - 1.0;
+    const icon_y_ndc: f32 = 1.0 - icon_y_px / (vp_h / 2.0);
+    const icon_w_ndc: f32 = icon_size_px / (vp_w / 2.0);
+    const icon_h_ndc: f32 = icon_size_px / (vp_h / 2.0);
+    const ic: [4]f32 = .{ icon_color[0], icon_color[1], icon_color[2], 1.0 };
+
+    if (firstc == '/' or firstc == '?') {
+        idx = app_mod.addSearchIconVerts(cmdline_verts, idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, ic, gid);
+    } else {
+        idx = app_mod.addChevronIconVerts(cmdline_verts, idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, ic, gid);
+    }
+
+    // Draw the cmdline overlay
+    gl.glUseProgram(app.gl_program_main);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+
+    var vbo: gl.GLuint = 0;
+    gl.glGenBuffers(1, &vbo);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo);
+    gl.glBufferData(
+        gl.GL_ARRAY_BUFFER,
+        @intCast(idx * @sizeOf(Vertex)),
+        @ptrCast(cmdline_verts.ptr),
+        gl.GL_STREAM_DRAW,
+    );
+    setupVertexAttribs();
+    gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(idx));
+    gl.glDeleteBuffers(1, &vbo);
+
+    // Release the paint snapshot
+    app.mu.lock();
+    if (app.external_windows.getPtr(app_mod.CMDLINE_GRID_ID)) |ext2| {
+        _ = ext2.tbs.releaseFromPaint(snapshot.committed_index);
+    }
+    app.mu.unlock();
+}
+
+/// Render ext_popupmenu overlay on the main GLArea.
+/// Position is calculated from anchor (row, col, grid_id) saved from onPopupmenuShow.
+fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
+    app.mu.lock();
+    const visible = app.popupmenu_visible;
+    const ext_ptr = app.external_windows.getPtr(app_mod.POPUPMENU_GRID_ID);
+    if (!visible or ext_ptr == null) {
+        app.mu.unlock();
+        return;
+    }
+    const ext = ext_ptr.?;
+
+    const snapshot = ext.tbs.acquireForPaint();
+    const ext_vs = &ext.tbs.sets[snapshot.committed_index];
+
+    // Collect row vertices
+    var total_vert_count: usize = 0;
+    const row_count = ext_vs.row_map.items.len;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        total_vert_count += ext.tbs.pool.slots.items[mapping.slot].verts.items.len;
+    }
+    total_vert_count += ext_vs.cursor_verts.items.len;
+
+    if (total_vert_count == 0) {
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_rows = ext_vs.rows;
+    const content_cols = ext_vs.cols;
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
+    const anchor_row = app.popupmenu_anchor_row;
+    const anchor_col = app.popupmenu_anchor_col;
+    const border_color = app.cmdline_border_color;
+    app.mu.unlock();
+
+    if (content_rows == 0 or content_cols == 0) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const vp_w: f32 = @floatFromInt(viewport_w);
+    const vp_h: f32 = @floatFromInt(viewport_h);
+    if (!(vp_w > 0 and vp_h > 0)) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_w_px: f32 = @floatFromInt(content_cols * cell_w);
+    const content_h_px: f32 = @floatFromInt(content_rows * cell_h);
+
+    // Calculate position from anchor
+    var box_x_px: f32 = undefined;
+    var box_y_px: f32 = undefined;
+
+    if (anchor_row == -1) {
+        // Cmdline completion: position above/below cmdline overlay
+        const cmdline_ext = app.external_windows.getPtr(app_mod.CMDLINE_GRID_ID);
+        const cmdline_rows: u32 = if (cmdline_ext) |ce| ce.rows else 1;
+        const cmdline_h_px: f32 = @floatFromInt(cmdline_rows * cell_h);
+        const icon_total_w: f32 = @floatFromInt(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
+        const padding: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+        const cmdline_total_h: f32 = cmdline_h_px + padding * 2.0;
+        const cmdline_y: f32 = vp_h / 3.0;
+
+        // Position above cmdline with a 4px gap
+        box_y_px = cmdline_y - content_h_px - 4.0;
+        if (box_y_px < 0) box_y_px = cmdline_y + cmdline_total_h + 4.0; // below if no room
+
+        // X: cmdline content area + anchor col offset
+        const cmdline_cols: u32 = if (cmdline_ext) |ce| ce.cols else 80;
+        const cmdline_content_w: f32 = @floatFromInt(cmdline_cols * cell_w);
+        const cmdline_total_w: f32 = @min(cmdline_content_w + icon_total_w + padding * 2.0, vp_w);
+        const cmdline_x: f32 = (vp_w - cmdline_total_w) / 2.0;
+        const col_f: f32 = if (anchor_col >= 0) @floatFromInt(anchor_col) else 0;
+        box_x_px = cmdline_x + padding + icon_total_w + col_f * @as(f32, @floatFromInt(cell_w));
+    } else {
+        // Anchored to main grid or other grid
+        const col_f: f32 = if (anchor_col >= 0) @floatFromInt(anchor_col) else 0;
+        const row_f: f32 = if (anchor_row >= 0) @floatFromInt(anchor_row) else 0;
+        box_x_px = col_f * @as(f32, @floatFromInt(cell_w));
+        // Position below the anchor row (+ 1 row for the line itself)
+        box_y_px = (row_f + 1.0) * @as(f32, @floatFromInt(cell_h));
+
+        // If popupmenu would go off-screen bottom, show above anchor
+        if (box_y_px + content_h_px > vp_h) {
+            box_y_px = row_f * @as(f32, @floatFromInt(cell_h)) - content_h_px;
+            if (box_y_px < 0) box_y_px = 0;
+        }
+    }
+
+    // Clamp to viewport
+    if (box_x_px + content_w_px > vp_w) box_x_px = vp_w - content_w_px;
+    if (box_x_px < 0) box_x_px = 0;
+
+    // NDC conversion
+    const box_left_ndc: f32 = box_x_px / vp_w * 2.0 - 1.0;
+    const box_top_ndc: f32 = 1.0 - box_y_px / vp_h * 2.0;
+    const box_w_ndc: f32 = content_w_px / vp_w * 2.0;
+    const box_h_ndc: f32 = content_h_px / vp_h * 2.0;
+
+    // Transform scale/offset for content vertices
+    const scale_x: f32 = box_w_ndc / 2.0;
+    const scale_y: f32 = box_h_ndc / 2.0;
+    const offset_x: f32 = box_left_ndc + box_w_ndc / 2.0;
+    const offset_y: f32 = box_top_ndc - box_h_ndc / 2.0;
+
+    // Allocate: content verts + border(24)
+    const extra_count: usize = 24;
+    const total_alloc = total_vert_count + extra_count;
+    var pum_verts = app.alloc.alloc(Vertex, total_alloc) catch {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    };
+    defer app.alloc.free(pum_verts);
+
+    // Transform and copy content vertices from all rows
+    var idx: usize = 0;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        for (ext.tbs.pool.slots.items[mapping.slot].verts.items) |v| {
+            var vert = v;
+            vert.position[0] = v.position[0] * scale_x + offset_x;
+            vert.position[1] = v.position[1] * scale_y + offset_y;
+            if (idx < total_alloc) {
+                pum_verts[idx] = vert;
+                idx += 1;
+            }
+        }
+    }
+
+    // Cursor vertices
+    for (ext_vs.cursor_verts.items) |v| {
+        var vert = v;
+        vert.position[0] = v.position[0] * scale_x + offset_x;
+        vert.position[1] = v.position[1] * scale_y + offset_y;
+        if (idx < total_alloc) {
+            pum_verts[idx] = vert;
+            idx += 1;
+        }
+    }
+
+    // Border (4 edges) using same border color as cmdline
+    const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (vp_w / 2.0);
+    const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (vp_h / 2.0);
+    const bc: [4]f32 = .{ border_color[0], border_color[1], border_color[2], 1.0 };
+    const bt: [2]f32 = .{ -1.0, -1.0 };
+    const gid = app_mod.POPUPMENU_GRID_ID;
+    idx = app_mod.addRectVerts(pum_verts, idx, box_left_ndc, box_top_ndc, box_w_ndc, border_h_ndc, bc, bt, gid);
+    idx = app_mod.addRectVerts(pum_verts, idx, box_left_ndc, box_top_ndc - box_h_ndc + border_h_ndc, box_w_ndc, border_h_ndc, bc, bt, gid);
+    idx = app_mod.addRectVerts(pum_verts, idx, box_left_ndc, box_top_ndc - border_h_ndc, border_w_ndc, box_h_ndc - 2.0 * border_h_ndc, bc, bt, gid);
+    idx = app_mod.addRectVerts(pum_verts, idx, box_left_ndc + box_w_ndc - border_w_ndc, box_top_ndc - border_h_ndc, border_w_ndc, box_h_ndc - 2.0 * border_h_ndc, bc, bt, gid);
+
+    // Draw
+    gl.glUseProgram(app.gl_program_main);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+
+    var vbo: gl.GLuint = 0;
+    gl.glGenBuffers(1, &vbo);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo);
+    gl.glBufferData(
+        gl.GL_ARRAY_BUFFER,
+        @intCast(idx * @sizeOf(Vertex)),
+        @ptrCast(pum_verts.ptr),
+        gl.GL_STREAM_DRAW,
+    );
+    setupVertexAttribs();
+    gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(idx));
+    gl.glDeleteBuffers(1, &vbo);
+
+    // Release paint snapshot
+    app.mu.lock();
+    if (app.external_windows.getPtr(app_mod.POPUPMENU_GRID_ID)) |ext2| {
+        _ = ext2.tbs.releaseFromPaint(snapshot.committed_index);
+    }
+    app.mu.unlock();
+}
+
 /// Render using row-mode vertex buffers (per-row VBOs with scroll optimization).
 fn renderRowMode(app: *App, vs: *const app_mod.VertexSet, w: u32, h: u32) void {
     _ = w;
     gl.glUseProgram(app.gl_program_main);
-    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
 
     // Ensure we have enough RowVBs
     const needed = vs.row_map.items.len;
