@@ -539,7 +539,7 @@ pub const GridBuf = struct {
         if (row >= self.rows or col >= self.cols) return false;
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
 
-        // Skip if no change (same optimization as main Grid.putCell)
+        // Skip if no change (same optimization as global Grid.putCell)
         const old = self.cells[idx];
         if (old.cp == cp and old.hl == hl) return false;
 
@@ -695,7 +695,7 @@ pub const GridBuf = struct {
 pub const GridPos = struct {
     row: u32,
     col: u32,
-    anchor_grid: i64 = 1, // which grid this float is anchored to (1 = main grid)
+    anchor_grid: i64 = 1, // which grid this float is anchored to (1 = global grid)
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -770,10 +770,10 @@ pub const ScrollOp = struct {
     right: u32,
     rows: i32, // positive = scroll up (content moves up), negative = scroll down
     cols: i32,
-    /// Grid dimensions at scroll time (target grid, not necessarily main grid)
+    /// Grid dimensions at scroll time (target grid, not necessarily global grid)
     target_rows: u32,
     target_cols: u32,
-    /// Main grid row offset from win_pos (0 if grid_id == 1)
+    /// Global grid row offset from win_pos (0 if grid_id == 1)
     win_pos_row: u32,
 };
 
@@ -791,7 +791,7 @@ pub const Grid = struct {
 
     // Screen width in cells (for cmdline max width). Set by frontend.
     screen_cols: u32 = 0,
-    // Dirty tracking (main grid only)
+    // Dirty tracking (global grid only)
     dirty_all: bool = true,
     dirty_rows: std.DynamicBitSetUnmanaged = .{},
 
@@ -897,13 +897,13 @@ pub const Grid = struct {
     scroll_fast_path_blocked: bool = false,
 
     // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
-    // These are main grid coordinates (already offset by win_pos for sub-grids).
+    // These are global grid coordinates (already offset by win_pos for sub-grids).
     // Tracked as a fixed-size array to avoid allocation. Overflow invalidates pending_scroll.
     scroll_touched_rows: [8]u32 = undefined,
     scroll_touched_count: u8 = 0,
 
     // Previous cursor row before grid_cursor_goto update.
-    // Stored as main grid coordinate (offset by win_pos for sub-grid cursors).
+    // Stored as global grid coordinate (offset by win_pos for sub-grid cursors).
     // Used by scroll-aware flush to know which rows need cursor redraw.
     // Set by setCursor(), cleared by clearScrollState().
     prev_cursor_row: ?u32 = null,
@@ -927,7 +927,7 @@ pub const Grid = struct {
     }
 
     pub fn deinit(self: *Grid) void {
-        // main grid
+        // global grid
         if (self.cells.len != 0) self.alloc.free(self.cells);
         self.cells = &[_]Cell{};
         self.rows = 0;
@@ -993,7 +993,7 @@ pub const Grid = struct {
 
     pub fn getGridMetricsPx(self: *const Grid, grid_id: i64) CellMetricsPx {
         if (self.grid_metrics.get(grid_id)) |m| return m;
-        // Fallback to main grid metrics; if not set, assume 1 to avoid div-by-zero.
+        // Fallback to global grid metrics; if not set, assume 1 to avoid div-by-zero.
         if (self.grid_metrics.get(1)) |m1| return m1;
         return .{ .cell_w_px = 1, .cell_h_px = 1 };
     }
@@ -1020,7 +1020,7 @@ pub const Grid = struct {
         return 0;
     }
 
-    /// Get cell at (row, col) for main grid
+    /// Get cell at (row, col) for global grid
     pub fn getCell(self: *const Grid, row: u32, col: u32) Cell {
         if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
@@ -1072,7 +1072,7 @@ pub const Grid = struct {
 
     /// Shift previously-recorded touched rows by a new scroll delta.
     /// Rows that scroll out of the [top, bot) region are removed.
-    /// Coordinates are in main grid space (win_pos_row already applied).
+    /// Coordinates are in global grid space (win_pos_row already applied).
     fn shiftTouchedRows(self: *Grid, scroll_rows: i32, top: u32, bot: u32, win_pos_row: u32) void {
         const main_top: i32 = @intCast(top + win_pos_row);
         const main_bot: i32 = @intCast(bot + win_pos_row);
@@ -1088,7 +1088,7 @@ pub const Grid = struct {
     }
 
     /// Record a row touched by grid_line while a pending_scroll is active.
-    /// Uses main grid coordinates. Deduplicates entries.
+    /// Uses global grid coordinates. Deduplicates entries.
     /// On overflow, invalidates pending_scroll (too many touched rows for fast path).
     fn recordScrollTouchedRow(self: *Grid, row: u32) void {
         if (self.pending_scroll == null) return;
@@ -1181,7 +1181,7 @@ pub const Grid = struct {
         // Treat only actual changes as dirty
         self.markDirtyRow(row);
 
-        // Record touched row for scroll-aware flush (main grid coordinate)
+        // Record touched row for scroll-aware flush (global grid coordinate)
         self.recordScrollTouchedRow(row);
 
         // Advance content_rev only on cell changes (defined in Grid)
@@ -1294,7 +1294,7 @@ pub const Grid = struct {
     }
 
     fn getOrCreateSub(self: *Grid, grid_id: i64) !*GridBuf {
-        // grid_id == 1 is the main grid; caller must not request it here
+        // grid_id == 1 is the global grid; caller must not request it here
         const gop = try self.sub_grids.getOrPut(self.alloc, grid_id);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
@@ -1312,7 +1312,7 @@ pub const Grid = struct {
         const sg = try self.getOrCreateSub(grid_id);
         try sg.resize(self.alloc, rows, cols);
 
-        // Only affect main grid state for composited grids (in win_pos).
+        // Only affect global grid state for composited grids (in win_pos).
         // External grids (not in win_pos) are rendered independently.
         if (self.win_pos.contains(grid_id)) {
             self.content_rev +%= 1;
@@ -1329,7 +1329,7 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| sg.clear();
 
-        // Only affect main grid state for composited grids.
+        // Only affect global grid state for composited grids.
         if (self.win_pos.contains(grid_id)) {
             self.content_rev +%= 1;
         }
@@ -1345,13 +1345,13 @@ pub const Grid = struct {
             const changed = sg.putCell(row, col, cp, hl);
             if (changed) {
                 if (self.win_pos.get(grid_id)) |p| {
-                    // Composited on main grid: affect main grid dirty state
+                    // Composited on global grid: affect global grid dirty state
                     self.content_rev +%= 1;
                     const tr = p.row + row;
                     self.markDirtyRow(tr);
                     self.recordScrollTouchedRow(tr);
                 }
-                // External grids (not in win_pos) do not affect main grid
+                // External grids (not in win_pos) do not affect global grid
                 // content_rev or dirty state.
 
                 // Advance cursor_rev if cursor is on this cell (to update cursor text)
@@ -1408,7 +1408,7 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll(top, bot, left, right, rows, cols);
-            // Multiple scrolls in same batch block the fast path (same as main grid)
+            // Multiple scrolls in same batch block the fast path (same as global grid)
             if (sg.last_scroll_op != null) {
                 sg.scroll_fast_path_blocked = true;
             }
@@ -1442,7 +1442,7 @@ pub const Grid = struct {
                 };
                 self.scroll_touched_count = 0;
             }
-            // External grids (not in win_pos) do not affect main grid
+            // External grids (not in win_pos) do not affect global grid
             // content_rev, dirty state, or pending_scroll.
 
             self.recordScrolledGrid(grid_id);
@@ -1604,7 +1604,7 @@ pub const Grid = struct {
         // so they get recomposed with the underlying grid=1 content
         // (e.g., window separators that were previously overlaid).
         // Only bump content_rev when win_pos existed (grid was composited);
-        // external-only grids don't affect main grid composition.
+        // external-only grids don't affect global grid composition.
         if (self.win_pos.get(grid_id)) |pos| {
             if (self.sub_grids.get(grid_id)) |sg| {
                 self.markDirtyRect(pos.row, pos.row + sg.rows);
@@ -1626,7 +1626,7 @@ pub const Grid = struct {
     /// Mark a grid as external (displayed in a separate top-level window).
     /// Returns true if this is a new external grid, false if it was already external.
     pub fn setWinExternalPos(self: *Grid, grid_id: i64, win: i64) !bool {
-        if (grid_id == 1) return false; // Main grid cannot be external
+        if (grid_id == 1) return false; // Global grid cannot be external
 
         // Store grid_id -> winid mapping
         try self.grid_win_ids.put(self.alloc, grid_id, win);
@@ -1666,7 +1666,7 @@ pub const Grid = struct {
             .start_col = start_col,
         });
 
-        // If cursor is on this grid, increment cursor_rev to trigger main grid cursor clear
+        // If cursor is on this grid, increment cursor_rev to trigger global grid cursor clear
         if (self.cursor_grid == grid_id) {
             self.cursor_rev +%= 1;
         }
@@ -1696,7 +1696,7 @@ pub const Grid = struct {
             (self.cursor_col != col);
 
         // Record previous cursor row for scroll-aware flush (only first move per batch).
-        // Stored as main grid coordinate (offset by win_pos for sub-grids).
+        // Stored as global grid coordinate (offset by win_pos for sub-grids).
         if (changed and self.prev_cursor_row == null and self.cursor_valid) {
             const win_offset: u32 = if (self.cursor_grid != 1)
                 if (self.win_pos.get(self.cursor_grid)) |p| p.row else 0
@@ -1718,7 +1718,7 @@ pub const Grid = struct {
         if (changed) self.cursor_rev +%= 1;
     }
 
-    /// Return the current cursor row in main-grid coordinates when the cursor is
+    /// Return the current cursor row in global-grid coordinates when the cursor is
     /// on the specified grid. Returns null if the cursor is hidden or on another grid.
     pub fn currentCursorMainRow(self: *const Grid, grid_id: i64) ?u32 {
         if (!self.cursor_valid or self.cursor_grid != grid_id) return null;

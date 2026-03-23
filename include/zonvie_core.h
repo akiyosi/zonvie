@@ -184,7 +184,7 @@ typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];
     float texCoord[2];
     float color[4] __attribute__((aligned(16)));  /* 16-byte aligned to match Swift simd_float4 */
-    int64_t grid_id;  /* 1 = main grid, >1 = sub-grid (float window) */
+    int64_t grid_id;  /* 1 = global grid, >1 = sub-grid (float window) */
     uint32_t deco_flags;  /* ZONVIE_DECO_* flags for decoration type */
     float deco_phase;     /* phase offset for undercurl (cell column position) */
 } zonvie_vertex;
@@ -216,7 +216,7 @@ typedef void (*zonvie_on_vertices_row_fn)(
 /* Main row-buffer scroll fast path notification.
    The core calls this when it can preserve previously submitted main-row content
    by shifting existing row buffers instead of resubmitting every reused row.
-   row_start/row_end are main-grid row indices in [row_start, row_end), cols are
+   row_start/row_end are global-grid row indices in [row_start, row_end), cols are
    a column range in [col_start, col_end), and rows_delta follows Neovim grid_scroll
    semantics (positive = content moves up, negative = content moves down).
    After this callback, the frontend should expect on_vertices_row only for
@@ -325,7 +325,7 @@ typedef void (*zonvie_on_set_title_fn)(
    grid_id: the grid to display externally
    win: Neovim window handle (for reference)
    rows, cols: dimensions of the grid
-   start_row, start_col: position in main grid cell units (from win_pos/win_float_pos)
+   start_row, start_col: position in global grid cell units (from win_pos/win_float_pos)
                          Use -1 if no position info available (cmdline, etc.)
    Called on win_external_pos event. Frontend should create a separate window
    and render the grid there. */
@@ -676,7 +676,7 @@ typedef struct zonvie_callbacks {
     zonvie_on_external_vertices_fn on_external_vertices;
 
     /* Called when cursor moves to a different grid.
-       grid_id: the grid where cursor now resides (1 = main grid).
+       grid_id: the grid where cursor now resides (1 = global grid).
        Frontend should activate the corresponding window. */
     void (*on_cursor_grid_changed)(void* ctx, int64_t grid_id);
 
@@ -791,7 +791,7 @@ void zonvie_core_set_ext_popupmenu(zonvie_core *core, int enabled);
 
 /* Enable ext_messages UI extension (must call before zonvie_core_start).
  * When enabled, message events are sent to frontend callbacks instead of
- * being rendered in the main grid. Messages are displayed as external
+ * being rendered in the global grid. Messages are displayed as external
  * floating windows. */
 void zonvie_core_set_ext_messages(zonvie_core *core, int enabled);
 
@@ -907,7 +907,7 @@ typedef struct zonvie_grid_info {
 
 /* Viewport info for scrollbar rendering */
 typedef struct zonvie_viewport_info {
-    int64_t grid_id;      /* Grid ID (1 = main grid) */
+    int64_t grid_id;      /* Grid ID (1 = global grid) */
     int64_t topline;      /* First visible line (0-based) */
     int64_t botline;      /* First line below window (exclusive) */
     int64_t line_count;   /* Total lines in buffer */
@@ -926,7 +926,7 @@ ZONVIE_API int zonvie_core_get_viewport(
 
 /* Get list of visible grids for hit-testing.
    Returns number of grids written (up to max_count).
-   Main grid (id=1) is always included first. */
+   Global grid (id=1) is always included first. */
 ZONVIE_API size_t zonvie_core_get_visible_grids(
     zonvie_core *core,
     zonvie_grid_info *out_grids,
@@ -943,7 +943,7 @@ ZONVIE_API int32_t zonvie_core_try_get_visible_grids(
 
 /* Get current cursor position.
    Returns cursor row and column (0-based) in out_row and out_col.
-   Returns the grid_id of the cursor (1 = main grid). */
+   Returns the grid_id of the cursor (1 = global grid). */
 ZONVIE_API int64_t zonvie_core_get_cursor_position(
     zonvie_core *core,
     int32_t *out_row,
@@ -979,7 +979,7 @@ ZONVIE_API void zonvie_core_get_cursor_blink(
 /* Send mouse scroll event to Neovim.
    direction: "up", "down", "left", or "right"
    modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt), "D" (super/command)
-   grid_id: target grid (1 = main grid)
+   grid_id: target grid (1 = global grid)
    row, col: position within the grid */
 ZONVIE_API void zonvie_core_send_mouse_scroll(
     zonvie_core *core,
@@ -1018,7 +1018,7 @@ ZONVIE_API void zonvie_core_process_pending_msg_scroll(
    button: "left", "right", "middle", "x1", "x2"
    action: "press", "drag", "release"
    modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt), "D" (super/command)
-   grid_id: target grid (1 = main grid)
+   grid_id: target grid (1 = global grid)
    row, col: position within the grid */
 ZONVIE_API void zonvie_core_send_mouse_input(
     zonvie_core *core,

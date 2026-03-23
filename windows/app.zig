@@ -285,7 +285,7 @@ pub const SurfaceState = struct {
 // Triple-buffered surface types
 // =========================================================================
 
-/// One frame's worth of CPU-side vertex data (main grid or external window).
+/// One frame's worth of CPU-side vertex data (global grid or external window).
 /// Three of these rotate inside TripleBufferedSurface.
 /// Row data is accessed via row_map → SlotPool indirection (COW shared slots).
 pub const VertexSet = struct {
@@ -2754,7 +2754,7 @@ pub const App = struct {
                     }
                 }
 
-                // For main grid, use main window client area
+                // For global grid, use main window client area
                 if (self.hwnd) |main_hwnd| {
                     var rect: c.RECT = undefined;
                     if (c.GetClientRect(main_hwnd, &rect) != 0) {

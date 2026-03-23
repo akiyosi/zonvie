@@ -698,7 +698,7 @@ pub fn onVerticesPartial(
     // Get hwnd before unlock
     const hwnd_for_blink = app.hwnd;
     // Always post blink update when cursor flag is set (covers cursor on external grid
-    // where main grid gets cursor_count=0 but blink settings may have changed via mode_change).
+    // where global grid gets cursor_count=0 but blink settings may have changed via mode_change).
     const blink_update_needed = cursor_updated or ((flags & app_mod.VERT_UPDATE_CURSOR) != 0);
 
     app.mu.unlock();
@@ -1171,7 +1171,7 @@ pub fn onVerticesRow(
                 .{grid_id},
             );
         }
-        return; // Don't process as main grid
+        return; // Don't process as global grid
     }
 
     const end_row_hint: u32 = row_start + row_count;

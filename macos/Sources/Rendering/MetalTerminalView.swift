@@ -1408,7 +1408,7 @@ final class MetalTerminalView: MTKView {
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
 
-        // grid=1 (main grid) does not support pixel-based smooth scrolling
+        // grid=1 (global grid) does not support pixel-based smooth scrolling
         // gridId < 0 means Zonvie-managed external windows (ext_messages, ext_cmdline)
         // which don't receive grid_scroll events from Neovim
         var effectiveHasPrecise = hasPrecise && gridId > 1
@@ -1728,7 +1728,7 @@ final class MetalTerminalView: MTKView {
         }
 
         // Find grid with highest zindex containing this point
-        var bestGridId: Int64 = 1  // default to main grid
+        var bestGridId: Int64 = 1  // default to global grid
         var bestZindex: Int64 = Int64.min
         var localRow: Int32 = globalRow
         var localCol: Int32 = globalCol

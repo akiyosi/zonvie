@@ -1287,12 +1287,12 @@ pub const Core = struct {
     fn getVisibleGridsLocked(self: *Core, out: []c_api.GridInfo) usize {
         var count: usize = 0;
 
-        // Always include main grid first
+        // Always include global grid first
         if (count < out.len) {
             const m1 = self.grid.getViewportMargins(1);
             out[count] = .{
                 .grid_id = 1,
-                .zindex = 0, // main grid has lowest zindex
+                .zindex = 0, // global grid has lowest zindex
                 .start_row = 0,
                 .start_col = 0,
                 .rows = @intCast(self.grid.rows),
@@ -1311,7 +1311,7 @@ pub const Core = struct {
             if (count >= out.len) break;
 
             const gid = entry.key_ptr.*;
-            if (gid == 1) continue; // skip main grid (already added)
+            if (gid == 1) continue; // skip global grid (already added)
 
             const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
@@ -1505,7 +1505,7 @@ pub const Core = struct {
         self.cell_w_px = cw;
         self.cell_h_px = ch;
 
-        // Keep main grid (id=1) cell metrics for future per-grid font metrics.
+        // Keep global grid (id=1) cell metrics for future per-grid font metrics.
         self.grid.setGridMetricsPx(1, cw, ch) catch {};
 
         // Update screen_cols for cmdline max width (cols derived from drawable width).

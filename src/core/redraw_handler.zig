@@ -481,7 +481,7 @@ pub fn handleRedraw(
                 // Only for grids that are actual external windows (ext_windows splits
                 // or UI-extension grids like popupmenu/messages). Float windows
                 // (e.g. Telescope) must NOT get entries here — they render on the
-                // main grid and their NDC uses sg.rows/sg.cols directly.
+                // global grid and their NDC uses sg.rows/sg.cols directly.
                 if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
                     grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width }) catch {};
                 }
@@ -547,7 +547,7 @@ pub fn handleRedraw(
                 log.write("[win_split] win1={d} grid1={d} win2={d} grid2={d} flags={d}\n", .{ win1, grid1, win2, grid2, flags });
 
                 // Only register the NEW window (grid2/win2) as external.
-                // The source window (grid1/win1) stays where it is (main grid or already external).
+                // The source window (grid1/win1) stays where it is (global grid or already external).
                 _ = grid.setWinExternalPos(grid2, win2) catch |e| {
                     log.write("[win_split] setWinExternalPos grid2={d} failed: {any}\n", .{ grid2, e });
                 };
@@ -870,13 +870,13 @@ pub fn handleRedraw(
                     col_i64 = base_col + anchor_col_i;
 
                     // Adjust by anchor using goneovim-like metrics conversion.
-                    // We compute float window size in "main grid cell units" using per-grid pixel metrics.
+                    // We compute float window size in "global grid cell units" using per-grid pixel metrics.
                     const main_m = grid.getGridMetricsPx(1);
                     const anchor_m = grid.getGridMetricsPx(anchor_grid);
                     const float_m = grid.getGridMetricsPx(grid_id);
 
-                    // Convert anchor point from anchor_grid units -> main grid units.
-                    // base_row/base_col are already in main grid units (win_pos is relative to grid=1).
+                    // Convert anchor point from anchor_grid units -> global grid units.
+                    // base_row/base_col are already in global grid units (win_pos is relative to grid=1).
                     const anchor_row_main: i64 = @as(i64, @intFromFloat(
                         @as(f64, @floatFromInt(anchor_row_i)) * @as(f64, @floatFromInt(anchor_m.cell_h_px)) /
                             @as(f64, @floatFromInt(main_m.cell_h_px))
@@ -889,7 +889,7 @@ pub fn handleRedraw(
                     row_i64 = base_row + anchor_row_main;
                     col_i64 = base_col + anchor_col_main;
 
-                    // Compute float window size in main grid units (approx; future-proof for per-grid fonts).
+                    // Compute float window size in global grid units (approx; future-proof for per-grid fonts).
                     if (grid.sub_grids.get(grid_id)) |sg| {
                         const float_rows: i64 = @as(i64, sg.rows);
                         const float_cols: i64 = @as(i64, sg.cols);

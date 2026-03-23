@@ -1658,7 +1658,7 @@ pub export fn WndProc(
                     _ = c.SetForegroundWindow(eh);
                     if (applog.isEnabled()) applog.appLog("[win] activated external window for grid_id={d}\n", .{grid_id});
                 } else {
-                    // Cursor moved to main grid - activate main window
+                    // Cursor moved to global grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
                     // Only invalidate if no paint is already pending from on_vertices_row/partial.
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT

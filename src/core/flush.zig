@@ -426,7 +426,7 @@ pub const ScrollFastPathResult = struct {
 /// Requirements:
 ///   - scrolled_count == 1 (single scroll in batch)
 ///   - grid_id >= 2 (multigrid content grid, not base grid)
-///   - win_pos_row == 0 (grid at top of main grid)
+///   - win_pos_row == 0 (grid at top of global grid)
 ///   - abs(rows) == 1 (single-line content shift only)
 ///   - cols == 0 (no horizontal scroll)
 ///   - full width (left == 0, right == target_cols)
@@ -453,9 +453,9 @@ pub fn checkScrollFastPath(
     // grid_id == 1 is the base grid and has different composition rules.
     if (ps.grid_id < 2)
         return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
-    // win_pos_row == 0: the scrolling grid starts at main grid row 0.
+    // win_pos_row == 0: the scrolling grid starts at global grid row 0.
     // Non-zero win_pos means the grid is embedded at an offset and cache
-    // shift indices would not correspond to main grid row indices.
+    // shift indices would not correspond to global grid row indices.
     if (ps.win_pos_row != 0)
         return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
     const region_height: u32 = ps.bot -| ps.top;
@@ -620,7 +620,7 @@ pub fn shiftScrollCacheAndValidate(
 }
 
 // ---------------------------------------------------------------------------
-// VertexHelpers: shared vertex generation utilities for both main grid and
+// VertexHelpers: shared vertex generation utilities for both global grid and
 // external grid pipelines.  Extracted to file level so the 5-pass row
 // generation function can be shared.
 // ---------------------------------------------------------------------------
@@ -819,7 +819,7 @@ pub const RowGenStats = struct {
     shape_calls: u32 = 0, // number of shape_text_run callback invocations
 };
 
-/// Unified 5-pass row vertex generation shared by main grid (row_mode) and
+/// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
 pub fn generateRowVertices(
@@ -2038,7 +2038,7 @@ pub const FlushCtx = struct {
                     v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                 }
 
-                /// Compute DECO_SCROLLABLE flag for a cell at main grid row `r` with the given grid_id.
+                /// Compute DECO_SCROLLABLE flag for a cell at global grid row `r` with the given grid_id.
                 /// For grid_id=1, uses the pre-computed main_scrollable flag.
                 /// For sub-grids, checks the sub-grid's own viewport margins.
                 fn computeScrollFlag(
@@ -2149,7 +2149,7 @@ pub const FlushCtx = struct {
                 }
 
                 // -------------------------------------------------
-                // Row callback mode: send only dirty rows (main grid)
+                // Row callback mode: send only dirty rows (global grid)
                 // -------------------------------------------------
 
                 const use_row_mode = (ctx.core.cb.on_vertices_row != null);
@@ -2935,7 +2935,7 @@ pub const FlushCtx = struct {
                     const nr_hl_cache_limit: u32 = @intCast(nr_hl_valid.len);
                     @memset(nr_hl_valid, false);
 
-                    // 1) draw main grid(1) with RLE batching + hl_cache
+                    // 1) draw global grid(1) with RLE batching + hl_cache
                     const grid_cells = ctx.core.grid.cells;
                     var row_i: u32 = 0;
                     while (row_i < rows) : (row_i += 1) {
@@ -3442,8 +3442,8 @@ pub const FlushCtx = struct {
             if (need_cursor) {
                 cursor.clearRetainingCapacity();
 
-                // Skip cursor generation if cursor is NOT on main grid and NOT embedded in main grid
-                // Embedded grids (win_pos) have their cursor drawn on main grid via coordinate transform
+                // Skip cursor generation if cursor is NOT on global grid and NOT embedded in global grid
+                // Embedded grids (win_pos) have their cursor drawn on global grid via coordinate transform
                 // External/special grids (external_grids, cmdline, etc.) render their own cursor
                 const cursor_grid = ctx.core.grid.cursor_grid;
                 const cursor_embedded_in_main = (cursor_grid == 1) or ctx.core.grid.win_pos.contains(cursor_grid);
@@ -3573,7 +3573,7 @@ pub const FlushCtx = struct {
                                 }
 
                                 if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                    // Calculate glyph position (same as main grid rendering)
+                                    // Calculate glyph position (same as global grid rendering)
                                     // Use topPad from outer scope
                                     const cursorBaseY: f32 = y0 + topPad;
                                     const baselineY: f32 = cursorBaseY + ge.ascent_px;
@@ -3697,7 +3697,7 @@ pub const FlushCtx = struct {
         ctx.core.invalidateScrollCache();
 
         // Mark ALL grids dirty so row-mode vertex generation re-renders
-        // every row with the new font/atlas. Without this, the main grid
+        // every row with the new font/atlas. Without this, the global grid
         // keeps old vertices referencing the now-empty atlas → blank screen
         // until Neovim resends content after nvim_ui_try_resize.
         ctx.core.grid.markAllDirty();
@@ -3842,7 +3842,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Check if cursor is on a non-existent external grid (e.g., closed cmdline)
     // In this case, we need to force redraw the grid that previously had cursor
     const cursor_on_closed_grid = !self.known_external_grids.contains(cursor_grid) and
-        cursor_grid != 1; // cursor_grid != main grid
+        cursor_grid != 1; // cursor_grid != global grid
     const need_force_redraw_last = cursor_on_closed_grid and
         self.known_external_grids.contains(self.last_ext_cursor_grid);
 
@@ -4188,7 +4188,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // in row vertices. This eliminates cursor ghost artifacts during GPU
         // scroll copy. No prev_cursor_row tracking needed for row regeneration.
 
-        // Build regen_rows set for scroll fast path (mirrors main grid approach).
+        // Build regen_rows set for scroll fast path (mirrors global grid approach).
         // Pre-compute which rows need regeneration: dirty_rows only (no cursor rows).
         var regen_rows: [12]u32 = undefined;
         var regen_count: u32 = 0;
@@ -4256,7 +4256,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // Compute scrollable flag for this row in the external grid
             const ext_scrollable: u32 = if (row >= ext_margins.top and row < sg.rows -| ext_margins.bottom) c_api.DECO_SCROLLABLE else 0;
 
-            // Row skip logic — mirrors main grid approach:
+            // Row skip logic — mirrors global grid approach:
             // Fast path: only compose rows in regen set (dirty + cursor rows).
             // Fallback: check dirty_rows bitmap.
             // When scroll happened but fast path is ineligible, regenerate all
@@ -4343,7 +4343,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     use_ext_scroll_fast_path = false; // Retry needs full redraw
                     continue :ext_retry; // Restart this grid's row loop from row 0
                 }
-                // 2nd reset: clear all sent rows (match main grid behavior)
+                // 2nd reset: clear all sent rows (match global grid behavior)
                 for (0..viewport_rows) |clear_ri| {
                     row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
                 }
@@ -4647,7 +4647,7 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             display_width += countDisplayWidth(special);
         }
 
-        // Grid width: start at main grid width, expand up to screen width, then scroll
+        // Grid width: start at global grid width, expand up to screen width, then scroll
         const min_width: u32 = if (self.grid.cols > 0) self.grid.cols else 80;
         const max_width: u32 = if (self.grid.screen_cols > 0) self.grid.screen_cols else min_width;
         const content_width: u32 = display_width + 1; // +1 for cursor
@@ -4817,7 +4817,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     const block_line_count: u32 = @intCast(block_lines.len);
 
     // Calculate total rows and max width
-    // Minimum width = main grid width; frontend constrains to screen width
+    // Minimum width = global grid width; frontend constrains to screen width
     const min_width: u32 = if (self.grid.cols > 0) self.grid.cols else 40;
     var max_width: u32 = min_width;
 
@@ -5722,7 +5722,7 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
 
     // Register as external grid
     self.grid.external_grids.put(self.alloc, msg_grid_id, .{
-        .win = 1, // Main grid
+        .win = 1, // Global grid
         .start_row = -2, // Special marker: position at top-right
         .start_col = -2,
     }) catch |e| {
@@ -6334,7 +6334,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     // Position: use special marker -2 to indicate "msg_show position" (top-right)
     // Frontend will interpret this and position like msg_show
     self.grid.external_grids.put(self.alloc, history_grid_id, .{
-        .win = 1, // Main grid
+        .win = 1, // Global grid
         .start_row = -2, // Special marker: position like msg_show (top-right)
         .start_col = -2,
     }) catch |e| {

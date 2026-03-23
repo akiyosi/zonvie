@@ -767,7 +767,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // composited editor window and skipping promotion entirely.
         var ext_windows_promoted = false;
         if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
-            // Detect whether the main grid has any composited editor windows.
+            // Detect whether the global grid has any composited editor windows.
             // Skip: grid 1 (global/status), floats (in win_layer), external grids,
             // and grids without a real Neovim window handle (not in grid_win_ids).
             var has_composited_editor_win = false;

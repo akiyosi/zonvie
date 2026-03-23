@@ -4337,7 +4337,7 @@ final class ZonvieCore {
                 }
                 ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId)")
             } else {
-                // Cursor moved to main grid - activate main window
+                // Cursor moved to global grid - activate main window
                 if let mainWindow = self.terminalView?.window {
                     mainWindow.makeKeyAndOrderFront(nil)
                     ZonvieCore.appLog("[cursor_grid_changed] activated main window (cursor on gridId=\(gridId))")
@@ -5240,7 +5240,7 @@ final class ZonvieCore {
                 }
             }
 
-            // Fallback to main grid (id=1) if not found
+            // Fallback to global grid (id=1) if not found
             if targetGrid == nil {
                 targetGrid = grids.first { $0.gridId == 1 }
             }

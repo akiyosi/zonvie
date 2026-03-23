@@ -87,7 +87,7 @@ pub const Vertex = extern struct {
     position: [2]f32,
     texCoord: [2]f32,
     color: [4]f32 align(16), // 16-byte alignment to match Swift simd_float4
-    grid_id: i64, // 1 = main grid, >1 = sub-grid (float window)
+    grid_id: i64, // 1 = global grid, >1 = sub-grid (float window)
     deco_flags: u32, // DECO_* flags for decoration type
     deco_phase: f32, // phase offset for undercurl (cell column position)
 
@@ -876,7 +876,7 @@ pub export fn zonvie_core_set_atlas_size(p: ?*zonvie_core, size: u32) callconv(.
 
 /// Enable ext_messages UI extension. Must be called before zonvie_core_start().
 /// When enabled, message events are sent to frontend callbacks instead of being
-/// rendered in the main grid. Messages are displayed as external floating windows.
+/// rendered in the global grid. Messages are displayed as external floating windows.
 pub export fn zonvie_core_set_ext_messages(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
