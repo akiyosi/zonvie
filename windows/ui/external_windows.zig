@@ -2162,7 +2162,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Snapshot vertex data. Row-mode normal surfaces use TBS committed set
     // (lock-free via refcount). Decorated surfaces and flat-mode still need snapshot.
-    const vert_count = ext_win.vert_count;
+    var vert_count = ext_win.vert_count;
     if (!is_row_mode_normal) {
         if (!app_mod.snapshotSurfaceRows(
             app.alloc,
@@ -2177,6 +2177,12 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             app.mu.unlock();
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
             return;
+        }
+        // Append cursor vertices so decorated surfaces (cmdline) can render the cursor.
+        const cursor_items = ext_win.surface.cursor_verts.items;
+        if (cursor_items.len > 0) {
+            ext_win.paint_scratch.appendSlice(app.alloc, cursor_items) catch {};
+            vert_count += cursor_items.len;
         }
     }
 
