@@ -204,6 +204,24 @@ test "prevCursorMainRowAfterScroll applies scroll delta to previous cursor row" 
 // B. Eligibility (checkScrollFastPath)
 // ============================================================================
 
+// Standard CachedSubgrid for the scrolling editor grid (grid_id=2, row 0..42, col 0..80).
+// cells pointer is not accessed by checkScrollFastPath, so we use a dummy.
+const dummy_cells: [1]grid_mod.Cell = .{.{ .cp = 0, .hl = 0 }};
+
+fn scrollingSubgrid() flush_mod.CachedSubgrid {
+    return .{
+        .grid_id = 2,
+        .row_start = 0,
+        .row_end = 42,
+        .col_start = 0,
+        .sg_cols = 80,
+        .sg_rows = 42,
+        .cells = &dummy_cells,
+        .margin_top = 0,
+        .margin_bottom = 0,
+    };
+}
+
 fn makeEligibleGrid(alloc: std.mem.Allocator) !Grid {
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
@@ -215,7 +233,8 @@ test "eligible: standard 1-line scroll down" {
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
@@ -225,7 +244,8 @@ test "ineligible: scrolled_count != 1" {
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 2, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 2, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_scroll_batch, result.reason);
 }
@@ -239,7 +259,8 @@ test "eligible: accumulated same-grid scroll in same batch" {
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
     try std.testing.expect(!g.scroll_fast_path_blocked);
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(@as(i32, 2), result.scroll_op.?.rows);
 }
@@ -249,10 +270,11 @@ test "ineligible: grid_id < 2" {
     var g = Grid.init(alloc);
     defer g.deinit();
     try g.resize(42, 80);
-    // scroll on main grid (grid_id=1)
+    // scroll on global grid (grid_id=1)
     g.scrollGrid(1, 1, 42, 0, 80, 1, 0);
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
 }
 
@@ -262,7 +284,8 @@ test "eligible: multi-row scroll (3 rows within half region)" {
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 0, 80, 3, 0); // 3 rows, region height=41, 3 <= 41/2
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
 }
 
@@ -272,7 +295,8 @@ test "ineligible: multi-row scroll exceeds half region" {
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 0, 80, 21, 0); // 21 rows, region height=41, 21 > 41/2=20
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_row_scroll, result.reason);
 }
@@ -283,7 +307,8 @@ test "ineligible: scroll rows >= region height" {
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 0, 80, 41, 0); // 41 rows = entire region
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.multi_row_scroll, result.reason);
 }
@@ -294,7 +319,8 @@ test "eligible: top == 0 (full grid scroll)" {
     defer g.deinit();
     g.scrollGrid(2, 0, 42, 0, 80, 1, 0); // top=0, full grid
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
@@ -305,7 +331,8 @@ test "eligible: partial region bot < target_rows" {
     defer g.deinit();
     g.scrollGrid(2, 1, 40, 0, 80, 1, 0); // bot=40, target_rows=42
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
@@ -316,7 +343,8 @@ test "ineligible: bot > target_rows" {
     defer g.deinit();
     g.scrollGrid(2, 1, 43, 0, 80, 1, 0); // bot=43 > target_rows=42
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.not_full_region, result.reason);
 }
@@ -327,7 +355,8 @@ test "ineligible: partial width" {
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 5, 80, 1, 0); // left=5
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.partial_width, result.reason);
 }
@@ -337,7 +366,8 @@ test "ineligible: rebuild_all" {
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
-    const result = flush_mod.checkScrollFastPath(&g, true, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, true, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.rebuild_all_set, result.reason);
 }
@@ -347,19 +377,100 @@ test "ineligible: atlas_retried" {
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
-    const result = flush_mod.checkScrollFastPath(&g, false, true, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, true, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.atlas_retried, result.reason);
 }
 
-test "ineligible: cached_subgrid_count > 1 (float window)" {
+test "ineligible: non-scrolling subgrid overlaps scroll region" {
     const alloc = std.testing.allocator;
     var g = try makeEligibleGrid(alloc);
     defer g.deinit();
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 2);
+    // Scrolling grid (grid_id=2) at rows 0..42, scroll region top=1 bot=42 → global rows 1..42
+    // Float window (grid_id=5) at rows 10..15 overlaps the scroll region
+    const sgs = [_]flush_mod.CachedSubgrid{
+        scrollingSubgrid(),
+        .{
+            .grid_id = 5,
+            .row_start = 10,
+            .row_end = 15,
+            .col_start = 20,
+            .sg_cols = 30,
+            .sg_rows = 5,
+            .cells = &dummy_cells,
+            .margin_top = 0,
+            .margin_bottom = 0,
+        },
+    };
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
-    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.no_subgrid, result.reason);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.subgrid_overlaps_scroll, result.reason);
+}
+
+test "eligible: non-scrolling subgrid outside scroll region (msg_set_pos)" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 44, 80, 42, 80);
+    defer g.deinit();
+    // Editor grid at row 1 (win_pos_row=1), msg grid at row 43 (outside scroll region)
+    try g.setWinPos(2, 0, 1, 0);
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0); // scroll region top=1 bot=42, win_pos_row=1 → global rows 2..43
+
+    const sgs = [_]flush_mod.CachedSubgrid{
+        .{
+            .grid_id = 2,
+            .row_start = 1,
+            .row_end = 43,
+            .col_start = 0,
+            .sg_cols = 80,
+            .sg_rows = 42,
+            .cells = &dummy_cells,
+            .margin_top = 0,
+            .margin_bottom = 0,
+        },
+        .{
+            .grid_id = 3,
+            .row_start = 43,
+            .row_end = 44,
+            .col_start = 0,
+            .sg_cols = 80,
+            .sg_rows = 1,
+            .cells = &dummy_cells,
+            .margin_top = 0,
+            .margin_bottom = 0,
+        },
+    };
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
+    try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
+}
+
+test "ineligible: scroll region exceeds global grid bounds (win_pos_row)" {
+    const alloc = std.testing.allocator;
+    // Global grid has 20 rows, subgrid has 20 rows at win_pos_row=5.
+    // scroll bot=20 + win_pos_row=5 → global row 25, but global grid only has 20 rows.
+    var g = try setupGridWithSubgrid(alloc, 20, 80, 20, 80);
+    defer g.deinit();
+    try g.setWinPos(2, 0, 5, 0);
+    g.scrollGrid(2, 1, 20, 0, 80, 1, 0); // bot=20, win_pos_row=5 → scroll_row_end=25 > 20
+
+    const sgs = [_]flush_mod.CachedSubgrid{
+        .{
+            .grid_id = 2,
+            .row_start = 5,
+            .row_end = 25, // extends beyond global grid
+            .col_start = 0,
+            .sg_cols = 80,
+            .sg_rows = 20,
+            .cells = &dummy_cells,
+            .margin_top = 0,
+            .margin_bottom = 0,
+        },
+    };
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
+    try std.testing.expect(!result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.not_full_region, result.reason);
 }
 
 test "ineligible: no pending_scroll" {
@@ -368,7 +479,8 @@ test "ineligible: no pending_scroll" {
     defer g.deinit();
     try g.resize(42, 80);
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.no_pending_scroll, result.reason);
 }
@@ -379,7 +491,8 @@ test "eligible: reverse single-line scroll (rows == -1)" {
     defer g.deinit();
     g.scrollGrid(2, 1, 42, 0, 80, -1, 0);
 
-    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, 1);
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }

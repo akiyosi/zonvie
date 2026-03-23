@@ -413,6 +413,7 @@ pub const ScrollFallbackReason = enum(u8) {
     atlas_retried, // atlas reset caused retry
     multi_scroll_batch, // scrolled_count > 1
     no_subgrid, // grid_id != 1 but not in sub_grids (shouldn't happen)
+    subgrid_overlaps_scroll, // a non-scrolling subgrid overlaps the scroll region
 };
 
 pub const ScrollFastPathResult = struct {
@@ -426,20 +427,19 @@ pub const ScrollFastPathResult = struct {
 /// Requirements:
 ///   - scrolled_count == 1 (single scroll in batch)
 ///   - grid_id >= 2 (multigrid content grid, not base grid)
-///   - win_pos_row == 0 (grid at top of global grid)
-///   - abs(rows) == 1 (single-line content shift only)
+///   - abs(rows) <= region_height/2 (not too many vacated rows)
 ///   - cols == 0 (no horizontal scroll)
 ///   - full width (left == 0, right == target_cols)
 ///   - bot <= target_rows (valid region bounds)
 ///   - no rebuild_all, no atlas retry
-///   - cached_subgrid_count <= 1 (no overlapping float windows)
+///   - no non-scrolling subgrid overlaps the scroll region
 ///
 pub fn checkScrollFastPath(
     grid: *const grid_mod.Grid,
     rebuild_all: bool,
     atlas_retried_flag: bool,
     scrolled_count: u8,
-    cached_subgrid_count: usize,
+    cached_subgrids: []const CachedSubgrid,
 ) ScrollFastPathResult {
     const no = ScrollFastPathResult{ .eligible = false, .scroll_op = null, .reason = .no_pending_scroll };
 
@@ -453,11 +453,6 @@ pub fn checkScrollFastPath(
     // grid_id == 1 is the base grid and has different composition rules.
     if (ps.grid_id < 2)
         return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
-    // win_pos_row == 0: the scrolling grid starts at global grid row 0.
-    // Non-zero win_pos means the grid is embedded at an offset and cache
-    // shift indices would not correspond to global grid row indices.
-    if (ps.win_pos_row != 0)
-        return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
     const region_height: u32 = ps.bot -| ps.top;
     const abs_rows: u32 = blk: {
         if (ps.rows == std.math.minInt(i32)) break :blk region_height;
@@ -477,8 +472,25 @@ pub fn checkScrollFastPath(
         return .{ .eligible = false, .reason = .rebuild_all_set, .scroll_op = ps };
     if (atlas_retried_flag)
         return .{ .eligible = false, .reason = .atlas_retried, .scroll_op = ps };
-    if (cached_subgrid_count > 1)
-        return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+
+    // Verify scroll region in global grid coordinates stays within bounds.
+    // shiftScrollCacheAndValidate indexes scroll_cache with these values,
+    // so out-of-range would cause an out-of-bounds access.
+    const scroll_row_start = ps.top + ps.win_pos_row;
+    const scroll_row_end = ps.bot + ps.win_pos_row;
+    if (scroll_row_end > grid.rows)
+        return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
+
+    // Check that no non-scrolling subgrid overlaps the scroll region.
+    // Cached row vertices bake in subgrid overlay content; if a non-scrolling
+    // subgrid overlaps the scroll region, cache shifting would move its
+    // content to wrong rows.
+    for (cached_subgrids) |csg| {
+        if (csg.grid_id == ps.grid_id) continue; // the scrolling grid itself is fine
+        // Check row overlap between [csg.row_start, csg.row_end) and [scroll_row_start, scroll_row_end)
+        if (csg.row_start < scroll_row_end and csg.row_end > scroll_row_start)
+            return .{ .eligible = false, .reason = .subgrid_overlaps_scroll, .scroll_op = ps };
+    }
 
     return .{ .eligible = true, .reason = .eligible, .scroll_op = ps };
 }
@@ -2346,7 +2358,7 @@ pub const FlushCtx = struct {
                         effective_rebuild_all,
                         atlas_retried,
                         @intCast(scrolled_count),
-                        cached_subgrid_count,
+                        cached_subgrids[0..cached_subgrid_count],
                     );
                     if (log_enabled) {
                         const t_prep_fast_path_check_end = std.time.nanoTimestamp();
