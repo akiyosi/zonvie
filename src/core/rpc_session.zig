@@ -1270,6 +1270,8 @@ pub fn runLoop(self: *Core) void {
         return;
     };
     ui_attached = true;
+    self.ui_attached.store(true, .seq_cst);
+    self.flushPendingFocus();
     self.requestTryResize(self.init_rows, self.init_cols) catch |e| self.log.write("try_resize send failed: {any}\n", .{e});
     self.requestCommand("redraw!") catch |e| self.log.write("redraw! send failed: {any}\n", .{e});
 

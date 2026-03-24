@@ -6117,6 +6117,14 @@ final class ZonvieCore {
         }
     }
 
+    // MARK: - Focus
+
+    /// Notify Neovim of window focus change (triggers FocusGained/FocusLost autocmds).
+    func setFocus(_ gained: Bool) {
+        guard let core else { return }
+        zonvie_core_set_focus(core, gained)
+    }
+
     /// Container for tabline update data passed via NSNotification.object.
     /// Uses a reference type to avoid Obj-C bridging issues with named tuples in userInfo.
     final class TablineUpdateInfo {

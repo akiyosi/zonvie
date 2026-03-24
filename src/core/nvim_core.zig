@@ -417,6 +417,12 @@ pub const Core = struct {
     grid_mu: std.Thread.Mutex = .{},
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Set to true after nvim_ui_attach completes successfully.
+    ui_attached: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Stores pending focus state when setFocus is called before ui_attach.
+    /// 0 = no pending, 1 = pending focus gained, 2 = pending focus lost.
+    pending_focus: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     thread: ?std.Thread = null,
 
     child_handle: ?std.process.Child.Id = null,
@@ -2112,6 +2118,51 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
+    }
+
+    /// Notify Neovim of window focus change via nvim_ui_set_focus.
+    /// Triggers FocusGained/FocusLost autocommands in Neovim.
+    /// If called before nvim_ui_attach, the focus state is deferred and
+    /// sent automatically once the UI session is established.
+    pub fn requestUiSetFocus(self: *Core, gained: bool) void {
+        if (!self.ui_attached.load(.seq_cst)) {
+            // UI not attached yet — store for later delivery.
+            self.pending_focus.store(if (gained) 1 else 2, .seq_cst);
+            self.log.write("requestUiSetFocus: deferred (gained={any})\n", .{gained});
+            return;
+        }
+        self.requestUiSetFocusInternal(gained) catch |e| {
+            self.log.write("requestUiSetFocus error: {any}\n", .{e});
+        };
+    }
+
+    fn requestUiSetFocusInternal(self: *Core, gained: bool) !void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_set_focus");
+
+        try rpc.packArray(&buf, self.alloc, 1);
+        try rpc.packBool(&buf, self.alloc, gained);
+
+        try self.sendRaw(buf.items);
+
+        self.log.write("rpc send: nvim_ui_set_focus (id={d}, gained={any})\n", .{ id, gained });
+    }
+
+    /// Send any focus state that was deferred before nvim_ui_attach.
+    pub fn flushPendingFocus(self: *Core) void {
+        const pending = self.pending_focus.swap(0, .seq_cst);
+        if (pending == 1) {
+            self.requestUiSetFocusInternal(true) catch |e| {
+                self.log.write("flushPendingFocus error: {any}\n", .{e});
+            };
+        } else if (pending == 2) {
+            self.requestUiSetFocusInternal(false) catch |e| {
+                self.log.write("flushPendingFocus error: {any}\n", .{e});
+            };
+        }
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {

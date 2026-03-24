@@ -3616,9 +3616,12 @@ pub export fn WndProc(
         },
 
         c.WM_ACTIVATEAPP => {
-            // Hide external windows when app loses focus (like macOS hidesOnDeactivate)
+            // Notify Neovim of focus change (triggers FocusGained/FocusLost autocmds)
             if (getApp(hwnd)) |app| {
                 const is_activating = wParam != 0;
+                if (app.corep) |corep| {
+                    core.zonvie_core_set_focus(corep, is_activating);
+                }
                 if (!is_activating) {
                     // App is being deactivated - hide mini and message windows
                     inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {

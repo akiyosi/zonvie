@@ -853,6 +853,11 @@ ZONVIE_API void zonvie_core_note_input_trace(
     int64_t sent_ns
 );
 
+/* Notify Neovim of window focus change via nvim_ui_set_focus.
+   Triggers FocusGained/FocusLost autocommands in Neovim.
+   gained: true when window gains focus, false when it loses focus */
+ZONVIE_API void zonvie_core_set_focus(zonvie_core *core, bool gained);
+
 /* Send a command to Neovim via nvim_command RPC (does not show in cmdline).
    cmd: command string (e.g., "lua vim.notify('hello')")
    len: length of command string */

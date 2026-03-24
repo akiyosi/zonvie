@@ -726,6 +726,13 @@ pub export fn zonvie_core_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: 
     box.core.noteInputTrace(seq, sent_ns);
 }
 
+/// Notify Neovim of window focus change (triggers FocusGained/FocusLost autocmds).
+pub export fn zonvie_core_set_focus(p: ?*zonvie_core, gained: bool) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.requestUiSetFocus(gained);
+}
+
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;

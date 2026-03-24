@@ -254,6 +254,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if ZonvieConfig.shared.ime.disableOnActivate {
             ZonvieCore.setIMEOff()
         }
+        if let vc = window?.contentViewController as? ViewController {
+            vc.core?.setFocus(true)
+        }
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        if let vc = window?.contentViewController as? ViewController {
+            vc.core?.setFocus(false)
+        }
     }
 
     // MARK: - Open Files from Finder
