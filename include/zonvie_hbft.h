@@ -12,7 +12,7 @@ typedef struct zonvie_ft_hb_font zonvie_ft_hb_font;
 // OpenType feature descriptor for HarfBuzz shaping.
 typedef struct zonvie_font_feature {
     char tag[4];    // 4-char OpenType tag (e.g. "liga", "ss01")
-    uint32_t value; // 0=disable, 1=enable, N=specific value
+    int32_t value;  // 0=disable, 1=enable, N=specific value (signed for slnt axis)
 } zonvie_font_feature;
 
 #define ZONVIE_MAX_FONT_FEATURES 32
@@ -26,6 +26,15 @@ void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f);
 // count must be <= ZONVIE_MAX_FONT_FEATURES; excess features are silently ignored.
 // count=0 clears all features (restores HarfBuzz defaults).
 void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feature* features, size_t count);
+
+// Apply font variation axes (wght, wdth, opsz, etc.) from the fvar table.
+// Each entry's tag is matched against the font's available axes; non-axis tags
+// are silently ignored. Values are interpreted as design-space coordinates
+// (e.g. wght=700, wdth=100, opsz=24).
+// Must be called BEFORE set_features (which rebuilds ASCII tables from the
+// current outline state). count=0 resets all axes to their default values.
+// Safe to call on non-variable fonts (no-op if fvar is absent).
+void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* variations, size_t count);
 
 // Shape UTF-32 scalars.
 // Outputs are HarfBuzz position values in 26.6 fixed-point pixels (1px = 64).

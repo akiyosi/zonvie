@@ -195,11 +195,11 @@ final class GlyphAtlas {
         return s.split(separator: ",").compactMap { token in
             let t = token.trimmingCharacters(in: .whitespaces)
             var tag: String
-            var value: UInt32
+            var value: Int32
 
             if t.contains("=") {
                 let kv = t.split(separator: "=", maxSplits: 1)
-                guard kv.count == 2, kv[0].count == 4, let val = UInt32(kv[1]) else { return nil }
+                guard kv.count == 2, kv[0].count == 4, let val = Int32(kv[1]) else { return nil }
                 tag = String(kv[0])
                 value = val
             } else if t.hasPrefix("+") {
@@ -346,11 +346,61 @@ final class GlyphAtlas {
 
     /// Font + metrics rebuild only. Metrics available immediately after return.
     /// Does NOT touch atlas texture or caches.
+    // CTFont with kCTFontVariationAttribute applied, used ONLY to obtain the
+    // variable font file URL for the base FreeType handle.  nil when no
+    // variation axes are requested or the font is not variable.
+    private var variableFontHint: CTFont?
+
     private func rebuildFontAndMetrics_locked() {
-        font = CTFontCreateWithName(fontName as CFString, pointSize * backingScale, nil)
-        loadFontVariants_locked()
+        let size = pointSize * backingScale
+
+        // `font` is always the default-weight CTFont.  It is used for glyph ID
+        // lookups (cmap doesn't change with weight) and bold/italic derivation.
+        font = CTFontCreateWithName(fontName as CFString, size, nil)
+        loadFontVariants_locked(from: font)
+
+        // When variation axes are present, build a hint CTFont that nudges
+        // CoreText toward the variable font file.  This is ONLY used as a
+        // fallback inside rebuildHbFtFont_locked when the default CTFont
+        // resolves to a static weight file (no fvar table).
+        let axes = Self.extractVariationAxes(from: fontFeatures)
+        variableFontHint = axes.isEmpty ? nil : Self.hintVariableCTFont(font, axes: axes)
+
         rebuildHbFtFont_locked()
         recomputeMetrics()
+    }
+
+    /// Convert ALL feature entries to (tag, value) pairs for the variation
+    /// pipeline.  The C-side set_variations matches each tag against the font's
+    /// actual fvar axes and silently ignores non-axis tags (e.g. "liga", "ss01").
+    /// This avoids hardcoding axis tags and supports custom axes (MONO, CASL, …).
+    private static func extractVariationAxes(from features: [zonvie_font_feature]) -> [(tag: UInt32, value: CGFloat)] {
+        return features.map { f in
+            let tag = UInt32(UInt8(bitPattern: f.tag.0)) << 24
+                    | UInt32(UInt8(bitPattern: f.tag.1)) << 16
+                    | UInt32(UInt8(bitPattern: f.tag.2)) << 8
+                    | UInt32(UInt8(bitPattern: f.tag.3))
+            return (tag: tag, value: CGFloat(f.value))
+        }
+    }
+
+    /// Use kCTFontVariationAttribute to nudge CoreText into selecting the variable
+    /// font file.  Always returns the varied CTFont — for static fonts the
+    /// variation dictionary is silently ignored and createHbFtFont_locked will
+    /// load the same static file (set_variations then becomes a harmless no-op).
+    private static func hintVariableCTFont(
+        _ baseFont: CTFont,
+        axes: [(tag: UInt32, value: CGFloat)]
+    ) -> CTFont? {
+        var varDict: [NSNumber: NSNumber] = [:]
+        for (tag, value) in axes {
+            varDict[NSNumber(value: tag)] = NSNumber(value: Double(value))
+        }
+        let varAttrs: [CFString: Any] = [kCTFontVariationAttribute: varDict]
+        let varDesc = CTFontDescriptorCreateWithAttributes(varAttrs as CFDictionary)
+        let varFont = CTFontCreateCopyWithAttributes(baseFont, 0, nil, varDesc)
+
+        return varFont
     }
 
     /// Clear all glyph/fallback caches. Must be called before rasterization with new font.
@@ -366,33 +416,13 @@ final class GlyphAtlas {
         scalarToGlyphIDCache.removeAll()
     }
 
-    private func loadFontVariants_locked() {
-        // Create bold variant
+    private func loadFontVariants_locked(from baseFont: CTFont) {
         boldFont = CTFontCreateCopyWithSymbolicTraits(
-            font,
-            0, // use same size
-            nil, // no matrix
-            .traitBold,
-            .traitBold
-        )
-
-        // Create italic variant
+            baseFont, 0, nil, .traitBold, .traitBold)
         italicFont = CTFontCreateCopyWithSymbolicTraits(
-            font,
-            0,
-            nil,
-            .traitItalic,
-            .traitItalic
-        )
-
-        // Create bold+italic variant
+            baseFont, 0, nil, .traitItalic, .traitItalic)
         boldItalicFont = CTFontCreateCopyWithSymbolicTraits(
-            font,
-            0,
-            nil,
-            [.traitBold, .traitItalic],
-            [.traitBold, .traitItalic]
-        )
+            baseFont, 0, nil, [.traitBold, .traitItalic], [.traitBold, .traitItalic])
     }
 
 
@@ -418,10 +448,20 @@ final class GlyphAtlas {
 
         let px = UInt32(ceil(pointSize * backingScale))
 
-        // Build base font
-        self.hbftFont = createHbFtFont_locked(for: font, px: px)
+        // Build base font.  When a variableFontHint exists, use its URL to get
+        // the variable font file.  Mask out the upper 16 bits of the face index
+        // (FreeType named-instance index) so we always open the base instance;
+        // set_variations will apply the user's coordinates explicitly.
+        if let hint = variableFontHint {
+            let rawIdx = ctFontFaceIndex(hint)
+            let baseFaceIdx = rawIdx & 0xFFFF  // strip named-instance bits
+            self.hbftFont = createHbFtFont_locked(for: hint, px: px, faceIndex: baseFaceIdx)
+        }
         if self.hbftFont == nil {
-            ZonvieCore.appLog("[rebuildHbFtFont] WARNING: hbft create failed for base font '\(fontName)' px=\(px), falling back to CoreGraphics-only rendering")
+            self.hbftFont = createHbFtFont_locked(for: font, px: px)
+        }
+        if self.hbftFont == nil {
+            ZonvieCore.appLog("[rebuildHbFtFont] WARNING: hbft create failed for base font '\(fontName)' px=\(px)")
         }
 
         // Build bold variant
@@ -439,11 +479,28 @@ final class GlyphAtlas {
             self.hbftBoldItalic = createHbFtFont_locked(for: boldItalicFont, px: px)
         }
 
-        // Apply OpenType features to all font handles
+        // Apply variation axes to ALL handles so that axes like wdth, opsz,
+        // and custom axes (MONO, CASL, …) are consistent across styled variants.
+        // For static font faces, set_variations is a harmless no-op (no fvar).
+        applyVariations_locked(to: self.hbftFont)
+        applyVariations_locked(to: self.hbftBold)
+        applyVariations_locked(to: self.hbftItalic)
+        applyVariations_locked(to: self.hbftBoldItalic)
+
+        // OpenType features (liga, ss01, …) apply to all variants.
         applyFeatures_locked(to: self.hbftFont)
         applyFeatures_locked(to: self.hbftBold)
         applyFeatures_locked(to: self.hbftItalic)
         applyFeatures_locked(to: self.hbftBoldItalic)
+    }
+
+    /// Apply stored variation axes to a HarfBuzz font handle.
+    /// Tags that do not match any fvar axis are silently ignored by the C layer.
+    private func applyVariations_locked(to hbft: OpaquePointer?) {
+        guard let hbft = hbft, !fontFeatures.isEmpty else { return }
+        fontFeatures.withUnsafeBufferPointer { buf in
+            zonvie_ft_hb_font_set_variations(hbft, buf.baseAddress, buf.count)
+        }
     }
 
     /// Apply stored font features to a HarfBuzz font handle.
@@ -454,7 +511,7 @@ final class GlyphAtlas {
         }
     }
 
-    private func createHbFtFont_locked(for ctFont: CTFont, px: UInt32) -> OpaquePointer? {
+    private func createHbFtFont_locked(for ctFont: CTFont, px: UInt32, faceIndex override: UInt32? = nil) -> OpaquePointer? {
         let ctName = CTFontCopyPostScriptName(ctFont) as String
         let desc = CTFontCopyFontDescriptor(ctFont)
         guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL else {
@@ -467,7 +524,7 @@ final class GlyphAtlas {
             return nil
         }
 
-        let faceIndex = ctFontFaceIndex(ctFont)
+        let faceIndex = override ?? ctFontFaceIndex(ctFont)
 
         let created: OpaquePointer? = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OpaquePointer? in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
@@ -475,7 +532,7 @@ final class GlyphAtlas {
         }
 
         if created == nil {
-            ZonvieCore.appLog("[createHbFtFont] zonvie_ft_hb_font_create returned nil for '\(ctName)' url='\(url.path)' size=\(data.count) px=\(px) faceIdx=\(faceIndex)")
+            ZonvieCore.appLog("[createHbFtFont] FAILED for '\(ctName)'")
         }
 
         return created

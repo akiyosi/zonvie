@@ -2243,6 +2243,14 @@ final class ZonvieCore {
         updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
                        cellW: UInt32(cw), cellH: UInt32(ch))
 
+        // Force-dirty all rows and invalidate glyph/scroll caches.
+        // When only the font weight changes (same cell dimensions), Neovim
+        // does not send a full redraw.  Without this, row-mode reuses cached
+        // vertex data whose atlas UVs point into the old (now cleared) texture.
+        if let c = core {
+            zonvie_core_invalidate_glyph_cache(c)
+        }
+
         // GUI-only updates (redraw, external window notify) can be async.
         DispatchQueue.main.async { [weak self] in
             view.requestRedraw()

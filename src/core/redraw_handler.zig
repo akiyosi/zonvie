@@ -212,7 +212,7 @@ fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
 
 const FontFeature = struct {
     tag: [4]u8,
-    value: u32,
+    value: i32,
 };
 
 const MAX_FONT_FEATURES = 32;
@@ -229,14 +229,14 @@ fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
     if (tok.len == 0) return null;
 
     var tag_str: []const u8 = undefined;
-    var value: u32 = 1;
+    var value: i32 = 1;
 
     if (tok[0] == '+' or tok[0] == '-') {
         tag_str = tok[1..];
         value = if (tok[0] == '+') 1 else 0;
     } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
         tag_str = tok[0..eq];
-        value = std.fmt.parseInt(u32, tok[eq + 1 ..], 10) catch return null;
+        value = std.fmt.parseInt(i32, tok[eq + 1 ..], 10) catch return null;
     } else {
         // Bare 4-char tag → enable
         tag_str = tok;

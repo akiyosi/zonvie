@@ -1,5 +1,13 @@
 import Foundation
 
+/// C-callable logging function for HBFTBridge.c and other C code.
+/// Routes through the same appLog system as all Swift-side logging.
+@_cdecl("zonvie_macos_log")
+public func zonvie_macos_log(_ msg: UnsafePointer<CChar>?) {
+    guard let msg else { return }
+    ZonvieCore.appLog(String(cString: msg))
+}
+
 @_cdecl("zonvie_macos_atlas_ensure_glyph")
 public func zonvie_macos_atlas_ensure_glyph(
     _ ctx: UnsafeMutableRawPointer?,

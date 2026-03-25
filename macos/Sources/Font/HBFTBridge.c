@@ -5,6 +5,7 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_MULTIPLE_MASTERS_H
 
 #include <harfbuzz/hb.h>
 #include <harfbuzz/hb-ft.h>
@@ -19,6 +20,7 @@ struct zonvie_ft_hb_font {
 
   uint8_t* font_bytes_owned;
   size_t font_len;
+  uint32_t pixel_size;  // stored for hb_font_set_scale re-apply after variation changes
 
   // OpenType features for shaping (set via zonvie_ft_hb_font_set_features).
   hb_feature_t features[ZONVIE_MAX_FONT_FEATURES];
@@ -130,6 +132,8 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
         &f->ft_face
       ) != 0) goto fail;
 
+  f->pixel_size = pixel_size;
+
   // Use pixel size directly (already scaled by backingScale on Swift side).
   if (FT_Set_Pixel_Sizes(f->ft_face, 0, pixel_size) != 0) goto fail;
 
@@ -159,11 +163,66 @@ void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feat
   for (size_t i = 0; i < n; i++) {
     f->features[i].tag = HB_TAG(features[i].tag[0], features[i].tag[1],
                                  features[i].tag[2], features[i].tag[3]);
-    f->features[i].value = features[i].value;
+    f->features[i].value = (uint32_t)features[i].value;
     f->features[i].start = 0;
     f->features[i].end = (unsigned int)-1;
   }
   build_ascii_tables(f);
+}
+
+void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* variations, size_t count) {
+  if (!f || !f->ft_face || !f->hb_font) return;
+
+  // Query available variation axes from the font's fvar table.
+  FT_MM_Var* mm_var = NULL;
+  if (FT_Get_MM_Var(f->ft_face, &mm_var) != 0 || !mm_var) return;
+
+  FT_UInt num_axes = mm_var->num_axis;
+  if (num_axes == 0) { FT_Done_MM_Var(f->ft_lib, mm_var); return; }
+
+  // Start with default axis values.
+  FT_Fixed coords[32];
+  if (num_axes > 32) num_axes = 32;
+  for (FT_UInt a = 0; a < num_axes; a++) {
+    coords[a] = mm_var->axis[a].def;
+  }
+
+  // Override axes that match input tags.
+  size_t n = count < ZONVIE_MAX_FONT_FEATURES ? count : ZONVIE_MAX_FONT_FEATURES;
+  int any_matched = 0;
+  for (size_t i = 0; i < n; i++) {
+    FT_ULong input_tag = FT_MAKE_TAG(variations[i].tag[0], variations[i].tag[1],
+                                      variations[i].tag[2], variations[i].tag[3]);
+    for (FT_UInt a = 0; a < num_axes; a++) {
+      if (mm_var->axis[a].tag == input_tag) {
+        // Convert design coordinate to FT_Fixed 16.16 and clamp to axis range.
+        // Use multiplication instead of left-shift to avoid UB on negative values.
+        FT_Fixed val = (FT_Fixed)((FT_Long)variations[i].value * 65536L);
+        if (val < mm_var->axis[a].minimum) val = mm_var->axis[a].minimum;
+        if (val > mm_var->axis[a].maximum) val = mm_var->axis[a].maximum;
+        coords[a] = val;
+        any_matched = 1;
+        break;
+      }
+    }
+  }
+
+  if (count == 0 || any_matched) {
+    FT_Set_Var_Design_Coordinates(f->ft_face, num_axes, coords);
+
+    // Re-apply pixel size so that FreeType recalculates size metrics
+    // (ascender, descender, advances) for the new variation coordinates.
+    // Without this, face->size->metrics retains stale values from the
+    // pre-variation FT_Set_Pixel_Sizes call.
+    FT_Set_Pixel_Sizes(f->ft_face, 0, f->pixel_size);
+
+    hb_ft_font_changed(f->hb_font);
+    hb_font_set_scale(f->hb_font,
+                      (int)(f->pixel_size * 64),
+                      (int)(f->pixel_size * 64));
+  }
+
+  FT_Done_MM_Var(f->ft_lib, mm_var);
 }
 
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {
