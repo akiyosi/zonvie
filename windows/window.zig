@@ -3453,16 +3453,30 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 const corep = app.corep orelse return 0;
                 const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
+                if (file_count == 0) return 0;
+
+                // Build a single command buffer: "drop path1 path2 ..."
+                // or just "path1 path2 ..." for cmdline mode insertion.
+                var cmd_buf: [32768]u8 = undefined;
+                var pos: usize = 0;
+
+                // Check if Neovim is in command-line mode.
+                const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
+                const mode = std.mem.span(mode_ptr);
+                const is_cmdline = std.mem.startsWith(u8, mode, "cmdline");
+
+                if (!is_cmdline) {
+                    const prefix = "drop ";
+                    @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
+                    pos += prefix.len;
+                }
 
                 var i: c.UINT = 0;
                 while (i < file_count) : (i += 1) {
-                    // Query required buffer length (excluding null terminator)
                     const required_len = c.DragQueryFileW(hDrop, i, null, 0);
                     if (required_len == 0) continue;
 
-                    const buf_len = required_len + 1; // +1 for null terminator
-
-                    // Use stack buffer for typical paths, heap for long paths
+                    const buf_len = required_len + 1;
                     var stack_buf: [c.MAX_PATH + 1]c.WCHAR = undefined;
                     const heap_buf = if (buf_len > stack_buf.len)
                         std.heap.page_allocator.alloc(c.WCHAR, buf_len) catch continue
@@ -3471,15 +3485,13 @@ pub export fn WndProc(
                     defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
 
                     const path_buf = if (heap_buf) |hb| hb.ptr else &stack_buf;
-
                     const len = c.DragQueryFileW(hDrop, i, path_buf, @intCast(buf_len));
                     if (len == 0) continue;
 
                     const wide_slice: []const u16 = @as([*]const u16, @ptrCast(path_buf))[0..len];
 
-                    // UTF-16 -> UTF-8 conversion (worst case: 4 bytes per code unit)
-                    const utf8_max = len * 4;
                     var utf8_stack: [c.MAX_PATH * 4]u8 = undefined;
+                    const utf8_max = len * 4;
                     const utf8_heap = if (utf8_max > utf8_stack.len)
                         std.heap.page_allocator.alloc(u8, utf8_max) catch continue
                     else
@@ -3490,25 +3502,17 @@ pub export fn WndProc(
                     const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
                     const utf8_path = utf8_dest[0..utf8_len];
 
-                    // Build "drop <escaped_path>" command
-                    // Worst case: each byte escapes to 2 bytes + "drop " prefix
-                    const cmd_max = 5 + utf8_len * 2;
-                    var cmd_stack: [c.MAX_PATH * 4 + 8]u8 = undefined;
-                    const cmd_heap = if (cmd_max > cmd_stack.len)
-                        std.heap.page_allocator.alloc(u8, cmd_max) catch continue
-                    else
-                        null;
-                    defer if (cmd_heap) |hb| std.heap.page_allocator.free(hb);
-
-                    const cmd_buf = if (cmd_heap) |hb| hb else &cmd_stack;
-                    var pos: usize = 0;
-
-                    const prefix = "drop ";
-                    @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
-                    pos += prefix.len;
+                    // Add space separator between paths
+                    if (i > 0 or (!is_cmdline and pos > 5)) {
+                        if (pos < cmd_buf.len) {
+                            cmd_buf[pos] = ' ';
+                            pos += 1;
+                        }
+                    }
 
                     // Escape special characters for Neovim
                     for (utf8_path) |ch| {
+                        if (pos + 2 > cmd_buf.len) break;
                         const escaped: ?[]const u8 = switch (ch) {
                             '\\' => "\\\\",
                             ' ' => "\\ ",
@@ -3521,21 +3525,29 @@ pub export fn WndProc(
                             ']' => "\\]",
                             '{' => "\\{",
                             '}' => "\\}",
-                            '$' => "\\$",
-                            '`' => "\\`",
                             else => null,
                         };
 
                         if (escaped) |esc| {
-                            @memcpy(cmd_buf[pos..][0..esc.len], esc);
-                            pos += esc.len;
+                            if (pos + esc.len <= cmd_buf.len) {
+                                @memcpy(cmd_buf[pos..][0..esc.len], esc);
+                                pos += esc.len;
+                            }
                         } else {
                             cmd_buf[pos] = ch;
                             pos += 1;
                         }
                     }
+                }
 
-                    app_mod.zonvie_core_send_command(corep, cmd_buf.ptr, pos);
+                if (pos > 0) {
+                    if (is_cmdline) {
+                        // In command-line mode: insert paths at cursor position.
+                        app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
+                    } else {
+                        // In normal/insert/visual mode: execute :drop immediately.
+                        app_mod.zonvie_core_send_command(corep, &cmd_buf, pos);
+                    }
                 }
             }
             return 0;

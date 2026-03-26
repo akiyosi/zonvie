@@ -2223,9 +2223,15 @@ extension MetalTerminalView {
 
         guard !urls.isEmpty, let core = core else { return false }
 
-        for url in urls {
-            let escapedPath = escapePathForNeovim(url.path)
-            core.sendCommand("drop \(escapedPath)")
+        let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
+        let mode = core.getCurrentMode()
+
+        if mode.hasPrefix("cmdline") {
+            // In command-line mode: insert paths at cursor position.
+            core.sendInput(paths)
+        } else {
+            // In normal/insert/visual mode: execute :drop immediately.
+            core.sendCommand("drop \(paths)")
         }
         return true
     }
