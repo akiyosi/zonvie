@@ -1524,6 +1524,14 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     if (ctx_bits % @alignOf(App) != 0) return;
     const app: *App = @ptrFromInt(ctx_bits);
 
+    // First flush triggers window show: keep window hidden until nvim sends first frame
+    if (!app.window_shown) {
+        app.window_shown = true;
+        if (app.hwnd) |hwnd| {
+            _ = c.PostMessageW(hwnd, app_mod.WM_APP_SHOW_WINDOW, 0, 0);
+        }
+    }
+
     // Report DWrite rasterization stats for this flush (only when logging enabled)
     if (applog.isEnabled()) {
         const raster_count = app.rasterize_call_count.swap(0, .monotonic);
@@ -1957,6 +1965,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     app.mu.lock();
 
     if (app.atlas) |*a| {
+        const prev_font_generation = a.font_generation;
         var applied_name: []const u8 = config_font;
         var applied_pt: f32 = config_pt;
         var font_set = false;
@@ -2029,6 +2038,15 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app.cell_w_px = a.cellW();
         app.cell_h_px = a.cellH();
         if (applog.isEnabled()) applog.appLog("onGuiFont: applied name='{s}' pt={d} cell=({d},{d})", .{ applied_name, applied_pt, app.cell_w_px, app.cell_h_px });
+
+        if (a.font_generation != prev_font_generation) {
+            if (applog.isEnabled()) applog.appLog("onGuiFont: font changed (gen {}->{}), invalidating core glyph cache\n", .{ prev_font_generation, a.font_generation });
+            if (app.corep) |cp| {
+                app.mu.unlock();
+                app_mod.zonvie_core_invalidate_glyph_cache(cp);
+                app.mu.lock();
+            }
+        }
     } else {
         if (applog.isEnabled()) applog.appLog("onGuiFont: atlas is null", .{});
     }

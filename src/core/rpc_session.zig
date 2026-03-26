@@ -231,22 +231,6 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
-    // Check if this is nvim_get_api_info response
-    // Response format: [channel_id, api_metadata]
-    if (self.get_api_info_msgid != null and id == self.get_api_info_msgid.? and self.channel_id == null) {
-        if (top[3] == .arr and top[3].arr.len >= 1) {
-            const result = top[3].arr;
-            if (result[0] == .int) {
-                self.channel_id = result[0].int;
-                self.log.write("channel_id extracted: {d}\n", .{self.channel_id.?});
-
-                // Setup clipboard after getting channel_id
-                setupClipboard(self);
-            }
-        }
-        return;
-    }
-
     // Check if this is quit request response
     const pending_quit_id = self.quit_request_msgid.load(.acquire);
     if (pending_quit_id != 0 and id == pending_quit_id) {
@@ -599,40 +583,34 @@ pub fn sendClipboardGetResponse(self: *Core, msgid: i64, content: []const u8) !v
 
 pub fn setupClipboard(self: *Core) void {
     if (self.clipboard_setup_done) return;
-    if (self.channel_id == null) return;
 
-    const channel = self.channel_id.?;
-
-    // Build Lua code to setup vim.g.clipboard
-    // Use vim.schedule to ensure it runs after current RPC processing
-    var lua_buf: [2048]u8 = undefined;
-    const lua_code = std.fmt.bufPrint(&lua_buf,
-        \\vim.g.zonvie_channel = {d}
+    // Use vim.fn.chanNr() for dynamic channel ID retrieval instead of
+    // depending on get_api_info response. This eliminates the round-trip.
+    const lua_code =
+        \\local ch = vim.fn.chanNr()
+        \\vim.g.zonvie_channel = ch
         \\vim.schedule(function()
-        \\  vim.g.clipboard = {{
+        \\  vim.g.clipboard = {
         \\    name = 'zonvie',
-        \\    copy = {{
+        \\    copy = {
         \\      ['+'] = function(lines, regtype)
-        \\        return vim.rpcrequest({d}, 'zonvie.set_clipboard', '+', lines)
+        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.set_clipboard', '+', lines)
         \\      end,
         \\      ['*'] = function(lines, regtype)
-        \\        return vim.rpcrequest({d}, 'zonvie.set_clipboard', '*', lines)
+        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.set_clipboard', '*', lines)
         \\      end,
-        \\    }},
-        \\    paste = {{
+        \\    },
+        \\    paste = {
         \\      ['+'] = function()
-        \\        return vim.rpcrequest({d}, 'zonvie.get_clipboard', '+')
+        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.get_clipboard', '+')
         \\      end,
         \\      ['*'] = function()
-        \\        return vim.rpcrequest({d}, 'zonvie.get_clipboard', '*')
+        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.get_clipboard', '*')
         \\      end,
-        \\    }},
-        \\  }}
+        \\    },
+        \\  }
         \\end)
-    , .{ channel, channel, channel, channel, channel }) catch {
-        self.log.write("setupClipboard: bufPrint failed\n", .{});
-        return;
-    };
+    ;
 
     self.requestExecLua(lua_code) catch |e| {
         self.log.write("setupClipboard: requestExecLua failed: {any}\n", .{e});
@@ -640,7 +618,7 @@ pub fn setupClipboard(self: *Core) void {
     };
 
     self.clipboard_setup_done = true;
-    self.log.write("clipboard setup done (channel={d})\n", .{channel});
+    self.log.write("clipboard setup done (via vim.fn.chanNr())\n", .{});
 }
 
 pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
@@ -1274,9 +1252,25 @@ pub fn runLoop(self: *Core) void {
 
     var ui_attached = false;
 
-    self.requestGetApiInfo() catch |e| self.log.write("send get_api_info failed: {any}\n", .{e});
+    // Block until layout is ready (ui_attach_cond signaled by notifyLayoutReady)
+    {
+        self.ui_attach_mutex.lock();
+        defer self.ui_attach_mutex.unlock();
+        while (!self.ui_attach_ready) {
+            if (self.stop_flag.load(.seq_cst)) break;
+            self.ui_attach_cond.wait(&self.ui_attach_mutex);
+        }
+    }
+
+    if (self.stop_flag.load(.seq_cst)) {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return;
+    }
+
+    self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
     self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
-    self.requestUiAttach(self.init_rows, self.init_cols) catch |e| {
+    self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
         self.log.write("ui_attach send failed: {any}\n", .{e});
         _ = child.kill() catch {};
         _ = child.wait() catch {};
@@ -1285,23 +1279,24 @@ pub fn runLoop(self: *Core) void {
     ui_attached = true;
     self.ui_attached.store(true, .seq_cst);
     self.flushPendingFocus();
-    self.requestTryResize(self.init_rows, self.init_cols) catch |e| self.log.write("try_resize send failed: {any}\n", .{e});
-    self.requestCommand("redraw!") catch |e| self.log.write("redraw! send failed: {any}\n", .{e});
+
+    // Setup clipboard immediately after ui_attach (no get_api_info round-trip needed)
+    setupClipboard(self);
 
     // Glow config is requested via glow_startup_retries during flush processing.
-    // -c commands may not have run yet at this point.
 
     if (self.pending_resize_valid) {
-        const pr = self.pending_resize_rows;
-        const pc = self.pending_resize_cols;
-        var pending_sent = true;
-        self.requestTryResize(pr, pc) catch |e| {
-            self.log.write("pending resize send failed: {any}\n", .{e});
-            pending_sent = false;
-        };
-        if (pending_sent) {
+        const pr2 = self.pending_resize_rows;
+        const pc2 = self.pending_resize_cols;
+        if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
             self.pending_resize_valid = false;
-            self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr, pc });
+            self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
+        } else {
+            self.requestTryResize(pr2, pc2) catch |e| {
+                self.log.write("pending resize send failed: {any}\n", .{e});
+            };
+            self.pending_resize_valid = false;
+            self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
         }
     }
 
@@ -1313,9 +1308,11 @@ pub fn runLoop(self: *Core) void {
     }
     var pr = PipeReader{ .file = self.stdout_file.? };
 
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+
     while (!self.stop_flag.load(.seq_cst)) {
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
+        _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
 
         const root = mp.decode(arena, &pr) catch |e| {
@@ -1338,7 +1335,7 @@ pub fn runLoop(self: *Core) void {
             continue;
         }
         if (t == 1) {
-            // RPC response (e.g., nvim_get_api_info result)
+            // RPC response (e.g., quit request result)
             handleRpcResponse(self, top);
             continue;
         }

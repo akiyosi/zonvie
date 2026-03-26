@@ -609,10 +609,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
     const dwStyle: c.DWORD = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW;
-    // Add WS_EX_NOREDIRECTIONBITMAP for transparency mode
-    const use_transparency = app.config.window.opacity < 1.0;
+    // Always use WS_EX_NOREDIRECTIONBITMAP: all rendering via DXGI + DirectComposition.
     const dwExStyle: c.DWORD = (if (is_special_window) @as(c.DWORD, @intCast(c.WS_EX_TOPMOST)) else @as(c.DWORD, 0)) |
-        (if (use_transparency) @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP)) else @as(c.DWORD, 0));
+        @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP));
 
     var rect: c.RECT = .{
         .left = 0,

@@ -28,6 +28,7 @@ pub const zonvie_core_create = core.zonvie_core_create;
 pub const zonvie_core_destroy = core.zonvie_core_destroy;
 pub const zonvie_core_start = core.zonvie_core_start;
 pub const zonvie_core_stop = core.zonvie_core_stop;
+pub const zonvie_core_notify_layout_ready = core.zonvie_core_notify_layout_ready;
 pub const zonvie_core_send_input = core.zonvie_core_send_input;
 pub const zonvie_core_send_key_event = core.zonvie_core_send_key_event;
 pub const zonvie_core_resize = core.zonvie_core_resize;
@@ -68,6 +69,7 @@ pub const zonvie_core_set_background_opacity = core.zonvie_core_set_background_o
 pub const zonvie_core_perf_now_ns = core.zonvie_core_perf_now_ns;
 pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;
 pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
+pub const zonvie_core_invalidate_glyph_cache = core.zonvie_core_invalidate_glyph_cache;
 
 // Re-export additional core types used by sub-modules
 pub const Callbacks = core.Callbacks;
@@ -108,6 +110,9 @@ pub const WM_APP_RESIZE_POPUPMENU: c.UINT = c.WM_APP + 21;
 pub const WM_APP_UPDATE_CMDLINE_COLORS: c.UINT = c.WM_APP + 22;
 pub const WM_APP_SET_TITLE: c.UINT = c.WM_APP + 23;
 pub const WM_APP_DEFERRED_WIN_POS: c.UINT = c.WM_APP + 24;
+pub const WM_APP_SHOW_WINDOW: c.UINT = c.WM_APP + 25;
+pub const WM_APP_SWP_FRAMECHANGED: c.UINT = c.WM_APP + 26;
+pub const WM_APP_POST_SHOW_INIT: c.UINT = c.WM_APP + 27;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -135,6 +140,10 @@ pub const TIMER_CURSOR_BLINK: c.UINT_PTR = 6;
 pub const TIMER_QUIT_TIMEOUT: c.UINT_PTR = 7;
 /// Timer ID for coalescing float/mini repositioning during window drag
 pub const TIMER_REPOSITION_FLOATS: c.UINT_PTR = 8;
+/// Timer ID for deferred tray icon initialization
+pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
+/// Tray icon init delay in milliseconds
+pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)
 pub const QUIT_TIMEOUT_MS: c.UINT = 5000;
 /// Scrollbar fade animation interval (16ms ~= 60fps)
@@ -2349,6 +2358,16 @@ pub const App = struct {
     // Atlas builder (DirectWrite + CPU atlas, metrics)
     atlas: ?dwrite_d2d.Renderer = null,
 
+    // Early atlas from doEarlyCoreInit (reused in WM_APP_DEFERRED_INIT for native mode)
+    early_atlas: ?dwrite_d2d.Renderer = null,
+
+    early_core_init_done: bool = false,
+    nvim_spawned: bool = false,
+
+    // D3D11 device (created early in WM_CREATE for D2D context)
+    d3d_device: ?*c.ID3D11Device = null,
+    d3d_ctx: ?*c.ID3D11DeviceContext = null,
+
     // GPU renderer (D3D11)
     renderer: ?d3d11.Renderer = null,
 
@@ -2596,6 +2615,10 @@ pub const App = struct {
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,
 
+    window_shown: bool = false,
+
+    pending_show_window: bool = false,
+
     // Clipboard request state (for cross-thread clipboard operations)
     clipboard_event: c.HANDLE = null, // Manual-reset event for sync
     clipboard_buf: [64 * 1024]u8 = undefined,
@@ -2618,6 +2641,8 @@ pub const App = struct {
 
     // Tray icon for OS notification (balloon notification)
     tray_icon: ?TrayIcon = null,
+
+    d3d_init_thread: ?std.Thread = null,
 
     /// Maximum row buffer count to prevent unbounded memory growth
     pub const max_row_buffers: u32 = 1000;

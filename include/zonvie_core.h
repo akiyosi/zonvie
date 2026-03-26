@@ -789,6 +789,14 @@ void zonvie_core_destroy(zonvie_core *core);
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);
 void zonvie_core_stop(zonvie_core *core);
 
+/* Notify the core that actual layout dimensions are ready.
+   Must be called from the UI thread after the renderer is initialized and the
+   real rows/cols are computed. This unblocks the RPC thread so it sends
+   nvim_ui_attach with the correct size, preventing Neovim from rendering the
+   initial splash at the wrong position before a subsequent resize corrects it.
+   Must be called after zonvie_core_start() (including devcontainer restarts). */
+void zonvie_core_notify_layout_ready(zonvie_core *core, unsigned rows, unsigned cols);
+
 void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int len);
 
 /* Timestamp helper for perf-log correlation across frontend/core stages. */

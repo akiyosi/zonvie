@@ -243,6 +243,101 @@ pub const Renderer = struct {
     dcomp_target: ?*IDCompositionTarget = null,
     dcomp_visual: ?*IDCompositionVisual = null,
 
+    /// Create a D3D11 device without a swap chain. Returns the device and context.
+    /// Called early (e.g. WM_CREATE) so the device is available for D2D context creation.
+    pub fn createDeviceOnly() !struct { device: *c.ID3D11Device, ctx: *c.ID3D11DeviceContext } {
+        var dev: ?*c.ID3D11Device = null;
+        var ctx: ?*c.ID3D11DeviceContext = null;
+        var fl: u32 = 0;
+
+        var flags: c.UINT = c.D3D11_CREATE_DEVICE_BGRA_SUPPORT; // Required for D2D interop
+        const is_debug = (@import("builtin").mode == .Debug);
+        if (is_debug) flags |= c.D3D11_CREATE_DEVICE_DEBUG;
+
+        var hr: c.HRESULT = c.D3D11CreateDevice(
+            null,
+            c.D3D_DRIVER_TYPE_HARDWARE,
+            null,
+            flags,
+            null,
+            0,
+            c.D3D11_SDK_VERSION,
+            @ptrCast(&dev),
+            @ptrCast(&fl),
+            @ptrCast(&ctx),
+        );
+
+        if ((hr != 0 or dev == null or ctx == null) and is_debug) {
+            dev = null;
+            ctx = null;
+            flags &= ~@as(c.UINT, c.D3D11_CREATE_DEVICE_DEBUG);
+            hr = c.D3D11CreateDevice(
+                null,
+                c.D3D_DRIVER_TYPE_HARDWARE,
+                null,
+                flags,
+                null,
+                0,
+                c.D3D11_SDK_VERSION,
+                @ptrCast(&dev),
+                @ptrCast(&fl),
+                @ptrCast(&ctx),
+            );
+        }
+
+        if (hr != 0 or dev == null or ctx == null) {
+            dbgLog("[d3d] createDeviceOnly: D3D11CreateDevice failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
+            return error.D3DCreateFailed;
+        }
+        dbgLog("[d3d] createDeviceOnly: ok dev=0x{x} fl=0x{x}\n", .{@intFromPtr(dev.?), fl});
+        return .{ .device = dev.?, .ctx = ctx.? };
+    }
+
+    /// Initialize with a pre-created D3D11 device (from createDeviceOnly).
+    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext) !Renderer {
+        var self: Renderer = .{
+            .alloc = alloc,
+            .hwnd = hwnd,
+            .opacity = opacity,
+            .device = device,
+            .ctx = device_ctx,
+        };
+
+        dbgLog("[d3d] initWithDevice: reusing pre-created device=0x{x}\n", .{@intFromPtr(device)});
+
+        var freq: c.LARGE_INTEGER = undefined;
+        var t0: c.LARGE_INTEGER = undefined;
+        var t1: c.LARGE_INTEGER = undefined;
+        _ = c.QueryPerformanceFrequency(&freq);
+
+        _ = c.QueryPerformanceCounter(&t0);
+        try self.createSwapchainOnly();
+        _ = c.QueryPerformanceCounter(&t1);
+        dbgLog("[d3d] [TIMING] createSwapchainOnly: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        _ = c.QueryPerformanceCounter(&t0);
+        try self.createBackTargets();
+        _ = c.QueryPerformanceCounter(&t1);
+        dbgLog("[d3d] [TIMING] createBackTargets: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        _ = c.QueryPerformanceCounter(&t0);
+        try self.createPipeline();
+        _ = c.QueryPerformanceCounter(&t1);
+        dbgLog("[d3d] [TIMING] createPipeline (shader compile): {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        _ = c.QueryPerformanceCounter(&t0);
+        try self.ensureVertexBuffer(1024 * @sizeOf(core.Vertex));
+        _ = c.QueryPerformanceCounter(&t1);
+        dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        _ = c.QueryPerformanceCounter(&t0);
+        try self.createAtlasTexture(self.atlas_w, self.atlas_h);
+        _ = c.QueryPerformanceCounter(&t1);
+        dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+
+        return self;
+    }
+
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32) !Renderer {
         var self: Renderer = .{
             .alloc = alloc,
@@ -1993,6 +2088,121 @@ pub const Renderer = struct {
         if (ctx_vtbl.*.RSSetScissorRects) |f| f(ctx, 1, &sr);
     }
 
+    /// Create swap chain and DirectComposition using the pre-set self.device/self.ctx.
+    fn createSwapchainOnly(self: *Renderer) !void {
+        var rc: c.RECT = undefined;
+        _ = c.GetClientRect(self.hwnd, &rc);
+        self.width = @intCast(@max(1, rc.right - rc.left));
+        self.height = @intCast(@max(1, rc.bottom - rc.top));
+
+        const dev = self.device;
+        var hr: c.HRESULT = 0;
+
+        // Skip device creation -- jump straight to swap chain.
+        // Feature level was determined at device creation time.
+        dbgLog("[d3d] createSwapchainOnly: begin (device=0x{x})\n", .{if (dev) |p| @intFromPtr(p) else 0});
+
+        const enable_flip_model = true;
+
+        var sc1: ?*c.IDXGISwapChain1 = null;
+        var sc0: ?*c.IDXGISwapChain = null;
+        var sc1_buf_count: u32 = 3;
+        var dxgi_dev: ?*c.IDXGIDevice = null;
+        var adapter: ?*c.IDXGIAdapter = null;
+        var factory2: ?*c.IDXGIFactory2 = null;
+
+        const dev_unk: *c.IUnknown = @ptrCast(dev.?);
+        const dev_vtbl = dev_unk.*.lpVtbl;
+        const qi = dev_vtbl.*.QueryInterface orelse return error.D3DCreateFailed;
+
+        if (!c.FAILED(qi(dev_unk, &c.IID_IDXGIDevice, @ptrCast(&dxgi_dev))) and dxgi_dev != null) {
+            const dxgi_vtbl = dxgi_dev.?.lpVtbl;
+            if (dxgi_vtbl.*.GetAdapter) |get_adapter| {
+                if (!c.FAILED(get_adapter(dxgi_dev.?, @ptrCast(&adapter))) and adapter != null) {
+                    const adap_vtbl = adapter.?.lpVtbl;
+                    if (adap_vtbl.*.GetParent) |get_parent| {
+                        _ = get_parent(adapter.?, &c.IID_IDXGIFactory2, @ptrCast(&factory2));
+                    }
+                }
+            }
+        }
+
+        if (enable_flip_model and factory2 != null) {
+            var sd1: c.DXGI_SWAP_CHAIN_DESC1 = std.mem.zeroes(c.DXGI_SWAP_CHAIN_DESC1);
+            sd1.Width = self.width;
+            sd1.Height = self.height;
+            sd1.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+            sd1.SampleDesc.Count = 1;
+            sd1.BufferUsage = c.DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd1.BufferCount = 3;
+            sd1.SwapEffect = c.DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            sd1.Scaling = c.DXGI_SCALING_STRETCH;
+            sd1.AlphaMode = c.DXGI_ALPHA_MODE_PREMULTIPLIED;
+            sc1_buf_count = @intCast(sd1.BufferCount);
+
+            const fac_vtbl = factory2.?.lpVtbl;
+            if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
+                hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
+                if (!c.FAILED(hr) and sc1 != null) {
+                    const sc1_vtbl = sc1.?.lpVtbl;
+                    if (sc1_vtbl.*.QueryInterface) |sc_qi| {
+                        _ = sc_qi(sc1.?, &c.IID_IDXGISwapChain, @ptrCast(&sc0));
+                    }
+                }
+            }
+        }
+
+        // Always initialize DirectComposition.
+        if (sc1 != null and dxgi_dev != null) {
+            var dcomp_dev: ?*IDCompositionDevice = null;
+            const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
+            if (!c.FAILED(dcomp_hr) and dcomp_dev != null) {
+                self.dcomp_device = dcomp_dev;
+                const vtbl = dcomp_dev.?.lpVtbl;
+                var dcomp_target: ?*IDCompositionTarget = null;
+                const target_hr = vtbl.CreateTargetForHwnd(dcomp_dev.?, self.hwnd, c.TRUE, &dcomp_target);
+                if (!c.FAILED(target_hr) and dcomp_target != null) {
+                    self.dcomp_target = dcomp_target;
+                    var dcomp_visual: ?*IDCompositionVisual = null;
+                    const visual_hr = vtbl.CreateVisual(dcomp_dev.?, &dcomp_visual);
+                    if (!c.FAILED(visual_hr) and dcomp_visual != null) {
+                        self.dcomp_visual = dcomp_visual;
+                        const sc_unk: *c.IUnknown = @ptrCast(sc1.?);
+                        _ = dcomp_visual.?.lpVtbl.SetContent(dcomp_visual.?, sc_unk);
+                        _ = dcomp_target.?.lpVtbl.SetRoot(dcomp_target.?, dcomp_visual);
+                        _ = vtbl.Commit(dcomp_dev.?);
+                    }
+                }
+            }
+        }
+
+        if (dxgi_dev) |p| { const rel = p.lpVtbl.*.Release orelse null; if (rel) |f| _ = f(p); }
+        if (adapter) |p| { const rel = p.lpVtbl.*.Release orelse null; if (rel) |f| _ = f(p); }
+        if (factory2) |p| { const rel = p.lpVtbl.*.Release orelse null; if (rel) |f| _ = f(p); }
+
+        if (sc1 == null or sc0 == null) {
+            if (sc1) |p| { const rel = p.lpVtbl.*.Release orelse null; if (rel) |f| _ = f(p); }
+            return error.D3DCreateFailed;
+        }
+
+        self.swapchain = sc0;
+        self.swapchain1 = sc1;
+        self.swapchain_buf_count = sc1_buf_count;
+        self.swapchain_buf_index = 0;
+        self.swapchain3 = null;
+
+        if (sc0) |sc0p| {
+            const sc0_vtbl = sc0p.*.lpVtbl;
+            if (sc0_vtbl.*.QueryInterface) |sc_qi| {
+                var sc3: ?*c.IDXGISwapChain3 = null;
+                const hr_sc3 = sc_qi(sc0p, &c.IID_IDXGISwapChain3, @ptrCast(&sc3));
+                if (!c.FAILED(hr_sc3) and sc3 != null) {
+                    self.swapchain3 = sc3;
+                }
+            }
+        }
+    }
+
     fn createDeviceAndSwapchain(self: *Renderer) !void {
         var rc: c.RECT = undefined;
         _ = c.GetClientRect(self.hwnd, &rc);
@@ -2077,8 +2287,6 @@ pub const Renderer = struct {
         }
         dbgLog("[d3d] init: factory2=0x{x}\n", .{ if (factory2) |p| @intFromPtr(p) else 0 });
 
-        const use_transparency = self.opacity < 1.0;
-
         if (enable_flip_model and factory2 != null) {
             var sd1: c.DXGI_SWAP_CHAIN_DESC1 = std.mem.zeroes(c.DXGI_SWAP_CHAIN_DESC1);
             sd1.Width = self.width;
@@ -2089,45 +2297,31 @@ pub const Renderer = struct {
             sd1.BufferCount = 3;
             sd1.SwapEffect = c.DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
             sd1.Scaling = c.DXGI_SCALING_STRETCH;
-            // Use premultiplied alpha for transparency
-            sd1.AlphaMode = if (use_transparency) c.DXGI_ALPHA_MODE_PREMULTIPLIED else c.DXGI_ALPHA_MODE_IGNORE;
+            // Always premultiplied alpha: WS_EX_NOREDIRECTIONBITMAP requires composition path.
+            sd1.AlphaMode = c.DXGI_ALPHA_MODE_PREMULTIPLIED;
             sc1_buf_count = @intCast(sd1.BufferCount);
 
             const fac_vtbl = factory2.?.lpVtbl;
 
-            if (use_transparency) {
-                // Use CreateSwapChainForComposition for transparency (works with WS_EX_NOREDIRECTIONBITMAP)
-                if (applog.isEnabled()) applog.appLog("[d3d] Attempting CreateSwapChainForComposition...\n", .{});
-                if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
-                    hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
-                    if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
-                    if (!c.FAILED(hr) and sc1 != null) {
-                        const sc1_vtbl = sc1.?.lpVtbl;
-                        if (sc1_vtbl.*.QueryInterface) |sc_qi| {
-                            _ = sc_qi(sc1.?, &c.IID_IDXGISwapChain, @ptrCast(&sc0));
-                        }
+            // Always use CreateSwapChainForComposition (required by WS_EX_NOREDIRECTIONBITMAP).
+            if (applog.isEnabled()) applog.appLog("[d3d] Attempting CreateSwapChainForComposition...\n", .{});
+            if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
+                hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
+                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
+                if (!c.FAILED(hr) and sc1 != null) {
+                    const sc1_vtbl = sc1.?.lpVtbl;
+                    if (sc1_vtbl.*.QueryInterface) |sc_qi| {
+                        _ = sc_qi(sc1.?, &c.IID_IDXGISwapChain, @ptrCast(&sc0));
                     }
-                } else {
-                    if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
                 }
             } else {
-                // Use CreateSwapChainForHwnd for normal windows
-                if (fac_vtbl.*.CreateSwapChainForHwnd) |create_sc| {
-                    hr = create_sc(factory2.?, @ptrCast(dev.?), self.hwnd, &sd1, null, null, @ptrCast(&sc1));
-                    dbgLog("[d3d] init: CreateSwapChainForHwnd hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
-                    if (!c.FAILED(hr) and sc1 != null) {
-                        const sc1_vtbl = sc1.?.lpVtbl;
-                        if (sc1_vtbl.*.QueryInterface) |sc_qi| {
-                            _ = sc_qi(sc1.?, &c.IID_IDXGISwapChain, @ptrCast(&sc0));
-                        }
-                    }
-                }
+                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
             }
         }
 
-        // Initialize DirectComposition for transparency
-        if (applog.isEnabled()) applog.appLog("[d3d] transparency: use_transparency={} sc1={} dxgi_dev={}\n", .{ use_transparency, sc1 != null, dxgi_dev != null });
-        if (use_transparency and sc1 != null and dxgi_dev != null) {
+        // Always initialize DirectComposition (required by WS_EX_NOREDIRECTIONBITMAP).
+        if (applog.isEnabled()) applog.appLog("[d3d] DirectComposition: sc1={} dxgi_dev={}\n", .{ sc1 != null, dxgi_dev != null });
+        if (sc1 != null and dxgi_dev != null) {
             var dcomp_dev: ?*IDCompositionDevice = null;
             const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
             if (applog.isEnabled()) applog.appLog("[d3d] DCompositionCreateDevice hr=0x{x} dev=0x{x}\n", .{ @as(u32, @bitCast(dcomp_hr)), if (dcomp_dev) |d| @intFromPtr(d) else 0 });

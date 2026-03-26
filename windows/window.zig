@@ -71,6 +71,9 @@ const WM_APP_RESIZE_POPUPMENU = app_mod.WM_APP_RESIZE_POPUPMENU;
 const WM_APP_UPDATE_CMDLINE_COLORS = app_mod.WM_APP_UPDATE_CMDLINE_COLORS;
 const WM_APP_SET_TITLE = app_mod.WM_APP_SET_TITLE;
 const WM_APP_DEFERRED_WIN_POS = app_mod.WM_APP_DEFERRED_WIN_POS;
+const WM_APP_SHOW_WINDOW = app_mod.WM_APP_SHOW_WINDOW;
+const WM_APP_SWP_FRAMECHANGED = app_mod.WM_APP_SWP_FRAMECHANGED;
+const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
 
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
@@ -84,6 +87,8 @@ const TIMER_SCROLLBAR_REPEAT = app_mod.TIMER_SCROLLBAR_REPEAT;
 const TIMER_CURSOR_BLINK = app_mod.TIMER_CURSOR_BLINK;
 const TIMER_QUIT_TIMEOUT = app_mod.TIMER_QUIT_TIMEOUT;
 const TIMER_REPOSITION_FLOATS = app_mod.TIMER_REPOSITION_FLOATS;
+const TIMER_TRAY_INIT = app_mod.TIMER_TRAY_INIT;
+const TRAY_INIT_DELAY_MS = app_mod.TRAY_INIT_DELAY_MS;
 const QUIT_TIMEOUT_MS = app_mod.QUIT_TIMEOUT_MS;
 const SCROLLBAR_FADE_INTERVAL = app_mod.SCROLLBAR_FADE_INTERVAL;
 const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
@@ -130,6 +135,181 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 
     // 2) app-root switch (Windows side)
     applog.setEnabled(enabled);
+}
+
+// =========================================================================
+// Helper: build core.Callbacks struct (shared between WM_CREATE and DEFERRED_INIT)
+// =========================================================================
+fn makeCoreCbs() core.Callbacks {
+    return .{
+        .on_vertices_partial = callbacks.onVerticesPartial,
+        .on_vertices_row = callbacks.onVerticesRow,
+        .on_atlas_ensure_glyph = callbacks.onAtlasEnsureGlyph,
+        .on_atlas_ensure_glyph_styled = callbacks.onAtlasEnsureGlyphStyled,
+        .on_log = callbacks.onLog,
+        .on_guifont = callbacks.onGuiFont,
+        .on_linespace = callbacks.onLineSpace,
+        .on_exit = callbacks.onExit,
+        .on_default_colors_set = callbacks.onDefaultColorsSet,
+        .on_set_title = callbacks.onSetTitle,
+        .on_external_window = external_windows.onExternalWindow,
+        .on_external_window_close = external_windows.onExternalWindowClose,
+        .on_cursor_grid_changed = external_windows.onCursorGridChanged,
+        .on_cmdline_show = callbacks.onCmdlineShow,
+        .on_cmdline_hide = callbacks.onCmdlineHide,
+        .on_msg_show = messages.onMsgShow,
+        .on_msg_clear = messages.onMsgClear,
+        .on_msg_showmode = messages.onMsgShowmode,
+        .on_msg_showcmd = messages.onMsgShowcmd,
+        .on_msg_ruler = messages.onMsgRuler,
+        .on_msg_history_show = messages.onMsgHistoryShow,
+        .on_tabline_update = tabline_mod.onTablineUpdate,
+        .on_tabline_hide = tabline_mod.onTablineHide,
+        .on_clipboard_get = callbacks.onClipboardGet,
+        .on_clipboard_set = callbacks.onClipboardSet,
+        .on_ssh_auth_prompt = callbacks.onSSHAuthPrompt,
+        .on_ime_off = callbacks.onIMEOff,
+        .on_quit_requested = callbacks.onQuitRequested,
+        .on_rasterize_glyph = callbacks.onRasterizeGlyph,
+        .on_atlas_upload = callbacks.onAtlasUpload,
+        .on_atlas_create = callbacks.onAtlasCreate,
+        .on_win_move = external_windows.onWinMove,
+        .on_win_exchange = external_windows.onWinExchange,
+        .on_win_rotate = external_windows.onWinRotate,
+        .on_win_resize_equal = external_windows.onWinResizeEqual,
+        .on_win_move_cursor = external_windows.onWinMoveCursor,
+        .on_shape_text_run = callbacks.onShapeTextRun,
+        .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
+        .on_get_ascii_table = callbacks.onGetAsciiTable,
+        .on_flush_begin = callbacks.onFlushBegin,
+        .on_flush_end = callbacks.onFlushEnd,
+        .on_main_row_scroll = callbacks.onMainRowScroll,
+        .on_grid_row_scroll = callbacks.onGridRowScroll,
+    };
+}
+
+// =========================================================================
+// Helper: D3D11 device creation on a separate thread
+// =========================================================================
+fn d3dInitThreadFn(app: *App) void {
+    const result = d3d11.Renderer.createDeviceOnly() catch return;
+    app.d3d_device = result.device;
+    app.d3d_ctx = result.ctx;
+    if (applog.isEnabled()) applog.appLog("[win] d3d_init_thread: device ready\n", .{});
+}
+
+// =========================================================================
+// Helper: build native-mode nvim command string
+// =========================================================================
+fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
+    const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
+    if (app.nvim_extra_args.items.len == 0) return effective_nvim;
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+    const needs_quote = std.mem.indexOfScalar(u8, effective_nvim, ' ') != null;
+    if (needs_quote) writer.writeByte('\'') catch {};
+    writer.writeAll(effective_nvim) catch {};
+    if (needs_quote) writer.writeByte('\'') catch {};
+    for (app.nvim_extra_args.items) |arg| {
+        writer.writeByte(' ') catch {};
+        if (std.mem.indexOfScalar(u8, arg, ' ') != null) {
+            writer.writeByte('"') catch {};
+            writer.writeAll(arg) catch {};
+            writer.writeByte('"') catch {};
+        } else {
+            writer.writeAll(arg) catch {};
+        }
+    }
+    return buf[0..fbs.pos];
+}
+
+// =========================================================================
+// doEarlyCoreInit: called from WM_CREATE for native mode only
+// Creates core, loads config, inits DWrite metrics, spawns nvim, and
+// kicks off D3D11 device creation on a separate thread.
+// =========================================================================
+fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
+    const log_enabled = applog.isEnabled();
+    var t1: c.LARGE_INTEGER = undefined;
+    var t2: c.LARGE_INTEGER = undefined;
+
+    // 1. Create core with callbacks
+    var cb = makeCoreCbs();
+    if (log_enabled) _ = c.QueryPerformanceCounter(&t1);
+    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
+    if (log_enabled) {
+        _ = c.QueryPerformanceCounter(&t2);
+        const ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+        applog.appLog("[win] doEarlyCoreInit: core_create {d}ms\n", .{ms});
+    }
+
+    // 2. Load config into core
+    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
+        defer app.alloc.free(config_path);
+        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
+        if (config_path_z) |cpath| {
+            defer app.alloc.free(cpath);
+            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
+        }
+    } else |_| {}
+
+    // 3. Set log/ext flags
+    setLogEnabledViaCore(app, app.config.log.enabled);
+    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
+    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
+    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
+    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
+    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
+    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+    core.zonvie_core_set_glyph_cache_size(
+        app.corep,
+        app.config.performance.glyph_cache_ascii_size,
+        app.config.performance.glyph_cache_non_ascii_size,
+    );
+    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+
+    // 4. DWrite metrics init (font metrics calculation) -> store in early_atlas
+    const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+    const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
+
+    if (log_enabled) _ = c.QueryPerformanceCounter(&t1);
+    var atlas_val = try dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt);
+    if (log_enabled) {
+        _ = c.QueryPerformanceCounter(&t2);
+        const ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+        applog.appLog("[win] doEarlyCoreInit: initMetrics {d}ms\n", .{ms});
+    }
+
+    app.dpi_scale = @as(f32, @floatFromInt(atlas_val.dpi)) / 96.0;
+    app.cell_w_px = atlas_val.cellW();
+    app.cell_h_px = atlas_val.cellH();
+    app.early_atlas = atlas_val;
+
+    // 5. Compute rows/cols from actual cell metrics
+    updateRowsColsFromClientForce(hwnd, app);
+
+    // 6. Spawn nvim (native mode only)
+    var nvim_cmd_buf: [1024]u8 = undefined;
+    const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
+    const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
+    defer if (nvim_path_z) |p| app.alloc.free(p);
+    const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
+
+    if (log_enabled) applog.appLog("[win] doEarlyCoreInit: starting nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+    _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+    app.nvim_spawned = true;
+    app.early_core_init_done = true;
+
+    // 7. D3D11 device init on separate thread
+    app.d3d_init_thread = std.Thread.spawn(.{}, d3dInitThreadFn, .{app}) catch null;
+
+    // 8. Tabline titlebar mode: trigger SWP_FRAMECHANGED immediately
+    if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
+        _ = c.SetWindowPos(hwnd, null, 0, 0, 0, 0, c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE);
+        if (log_enabled) applog.appLog("[win] WM_CREATE: SWP_FRAMECHANGED applied (overlaps nvim spawn ~50ms)\n", .{});
+    }
+
+    if (log_enabled) applog.appLog("[win] WM_CREATE: early core init done, nvim spawn started rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
 }
 
 pub export fn WndProc(
@@ -308,34 +488,17 @@ pub export fn WndProc(
                     if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
                 }
 
-                // DWM custom titlebar: trigger frame recalculation (titlebar mode only)
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
-                    var rc: c.RECT = undefined;
-                    _ = c.GetWindowRect(hwnd, &rc);
-                    _ = c.SetWindowPos(
-                        hwnd,
-                        null,
-                        rc.left,
-                        rc.top,
-                        rc.right - rc.left,
-                        rc.bottom - rc.top,
-                        c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE,
-                    );
-                    if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: triggered SWP_FRAMECHANGED for custom titlebar\n", .{});
-
-                    // NOTE: content_hwnd is NOT created anymore.
-                    // D3D11 renders to parent window directly, including tabline area.
-                    // This avoids DWM composition issues with GDI/D3D mixing across windows.
-                }
-
-                // Initialize tray icon for OS notification (balloon notification)
-                app.tray_icon = TrayIcon.init(hwnd);
-                if (app.tray_icon) |*tray| {
-                    tray.add();
-                }
-
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
+
+                // Native mode: perform early core init (before deferred init)
+                // WSL/SSH/devcontainer modes use the traditional WM_APP_DEFERRED_INIT path
+                const is_remote = app.wsl_mode or app.ssh_mode or app.devcontainer_mode;
+                if (!is_remote) {
+                    doEarlyCoreInit(hwnd, app) catch |e| {
+                        if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: doEarlyCoreInit failed: {any}\n", .{e});
+                    };
+                }
 
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
@@ -1520,7 +1683,18 @@ pub export fn WndProc(
                 }
 
                 // 2) core layout update must be outside lock (can re-enter via callbacks).
-                updateLayoutToCore(hwnd, app);
+                if (app.window_shown) {
+                    updateLayoutToCore(hwnd, app);
+                }
+
+                // Unblock RPC thread once layout is known (before window is shown)
+                if (app.early_core_init_done and app.nvim_spawned and !app.window_shown) {
+                    if (app.corep) |corep| {
+                        if (app.surface.rows > 0 and app.surface.cols > 0) {
+                            core.zonvie_core_notify_layout_ready(corep, app.surface.rows, app.surface.cols);
+                        }
+                    }
+                }
 
                 // 3) Resize tabline child window if present
                 if (app.tabline_state.hwnd) |tabline_hwnd| {
@@ -2065,6 +2239,9 @@ pub export fn WndProc(
                                 const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
                                 if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
 
+                                // Renderer is already initialized at this point; notify with correct rows/cols.
+                                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
+
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
                             }
@@ -2085,6 +2262,15 @@ pub export fn WndProc(
                 if (getApp(hwnd)) |app| {
                     messages.updateExtFloatPositions(app);
                     messages.updateMiniWindows(app);
+                }
+            } else if (wParam == TIMER_TRAY_INIT) {
+                _ = c.KillTimer(hwnd, TIMER_TRAY_INIT);
+                if (getApp(hwnd)) |app| {
+                    app.tray_icon = TrayIcon.init(hwnd);
+                    if (app.tray_icon) |*tray| {
+                        tray.add();
+                    }
+                    if (applog.isEnabled()) applog.appLog("[win] TIMER_TRAY_INIT: tray icon initialized\n", .{});
                 }
             } else if (wParam == TIMER_QUIT_TIMEOUT) {
                 // Neovim not responding to quit request - show force quit dialog
@@ -2117,358 +2303,283 @@ pub export fn WndProc(
             }
 
             if (getApp(hwnd)) |app| {
-                // ============================================================
-                // PHASE 1: Start nvim spawn FIRST (runs in parallel with renderer init)
-                // ============================================================
-                var cb: core.Callbacks = .{
-                    .on_vertices_partial = callbacks.onVerticesPartial,
-                    .on_vertices_row = callbacks.onVerticesRow,
-                    .on_atlas_ensure_glyph = callbacks.onAtlasEnsureGlyph,
-                    .on_atlas_ensure_glyph_styled = callbacks.onAtlasEnsureGlyphStyled,
-                    .on_log = callbacks.onLog,
-                    .on_guifont = callbacks.onGuiFont,
-                    .on_linespace = callbacks.onLineSpace,
-                    .on_exit = callbacks.onExit,
-                    .on_default_colors_set = callbacks.onDefaultColorsSet,
-                    .on_set_title = callbacks.onSetTitle,
-                    .on_external_window = external_windows.onExternalWindow,
-                    .on_external_window_close = external_windows.onExternalWindowClose,
-                    .on_cursor_grid_changed = external_windows.onCursorGridChanged,
-                    .on_cmdline_show = callbacks.onCmdlineShow,
-                    .on_cmdline_hide = callbacks.onCmdlineHide,
-                    .on_msg_show = messages.onMsgShow,
-                    .on_msg_clear = messages.onMsgClear,
-                    .on_msg_showmode = messages.onMsgShowmode,
-                    .on_msg_showcmd = messages.onMsgShowcmd,
-                    .on_msg_ruler = messages.onMsgRuler,
-                    .on_msg_history_show = messages.onMsgHistoryShow,
-                    .on_tabline_update = tabline_mod.onTablineUpdate,
-                    .on_tabline_hide = tabline_mod.onTablineHide,
-                    .on_clipboard_get = callbacks.onClipboardGet,
-                    .on_clipboard_set = callbacks.onClipboardSet,
-                    .on_ssh_auth_prompt = callbacks.onSSHAuthPrompt,
-                    .on_ime_off = callbacks.onIMEOff,
-                    .on_quit_requested = callbacks.onQuitRequested,
-                    .on_rasterize_glyph = callbacks.onRasterizeGlyph,
-                    .on_atlas_upload = callbacks.onAtlasUpload,
-                    .on_atlas_create = callbacks.onAtlasCreate,
-                    .on_win_move = external_windows.onWinMove,
-                    .on_win_exchange = external_windows.onWinExchange,
-                    .on_win_rotate = external_windows.onWinRotate,
-                    .on_win_resize_equal = external_windows.onWinResizeEqual,
-                    .on_win_move_cursor = external_windows.onWinMoveCursor,
-                    .on_shape_text_run = callbacks.onShapeTextRun,
-                    .on_rasterize_glyph_by_id = callbacks.onRasterizeGlyphById,
-                    .on_get_ascii_table = callbacks.onGetAsciiTable,
-                    .on_flush_begin = callbacks.onFlushBegin,
-                    .on_flush_end = callbacks.onFlushEnd,
-                    .on_main_row_scroll = callbacks.onMainRowScroll,
-                    .on_grid_row_scroll = callbacks.onGridRowScroll,
-                };
-                if (deferred_log_enabled) applog.appLog("[win] row_mode enabled: using row-vertex path\n", .{});
+                var atlas: dwrite_d2d.Renderer = undefined;
 
-                if (deferred_log_enabled) applog.appLog("  core_create callbacks ptr ctx(app)={*}", .{app});
-                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
-                if (deferred_log_enabled) {
-                    _ = c.QueryPerformanceCounter(&t2);
-                    const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
-                    applog.appLog("  core_create -> corep={*}", .{app.corep});
-                }
-
-                // Load config into core for message routing
-                if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
-                    defer app.alloc.free(config_path);
-                    const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
-                    if (config_path_z) |cpath| {
-                        defer app.alloc.free(cpath);
-                        const load_result = core.zonvie_core_load_config(app.corep, cpath.ptr);
-                        if (deferred_log_enabled) applog.appLog("[win] zonvie_core_load_config({s}) = {d}\n", .{ config_path, load_result });
-                    }
-                } else |_| {
-                    if (deferred_log_enabled) applog.appLog("[win] no config path found, using defaults\n", .{});
-                }
-
-                // Configure core settings
-                setLogEnabledViaCore(app, app.config.log.enabled);
-                if (app.ext_cmdline_enabled) {
-                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_cmdline\n", .{});
-                    core.zonvie_core_set_ext_cmdline(app.corep, 1);
-                }
-                if (app.config.popup.external) {
-                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_popupmenu\n", .{});
-                    core.zonvie_core_set_ext_popupmenu(app.corep, 1);
-                }
-                if (app.ext_messages_enabled) {
-                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_messages\n", .{});
-                    core.zonvie_core_set_ext_messages(app.corep, 1);
-                }
-                if (app.ext_tabline_enabled) {
-                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_tabline\n", .{});
-                    core.zonvie_core_set_ext_tabline(app.corep, 1);
-                    // Note: Child window approach doesn't work with D3D11
-                    // D3D11 renders on top of GDI child windows
-                    // We'll draw tabline using GDI after D3D11 Present instead
-                }
-                if (app.ext_windows_enabled) {
-                    if (deferred_log_enabled) applog.appLog("[win] enabling ext_windows\n", .{});
-                    core.zonvie_core_set_ext_windows(app.corep, 1);
-                }
-                core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-                if (deferred_log_enabled) applog.appLog("[win] set opacity={d:.2}\n", .{app.config.window.opacity});
-                core.zonvie_core_set_glyph_cache_size(
-                    app.corep,
-                    app.config.performance.glyph_cache_ascii_size,
-                    app.config.performance.glyph_cache_non_ascii_size,
-                );
-                if (deferred_log_enabled) applog.appLog("[win] set glyph_cache_size ascii={d} non_ascii={d}\n", .{
-                    app.config.performance.glyph_cache_ascii_size,
-                    app.config.performance.glyph_cache_non_ascii_size,
-                });
-                // Clamp atlas_size against D3D max texture size, then set
-                const atlas_cfg = app.config.performance.atlas_size;
-                var atlas_size_clamped = atlas_cfg;
-                if (app.renderer) |*g| {
-                    const max_tex = g.maxTextureSize();
-                    if (atlas_cfg > max_tex) {
-                        if (deferred_log_enabled) applog.appLog("[win] atlas_size {d} exceeds D3D max {d}, clamping\n", .{ atlas_cfg, max_tex });
-                        atlas_size_clamped = max_tex;
-                    }
-                }
-                core.zonvie_core_set_atlas_size(app.corep, atlas_size_clamped);
-                if (deferred_log_enabled) applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
-
-                // Build nvim command and start nvim (runs in background thread)
-                var nvim_cmd_buf: [1024]u8 = undefined;
-                var nvim_cmd_slice: []const u8 = undefined;
-
-                // Compute effective local nvim path (CLI override + quote for spaces)
-                const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
-                const quoted_nvim: []const u8 = blk: {
-                    if (std.mem.indexOfScalar(u8, effective_nvim, ' ') != null) {
-                        const buf = app.alloc.alloc(u8, effective_nvim.len + 2) catch
-                            break :blk effective_nvim; // OOM: fallback to unquoted (catastrophic scenario)
-                        buf[0] = '\'';
-                        @memcpy(buf[1 .. 1 + effective_nvim.len], effective_nvim);
-                        buf[1 + effective_nvim.len] = '\'';
-                        break :blk buf;
-                    }
-                    break :blk effective_nvim;
-                };
-                defer if (quoted_nvim.ptr != effective_nvim.ptr) app.alloc.free(@constCast(quoted_nvim));
-
-                if (app.wsl_mode) {
-                    var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                    const writer = fbs.writer();
-                    writer.writeAll("wsl.exe") catch {};
-                    if (app.wsl_distro) |distro| {
-                        writer.print(" -d {s}", .{distro}) catch {};
-                    }
-                    writer.writeAll(" --shell-type login -- nvim --embed") catch {};
-                    nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                    if (deferred_log_enabled) applog.appLog("[win] WSL mode enabled, command: {s}\n", .{nvim_cmd_slice});
-                } else if (app.ssh_mode) {
-                    if (app.ssh_host) |host| {
-                        if (deferred_log_enabled) applog.appLog("[win] SSH mode: building SSH command, host={s}\n", .{host});
-                        var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                        const writer = fbs.writer();
-                        // Always use ssh-askpass prefix for GUI dialog (password or key passphrase)
-                        writer.writeAll("ssh-askpass ") catch {};
-                        writer.writeAll("C:\\Windows\\System32\\OpenSSH\\ssh.exe") catch {};
-                        if (app.ssh_port) |port| {
-                            writer.print(" -p {d}", .{port}) catch {};
-                        }
-                        if (app.ssh_identity) |identity| {
-                            // Public key auth: use identity file, disable password auth
-                            // (key passphrase dialog still works via SSH_ASKPASS)
-                            writer.print(" -i \"{s}\"", .{identity}) catch {};
-                            writer.writeAll(" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no") catch {};
-                        }
-                        writer.writeAll(" -o StrictHostKeyChecking=accept-new") catch {};
-                        // Use --nvim override for remote nvim path, default to bare "nvim" (PATH lookup)
-                        // Quote with "'...'" so Zig parser strips "" and remote shell strips ''
-                        const remote_nvim = app.cli_nvim_path orelse "nvim";
-                        writer.print(" {s} \"'{s}'\" --headless --embed", .{ host, remote_nvim }) catch {};
-                        nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                        if (deferred_log_enabled) applog.appLog("[win] SSH command: {s}\n", .{nvim_cmd_slice});
-
-                        // Always set up SSH_ASKPASS for on-demand password/passphrase dialog
-                        // SSH will call SSH_ASKPASS only when it needs authentication
-                        if (app.ssh_password) |pwd| {
-                            // Pre-set password mode: store password in environment
-                            var pwd_utf16: [256]u16 = undefined;
-                            var pwd_idx: usize = 0;
-                            for (pwd) |ch| {
-                                if (pwd_idx < 255) {
-                                    pwd_utf16[pwd_idx] = ch;
-                                    pwd_idx += 1;
-                                }
-                            }
-                            pwd_utf16[pwd_idx] = 0;
-                            _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_SSH_PASSWORD"), &pwd_utf16);
-                        }
-                        // Set zonvie.exe as SSH_ASKPASS program (shows dialog when SSH needs auth)
-                        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_ASKPASS_MODE"), std.unicode.utf8ToUtf16LeStringLiteral("1"));
-                        var exe_path: [c.MAX_PATH + 1]u16 = undefined;
-                        const exe_len = c.GetModuleFileNameW(null, &exe_path, c.MAX_PATH + 1);
-                        if (exe_len > 0 and exe_len < c.MAX_PATH) {
-                            exe_path[exe_len] = 0;
-                            _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS"), &exe_path);
-                        }
-                        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS_REQUIRE"), std.unicode.utf8ToUtf16LeStringLiteral("force"));
-                        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("DISPLAY"), std.unicode.utf8ToUtf16LeStringLiteral("dummy:0"));
-                    } else {
-                        if (deferred_log_enabled) applog.appLog("[win] SSH mode enabled but no host specified\n", .{});
-                        nvim_cmd_slice = quoted_nvim;
-                    }
-                } else if (app.devcontainer_mode) devcontainer_block: {
-                    if (app.devcontainer_workspace) |workspace| {
-                        if (deferred_log_enabled) applog.appLog("[win] devcontainer mode: workspace={s}, rebuild={}\n", .{ workspace, app.devcontainer_rebuild });
-
-                        if (app.devcontainer_rebuild) {
-                            // Rebuild mode: show progress dialog and run devcontainer up in background
-                            dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Building devcontainer..."));
-
-                            // Reset atomic flags
-                            dialogs.g_devcontainer_up_done.store(false, .seq_cst);
-                            dialogs.g_devcontainer_up_success.store(false, .seq_cst);
-
-                            // Start background thread for devcontainer up
-                            const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
-                                if (deferred_log_enabled) applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
-                                dialogs.hideDevcontainerProgressDialog();
-                                nvim_cmd_slice = quoted_nvim;
-                                break :devcontainer_block;
-                            };
-                            thread.detach();
-
-                            // Mark that we're waiting for devcontainer up
-                            app.devcontainer_up_pending = true;
-
-                            // Start polling timer
-                            _ = c.SetTimer(hwnd, TIMER_DEVCONTAINER_POLL, DEVCONTAINER_POLL_INTERVAL, null);
-                            if (deferred_log_enabled) applog.appLog("[win] devcontainer poll timer started\n", .{});
-
-                            // Skip nvim startup - will be done after devcontainer up completes
-                            if (deferred_log_enabled) applog.appLog("[win] devcontainer up started in background, skipping nvim startup\n", .{});
-
-                            // Initialize renderers anyway (they're needed for the window)
-                            // But skip zonvie_core_start until devcontainer up completes
-                            break :devcontainer_block;
-                        } else {
-                            // Normal mode: show connecting dialog and direct devcontainer exec
-                            dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
-
-                            var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                            const writer = fbs.writer();
-                            writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-                            writer.writeAll(workspace) catch {};
-                            writer.writeAll("\"") catch {};
-                            if (app.devcontainer_config) |config_path| {
-                                writer.writeAll(" --config \"") catch {};
-                                writer.writeAll(config_path) catch {};
-                                writer.writeAll("\"") catch {};
-                            }
-                            writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                            nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                            if (deferred_log_enabled) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
-                        }
-                    } else {
-                        if (deferred_log_enabled) applog.appLog("[win] devcontainer mode enabled but no workspace specified\n", .{});
-                        nvim_cmd_slice = quoted_nvim;
-                    }
+                if (app.early_core_init_done) {
+                    // Native mode: core, config, nvim already initialized in doEarlyCoreInit.
+                    // Reuse early_atlas for renderer setup.
+                    if (deferred_log_enabled) applog.appLog("[win] DEFERRED_INIT: early_core_init path\n", .{});
+                    atlas = app.early_atlas orelse return 0;
+                    app.early_atlas = null;
                 } else {
-                    // Native mode: add extra args if any
-                    if (app.nvim_extra_args.items.len > 0) {
-                        var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                        const writer = fbs.writer();
-                        writer.writeAll(quoted_nvim) catch {};
-                        for (app.nvim_extra_args.items) |arg| {
-                            writer.writeAll(" ") catch {};
-                            // Escape arguments with spaces
-                            if (std.mem.indexOfScalar(u8, arg, ' ') != null) {
-                                writer.writeAll("\"") catch {};
-                                writer.writeAll(arg) catch {};
-                                writer.writeAll("\"") catch {};
-                            } else {
-                                writer.writeAll(arg) catch {};
-                            }
-                        }
-                        nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
-                        if (deferred_log_enabled) applog.appLog("[win] Added nvim extra args, command: {s}\n", .{nvim_cmd_slice});
-                    } else {
-                        nvim_cmd_slice = quoted_nvim;
-                    }
-                }
+                    // WSL/SSH/devcontainer mode: full initialization path
+                    if (deferred_log_enabled) applog.appLog("[win] DEFERRED_INIT: full init path\n", .{});
 
-                // Skip nvim startup if waiting for devcontainer up
-                if (!app.devcontainer_up_pending) {
-                    const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
-                    defer if (nvim_path_z) |p| app.alloc.free(p);
-                    const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s}\n", .{nvim_cmd_slice});
+                    var cb = makeCoreCbs();
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
+                    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
                     if (deferred_log_enabled) {
                         _ = c.QueryPerformanceCounter(&t2);
-                        const core_start_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                        applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
-                        applog.appLog("  core_start -> {d}", .{start_ok});
+                        const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                        applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
                     }
 
-                    // Close devcontainer progress dialog if shown (for non-rebuild mode)
-                    if (app.devcontainer_mode and !app.devcontainer_rebuild) {
-                        dialogs.hideDevcontainerProgressDialog();
+                    // Load config into core for message routing
+                    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
+                        defer app.alloc.free(config_path);
+                        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
+                        if (config_path_z) |cpath| {
+                            defer app.alloc.free(cpath);
+                            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
+                        }
+                    } else |_| {}
+
+                    // Configure core settings
+                    setLogEnabledViaCore(app, app.config.log.enabled);
+                    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
+                    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
+                    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
+                    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
+                    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
+                    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+                    core.zonvie_core_set_glyph_cache_size(
+                        app.corep,
+                        app.config.performance.glyph_cache_ascii_size,
+                        app.config.performance.glyph_cache_non_ascii_size,
+                    );
+                    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+
+                    // DWrite metrics init
+                    const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+                    const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
+
+                    if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
+                    atlas = dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
+                        if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initMetrics failed: {any}\n", .{e});
+                        return 0;
+                    };
+                    if (deferred_log_enabled) {
+                        _ = c.QueryPerformanceCounter(&t2);
+                        const dwrite_metrics_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                        applog.appLog("  [TIMING] dwrite_d2d.Renderer.initMetrics: {d}ms", .{dwrite_metrics_ms});
+                    }
+
+                    app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
+                    app.cell_w_px = atlas.cellW();
+                    app.cell_h_px = atlas.cellH();
+                    updateRowsColsFromClientForce(hwnd, app);
+
+                    // Build nvim command and start nvim
+                    var nvim_cmd_buf: [1024]u8 = undefined;
+                    var nvim_cmd_slice: []const u8 = undefined;
+
+                    const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
+                    const quoted_nvim: []const u8 = blk: {
+                        if (std.mem.indexOfScalar(u8, effective_nvim, ' ') != null) {
+                            const buf = app.alloc.alloc(u8, effective_nvim.len + 2) catch
+                                break :blk effective_nvim;
+                            buf[0] = '\'';
+                            @memcpy(buf[1 .. 1 + effective_nvim.len], effective_nvim);
+                            buf[1 + effective_nvim.len] = '\'';
+                            break :blk buf;
+                        }
+                        break :blk effective_nvim;
+                    };
+                    defer if (quoted_nvim.ptr != effective_nvim.ptr) app.alloc.free(@constCast(quoted_nvim));
+
+                    if (app.wsl_mode) {
+                        var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
+                        const writer = fbs.writer();
+                        writer.writeAll("wsl.exe") catch {};
+                        if (app.wsl_distro) |distro| {
+                            writer.print(" -d {s}", .{distro}) catch {};
+                        }
+                        writer.writeAll(" --shell-type login -- nvim --embed") catch {};
+                        nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                    } else if (app.ssh_mode) {
+                        if (app.ssh_host) |host| {
+                            var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
+                            const writer = fbs.writer();
+                            writer.writeAll("ssh-askpass ") catch {};
+                            writer.writeAll("C:\\Windows\\System32\\OpenSSH\\ssh.exe") catch {};
+                            if (app.ssh_port) |port| {
+                                writer.print(" -p {d}", .{port}) catch {};
+                            }
+                            if (app.ssh_identity) |identity| {
+                                writer.print(" -i \"{s}\"", .{identity}) catch {};
+                                writer.writeAll(" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no") catch {};
+                            }
+                            writer.writeAll(" -o StrictHostKeyChecking=accept-new") catch {};
+                            const remote_nvim = app.cli_nvim_path orelse "nvim";
+                            writer.print(" {s} \"'{s}'\" --headless --embed", .{ host, remote_nvim }) catch {};
+                            nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+
+                            if (app.ssh_password) |pwd| {
+                                var pwd_utf16: [256]u16 = undefined;
+                                var pwd_idx: usize = 0;
+                                for (pwd) |ch| {
+                                    if (pwd_idx < 255) {
+                                        pwd_utf16[pwd_idx] = ch;
+                                        pwd_idx += 1;
+                                    }
+                                }
+                                pwd_utf16[pwd_idx] = 0;
+                                _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_SSH_PASSWORD"), &pwd_utf16);
+                            }
+                            _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_ASKPASS_MODE"), std.unicode.utf8ToUtf16LeStringLiteral("1"));
+                            var exe_path: [c.MAX_PATH + 1]u16 = undefined;
+                            const exe_len = c.GetModuleFileNameW(null, &exe_path, c.MAX_PATH + 1);
+                            if (exe_len > 0 and exe_len < c.MAX_PATH) {
+                                exe_path[exe_len] = 0;
+                                _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS"), &exe_path);
+                            }
+                            _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SSH_ASKPASS_REQUIRE"), std.unicode.utf8ToUtf16LeStringLiteral("force"));
+                            _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("DISPLAY"), std.unicode.utf8ToUtf16LeStringLiteral("dummy:0"));
+                        } else {
+                            nvim_cmd_slice = quoted_nvim;
+                        }
+                    } else if (app.devcontainer_mode) devcontainer_block: {
+                        if (app.devcontainer_workspace) |workspace| {
+                            if (app.devcontainer_rebuild) {
+                                dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Building devcontainer..."));
+                                dialogs.g_devcontainer_up_done.store(false, .seq_cst);
+                                dialogs.g_devcontainer_up_success.store(false, .seq_cst);
+                                const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
+                                    if (deferred_log_enabled) applog.appLog("[win] failed to spawn devcontainer up thread: {any}\n", .{e});
+                                    dialogs.hideDevcontainerProgressDialog();
+                                    nvim_cmd_slice = quoted_nvim;
+                                    break :devcontainer_block;
+                                };
+                                thread.detach();
+                                app.devcontainer_up_pending = true;
+                                _ = c.SetTimer(hwnd, TIMER_DEVCONTAINER_POLL, DEVCONTAINER_POLL_INTERVAL, null);
+                                break :devcontainer_block;
+                            } else {
+                                dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
+                                var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
+                                const writer = fbs.writer();
+                                writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
+                                writer.writeAll(workspace) catch {};
+                                writer.writeAll("\"") catch {};
+                                if (app.devcontainer_config) |config_path| {
+                                    writer.writeAll(" --config \"") catch {};
+                                    writer.writeAll(config_path) catch {};
+                                    writer.writeAll("\"") catch {};
+                                }
+                                writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
+                                nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                            }
+                        } else {
+                            nvim_cmd_slice = quoted_nvim;
+                        }
+                    } else {
+                        nvim_cmd_slice = quoted_nvim;
+                    }
+
+                    // Start nvim
+                    if (!app.devcontainer_up_pending) {
+                        const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
+                        defer if (nvim_path_z) |p| app.alloc.free(p);
+                        const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
+                        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        app.nvim_spawned = true;
+                        if (app.devcontainer_mode and !app.devcontainer_rebuild) {
+                            dialogs.hideDevcontainerProgressDialog();
+                        }
+                    }
+
+                    // Create D3D11 device (inline, not threaded for remote modes)
+                    const d3d_result = d3d11.Renderer.createDeviceOnly() catch null;
+                    if (d3d_result) |result| {
+                        app.d3d_device = result.device;
+                        app.d3d_ctx = result.ctx;
+                    }
+
+                    // DWM custom titlebar: post SWP_FRAMECHANGED (fallback path only)
+                    if (!app.early_core_init_done and app.ext_tabline_enabled and app.tabline_style == .titlebar) {
+                        _ = c.PostMessageW(hwnd, app_mod.WM_APP_SWP_FRAMECHANGED, 0, 0);
+                        if (deferred_log_enabled) applog.appLog("[win] deferred_init: SWP_FRAMECHANGED posted (fallback path)\n", .{});
+                    }
+                }
+
+                // ============================================================
+                // PHASE 2: Initialize renderers
+                // ============================================================
+
+                // Assign atlas BEFORE renderer creation so callbacks can use it
+                app.mu.lock();
+                app.atlas = atlas;
+                app.mu.unlock();
+
+                // Notify layout ready BEFORE renderer setup (atlas is ready, unblock RPC thread)
+                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
+                if (deferred_log_enabled) applog.appLog("[win] notified layout ready: rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+
+                // Complete DWrite/D2D: create D2D device context from D3D11 device.
+                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
+
+                // Join D3D11 init thread if it was spawned (native mode)
+                if (app.d3d_init_thread) |thr| {
+                    thr.join();
+                    app.d3d_init_thread = null;
+                    if (deferred_log_enabled) applog.appLog("[win] d3d_init_thread joined\n", .{});
+                }
+
+                // If no D3D device after thread join, create inline
+                if (app.d3d_device == null) {
+                    const d3d_inline = d3d11.Renderer.createDeviceOnly() catch null;
+                    if (d3d_inline) |result| {
+                        app.d3d_device = result.device;
+                        app.d3d_ctx = result.ctx;
+                    }
+                }
+
+                if (app.d3d_device) |d3d_dev| {
+                    if (app.atlas) |*a| {
+                        a.initD2DDeviceContext(d3d_dev) catch |e| {
+                            if (deferred_log_enabled) applog.appLog("dwrite_d2d initD2DDeviceContext failed: {any}, trying legacy\n", .{e});
+                            a.initRenderTarget() catch {};
+                        };
                     }
                 } else {
-                    if (deferred_log_enabled) applog.appLog("[win] nvim startup skipped, waiting for devcontainer up\n", .{});
+                    if (app.atlas) |*a| {
+                        a.initRenderTarget() catch {};
+                    }
                 }
-
-                // ============================================================
-                // PHASE 2: Initialize renderers (runs in parallel with nvim spawn)
-                // ============================================================
-                if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
-
-                // 1) Atlas builder (DirectWrite + CPU atlas)
-                // Font priority: config.font.family > OS default (Consolas)
-                const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
-                const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
-                if (deferred_log_enabled) applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
-
-                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                const atlas = dwrite_d2d.Renderer.init(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
-                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.init failed: {any}\n", .{e});
-                    app.atlas = null;
-                    app.renderer = null;
-                    return 0;
-                };
+                // Check we have at least one render path
+                if (app.atlas) |*a| {
+                    if (a.d2d_device_ctx == null and a.rt == null) {
+                        if (deferred_log_enabled) applog.appLog("dwrite_d2d: no D2D render path available\n", .{});
+                        a.deinit();
+                        app.atlas = null;
+                        app.renderer = null;
+                        return 0;
+                    }
+                }
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
-                    const dwrite_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.init: {d}ms", .{dwrite_ms});
+                    const rt_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] D2D context init: {d}ms", .{rt_ms});
                 }
 
-                // Set initial DPI scale from renderer
-                app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
-                if (deferred_log_enabled) applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
-
-                // 2) GPU renderer (D3D11)
-                // When ext_tabline is enabled, use content child window for D3D11 rendering
+                // D3D11 GPU renderer
                 const render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
                     app.content_hwnd.?
                 else
                     hwnd;
-                if (deferred_log_enabled) applog.appLog("[win] D3D11 target hwnd: {s}\n", .{if (render_hwnd == hwnd) "main" else "content child"});
 
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                const gpu = d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
-                    if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
-                    var tmp = atlas;
-                    tmp.deinit(); // avoid leak
-                    app.atlas = null;
-                    app.renderer = null;
-                    return 0;
+                const gpu = blk: {
+                    if (app.d3d_device != null and app.d3d_ctx != null) {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                            if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
+                            return 0;
+                        };
+                    }
+                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
+                        if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
+                        return 0;
+                    };
                 };
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
@@ -2477,26 +2588,19 @@ pub export fn WndProc(
                 }
 
                 app.mu.lock();
-                app.atlas = atlas;
                 app.renderer = gpu;
                 app.mu.unlock();
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
 
-                if (app.atlas) |*a| {
-                    app.cell_w_px = a.cellW();
-                    app.cell_h_px = a.cellH();
-                }
-
-                // Process pending glyphs that were requested before atlas was ready
-                // (happens when nvim spawn runs in parallel with renderer init)
+                // Process pending glyphs
                 {
                     app.mu.lock();
                     const pending_count = app.pending_glyphs.items.len;
                     app.mu.unlock();
 
                     if (pending_count > 0) {
-                        if (deferred_log_enabled) applog.appLog("  [TIMING] processing {d} pending glyphs", .{pending_count});
+                        if (deferred_log_enabled) applog.appLog("  processing {d} pending glyphs", .{pending_count});
                         app.mu.lock();
                         defer app.mu.unlock();
                         if (app.atlas) |*a| {
@@ -2512,13 +2616,24 @@ pub export fn WndProc(
                     }
                 }
 
-                // NOTE: setFontUtf8("Consolas", 14.0) is already called in dwrite_d2d.Renderer.init()
-                // Removed redundant call to avoid double font initialization (~10ms savings)
+                // Show window if pending (renderer now ready)
+                if (app.pending_show_window) {
+                    app.pending_show_window = false;
+                    _ = c.ShowWindow(hwnd, c.SW_SHOW);
+                    _ = c.PostMessageW(hwnd, app_mod.WM_APP_POST_SHOW_INIT, 0, 0);
+                    if (deferred_log_enabled) {
+                        var t_show: c.LARGE_INTEGER = undefined;
+                        _ = c.QueryPerformanceCounter(&t_show);
+                        const show_ms = @divTrunc((t_show.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+                        applog.appLog("[TIMING] ShowWindow (deferred, renderer ready): {d}ms from main()\n", .{show_ms});
+                    }
+                }
 
-                updateRowsColsFromClientForce(hwnd, app);
-
-                // Update layout after renderer is ready
-                updateLayoutToCore(hwnd, app);
+                // Update rows/cols + layout (non-titlebar mode)
+                if (!(app.ext_tabline_enabled and app.tabline_style == .titlebar)) {
+                    updateRowsColsFromClientForce(hwnd, app);
+                    updateLayoutToCore(hwnd, app);
+                }
 
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
@@ -2529,6 +2644,46 @@ pub export fn WndProc(
                 // Force a repaint now that renderer is ready
                 _ = c.InvalidateRect(hwnd, null, 0);
             }
+            return 0;
+        },
+
+        WM_APP_SHOW_WINDOW => {
+            if (getApp(hwnd)) |app| {
+                if (app.renderer == null) {
+                    app.pending_show_window = true;
+                    return 0;
+                }
+            }
+            _ = c.ShowWindow(hwnd, c.SW_SHOW);
+            _ = c.PostMessageW(hwnd, app_mod.WM_APP_POST_SHOW_INIT, 0, 0);
+            if (applog.isEnabled()) {
+                var t_show: c.LARGE_INTEGER = undefined;
+                _ = c.QueryPerformanceCounter(&t_show);
+                const elapsed_ms = @divTrunc((t_show.QuadPart - app_mod.g_startup_t0.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
+                applog.appLog("[TIMING] ShowWindow (first flush): {d}ms from main()\n", .{elapsed_ms});
+            }
+            return 0;
+        },
+
+        WM_APP_POST_SHOW_INIT => {
+            // Deferred tray icon initialization (after window is shown)
+            _ = c.SetTimer(hwnd, TIMER_TRAY_INIT, TRAY_INIT_DELAY_MS, null);
+            return 0;
+        },
+
+        WM_APP_SWP_FRAMECHANGED => {
+            var rc: c.RECT = undefined;
+            _ = c.GetWindowRect(hwnd, &rc);
+            _ = c.SetWindowPos(
+                hwnd,
+                null,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                c.SWP_FRAMECHANGED | c.SWP_NOMOVE | c.SWP_NOSIZE,
+            );
+            if (applog.isEnabled()) applog.appLog("[win] WM_APP_SWP_FRAMECHANGED: applied\n", .{});
             return 0;
         },
 

@@ -234,20 +234,6 @@ pub fn main() u8 {
     defer config.deinit();
     defer if (config_result.path) |p| alloc.free(p);
 
-    // Early debug: write config info to a debug file (before applog is enabled)
-    if (std.fs.createFileAbsolute("C:\\Users\\MaruyamaAkiyoshi\\Dev\\zonvie_config_debug.txt", .{ .truncate = true })) |dbg_file| {
-        defer dbg_file.close();
-        var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Config path: {s}\nlog.enabled: {}\nlog.path: {s}\nroutes_count: {d}\nroutes_allocated: {}\n", .{
-            config_result.path orelse "(none)",
-            config.log.enabled,
-            config.log.path orelse "(null)",
-            config.messages.routes.len,
-            config.routes_allocated,
-        }) catch "fmt error";
-        _ = dbg_file.write(msg) catch {};
-    } else |_| {}
-
     // Parse command line arguments (override config)
     var ext_cmdline_enabled = config.cmdline.external;
     var ext_popup_enabled = config.popup.external;
@@ -631,11 +617,12 @@ pub fn main() u8 {
 
     if (applog.isEnabled()) applog.appLog("[win] opacity={d:.2}\n", .{opacity});
 
-    // Use WS_EX_NOREDIRECTIONBITMAP for DirectComposition-based transparency
-    const dwExStyle: c.DWORD = if (opacity < 1.0) c.WS_EX_NOREDIRECTIONBITMAP else 0;
+    // Always use WS_EX_NOREDIRECTIONBITMAP: DWM won't allocate a redirection surface.
+    // All rendering goes through DXGI swap chain + DirectComposition.
+    const dwExStyle: c.DWORD = c.WS_EX_NOREDIRECTIONBITMAP;
 
     // Custom D3D11 overlay scrollbar (no WS_VSCROLL)
-    const window_style: c.DWORD = c.WS_OVERLAPPEDWINDOW | c.WS_VISIBLE;
+    const window_style: c.DWORD = c.WS_OVERLAPPEDWINDOW;
 
     _ = c.QueryPerformanceCounter(&t1);
     const hwnd = c.CreateWindowExW(

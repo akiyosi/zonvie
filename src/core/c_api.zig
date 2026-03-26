@@ -650,6 +650,16 @@ pub export fn zonvie_core_stop(p: ?*zonvie_core) callconv(.c) void {
     box.core.stop();
 }
 
+/// Notify the core that actual layout dimensions are ready. Must be called from
+/// the UI thread after the renderer is initialized and rows/cols are computed.
+/// This unblocks the RPC thread so it can send nvim_ui_attach with the correct
+/// size, preventing Neovim from rendering the initial splash at the wrong position.
+pub export fn zonvie_core_notify_layout_ready(p: ?*zonvie_core, rows: u32, cols: u32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.notifyLayoutReady(rows, cols);
+}
+
 pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

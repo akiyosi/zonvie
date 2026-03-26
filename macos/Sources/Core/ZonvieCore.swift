@@ -1117,6 +1117,9 @@ final class ZonvieCore {
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
 
+        // Notify that layout dimensions are known so nvim_ui_attach uses the correct size.
+        zonvie_core_notify_layout_ready(core, rows, cols)
+
         // Enable Zig core logging based on app log setting
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
 
@@ -1388,6 +1391,8 @@ final class ZonvieCore {
 
         let cstr = (cmd as NSString).utf8String
         _ = zonvie_core_start(core, cstr, rows, cols)
+        // Renderer is already initialized; notify with actual size.
+        zonvie_core_notify_layout_ready(core, rows, cols)
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
 
         // Note: Progress dialog will be closed by neovimReadyNotification observer
