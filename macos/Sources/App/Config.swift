@@ -121,12 +121,22 @@ struct ZonvieConfig {
         var atlasSize: Int = 2048
     }
 
+    enum OptionAsMeta: UInt8 {
+        case both = 0       // Both Option keys → Meta
+        case none = 1       // Both Option keys → macOS special characters
+        case onlyLeft = 2   // Left Option → Meta, Right Option → macOS
+        case onlyRight = 3  // Right Option → Meta, Left Option → macOS
+    }
+
     struct IMEConfig {
         /// Disable IME when app becomes active (switching from another app)
         var disableOnActivate: Bool = false
 
         /// Disable IME on any Vim mode change (insert→normal, normal→visual, etc.)
         var disableOnModechange: Bool = false
+
+        /// How Option keys are handled: as Meta (Alt) for Neovim, or as macOS special character input
+        var optionAsMeta: OptionAsMeta = .both
     }
 
     /// Shared instance loaded at app startup
@@ -210,6 +220,7 @@ struct ZonvieConfig {
         // IME
         config.ime.disableOnActivate = v.ime_disable_on_activate
         config.ime.disableOnModechange = v.ime_disable_on_modechange
+        config.ime.optionAsMeta = OptionAsMeta(rawValue: v.ime_option_as_meta) ?? .both
 
         zonvie_config_destroy(handle)
 

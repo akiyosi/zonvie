@@ -1032,6 +1032,21 @@ pub export fn zonvie_core_is_cursor_visible(p: ?*zonvie_core) callconv(.c) bool 
     return box.core.grid.cursor_visible;
 }
 
+/// Get option_as_meta value (0=both, 1=none, 2=only_left, 3=only_right).
+/// Set via RPC notification "zonvie_option_as_meta". Lock-free atomic read.
+pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.option_as_meta.load(.acquire);
+}
+
+/// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).
+pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.option_as_meta.store(value, .release);
+}
+
 /// Get current cursor blink parameters (in milliseconds).
 pub export fn zonvie_core_get_cursor_blink(
     p: ?*zonvie_core,
@@ -1349,6 +1364,7 @@ pub const zonvie_config_values = extern struct {
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
+    ime_option_as_meta: u8 = 0,  // 0=both, 1=none, 2=only_left, 3=only_right
 };
 
 const ConfigHandle = struct {
@@ -1420,6 +1436,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         // ime
         .ime_disable_on_activate = cfg.ime.disable_on_activate,
         .ime_disable_on_modechange = cfg.ime.disable_on_modechange,
+        .ime_option_as_meta = @intFromEnum(cfg.ime.option_as_meta),
     };
 }
 

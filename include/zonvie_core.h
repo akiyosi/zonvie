@@ -965,6 +965,11 @@ ZONVIE_API int64_t zonvie_core_get_win_id(zonvie_core *core, int64_t grid_id);
    Returns empty string if core is null. */
 ZONVIE_API const char* zonvie_core_get_current_mode(zonvie_core *core);
 
+/* Get/set option_as_meta value (0=both, 1=none, 2=only_left, 3=only_right).
+   Settable via config (initial) or RPC notification "zonvie_option_as_meta" (runtime). */
+ZONVIE_API uint8_t zonvie_core_get_option_as_meta(zonvie_core *core);
+ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value);
+
 /* Check if cursor is visible.
    Returns false during busy_start, true after busy_stop. */
 ZONVIE_API bool zonvie_core_is_cursor_visible(zonvie_core *core);
@@ -1168,6 +1173,7 @@ typedef struct zonvie_config_values {
     // ime
     bool ime_disable_on_activate;
     bool ime_disable_on_modechange;
+    uint8_t ime_option_as_meta;  // 0=both, 1=none, 2=only_left, 3=only_right
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

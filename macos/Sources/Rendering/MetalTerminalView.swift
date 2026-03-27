@@ -1194,7 +1194,23 @@ final class MetalTerminalView: MTKView {
         currentKeyEventIsRepeat = event.isARepeat
 
         let m = event.modifierFlags
-        let hasControlOrCommand = m.contains(.control) || m.contains(.command)
+
+        // Check if Option key should be treated as Meta (Alt) based on config.
+        // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
+        let optionIsMeta: Bool = {
+            guard m.contains(.option) else { return false }
+            // Read the runtime value from the core (atomic, lock-free).
+            // Settable via :call rpcnotify(0, 'zonvie_option_as_meta', 'both')
+            let val = core.getOptionAsMeta()
+            switch val {
+            case 0: return true                       // both
+            case 1: return false                      // none
+            case 2: return m.rawValue & 0x20 != 0     // only_left
+            case 3: return m.rawValue & 0x40 != 0     // only_right
+            default: return true
+            }
+        }()
+        let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
         ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat)")
 
@@ -1220,15 +1236,20 @@ final class MetalTerminalView: MTKView {
         if hasControlOrCommand || isSpecialKey {
             var mods: UInt32 = 0
             if m.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
-            if m.contains(.option)  { mods |= UInt32(ZONVIE_MOD_ALT) }
+            if optionIsMeta          { mods |= UInt32(ZONVIE_MOD_ALT) }
             if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
             if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
 
-            ZonvieCore.appLog("[keyDown] -> sendKeyEvent (special/mod)")
+            // When Option is treated as Meta, use charactersIgnoringModifiers
+            // as the primary characters to avoid macOS Option-transformed chars
+            // (e.g. ƒ instead of f).  Neovim will see <A-f>, not <A-ƒ>.
+            let chars = optionIsMeta ? event.charactersIgnoringModifiers : event.characters
+
+            ZonvieCore.appLog("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
             core.sendKeyEvent(
                 keyCode: UInt32(event.keyCode),
                 mods: mods,
-                characters: event.characters,
+                characters: chars,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers
             )
             return

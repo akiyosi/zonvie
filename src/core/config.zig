@@ -247,9 +247,13 @@ pub const Config = struct {
         atlas_size: u32 = atlas_size_default,
     };
 
+    /// 0=both, 1=none, 2=only_left, 3=only_right
+    pub const OptionAsMeta = enum(u8) { both = 0, none = 1, only_left = 2, only_right = 3 };
+
     pub const IMEConfig = struct {
         disable_on_activate: bool = false,
         disable_on_modechange: bool = false,
+        option_as_meta: OptionAsMeta = .both,
     };
 
     const Self = @This();
@@ -429,6 +433,12 @@ pub const Config = struct {
         if (cfg.ime) |i| {
             if (i.disable_on_activate) |v| self.ime.disable_on_activate = v;
             if (i.disable_on_modechange) |v| self.ime.disable_on_modechange = v;
+            if (i.option_as_meta) |v| {
+                if (std.mem.eql(u8, v, "both")) { self.ime.option_as_meta = .both; }
+                else if (std.mem.eql(u8, v, "none")) { self.ime.option_as_meta = .none; }
+                else if (std.mem.eql(u8, v, "only_left")) { self.ime.option_as_meta = .only_left; }
+                else if (std.mem.eql(u8, v, "only_right")) { self.ime.option_as_meta = .only_right; }
+            }
         }
     }
 
@@ -627,4 +637,5 @@ const TomlPerformance = struct {
 const TomlIME = struct {
     disable_on_activate: ?bool = null,
     disable_on_modechange: ?bool = null,
+    option_as_meta: ?[]const u8 = null,
 };

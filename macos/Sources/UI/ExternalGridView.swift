@@ -1557,7 +1557,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         let m = event.modifierFlags
-        let hasControlOrCommand = m.contains(.control) || m.contains(.command)
+
+        // Check if Option key should be treated as Meta (Alt) based on config.
+        // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
+        let optionIsMeta: Bool = {
+            guard m.contains(.option) else { return false }
+            let val = core.getOptionAsMeta()
+            switch val {
+            case 0: return true                       // both
+            case 1: return false                      // none
+            case 2: return m.rawValue & 0x20 != 0     // only_left
+            case 3: return m.rawValue & 0x40 != 0     // only_right
+            default: return true
+            }
+        }()
+        let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
@@ -1582,7 +1596,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // Use sendKeyEvent (same as MetalTerminalView) instead of sendInput
             var mods: UInt32 = 0
             if m.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
-            if m.contains(.option)  { mods |= UInt32(ZONVIE_MOD_ALT) }
+            if optionIsMeta          { mods |= UInt32(ZONVIE_MOD_ALT) }
             if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
             if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
 

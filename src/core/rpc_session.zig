@@ -976,6 +976,17 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         if (self.cb.on_ime_off) |cb| {
             cb(self.ctx);
         }
+    } else if (std.mem.eql(u8, method, "zonvie_option_as_meta")) {
+        // Store the new value atomically; the frontend reads it on each keyDown.
+        if (params.len > 0 and params[0] == .str) {
+            const val_str = params[0].str;
+            const val: u8 = if (std.mem.eql(u8, val_str, "both")) 0
+                else if (std.mem.eql(u8, val_str, "none")) 1
+                else if (std.mem.eql(u8, val_str, "only_left")) 2
+                else if (std.mem.eql(u8, val_str, "only_right")) 3
+                else return;  // unknown value: keep existing setting
+            self.option_as_meta.store(val, .release);
+        }
     }
 }
 

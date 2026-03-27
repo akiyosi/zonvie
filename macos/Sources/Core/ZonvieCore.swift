@@ -590,7 +590,6 @@ final class ZonvieCore {
             },
             on_ime_off: { ctx in
                 guard let ctx else { return }
-                // Must call on main thread (Carbon TIS API requirement)
                 DispatchQueue.main.async {
                     ZonvieCore.setIMEOff()
                 }
@@ -1134,6 +1133,7 @@ final class ZonvieCore {
             UInt32(perfConfig.glyphCacheNonAsciiSize)
         )
         zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
+        zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
 
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
@@ -2115,6 +2115,13 @@ final class ZonvieCore {
         guard let core else { return "" }
         guard let cstr = zonvie_core_get_current_mode(core) else { return "" }
         return String(cString: cstr)
+    }
+
+    /// Get option_as_meta value (0=both, 1=none, 2=only_left, 3=only_right).
+    /// Lock-free atomic read; safe to call from any thread.
+    func getOptionAsMeta() -> UInt8 {
+        guard let core else { return ZonvieConfig.shared.ime.optionAsMeta.rawValue }
+        return zonvie_core_get_option_as_meta(core)
     }
 
     /// Check if cursor is visible (false during busy, true otherwise)

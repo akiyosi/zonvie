@@ -582,6 +582,11 @@ pub const Core = struct {
     popupmenu_win_id: ?i64 = null,
     popupmenu_buf_id: ?i64 = null,
 
+    // Option-as-Meta setting (0=both, 1=none, 2=only_left, 3=only_right).
+    // Updated via RPC notification "zonvie_option_as_meta". Atomic for
+    // cross-thread reads from the frontend UI thread.
+    option_as_meta: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
     // RPC channel ID (extracted from nvim_get_api_info response)
     channel_id: ?i64 = null,
     get_api_info_msgid: ?i64 = null,
