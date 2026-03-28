@@ -762,6 +762,14 @@ pub const Core = struct {
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
 
+        // Free session state that was previously leaked on stop.
+        self.known_external_grids.deinit(self.alloc);
+        self.known_external_grids = .{};
+        self.msg_line_cache.deinit(self.alloc);
+        self.msg_line_cache = .{};
+        self.msg_config.deinit();
+        self.msg_config = .{};
+
         // Free caches
         self.deinitHlCache();
         self.deinitGlyphCache();

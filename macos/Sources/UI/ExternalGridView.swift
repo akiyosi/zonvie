@@ -249,6 +249,39 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         setupScrollbar()
     }
 
+    deinit {
+        ZonvieCore.appLog("[ExternalGridView] deinit: gridId=\(gridId)")
+
+        // Invalidate scrollbar hide timer to break its run-loop retain.
+        scrollbarHideTimer?.invalidate()
+        scrollbarHideTimer = nil
+
+        // Release Metal buffers held by all three SurfaceBufferSet objects.
+        // Each set contains per-row MTLBuffer references that can total ~8MB.
+        for bs in bufferSets {
+            for i in 0..<bs.rowState.buffers.count {
+                bs.rowState.buffers[i] = nil
+            }
+            bs.mainVertexBuffer = nil
+            bs.cursorVertexBuffer = nil
+        }
+
+        // Release per-view Metal resources.
+        vertexBuffer = nil
+        cursorVertexBuffer = nil
+        backBuffer = nil
+        scrollScratchTexture = nil
+        backgroundAlphaBuffer = nil
+        cursorBlinkBuffer = nil
+
+        // Release glow textures.
+        glowTextures.extractTex = nil
+        for i in 0..<glowTextures.mipTextures.count {
+            glowTextures.mipTextures[i] = nil
+        }
+        glowTextures.intensityBuffer = nil
+    }
+
     // MARK: - Active Draw Mode
 
     /// Switch to active draw mode: MTKView auto-draws at preferredFramesPerSecond.

@@ -714,25 +714,25 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 ZonvieCore.appLog("[ext_win] on_win_move: grid=\(gridId) win=\(win) flags=\(flags)")
-                DispatchQueue.main.async { me.handleWinMove(gridId: gridId, flags: flags) }
+                DispatchQueue.main.async { [weak me] in me?.handleWinMove(gridId: gridId, flags: flags) }
             },
             on_win_exchange: { ctx, gridId, win, count in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 ZonvieCore.appLog("[ext_win] on_win_exchange: grid=\(gridId) win=\(win) count=\(count)")
-                DispatchQueue.main.async { me.handleWinExchange(gridId: gridId, count: count) }
+                DispatchQueue.main.async { [weak me] in me?.handleWinExchange(gridId: gridId, count: count) }
             },
             on_win_rotate: { ctx, gridId, win, direction, count in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 ZonvieCore.appLog("[ext_win] on_win_rotate: grid=\(gridId) win=\(win) direction=\(direction) count=\(count)")
-                DispatchQueue.main.async { me.handleWinRotate(direction: direction, count: count) }
+                DispatchQueue.main.async { [weak me] in me?.handleWinRotate(direction: direction, count: count) }
             },
             on_win_resize_equal: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 ZonvieCore.appLog("[ext_win] on_win_resize_equal")
-                DispatchQueue.main.async { me.handleWinResizeEqual() }
+                DispatchQueue.main.async { [weak me] in me?.handleWinResizeEqual() }
             },
             on_win_move_cursor: { ctx, direction, count in
                 guard let ctx else { return 0 }
@@ -813,6 +813,12 @@ final class ZonvieCore {
     }
 
     deinit {
+        // Remove notification observer to prevent orphaned observer accumulation.
+        if let observer = sshNotificationObserver {
+            NotificationCenter.default.removeObserver(observer)
+            sshNotificationObserver = nil
+        }
+
         if let core { zonvie_core_destroy(core) }
         core = nil
         ctxPtr = nil
@@ -2964,11 +2970,29 @@ final class ZonvieCore {
             self.externalGridViews.removeValue(forKey: gridId)
             self.externalGridViewsLock.unlock()
             self.externalWindowWinIds.removeValue(forKey: gridId)
+
+            // Clean up pending vertex/config data for this grid.
+            // Without this, vertex arrays accumulated before window creation
+            // would leak indefinitely when the grid is closed.
+            self.pendingExternalVertices.removeValue(forKey: gridId)
+            self.pendingExternalGridConfig.removeValue(forKey: gridId)
+
             if let window = self.externalWindows.removeValue(forKey: gridId) {
-                // Save window position for restoration on tab switch back
+                // Save window position for restoration on tab switch back.
+                // Evict the entry with the lowest gridId to bound growth
+                // while preserving recent positions for tab restoration.
+                if self.savedExternalWindowPositions.count > 100 {
+                    if let oldest = self.savedExternalWindowPositions.keys.min() {
+                        self.savedExternalWindowPositions.removeValue(forKey: oldest)
+                    }
+                }
                 self.savedExternalWindowPositions[gridId] = window.frame.origin
                 ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
                 window.delegate = nil
+                // Release contentView reference before close so the
+                // ExternalGridView can deallocate immediately instead of
+                // waiting for the deferred NSWindow deallocation.
+                window.contentView = nil
                 window.close()
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
             }

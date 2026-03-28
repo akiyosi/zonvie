@@ -393,6 +393,8 @@ final class MetalTerminalView: MTKView {
     }
 
     deinit {
+        scrollbarHideTimer?.invalidate()
+        scrollbarHideTimer = nil
         stopInputThrottling()
     }
 

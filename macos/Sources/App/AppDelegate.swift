@@ -20,6 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Tab menu manager (for "menu" tabline style)
     private var tabMenuManager: TabMenuManager?
 
+    // Notification observer token (stored so it can be removed on deinit)
+    private var neovimReadyObserver: Any?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = ZonvieConfig.shared
         ZonvieCore.appLog("zonvie: applicationDidFinishLaunching")
@@ -29,7 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         ZonvieCore.requestNotificationPermission()
 
         // Observe Neovim ready notification (fired when first vertices are received)
-        NotificationCenter.default.addObserver(
+        neovimReadyObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.neovimReadyNotification,
             object: nil,
             queue: .main

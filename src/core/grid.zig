@@ -1497,6 +1497,14 @@ pub const Grid = struct {
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
+        // Clean up per-grid metadata that was previously leaked on destroy.
+        _ = self.grid_metrics.remove(grid_id);
+        _ = self.viewport.remove(grid_id);
+        _ = self.viewport_margins.remove(grid_id);
+        _ = self.external_grids.remove(grid_id);
+        _ = self.pending_ext_window_grids.remove(grid_id);
+        _ = self.ext_windows_grids.remove(grid_id);
+        _ = self.external_grid_target_sizes.remove(grid_id);
         self.markAllDirty();
 
         if (self.cursor_grid == grid_id) {
