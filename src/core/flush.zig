@@ -2305,6 +2305,7 @@ pub const FlushCtx = struct {
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
+                    var atlas_retry_aborted: bool = false;
                     var used_scroll_fast_path: bool = false;
 
                     retry_loop: while (true) {
@@ -2792,6 +2793,7 @@ pub const FlushCtx = struct {
                             // frontends replace stale vertex data with empty buffers.
                             // markAllDirty (after the loop) ensures the next flush
                             // regenerates everything against the fresh atlas.
+                            atlas_retry_aborted = true;
                             if (log_enabled) {
                                 ctx.core.log.write(
                                     "[scroll_debug] atlas_reset_during_flush at row={d} on retry: clearing all rows and aborting\n",
@@ -2855,9 +2857,16 @@ pub const FlushCtx = struct {
                     ctx.core.grid.clearScrollState();
                     if (had_glyph_miss or saw_atlas_reset) {
                         ctx.core.grid.markAllDirty();
-                        // Atlas reset invalidates cached UVs in scroll cache too
+                        // Atlas reset invalidates cached UVs in scroll cache — but only
+                        // when the retry was aborted (partial/stale data) or no retry ran.
+                        // When the retry succeeded, all rows were regenerated with the
+                        // fresh atlas, so scroll cache entries are already valid.
+                        // Invalidating here would undo that work and force a full
+                        // regeneration on the next scroll flush (~65-80ms for CJK).
                         if (saw_atlas_reset) {
-                            ctx.core.invalidateScrollCache();
+                            if (!atlas_retried or atlas_retry_aborted) {
+                                ctx.core.invalidateScrollCache();
+                            }
                             var sg_it = ctx.core.grid.sub_grids.valueIterator();
                             while (sg_it.next()) |sg| {
                                 sg.dirty = true;

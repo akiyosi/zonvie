@@ -88,10 +88,17 @@ final class GlyphAtlas {
         let url: URL
         let hbft: OpaquePointer
         let key: UInt64
+        var accessOrder: UInt64 = 0  // LRU tracking: higher = more recent
     }
 
     // base face is represented by (font, hbftFont). Fallback faces are cached by URL string.
     private var fallbackFacesByURL: [String: HbFtFace] = [:]
+    private var fallbackAccessCounter: UInt64 = 0
+
+    // Maximum number of concurrent fallback font faces held in memory.
+    // Each CJK face holds ~15-20 MB (font_bytes_owned in hbft).
+    // Cap at 4 to bound RSS growth from fallback fonts to ~60-80 MB.
+    private let maxFallbackFaces = 4
 
     // Cache for CTFontCreateForString results to avoid expensive per-glyph lookups.
     // Keyed by (base font pointer, scalar) to avoid returning a bold fallback
@@ -109,6 +116,19 @@ final class GlyphAtlas {
     // Cache for scalar → glyphID mapping to avoid CTFontGetGlyphsForCharacters calls.
     // Key: (fontKey << 32) | scalar, Value: glyphID. Cleared when font settings change.
     private var scalarToGlyphIDCache: [UInt64: UInt32] = [:]
+
+    // Maximum entries for scalar-level caches. When exceeded, the entire cache is
+    // cleared to bound memory growth from large Unicode workloads. Entries are small
+    // (8-16 bytes each), so 50k entries ≈ 0.4-0.8 MB per cache — acceptable.
+    private let maxScalarCacheEntries = 50_000
+
+    /// Insert into failedScalarCache with overflow protection.
+    private func insertFailedScalar_locked(_ key: UInt64) {
+        if failedScalarCache.count >= maxScalarCacheEntries {
+            failedScalarCache.removeAll(keepingCapacity: true)
+        }
+        failedScalarCache.insert(key)
+    }
 
     private var nextX: Int = 1
     private var nextY: Int = 1
@@ -403,6 +423,29 @@ final class GlyphAtlas {
         return varFont
     }
 
+    /// Evict the least recently used fallback font face to free its font_bytes_owned memory.
+    /// Already-rasterized glyphs in `map` remain valid; only new rasterizations for the
+    /// evicted font will trigger a reload from disk.
+    private func evictLRUFallbackFace_locked() {
+        guard !fallbackFacesByURL.isEmpty else { return }
+        var lruKey: String?
+        var lruOrder: UInt64 = .max
+        for (urlKey, face) in fallbackFacesByURL {
+            if face.accessOrder < lruOrder {
+                lruOrder = face.accessOrder
+                lruKey = urlKey
+            }
+        }
+        if let evictKey = lruKey, let evicted = fallbackFacesByURL.removeValue(forKey: evictKey) {
+            // Remove all map entries referencing the evicted font's key to prevent
+            // stale hits if malloc reuses the same pointer address for a new hbft.
+            let evictedFontKey = evicted.key
+            map = map.filter { $0.key.fontKey != evictedFontKey }
+            zonvie_ft_hb_font_destroy(evicted.hbft)
+            ZonvieCore.appLog("[Atlas] LRU evict fallback font: \(evicted.url.lastPathComponent) (count=\(fallbackFacesByURL.count))")
+        }
+    }
+
     /// Clear all glyph/fallback caches. Must be called before rasterization with new font.
     /// Idempotent: safe to call repeatedly on retry (caches already empty after first call).
     private func clearCaches_locked() {
@@ -564,7 +607,11 @@ final class GlyphAtlas {
         let faceIndex = ctFontFaceIndex(ctFont)
         let urlKey = "\(url.absoluteString)#\(faceIndex)"
 
-        if let cached = fallbackFacesByURL[urlKey] {
+        if var cached = fallbackFacesByURL[urlKey] {
+            // LRU: update access order on hit
+            fallbackAccessCounter += 1
+            cached.accessOrder = fallbackAccessCounter
+            fallbackFacesByURL[urlKey] = cached
             return cached
         }
 
@@ -602,8 +649,14 @@ final class GlyphAtlas {
         let createMs = (createEnd - loadEnd) * 1000
         ZonvieCore.appLog("[Atlas] NEW fallback font: \(url.lastPathComponent) load=\(String(format: "%.1f", loadMs))ms create=\(String(format: "%.1f", createMs))ms")
 
+        // LRU eviction: if at capacity, destroy the least recently used face
+        if fallbackFacesByURL.count >= maxFallbackFaces {
+            evictLRUFallbackFace_locked()
+        }
+
+        fallbackAccessCounter += 1
         let key = UInt64(UInt(bitPattern: hbft))
-        let face = HbFtFace(ctFont: ctFont, url: url, hbft: hbft, key: key)
+        let face = HbFtFace(ctFont: ctFont, url: url, hbft: hbft, key: key, accessOrder: fallbackAccessCounter)
         fallbackFacesByURL[urlKey] = face
         return face
     }
@@ -624,7 +677,7 @@ final class GlyphAtlas {
         if let gid = glyphID(in: font, scalar: scalar) {
             guard let baseHbft = hbftFont else {
                 ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): base hbft is nil")
-                failedScalarCache.insert(failKey)
+                insertFailedScalar_locked(failKey)
                 return nil
             }
             let k = GlyphKey(fontKey: UInt64(UInt(bitPattern: baseHbft)), glyphID: gid)
@@ -635,17 +688,17 @@ final class GlyphAtlas {
         // 2) Fallback via CoreText
         guard let fbCT = ctFontForScalarFallback(base: font, scalar: scalar) else {
             ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): no fallback font")
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
         guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
             ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): fallback font has no glyph")
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
         guard let face = ensureHbFtFace_locked(for: fbCT) else {
             ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): failed to create hbft face")
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
 
@@ -692,7 +745,7 @@ final class GlyphAtlas {
         let hbftToUse = selectedHbft ?? hbftFont
 
         guard let hbft = hbftToUse else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
 
@@ -710,15 +763,15 @@ final class GlyphAtlas {
 
         // Try fallback fonts
         guard let fbCT = ctFontForScalarFallback(base: fontToUse, scalar: scalar) else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
         guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
         guard let face = ensureHbFtFace_locked(for: fbCT) else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
 
@@ -774,7 +827,10 @@ final class GlyphAtlas {
         // For our current "cell-per-scalar" model, prefer the first glyph.
         let gid = UInt32(glyphs[0])
 
-        // Cache the result
+        // Cache the result (clear on overflow to bound memory)
+        if scalarToGlyphIDCache.count >= maxScalarCacheEntries {
+            scalarToGlyphIDCache.removeAll(keepingCapacity: true)
+        }
         scalarToGlyphIDCache[cacheKey] = gid
         return gid
     }
@@ -815,7 +871,10 @@ final class GlyphAtlas {
             }
         }
 
-        // Cache the result for future lookups
+        // Cache the result for future lookups (clear on overflow to bound memory)
+        if fallbackFontCache.count >= maxScalarCacheEntries {
+            fallbackFontCache.removeAll(keepingCapacity: true)
+        }
         fallbackFontCache[cacheKey] = result
         return result
     }
@@ -1094,7 +1153,7 @@ final class GlyphAtlas {
         let hbftToUse = selectedHbft ?? hbftFont
 
         guard let hbft = hbftToUse else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
 
@@ -1125,7 +1184,7 @@ final class GlyphAtlas {
 
         // Fallback font lookup (always uses CTFont to find the right font)
         guard let fbCT = ctFontForScalarFallback(base: fontToUse, scalar: scalar) else {
-            failedScalarCache.insert(failKey)
+            insertFailedScalar_locked(failKey)
             return nil
         }
 
@@ -1151,7 +1210,7 @@ final class GlyphAtlas {
             return (hbft: nil, glyphID: gid, ctFont: fbCT)
         }
 
-        failedScalarCache.insert(failKey)
+        insertFailedScalar_locked(failKey)
         return nil
     }
 

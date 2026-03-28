@@ -2212,6 +2212,15 @@ pub const Grid = struct {
             return;
         }
 
+        // Cap accumulating messages to prevent unbounded memory growth.
+        // Only evict when actually creating a new message (not on append/replace_last
+        // which reuse existing entries and don't increase count).
+        const max_messages = 1000;
+        while (self.message_state.messages.items.len >= max_messages) {
+            var oldest = self.message_state.messages.orderedRemove(0);
+            oldest.deinit(self.alloc);
+        }
+
         // Create new message
         var new_msg = Message{
             .id = msg_id,

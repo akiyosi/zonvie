@@ -803,7 +803,14 @@ pub const Core = struct {
     }
 
     /// Invalidate all scroll cache entries (e.g., on resize, guifont, atlas reset).
+    /// Also releases per-row vertex capacity to reclaim peak memory from prior frames.
     pub fn invalidateScrollCache(self: *Core) void {
+        // Free per-row vertex buffers to release peak capacity
+        for (self.scroll_cache.items) |*row_buf| {
+            row_buf.deinit(self.alloc);
+        }
+        self.scroll_cache.items.len = 0;
+
         if (self.scroll_cache_valid.bit_length != 0) {
             self.scroll_cache_valid.unsetAll();
         }
