@@ -614,7 +614,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         dst.cursorVertexCount = src.cursorVertexCount
         let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-
         dst.pendingScroll = nil
 
         if perfEnabled {
@@ -1373,8 +1372,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     blurEnabled: blurEnabled
                 )
                 ZonvieCore.appLog("[draw] loadAction=.clear bg=\(String(format: "0x%06X", snappedBgRGB)) alpha=\(rpd.colorAttachments[0].clearColor.alpha)")
+
+                // After .clear, ALL rows must be redrawn — the entire backBuffer
+                // was wiped. If dirtyRows is empty (race between flush and draw),
+                // force all rows dirty so content is not lost.
+                if rowMode && dirtyRows.isEmpty && safeRowCount > 0 {
+                    dirtyRows = Array(0..<safeRowCount)
+                }
             }
-            
+
             // === PERF LOG: Metalエンコード開始 ===
             var t_encode_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -2812,6 +2818,72 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         // Also clear the rect so full redraw happens
         pendingDirtyRectPx = nil
+    }
+
+    // MARK: - Snapshot capture (for workspace tile thumbnails)
+
+    /// Prepare the renderer for a new core connection (workspace tile switch).
+    /// Clears ALL state: backBuffer, vertex GPU buffers, metadata.
+    /// The new core's first flush will populate everything from scratch.
+    /// Call AFTER captureSnapshot so the snapshot gets the old content.
+    func prepareForNewCore() {
+        hasPresentedOnce = false
+
+        // Destroy backBuffer so stale pixels from the old core cannot appear.
+        // The first draw after this creates a fresh backBuffer via ensureBackBuffer
+        // with loadAction=.clear (because hasPresentedOnce=false).
+        //
+        // Note: committedSetIndex still points to the old core's data. The first
+        // draw may render old vertices onto the fresh (cleared) backBuffer, but
+        // this is harmless because the workspace overlay covers the terminal view
+        // during tile switching. The new core's first flush overwrites everything.
+        backBuffer = nil
+        backBufferSize = .zero
+
+        lock.lock()
+        lock.unlock()
+    }
+
+    /// Copy the current backBuffer to a new persistent texture suitable for
+    /// display as a workspace tile thumbnail. Returns nil if no frame has been
+    /// rendered yet. The returned texture is independent of the renderer's
+    /// back buffer and can be retained by the caller.
+    func captureSnapshot() -> MTLTexture? {
+        guard let backTex = backBuffer else { return nil }
+        let device = backTex.device
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: backTex.pixelFormat,
+            width: backTex.width,
+            height: backTex.height,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        desc.storageMode = .managed
+
+        guard let snapshot = device.makeTexture(descriptor: desc) else { return nil }
+        guard let queue = device.makeCommandQueue() else { return nil }
+        guard let cmd = queue.makeCommandBuffer() else { return nil }
+        guard let blit = cmd.makeBlitCommandEncoder() else { return nil }
+
+        blit.copy(
+            from: backTex,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOriginMake(0, 0, 0),
+            sourceSize: MTLSizeMake(backTex.width, backTex.height, 1),
+            to: snapshot,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOriginMake(0, 0, 0)
+        )
+        // Synchronize managed texture from GPU to CPU for getBytes() access
+        blit.synchronize(resource: snapshot)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        return snapshot
     }
 
 }

@@ -275,6 +275,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     deinit {
         ZonvieCore.appLog("[ExternalGridView] deinit: gridId=\(gridId)")
 
+        // Stop rendering so no new GPU commands are submitted.
+        isPaused = true
+
+        // DispatchSemaphore crashes on dispose if its value is below the
+        // initial value (2). In-flight GPU completion handlers capture
+        // [weak self], so they won't signal() after dealloc starts.
+        // Restore the semaphore to its initial value by signaling.
+        inflightSemaphore.signal()
+        inflightSemaphore.signal()
+
         // Invalidate scrollbar hide timer to break its run-loop retain.
         scrollbarHideTimer?.invalidate()
         scrollbarHideTimer = nil
@@ -1733,6 +1743,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Modifier-only events typically not needed for terminal input
     }
 
+    // MARK: - Pinch Gesture (Workspace Tile View)
+
+    override func magnify(with event: NSEvent) {
+        // Only normal (non-decorated) external windows support tile view entry
+        guard !isDecoratedSurface else { return }
+
+        // Pinch-out (zoom out) triggers tile view on the main window
+        if event.magnification < -0.02 {
+            NotificationCenter.default.post(
+                name: ZonvieCore.enterTileViewNotification,
+                object: nil
+            )
+        }
+    }
+
     // MARK: - Scroll Event Handling
 
     override func scrollWheel(with event: NSEvent) {
@@ -2165,4 +2190,46 @@ extension ExternalGridView: NSTextInputClient {
         }
         super.mouseMoved(with: event)
     }
+
+    // MARK: - Snapshot
+
+    /// Capture the current back buffer as a managed texture for tile thumbnails.
+    func captureSnapshot() -> MTLTexture? {
+        guard let backTex = backBuffer else { return nil }
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: backTex.pixelFormat,
+            width: backTex.width,
+            height: backTex.height,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        desc.storageMode = .managed
+
+        guard let snapshot = mtlDevice.makeTexture(descriptor: desc) else { return nil }
+        guard let cmd = queue.makeCommandBuffer() else { return nil }
+        guard let blit = cmd.makeBlitCommandEncoder() else { return nil }
+
+        blit.copy(
+            from: backTex,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOriginMake(0, 0, 0),
+            sourceSize: MTLSizeMake(backTex.width, backTex.height, 1),
+            to: snapshot,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOriginMake(0, 0, 0)
+        )
+        blit.synchronize(resource: snapshot)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        return snapshot
+    }
 }
+
+// MARK: - SnapshotCapturing
+
+extension ExternalGridView: SnapshotCapturing {}

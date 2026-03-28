@@ -27,6 +27,11 @@
 		AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */; };
 		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
 		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
+		D3AB27BAE35944C8968F786E /* WorkspaceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9385B2908CAA4A21B5B05C02 /* WorkspaceManager.swift */; };
+		444CE07561F94DDBB05B7F51 /* WorkspaceOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8D3818DE9BE42C5AD724B61 /* WorkspaceOverlayView.swift */; };
+		C30AD542BB7F412DB9CDA0E3 /* ConnectionMenuViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83F23C50601C400AA23C3B14 /* ConnectionMenuViewController.swift */; };
+		E1DA821484ED477492A01EB2 /* TileRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE8B11E9F6494F40980B2329 /* TileRenderer.swift */; };
+		F1A2B3C4D5E647F8A0B1C2D3 /* WorkspaceOverlayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3C4D5E647F8A0B1C2D4 /* WorkspaceOverlayController.swift */; };
 
 /* End PBXBuildFile section */
 
@@ -48,6 +53,11 @@
 		AB9AE9BA2EF22AED0072639A /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		AB9AE9C42EF236FC0072639A /* MetalTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTypes.swift; sourceTree = "<group>"; };
 		AB9AE9C72EF23C170072639A /* ZonvieCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZonvieCore.swift; sourceTree = "<group>"; };
+		9385B2908CAA4A21B5B05C02 /* WorkspaceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManager.swift; sourceTree = "<group>"; };
+		F1A2B3C4D5E647F8A0B1C2D4 /* WorkspaceOverlayController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceOverlayController.swift; sourceTree = "<group>"; };
+		A8D3818DE9BE42C5AD724B61 /* WorkspaceOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceOverlayView.swift; sourceTree = "<group>"; };
+		83F23C50601C400AA23C3B14 /* ConnectionMenuViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMenuViewController.swift; sourceTree = "<group>"; };
+		AE8B11E9F6494F40980B2329 /* TileRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TileRenderer.swift; sourceTree = "<group>"; };
 		AB9AE9C92EF2A2130072639A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = HBFTBridge.c; sourceTree = "<group>"; };
 		AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlasCApi.swift; sourceTree = "<group>"; };
@@ -107,6 +117,8 @@
 				AB9AE9C92EF2A2130072639A /* main.swift */,
 				AB9AE9A72EF1B8320072639A /* AppDelegate.swift */,
 				AB9AE9AB2EF1B8320072639A /* ViewController.swift */,
+				9385B2908CAA4A21B5B05C02 /* WorkspaceManager.swift */,
+				F1A2B3C4D5E647F8A0B1C2D4 /* WorkspaceOverlayController.swift */,
 				AB79DAFE2F1621F7005729E6 /* Config.swift */,
 			);
 			path = App;
@@ -137,6 +149,7 @@
 				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
 				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
 				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
+				AE8B11E9F6494F40980B2329 /* TileRenderer.swift */,
 			);
 			path = Rendering;
 			sourceTree = "<group>";
@@ -149,6 +162,8 @@
 				AB79DB022F1621F9005729E6 /* TabSidebarView.swift */,
 				AB79DB042F1621FA005729E6 /* TabMenuManager.swift */,
 				AB79DB062F1621FB005729E6 /* TabDragPreviewHelper.swift */,
+				A8D3818DE9BE42C5AD724B61 /* WorkspaceOverlayView.swift */,
+				83F23C50601C400AA23C3B14 /* ConnectionMenuViewController.swift */,
 			);
 			path = UI;
 			sourceTree = "<group>";
@@ -265,6 +280,11 @@
 				AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */,
 				AB9AE9AD2EF1B8320072639A /* AppDelegate.swift in Sources */,
 				AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */,
+				D3AB27BAE35944C8968F786E /* WorkspaceManager.swift in Sources */,
+				F1A2B3C4D5E647F8A0B1C2D3 /* WorkspaceOverlayController.swift in Sources */,
+				444CE07561F94DDBB05B7F51 /* WorkspaceOverlayView.swift in Sources */,
+				C30AD542BB7F412DB9CDA0E3 /* ConnectionMenuViewController.swift in Sources */,
+				E1DA821484ED477492A01EB2 /* TileRenderer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1287,7 +1287,7 @@ final class MetalTerminalView: MTKView {
         }()
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
-        ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat)")
+        ZonvieCore.appLog("[core#\(core.instanceId)][keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat)")
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
@@ -1320,7 +1320,7 @@ final class MetalTerminalView: MTKView {
             // (e.g. ƒ instead of f).  Neovim will see <A-f>, not <A-ƒ>.
             let chars = optionIsMeta ? event.charactersIgnoringModifiers : event.characters
 
-            ZonvieCore.appLog("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
+            ZonvieCore.appLog("[core#\(core.instanceId)][keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
             core.sendKeyEvent(
                 keyCode: UInt32(event.keyCode),
                 mods: mods,
@@ -1332,10 +1332,10 @@ final class MetalTerminalView: MTKView {
 
         // Let the system handle IME input.
         if let ctx = inputContext, ctx.handleEvent(event) {
-            ZonvieCore.appLog("[keyDown] -> inputContext.handleEvent returned true")
+            ZonvieCore.appLog("[core#\(core.instanceId)][keyDown] -> inputContext.handleEvent returned true")
             return
         }
-        ZonvieCore.appLog("[keyDown] -> interpretKeyEvents fallback")
+        ZonvieCore.appLog("[core#\(core.instanceId)][keyDown] -> interpretKeyEvents fallback")
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
     }
@@ -1896,7 +1896,7 @@ extension MetalTerminalView: NSTextInputClient {
             return
         }
 
-        ZonvieCore.appLog("[IME] insertText: \"\(text)\" core=\(core != nil ? "set" : "nil")")
+        ZonvieCore.appLog("[core#\(core?.instanceId ?? -1)][IME] insertText: \"\(text)\" core=\(core != nil ? "set" : "nil")")
 
         // Clear marked text state and hide preedit overlay.
         markedText = NSMutableAttributedString()
@@ -1907,7 +1907,7 @@ extension MetalTerminalView: NSTextInputClient {
         // For repeat events during slow rendering, input may be queued or dropped.
         let sent = trySendInput(text, isRepeat: currentKeyEventIsRepeat)
         if !sent {
-            ZonvieCore.appLog("[IME] insertText: input dropped (rendering slow, already have pending)")
+            ZonvieCore.appLog("[core#\(core?.instanceId ?? -1)][IME] insertText: input dropped (rendering slow, already have pending)")
         }
         // Reset repeat flag
         currentKeyEventIsRepeat = false
@@ -2331,4 +2331,24 @@ extension MetalTerminalView {
         }
         return true
     }
+
+    // MARK: - Workspace magnify gesture (pinch to zoom out/in)
+
+    // MARK: - Snapshot capture (for workspace tile thumbnails)
+
+    /// Capture the current back buffer as a persistent texture for workspace
+    /// tile thumbnail display. Delegates to the renderer.
+    func captureSnapshot() -> MTLTexture? {
+        return renderer?.captureSnapshot()
+    }
+
+    /// Prepare the renderer for a new core (workspace tile switch).
+    /// Destroys the backBuffer so old content is not shown.
+    func prepareForNewCore() {
+        renderer?.prepareForNewCore()
+    }
 }
+
+// MARK: - SnapshotCapturing
+
+extension MetalTerminalView: SnapshotCapturing {}

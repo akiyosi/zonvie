@@ -9,7 +9,7 @@ private func CGSSetWindowBackgroundBlurRadius(_ connection: UInt, _ windowNumber
 @_silgen_name("CGSMainConnectionID")
 private func CGSMainConnectionID() -> UInt
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private var window: NSWindow?
     // OS/UI-specific: persist window geometry across launches.
     private let windowFrameAutosaveName = "zonvie.mainWindow.frame"
@@ -82,8 +82,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.deferredTabMenu = tabMenu
         }
 
+        // Workspaces menu
+        let wsMenuItem = NSMenuItem(title: "Workspaces", action: nil, keyEquivalent: "")
+        let wsMenu = NSMenu(title: "Workspaces")
+        wsMenu.delegate = self
+        wsMenuItem.submenu = wsMenu
+        mainMenu.addItem(wsMenuItem)
+        self.workspacesMenu = wsMenu
+
         NSApp.mainMenu = mainMenu
     }
+
+    private var workspacesMenu: NSMenu?
 
     // Deferred tab menu setup (needs ViewController)
     private var deferredTabMenu: NSMenu?
@@ -328,6 +338,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         pendingFilesToOpen = []
+    }
+
+    // MARK: - Workspaces Menu (NSMenuDelegate)
+
+    private let workspacesNewSessionTag = 9000
+    private let workspacesSessionBaseTag = 9100
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === workspacesMenu else { return }
+        menu.removeAllItems()
+
+        // New Session
+        let newItem = NSMenuItem(title: "New Session...", action: #selector(workspacesNewSession(_:)), keyEquivalent: "n")
+        newItem.keyEquivalentModifierMask = [.command, .shift]
+        newItem.target = self
+        newItem.tag = workspacesNewSessionTag
+        menu.addItem(newItem)
+
+        // Active sessions
+        guard let vc = window?.contentViewController as? ViewController else { return }
+        let tiles = vc.workspaceManager.tiles
+        let hasActiveSessions = tiles.contains { $0.isOccupied }
+        if hasActiveSessions {
+            menu.addItem(NSMenuItem.separator())
+            for (i, tile) in tiles.enumerated() {
+                guard tile.isOccupied else { continue }
+                let name = tile.title.isEmpty ? tile.config.displayName : tile.title
+                let prefix = (i == vc.workspaceManager.activeTileIndex) ? "● " : "  "
+                let item = NSMenuItem(title: "\(prefix)\(name)", action: #selector(workspacesSelectSession(_:)), keyEquivalent: "")
+                item.target = self
+                item.tag = workspacesSessionBaseTag + i
+                menu.addItem(item)
+            }
+        }
+    }
+
+    @objc private func workspacesNewSession(_ sender: NSMenuItem) {
+        guard let vc = window?.contentViewController as? ViewController else { return }
+        vc.showNewSessionFromMenu()
+    }
+
+    @objc private func workspacesSelectSession(_ sender: NSMenuItem) {
+        let index = sender.tag - workspacesSessionBaseTag
+        guard let vc = window?.contentViewController as? ViewController else { return }
+        vc.selectSessionFromMenu(at: index)
     }
 
 }

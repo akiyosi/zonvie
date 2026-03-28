@@ -2339,6 +2339,7 @@ pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) c
     const clamped_len = @min(wide_len, app.pending_title.len - 1);
     app.pending_title[clamped_len] = 0; // null terminate
     app.pending_title_len = clamped_len;
+    app.workspace.setTileTitle(0, src);
     app.mu.unlock();
 
     if (clamped_len > 0) {

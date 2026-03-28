@@ -738,6 +738,10 @@ typedef struct zonvie_callbacks {
        Suppressed when multiple scrolls occur in the same batch.
        Consumer must validate eligibility before applying optimizations. */
     zonvie_on_grid_row_scroll_fn on_grid_row_scroll;
+
+    /* Workspace scale notification (from ZonvieWorkspaceScaleIn/Out commands).
+       direction: 1 = scale in (toward fullscreen), -1 = scale out (toward grid). */
+    void (*on_workspace_scale)(void *ctx, int direction);
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

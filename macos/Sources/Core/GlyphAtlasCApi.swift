@@ -14,9 +14,9 @@ public func zonvie_macos_atlas_ensure_glyph(
     _ scalar: UInt32,
     _ outEntry: UnsafeMutablePointer<zonvie_glyph_entry>?
 ) -> Int32 {
-    // Return non-zero (1) for success, 0 for failure (matching main window convention)
     guard let ctx, let outEntry else { return 0 }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+    // Phase 1 legacy atlas (not used with tile renderer — core-managed atlas handles it)
     guard let view = core.terminalView else { return 0 }
     return view.atlasEnsureGlyph(scalar: scalar, out: outEntry) ? 1 : 0
 }
@@ -28,7 +28,6 @@ public func zonvie_macos_atlas_ensure_glyph_styled(
     _ styleFlags: UInt32,
     _ outEntry: UnsafeMutablePointer<zonvie_glyph_entry>?
 ) -> Int32 {
-    // Return non-zero (1) for success, 0 for failure (matching main window convention)
     guard let ctx, let outEntry else { return 0 }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
     guard let view = core.terminalView else { return 0 }
@@ -46,8 +45,16 @@ public func zonvie_macos_rasterize_glyph(
 ) -> Int32 {
     guard let ctx, let outBitmap else { return 0 }
     let zc = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = zc.terminalView else { return 0 }
-    return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
+    if let view = zc.terminalView {
+        return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
+    }
+    // TileRenderer: rasterize through the shared atlas (same as main renderer).
+    // This populates the atlas back texture. The glyph will be visible after
+    // the main renderer's next commitAndSnapshotFrontTexture swaps.
+    if let atlas = zc.tileRenderer?.glyphAtlas {
+        return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
+    }
+    return 0
 }
 
 @_cdecl("zonvie_macos_atlas_upload")
@@ -61,8 +68,12 @@ public func zonvie_macos_atlas_upload(
 ) {
     guard let ctx, let bitmap else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = core.terminalView else { return }
-    view.renderer.uploadAtlasRegion(destX: destX, destY: destY, width: width, height: height, bitmap: bitmap)
+    if let view = core.terminalView {
+        view.renderer.uploadAtlasRegion(destX: destX, destY: destY, width: width, height: height, bitmap: bitmap)
+        return
+    }
+    // TileRenderer: upload to shared atlas back texture (same atlas object).
+    core.tileRenderer?.glyphAtlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
 }
 
 @_cdecl("zonvie_macos_atlas_create")
@@ -73,6 +84,11 @@ public func zonvie_macos_atlas_create(
 ) {
     guard let ctx else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = core.terminalView else { return }
-    view.renderer.recreateAtlasTexture(width: atlasW, height: atlasH)
+    if let view = core.terminalView {
+        view.renderer.recreateAtlasTexture(width: atlasW, height: atlasH)
+        return
+    }
+    // TileRenderer: recreate the shared atlas. This is necessary when the
+    // atlas fills up. Both cores share the same atlas so this affects both.
+    core.tileRenderer?.glyphAtlas.recreateTexture(width: Int(atlasW), height: Int(atlasH))
 }

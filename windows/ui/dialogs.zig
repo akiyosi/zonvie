@@ -3,6 +3,7 @@ const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
+const session_registry = @import("../session_registry.zig");
 
 // --- SSH Password Dialog state ---
 var ssh_dlg_password: [256]u8 = undefined;
@@ -910,4 +911,507 @@ pub fn handleClipboardSetOnUIThread(app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: success len={d}\n", .{len});
     app.clipboard_result = 1;
     _ = c.SetEvent(app.clipboard_event);
+}
+
+// ============================================================
+// Session Overview / Connection Dialog
+// ============================================================
+
+var g_session_overview_hwnd: ?c.HWND = null;
+var g_session_overview_list_hwnd: ?c.HWND = null;
+var g_session_overview_owner: ?c.HWND = null;
+var g_session_overview_activate_hwnd: ?c.HWND = null;
+var g_session_overview_new_hwnd: ?c.HWND = null;
+var g_session_overview_close_hwnd: ?c.HWND = null;
+var g_connection_dialog_hwnd: ?c.HWND = null;
+
+var g_conn_name_hwnd: ?c.HWND = null;
+var g_conn_nvim_hwnd: ?c.HWND = null;
+var g_conn_local_hwnd: ?c.HWND = null;
+var g_conn_ssh_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_hwnd: ?c.HWND = null;
+var g_conn_ssh_host_hwnd: ?c.HWND = null;
+var g_conn_ssh_port_hwnd: ?c.HWND = null;
+var g_conn_ssh_identity_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_workspace_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_config_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_rebuild_hwnd: ?c.HWND = null;
+var g_conn_ext_cmdline_hwnd: ?c.HWND = null;
+var g_conn_ext_popup_hwnd: ?c.HWND = null;
+var g_conn_ext_messages_hwnd: ?c.HWND = null;
+var g_conn_ext_tabline_hwnd: ?c.HWND = null;
+var g_conn_ext_windows_hwnd: ?c.HWND = null;
+var g_conn_connect_hwnd: ?c.HWND = null;
+var g_conn_cancel_hwnd: ?c.HWND = null;
+
+pub fn preTranslateMessage(msg: *c.MSG) bool {
+    if (g_connection_dialog_hwnd) |dialog_hwnd| {
+        if (msg.message == c.WM_KEYDOWN and msg.wParam == c.VK_ESCAPE) {
+            const root = c.GetAncestor(msg.hwnd, c.GA_ROOT);
+            if (root == dialog_hwnd) {
+                _ = c.DestroyWindow(dialog_hwnd);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn showSessionOverview(app: *App, owner: c.HWND) void {
+    g_session_overview_owner = owner;
+    if (g_session_overview_hwnd) |hwnd| {
+        refreshSessionOverview(app);
+        _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+        _ = c.SetForegroundWindow(hwnd);
+        return;
+    }
+
+    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
+    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
+    wc.lpfnWndProc = sessionOverviewProc;
+    wc.hInstance = c.GetModuleHandleW(null);
+    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512));
+    wc.hbrBackground = null;
+    wc.lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieSessionOverviewWin");
+    _ = c.RegisterClassExW(&wc);
+
+    const hwnd = c.CreateWindowExW(
+        c.WS_EX_TOOLWINDOW,
+        wc.lpszClassName,
+        std.unicode.utf8ToUtf16LeStringLiteral("Workspace Overview"),
+        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        420,
+        320,
+        owner,
+        null,
+        wc.hInstance,
+        app,
+    );
+    if (hwnd == null) return;
+    g_session_overview_hwnd = hwnd;
+    _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+    _ = c.UpdateWindow(hwnd);
+}
+
+pub fn showConnectionDialog(app: *App, owner: c.HWND) void {
+    if (g_connection_dialog_hwnd) |hwnd| {
+        _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+        _ = c.SetForegroundWindow(hwnd);
+        return;
+    }
+
+    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
+    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
+    wc.lpfnWndProc = connectionDialogProc;
+    wc.hInstance = c.GetModuleHandleW(null);
+    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512));
+    wc.hbrBackground = null;
+    wc.lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectionDialogWin");
+    _ = c.RegisterClassExW(&wc);
+
+    const hwnd = c.CreateWindowExW(
+        c.WS_EX_TOOLWINDOW,
+        wc.lpszClassName,
+        std.unicode.utf8ToUtf16LeStringLiteral("New Session"),
+        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        520,
+        520,
+        owner,
+        null,
+        wc.hInstance,
+        app,
+    );
+    if (hwnd == null) return;
+    g_connection_dialog_hwnd = hwnd;
+    _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+    _ = c.UpdateWindow(hwnd);
+}
+
+pub fn hideConnectionDialog() void {
+    if (g_connection_dialog_hwnd) |hwnd| {
+        _ = c.DestroyWindow(hwnd);
+    }
+}
+
+fn sessionOverviewProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    switch (msg) {
+        c.WM_CREATE => {
+            const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            const app: *App = @ptrCast(@alignCast(cs.lpCreateParams.?));
+            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
+
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("Sessions"), c.WS_CHILD | c.WS_VISIBLE, 12, 12, 120, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_session_overview_list_hwnd = c.CreateWindowExW(
+                c.WS_EX_CLIENTEDGE,
+                std.unicode.utf8ToUtf16LeStringLiteral("LISTBOX"),
+                null,
+                c.WS_CHILD | c.WS_VISIBLE | c.LBS_NOTIFY | c.WS_VSCROLL,
+                12,
+                36,
+                380,
+                190,
+                hwnd,
+                null,
+                c.GetModuleHandleW(null),
+                null,
+            );
+            g_session_overview_activate_hwnd = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral("Activate"), c.WS_CHILD | c.WS_VISIBLE | c.BS_PUSHBUTTON, 12, 238, 90, 28, hwnd, null, c.GetModuleHandleW(null), null);
+            g_session_overview_new_hwnd = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral("New Session..."), c.WS_CHILD | c.WS_VISIBLE | c.BS_PUSHBUTTON, 112, 238, 120, 28, hwnd, null, c.GetModuleHandleW(null), null);
+            g_session_overview_close_hwnd = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral("Close"), c.WS_CHILD | c.WS_VISIBLE | c.BS_PUSHBUTTON, 312, 238, 80, 28, hwnd, null, c.GetModuleHandleW(null), null);
+            refreshSessionOverview(app);
+            return 0;
+        },
+        c.WM_COMMAND => {
+            const code = (wParam >> 16) & 0xFFFF;
+            const source_hwnd: ?c.HWND = if (lParam == 0) null else @ptrFromInt(@as(usize, @bitCast(lParam)));
+            if (source_hwnd == g_session_overview_new_hwnd) {
+                if (g_session_overview_owner) |owner| {
+                    const app: *App = @ptrFromInt(@as(usize, @bitCast(c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA))));
+                    showConnectionDialog(app, owner);
+                }
+                return 0;
+            }
+            if (source_hwnd == g_session_overview_close_hwnd) {
+                _ = c.DestroyWindow(hwnd);
+                return 0;
+            }
+            if (source_hwnd == g_session_overview_activate_hwnd or (source_hwnd == g_session_overview_list_hwnd and code == c.LBN_DBLCLK)) {
+                activateSelectedOverviewSession();
+                return 0;
+            }
+        },
+        c.WM_ACTIVATE => {
+            if (wParam != 0) {
+                const app: *App = @ptrFromInt(@as(usize, @bitCast(c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA))));
+                refreshSessionOverview(app);
+            }
+            return 0;
+        },
+        c.WM_DESTROY => {
+            g_session_overview_hwnd = null;
+            g_session_overview_list_hwnd = null;
+            g_session_overview_activate_hwnd = null;
+            g_session_overview_new_hwnd = null;
+            g_session_overview_close_hwnd = null;
+            return 0;
+        },
+        else => {},
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    switch (msg) {
+        c.WM_CREATE => {
+            const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            const app: *App = @ptrCast(@alignCast(cs.lpCreateParams.?));
+            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
+
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("Name"), c.WS_CHILD | c.WS_VISIBLE, 14, 14, 120, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_name_hwnd = createEdit(hwnd, 14, 34, 480, null);
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("Nvim Path"), c.WS_CHILD | c.WS_VISIBLE, 14, 64, 120, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_nvim_hwnd = createEdit(hwnd, 14, 84, 480, null);
+
+            g_conn_local_hwnd = createRadio(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Local"), 14, 120, true);
+            g_conn_ssh_hwnd = createRadio(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("SSH"), 110, 120, false);
+            g_conn_devcontainer_hwnd = createRadio(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer"), 180, 120, false);
+
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("SSH Host"), c.WS_CHILD | c.WS_VISIBLE, 14, 154, 120, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_ssh_host_hwnd = createEdit(hwnd, 14, 174, 240, null);
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("SSH Port"), c.WS_CHILD | c.WS_VISIBLE, 266, 154, 80, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_ssh_port_hwnd = createEdit(hwnd, 266, 174, 70, null);
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("SSH Identity"), c.WS_CHILD | c.WS_VISIBLE, 14, 204, 120, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_ssh_identity_hwnd = createEdit(hwnd, 14, 224, 480, null);
+
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer Workspace"), c.WS_CHILD | c.WS_VISIBLE, 14, 258, 180, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_devcontainer_workspace_hwnd = createEdit(hwnd, 14, 278, 480, null);
+            _ = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer Config"), c.WS_CHILD | c.WS_VISIBLE, 14, 308, 180, 20, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_devcontainer_config_hwnd = createEdit(hwnd, 14, 328, 480, null);
+            g_conn_devcontainer_rebuild_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Rebuild on start"), 14, 358, false);
+
+            g_conn_ext_cmdline_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("ext-cmdline"), 14, 392, app.ext_cmdline_enabled);
+            g_conn_ext_popup_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("ext-popupmenu"), 130, 392, app.config.popup.external);
+            g_conn_ext_messages_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("ext-messages"), 260, 392, app.ext_messages_enabled);
+            g_conn_ext_tabline_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("ext-tabline"), 14, 418, app.ext_tabline_enabled);
+            g_conn_ext_windows_hwnd = createCheck(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("ext-windows"), 130, 418, app.ext_windows_enabled);
+
+            g_conn_connect_hwnd = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral("Connect"), c.WS_CHILD | c.WS_VISIBLE | c.BS_DEFPUSHBUTTON, 314, 450, 86, 28, hwnd, null, c.GetModuleHandleW(null), null);
+            g_conn_cancel_hwnd = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), std.unicode.utf8ToUtf16LeStringLiteral("Cancel"), c.WS_CHILD | c.WS_VISIBLE | c.BS_PUSHBUTTON, 408, 450, 86, 28, hwnd, null, c.GetModuleHandleW(null), null);
+            return 0;
+        },
+        c.WM_COMMAND => {
+            const source_hwnd: ?c.HWND = if (lParam == 0) null else @ptrFromInt(@as(usize, @bitCast(lParam)));
+            if (source_hwnd == g_conn_cancel_hwnd) {
+                _ = c.DestroyWindow(hwnd);
+                return 0;
+            }
+            if (source_hwnd == g_conn_connect_hwnd) {
+                if (launchConfiguredSession()) {
+                    _ = c.DestroyWindow(hwnd);
+                }
+                return 0;
+            }
+        },
+        c.WM_CLOSE => {
+            _ = c.DestroyWindow(hwnd);
+            return 0;
+        },
+        c.WM_DESTROY => {
+            g_connection_dialog_hwnd = null;
+            g_conn_connect_hwnd = null;
+            g_conn_cancel_hwnd = null;
+            return 0;
+        },
+        else => {},
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+fn refreshSessionOverview(app: *App) void {
+    const list_hwnd = g_session_overview_list_hwnd orelse return;
+    _ = c.SendMessageW(list_hwnd, c.LB_RESETCONTENT, 0, 0);
+
+    var sessions = std.ArrayListUnmanaged(session_registry.SessionInfo){};
+    defer sessions.deinit(app.alloc);
+    session_registry.loadSessions(app.alloc, &sessions);
+
+    for (sessions.items) |session| {
+        const target_hwnd: c.HWND = @ptrFromInt(session.hwnd);
+        if (c.IsWindow(target_hwnd) == 0) continue;
+
+        var label_w: [320]u16 = std.mem.zeroes([320]u16);
+        const label_len = std.unicode.utf8ToUtf16Le(&label_w, session.displayLabel()) catch 0;
+        label_w[@min(label_len, label_w.len - 1)] = 0;
+        const index = c.SendMessageW(list_hwnd, c.LB_ADDSTRING, 0, @bitCast(@intFromPtr(&label_w)));
+        _ = c.SendMessageW(list_hwnd, c.LB_SETITEMDATA, @bitCast(index), @bitCast(session.hwnd));
+    }
+}
+
+fn activateSelectedOverviewSession() void {
+    const list_hwnd = g_session_overview_list_hwnd orelse return;
+    const sel = c.SendMessageW(list_hwnd, c.LB_GETCURSEL, 0, 0);
+    if (sel == c.LB_ERR) return;
+    const hwnd_value: usize = @intCast(c.SendMessageW(list_hwnd, c.LB_GETITEMDATA, @bitCast(sel), 0));
+    if (hwnd_value == 0) return;
+    const target_hwnd: c.HWND = @ptrFromInt(hwnd_value);
+    if (c.IsWindow(target_hwnd) == 0) return;
+    if (c.IsIconic(target_hwnd) != 0) {
+        _ = c.ShowWindow(target_hwnd, c.SW_RESTORE);
+    } else {
+        _ = c.ShowWindow(target_hwnd, c.SW_SHOW);
+    }
+    _ = c.SetForegroundWindow(target_hwnd);
+}
+
+fn launchConfiguredSession() bool {
+    var config = app_mod.workspace_mod.ConnectionConfig{};
+
+    var utf8_buf: [512]u8 = undefined;
+    const name = readWindowTextUtf8(g_conn_name_hwnd, &utf8_buf);
+    config.setName(name);
+
+    var nvim_buf: [512]u8 = undefined;
+    config.setNvimPath(readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf));
+
+    const is_ssh = isChecked(g_conn_ssh_hwnd);
+    const is_devcontainer = isChecked(g_conn_devcontainer_hwnd);
+    if (is_ssh) {
+        var host_buf: [256]u8 = undefined;
+        config.setSSHHost(readWindowTextUtf8(g_conn_ssh_host_hwnd, &host_buf));
+
+        var port_buf: [32]u8 = undefined;
+        const port_text = readWindowTextUtf8(g_conn_ssh_port_hwnd, &port_buf);
+        if (port_text.len != 0) {
+            config.ssh_port = std.fmt.parseInt(u16, port_text, 10) catch null;
+        }
+
+        var identity_buf: [512]u8 = undefined;
+        config.setSSHIdentity(readWindowTextUtf8(g_conn_ssh_identity_hwnd, &identity_buf));
+    } else if (is_devcontainer) {
+        var workspace_buf: [512]u8 = undefined;
+        config.setDevcontainerWorkspace(readWindowTextUtf8(g_conn_devcontainer_workspace_hwnd, &workspace_buf));
+
+        var dc_config_buf: [512]u8 = undefined;
+        config.setDevcontainerConfig(readWindowTextUtf8(g_conn_devcontainer_config_hwnd, &dc_config_buf));
+        config.devcontainer_rebuild = isChecked(g_conn_devcontainer_rebuild_hwnd);
+    }
+
+    config.ext_cmdline = isChecked(g_conn_ext_cmdline_hwnd);
+    config.ext_popupmenu = isChecked(g_conn_ext_popup_hwnd);
+    config.ext_messages = isChecked(g_conn_ext_messages_hwnd);
+    config.ext_tabline = isChecked(g_conn_ext_tabline_hwnd);
+    config.ext_windows = isChecked(g_conn_ext_windows_hwnd);
+
+    return spawnConfiguredSession(&config);
+}
+
+fn spawnConfiguredSession(config: *const app_mod.workspace_mod.ConnectionConfig) bool {
+    var exe_path_w: [c.MAX_PATH + 1]u16 = std.mem.zeroes([c.MAX_PATH + 1]u16);
+    const exe_len = c.GetModuleFileNameW(null, &exe_path_w, c.MAX_PATH);
+    if (exe_len == 0 or exe_len >= c.MAX_PATH) return false;
+    exe_path_w[exe_len] = 0;
+
+    var cmd_buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&cmd_buf);
+    const writer = fbs.writer();
+    writer.writeByte('"') catch return false;
+    writeWideAsUtf8(writer, exe_path_w[0..exe_len]) catch return false;
+    writer.writeByte('"') catch return false;
+
+    if (config.nvimPath().len != 0) {
+        writer.writeAll(" --nvim \"") catch return false;
+        writer.writeAll(config.nvimPath()) catch return false;
+        writer.writeByte('"') catch return false;
+    }
+    if (config.isSSH()) {
+        writer.writeAll(" --ssh \"") catch return false;
+        writer.writeAll(config.sshHost()) catch return false;
+        if (config.ssh_port) |port| {
+            writer.print(":{d}", .{port}) catch return false;
+        }
+        writer.writeByte('"') catch return false;
+        if (config.sshIdentity().len != 0) {
+            writer.writeAll(" --ssh-identity \"") catch return false;
+            writer.writeAll(config.sshIdentity()) catch return false;
+            writer.writeByte('"') catch return false;
+        }
+    } else if (config.isDevcontainer()) {
+        writer.writeAll(" --devcontainer \"") catch return false;
+        writer.writeAll(config.devcontainerWorkspace()) catch return false;
+        writer.writeByte('"') catch return false;
+        if (config.devcontainerConfig().len != 0) {
+            writer.writeAll(" --devcontainer-config \"") catch return false;
+            writer.writeAll(config.devcontainerConfig()) catch return false;
+            writer.writeByte('"') catch return false;
+        }
+        if (config.devcontainer_rebuild) {
+            writer.writeAll(" --devcontainer-rebuild") catch return false;
+        }
+    }
+    if (config.ext_cmdline) writer.writeAll(" --extcmdline") catch return false;
+    if (config.ext_popupmenu) writer.writeAll(" --extpopup") catch return false;
+    if (config.ext_messages) writer.writeAll(" --extmessages") catch return false;
+    if (config.ext_tabline) writer.writeAll(" --exttabline") catch return false;
+    if (config.ext_windows) writer.writeAll(" --extwindows") catch return false;
+
+    var cmd_w: [4096]u16 = std.mem.zeroes([4096]u16);
+    const cmd_utf8 = cmd_buf[0..fbs.pos];
+    const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w, cmd_utf8) catch return false;
+    cmd_w[cmd_w_len] = 0;
+
+    var previous_name: [512]u16 = std.mem.zeroes([512]u16);
+    const previous_len = c.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_INTERNAL_WORKSPACE_NAME"), &previous_name, previous_name.len);
+    const had_previous = previous_len > 0 and previous_len < previous_name.len;
+    if (config.name().len != 0) {
+        var name_w: [256]u16 = std.mem.zeroes([256]u16);
+        const name_w_len = std.unicode.utf8ToUtf16Le(&name_w, config.name()) catch return false;
+        name_w[name_w_len] = 0;
+        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_INTERNAL_WORKSPACE_NAME"), &name_w);
+    } else {
+        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_INTERNAL_WORKSPACE_NAME"), null);
+    }
+
+    var si: c.STARTUPINFOW = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi: c.PROCESS_INFORMATION = std.mem.zeroes(c.PROCESS_INFORMATION);
+    const create_ok = c.CreateProcessW(&exe_path_w, &cmd_w, null, null, 0, 0, null, null, &si, &pi);
+
+    if (had_previous) {
+        previous_name[previous_len] = 0;
+        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_INTERNAL_WORKSPACE_NAME"), &previous_name);
+    } else {
+        _ = c.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZONVIE_INTERNAL_WORKSPACE_NAME"), null);
+    }
+
+    if (create_ok == 0) return false;
+    _ = c.CloseHandle(pi.hProcess);
+    _ = c.CloseHandle(pi.hThread);
+    return true;
+}
+
+fn createEdit(parent: c.HWND, x: c_int, y: c_int, w: c_int, initial: ?[*:0]const u16) ?c.HWND {
+    const hwnd = c.CreateWindowExW(
+        c.WS_EX_CLIENTEDGE,
+        std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+        initial,
+        c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.ES_AUTOHSCROLL,
+        x,
+        y,
+        w,
+        24,
+        parent,
+        null,
+        c.GetModuleHandleW(null),
+        null,
+    );
+    return hwnd;
+}
+
+fn createRadio(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, checked: bool) ?c.HWND {
+    const style: c.DWORD =
+        @as(c.DWORD, @intCast(c.WS_CHILD)) |
+        @as(c.DWORD, @intCast(c.WS_VISIBLE)) |
+        @as(c.DWORD, @intCast(c.WS_TABSTOP)) |
+        @as(c.DWORD, @intCast(c.BS_AUTORADIOBUTTON)) |
+        if (checked) @as(c.DWORD, @intCast(c.WS_GROUP)) else 0;
+    const hwnd = c.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        text,
+        style,
+        x,
+        y,
+        120,
+        20,
+        parent,
+        null,
+        c.GetModuleHandleW(null),
+        null,
+    );
+    if (checked and hwnd != null) _ = c.SendMessageW(hwnd, c.BM_SETCHECK, c.BST_CHECKED, 0);
+    return hwnd;
+}
+
+fn createCheck(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, checked: bool) ?c.HWND {
+    const hwnd = c.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+        text,
+        c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.BS_AUTOCHECKBOX,
+        x,
+        y,
+        140,
+        20,
+        parent,
+        null,
+        c.GetModuleHandleW(null),
+        null,
+    );
+    if (checked and hwnd != null) _ = c.SendMessageW(hwnd, c.BM_SETCHECK, c.BST_CHECKED, 0);
+    return hwnd;
+}
+
+fn readWindowTextUtf8(hwnd_opt: ?c.HWND, dest: []u8) []const u8 {
+    const hwnd = hwnd_opt orelse return "";
+    var wide: [512]u16 = std.mem.zeroes([512]u16);
+    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    if (len <= 0) return "";
+    const slice = wide[0..@intCast(len)];
+    const utf8_len = std.unicode.utf16LeToUtf8(dest, slice) catch return "";
+    return dest[0..utf8_len];
+}
+
+fn isChecked(hwnd_opt: ?c.HWND) bool {
+    const hwnd = hwnd_opt orelse return false;
+    return c.SendMessageW(hwnd, c.BM_GETCHECK, 0, 0) == c.BST_CHECKED;
+}
+
+fn writeWideAsUtf8(writer: anytype, wide: []const u16) !void {
+    var buf: [1024]u8 = undefined;
+    const len = try std.unicode.utf16LeToUtf8(&buf, wide);
+    try writer.writeAll(buf[0..len]);
 }

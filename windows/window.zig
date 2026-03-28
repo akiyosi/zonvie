@@ -8,6 +8,9 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
+const workspace_mod = app_mod.workspace_mod;
+const session_registry = @import("session_registry.zig");
+const workspace_overlay = @import("workspace_overlay.zig");
 
 // Sub-module imports
 const callbacks = @import("callbacks.zig");
@@ -75,6 +78,7 @@ const WM_APP_SHOW_WINDOW = app_mod.WM_APP_SHOW_WINDOW;
 const WM_APP_SWP_FRAMECHANGED = app_mod.WM_APP_SWP_FRAMECHANGED;
 const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
 const WM_APP_SNAP_MAIN_WINDOW = app_mod.WM_APP_SNAP_MAIN_WINDOW;
+const WM_APP_REQUEST_NEW_SESSION = app_mod.WM_APP_REQUEST_NEW_SESSION;
 
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
@@ -246,6 +250,15 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         applog.appLog("[win] doEarlyCoreInit: core_create {d}ms\n", .{ms});
     }
 
+    // Initialize workspace state and attach the early core to tile 0.
+    // WM_CREATE's updateSystemMenu runs right after this helper returns,
+    // so the workspace must already be populated to expose the active
+    // session in the system menu.
+    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
+    if (app.corep) |cp| {
+        app.workspace.attachCore(0, cp);
+    }
+
     // 2. Load config into core
     if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
         defer app.alloc.free(config_path);
@@ -299,9 +312,15 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
 
     if (log_enabled) applog.appLog("[win] doEarlyCoreInit: starting nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
-    _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
     app.nvim_spawned = true;
     app.early_core_init_done = true;
+    if (start_ok != 0) {
+        app.session_started = true;
+        app.workspace.setTileStarted(0, true);
+        refreshSessionRegistration(app);
+        refreshWorkspaceSystemMenu(app, hwnd);
+    }
 
     // 7. D3D11 device init on separate thread
     app.d3d_init_thread = std.Thread.spawn(.{}, d3dInitThreadFn, .{app}) catch null;
@@ -313,6 +332,146 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     }
 
     if (log_enabled) applog.appLog("[win] WM_CREATE: early core init done, nvim spawn started rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+}
+
+fn syncPrimaryTileConfig(app: *App) void {
+    var config = workspace_mod.ConnectionConfig{};
+    if (app.workspace_name) |name| config.setName(name);
+    if (app.cli_nvim_path) |path| config.setNvimPath(path);
+    if (app.ssh_host) |host| config.setSSHHost(host);
+    if (app.ssh_identity) |identity| config.setSSHIdentity(identity);
+    if (app.ssh_port) |port| config.ssh_port = port;
+    if (app.devcontainer_workspace) |workspace| config.setDevcontainerWorkspace(workspace);
+    if (app.devcontainer_config) |path| config.setDevcontainerConfig(path);
+    config.ext_cmdline = app.ext_cmdline_enabled;
+    config.ext_popupmenu = app.config.popup.external;
+    config.ext_messages = app.ext_messages_enabled;
+    config.ext_tabline = app.ext_tabline_enabled;
+    config.ext_windows = app.ext_windows_enabled;
+    config.devcontainer_rebuild = app.devcontainer_rebuild;
+    app.workspace.setTileConfig(0, config);
+}
+
+fn currentSessionLabel(app: *App, buf: []u8) []const u8 {
+    if (app.workspace.tiles.items.len == 0) return "Session";
+    const tile = &app.workspace.tiles.items[0];
+    if (tile.title_len != 0) return tile.title_buf[0..tile.title_len];
+    return tile.config.displayName(buf);
+}
+
+fn refreshSessionRegistration(app: *App) void {
+    const pid = c.GetCurrentProcessId();
+    if (!app.session_started or app.hwnd == null) {
+        session_registry.removeSession(app.alloc, pid);
+        return;
+    }
+
+    var label_buf: [512]u8 = undefined;
+    const label = currentSessionLabel(app, &label_buf);
+    session_registry.writeCurrentSession(app.alloc, pid, @intFromPtr(app.hwnd.?), label, label);
+}
+
+fn focusRegisteredSession(target_hwnd_value: usize) void {
+    if (target_hwnd_value == 0) return;
+    const target_hwnd: c.HWND = @ptrFromInt(target_hwnd_value);
+    if (c.IsWindow(target_hwnd) == 0) return;
+    if (c.IsIconic(target_hwnd) != 0) {
+        _ = c.ShowWindow(target_hwnd, c.SW_RESTORE);
+    } else {
+        _ = c.ShowWindow(target_hwnd, c.SW_SHOW);
+    }
+    _ = c.BringWindowToTop(target_hwnd);
+    _ = c.SetForegroundWindow(target_hwnd);
+}
+
+fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
+    const sys_menu = c.GetSystemMenu(hwnd, 0);
+    if (sys_menu == null) return;
+
+    var remaining = app.workspace.system_menu_added_items;
+    while (remaining > 0) : (remaining -= 1) {
+        const count = c.GetMenuItemCount(sys_menu);
+        if (count <= 0) break;
+        _ = c.RemoveMenu(sys_menu, @intCast(count - 1), c.MF_BYPOSITION);
+    }
+    app.workspace.system_menu_added_items = 0;
+    app.session_menu_count = 0;
+    @memset(&app.session_menu_hwnds, 0);
+
+    _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
+    app.workspace.system_menu_added_items += 1;
+    _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_NEW_SESSION, std.unicode.utf8ToUtf16LeStringLiteral("New Session..."));
+    app.workspace.system_menu_added_items += 1;
+
+    var sessions = std.ArrayListUnmanaged(session_registry.SessionInfo){};
+    defer sessions.deinit(app.alloc);
+    session_registry.loadSessions(app.alloc, &sessions);
+
+    if (sessions.items.len != 0) {
+        _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
+        app.workspace.system_menu_added_items += 1;
+    }
+
+    for (sessions.items) |session| {
+        if (app.session_menu_count >= app.session_menu_hwnds.len) break;
+        const session_hwnd: c.HWND = @ptrFromInt(session.hwnd);
+        if (c.IsWindow(session_hwnd) == 0) continue;
+
+        var buf: [300]u16 = undefined;
+        var pos: usize = 0;
+        const prefix: []const u8 = if (session.hwnd == @intFromPtr(hwnd)) "* " else "  ";
+        for (prefix) |byte| {
+            if (pos >= buf.len - 1) break;
+            buf[pos] = byte;
+            pos += 1;
+        }
+        for (session.displayLabel()) |byte| {
+            if (pos >= buf.len - 1) break;
+            buf[pos] = byte;
+            pos += 1;
+        }
+        buf[pos] = 0;
+
+        const slot = app.session_menu_count;
+        app.session_menu_hwnds[slot] = session.hwnd;
+        app.session_menu_count += 1;
+        _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + @as(c_uint, @intCast(slot)), &buf);
+        app.workspace.system_menu_added_items += 1;
+    }
+}
+
+fn launchNewWindow() bool {
+    var exe_path_buf: [260]u16 = std.mem.zeroes([260]u16);
+    const exe_len = c.GetModuleFileNameW(null, &exe_path_buf, exe_path_buf.len);
+    if (exe_len == 0 or exe_len >= exe_path_buf.len) {
+        if (applog.isEnabled()) applog.appLog("[win] launchNewWindow: GetModuleFileNameW failed\n", .{});
+        return false;
+    }
+
+    var si: c.STARTUPINFOW = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi: c.PROCESS_INFORMATION = std.mem.zeroes(c.PROCESS_INFORMATION);
+
+    const create_ok = c.CreateProcessW(
+        @ptrCast(&exe_path_buf),
+        null,
+        null,
+        null,
+        0,
+        0,
+        null,
+        null,
+        &si,
+        &pi,
+    );
+    if (create_ok == 0) {
+        if (applog.isEnabled()) applog.appLog("[win] launchNewWindow: CreateProcessW failed, gle={d}\n", .{c.GetLastError()});
+        return false;
+    }
+
+    _ = c.CloseHandle(pi.hProcess);
+    _ = c.CloseHandle(pi.hThread);
+    return true;
 }
 
 pub export fn WndProc(
@@ -502,6 +661,14 @@ pub export fn WndProc(
                         if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: doEarlyCoreInit failed: {any}\n", .{e});
                     };
                 }
+
+                // Populate workspace tile 0 with the initial connection config
+                // and build the system menu entries. Replaces the simpler
+                // updateSystemMenu call so that the session registry picks up
+                // this process and other running zonvie windows appear in the
+                // menu immediately on open.
+                syncPrimaryTileConfig(app);
+                refreshWorkspaceSystemMenu(app, hwnd);
 
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
@@ -1522,12 +1689,17 @@ pub export fn WndProc(
                             // content shift. Adding pScrollRect/pScrollOffset to Present1 would
                             // cause a double-shift since we CopySubresourceRegion back_tex→bb.
 
+                            // Draw workspace overlay if visible
+                            if (app.workspace.isOverviewVisible()) {
+                                workspace_overlay.draw(g, &app.workspace, g.width, g.height);
+                            }
+
                             if (g.presentFromBackRectsWithCursorNoResize(
                                 present_rects_slice,
                                 app.cursor_vb,
                                 cursor_verts_snapshot.len,
                                 cursor_rc_opt,
-                                force_full_present,
+                                force_full_present or app.workspace.isOverviewVisible(),
                                 null,
                                 null,
                             )) {
@@ -2176,6 +2348,8 @@ pub export fn WndProc(
                 if (len > 0) {
                     local_buf[len] = 0; // null terminate
                     _ = c.SetWindowTextW(hwnd, &local_buf);
+                    refreshSessionRegistration(app);
+                    refreshWorkspaceSystemMenu(app, hwnd);
                 }
             }
             return 0;
@@ -2349,6 +2523,12 @@ pub export fn WndProc(
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
+                                if (start_ok != 0) {
+                                    app.session_started = true;
+                                    app.workspace.setTileStarted(0, true);
+                                    refreshSessionRegistration(app);
+                                    refreshWorkspaceSystemMenu(app, hwnd);
+                                }
                             }
 
                             // Hide progress dialog
@@ -2376,6 +2556,15 @@ pub export fn WndProc(
                         tray.add();
                     }
                     if (applog.isEnabled()) applog.appLog("[win] TIMER_TRAY_INIT: tray icon initialized\n", .{});
+                }
+            } else if (wParam == app_mod.TIMER_WORKSPACE_ANIM) {
+                if (getApp(hwnd)) |app| {
+                    const now_ms: u32 = c.GetTickCount();
+                    const still = app.workspace.tickScaleAnim(now_ms);
+                    if (!still) {
+                        _ = c.KillTimer(hwnd, app_mod.TIMER_WORKSPACE_ANIM);
+                    }
+                    _ = c.InvalidateRect(hwnd, null, 0);
                 }
             } else if (wParam == TIMER_QUIT_TIMEOUT) {
                 // Neovim not responding to quit request - show force quit dialog
@@ -2423,6 +2612,14 @@ pub export fn WndProc(
                     var cb = makeCoreCbs();
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                     app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
+
+                    // Initialize workspace state and attach core to tile 0.
+                    // (The early-core path does this inside doEarlyCoreInit.)
+                    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
+                    if (app.corep) |cp| {
+                        app.workspace.attachCore(0, cp);
+                    }
+
                     if (deferred_log_enabled) {
                         _ = c.QueryPerformanceCounter(&t2);
                         const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
@@ -2581,16 +2778,26 @@ pub export fn WndProc(
                         nvim_cmd_slice = quoted_nvim;
                     }
 
-                    // Start nvim
-                    if (!app.devcontainer_up_pending) {
+                    // Start nvim. Skip when waiting on devcontainer up or when
+                    // this window is acting only as the launcher for the session
+                    // overview/dialog flow.
+                    if (!app.devcontainer_up_pending and !app.show_new_session_dialog) {
                         const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                         defer if (nvim_path_z) |p| app.alloc.free(p);
                         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
                         app.nvim_spawned = true;
+                        if (start_ok != 0) {
+                            app.session_started = true;
+                            app.workspace.setTileStarted(0, true);
+                            refreshSessionRegistration(app);
+                            refreshWorkspaceSystemMenu(app, hwnd);
+                        }
                         if (app.devcontainer_mode and !app.devcontainer_rebuild) {
                             dialogs.hideDevcontainerProgressDialog();
                         }
+                    } else {
+                        if (deferred_log_enabled) applog.appLog("[win] nvim startup skipped, waiting for devcontainer up or session dialog\n", .{});
                     }
 
                     // Create D3D11 device (inline, not threaded for remote modes)
@@ -2746,6 +2953,10 @@ pub export fn WndProc(
                     applog.appLog("[win] WM_APP_DEFERRED_INIT: end (total {d}ms)", .{total_ms});
                 }
 
+                if (app.show_new_session_dialog) {
+                    dialogs.showConnectionDialog(app, hwnd);
+                }
+
                 // Force a repaint now that renderer is ready
                 _ = c.InvalidateRect(hwnd, null, 0);
             }
@@ -2776,6 +2987,16 @@ pub export fn WndProc(
             return 0;
         },
 
+        WM_APP_REQUEST_NEW_SESSION => {
+            if (getApp(hwnd)) |app| {
+                if (app.workspace.scale > 0.0) {
+                    animateWorkspaceScale(app, hwnd, 0.0);
+                }
+                dialogs.showConnectionDialog(app, hwnd);
+            }
+            return 0;
+        },
+
         WM_APP_SWP_FRAMECHANGED => {
             var rc: c.RECT = undefined;
             _ = c.GetWindowRect(hwnd, &rc);
@@ -2796,6 +3017,9 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 const vk: u32 = @intCast(wParam);
                 const mods = input.queryMods();
+
+                // Workspace overlay shortcuts (before core input)
+                if (handleWorkspaceKey(app, hwnd, vk, mods)) return 0;
 
                 // Windows keycode is passed as 0x10000|VK so Zig core can distinguish.
                 const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
@@ -3085,6 +3309,30 @@ pub export fn WndProc(
                 // Extract position from lParam
                 const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
                 const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+
+                // Workspace overlay intercepts input while visible.
+                if (app.workspace.isOverviewVisible() and msg == c.WM_LBUTTONDOWN) {
+                    var client_rect: c.RECT = undefined;
+                    _ = c.GetClientRect(hwnd, &client_rect);
+                    const hit = workspace_overlay.hitTest(
+                        &app.workspace,
+                        @intCast(client_rect.right - client_rect.left),
+                        @intCast(client_rect.bottom - client_rect.top),
+                        @floatFromInt(x),
+                        @floatFromInt(y),
+                    );
+                    switch (hit) {
+                        .tile => |idx| {
+                            switchActiveTile(app, hwnd, @intCast(idx));
+                            animateWorkspaceScale(app, hwnd, 1.0);
+                        },
+                        .plus => {
+                            dialogs.showConnectionDialog(app, hwnd);
+                        },
+                        .none => {},
+                    }
+                    return 0;
+                }
 
                 // Check tabline/sidebar area first (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
@@ -3811,6 +4059,28 @@ pub export fn WndProc(
             return 0;
         },
 
+        c.WM_SYSCOMMAND => {
+            const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
+            if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
+                if (getApp(hwnd)) |app| {
+                    dialogs.showConnectionDialog(app, hwnd);
+                }
+                return 0;
+            }
+            if (cmd >= app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE and
+                cmd < app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + 9)
+            {
+                if (getApp(hwnd)) |app| {
+                    const index: usize = @intCast(cmd - app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE);
+                    if (index < app.session_menu_count) {
+                        focusRegisteredSession(app.session_menu_hwnds[index]);
+                    }
+                }
+                return 0;
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
         c.WM_CLOSE => {
             // Intercept window close to check for unsaved buffers
             if (getApp(hwnd)) |app| {
@@ -3860,6 +4130,7 @@ pub export fn WndProc(
         c.WM_DESTROY => {
             // Remove tray icon before quitting
             if (getApp(hwnd)) |app| {
+                session_registry.removeSession(app.alloc, c.GetCurrentProcessId());
                 if (app.tray_icon) |*tray| {
                     tray.remove();
                 }
@@ -4008,4 +4279,94 @@ pub export fn WndProc(
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ============================================================
+// Workspace overlay keyboard handling
+// ============================================================
+
+/// Switch the active tile and update all per-active pointers accordingly.
+/// Keeps `app.corep` in sync with `workspace.activeCorep()` so input/flush
+/// routing follows the selected tile. Capture a snapshot of the outgoing
+/// tile first so its thumbnail remains visible in the overview.
+pub fn switchActiveTile(app: *App, hwnd: c.HWND, index: u8) void {
+    if (index >= app.workspace.tiles.items.len) return;
+    if (index == app.workspace.active_tile) return;
+    captureActiveTileSnapshot(app);
+    app.workspace.switchToTile(index);
+    if (app.workspace.activeCorep()) |cp| {
+        app.corep = cp;
+    }
+    _ = c.InvalidateRect(hwnd, null, 0);
+}
+
+/// Capture a snapshot of the current frame for the active tile. No-op if
+/// the renderer is not ready. Safe to call before entering tile grid view.
+pub fn captureActiveTileSnapshot(app: *App) void {
+    if (app.renderer) |*renderer| {
+        renderer.lockContext();
+        defer renderer.unlockContext();
+        if (renderer.captureSnapshot()) |snap| {
+            var tile = app.workspace.activeTile();
+            if (tile.snapshot) |*old| {
+                d3d11.Renderer.releaseSnapshot(old);
+            }
+            tile.snapshot = snap;
+        } else |_| {}
+    }
+}
+
+/// Animate the workspace scale toward `target`. Captures a snapshot when
+/// transitioning into the tile grid so the active tile thumbnail is visible.
+pub fn animateWorkspaceScale(app: *App, hwnd: c.HWND, target: f32) void {
+    if (target < app.workspace.scale) {
+        captureActiveTileSnapshot(app);
+    }
+    const now_ms: u32 = c.GetTickCount();
+    app.workspace.beginScaleAnim(target, app_mod.WORKSPACE_ANIM_DURATION_MS, now_ms);
+    _ = c.SetTimer(hwnd, app_mod.TIMER_WORKSPACE_ANIM, app_mod.WORKSPACE_ANIM_INTERVAL_MS, null);
+    _ = c.InvalidateRect(hwnd, null, 0);
+}
+
+/// Handle workspace overlay keyboard shortcuts.
+/// Returns true if the key was consumed (caller should return 0).
+fn handleWorkspaceKey(app: *App, hwnd: c.HWND, vk: u32, mods: u32) bool {
+    const ctrl_only = (mods & input.MOD_CTRL) != 0 and (mods & (input.MOD_ALT | input.MOD_SHIFT)) == 0;
+
+    // Ctrl+` (VK_OEM_3 = backtick/tilde key): toggle workspace overview
+    if (ctrl_only and vk == c.VK_OEM_3) {
+        const target: f32 = if (app.workspace.scale >= 1.0) 0.0 else 1.0;
+        animateWorkspaceScale(app, hwnd, target);
+        return true;
+    }
+
+    // When overview is visible, intercept keys
+    if (app.workspace.isOverviewVisible()) {
+        // Escape: close overview
+        if (vk == c.VK_ESCAPE) {
+            animateWorkspaceScale(app, hwnd, 1.0);
+            return true;
+        }
+
+        // Number keys 1-9: select tile by index
+        if (vk >= '1' and vk <= '9') {
+            const index: u8 = @intCast(vk - '1');
+            if (index < app.workspace.tiles.items.len) {
+                switchActiveTile(app, hwnd, index);
+                animateWorkspaceScale(app, hwnd, 1.0);
+            }
+            return true;
+        }
+
+        // Enter: activate selected tile and close overview
+        if (vk == c.VK_RETURN) {
+            animateWorkspaceScale(app, hwnd, 1.0);
+            return true;
+        }
+
+        // Consume all other keys while overview is visible
+        return true;
+    }
+
+    return false;
 }

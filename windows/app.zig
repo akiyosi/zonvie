@@ -11,6 +11,7 @@ pub const c = @import("win32.zig").c;
 pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
+pub const workspace_mod = @import("workspace.zig");
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
@@ -123,6 +124,12 @@ pub const WM_APP_POST_SHOW_INIT: c.UINT = c.WM_APP + 27;
 /// cleared it to (historically hardcoded black).
 pub const WM_APP_SNAP_MAIN_WINDOW: c.UINT = c.WM_APP + 28;
 
+/// Posted cross-process by a secondary Zonvie launcher when Jump List
+/// "New Session" is clicked and an existing Zonvie instance is found.
+/// The receiver opens the in-process connection dialog on its main window,
+/// matching the macOS Workspaces menu flow.
+pub const WM_APP_REQUEST_NEW_SESSION: c.UINT = c.WM_APP + 29;
+
 // =========================================================================
 // Timer IDs and timing constants
 // =========================================================================
@@ -153,6 +160,12 @@ pub const TIMER_REPOSITION_FLOATS: c.UINT_PTR = 8;
 pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
+/// Timer ID for workspace overlay scale animation (fullscreen ↔ tile grid)
+pub const TIMER_WORKSPACE_ANIM: c.UINT_PTR = 11;
+/// Workspace scale animation tick (16ms ~= 60fps)
+pub const WORKSPACE_ANIM_INTERVAL_MS: c.UINT = 16;
+/// Workspace scale animation duration in milliseconds
+pub const WORKSPACE_ANIM_DURATION_MS: u32 = 220;
 /// Quit timeout in milliseconds (5 seconds)
 pub const QUIT_TIMEOUT_MS: c.UINT = 5000;
 /// Scrollbar fade animation interval (16ms ~= 60fps)
@@ -2423,6 +2436,11 @@ pub const App = struct {
     content_hwnd: ?c.HWND = null, // Child window for D3D11 rendering (when ext_tabline enabled)
     corep: ?*zonvie_core = null,
 
+    // Workspace tile manager (multi-core support).
+    // Phase 1: workspace state is initialized alongside corep.
+    // Future phases will migrate corep references to workspace.activeCorep().
+    workspace: workspace_mod.WorkspaceState = .{ .alloc = undefined },
+
     ui_thread_id: u32 = 0,
 
     // Atlas builder (DirectWrite + CPU atlas, metrics)
@@ -2691,6 +2709,11 @@ pub const App = struct {
 
     // CLI --nvim override (points into args allocation, no ownership)
     cli_nvim_path: ?[]const u8 = null,
+    workspace_name: ?[]const u8 = null,
+    show_new_session_dialog: bool = false,
+    session_started: bool = false,
+    session_menu_hwnds: [9]usize = .{0} ** 9,
+    session_menu_count: usize = 0,
 
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,
@@ -2960,6 +2983,9 @@ pub const App = struct {
 
         if (self.corep) |p| zonvie_core_destroy(p);
         self.corep = null;
+
+        // Clean up workspace tile contexts
+        self.workspace.deinit();
 
         // Clipboard event cleanup
         if (self.clipboard_event != null) {

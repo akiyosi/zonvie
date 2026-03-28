@@ -497,6 +497,10 @@ pub const Callbacks = extern struct {
         total_rows: u32,
         total_cols: u32,
     ) callconv(.c) void = null,
+
+    // Workspace scale notification (from ZonvieWorkspaceScaleIn/Out commands).
+    // direction: 1 = scale in (toward fullscreen), -1 = scale out (toward grid).
+    on_workspace_scale: ?*const fn (ctx: ?*anyopaque, direction: i32) callconv(.c) void = null,
 };
 
 
@@ -639,6 +643,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         // External grid row-buffer scroll fast path notification
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
+
+        // Workspace scale
+        .on_workspace_scale = box.cb.on_workspace_scale,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);

@@ -1712,6 +1712,123 @@ pub const Renderer = struct {
         ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }
 
+    // ============================================================
+    // Workspace overlay: snapshot capture + textured quad drawing
+    // ============================================================
+
+    /// Snapshot of a tile's back_tex content for workspace overlay display.
+    pub const SnapshotTexture = struct {
+        tex: *c.ID3D11Texture2D,
+        srv: *c.ID3D11ShaderResourceView,
+        width: u32,
+        height: u32,
+    };
+
+    /// Capture the current back_tex into a new texture+SRV pair.
+    /// Caller owns the returned SnapshotTexture and must call releaseSnapshot.
+    pub fn captureSnapshot(self: *Renderer) !SnapshotTexture {
+        const dev = self.device orelse return error.NoDevice;
+        const ctx = self.ctx orelse return error.NoContext;
+        const back = self.back_tex orelse return error.NoBackTex;
+        const w = self.width;
+        const h = self.height;
+        if (w == 0 or h == 0) return error.ZeroSize;
+
+        // Create texture with same format as back_tex but SRV-only (read-only snapshot)
+        var desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = c.D3D11_USAGE_DEFAULT;
+        desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_tex = dev_vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
+
+        var tex: ?*c.ID3D11Texture2D = null;
+        const hr_tex = create_tex(dev, &desc, null, @ptrCast(&tex));
+        if (c.FAILED(hr_tex) or tex == null) return error.SnapshotTexCreateFailed;
+
+        // Copy back_tex -> snapshot
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const copy_res = ctx_vtbl.*.CopyResource orelse {
+            safeRelease(&tex);
+            return error.NoCopyResource;
+        };
+        copy_res(ctx, @ptrCast(tex.?), @ptrCast(back));
+
+        // Create SRV
+        const create_srv = dev_vtbl.*.CreateShaderResourceView orelse {
+            safeRelease(&tex);
+            return error.NoCreateSRV;
+        };
+        var srv: ?*c.ID3D11ShaderResourceView = null;
+        const hr_srv = create_srv(dev, @ptrCast(tex.?), null, @ptrCast(&srv));
+        if (c.FAILED(hr_srv) or srv == null) {
+            safeRelease(&tex);
+            return error.SnapshotSRVCreateFailed;
+        }
+
+        return .{ .tex = tex.?, .srv = srv.?, .width = w, .height = h };
+    }
+
+    /// Release a previously captured snapshot.
+    pub fn releaseSnapshot(snap: *SnapshotTexture) void {
+        var srv_opt: ?*c.ID3D11ShaderResourceView = snap.srv;
+        safeRelease(&srv_opt);
+        var tex_opt: ?*c.ID3D11Texture2D = snap.tex;
+        safeRelease(&tex_opt);
+        snap.* = undefined;
+    }
+
+    /// Draw a textured quad using a snapshot SRV.
+    /// ndc: { left, top, right, bottom } in normalized device coords.
+    /// Temporarily rebinds texture slot 0; restores atlas SRV afterward.
+    pub fn drawOverlayQuad(self: *Renderer, srv: *c.ID3D11ShaderResourceView, ndc: [4]f32, alpha: f32) !void {
+        const ctx = self.ctx orelse return error.NoContext;
+
+        const uv_marker: f32 = -5.0; // reuse TABLINE_TEXTURE sampling path
+        const color: [4]f32 = .{ 1, 1, 1, alpha };
+
+        const verts: [6]core.Vertex = .{
+            .{ .position = .{ ndc[0], ndc[1] }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[2], ndc[1] }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[0], ndc[3] }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc[2], ndc[1] }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[2], ndc[3] }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc[0], ndc[3] }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+        };
+
+        // Bind snapshot SRV
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
+        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+
+        try self.drawVertices(&verts);
+
+        // Restore atlas SRV
+        srvs[0] = self.atlas_srv;
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+    }
+
+    /// Draw a solid-color rectangle (no texture).
+    /// Uses uv.x = -1.0 (SOLID marker in shader) so no texture is sampled.
+    pub fn drawOverlaySolid(self: *Renderer, ndc: [4]f32, rgba: [4]f32) !void {
+        const verts: [6]core.Vertex = .{
+            .{ .position = .{ ndc[0], ndc[1] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[2], ndc[1] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[0], ndc[3] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[2], ndc[1] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[2], ndc[3] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc[0], ndc[3] }, .texCoord = .{ -1, 0 }, .color = rgba, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+        };
+        try self.drawVertices(&verts);
+    }
+
     /// Update sidebar texture from BGRA pixel data (rendered by GDI offscreen).
     pub fn updateSidebarTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {
         if (width == 0 or height == 0) return;

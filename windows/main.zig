@@ -6,6 +6,7 @@ const applog = app_mod.applog;
 const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
 const dialogs = @import("ui/dialogs.zig");
+const jump_list = @import("jump_list.zig");
 const window = @import("window.zig");
 
 pub const std_options = std.Options{
@@ -117,6 +118,9 @@ pub fn main() u8 {
     // Enable Per-Monitor DPI Awareness V2 before any window creation.
     // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
     _ = SetProcessDpiAwarenessContext(@ptrFromInt(@as(usize, @bitCast(@as(isize, -4)))));
+
+    // Initialize COM (STA) before any COM usage (DWrite, Jump List, etc.)
+    jump_list.initCom();
 
     // Reduce Windows scheduler quantum to 1ms for responsive rendering.
     // DWrite glyph rasterization makes COM calls that can yield the thread;
@@ -263,6 +267,8 @@ pub fn main() u8 {
     var devcontainer_workspace: ?[]const u8 = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild: bool = false;
+    var workspace_name: ?[]const u8 = null;
+    var show_new_session_dialog: bool = false;
     const args = std.process.argsAlloc(alloc) catch return 1;
     defer std.process.argsFree(alloc, args);
 
@@ -523,6 +529,36 @@ pub fn main() u8 {
         }
     }
 
+    {
+        var buf: [512]u8 = undefined;
+        const name_len = c.GetEnvironmentVariableA("ZONVIE_INTERNAL_WORKSPACE_NAME", &buf, buf.len);
+        if (name_len > 0 and name_len < buf.len) {
+            workspace_name = alloc.dupe(u8, buf[0..name_len]) catch null;
+            if (applog.isEnabled()) applog.appLog("[win] internal workspace name detected: {s}\n", .{workspace_name.?});
+        }
+        const dialog_len = c.GetEnvironmentVariableA("ZONVIE_INTERNAL_SHOW_NEW_SESSION_DIALOG", &buf, buf.len);
+        if (dialog_len > 0) {
+            show_new_session_dialog = true;
+            if (applog.isEnabled()) applog.appLog("[win] internal new session dialog requested\n", .{});
+        }
+    }
+
+    // Jump List "New Session" routes here with the env var set. If an existing
+    // Zonvie instance is already running, forward the request and exit so a
+    // second main window is not created (macOS-style single-instance behavior).
+    if (show_new_session_dialog) {
+        const class_w: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieWin");
+        const existing: ?c.HWND = c.FindWindowW(@ptrCast(class_w.ptr), null);
+        if (existing) |existing_hwnd| {
+            _ = c.PostMessageW(existing_hwnd, app_mod.WM_APP_REQUEST_NEW_SESSION, 0, 0);
+            if (c.IsIconic(existing_hwnd) != 0) {
+                _ = c.ShowWindow(existing_hwnd, c.SW_RESTORE);
+            }
+            _ = c.SetForegroundWindow(existing_hwnd);
+            return 0;
+        }
+    }
+
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
         applog.setEnabled(true);
@@ -609,6 +645,8 @@ pub fn main() u8 {
         .devcontainer_rebuild = devcontainer_rebuild,
         .nvim_extra_args = nvim_extra_args,
         .cli_nvim_path = cli_nvim_path,
+        .workspace_name = workspace_name,
+        .show_new_session_dialog = show_new_session_dialog,
     };
 
     // Prevent config.deinit from freeing strings now owned by app
@@ -647,8 +685,14 @@ pub fn main() u8 {
         return 1;
     }
 
+    // Register Jump List tasks (taskbar right-click menu)
+    jump_list.initJumpList();
+
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
+        if (dialogs.preTranslateMessage(&msg)) {
+            continue;
+        }
         _ = c.TranslateMessage(&msg);
         _ = c.DispatchMessageW(&msg);
     }

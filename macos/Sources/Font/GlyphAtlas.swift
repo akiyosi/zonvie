@@ -36,6 +36,7 @@ final class GlyphAtlas {
 
     // OpenType font features (parsed from guifont string).
     private var fontFeatures: [zonvie_font_feature] = []
+    private var fontFeaturesString: String = ""
     private var hasFeatures: Bool { !fontFeatures.isEmpty }
 
     // Font variants for bold/italic
@@ -47,6 +48,8 @@ final class GlyphAtlas {
     var currentFontName: String { fontName }
     /// Current point size (read-only for external use).
     var currentPointSize: CGFloat { pointSize }
+    /// Current OpenType features string (as passed to setFont).
+    var currentFontFeatures: String { fontFeaturesString }
 
     private(set) var ascentPx: Float = 0
     private(set) var descentPx: Float = 0
@@ -231,6 +234,7 @@ final class GlyphAtlas {
 
         self.fontName = name
         self.pointSize = pointSize
+        self.fontFeaturesString = features
         self.fontFeatures = parsedFeatures
         ZonvieCore.appLog("[GlyphAtlas.setFont] name='\(name)' pt=\(pointSize) features_str='\(features)' parsed_count=\(self.fontFeatures.count) hasFeatures=\(hasFeatures)")
         rebuildFont_locked()
@@ -1978,6 +1982,7 @@ final class GlyphAtlas {
         return tex
     }
 
+    /// Return the front (read) texture WITHOUT any modification.
     /// Returns the committed front texture under lock.
     func snapshotFrontTexture() -> MTLTexture? {
         os_unfair_lock_lock(&mu)

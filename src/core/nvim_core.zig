@@ -283,6 +283,10 @@ pub const Callbacks = struct {
         total_rows: u32,
         total_cols: u32,
     ) callconv(.c) void = null,
+
+    // Workspace scale notification (from ZonvieWorkspaceScaleIn/Out commands).
+    // direction: 1 = scale in (toward fullscreen), -1 = scale out (toward grid).
+    on_workspace_scale: ?*const fn (ctx: ?*anyopaque, direction: i32) callconv(.c) void = null,
 };
 
 const PipeReader = rpc_session.PipeReader;

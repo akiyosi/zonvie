@@ -3,9 +3,25 @@ import MetalKit
 
 final class ViewController: NSViewController {
     private var terminalView: MetalTerminalView!
-    private(set) var core: ZonvieCore!
+    private(set) var workspaceManager: WorkspaceManager!
+
+    /// Active core convenience accessor (delegates to workspace manager).
+    var core: ZonvieCore? {
+        workspaceManager?.activeCore
+    }
+
     private var tabBarView: TabBarView?
     private var sidebarView: TabSidebarView?
+    private(set) var overlayController: WorkspaceOverlayController?
+    private var nvimExitObserver: Any?
+    private var nvimReadyObserver: Any?
+    private var enterTileViewObserver: Any?
+    private var magnifyEventMonitor: Any?
+
+    /// When set, the tile at this index is waiting for nvim to become ready
+    /// (SSH/devcontainer connecting). animateToFullscreen on neovimReady.
+    private var pendingFullscreenTileIndex: Int?
+
 
     // Height of the Chrome-style tab bar
     private let tabBarHeight: CGFloat = 36
@@ -80,21 +96,100 @@ final class ViewController: NSViewController {
             ])
         }
 
-        // Create core (init takes no args)
-        core = ZonvieCore()
+        // Create workspace manager with first tile
+        workspaceManager = WorkspaceManager()
+        workspaceManager.viewController = self
+        workspaceManager.terminalView = terminalView
 
-        // Wire both directions
-        core.terminalView = terminalView
-        terminalView.core = core
+        // Create core for tile 0 and wire it up
+        let initialCore = ZonvieCore()
+        workspaceManager.attachCore(initialCore, at: 0)
+
+        initialCore.terminalView = terminalView
+        terminalView.core = initialCore
 
         // Enable ext_popupmenu if configured (must be before start())
         if config.popup.external {
-            core.setExtPopupmenu(true)
+            initialCore.setExtPopupmenu(true)
         }
 
         // Enable ext_messages if configured (must be before start())
         if config.messages.external {
-            core.setExtMessages(true)
+            initialCore.setExtMessages(true)
+        }
+
+        // Set up workspace overlay controller (handles pinch, animation, visibility)
+        overlayController = WorkspaceOverlayController(
+            hostView: view,
+            workspaceManager: workspaceManager,
+            snapshotSource: terminalView,
+            delegate: self
+        )
+
+        // Observe nvim process exits — show tile view or terminate app
+        nvimExitObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.nvimExitedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let info = notification.object as? ZonvieCore.NvimExitInfo else { return }
+            self.handleNvimExited(info: info)
+        }
+
+        // Observe neovimReady — for SSH/devcontainer tiles waiting to go fullscreen
+        nvimReadyObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.neovimReadyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            guard let pendingIndex = self.pendingFullscreenTileIndex else {
+                ZonvieCore.appLog("[Workspace] neovimReady received but pendingFullscreenTileIndex is nil — skipping")
+                return
+            }
+            ZonvieCore.appLog("[Workspace] neovimReady: pendingIndex=\(pendingIndex) activeTileIndex=\(self.workspaceManager.activeTileIndex)")
+            // The pending tile's nvim is now ready — go fullscreen
+            self.pendingFullscreenTileIndex = nil
+            if self.workspaceManager.activeTileIndex == pendingIndex {
+                self.overlayController?.resetPanOffset()
+                self.overlayController?.animateToFullscreen()
+                ZonvieCore.appLog("[Workspace] animateToFullscreen triggered for tile \(pendingIndex)")
+            }
+        }
+
+        // Observe tile view requests from external windows (pinch gesture on ExternalGridView)
+        enterTileViewObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.enterTileViewNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            // Only enter tile view if currently fullscreen
+            if self.workspaceManager.scale >= 1.0 {
+                self.overlayController?.animateToTileGrid()
+                // Bring main window to front so user can interact with tile view
+                self.view.window?.makeKeyAndOrderFront(nil)
+            }
+        }
+
+        // Monitor magnify events app-wide so pinch-out on the main window
+        // triggers tile view even when an external window has focus.
+        // NSMagnificationGestureRecognizer does not fire on a non-key window,
+        // so we intercept the raw magnify event here instead.
+        magnifyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .magnify) { [weak self] event in
+            guard let self = self else { return event }
+            // Only handle events targeting the main window
+            guard event.window === self.view.window else { return event }
+            // Only trigger when the main window is NOT key (gesture recognizer handles the key case)
+            guard self.view.window?.isKeyWindow == false else { return event }
+            // Only enter tile view from fullscreen on pinch-out
+            if self.workspaceManager.scale >= 1.0 && event.magnification < -0.02 {
+                self.view.window?.makeKeyAndOrderFront(nil)
+                self.overlayController?.animateToTileGrid()
+                return nil // consume the event
+            }
+            return event
         }
 
         // Dispatch core.start() off the main thread so viewDidLoad can return
@@ -118,16 +213,142 @@ final class ViewController: NSViewController {
         if sshEnabled || devcontainerModeEnabled {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                _ = self.workspaceManager.activeCore?.start(nvimPath: nvimPath, rows: 1, cols: 1)
             }
         } else {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
-                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                _ = self.workspaceManager.activeCore?.start(nvimPath: nvimPath, rows: 1, cols: 1)
             }
         }
     }
 
+    // MARK: - Nvim Exit Handling
+
+    private func handleNvimExited(info: ZonvieCore.NvimExitInfo) {
+        let exitedCore = info.core
+        let exitCode = info.exitCode
+
+        // Show error alert for non-zero exit (connection failure, crash, etc.)
+        if exitCode != 0 {
+            ZonvieCore.appLog("[Workspace] showing error alert: \(info.connectionName) code=\(exitCode)")
+
+            // Ensure window is visible (SSH mode hides it until ready)
+            if let window = view.window, !window.isVisible {
+                window.makeKeyAndOrderFront(nil)
+            }
+
+            let alert = NSAlert()
+            if exitCode == 255 && info.core.workspaceConfig?.isSSH == true {
+                alert.messageText = "SSH Connection Failed"
+                let host = info.core.workspaceConfig?.sshHost ?? "unknown"
+                alert.informativeText = "Could not connect to \(host).\nConnection timed out or host is unreachable."
+            } else {
+                alert.messageText = "Session ended unexpectedly"
+                alert.informativeText = "\"\(info.connectionName)\" exited with code \(exitCode)."
+            }
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            if let window = view.window {
+                alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
+        }
+
+        // Clear the tile that held this core
+        workspaceManager.clearTile(for: exitedCore)
+
+        if workspaceManager.hasOccupiedTiles {
+            // Other sessions still running — show tile view
+            ZonvieCore.appLog("[Workspace] nvim exited (code=\(exitCode)), other sessions remain — showing tile view")
+            if workspaceManager.scale >= 1.0 {
+                if let nextIndex = workspaceManager.firstOccupiedTileIndex {
+                    workspaceManager.switchToTile(at: nextIndex)
+                }
+            }
+            overlayController?.animateToTileGrid()
+        } else if exitCode != 0 {
+            // Error exit, no other sessions — show tile view so user can retry
+            ZonvieCore.appLog("[Workspace] nvim exited with error (code=\(exitCode)), no sessions — showing tile view")
+            overlayController?.animateToTileGrid()
+        } else {
+            // Normal exit, no sessions left — terminate app
+            ZonvieCore.appLog("[Workspace] nvim exited normally, no sessions remain — terminating")
+            ZonvieCore.terminateApp()
+        }
+    }
+
+    // MARK: - Connection Menu
+
+    private func showConnectionMenu(for tileIndex: Int) {
+        ZonvieCore.appLog("[Workspace] showConnectionMenu: tileIndex=\(tileIndex) currentTiles=\(workspaceManager.tiles.count)")
+        let menu = ConnectionMenuViewController()
+        menu.onConnect = { [weak self] config in
+            guard let self = self else { return }
+            ZonvieCore.appLog("[Workspace] onConnect: tileIndex=\(tileIndex) name=\(config.name) isSSH=\(config.isSSH) isDC=\(config.isDevcontainer)")
+            // Add tiles up to the requested index
+            while tileIndex >= self.workspaceManager.tiles.count {
+                self.workspaceManager.addTile(config: config)
+            }
+            // Update config if tile already exists
+            self.workspaceManager.setTileConfig(at: tileIndex, config: config)
+            self.workspaceManager.startTile(at: tileIndex)
+
+            if config.isSSH || config.isDevcontainer {
+                // SSH/devcontainer: stay in tile view until nvim is ready.
+                // neovimReadyNotification will trigger animateToFullscreen.
+                self.workspaceManager.switchToTile(at: tileIndex)
+                self.overlayController?.setNeedsDisplay()
+                self.pendingFullscreenTileIndex = tileIndex
+                ZonvieCore.appLog("[Workspace] SSH/devcontainer tile \(tileIndex) started, pendingFullscreenTileIndex set")
+            } else {
+                // Local: switch and go fullscreen immediately
+                ZonvieCore.appLog("[Workspace] onConnect: local tile \(tileIndex), switching and animating to fullscreen")
+                self.workspaceManager.switchToTile(at: tileIndex)
+                self.overlayController?.resetPanOffset()
+                self.overlayController?.animateToFullscreen()
+            }
+        }
+        presentAsSheet(menu)
+    }
+
+    /// Request closing a tile's nvim session via the workspace overlay close button.
+    /// Uses the same quit flow as the window close button: checks for unsaved
+    /// buffers and shows a confirmation dialog if needed.
+    private func requestCloseTile(at index: Int) {
+        guard index >= 0, index < workspaceManager.tiles.count else { return }
+        guard let core = workspaceManager.tiles[index].core else { return }
+        ZonvieCore.appLog("[Workspace] requestCloseTile index=\(index)")
+        core.requestQuit()
+    }
+
+    /// Called from Workspaces menu "New Session..." item.
+    /// Opens the connection menu for the first empty tile slot.
+    func showNewSessionFromMenu() {
+        // Find the first empty slot
+        var targetIndex = workspaceManager.tiles.count
+        for (i, tile) in workspaceManager.tiles.enumerated() {
+            if !tile.isOccupied {
+                targetIndex = i
+                break
+            }
+        }
+        // Show tile grid, then open the connection menu
+        if workspaceManager.scale >= 1.0 {
+            overlayController?.animateToTileGrid()
+        }
+        showConnectionMenu(for: targetIndex)
+    }
+
+    /// Called from Workspaces menu to switch to an active session.
+    func selectSessionFromMenu(at index: Int) {
+        guard index >= 0, index < workspaceManager.tiles.count else { return }
+        guard workspaceManager.tiles[index].isOccupied else { return }
+        workspaceManager.switchToTile(at: index)
+        overlayController?.resetPanOffset()
+        overlayController?.animateToFullscreen()
+    }
 
     /// Trigger a full redraw of the terminal view (e.g. after deminiaturize).
     func requestFullRedraw() {
@@ -174,6 +395,7 @@ final class ViewController: NSViewController {
         if tablineUpdateObserver == nil {
             setupTablineNotificationObservers()
         }
+        overlayController?.invalidateAnimation()
     }
 
     // MARK: - Tabline Notification Observers (shared across modes)
@@ -404,5 +626,50 @@ final class ViewController: NSViewController {
         let luaScript = "lua vim.cmd('\(tabNumber)tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local buf=vim.api.nvim_win_get_buf(w); local cur=vim.api.nvim_win_get_cursor(w); local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); local ew=vim.api.nvim_open_win(buf,true,{external=true,width=W,height=H}); vim.api.nvim_win_set_cursor(ew,cur); vim.api.nvim_win_set_buf(w,vim.api.nvim_create_buf(true,true))"
         ZonvieCore.appLog("[EXTERNALIZE] sending Lua script to nvim: \(luaScript)")
         core.sendCommand(luaScript)
+    }
+}
+
+// MARK: - WorkspaceOverlayDelegate
+
+extension ViewController: WorkspaceOverlayDelegate {
+    func overlayDidSelectTile(at index: Int) {
+        ZonvieCore.appLog("[Workspace] overlayDidSelectTile: index=\(index)")
+        workspaceManager.switchToTile(at: index)
+        overlayController?.resetPanOffset()
+        overlayController?.animateToFullscreen()
+    }
+
+    func overlayDidRequestNewTile(at index: Int) {
+        ZonvieCore.appLog("[Workspace] overlayDidRequestNewTile: index=\(index)")
+        showConnectionMenu(for: index)
+    }
+
+    func overlayDidRequestCloseTile(at index: Int) {
+        ZonvieCore.appLog("[Workspace] overlayDidRequestCloseTile: index=\(index)")
+        requestCloseTile(at: index)
+    }
+
+    func overlayDidRequestDismiss() {
+        ZonvieCore.appLog("[Workspace] overlayDidRequestDismiss: activeTile occupied=\(workspaceManager.activeTile.isOccupied)")
+        guard workspaceManager.activeTile.isOccupied else { return }
+        overlayController?.resetPanOffset()
+        overlayController?.animateToFullscreen()
+    }
+
+    func overlayFirstResponderOnDismiss() -> NSView? {
+        return terminalView
+    }
+
+    func overlayWillEnterTileView() {
+        // Make main window key BEFORE hiding external windows.
+        // If the focused external window is hidden first, macOS may activate
+        // another app's window instead of the main Zonvie window.
+        view.window?.makeKeyAndOrderFront(nil)
+        core?.hideNormalExternalWindows()
+    }
+
+    func overlayDidExitTileView() {
+        // Restore external windows for the newly active core
+        core?.showNormalExternalWindows()
     }
 }
