@@ -2854,6 +2854,8 @@ pub const App = struct {
         }
         self.pending_external_verts.deinit(self.alloc);
         self.saved_external_window_positions.deinit(self.alloc);
+        self.pending_messages.deinit(self.alloc);
+        self.display_messages.deinit(self.alloc);
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;
