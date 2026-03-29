@@ -243,7 +243,9 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             // Force is_in_flush=true so commitFlush actually commits.
             if (!entry.value_ptr.tbs.is_in_flush) {
                 const gid = entry.key_ptr.*;
-                if (gid == app_mod.CMDLINE_GRID_ID or gid == app_mod.POPUPMENU_GRID_ID) {
+                if (gid == app_mod.CMDLINE_GRID_ID or gid == app_mod.POPUPMENU_GRID_ID or
+                    gid == app_mod.MESSAGE_GRID_ID or gid == app_mod.MSG_HISTORY_GRID_ID)
+                {
                     entry.value_ptr.tbs.is_in_flush = true;
                 }
             }
@@ -252,8 +254,18 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         app.mu.unlock();
     }
 
-    // Queue redraw on GTK main thread
-    _ = gtk_mod.g_idle_add(&idleQueueDraw, @ptrCast(app));
+    // Queue redraw + cursor blink update on GTK main thread
+    _ = gtk_mod.g_idle_add(&idlePostFlush, @ptrCast(app));
+}
+
+fn idlePostFlush(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    updateCursorBlinking(app);
+    updateScrollbar(app);
+    return 0; // G_SOURCE_REMOVE
 }
 
 fn idleQueueDraw(user_data: ?*anyopaque) callconv(.c) c_int {
@@ -262,6 +274,112 @@ fn idleQueueDraw(user_data: ?*anyopaque) callconv(.c) c_int {
         main_mod.gtk_externs.widget_queue_draw(area);
     }
     return 0; // G_SOURCE_REMOVE
+}
+
+// =========================================================================
+// Cursor blink
+// =========================================================================
+
+fn updateCursorBlinking(app: *App) void {
+    var wait_ms: u32 = 0;
+    var on_ms: u32 = 0;
+    var off_ms: u32 = 0;
+
+    if (app.corep) |core_ptr| {
+        app_mod.zonvie_core_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms);
+    }
+
+    const settings_changed = wait_ms != app.cursor_blink_wait_ms or
+        on_ms != app.cursor_blink_on_ms or
+        off_ms != app.cursor_blink_off_ms;
+
+    const timer_stopped = app.cursor_blink_timer == 0;
+
+    if (on_ms > 0 and off_ms > 0) {
+        if (settings_changed or timer_stopped) {
+            startCursorBlinking(app, wait_ms, on_ms, off_ms);
+        }
+    } else {
+        if (settings_changed) {
+            stopCursorBlinking(app);
+        }
+    }
+}
+
+fn startCursorBlinking(app: *App, wait_ms: u32, on_ms: u32, off_ms: u32) void {
+    stopCursorBlinking(app);
+
+    if (on_ms == 0) return;
+
+    app.cursor_blink_wait_ms = wait_ms;
+    app.cursor_blink_on_ms = on_ms;
+    app.cursor_blink_off_ms = off_ms;
+
+    if (wait_ms > 0) {
+        app.cursor_blink_phase = 0;
+        app.cursor_blink_state = true;
+        app.cursor_blink_timer = gtk_mod.g_timeout_add(wait_ms, &onCursorBlinkTimer, @ptrCast(app));
+    } else {
+        enterBlinkCycle(app);
+    }
+}
+
+fn enterBlinkCycle(app: *App) void {
+    app.cursor_blink_phase = 1;
+    app.cursor_blink_state = true;
+    scheduleNextBlink(app, true);
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+}
+
+fn scheduleNextBlink(app: *App, is_currently_on: bool) void {
+    const interval = if (is_currently_on) app.cursor_blink_on_ms else app.cursor_blink_off_ms;
+    if (interval == 0) return;
+    app.cursor_blink_timer = gtk_mod.g_timeout_add(interval, &onCursorBlinkTimer, @ptrCast(app));
+}
+
+fn onCursorBlinkTimer(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    app.cursor_blink_timer = 0;
+
+    if (app.cursor_blink_phase == 0) {
+        enterBlinkCycle(app);
+    } else {
+        app.cursor_blink_state = !app.cursor_blink_state;
+
+        if (app.gl_area) |area| {
+            main_mod.gtk_externs.widget_queue_draw(area);
+        }
+
+        scheduleNextBlink(app, app.cursor_blink_state);
+    }
+
+    return 0; // G_SOURCE_REMOVE (one-shot timer)
+}
+
+// =========================================================================
+// Scrollbar
+// =========================================================================
+
+fn updateScrollbar(app: *App) void {
+    if (app.corep == null) return;
+    if (!app.config.scrollbar.enabled) return;
+
+    var vp: app_mod.ViewportInfo = undefined;
+    _ = app_mod.zonvie_core_get_viewport(app.corep, 1, &vp);
+
+    app.scrollbar.updateFromViewport(vp);
+    app.scrollbar.visible = (vp.line_count > 0);
+}
+
+fn stopCursorBlinking(app: *App) void {
+    if (app.cursor_blink_timer != 0) {
+        _ = gtk_mod.g_source_remove(app.cursor_blink_timer);
+        app.cursor_blink_timer = 0;
+    }
+    app.cursor_blink_phase = 0;
+    app.cursor_blink_state = true;
 }
 
 // =========================================================================
@@ -365,7 +483,8 @@ pub fn onVerticesRow(
             // is_in_flush=false.  Force a commit when all data has arrived:
             //   - cursor update (VERT_UPDATE_CURSOR) for cmdline
             //   - last row for popupmenu (which has no cursor)
-            const is_overlay_grid = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID);
+            const is_overlay_grid = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID or
+                grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID);
             const is_cursor = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
             const is_last_row = (row_start + row_count >= total_rows) and !is_cursor;
             if (is_overlay_grid and (is_cursor or is_last_row)) {
@@ -808,17 +927,67 @@ pub fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
     if (has_unsaved != 0) {
-        // TODO: show GTK confirmation dialog
-        // For now, force quit
-        if (app.corep) |corep| {
-            app_mod.zonvie_core_quit_confirmed(corep, 1);
-        }
+        // Dispatch dialog to GTK main thread
+        _ = gtk_mod.g_idle_add(&idleShowQuitDialog, @ptrCast(app));
     } else {
         if (app.corep) |corep| {
             app_mod.zonvie_core_quit_confirmed(corep, 0);
         }
     }
 }
+
+fn idleShowQuitDialog(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const win = app.main_window orelse return 0;
+
+    const GTK_DIALOG_MODAL = 0x01;
+    const GTK_DIALOG_DESTROY_WITH_PARENT = 0x02;
+    const GTK_MESSAGE_WARNING = 3;
+    const GTK_BUTTONS_NONE = 0;
+    const dialog = gtk_message_dialog_new(
+        win,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_NONE,
+        "There are unsaved changes. Quit anyway?",
+    ) orelse return 0;
+
+    _ = gtk_dialog_add_button(dialog, "Cancel", 0);
+    _ = gtk_dialog_add_button(dialog, "Discard and Quit", 1);
+
+    _ = gtk_mod.g_signal_connect(dialog, "response", @ptrCast(&onQuitDialogResponse), @ptrCast(app));
+    gtk_widget_set_visible(dialog, 1);
+
+    return 0; // G_SOURCE_REMOVE
+}
+
+fn onQuitDialogResponse(dialog: ?*anyopaque, response_id: c_int, user_data: ?*anyopaque) callconv(.c) void {
+    const app = getApp(user_data) orelse return;
+
+    if (dialog) |d| {
+        gtk_window_destroy(d);
+    }
+
+    if (response_id == 1) {
+        // Discard and quit
+        if (app.corep) |corep| {
+            app_mod.zonvie_core_quit_confirmed(corep, 1);
+        }
+    }
+    // else: cancel, do nothing
+}
+
+extern "c" fn gtk_message_dialog_new(
+    parent: ?*anyopaque,
+    flags: c_uint,
+    msg_type: c_int,
+    buttons: c_int,
+    message: [*:0]const u8,
+    ...,
+) ?*anyopaque;
+extern "c" fn gtk_dialog_add_button(dialog: *anyopaque, label: [*:0]const u8, response_id: c_int) ?*anyopaque;
+extern "c" fn gtk_widget_set_visible(widget: *anyopaque, visible: c_int) void;
+extern "c" fn gtk_window_destroy(window: *anyopaque) void;
 
 // =========================================================================
 // Default colors callback
@@ -851,11 +1020,24 @@ pub fn onSetTitle(ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callco
     const app = getApp(ctx) orelse return;
     if (title_len == 0) return;
 
-    // Must dispatch to GTK main thread
-    _ = app;
-    _ = title;
-    // TODO: g_idle_add with title data
+    const copy_len = @min(title_len, app.pending_title.len - 1);
+    @memcpy(app.pending_title[0..copy_len], title[0..copy_len]);
+    app.pending_title[copy_len] = 0;
+    app.pending_title_len = copy_len;
+
+    _ = gtk_mod.g_idle_add(&idleSetTitle, @ptrCast(app));
 }
+
+fn idleSetTitle(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const win = app.main_window orelse return 0;
+    if (app.pending_title_len > 0) {
+        gtk_window_set_title(win, @ptrCast(&app.pending_title));
+    }
+    return 0; // G_SOURCE_REMOVE
+}
+
+extern "c" fn gtk_window_set_title(window: *anyopaque, title: [*:0]const u8) void;
 
 // =========================================================================
 // IME callback
@@ -886,13 +1068,93 @@ pub fn onClipboardGet(
     out_len: *usize,
     max_len: usize,
 ) callconv(.c) c_int {
-    _ = ctx;
     _ = register;
-    _ = out_buf;
-    _ = max_len;
-    // TODO: implement GDK clipboard read (async -> sync bridge)
-    out_len.* = 0;
-    return 0;
+    const app = getApp(ctx) orelse {
+        out_len.* = 0;
+        return 1;
+    };
+
+    if (applog.isEnabled()) applog.appLog("[linux] clipboard_get: called\n", .{});
+
+    // Reset state and post to GTK main thread
+    app.clipboard_mu.lock();
+    app.clipboard_ready = false;
+    app.clipboard_len = 0;
+    app.clipboard_result = 1;
+    app.clipboard_mu.unlock();
+
+    _ = gtk_mod.g_idle_add(&idleClipboardGet, @ptrCast(app));
+
+    // Wait for GTK main thread to complete (timeout 5s)
+    app.clipboard_mu.lock();
+    defer app.clipboard_mu.unlock();
+    if (!app.clipboard_ready) {
+        app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
+    }
+
+    if (!app.clipboard_ready) {
+        if (applog.isEnabled()) applog.appLog("[linux] clipboard_get: timeout\n", .{});
+        out_len.* = 0;
+        return 1;
+    }
+
+    const copy_len = @min(app.clipboard_len, max_len);
+    if (copy_len > 0) {
+        @memcpy(out_buf[0..copy_len], app.clipboard_buf[0..copy_len]);
+    }
+    out_len.* = copy_len;
+
+    if (applog.isEnabled()) applog.appLog("[linux] clipboard_get: len={d}\n", .{copy_len});
+    return app.clipboard_result;
+}
+
+fn idleClipboardGet(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const display = gdk_display_get_default() orelse {
+        signalClipboardDone(app, 1, 0);
+        return 0;
+    };
+    const clipboard = gdk_display_get_clipboard(display) orelse {
+        signalClipboardDone(app, 1, 0);
+        return 0;
+    };
+    gdk_clipboard_read_text_async(clipboard, null, &onClipboardReadFinish, @ptrCast(app));
+    return 0; // G_SOURCE_REMOVE
+}
+
+fn onClipboardReadFinish(source: ?*anyopaque, result: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const app = getApp(user_data) orelse return;
+    const clipboard = source orelse {
+        signalClipboardDone(app, 1, 0);
+        return;
+    };
+
+    var err: ?*anyopaque = null;
+    const text_ptr: ?[*:0]const u8 = gdk_clipboard_read_text_finish(clipboard, result, &err);
+    if (err != null) {
+        g_error_free(err.?);
+        signalClipboardDone(app, 1, 0);
+        return;
+    }
+    if (text_ptr == null) {
+        signalClipboardDone(app, 1, 0);
+        return;
+    }
+
+    const text = std.mem.span(text_ptr.?);
+    const copy_len = @min(text.len, app.clipboard_buf.len);
+    @memcpy(app.clipboard_buf[0..copy_len], text[0..copy_len]);
+    g_free(@ptrCast(@constCast(text_ptr.?)));
+    signalClipboardDone(app, 0, copy_len);
+}
+
+fn signalClipboardDone(app: *App, result: c_int, len: usize) void {
+    app.clipboard_mu.lock();
+    defer app.clipboard_mu.unlock();
+    app.clipboard_result = result;
+    app.clipboard_len = len;
+    app.clipboard_ready = true;
+    app.clipboard_cond.signal();
 }
 
 pub fn onClipboardSet(
@@ -901,13 +1163,79 @@ pub fn onClipboardSet(
     data: [*]const u8,
     len: usize,
 ) callconv(.c) c_int {
-    _ = ctx;
     _ = register;
-    _ = data;
-    _ = len;
-    // TODO: implement GDK clipboard write
-    return 0;
+    const app = getApp(ctx) orelse return 0;
+
+    if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: called len={d}\n", .{len});
+    if (len == 0) return 1;
+
+    // Reset state, store data pointer for GTK thread
+    app.clipboard_mu.lock();
+    app.clipboard_ready = false;
+    app.clipboard_set_data = data;
+    app.clipboard_set_len = len;
+    app.clipboard_result = 0;
+    app.clipboard_mu.unlock();
+
+    _ = gtk_mod.g_idle_add(&idleClipboardSet, @ptrCast(app));
+
+    // Wait for GTK main thread to complete
+    app.clipboard_mu.lock();
+    defer app.clipboard_mu.unlock();
+    if (!app.clipboard_ready) {
+        app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
+    }
+
+    if (!app.clipboard_ready) {
+        // Invalidate data pointer to prevent GTK callback from reading stale memory
+        app.clipboard_set_data = null;
+        app.clipboard_set_len = 0;
+        if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: timeout\n", .{});
+        return 0;
+    }
+
+    if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: result={d}\n", .{app.clipboard_result});
+    return app.clipboard_result;
 }
+
+fn idleClipboardSet(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const display = gdk_display_get_default() orelse {
+        signalClipboardDone(app, 0, 0);
+        return 0;
+    };
+    const clipboard = gdk_display_get_clipboard(display) orelse {
+        signalClipboardDone(app, 0, 0);
+        return 0;
+    };
+
+    app.clipboard_mu.lock();
+    const data = app.clipboard_set_data;
+    const len = app.clipboard_set_len;
+    app.clipboard_mu.unlock();
+
+    if (data) |d| {
+        // Copy to a NUL-terminated buffer for gdk_clipboard_set_text
+        const copy_len = @min(len, app.clipboard_buf.len - 1);
+        @memcpy(app.clipboard_buf[0..copy_len], d[0..copy_len]);
+        app.clipboard_buf[copy_len] = 0;
+        gdk_clipboard_set_text(clipboard, @ptrCast(&app.clipboard_buf));
+        signalClipboardDone(app, 1, copy_len);
+    } else {
+        signalClipboardDone(app, 0, 0);
+    }
+
+    return 0; // G_SOURCE_REMOVE
+}
+
+// GDK clipboard extern declarations
+extern "c" fn gdk_display_get_default() ?*anyopaque;
+extern "c" fn gdk_display_get_clipboard(display: *anyopaque) ?*anyopaque;
+extern "c" fn gdk_clipboard_read_text_async(clipboard: *anyopaque, cancellable: ?*anyopaque, callback: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) void, user_data: ?*anyopaque) void;
+extern "c" fn gdk_clipboard_read_text_finish(clipboard: *anyopaque, result: ?*anyopaque, err: *?*anyopaque) ?[*:0]const u8;
+extern "c" fn gdk_clipboard_set_text(clipboard: *anyopaque, text: [*:0]const u8) void;
+extern "c" fn g_free(ptr: ?*anyopaque) void;
+extern "c" fn g_error_free(err: *anyopaque) void;
 
 // =========================================================================
 // SSH auth prompt callback
@@ -1124,23 +1452,83 @@ pub fn onMsgShow(
     msg_id: i64,
     timeout_ms: u32,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = view;
-    _ = kind;
-    _ = kind_len;
+    _ = history;
+    _ = msg_id;
+    _ = replace_last;
+    _ = append;
     _ = chunks;
     _ = chunk_count;
-    _ = replace_last;
-    _ = history;
-    _ = append;
-    _ = msg_id;
-    _ = timeout_ms;
-    // TODO: implement ext_messages show
+    const app = getApp(ctx) orelse return;
+
+    if (view == .none) return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] on_msg_show: kind={s} view={d} timeout_ms={d}\n", .{
+        kind[0..kind_len], @intFromEnum(view), timeout_ms,
+    });
+
+    // Route based on view type
+    switch (view) {
+        .mini => {
+            // Mini messages are handled by showmode/showcmd/ruler callbacks
+            return;
+        },
+        .notification => {
+            // OS-level notifications not yet supported on Linux
+            return;
+        },
+        else => {},
+    }
+
+    // ext_float / confirm / split: rendered via MESSAGE_GRID_ID overlay grid.
+    // Core generates grid vertices and sends them through onExternalWindow +
+    // onVerticesRow for MESSAGE_GRID_ID. We only need to manage the auto-hide timer.
+    const timeout_sec: f32 = if (timeout_ms > 0) @as(f32, @floatFromInt(timeout_ms)) / 1000.0 else 4.0;
+    scheduleMsgHideTimer(app, timeout_sec);
+
+    _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
+}
+
+fn scheduleMsgHideTimer(app: *App, timeout_sec: f32) void {
+    // Cancel existing timer
+    if (app.msg_hide_timer != 0) {
+        _ = gtk_mod.g_source_remove(app.msg_hide_timer);
+        app.msg_hide_timer = 0;
+    }
+
+    if (timeout_sec > 0) {
+        const interval_ms: c_uint = @intFromFloat(timeout_sec * 1000.0);
+        if (interval_ms > 0) {
+            app.msg_hide_timer = gtk_mod.g_timeout_add(interval_ms, &onMsgHideTimer, @ptrCast(app));
+        }
+    }
+}
+
+fn onMsgHideTimer(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    app.msg_hide_timer = 0;
+
+    // Tell core to tick message throttle which will close expired grids
+    if (app.corep) |corep| {
+        app_mod.zonvie_core_tick_msg_throttle(corep);
+    }
+
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    return 0; // G_SOURCE_REMOVE
 }
 
 pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
-    _ = ctx;
-    // TODO: implement ext_messages clear
+    const app = getApp(ctx) orelse return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] on_msg_clear\n", .{});
+
+    if (app.msg_hide_timer != 0) {
+        _ = gtk_mod.g_source_remove(app.msg_hide_timer);
+        app.msg_hide_timer = 0;
+    }
+
+    // Core will close MESSAGE_GRID_ID which triggers onExternalWindowClose → redraw
 }
 
 pub fn onMsgShowmode(
@@ -1149,11 +1537,7 @@ pub fn onMsgShowmode(
     chunks: [*]const app_mod.MsgChunk,
     chunk_count: usize,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = view;
-    _ = chunks;
-    _ = chunk_count;
-    // TODO: implement ext_messages showmode
+    handleMsgMini(ctx, view, .showmode, chunks, chunk_count);
 }
 
 pub fn onMsgShowcmd(
@@ -1162,11 +1546,7 @@ pub fn onMsgShowcmd(
     chunks: [*]const app_mod.MsgChunk,
     chunk_count: usize,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = view;
-    _ = chunks;
-    _ = chunk_count;
-    // TODO: implement ext_messages showcmd
+    handleMsgMini(ctx, view, .showcmd, chunks, chunk_count);
 }
 
 pub fn onMsgRuler(
@@ -1175,11 +1555,73 @@ pub fn onMsgRuler(
     chunks: [*]const app_mod.MsgChunk,
     chunk_count: usize,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = view;
-    _ = chunks;
-    _ = chunk_count;
-    // TODO: implement ext_messages ruler
+    handleMsgMini(ctx, view, .ruler, chunks, chunk_count);
+}
+
+fn handleMsgMini(
+    ctx: ?*anyopaque,
+    view: app_mod.zonvie_msg_view_type,
+    mini_id: app_mod.MiniWindowId,
+    chunks: [*]const app_mod.MsgChunk,
+    chunk_count: usize,
+) void {
+    const app = getApp(ctx) orelse return;
+
+    if (view == .none) return;
+
+    // Build text from chunks
+    var text_buf: [256]u8 = undefined;
+    var text_len: usize = 0;
+    for (chunks[0..chunk_count]) |chunk| {
+        const text = chunk.text[0..chunk.text_len];
+        const copy_len = @min(text.len, text_buf.len - text_len);
+        @memcpy(text_buf[text_len..][0..copy_len], text[0..copy_len]);
+        text_len += copy_len;
+        if (text_len >= text_buf.len) break;
+    }
+
+    const idx = @intFromEnum(mini_id);
+    app.mu.lock();
+    @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
+    app.mini_windows[idx].text_len = text_len;
+    app.mu.unlock();
+
+    _ = gtk_mod.g_idle_add(&idleUpdateMiniLabel, @ptrCast(app));
+}
+
+fn idleUpdateMiniLabel(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const label = app.mini_label orelse return 0;
+
+    // Combine all mini windows into one string: "showmode  showcmd  ruler"
+    var combined: [768]u8 = undefined;
+    var combined_len: usize = 0;
+
+    app.mu.lock();
+    for (app.mini_windows) |mw| {
+        if (mw.text_len > 0) {
+            if (combined_len > 0 and combined_len < combined.len - 2) {
+                combined[combined_len] = ' ';
+                combined[combined_len + 1] = ' ';
+                combined_len += 2;
+            }
+            const copy_len = @min(mw.text_len, combined.len - combined_len);
+            @memcpy(combined[combined_len..][0..copy_len], mw.text[0..copy_len]);
+            combined_len += copy_len;
+        }
+    }
+    app.mu.unlock();
+
+    if (combined_len > 0 and combined_len < combined.len) {
+        combined[combined_len] = 0;
+        main_mod.gtk_externs.label_set_text(label, @ptrCast(&combined));
+        main_mod.gtk_externs.widget_set_visible(label, 1);
+    } else {
+        main_mod.gtk_externs.label_set_text(label, "");
+        main_mod.gtk_externs.widget_set_visible(label, 0);
+    }
+
+    return 0; // G_SOURCE_REMOVE
 }
 
 pub fn onMsgHistoryShow(
@@ -1188,11 +1630,14 @@ pub fn onMsgHistoryShow(
     entry_count: usize,
     prev_cmd: c_int,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = entries;
-    _ = entry_count;
     _ = prev_cmd;
-    // TODO: implement ext_messages history show
+    _ = entries;
+    const app = getApp(ctx) orelse return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] on_msg_history_show: entries={d}\n", .{entry_count});
+
+    // Core renders history via MSG_HISTORY_GRID_ID overlay grid.
+    _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
 }
 
 // =========================================================================
@@ -1208,19 +1653,129 @@ pub fn onTablineUpdate(
     buffers: [*]const core.BufferEntry,
     buffer_count: usize,
 ) callconv(.c) void {
-    _ = ctx;
-    _ = curtab;
-    _ = tabs;
-    _ = tab_count;
     _ = curbuf;
     _ = buffers;
     _ = buffer_count;
-    // TODO: implement ext_tabline update
+    const app = getApp(ctx) orelse return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] onTablineUpdate: curtab={d} tab_count={d}\n", .{ curtab, tab_count });
+
+    app.mu.lock();
+    defer app.mu.unlock();
+
+    app.tabline.clear(app.alloc);
+    app.tabline.current_tab = curtab;
+    app.tabline.visible = true;
+
+    for (tabs[0..tab_count]) |tab| {
+        const name_slice = tab.name[0..tab.name_len];
+        const name_copy = app.alloc.dupe(u8, name_slice) catch continue;
+        app.tabline.tabs.append(app.alloc, .{
+            .tab_handle = tab.tab_handle,
+            .name = name_copy,
+            .name_owned = true,
+        }) catch {
+            app.alloc.free(name_copy);
+            continue;
+        };
+    }
+
+    _ = gtk_mod.g_idle_add(&idleUpdateTabBar, @ptrCast(app));
 }
 
 pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
-    _ = ctx;
-    // TODO: implement ext_tabline hide
+    const app = getApp(ctx) orelse return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] onTablineHide\n", .{});
+
+    app.mu.lock();
+    app.tabline.visible = false;
+    app.mu.unlock();
+
+    _ = gtk_mod.g_idle_add(&idleUpdateTabBar, @ptrCast(app));
+}
+
+fn idleUpdateTabBar(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const tab_box = app.tab_bar_box orelse return 0;
+
+    // Remove all existing children
+    removeAllBoxChildren(tab_box);
+
+    // Copy tab info under lock to avoid holding mutex during GTK operations
+    const MAX_TABS = 64;
+    var tab_names: [MAX_TABS][64]u8 = undefined;
+    var tab_name_lens: [MAX_TABS]usize = undefined;
+    var tab_handles: [MAX_TABS]i64 = undefined;
+    var copy_count: usize = 0;
+    var current_tab: i64 = 0;
+    var visible: bool = false;
+
+    {
+        app.mu.lock();
+        defer app.mu.unlock();
+        visible = app.tabline.visible;
+        current_tab = app.tabline.current_tab;
+        copy_count = @min(app.tabline.tabs.items.len, MAX_TABS);
+        for (app.tabline.tabs.items[0..copy_count], 0..) |tab, i| {
+            const name_len = @min(tab.name.len, tab_names[i].len - 1);
+            @memcpy(tab_names[i][0..name_len], tab.name[0..name_len]);
+            tab_names[i][name_len] = 0;
+            tab_name_lens[i] = name_len;
+            tab_handles[i] = tab.tab_handle;
+        }
+    }
+
+    if (!visible or copy_count == 0) {
+        main_mod.gtk_externs.widget_set_visible(tab_box, 0);
+        return 0;
+    }
+
+    // Create a button for each tab (mutex released, safe for GTK calls)
+    for (0..copy_count) |i| {
+        const btn = main_mod.gtk_externs.button_new_with_label(@ptrCast(&tab_names[i])) orelse continue;
+        main_mod.gtk_externs.widget_set_size_request(btn, 80, 28);
+
+        if (tab_handles[i] == current_tab) {
+            gtk_widget_add_css_class(btn, "current");
+        }
+
+        const idx_ptr: ?*anyopaque = @ptrFromInt(i + 1); // 1-based
+        _ = gtk_mod.g_signal_connect(btn, "clicked", @ptrCast(&onTabButtonClicked), idx_ptr);
+
+        main_mod.gtk_externs.box_append(tab_box, btn);
+    }
+
+    main_mod.gtk_externs.widget_set_visible(tab_box, 1);
+    return 0;
+}
+
+fn onTabButtonClicked(button: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    _ = button;
+    const idx: usize = if (user_data) |p| @intFromPtr(p) else return;
+    if (idx == 0) return;
+
+    const app = app_mod.g_app orelse return;
+    const corep = app.corep orelse return;
+
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "tabn {d}", .{idx}) catch return;
+    // NUL-terminate in-place
+    if (cmd.len < cmd_buf.len) {
+        cmd_buf[cmd.len] = 0;
+    }
+    app_mod.zonvie_core_send_command(corep, @ptrCast(&cmd_buf), cmd.len);
+}
+
+extern "c" fn gtk_widget_add_css_class(widget: *anyopaque, css_class: [*:0]const u8) void;
+extern "c" fn gtk_widget_get_first_child(widget: *anyopaque) ?*anyopaque;
+extern "c" fn gtk_widget_get_next_sibling(widget: *anyopaque) ?*anyopaque;
+extern "c" fn gtk_box_remove(box: *anyopaque, child: *anyopaque) void;
+
+fn removeAllBoxChildren(box: *anyopaque) void {
+    while (gtk_widget_get_first_child(box)) |child| {
+        gtk_box_remove(box, child);
+    }
 }
 
 // =========================================================================
@@ -1238,10 +1793,13 @@ pub fn onExternalWindow(
 ) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
-    const is_overlay = (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID);
+    const is_overlay = (grid_id == app_mod.CMDLINE_GRID_ID or
+        grid_id == app_mod.POPUPMENU_GRID_ID or
+        grid_id == app_mod.MESSAGE_GRID_ID or
+        grid_id == app_mod.MSG_HISTORY_GRID_ID);
 
     if (is_overlay) {
-        // Cmdline and popupmenu grids are rendered as overlays on the main GLArea.
+        // Cmdline, popupmenu, and message grids are rendered as overlays on the main GLArea.
         // Register in external_windows without creating a GtkWindow.
         if (applog.isEnabled()) applog.appLog("[linux] onExternalWindow: overlay grid_id={d} rows={d} cols={d} start=({d},{d})\n", .{ grid_id, rows, cols, start_row, start_col });
 
@@ -1251,10 +1809,14 @@ pub fn onExternalWindow(
         if (app.external_windows.getPtr(grid_id)) |ext| {
             ext.rows = rows;
             ext.cols = cols;
+            ext.start_row = start_row;
+            ext.start_col = start_col;
         } else {
             app.external_windows.put(app.alloc, grid_id, .{
                 .rows = rows,
                 .cols = cols,
+                .start_row = start_row,
+                .start_col = start_col,
             }) catch {};
         }
 
@@ -1295,7 +1857,12 @@ fn idleCreateExternalWindow(user_data: ?*anyopaque) callconv(.c) c_int {
 pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app = getApp(ctx) orelse return;
 
-    if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID) {
+    const is_overlay = (grid_id == app_mod.CMDLINE_GRID_ID or
+        grid_id == app_mod.POPUPMENU_GRID_ID or
+        grid_id == app_mod.MESSAGE_GRID_ID or
+        grid_id == app_mod.MSG_HISTORY_GRID_ID);
+
+    if (is_overlay) {
         if (applog.isEnabled()) applog.appLog("[linux] onExternalWindowClose: overlay grid_id={d}\n", .{grid_id});
         app.mu.lock();
         if (app.external_windows.fetchRemove(grid_id)) |kv| {
@@ -1305,6 +1872,7 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
         if (grid_id == app_mod.CMDLINE_GRID_ID) app.cmdline_visible = false;
         if (grid_id == app_mod.POPUPMENU_GRID_ID) app.popupmenu_visible = false;
         app.mu.unlock();
+        _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
         return;
     }
 
@@ -1337,7 +1905,9 @@ pub fn onExternalVertices(
     app.mu.unlock();
 
     // For overlay grids, queue a redraw of the main GLArea
-    if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID) {
+    if (grid_id == app_mod.CMDLINE_GRID_ID or grid_id == app_mod.POPUPMENU_GRID_ID or
+        grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID)
+    {
         _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
     }
 }

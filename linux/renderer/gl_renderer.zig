@@ -441,8 +441,8 @@ pub fn render(app: *App, width: i32, height: i32) bool {
         gl.glDeleteBuffers(1, &vbo);
     }
 
-    // Draw cursor
-    if (vs.cursor_verts.items.len > 0) {
+    // Draw cursor (skip when blink state is off)
+    if (vs.cursor_verts.items.len > 0 and app.cursor_blink_state) {
         gl.glUseProgram(app.gl_program_main);
         gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
 
@@ -465,6 +465,14 @@ pub fn render(app: *App, width: i32, height: i32) bool {
 
     // Draw popupmenu overlay (ext_popupmenu rendered on main GLArea)
     renderPopupmenuOverlay(app, w, h);
+
+    // Draw message overlay (ext_messages rendered on main GLArea)
+    renderMessageOverlay(app, w, h);
+
+    // Tab bar is rendered by GTK widgets (see callbacks.zig idleUpdateTabBar)
+
+    // Draw scrollbar
+    renderScrollbar(app, w, h);
 
     gl.glBindVertexArray(0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
@@ -963,6 +971,236 @@ fn renderRowMode(app: *App, vs: *const app_mod.VertexSet, w: u32, h: u32) void {
             vs.row_map.items.len, none_count, empty_count, total_drawn, app.tbs.pool.slots.items.len,
         });
     }
+}
+
+/// Render ext_messages overlay (MESSAGE_GRID_ID / MSG_HISTORY_GRID_ID) on main GLArea.
+fn renderMessageOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
+    const grid_ids = [_]i64{ app_mod.MESSAGE_GRID_ID, app_mod.MSG_HISTORY_GRID_ID };
+    for (grid_ids) |grid_id| {
+        renderSingleMessageGrid(app, viewport_w, viewport_h, grid_id);
+    }
+}
+
+fn renderSingleMessageGrid(app: *App, viewport_w: u32, viewport_h: u32, grid_id: i64) void {
+    app.mu.lock();
+    const ext_ptr = app.external_windows.getPtr(grid_id);
+    if (ext_ptr == null) {
+        app.mu.unlock();
+        return;
+    }
+    const ext = ext_ptr.?;
+
+    const snapshot = ext.tbs.acquireForPaint();
+    const ext_vs = &ext.tbs.sets[snapshot.committed_index];
+
+    var total_vert_count: usize = 0;
+    const row_count = ext_vs.row_map.items.len;
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        total_vert_count += ext.tbs.pool.slots.items[mapping.slot].verts.items.len;
+    }
+    total_vert_count += ext_vs.cursor_verts.items.len;
+
+    if (total_vert_count == 0) {
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_rows = ext_vs.rows;
+    const content_cols = ext_vs.cols;
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px + app.linespace_px;
+    const start_row = ext.start_row;
+    const start_col = ext.start_col;
+    app.mu.unlock();
+
+    if (content_rows == 0 or content_cols == 0) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const vp_w: f32 = @floatFromInt(viewport_w);
+    const vp_h: f32 = @floatFromInt(viewport_h);
+    if (!(vp_w > 0 and vp_h > 0)) {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    }
+
+    const content_w_px: f32 = @floatFromInt(content_cols * cell_w);
+    const content_h_px: f32 = @floatFromInt(content_rows * cell_h);
+    const padding: f32 = @floatFromInt(app_mod.MSG_PADDING);
+
+    // Position from core-supplied start_row/start_col (grid coordinates)
+    var box_x_px: f32 = @as(f32, @floatFromInt(start_col)) * @as(f32, @floatFromInt(cell_w));
+    var box_y_px: f32 = @as(f32, @floatFromInt(start_row)) * @as(f32, @floatFromInt(cell_h));
+
+    if (start_row < 0) box_y_px = vp_h - content_h_px - padding * 2.0;
+    if (start_col < 0) box_x_px = vp_w - content_w_px - padding * 2.0;
+
+    const total_w_px: f32 = content_w_px + padding * 2.0;
+    const total_h_px: f32 = content_h_px + padding * 2.0;
+
+    if (box_x_px + total_w_px > vp_w) box_x_px = @max(0, vp_w - total_w_px);
+    if (box_y_px + total_h_px > vp_h) box_y_px = @max(0, vp_h - total_h_px);
+
+    const box_left_ndc: f32 = box_x_px / vp_w * 2.0 - 1.0;
+    const box_top_ndc: f32 = 1.0 - box_y_px / vp_h * 2.0;
+    const box_w_ndc: f32 = total_w_px / vp_w * 2.0;
+    const box_h_ndc: f32 = total_h_px / vp_h * 2.0;
+
+    const content_left_px: f32 = box_x_px + padding;
+    const content_top_px: f32 = box_y_px + padding;
+    const content_w_ndc: f32 = content_w_px / vp_w * 2.0;
+    const content_h_ndc: f32 = content_h_px / vp_h * 2.0;
+    const content_left_ndc: f32 = content_left_px / vp_w * 2.0 - 1.0;
+    const content_top_ndc: f32 = 1.0 - content_top_px / vp_h * 2.0;
+
+    const scale_x: f32 = content_w_ndc / 2.0;
+    const scale_y: f32 = content_h_ndc / 2.0;
+    const offset_x: f32 = content_left_ndc + content_w_ndc / 2.0;
+    const offset_y: f32 = content_top_ndc - content_h_ndc / 2.0;
+
+    // bg(6) + border(24) + content
+    const extra_count: usize = 6 + 24;
+    const total_alloc = total_vert_count + extra_count;
+    var msg_verts = app.alloc.alloc(Vertex, total_alloc) catch {
+        app.mu.lock();
+        _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+        app.mu.unlock();
+        return;
+    };
+    defer app.alloc.free(msg_verts);
+
+    var idx: usize = 0;
+    const bg_tex: [2]f32 = .{ -1.0, -1.0 };
+
+    // Background
+    const bg_r: f32 = @as(f32, @floatFromInt((app.default_bg >> 16) & 0xFF)) / 255.0;
+    const bg_g: f32 = @as(f32, @floatFromInt((app.default_bg >> 8) & 0xFF)) / 255.0;
+    const bg_b: f32 = @as(f32, @floatFromInt(app.default_bg & 0xFF)) / 255.0;
+    const bg_a: f32 = 0.95;
+    idx = app_mod.addRectVerts(msg_verts, idx, box_left_ndc, box_top_ndc, box_w_ndc, box_h_ndc, .{ bg_r * bg_a, bg_g * bg_a, bg_b * bg_a, bg_a }, bg_tex, grid_id);
+
+    // Border (1px)
+    const bc: f32 = 0.35;
+    const ba: f32 = 0.8;
+    const bw_ndc: f32 = 1.0 / vp_w * 2.0;
+    const bh_ndc: f32 = 1.0 / vp_h * 2.0;
+    idx = app_mod.addRectVerts(msg_verts, idx, box_left_ndc, box_top_ndc, box_w_ndc, bh_ndc, .{ bc * ba, bc * ba, bc * ba, ba }, bg_tex, grid_id);
+    idx = app_mod.addRectVerts(msg_verts, idx, box_left_ndc, box_top_ndc - box_h_ndc + bh_ndc, box_w_ndc, bh_ndc, .{ bc * ba, bc * ba, bc * ba, ba }, bg_tex, grid_id);
+    idx = app_mod.addRectVerts(msg_verts, idx, box_left_ndc, box_top_ndc, bw_ndc, box_h_ndc, .{ bc * ba, bc * ba, bc * ba, ba }, bg_tex, grid_id);
+    idx = app_mod.addRectVerts(msg_verts, idx, box_left_ndc + box_w_ndc - bw_ndc, box_top_ndc, bw_ndc, box_h_ndc, .{ bc * ba, bc * ba, bc * ba, ba }, bg_tex, grid_id);
+
+    // Content vertices
+    for (ext_vs.row_map.items[0..row_count]) |mapping| {
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        if (mapping.slot >= ext.tbs.pool.slots.items.len) continue;
+        for (ext.tbs.pool.slots.items[mapping.slot].verts.items) |v| {
+            var tv = v;
+            tv.position[0] = v.position[0] * scale_x + offset_x;
+            tv.position[1] = v.position[1] * scale_y + offset_y;
+            msg_verts[idx] = tv;
+            idx += 1;
+        }
+    }
+    for (ext_vs.cursor_verts.items) |v| {
+        var tv = v;
+        tv.position[0] = v.position[0] * scale_x + offset_x;
+        tv.position[1] = v.position[1] * scale_y + offset_y;
+        msg_verts[idx] = tv;
+        idx += 1;
+    }
+
+    app.mu.lock();
+    _ = ext.tbs.releaseFromPaint(snapshot.committed_index);
+    app.mu.unlock();
+
+    if (idx == 0) return;
+
+    gl.glUseProgram(app.gl_program_main);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+
+    var vbo: gl.GLuint = 0;
+    gl.glGenBuffers(1, &vbo);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo);
+    gl.glBufferData(gl.GL_ARRAY_BUFFER, @intCast(idx * @sizeOf(Vertex)), @ptrCast(msg_verts.ptr), gl.GL_STREAM_DRAW);
+    setupVertexAttribs();
+    gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(idx));
+    gl.glDeleteBuffers(1, &vbo);
+}
+
+/// Render scrollbar overlay on the right edge of the viewport.
+fn renderScrollbar(app: *App, viewport_w: u32, viewport_h: u32) void {
+    if (!app.scrollbar.visible) return;
+
+    const vp_w: f32 = @floatFromInt(viewport_w);
+    const vp_h: f32 = @floatFromInt(viewport_h);
+    if (!(vp_w > 0 and vp_h > 0)) return;
+
+    const sb_w = app_mod.scrollbarWidth(app.dpi_scale);
+    const sb_margin = app_mod.scrollbarMargin(app.dpi_scale);
+    const min_knob_h = app_mod.scrollbarMinKnobHeight(app.dpi_scale);
+
+    // Track area (right edge, full height minus margins)
+    const track_x_px: f32 = vp_w - sb_w - sb_margin;
+    const track_y_px: f32 = sb_margin;
+    const track_h_px: f32 = vp_h - sb_margin * 2.0;
+
+    // Knob position
+    const knob_y_px: f32 = track_y_px + app.scrollbar.knob_top * track_h_px;
+    const knob_h_px: f32 = @max(min_knob_h, app.scrollbar.knob_height * track_h_px);
+
+    const alpha: f32 = app.scrollbar.alpha;
+    if (alpha <= 0.01) return;
+
+    // NDC conversion
+    const bg_tex: [2]f32 = .{ -1.0, -1.0 };
+
+    // Track background (very subtle)
+    const track_left_ndc: f32 = track_x_px / vp_w * 2.0 - 1.0;
+    const track_top_ndc: f32 = 1.0 - track_y_px / vp_h * 2.0;
+    const track_w_ndc: f32 = sb_w / vp_w * 2.0;
+    const track_h_ndc: f32 = track_h_px / vp_h * 2.0;
+
+    // Knob
+    const knob_left_ndc: f32 = track_left_ndc;
+    const knob_top_ndc: f32 = 1.0 - knob_y_px / vp_h * 2.0;
+    const knob_w_ndc: f32 = track_w_ndc;
+    const knob_h_ndc: f32 = knob_h_px / vp_h * 2.0;
+
+    // 2 quads: track + knob = 12 verts
+    var verts: [12]Vertex = undefined;
+    var idx: usize = 0;
+
+    // Track (semi-transparent)
+    const ta: f32 = 0.1 * alpha;
+    idx = app_mod.addRectVerts(&verts, idx, track_left_ndc, track_top_ndc, track_w_ndc, track_h_ndc, .{ ta, ta, ta, ta }, bg_tex, 0);
+
+    // Knob
+    const fg_r: f32 = @as(f32, @floatFromInt((app.default_fg >> 16) & 0xFF)) / 255.0;
+    const fg_g: f32 = @as(f32, @floatFromInt((app.default_fg >> 8) & 0xFF)) / 255.0;
+    const fg_b: f32 = @as(f32, @floatFromInt(app.default_fg & 0xFF)) / 255.0;
+    const ka: f32 = 0.4 * alpha;
+    idx = app_mod.addRectVerts(&verts, idx, knob_left_ndc, knob_top_ndc, knob_w_ndc, knob_h_ndc, .{ fg_r * ka, fg_g * ka, fg_b * ka, ka }, bg_tex, 0);
+
+    if (idx == 0) return;
+
+    gl.glUseProgram(app.gl_program_main);
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA);
+
+    var vbo: gl.GLuint = 0;
+    gl.glGenBuffers(1, &vbo);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo);
+    gl.glBufferData(gl.GL_ARRAY_BUFFER, @intCast(idx * @sizeOf(Vertex)), @ptrCast(&verts), gl.GL_STREAM_DRAW);
+    setupVertexAttribs();
+    gl.glDrawArrays(gl.GL_TRIANGLES, 0, @intCast(idx));
+    gl.glDeleteBuffers(1, &vbo);
 }
 
 // =========================================================================
