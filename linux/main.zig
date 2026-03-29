@@ -65,6 +65,39 @@ extern "c" fn gtk_css_provider_load_from_string(provider: *anyopaque, css: [*:0]
 extern "c" fn gtk_style_context_add_provider_for_display(display: *anyopaque, provider: *anyopaque, priority: c_uint) void;
 extern "c" fn gtk_widget_get_display(widget: *anyopaque) ?*anyopaque;
 extern "c" fn gtk_widget_add_css_class(widget: *anyopaque, css_class: [*:0]const u8) void;
+extern "c" fn gtk_im_multicontext_new() ?*anyopaque;
+extern "c" fn gtk_event_controller_key_set_im_context(controller: *anyopaque, im_context: *anyopaque) void;
+
+// Layout widgets
+extern "c" fn gtk_box_new(orientation: c_int, spacing: c_int) ?*anyopaque;
+extern "c" fn gtk_box_append(box: *anyopaque, child: *anyopaque) void;
+extern "c" fn gtk_overlay_new() ?*anyopaque;
+extern "c" fn gtk_overlay_set_child(overlay: *anyopaque, child: *anyopaque) void;
+extern "c" fn gtk_overlay_add_overlay(overlay: *anyopaque, widget: *anyopaque) void;
+extern "c" fn gtk_label_new(text: [*:0]const u8) ?*anyopaque;
+extern "c" fn gtk_label_set_text(label: *anyopaque, text: [*:0]const u8) void;
+extern "c" fn gtk_widget_set_visible(widget: *anyopaque, visible: c_int) void;
+extern "c" fn gtk_widget_set_halign(widget: *anyopaque, align_val: c_int) void;
+extern "c" fn gtk_widget_set_valign(widget: *anyopaque, align_val: c_int) void;
+extern "c" fn gtk_widget_set_margin_end(widget: *anyopaque, margin: c_int) void;
+extern "c" fn gtk_widget_set_margin_bottom(widget: *anyopaque, margin: c_int) void;
+extern "c" fn gtk_widget_set_vexpand(widget: *anyopaque, expand: c_int) void;
+extern "c" fn gtk_widget_set_hexpand(widget: *anyopaque, expand: c_int) void;
+extern "c" fn gtk_button_new_with_label(label: [*:0]const u8) ?*anyopaque;
+extern "c" fn gtk_widget_set_size_request(widget: *anyopaque, width: c_int, height: c_int) void;
+extern "c" fn gtk_im_context_set_cursor_location(context: *anyopaque, area: *const GdkRectangle) void;
+extern "c" fn gtk_im_context_get_preedit_string(context: *anyopaque, str: *?[*:0]u8, attrs: *?*anyopaque, cursor_pos: *c_int) void;
+extern "c" fn gtk_widget_set_margin_start(widget: *anyopaque, margin: c_int) void;
+extern "c" fn gtk_widget_set_margin_top(widget: *anyopaque, margin: c_int) void;
+extern "c" fn gtk_label_set_markup(label: *anyopaque, markup: [*:0]const u8) void;
+extern "c" fn pango_attr_list_unref(list: *anyopaque) void;
+
+pub const GdkRectangle = extern struct {
+    x: c_int = 0,
+    y: c_int = 0,
+    width: c_int = 0,
+    height: c_int = 0,
+};
 
 // GTK event controller scroll flags
 const GTK_EVENT_CONTROLLER_SCROLL_VERTICAL: c_uint = 1 << 2;
@@ -82,6 +115,17 @@ pub const gtk_externs = struct {
     pub const application_quit = g_application_quit;
     pub const im_context_reset = gtk_im_context_reset;
     pub const css_provider_load_from_string = gtk_css_provider_load_from_string;
+    pub const label_set_text = gtk_label_set_text;
+    pub const widget_set_visible = gtk_widget_set_visible;
+    pub const box_append = gtk_box_append;
+    pub const button_new_with_label = gtk_button_new_with_label;
+    pub const widget_set_size_request = gtk_widget_set_size_request;
+    pub const im_context_set_cursor_location = gtk_im_context_set_cursor_location;
+    pub const im_context_get_preedit_string = gtk_im_context_get_preedit_string;
+    pub const widget_set_margin_start = gtk_widget_set_margin_start;
+    pub const widget_set_margin_top = gtk_widget_set_margin_top;
+    pub const label_set_markup = gtk_label_set_markup;
+    pub const attr_list_unref = pango_attr_list_unref;
 };
 
 /// Custom panic handler for debug builds.
@@ -217,6 +261,7 @@ fn onResize(area: ?*anyopaque, width: c_int, height: c_int, user_data: ?*anyopaq
 fn onActivate(gapp: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(user_data orelse return));
     app.gtk_app = gapp orelse return;
+    app_mod.g_app = app;
 
     // Create main window
     const win = gtk_application_window_new(gapp.?) orelse return;
@@ -235,7 +280,18 @@ fn onActivate(gapp: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     // The css_provider is saved on App so onDefaultColorsSet can update it dynamically.
     gtk_widget_add_css_class(gl_area, "zonvie-gl");
     if (gtk_css_provider_new()) |css_provider| {
-        gtk_css_provider_load_from_string(css_provider, ".zonvie-gl { background-color: black; }");
+        gtk_css_provider_load_from_string(css_provider,
+            \\.zonvie-gl { background-color: black; }
+            \\.zonvie-mini { background-color: rgba(30,30,30,0.85); color: #cccccc;
+            \\  padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+            \\.zonvie-tabbar { background-color: #1e1e1e; padding: 2px; }
+            \\.zonvie-tabbar button { padding: 4px 12px; border-radius: 4px; min-width: 60px;
+            \\  font-family: monospace; font-size: 12px; }
+            \\.zonvie-tabbar button.current { background-color: #333333; color: #ffffff; }
+            \\.zonvie-tabbar button:not(.current) { background-color: transparent; color: #888888; }
+            \\.zonvie-preedit { background-color: rgba(40,40,40,0.95); color: #ffffff;
+            \\  padding: 1px 2px; font-family: monospace; border-bottom: 2px solid #4488ff; }
+        );
         if (gtk_widget_get_display(gl_area)) |display| {
             gtk_style_context_add_provider_for_display(display, css_provider, 800);
         }
@@ -247,12 +303,61 @@ fn onActivate(gapp: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     _ = g_signal_connect_data(gl_area, "render", @ptrCast(&onRender), app, null, 0);
     _ = g_signal_connect_data(gl_area, "resize", @ptrCast(&onResize), app, null, 0);
 
-    // Set GLArea as window child
-    gtk_window_set_child(win, gl_area);
+    // Build widget hierarchy:
+    //   GtkWindow → GtkBox(v) → [tab_bar_box, GtkOverlay → [GLArea, mini_label]]
+    const vbox = gtk_box_new(1, 0) orelse return; // GTK_ORIENTATION_VERTICAL
+    gtk_window_set_child(win, vbox);
+
+    // Tab bar (initially hidden)
+    const tab_bar_box = gtk_box_new(0, 2) orelse return; // GTK_ORIENTATION_HORIZONTAL
+    gtk_widget_set_visible(tab_bar_box, 0);
+    gtk_widget_add_css_class(tab_bar_box, "zonvie-tabbar");
+    gtk_box_append(vbox, tab_bar_box);
+    app.tab_bar_box = tab_bar_box;
+
+    // Overlay container for GLArea + mini label
+    const overlay = gtk_overlay_new() orelse return;
+    gtk_widget_set_vexpand(overlay, 1);
+    gtk_widget_set_hexpand(overlay, 1);
+    gtk_box_append(vbox, overlay);
+
+    // GLArea as main overlay child
+    gtk_overlay_set_child(overlay, gl_area);
+
+    // Mini label (showmode/showcmd/ruler) at bottom-right
+    const mini_label = gtk_label_new("") orelse return;
+    gtk_widget_set_halign(mini_label, 2); // GTK_ALIGN_END
+    gtk_widget_set_valign(mini_label, 2); // GTK_ALIGN_END
+    gtk_widget_set_margin_end(mini_label, 8);
+    gtk_widget_set_margin_bottom(mini_label, 4);
+    gtk_widget_add_css_class(mini_label, "zonvie-mini");
+    gtk_overlay_add_overlay(overlay, mini_label);
+    app.mini_label = mini_label;
+
+    // Preedit label (IME composition text at cursor position)
+    const preedit_label = gtk_label_new("") orelse return;
+    gtk_widget_set_halign(preedit_label, 0); // GTK_ALIGN_START
+    gtk_widget_set_valign(preedit_label, 0); // GTK_ALIGN_START
+    gtk_widget_add_css_class(preedit_label, "zonvie-preedit");
+    gtk_widget_set_visible(preedit_label, 0);
+    gtk_overlay_add_overlay(overlay, preedit_label);
+    app.preedit_label = preedit_label;
+    app.preedit_overlay = overlay;
+
+    // Set up IME context
+    const im_context = gtk_im_multicontext_new();
+    if (im_context) |im| {
+        app.im_context = im;
+        _ = g_signal_connect_data(im, "commit", @ptrCast(&input.onIMECommit), app, null, 0);
+        _ = g_signal_connect_data(im, "preedit-changed", @ptrCast(&input.onIMEPreeditChanged), app, null, 0);
+    }
 
     // Set up keyboard input
     const key_controller = gtk_event_controller_key_new() orelse return;
     _ = g_signal_connect_data(key_controller, "key-pressed", @ptrCast(&input.onKeyPressed), app, null, 0);
+    if (im_context) |im| {
+        gtk_event_controller_key_set_im_context(key_controller, im);
+    }
     gtk_widget_add_controller(gl_area, key_controller);
 
     // Set up mouse input

@@ -119,11 +119,10 @@ pub fn onKeyPressed(
     _ = keycode;
     const app: *App = @ptrCast(@alignCast(user_data orelse return 0));
 
-    // Let IME handle the key first
-    if (app.im_context) |im| {
-        // TODO: forward to im_context_filter_keypress when GTK4 IME is wired
-        _ = im;
-    }
+    // IME filtering is handled by GTK4 automatically via
+    // gtk_event_controller_key_set_im_context. When IME consumes a key,
+    // this signal handler is not called — the committed text arrives
+    // via the "commit" signal instead.
 
     const mods = gdkModsToNeovim(state);
 
@@ -180,6 +179,12 @@ pub fn onMousePressed(
     const app: *App = @ptrCast(@alignCast(user_data orelse return));
     if (app.corep == null) return;
 
+    // Check scrollbar hit
+    if (scrollbarHitTest(app, x, y)) {
+        startScrollbarDrag(app, y);
+        return;
+    }
+
     const pos = pixelToGrid(app, x, y);
 
     const button: [*c]const u8 = if (n_press == 2) "left" else "left";
@@ -208,6 +213,11 @@ pub fn onMouseReleased(
     const app: *App = @ptrCast(@alignCast(user_data orelse return));
     if (app.corep == null) return;
 
+    if (app.scrollbar.dragging) {
+        endScrollbarDrag(app, y);
+        return;
+    }
+
     const pos = pixelToGrid(app, x, y);
     app_mod.zonvie_core_send_mouse_input(
         app.corep,
@@ -231,6 +241,11 @@ pub fn onMouseMotion(
     const app: *App = @ptrCast(@alignCast(user_data orelse return));
     if (app.corep == null) return;
 
+    if (app.scrollbar.dragging) {
+        updateScrollbarDrag(app, y);
+        return;
+    }
+
     const pos = pixelToGrid(app, x, y);
     app_mod.zonvie_core_send_mouse_input(
         app.corep,
@@ -241,6 +256,73 @@ pub fn onMouseMotion(
         pos.row,
         pos.col,
     );
+}
+
+// =========================================================================
+// Scrollbar drag handling
+// =========================================================================
+
+fn scrollbarHitTest(app: *const App, x: f64, y: f64) bool {
+    if (!app.scrollbar.visible) return false;
+    const vp_w: f32 = @floatFromInt(app.drawable_w_px);
+    const sb_w = app_mod.scrollbarWidth(app.dpi_scale);
+    const sb_margin = app_mod.scrollbarMargin(app.dpi_scale);
+    const track_x = vp_w - sb_w - sb_margin;
+    return @as(f32, @floatCast(x)) >= track_x and @as(f32, @floatCast(y)) >= sb_margin;
+}
+
+fn startScrollbarDrag(app: *App, y: f64) void {
+    const vp_h: f32 = @floatFromInt(app.drawable_h_px);
+    const sb_margin = app_mod.scrollbarMargin(app.dpi_scale);
+    const track_h = vp_h - sb_margin * 2.0;
+    if (track_h <= 0) return;
+
+    // Check if click is on the knob or on the track
+    const click_in_track: f32 = (@as(f32, @floatCast(y)) - sb_margin) / track_h;
+    const knob_top = app.scrollbar.knob_top;
+    const knob_bottom = knob_top + app.scrollbar.knob_height;
+
+    if (click_in_track >= knob_top and click_in_track <= knob_bottom) {
+        // Clicked on knob — start drag from current position
+        app.scrollbar.drag_start_knob_top = knob_top;
+    } else {
+        // Clicked on track — jump knob to click position
+        app.scrollbar.drag_start_knob_top = click_in_track;
+        // Immediately scroll to that position
+        updateScrollbarDrag(app, y);
+    }
+
+    app.scrollbar.dragging = true;
+    app.scrollbar.drag_start_y = @floatCast(y);
+}
+
+fn updateScrollbarDrag(app: *App, y: f64) void {
+    const corep = app.corep orelse return;
+    const vp_h: f32 = @floatFromInt(app.drawable_h_px);
+    const sb_margin = app_mod.scrollbarMargin(app.dpi_scale);
+    const track_h = vp_h - sb_margin * 2.0;
+    if (track_h <= 0) return;
+
+    const dy: f32 = @as(f32, @floatCast(y)) - app.scrollbar.drag_start_y;
+    const scroll_ratio = std.math.clamp(app.scrollbar.drag_start_knob_top + dy / track_h, 0.0, 1.0);
+
+    // Throttle RPC calls (100ms)
+    const now = std.time.milliTimestamp();
+    if (now - app.scrollbar_last_scroll_time < 100) return;
+    app.scrollbar_last_scroll_time = now;
+
+    const line_count = app.scrollbar.linecount;
+    if (line_count <= 0) return;
+
+    const target_line: i64 = @intFromFloat(scroll_ratio * @as(f32, @floatFromInt(line_count)));
+    const use_bottom: bool = scroll_ratio >= 0.5;
+    app_mod.zonvie_core_scroll_to_line(corep, @max(1, target_line), use_bottom);
+}
+
+fn endScrollbarDrag(app: *App, y: f64) void {
+    // Flush final position
+    updateScrollbarDrag(app, y);
+    app.scrollbar.dragging = false;
 }
 
 /// GTK4 scroll signal handler (mouse wheel).
@@ -272,3 +354,160 @@ pub fn onScroll(
 
     return 1; // TRUE
 }
+
+// =========================================================================
+// IME handling
+// =========================================================================
+
+/// GTK4 IMContext "commit" signal handler.
+/// Called when IME composition is confirmed — the committed string should
+/// be sent to Neovim as regular input.
+pub fn onIMECommit(
+    im_context: ?*anyopaque,
+    str_ptr: ?[*:0]const u8,
+    user_data: ?*anyopaque,
+) callconv(.c) void {
+    _ = im_context;
+    const app: *App = @ptrCast(@alignCast(user_data orelse return));
+    if (app.corep == null) return;
+
+    const text = if (str_ptr) |s| std.mem.span(s) else return;
+    if (text.len == 0) return;
+
+    if (applog.isEnabled()) applog.appLog("[linux] IME commit: \"{s}\" len={d}\n", .{ text, text.len });
+
+    // Hide preedit overlay
+    hidePreeditOverlay(app);
+
+    // Send committed text to core as raw input
+    app_mod.zonvie_core_send_input(app.corep, text.ptr, text.len);
+}
+
+/// GTK4 IMContext "preedit-changed" signal handler.
+/// Retrieves preedit string and displays it at the cursor position.
+pub fn onIMEPreeditChanged(
+    im_context: ?*anyopaque,
+    user_data: ?*anyopaque,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(user_data orelse return));
+    const im = im_context orelse return;
+    const main = @import("main.zig");
+    const gtk = main.gtk_externs;
+
+    // Get cursor position from core
+    var cursor_row: i32 = 0;
+    var cursor_col: i32 = 0;
+    if (app.corep) |corep| {
+        _ = app_mod.zonvie_core_get_cursor_position(corep, &cursor_row, &cursor_col);
+    }
+
+    const cell_w: i32 = @intCast(app.cell_w_px);
+    const cell_h: i32 = @intCast(app.cell_h_px + app.linespace_px);
+
+    // Set cursor location for candidate window positioning
+    var rect = main.GdkRectangle{
+        .x = cursor_col * cell_w,
+        .y = cursor_row * cell_h,
+        .width = cell_w,
+        .height = cell_h,
+    };
+    gtk.im_context_set_cursor_location(im, &rect);
+
+    // Get preedit string
+    var preedit_str: ?[*:0]u8 = null;
+    var attrs: ?*anyopaque = null;
+    var cursor_pos: c_int = 0;
+    gtk.im_context_get_preedit_string(im, &preedit_str, &attrs, &cursor_pos);
+    defer if (attrs) |a| gtk.attr_list_unref(a);
+    defer if (preedit_str) |s| g_free(@ptrCast(s));
+
+    const preedit_text = if (preedit_str) |s| std.mem.span(s) else "";
+
+    if (preedit_text.len == 0) {
+        hidePreeditOverlay(app);
+        return;
+    }
+
+    if (applog.isEnabled()) applog.appLog("[linux] IME preedit: \"{s}\" cursor={d}\n", .{ preedit_text, cursor_pos });
+
+    // Show preedit overlay at cursor position
+    const label = app.preedit_label orelse return;
+
+    // Build Pango markup: text with underline, cursor position highlighted
+    // Split text at cursor_pos (byte offset from GTK) to show cursor
+    var markup_buf: [1024]u8 = undefined;
+    var markup_len: usize = 0;
+
+    // Find the byte offset for cursor_pos (which is in characters)
+    var char_count: usize = 0;
+    var byte_offset: usize = 0;
+    const cursor_byte = blk: {
+        while (byte_offset < preedit_text.len and char_count < @as(usize, @intCast(cursor_pos))) {
+            const b = preedit_text[byte_offset];
+            const seq_len: usize = if (b < 0x80) 1 else if (b < 0xE0) 2 else if (b < 0xF0) 3 else 4;
+            byte_offset += @min(seq_len, preedit_text.len - byte_offset);
+            char_count += 1;
+        }
+        break :blk byte_offset;
+    };
+
+    // Markup: <u>before_cursor</u><u><b>|</b></u><u>after_cursor</u>
+    // Actually simpler: just underline everything, the CSS border handles it
+    // Use Pango markup for underline
+    const prefix = "<u>";
+    const suffix = "</u>";
+    if (prefix.len + preedit_text.len + suffix.len < markup_buf.len) {
+        @memcpy(markup_buf[0..prefix.len], prefix);
+        markup_len = prefix.len;
+
+        // Escape XML special chars in preedit text
+        for (preedit_text) |c| {
+            if (markup_len >= markup_buf.len - 10) break;
+            switch (c) {
+                '<' => {
+                    @memcpy(markup_buf[markup_len..][0..4], "&lt;");
+                    markup_len += 4;
+                },
+                '>' => {
+                    @memcpy(markup_buf[markup_len..][0..4], "&gt;");
+                    markup_len += 4;
+                },
+                '&' => {
+                    @memcpy(markup_buf[markup_len..][0..5], "&amp;");
+                    markup_len += 5;
+                },
+                else => {
+                    markup_buf[markup_len] = c;
+                    markup_len += 1;
+                },
+            }
+        }
+        @memcpy(markup_buf[markup_len..][0..suffix.len], suffix);
+        markup_len += suffix.len;
+        markup_buf[markup_len] = 0;
+
+        gtk.label_set_markup(label, @ptrCast(&markup_buf));
+    } else {
+        // Fallback: just set plain text
+        if (preedit_str) |s| {
+            gtk.label_set_text(label, s);
+        }
+    }
+
+    _ = cursor_byte;
+
+    // Position the label at cursor location via margins
+    gtk.widget_set_margin_start(label, cursor_col * cell_w);
+    gtk.widget_set_margin_top(label, cursor_row * cell_h + cell_h);
+    gtk.widget_set_visible(label, 1);
+}
+
+fn hidePreeditOverlay(app: *App) void {
+    const main = @import("main.zig");
+    if (app.preedit_label) |label| {
+        main.gtk_externs.label_set_text(label, "");
+        main.gtk_externs.widget_set_visible(label, 0);
+    }
+}
+
+extern "c" fn g_free(ptr: ?*anyopaque) void;

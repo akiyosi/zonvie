@@ -133,6 +133,22 @@ pub const CMDLINE_CORNER_RADIUS: f32 = 8.0;
 pub const MSG_PADDING: u32 = 8;
 
 // =========================================================================
+// Message display types
+// =========================================================================
+
+pub const MiniWindowId = enum(u8) {
+    showmode = 0,
+    showcmd = 1,
+    ruler = 2,
+};
+
+pub const MiniWindow = struct {
+    text: [256]u8 = undefined,
+    text_len: usize = 0,
+};
+
+
+// =========================================================================
 // Tabline style
 // =========================================================================
 
@@ -148,6 +164,9 @@ pub const TablineStyle = enum {
 
 // Global exit code (returned from main)
 pub var g_exit_code: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+// Global app pointer for GTK signal handlers that can't carry user_data
+pub var g_app: ?*App = null;
 
 // =========================================================================
 // Type definitions
@@ -693,6 +712,8 @@ pub const ExternalWindow = struct {
     needs_redraw: bool = false,
     rows: u32 = 0,
     cols: u32 = 0,
+    start_row: i32 = 0,
+    start_col: i32 = 0,
 
     pub fn deinit(self: *ExternalWindow, alloc: std.mem.Allocator) void {
         for (self.row_vbs.items) |*rvb| {
@@ -721,6 +742,10 @@ pub const App = struct {
     main_window: ?*anyopaque = null,
     gl_area: ?*anyopaque = null,
     im_context: ?*anyopaque = null,
+    tab_bar_box: ?*anyopaque = null,
+    mini_label: ?*anyopaque = null,
+    preedit_label: ?*anyopaque = null,
+    preedit_overlay: ?*anyopaque = null, // GtkOverlay parent (for positioning)
 
     // Core
     corep: ?*zonvie_core = null,
@@ -743,6 +768,13 @@ pub const App = struct {
     cmdline_visible: bool = false,
     cmdline_border_color: [3]f32 = .{ 1.0, 1.0, 0.0 }, // default yellow (Search bg)
     cmdline_icon_color: [3]f32 = .{ 0.5, 0.5, 0.5 }, // default gray (Comment fg)
+
+    // ext_messages state
+    mini_windows: [3]MiniWindow = [_]MiniWindow{.{}} ** 3,
+    msg_hide_timer: c_uint = 0,
+
+    // ext_tabline state
+    tabline: @import("ui/tabbar.zig").TablineState = .{},
 
     // ext_popupmenu state
     popupmenu_visible: bool = false,
@@ -776,12 +808,15 @@ pub const App = struct {
     cursor: ?Cursor = null,
     last_painted_cursor_row: ?u32 = null,
     cursor_blink_state: bool = true,
-    cursor_blink_timer: u32 = 0,
+    cursor_blink_timer: c_uint = 0,
+    cursor_blink_phase: u8 = 0, // 0 = wait, 1 = blink cycle
+    cursor_blink_wait_ms: u32 = 0,
+    cursor_blink_on_ms: u32 = 0,
+    cursor_blink_off_ms: u32 = 0,
 
     // Scrollbar
-    scrollbar_update_pending: std.atomic.Value(bool) = .init(false),
-    scrollbar_visible: bool = false,
-    scrollbar_alpha: f32 = 0.0,
+    scrollbar: @import("ui/scrollbar.zig").ScrollbarState = .{},
+    scrollbar_last_scroll_time: i64 = 0,
 
     // SSH / remote
     ssh_mode: bool = false,
@@ -845,6 +880,20 @@ pub const App = struct {
     rasterize_call_count: std.atomic.Value(u64) = .init(0),
     rasterize_total_ns: std.atomic.Value(u64) = .init(0),
     rasterize_max_ns: std.atomic.Value(u64) = .init(0),
+
+    // Window title (set from core thread, applied on GTK main thread)
+    pending_title: [512]u8 = undefined,
+    pending_title_len: usize = 0,
+
+    // Clipboard (async GTK ↔ sync core bridge)
+    clipboard_mu: std.Thread.Mutex = .{},
+    clipboard_cond: std.Thread.Condition = .{},
+    clipboard_buf: [65536]u8 = undefined,
+    clipboard_len: usize = 0,
+    clipboard_result: c_int = 0,
+    clipboard_ready: bool = false,
+    clipboard_set_data: ?[*]const u8 = null,
+    clipboard_set_len: usize = 0,
 
     /// Scale a logical pixel value by DPI scale factor
     pub fn scalePx(self: *const App, v: u32) i32 {
