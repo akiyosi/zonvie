@@ -66,3 +66,26 @@ pub extern "c" fn g_source_remove(tag: c_uint) c_int;
 // =========================================================================
 
 pub extern "c" fn gdk_keyval_to_unicode(keyval: c_uint) u32;
+
+// =========================================================================
+// GLib signal connection helper
+// =========================================================================
+
+/// Connect a signal handler (simplified g_signal_connect macro).
+pub fn g_signal_connect(
+    instance: *anyopaque,
+    detailed_signal: [*:0]const u8,
+    c_handler: *const anyopaque,
+    data: ?*anyopaque,
+) c_ulong {
+    return g_signal_connect_data(instance, detailed_signal, c_handler, data, null, 0);
+}
+
+extern "c" fn g_signal_connect_data(
+    instance: *anyopaque,
+    detailed_signal: [*:0]const u8,
+    c_handler: *const anyopaque,
+    data: ?*anyopaque,
+    destroy_data: ?*anyopaque,
+    connect_flags: c_uint,
+) c_ulong;
