@@ -375,9 +375,18 @@ pub const Config = struct {
                             if (r.kind) |kind_arr| {
                                 var kinds_list: std.ArrayList([]const u8) = .{};
                                 for (kind_arr) |k| {
-                                    kinds_list.append(alloc, alloc.dupe(u8, k) catch continue) catch continue;
+                                    const duped = alloc.dupe(u8, k) catch continue;
+                                    kinds_list.append(alloc, duped) catch {
+                                        alloc.free(duped);
+                                        continue;
+                                    };
                                 }
-                                kinds = kinds_list.toOwnedSlice(alloc) catch null;
+                                if (kinds_list.toOwnedSlice(alloc)) |slice| {
+                                    kinds = slice;
+                                } else |_| {
+                                    for (kinds_list.items) |k_str| alloc.free(k_str);
+                                    kinds_list.deinit(alloc);
+                                }
                             }
 
                             route_list.append(alloc, .{
@@ -387,13 +396,29 @@ pub const Config = struct {
                                 .timeout = r.timeout,
                                 .min_height = r.min_height,
                                 .max_height = r.max_height,
-                            }) catch continue;
+                            }) catch {
+                                if (kinds) |ks| {
+                                    for (ks) |k_str| alloc.free(k_str);
+                                    alloc.free(ks);
+                                }
+                                continue;
+                            };
                         }
                     }
                 }
                 if (route_list.items.len > 0) {
-                    self.messages.routes = route_list.toOwnedSlice(alloc) catch &default_routes;
-                    self.routes_allocated = true;
+                    if (route_list.toOwnedSlice(alloc)) |slice| {
+                        self.messages.routes = slice;
+                        self.routes_allocated = true;
+                    } else |_| {
+                        for (route_list.items) |route| {
+                            if (route.kinds) |ks| {
+                                for (ks) |k_str| alloc.free(k_str);
+                                alloc.free(ks);
+                            }
+                        }
+                        route_list.deinit(alloc);
+                    }
                 }
             }
         }

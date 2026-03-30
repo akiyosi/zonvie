@@ -2815,10 +2815,13 @@ pub const FlushCtx = struct {
                         // Store composed vertices in scroll cache for future reuse
                         if (r < ctx.core.scroll_cache_rows) {
                             var cached_row = &ctx.core.scroll_cache.items[r];
-                            cached_row.clearRetainingCapacity();
-                            cached_row.ensureTotalCapacity(ctx.core.alloc, out.items.len) catch {};
-                            cached_row.appendSliceAssumeCapacity(out.items);
-                            ctx.core.scroll_cache_valid.set(r);
+                            if (cached_row.ensureTotalCapacity(ctx.core.alloc, out.items.len)) |_| {
+                                cached_row.clearRetainingCapacity();
+                                cached_row.appendSliceAssumeCapacity(out.items);
+                                ctx.core.scroll_cache_valid.set(r);
+                            } else |_| {
+                                ctx.core.scroll_cache_valid.unset(r);
+                            }
                         }
 
                         var t_row_before_cb: i128 = 0;

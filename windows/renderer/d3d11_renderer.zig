@@ -893,7 +893,7 @@ pub const Renderer = struct {
         // ---- Post-process bloom (neon glow) ----
         if (opts.glow_enabled and self.vs_fullscreen != null and self.ps_glow_extract != null) {
             self.ensureGlowTextures();
-            if (self.glow_extract_rtv != null and self.glow_mip_rtv[0] != null) {
+            if (self.glowTexturesComplete()) {
                 self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, opts.glow_intensity, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height);
             }
         }
@@ -2535,6 +2535,19 @@ pub const Renderer = struct {
         self.glow_half_h = hh;
     }
 
+    /// Check whether all glow texture resources (tex/RTV/SRV) were fully created.
+    /// Returns false if ensureGlowTextures() returned early due to a partial failure.
+    fn glowTexturesComplete(self: *const Renderer) bool {
+        if (self.glow_extract_rtv == null or self.glow_extract_srv == null) return false;
+        for (self.glow_mip_rtv) |r| {
+            if (r == null) return false;
+        }
+        for (self.glow_mip_srv) |s| {
+            if (s == null) return false;
+        }
+        return true;
+    }
+
     /// Execute post-process bloom: extract → Dual Kawase downsample/upsample → composite.
     fn drawBloomPasses(
         self: *Renderer,
@@ -2774,7 +2787,7 @@ pub const Renderer = struct {
     pub fn drawBloomFromVerts(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex, intensity: f32, vp_x: u32, vp_y: u32, vp_w: u32, vp_h: u32) void {
         if (self.vs_fullscreen == null or self.ps_glow_extract == null) return;
         self.ensureGlowTextures();
-        if (self.glow_extract_rtv == null or self.glow_mip_rtv[0] == null) return;
+        if (!self.glowTexturesComplete()) return;
         const ctx = self.ctx orelse return;
         const ctx_vtbl = ctx.*.lpVtbl;
         self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, intensity, vp_x, vp_y, vp_w, vp_h);

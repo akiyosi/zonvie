@@ -797,6 +797,8 @@ pub const Core = struct {
         // Resize the valid bitset
         if (self.scroll_cache_valid.bit_length != target_rows) {
             self.scroll_cache_valid.deinit(self.alloc);
+            self.scroll_cache_valid = .{}; // zero state so use-after-free cannot occur on alloc failure
+            self.scroll_cache_rows = 0; // invalidate cache_ready check in flush
             self.scroll_cache_valid = try std.DynamicBitSetUnmanaged.initEmpty(self.alloc, target_rows);
         }
         self.scroll_cache_rows = target_rows;
@@ -975,9 +977,12 @@ pub const Core = struct {
     pub fn initHlCache(self: *Core) !void {
         if (self.hl_cache_initialized) return;
         const size = self.hl_cache_size;
-        self.hl_cache_buf = try self.alloc.alloc(highlight.ResolvedAttrWithStyles, size);
-        self.hl_valid_buf = try self.alloc.alloc(bool, size);
-        @memset(self.hl_valid_buf.?, false);
+        const hl_buf = try self.alloc.alloc(highlight.ResolvedAttrWithStyles, size);
+        errdefer self.alloc.free(hl_buf);
+        const valid_buf = try self.alloc.alloc(bool, size);
+        @memset(valid_buf, false);
+        self.hl_cache_buf = hl_buf;
+        self.hl_valid_buf = valid_buf;
         self.hl_cache_initialized = true;
     }
 
