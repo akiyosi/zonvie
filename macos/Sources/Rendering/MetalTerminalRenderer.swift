@@ -570,6 +570,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         copySurfaceBufferSetRowState(from: src, to: dst)
         let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
+        // Save dst's main/cursor buffers into the detach pool before shallow-copying src.
+        dst.detachPoolMainBuffer = dst.mainVertexBuffer
+        dst.detachPoolMainCap = dst.mainVertexBufferCap
+        dst.detachPoolCursorBuffer = dst.cursorVertexBuffer
+        dst.detachPoolCursorCap = dst.cursorVertexBufferCap
+
         let sharedMainBytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
         let tMainCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         dst.mainVertexBuffer = src.mainVertexBuffer
@@ -2166,41 +2172,76 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // surfaceSafeNeededBytes() / surfaceGrowCapacity().
     
     /// Ensure main vertex buffer in the specified buffer set has sufficient capacity.
+    /// If the buffer is shared with the committed set (COW), detach by reusing
+    /// the pool buffer saved in beginFlush, or allocate new if pool is insufficient.
     private func ensureMainBufferInSet(_ setIdx: Int, vertexCount: Int) {
-        if setIdx == writeSetIndex {
-            precondition(isInFlush, "write-set buffer detachment is only valid during an active flush")
-        }
         let vc = max(0, vertexCount)
         guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else { return }
 
         let srcMain = bufferSets[flushSourceSetIndex].mainVertexBuffer
-        let sharesCommitted = setIdx == writeSetIndex && srcMain != nil && bufferSets[setIdx].mainVertexBuffer === srcMain
-        if sharesCommitted || bufferSets[setIdx].mainVertexBuffer == nil || needed > bufferSets[setIdx].mainVertexBufferCap {
+        let sharesSource = setIdx == writeSetIndex && srcMain != nil
+            && bufferSets[setIdx].mainVertexBuffer === srcMain
+        let needsNew = sharesSource
+            || bufferSets[setIdx].mainVertexBuffer == nil
+            || needed > bufferSets[setIdx].mainVertexBufferCap
+
+        if needsNew {
             guard let nextCap = surfaceGrowCapacity(current: bufferSets[setIdx].mainVertexBufferCap, needed: max(1, needed)) else { return }
-            bufferSets[setIdx].mainVertexBufferCap = nextCap
-            bufferSets[setIdx].mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if bufferSets[setIdx].mainVertexBuffer == nil {
-                bufferSets[setIdx].mainVertexBufferCap = 0
+
+            // Try detach pool first.
+            // Guard: pool buffer must not alias source, otherwise we'd
+            // write into the committed frame.
+            let bs = bufferSets[setIdx]
+            if let poolBuf = bs.detachPoolMainBuffer,
+               bs.detachPoolMainCap >= nextCap,
+               poolBuf !== srcMain
+            {
+                bs.mainVertexBuffer = poolBuf
+                bs.mainVertexBufferCap = bs.detachPoolMainCap
+                bs.detachPoolMainBuffer = nil
+            } else {
+                bs.mainVertexBufferCap = nextCap
+                bs.mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                if bs.mainVertexBuffer == nil {
+                    bs.mainVertexBufferCap = 0
+                }
             }
         }
     }
 
     /// Ensure cursor vertex buffer in the specified buffer set has sufficient capacity.
+    /// If the buffer is shared with the committed set (COW), detach by reusing
+    /// the pool buffer saved in beginFlush, or allocate new if pool is insufficient.
     private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
-        if setIdx == writeSetIndex {
-            precondition(isInFlush, "write-set buffer detachment is only valid during an active flush")
-        }
         let vc = max(0, vertexCount)
         guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else { return }
 
         let srcCursor = bufferSets[flushSourceSetIndex].cursorVertexBuffer
-        let sharesCommitted = setIdx == writeSetIndex && srcCursor != nil && bufferSets[setIdx].cursorVertexBuffer === srcCursor
-        if sharesCommitted || bufferSets[setIdx].cursorVertexBuffer == nil || needed > bufferSets[setIdx].cursorVertexBufferCap {
+        let sharesSource = setIdx == writeSetIndex && srcCursor != nil
+            && bufferSets[setIdx].cursorVertexBuffer === srcCursor
+        let needsNew = sharesSource
+            || bufferSets[setIdx].cursorVertexBuffer == nil
+            || needed > bufferSets[setIdx].cursorVertexBufferCap
+
+        if needsNew {
             guard let nextCap = surfaceGrowCapacity(current: bufferSets[setIdx].cursorVertexBufferCap, needed: max(1, needed)) else { return }
-            bufferSets[setIdx].cursorVertexBufferCap = nextCap
-            bufferSets[setIdx].cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if bufferSets[setIdx].cursorVertexBuffer == nil {
-                bufferSets[setIdx].cursorVertexBufferCap = 0
+
+            // Try detach pool first.
+            // Guard: pool buffer must not alias source.
+            let bs = bufferSets[setIdx]
+            if let poolBuf = bs.detachPoolCursorBuffer,
+               bs.detachPoolCursorCap >= nextCap,
+               poolBuf !== srcCursor
+            {
+                bs.cursorVertexBuffer = poolBuf
+                bs.cursorVertexBufferCap = bs.detachPoolCursorCap
+                bs.detachPoolCursorBuffer = nil
+            } else {
+                bs.cursorVertexBufferCap = nextCap
+                bs.cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                if bs.cursorVertexBuffer == nil {
+                    bs.cursorVertexBufferCap = 0
+                }
             }
         }
     }
@@ -2214,11 +2255,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         prepareSurfaceRowModeSetForWrite(bufferSet: bufferSets[setIdx], totalRows: totalRows)
     }
 
-    private func ensureDetachedRowBufferInSet(_ setIdx: Int, row: Int, vertexCount: Int) -> MTLBuffer? {
+    private func ensureRowBufferInSet(_ setIdx: Int, row: Int, vertexCount: Int) -> MTLBuffer? {
         if setIdx == writeSetIndex {
-            precondition(isInFlush, "write-set row detachment is only valid during an active flush")
+            precondition(isInFlush, "write-set row buffer allocation is only valid during an active flush")
         }
-        return ensureDetachedSurfaceRowBuffer(
+        return ensureSurfaceRowBuffer(
             bufferSet: bufferSets[setIdx],
             sourceSet: bufferSets[flushSourceSetIndex],
             device: device,
@@ -2298,7 +2339,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }
-                guard let dstBuffer = ensureDetachedRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }
@@ -2332,7 +2373,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }
-                guard let dstBuffer = ensureDetachedRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }

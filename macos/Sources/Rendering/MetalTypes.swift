@@ -3,6 +3,7 @@ import Foundation
 import Metal
 import simd
 
+
 struct Vertex {
     var position: simd_float2
     var texCoord: simd_float2
@@ -278,6 +279,15 @@ final class SurfaceBufferSet {
     var cursorVertexBuffer: MTLBuffer? = nil
     var cursorVertexBufferCap: Int = 0
     var cursorVertexCount: Int = 0
+
+    // Detach pool: buffers saved from this set before beginFlush overwrites them.
+    // On COW detach, reuse a pool buffer instead of calling device.makeBuffer().
+    var detachPoolRowBuffers: [MTLBuffer?] = []
+    var detachPoolRowCapacities: [Int] = []
+    var detachPoolMainBuffer: MTLBuffer? = nil
+    var detachPoolMainCap: Int = 0
+    var detachPoolCursorBuffer: MTLBuffer? = nil
+    var detachPoolCursorCap: Int = 0
 }
 
 /// Pick a free buffer set index for writing during a flush.
@@ -380,9 +390,12 @@ func prepareSurfaceRowModeSetForWrite(bufferSet: SurfaceBufferSet, totalRows: In
     }
 }
 
-/// Ensure a detached (COW-safe) row buffer for writing.
-/// If `sourceSet` is provided, detaches from shared buffers on first write.
-func ensureDetachedSurfaceRowBuffer(
+/// Ensure a writable row buffer for the given slot.
+/// If the current buffer is shared with the source set (COW), detach by
+/// taking a buffer from the detach pool (saved in copySurfaceBufferSetRowState).
+/// A new MTLBuffer via device.makeBuffer is only created when no pool buffer
+/// of sufficient capacity exists.
+func ensureSurfaceRowBuffer(
     bufferSet: SurfaceBufferSet,
     sourceSet: SurfaceBufferSet?,
     device: MTLDevice,
@@ -395,17 +408,46 @@ func ensureDetachedSurfaceRowBuffer(
     guard row < bufferSet.rowState.buffers.count else { return nil }
     guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) else { return nil }
 
+    // Check if we share this buffer with the source (committed) set.
     let srcRowBuffer = sourceSet.flatMap { src in
         row < src.rowState.buffers.count ? src.rowState.buffers[row] : nil
     }
-    let sharesSource = sourceSet != nil && srcRowBuffer != nil && bufferSet.rowState.buffers[row] === srcRowBuffer
-    if sharesSource || bufferSet.rowState.buffers[row] == nil || neededBytes > bufferSet.rowState.capacities[row] {
-        guard let nextCap = surfaceGrowCapacity(current: bufferSet.rowState.capacities[row], needed: max(1, neededBytes)) else { return nil }
-        bufferSet.rowState.capacities[row] = nextCap
-        bufferSet.rowState.buffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
-        if bufferSet.rowState.buffers[row] == nil {
-            bufferSet.rowState.capacities[row] = 0
-            return nil
+    let sharesSource = sourceSet != nil && srcRowBuffer != nil
+        && bufferSet.rowState.buffers[row] === srcRowBuffer
+
+    let needsNewBuffer = sharesSource
+        || bufferSet.rowState.buffers[row] == nil
+        || neededBytes > bufferSet.rowState.capacities[row]
+
+    if needsNewBuffer {
+        guard let nextCap = surfaceGrowCapacity(
+            current: bufferSet.rowState.capacities[row],
+            needed: max(1, neededBytes)
+        ) else { return nil }
+
+        // Try to reuse a buffer from the detach pool (saved before shallow copy).
+        // Guard: the pool buffer must not alias the source buffer, otherwise
+        // we'd write into the committed frame.
+        var reused = false
+        if row < bufferSet.detachPoolRowBuffers.count,
+           let poolBuf = bufferSet.detachPoolRowBuffers[row],
+           row < bufferSet.detachPoolRowCapacities.count,
+           bufferSet.detachPoolRowCapacities[row] >= nextCap,
+           poolBuf !== srcRowBuffer
+        {
+            bufferSet.rowState.buffers[row] = poolBuf
+            bufferSet.rowState.capacities[row] = bufferSet.detachPoolRowCapacities[row]
+            bufferSet.detachPoolRowBuffers[row] = nil  // consumed
+            reused = true
+        }
+
+        if !reused {
+            bufferSet.rowState.capacities[row] = nextCap
+            bufferSet.rowState.buffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bufferSet.rowState.buffers[row] == nil {
+                bufferSet.rowState.capacities[row] = 0
+                return nil
+            }
         }
     }
     return bufferSet.rowState.buffers[row]
@@ -452,8 +494,16 @@ func remapSurfaceRowSlots(
     }
 }
 
-/// Copy shared buffer references from source to destination (COW shallow copy).
+/// Copy buffer set state from source to destination for the start of a new flush.
+/// Before overwriting dst's buffer references with src's (shallow copy), dst's
+/// own buffers are saved into the detach pool.  On COW detach, pool buffers
+/// are reused instead of calling device.makeBuffer(), keeping the total
+/// MTLBuffer count bounded at 3 sets × rows.
 func copySurfaceBufferSetRowState(from src: SurfaceBufferSet, to dst: SurfaceBufferSet) {
+    // Save dst's own row buffers into the detach pool before overwriting.
+    dst.detachPoolRowBuffers = dst.rowState.buffers
+    dst.detachPoolRowCapacities = dst.rowState.capacities
+
     dst.knownTotalRows = src.knownTotalRows
     dst.rowState.buffers = src.rowState.buffers
     dst.rowState.capacities = src.rowState.capacities
@@ -469,7 +519,6 @@ func copySurfaceBufferSetRowState(from src: SurfaceBufferSet, to dst: SurfaceBuf
 ///
 /// - Parameters:
 ///   - target: The buffer set to write into (write set during flush, or committed set)
-///   - sourceSet: Source buffer set for COW detach (typically the flush source set, nil if none)
 ///   - device: Metal device for buffer allocation
 ///   - rowStart: Logical row index
 ///   - ptr: Raw pointer to vertex data (nil clears the row). Must point to
@@ -510,7 +559,7 @@ func submitSurfaceRowVertices(
         return
     }
 
-    guard let dstBuffer = ensureDetachedSurfaceRowBuffer(
+    guard let dstBuffer = ensureSurfaceRowBuffer(
         bufferSet: target,
         sourceSet: sourceSet,
         device: device,
