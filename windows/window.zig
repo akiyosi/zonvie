@@ -2259,6 +2259,7 @@ pub export fn WndProc(
                     }
                     break :blk effective_nvim;
                 };
+                defer if (quoted_nvim.ptr != effective_nvim.ptr) app.alloc.free(@constCast(quoted_nvim));
 
                 if (app.wsl_mode) {
                     var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);

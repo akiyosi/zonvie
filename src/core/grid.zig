@@ -977,6 +977,9 @@ pub const Grid = struct {
         // ext_messages
         self.message_state.deinit(self.alloc);
         self.msg_history_state.deinit(self.alloc);
+
+        // mode info
+        self.mode_infos.deinit(self.alloc);
     }
 
     // Per-grid cell metrics in drawable pixels (for goneovim-like float positioning).
@@ -1847,6 +1850,7 @@ pub const Grid = struct {
         // Dup and append each chunk's text (arena memory may be freed later)
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try state.content.append(self.alloc, CmdlineChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -1856,11 +1860,12 @@ pub const Grid = struct {
         state.pos = pos;
         state.firstc = firstc;
 
-        // Free previous prompt and dup new one
+        // Dupe new prompt first, then free old one (avoid dangling on OOM)
+        const new_prompt = if (prompt.len > 0) try self.alloc.dupe(u8, prompt) else "";
         if (state.prompt.len > 0) {
             self.alloc.free(state.prompt);
         }
-        state.prompt = if (prompt.len > 0) try self.alloc.dupe(u8, prompt) else "";
+        state.prompt = new_prompt;
 
         state.indent = indent;
         state.level = level;
@@ -1905,9 +1910,16 @@ pub const Grid = struct {
         self.cmdline_block.clear(self.alloc);
         for (lines) |line| {
             var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .{};
+            errdefer {
+                for (line_chunks.items) |chunk| {
+                    if (chunk.text.len > 0) self.alloc.free(chunk.text);
+                }
+                line_chunks.deinit(self.alloc);
+            }
             // Dup each chunk's text (arena memory may be freed later)
             for (line) |chunk| {
                 const duped_text = try self.alloc.dupe(u8, chunk.text);
+                errdefer self.alloc.free(duped_text);
                 try line_chunks.append(self.alloc, CmdlineChunk{
                     .hl_id = chunk.hl_id,
                     .text = duped_text,
@@ -1922,9 +1934,16 @@ pub const Grid = struct {
     /// Handle cmdline_block_append event.
     pub fn appendCmdlineBlock(self: *Grid, line: []const CmdlineChunk) !void {
         var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .{};
+        errdefer {
+            for (line_chunks.items) |chunk| {
+                if (chunk.text.len > 0) self.alloc.free(chunk.text);
+            }
+            line_chunks.deinit(self.alloc);
+        }
         // Dup each chunk's text (arena memory may be freed later)
         for (line) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try line_chunks.append(self.alloc, CmdlineChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -1976,9 +1995,13 @@ pub const Grid = struct {
         // Copy items (dup strings from arena memory)
         for (items) |item| {
             const duped_word = if (item.word.len > 0) try self.alloc.dupe(u8, item.word) else "";
+            errdefer if (duped_word.len > 0) self.alloc.free(duped_word);
             const duped_kind = if (item.kind.len > 0) try self.alloc.dupe(u8, item.kind) else "";
+            errdefer if (duped_kind.len > 0) self.alloc.free(duped_kind);
             const duped_menu = if (item.menu.len > 0) try self.alloc.dupe(u8, item.menu) else "";
+            errdefer if (duped_menu.len > 0) self.alloc.free(duped_menu);
             const duped_info = if (item.info.len > 0) try self.alloc.dupe(u8, item.info) else "";
+            errdefer if (duped_info.len > 0) self.alloc.free(duped_info);
             try self.popupmenu.items.append(self.alloc, PopupmenuItem{
                 .word = duped_word,
                 .kind = duped_kind,
@@ -2184,6 +2207,7 @@ pub const Grid = struct {
                 // Copy new content
                 for (content) |chunk| {
                     const duped_text = try self.alloc.dupe(u8, chunk.text);
+                    errdefer self.alloc.free(duped_text);
                     try msg.content.append(self.alloc, MsgChunk{
                         .hl_id = chunk.hl_id,
                         .text = duped_text,
@@ -2202,6 +2226,7 @@ pub const Grid = struct {
             const last_msg = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
             for (content) |chunk| {
                 const duped_text = try self.alloc.dupe(u8, chunk.text);
+                errdefer self.alloc.free(duped_text);
                 try last_msg.content.append(self.alloc, MsgChunk{
                     .hl_id = chunk.hl_id,
                     .text = duped_text,
@@ -2229,10 +2254,12 @@ pub const Grid = struct {
             .append = append,
             .replace_last = replace_last,
         };
+        errdefer new_msg.deinit(self.alloc);
 
         // Copy content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try new_msg.content.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -2295,6 +2322,7 @@ pub const Grid = struct {
         // Copy new content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try self.message_state.showmode_content.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -2314,6 +2342,7 @@ pub const Grid = struct {
         // Copy new content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try self.message_state.showcmd_content.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -2333,6 +2362,7 @@ pub const Grid = struct {
         // Copy new content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
+            errdefer self.alloc.free(duped_text);
             try self.message_state.ruler_content.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
@@ -2352,8 +2382,10 @@ pub const Grid = struct {
                 .kind = if (entry.kind.len > 0) try self.alloc.dupe(u8, entry.kind) else "",
                 .append = entry.append,
             };
+            errdefer new_entry.deinit(self.alloc);
             for (entry.content.items) |chunk| {
                 const duped_text = try self.alloc.dupe(u8, chunk.text);
+                errdefer self.alloc.free(duped_text);
                 try new_entry.content.append(self.alloc, MsgChunk{
                     .hl_id = chunk.hl_id,
                     .text = duped_text,

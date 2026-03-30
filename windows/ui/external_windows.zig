@@ -1086,6 +1086,20 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         if (ew.hwnd) |hwnd| {
             var rect: c.RECT = undefined;
             if (c.GetWindowRect(hwnd, &rect) != 0) {
+                // Evict oldest entry (smallest grid_id) when inserting a new key
+                // to bound memory growth (matches macOS 100-entry cap).
+                if (app.saved_external_window_positions.getPtr(grid_id) == null and
+                    app.saved_external_window_positions.count() > 100)
+                {
+                    var min_key: i64 = std.math.maxInt(i64);
+                    var pos_it = app.saved_external_window_positions.iterator();
+                    while (pos_it.next()) |e| {
+                        if (e.key_ptr.* < min_key) min_key = e.key_ptr.*;
+                    }
+                    if (min_key != std.math.maxInt(i64)) {
+                        _ = app.saved_external_window_positions.remove(min_key);
+                    }
+                }
                 app.saved_external_window_positions.put(app.alloc, grid_id, .{
                     .x = rect.left,
                     .y = rect.top,

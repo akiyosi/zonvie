@@ -135,12 +135,22 @@ final class ViewController: NSViewController {
         // explicit stop point (e.g. windowWillClose or a dedicated cleanup
         // method) must be added for the detached ViewController's core.
 
-        // Remove notification observers
+        // Remove notification observers and nil tokens so viewDidAppear can re-register
         if let observer = tablineUpdateObserver {
             NotificationCenter.default.removeObserver(observer)
+            tablineUpdateObserver = nil
         }
         if let observer = tablineHideObserver {
             NotificationCenter.default.removeObserver(observer)
+            tablineHideObserver = nil
+        }
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
+        if tablineUpdateObserver == nil {
+            setupTablineNotificationObservers()
         }
     }
 

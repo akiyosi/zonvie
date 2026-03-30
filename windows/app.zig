@@ -2837,6 +2837,17 @@ pub const App = struct {
             self.cursor_vb_bytes = 0;
         }
 
+        // Release scrollbar VB (main window)
+        if (self.scrollbar_vb) |vb| {
+            _ = vb.lpVtbl.*.Release.?(vb);
+            self.scrollbar_vb = null;
+        }
+
+        // Free remaining ArrayListUnmanaged backing buffers
+        self.paint_rects.deinit(self.alloc);
+        self.nvim_extra_args.deinit(self.alloc);
+        self.pending_glyphs.deinit(self.alloc);
+
         // IME state cleanup
         self.ime_composition_str.deinit(self.alloc);
         self.ime_composition_utf8.deinit(self.alloc);
