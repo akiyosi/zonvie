@@ -2375,7 +2375,7 @@ pub const FlushCtx = struct {
                     // Build the set of rows to compose this pass.
                     // Fast path: only touched_rows + prev_cursor_row (frontend retains other rows).
                     // Fallback: all dirty rows (existing behavior).
-                    var regen_rows: [12]u32 = undefined; // max: 8 touched + prev_cursor + margin
+                    var regen_rows: [32]u32 = undefined; // 8 touched + cursor + non-scroll dirty rows
                     var regen_count: u32 = 0;
                     var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
 
@@ -2416,6 +2416,35 @@ pub const FlushCtx = struct {
                         if (log_enabled) {
                             const t_prep_regen_build_end = std.time.nanoTimestamp();
                             perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
+                        }
+
+                        // Expand regen_rows with non-scroll dirty rows.
+                        // Events like win_float_pos, win_pos, win_hide mark
+                        // dirty_rows but do not call recordScrollTouchedRow.
+                        // Without this, those rows are skipped by the fast path
+                        // and their dirty state is lost when clearDirty runs.
+                        // Must run BEFORE shiftScrollCacheAndValidate so the
+                        // cache shift correctly invalidates these rows.
+                        if (!effective_rebuild_all) {
+                            var dr: u32 = 0;
+                            while (dr < rows) : (dr += 1) {
+                                if (!ctx.core.grid.dirty_rows.isSet(@as(usize, dr))) continue;
+                                var found = false;
+                                for (regen_rows[0..regen_count]) |rr| {
+                                    if (rr == dr) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    if (regen_count >= regen_rows.len) {
+                                        use_scroll_fast_path = false;
+                                        break;
+                                    }
+                                    regen_rows[regen_count] = dr;
+                                    regen_count += 1;
+                                }
+                            }
                         }
 
                         // --- Scroll cache: shift + y-adjust + validity check ---
