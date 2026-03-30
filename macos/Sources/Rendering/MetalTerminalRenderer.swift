@@ -1610,14 +1610,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_present_start = CFAbsoluteTimeGetCurrent()
             }
             cmd.present(drawable)
+            // Capture semaphore and lock directly so the signal fires even
+            // if the renderer is deallocated before the GPU finishes.
+            let sem = inflightSemaphore
+            let lk = lock
             cmd.addCompletedHandler { [weak self, weak view] _ in
-                guard let self = self else { return }
-                // Release GPU in-flight mark + semaphore for this buffer set
-                self.lock.lock()
-                self.gpuInFlightCount[csi] -= 1
-                self.lock.unlock()
-                self.inflightSemaphore.signal()
+                // Always release GPU in-flight mark + semaphore, even if self is gone.
+                lk.lock()
+                self?.gpuInFlightCount[csi] -= 1
+                lk.unlock()
+                sem.signal()
 
+                guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
 

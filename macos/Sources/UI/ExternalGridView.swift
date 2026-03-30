@@ -1293,12 +1293,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             // --- Blit back buffer to drawable ---
             guard let drawable = view.currentDrawable else {
+                // Capture semaphore and lock directly so the signal fires even
+                // if the view is deallocated before the GPU finishes.
+                let sem = inflightSemaphore
+                let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
-                    guard let self else { return }
-                    self.tripleBufferLock.lock()
-                    self.gpuInFlightCount[csi] -= 1
-                    self.tripleBufferLock.unlock()
-                    self.inflightSemaphore.signal()
+                    tbLock.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    tbLock.unlock()
+                    sem.signal()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -1359,12 +1362,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             cmd.present(drawable)
+            // Capture semaphore and lock directly so the signal fires even
+            // if the view is deallocated before the GPU finishes.
+            let sem = inflightSemaphore
+            let tbLock = tripleBufferLock
             cmd.addCompletedHandler { [weak self] _ in
-                guard let self else { return }
-                self.tripleBufferLock.lock()
-                self.gpuInFlightCount[csi] -= 1
-                self.tripleBufferLock.unlock()
-                self.inflightSemaphore.signal()
+                tbLock.lock()
+                self?.gpuInFlightCount[csi] -= 1
+                tbLock.unlock()
+                sem.signal()
             }
             cmd.commit()
             gpuSubmitted = true
