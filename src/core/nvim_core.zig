@@ -292,6 +292,7 @@ const CwdOwner = rpc_session.CwdOwner;
 const GridEntry = flush.GridEntry;
 const MAX_CACHED_SUBGRIDS = flush.MAX_CACHED_SUBGRIDS;
 const CachedSubgrid = flush.CachedSubgrid;
+const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
 const STYLE_ITALIC = flush.STYLE_ITALIC;
 const STYLE_STRIKETHROUGH = flush.STYLE_STRIKETHROUGH;
@@ -394,6 +395,14 @@ pub const Core = struct {
     scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .{},
     scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
     scroll_cache_rows: u32 = 0,
+
+    // Subgrid layout snapshot for scroll fast path.
+    // Stores the (grid_id, row_start, row_end) of every composited subgrid
+    // from the previous successful flush. Compared against the current layout
+    // to detect position changes, additions, and removals that invalidate
+    // cached row vertices inside the scroll region.
+    prev_subgrid_snapshots: [MAX_CACHED_SUBGRIDS]SubgridSnapshot = undefined,
+    prev_subgrid_snapshot_count: u32 = 0,
 
     // Reusable scratch buffers (zero-allocation hot path)
     tmp_cells: RenderCells = .{},
@@ -801,6 +810,7 @@ pub const Core = struct {
             self.scroll_cache_rows = 0; // invalidate cache_ready check in flush
             self.scroll_cache_valid = try std.DynamicBitSetUnmanaged.initEmpty(self.alloc, target_rows);
         }
+
         self.scroll_cache_rows = target_rows;
     }
 
@@ -817,6 +827,9 @@ pub const Core = struct {
             self.scroll_cache_valid.unsetAll();
         }
         self.scroll_cache_rows = 0;
+
+        // Reset subgrid snapshot so the next flush treats all subgrids as new.
+        self.prev_subgrid_snapshot_count = 0;
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)

@@ -33,6 +33,26 @@ pub const GridEntry = struct {
 // Pre-computed subgrid info for row-mode compose optimization.
 // Caches win_pos/sub_grids lookups to avoid per-row hash map access.
 pub const MAX_CACHED_SUBGRIDS = 32;
+/// Lightweight snapshot of a composited subgrid's identity and row range.
+/// Stored across flushes to detect layout changes (move/add/remove) that
+/// invalidate cached row vertices inside the scroll region.
+pub const SubgridSnapshot = struct {
+    grid_id: i64,
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    sg_cols: u32,
+    margin_top: u32,
+    margin_bottom: u32,
+
+    fn matchesCsg(self: SubgridSnapshot, csg: CachedSubgrid) bool {
+        return self.grid_id == csg.grid_id and
+            self.row_start == csg.row_start and self.row_end == csg.row_end and
+            self.col_start == csg.col_start and self.sg_cols == csg.sg_cols and
+            self.margin_top == csg.margin_top and self.margin_bottom == csg.margin_bottom;
+    }
+};
+
 pub const CachedSubgrid = struct {
     grid_id: i64,
     row_start: u32, // pos.row
@@ -493,6 +513,123 @@ pub fn checkScrollFastPath(
     }
 
     return .{ .eligible = true, .reason = .eligible, .scroll_op = ps };
+}
+
+/// Save current subgrid layout into prev_subgrid_snapshots.
+/// Called after successful vertex emission so the next flush can detect
+/// layout changes (move/add/remove).
+/// Must receive the same cached_subgrids slice that was used for vertex
+/// generation so the snapshot and the comparison target are identical sets.
+fn saveSubgridSnapshots(core: *Core, cached_subgrids: []const CachedSubgrid) void {
+    var count: u32 = 0;
+    for (cached_subgrids) |csg| {
+        if (count >= MAX_CACHED_SUBGRIDS) break;
+        core.prev_subgrid_snapshots[count] = .{
+            .grid_id = csg.grid_id,
+            .row_start = csg.row_start,
+            .row_end = csg.row_end,
+            .col_start = csg.col_start,
+            .sg_cols = csg.sg_cols,
+            .margin_top = csg.margin_top,
+            .margin_bottom = csg.margin_bottom,
+        };
+        count += 1;
+    }
+    core.prev_subgrid_snapshot_count = count;
+}
+
+/// Collect rows affected by subgrid layout changes between previous and
+/// current flush. Returns rows that need regeneration because a subgrid
+/// moved away from or into those rows, making the cached vertices stale.
+/// Only rows inside [region_top, region_bot) are collected (scroll region);
+/// rows outside are handled by dirty_rows in the caller.
+///
+/// Returns the number of rows written to `out`. If the return value equals
+/// `out.len`, the buffer may have overflowed — the caller must treat this
+/// as "too many diff rows" and fall back from the fast path.
+fn collectSubgridDiffRows(
+    core: *const Core,
+    cached_subgrids: []const CachedSubgrid,
+    region_top: u32,
+    region_bot: u32,
+    out: []u32,
+    existing_regen: []const u32,
+) u32 {
+    var count: u32 = 0;
+    const prev = core.prev_subgrid_snapshots[0..core.prev_subgrid_snapshot_count];
+
+    // Detect removed or moved grids: iterate previous snapshots.
+    for (prev) |ps| {
+        var found_same = false;
+        for (cached_subgrids) |csg| {
+            if (ps.matchesCsg(csg)) {
+                found_same = true;
+                break;
+            }
+        }
+        if (!found_same) {
+            count = addRowRange(ps.row_start, ps.row_end, region_top, region_bot, out, count, existing_regen);
+            if (count >= out.len) return count;
+        }
+    }
+
+    // Detect added or moved grids: iterate current subgrids.
+    for (cached_subgrids) |csg| {
+        var found_same = false;
+        for (prev) |ps| {
+            if (ps.matchesCsg(csg))
+            {
+                found_same = true;
+                break;
+            }
+        }
+        if (!found_same) {
+            count = addRowRange(csg.row_start, csg.row_end, region_top, region_bot, out, count, existing_regen);
+            if (count >= out.len) return count;
+        }
+    }
+
+    return count;
+}
+
+/// Helper: add rows from [start, end) that fall within [region_top, region_bot)
+/// to out[], skipping duplicates against both out[0..count] and existing_regen.
+fn addRowRange(
+    start: u32,
+    end: u32,
+    region_top: u32,
+    region_bot: u32,
+    out: []u32,
+    initial_count: u32,
+    existing_regen: []const u32,
+) u32 {
+    var count = initial_count;
+    const clamped_start = @max(start, region_top);
+    const clamped_end = @min(end, region_bot);
+    var r = clamped_start;
+    while (r < clamped_end) : (r += 1) {
+        if (count >= out.len) return count;
+        var dup = false;
+        for (out[0..count]) |existing| {
+            if (existing == r) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            for (existing_regen) |er| {
+                if (er == r) {
+                    dup = true;
+                    break;
+                }
+            }
+        }
+        if (!dup) {
+            out[count] = r;
+            count += 1;
+        }
+    }
+    return count;
 }
 
 /// Result of scroll cache shift + validity check.
@@ -2074,6 +2211,11 @@ pub const FlushCtx = struct {
 
             var sent_main_by_rows: bool = false;
 
+            // Pre-compute subgrid info — declared outside need_main so the
+            // snapshot is accessible for saveSubgridSnapshots in all exit paths.
+            var cached_subgrids: [MAX_CACHED_SUBGRIDS]CachedSubgrid = undefined;
+            var cached_subgrid_count: usize = 0;
+
             // ----------------------------
             // Rebuild MAIN only when needed
             // ----------------------------
@@ -2134,8 +2276,6 @@ pub const FlushCtx = struct {
                 // Pre-compute subgrid info (shared by row-mode and non-row-mode paths).
                 // Caches win_pos/sub_grids lookups and viewport margins to avoid
                 // per-row hash map access during vertex generation.
-                var cached_subgrids: [MAX_CACHED_SUBGRIDS]CachedSubgrid = undefined;
-                var cached_subgrid_count: usize = 0;
                 for (ctx.core.grid_entries.items) |ent| {
                     if (cached_subgrid_count >= MAX_CACHED_SUBGRIDS) break;
                     const subgrid_id = ent.grid_id;
@@ -2418,23 +2558,37 @@ pub const FlushCtx = struct {
                             perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
                         }
 
-                        // Expand regen_rows with non-scroll dirty rows.
-                        // Events like win_float_pos, win_pos, win_hide mark
-                        // dirty_rows but do not call recordScrollTouchedRow.
-                        // Without this, those rows are skipped by the fast path
-                        // and their dirty state is lost when clearDirty runs.
+                        // Expand regen_rows with rows that need regeneration
+                        // beyond the scroll-touched + cursor set.
+                        //
+                        // Two sources:
+                        // (A) Dirty rows OUTSIDE the scroll region.
+                        //     Events like win_float_pos, win_pos, win_hide mark
+                        //     dirty_rows but do not call recordScrollTouchedRow.
+                        //     scrollGrid's markDirtyRect covers the entire scroll
+                        //     region, so we skip in-region dirty rows (handled by
+                        //     cache shift).
+                        //
+                        // (B) Subgrid layout changes INSIDE the scroll region.
+                        //     If any composited subgrid moved, appeared, or
+                        //     disappeared since the last flush, the cached vertices
+                        //     for affected rows are stale. Detected by comparing
+                        //     current cached_subgrids against prev_subgrid_snapshots.
+                        //
                         // Must run BEFORE shiftScrollCacheAndValidate so the
                         // cache shift correctly invalidates these rows.
                         if (!effective_rebuild_all) {
+                            const scroll_region_top: u32 = scroll_op.top + scroll_op.win_pos_row;
+                            const scroll_region_bot: u32 = scroll_op.bot + scroll_op.win_pos_row;
+
+                            // (A) Dirty rows outside the scroll region.
                             var dr: u32 = 0;
                             while (dr < rows) : (dr += 1) {
+                                if (dr >= scroll_region_top and dr < scroll_region_bot) continue;
                                 if (!ctx.core.grid.dirty_rows.isSet(@as(usize, dr))) continue;
                                 var found = false;
                                 for (regen_rows[0..regen_count]) |rr| {
-                                    if (rr == dr) {
-                                        found = true;
-                                        break;
-                                    }
+                                    if (rr == dr) { found = true; break; }
                                 }
                                 if (!found) {
                                     if (regen_count >= regen_rows.len) {
@@ -2443,6 +2597,34 @@ pub const FlushCtx = struct {
                                     }
                                     regen_rows[regen_count] = dr;
                                     regen_count += 1;
+                                }
+                            }
+
+                            // (B) Subgrid layout diff inside scroll region.
+                            if (use_scroll_fast_path) {
+                                var diff_buf: [32]u32 = undefined;
+                                const diff_count = collectSubgridDiffRows(
+                                    ctx.core,
+                                    cached_subgrids[0..cached_subgrid_count],
+                                    scroll_region_top,
+                                    scroll_region_bot,
+                                    &diff_buf,
+                                    regen_rows[0..regen_count],
+                                );
+                                // diff_count == diff_buf.len means the buffer
+                                // may have overflowed — fall back to full regen.
+                                if (diff_count >= diff_buf.len) {
+                                    use_scroll_fast_path = false;
+                                }
+                                if (use_scroll_fast_path) {
+                                    for (diff_buf[0..diff_count]) |row| {
+                                        if (regen_count >= regen_rows.len) {
+                                            use_scroll_fast_path = false;
+                                            break;
+                                        }
+                                        regen_rows[regen_count] = row;
+                                        regen_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -2884,6 +3066,9 @@ pub const FlushCtx = struct {
                     }
                     break; // Normal exit from retry_loop
                     }
+
+                    // Snapshot overlay coverage for next flush's diff detection.
+                    saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
 
                     ctx.core.grid.clearDirty();
                     ctx.core.grid.clearScrollState();
@@ -3703,6 +3888,9 @@ pub const FlushCtx = struct {
                 if (need_cursor) {
                     ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
                 }
+                // Only update snapshot when main was rebuilt (subgrid info is current).
+                // cursor-only flushes leave cached_subgrid_count == 0.
+                if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
                 ctx.core.grid.clearDirty();
                 ctx.core.grid.clearScrollState();
                 return;
@@ -3722,12 +3910,14 @@ pub const FlushCtx = struct {
                 if (need_cursor) {
                     ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
                 }
+                if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
                 ctx.core.grid.clearDirty();
                 ctx.core.grid.clearScrollState();
                 return;
             }
 
             // No callback (shouldn't happen because we gated above), but keep safe:
+            if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
             ctx.core.grid.clearDirty();
             ctx.core.grid.clearScrollState();
             return;
