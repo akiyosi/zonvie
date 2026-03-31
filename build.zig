@@ -141,4 +141,34 @@ pub fn build(b: *std.Build) !void {
         .root_module = scroll_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
+
+    // Font feature / variable axis parsing tests
+    const font_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/font_feature_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const font_tests = b.addTest(.{
+        .root_module = font_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(font_tests).step);
+
+    // Ligature vertex tests
+    const lig_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/ligature_vertex_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const lig_tests = b.addTest(.{
+        .root_module = lig_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(lig_tests).step);
 }

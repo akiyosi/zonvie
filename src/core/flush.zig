@@ -247,6 +247,17 @@ pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, ta
     return i;
 }
 
+/// Find end of run where (items[i] & mask) == val.
+/// Used to split glyph runs by bold/italic style so each sub-run is shaped
+/// with the correct font variant, preventing ligature rendering corruption.
+pub inline fn findStyleMaskEnd(items: []const u8, start: usize, limit: usize, mask: u8, val: u8) usize {
+    var i = start + 1;
+    while (i < limit) : (i += 1) {
+        if ((items[i] & mask) != val) return i;
+    }
+    return limit;
+}
+
 /// Find first index where a bit is NOT set: (items[i] & mask) == 0.
 /// Used for strikethrough run scans that check a specific bit rather than exact equality.
 pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usize, mask: u8) usize {
@@ -1111,13 +1122,21 @@ pub fn generateRowVertices(
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
             const run_start = c;
 
-            const base_end = @min(
+            const base_end_attr = @min(
                 simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
                 @min(
                     simdFindRunEndU32(rc.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
                     simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
                 ),
             );
+            // When shaping is active, also split by bold/italic style so each
+            // sub-run selects the correct font variant for HarfBuzz shaping.
+            const shaping_style_mask: u8 = STYLE_BOLD | STYLE_ITALIC;
+            const run_style_bi: u8 = rc.style_flags_arr.items[@intCast(c)] & shaping_style_mask;
+            const base_end: usize = if (has_shaping)
+                @min(base_end_attr, findStyleMaskEnd(rc.style_flags_arr.items, @intCast(c), base_end_attr, shaping_style_mask, run_style_bi))
+            else
+                base_end_attr;
             const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
             const end: u32 = @intCast(if (p.glow_enabled)
                 @min(base_end, simdFindRunEndU8(rc.glow_arr.items, @intCast(c), @intCast(cols), run_glow))
@@ -1350,6 +1369,53 @@ pub fn generateRowVertices(
                     };
                     var penX: f32 = baseX;
 
+                    // Dump shaping results for ligature debugging.
+                    // Log when shaping was used (not ASCII fast path) — covers both
+                    // calt (glyph count == scalar count, IDs differ) and liga (count differs).
+                    if (log_enabled and final_glyph_count > 0 and !used_ascii_fast_path) {
+                        core.log.write("[shape_dump] scalars={d} glyphs={d} run=[{d}..{d}) style={d}\n", .{ scalar_count, final_glyph_count, run_start, end, c_style });
+                        for (0..@min(final_glyph_count, 16)) |dgi| {
+                            core.log.write("[shape_dump]   g[{d}] gid={d} cluster={d} x_adv={d} x_off={d}\n", .{
+                                dgi,
+                                bufs.glyph_ids.items[dgi],
+                                bufs.clusters.items[dgi],
+                                bufs.x_adv.items[dgi],
+                                bufs.x_off.items[dgi],
+                            });
+                        }
+                        for (0..@min(scalar_count, 16)) |dsi| {
+                            core.log.write("[shape_dump]   s[{d}] scalar=0x{x} col_w={d}\n", .{
+                                dsi,
+                                core.shaping_scalars.items[dsi],
+                                core.shaping_col_widths.items[dsi],
+                            });
+                        }
+                    }
+
+                    // Retroactive suppression for calt "last glyph draws all".
+                    //
+                    // After resolving each glyph in the render loop, we record its
+                    // quad position. When a later glyph extends backward by >= 0.75
+                    // cellW, we zero out already-emitted quads for preceding glyphs
+                    // that: (a) have a DIFFERENT glyph ID (placeholder vs covering),
+                    //       (b) fit within their own cell (not intentional overhang).
+                    //
+                    // This uses the ACTUAL glyph entries from the render loop (not a
+                    // separate pre-scan), so atlas state is always correct.
+                    const RecentQuad = struct {
+                        vert_start: usize,
+                        gx0: f32,
+                        gx1: f32,
+                        penX: f32,
+                        cell_adv: f32,
+                        gid: u32,
+                    };
+                    // Circular buffer: only the last RECENT_CAP entries matter
+                    // (suppression looks back at most ceil(backward/cellW) ≈ 1-3 cells).
+                    const RECENT_CAP = 8;
+                    var recent_quads: [RECENT_CAP]RecentQuad = undefined;
+                    var recent_quad_total: usize = 0; // total quads ever written (wraps index)
+
                     var gi: usize = 0;
                     while (gi < final_glyph_count) : (gi += 1) {
                         const gid = bufs.glyph_ids.items[gi];
@@ -1519,6 +1585,52 @@ pub fn generateRowVertices(
                             }
                         }
 
+                        // Multi-scalar non-emoji fallback: if glyph-by-ID failed for a
+                        // ligature cluster, render each scalar individually to prevent
+                        // invisible glyphs where the ligature should appear.
+                        if (!glyph_ok and next_cluster > this_cluster + 1 and !cluster_is_emoji) {
+                            var mci: u32 = this_cluster;
+                            while (mci < next_cluster) : (mci += 1) {
+                                const mc_scalar = core.shaping_scalars.items[@intCast(mci)];
+                                const mc_col_w = core.shaping_col_widths.items[@intCast(mci)];
+                                if (mc_scalar == 32 or mc_scalar == 0) {
+                                    penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
+                                    continue;
+                                }
+                                if (core.ensureGlyphPhase2(mc_scalar, c_style)) |mc_ge| {
+                                    if (mc_ge.bbox_size_px[0] > 0 and mc_ge.bbox_size_px[1] > 0) {
+                                        const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
+                                        const mc_gx0: f32 = penX + mc_ge.bbox_origin_px[0];
+                                        const mc_gx1: f32 = mc_gx0 + mc_ge.bbox_size_px[0];
+                                        const mc_gy0: f32 = mc_baselineY - (mc_ge.bbox_origin_px[1] + mc_ge.bbox_size_px[1]);
+                                        const mc_gy1: f32 = mc_gy0 + mc_ge.bbox_size_px[1];
+                                        const mc_uv0: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_min[1] };
+                                        const mc_uv1: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_min[1] };
+                                        const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_max[1] };
+                                        const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_max[1] };
+                                        const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
+                                        VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, vw, vh, run_grid_id, mc_deco);
+                                    }
+                                }
+                                penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
+                            }
+                            continue;
+                        }
+
+                        // Advance pen using column widths
+                        const cl_span = next_cluster - this_cluster;
+                        const cluster_cols: u32 = if (cl_span == 1)
+                            core.shaping_col_widths.items[@intCast(this_cluster)]
+                        else blk: {
+                            var sum: u32 = 0;
+                            var cwi: u32 = this_cluster;
+                            while (cwi < next_cluster) : (cwi += 1) {
+                                sum += core.shaping_col_widths.items[@intCast(cwi)];
+                            }
+                            break :blk sum;
+                        };
+                        const cell_advance: f32 = @as(f32, @floatFromInt(cluster_cols)) * cellW;
+
                         if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
                             const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
@@ -1534,25 +1646,66 @@ pub fn generateRowVertices(
                             const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
                             const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
 
+                            // Retroactive suppression: if this glyph extends backward
+                            // by >= 0.75*cellW, zero out preceding quads that have a
+                            // DIFFERENT glyph ID and fit within their cell.
+                            const backward_px = penX - gx0;
+                            // Threshold 0.35: covers || (38%), <= (53%), -- (76%),
+                            // == (88%), === (188%) while excluding normal overhang
+                            // (all observed normal glyphs have backward <= 0).
+                            const recent_count = @min(recent_quad_total, RECENT_CAP);
+                            if (backward_px >= cellW * 0.35 and recent_count > 0) {
+                                const back_cells = @min(
+                                    recent_count,
+                                    @as(usize, @intFromFloat(@ceil(backward_px / cellW))),
+                                );
+                                var rqi: usize = 0;
+                                while (rqi < back_cells) : (rqi += 1) {
+                                    // Walk backward through the circular buffer
+                                    const idx = (recent_quad_total - 1 - rqi) % RECENT_CAP;
+                                    const rq = recent_quads[idx];
+                                    // Different gid → placeholder, not same visual form
+                                    if (rq.gid == gid) continue;
+                                    // Must fit in its cell (not intentional overhang)
+                                    if (rq.gx0 < rq.penX - 1.0) continue;
+                                    if (rq.gx1 > rq.penX + rq.cell_adv + 1.0) continue;
+                                    // Covering glyph bitmap must reach this cell
+                                    if (gx0 < rq.penX + rq.cell_adv and gx1 > rq.penX) {
+                                        // Zero out the 6 vertices
+                                        if (rq.vert_start + 6 <= out.items.len) {
+                                            for (0..6) |k| {
+                                                out.items[rq.vert_start + k].position = .{ 0, 0 };
+                                                out.items[rq.vert_start + k].texCoord = .{ -1, -1 };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (log_enabled and !used_ascii_fast_path) {
+                                core.log.write("[glyph_quad] gi={d} gid={d} penX={d:.1} gx0={d:.1} gx1={d:.1} bbox_w={d:.1} bbox_ox={d:.1} x_off={d:.1} cellW={d:.1}\n", .{
+                                    gi, gid, penX, gx0, gx1, ge.bbox_size_px[0], ge.bbox_origin_px[0], x_off_px, cellW,
+                                });
+                            }
+
+                            // Record quad for potential retroactive suppression by later glyphs
+                            const vert_start = out.items.len;
                             const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
+
+                            recent_quads[recent_quad_total % RECENT_CAP] = .{
+                                .vert_start = vert_start,
+                                .gx0 = gx0,
+                                .gx1 = gx1,
+                                .penX = penX,
+                                .cell_adv = cell_advance,
+                                .gid = gid,
+                            };
+                            recent_quad_total += 1;
                         }
 
-                        // Advance pen using column widths
-                        {
-                            const cl_span = next_cluster - this_cluster;
-                            const cluster_cols: u32 = if (cl_span == 1)
-                                core.shaping_col_widths.items[@intCast(this_cluster)]
-                            else blk: {
-                                var sum: u32 = 0;
-                                var cwi: u32 = this_cluster;
-                                while (cwi < next_cluster) : (cwi += 1) {
-                                    sum += core.shaping_col_widths.items[@intCast(cwi)];
-                                }
-                                break :blk sum;
-                            };
-                            penX += @as(f32, @floatFromInt(cluster_cols)) * cellW;
-                        }
+                        // Advance pen
+                        penX += cell_advance;
                     }
                 } else {
                     // --- Per-cell glyph path (fallback when shaping unavailable) ---

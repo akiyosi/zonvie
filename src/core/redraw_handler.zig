@@ -210,14 +210,14 @@ fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
 
 // ---- guifont "candidate" parse (Zig-side: name + pointSize + features) ----
 
-const FontFeature = struct {
+pub const FontFeature = struct {
     tag: [4]u8,
     value: i32,
 };
 
 const MAX_FONT_FEATURES = 32;
 
-const GuiFontResolved = struct {
+pub const GuiFontResolved = struct {
     name: []const u8,
     point_size: f64,
     features: []const FontFeature,
@@ -225,7 +225,7 @@ const GuiFontResolved = struct {
 
 /// Try to parse a colon-separated token as an OpenType feature.
 /// Accepted formats: "+liga", "-dlig", "ss01=2", "zero" (4-char tag = enable).
-fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
+pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
     if (tok.len == 0) return null;
 
     var tag_str: []const u8 = undefined;
@@ -254,7 +254,7 @@ fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
     };
 }
 
-fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
+pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
     // point_size default: 14
@@ -1907,3 +1907,4 @@ pub fn handleRedraw(
         }
     }
 }
+

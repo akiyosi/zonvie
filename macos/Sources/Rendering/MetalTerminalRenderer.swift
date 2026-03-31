@@ -110,9 +110,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let a = mainDesc.colorAttachments[0] {
             a.isBlendingEnabled = true
             a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
             a.sourceRGBBlendFactor = .sourceAlpha
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.alphaBlendOperation = .add
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
@@ -142,9 +142,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let a = glyphDesc.colorAttachments[0] {
             a.isBlendingEnabled = true
             a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
             a.sourceRGBBlendFactor = .sourceAlpha
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.alphaBlendOperation = .add
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
@@ -1749,9 +1749,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let a = desc.colorAttachments[0] {
             a.isBlendingEnabled = true
             a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
             a.sourceRGBBlendFactor = .sourceAlpha
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.alphaBlendOperation = .add
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
@@ -1837,9 +1837,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let a = glyphDesc.colorAttachments[0] {
             a.isBlendingEnabled = true
             a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
             a.sourceRGBBlendFactor = .sourceAlpha
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.alphaBlendOperation = .add
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
@@ -1992,9 +1992,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let a = desc.colorAttachments[0] {
             a.isBlendingEnabled = true
             a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
             a.sourceRGBBlendFactor = .sourceAlpha
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.alphaBlendOperation = .add
             a.sourceAlphaBlendFactor = .one
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
