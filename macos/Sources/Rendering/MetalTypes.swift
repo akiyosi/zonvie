@@ -433,9 +433,12 @@ func ensureSurfaceRowBuffer(
         if row < bufferSet.detachPoolRowBuffers.count,
            let poolBuf = bufferSet.detachPoolRowBuffers[row],
            row < bufferSet.detachPoolRowCapacities.count,
-           bufferSet.detachPoolRowCapacities[row] >= nextCap,
-           poolBuf !== srcRowBuffer
+           bufferSet.detachPoolRowCapacities[row] >= nextCap
         {
+            // Pool buffer may alias the source (committed) buffer when all 3 sets
+            // share the same buffer for this row. This is safe during flush because
+            // the GPU semaphore guarantees no in-flight draw is reading the buffer.
+            // The row is about to be overwritten via memcpy anyway.
             bufferSet.rowState.buffers[row] = poolBuf
             bufferSet.rowState.capacities[row] = bufferSet.detachPoolRowCapacities[row]
             bufferSet.detachPoolRowBuffers[row] = nil  // consumed
