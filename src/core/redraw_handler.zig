@@ -47,6 +47,36 @@ fn firstCodepoint(utf8: []const u8) u32 {
     return @as(u32, cp);
 }
 
+/// Extract all codepoints from a UTF-8 cell string into a stack buffer.
+/// Returns the number of codepoints written (including the first).
+/// If the string has only one codepoint, returns 1 (no overflow needed).
+fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) u32 {
+    if (utf8.len == 0) {
+        buf[0] = 0;
+        return 1;
+    }
+
+    var it = std.unicode.Utf8Iterator{ .bytes = utf8, .i = 0 };
+    var count: u32 = 0;
+
+    while (count < buf.len) {
+        const slice = it.nextCodepointSlice() orelse break;
+        const cp = std.unicode.utf8Decode(slice) catch {
+            buf[count] = 0xFFFD;
+            count += 1;
+            continue;
+        };
+        buf[count] = @as(u32, cp);
+        count += 1;
+    }
+
+    if (count == 0) {
+        buf[0] = ' ';
+        return 1;
+    }
+    return count;
+}
+
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .int) {
@@ -1381,7 +1411,12 @@ pub fn handleRedraw(
                     const c = cellv.arr;
                     if (c.len < 1 or c[0] != .str) continue;
 
-                    const cp = firstCodepoint(c[0].str);
+                    // Extract all codepoints from the cell string.
+                    // If >1 codepoint (e.g., U+26A0 + U+FE0F), extras go to overflow map.
+                    var cp_buf: [16]u32 = undefined;
+                    const cp_count = extractAllCodepoints(c[0].str, &cp_buf);
+                    const cp = cp_buf[0];
+                    const has_overflow = cp_count > 1;
 
                     // Update hl_state only when provided.
                     if (c.len >= 2 and c[1] == .int) {
@@ -1422,6 +1457,22 @@ pub fn handleRedraw(
                         }
 
                         grid.putCellGrid(grid_id, row, col, cp, hl_to_use);
+
+                        // Manage overflow map for multi-codepoint cells.
+                        // Force-mark dirty when overflow state changes, because
+                        // putCellGrid skips dirty marking when cp+hl are unchanged
+                        // (e.g., ⚠ → ⚠️ where base cp is the same).
+                        if (has_overflow) {
+                            const old = grid.getOverflow(grid_id, row, col);
+                            const changed = if (old) |o| !std.mem.eql(u32, o, cp_buf[1..cp_count]) else true;
+                            grid.putOverflow(grid_id, row, col, cp_buf[1..cp_count]);
+                            if (changed) grid.markDirtyCellGrid(grid_id, row, col);
+                        } else {
+                            const had = grid.getOverflow(grid_id, row, col) != null;
+                            grid.removeOverflow(grid_id, row, col);
+                            if (had) grid.markDirtyCellGrid(grid_id, row, col);
+                        }
+
                         col += 1;
                     }
                 }

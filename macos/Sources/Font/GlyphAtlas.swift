@@ -1299,12 +1299,127 @@ final class GlyphAtlas {
         return true
     }
 
+    /// Render a multi-codepoint emoji cluster using CoreText line layout.
+    /// Handles VS16 emoji, ZWJ sequences, flag sequences, etc.
+    /// Must be called with mu locked. Stores pixel data in rasterizeScratch.
+    private func renderEmojiClusterWithCoreGraphics_locked(
+        scalars: UnsafePointer<UInt32>, count: Int,
+        outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+    ) -> Bool {
+        // Build a String from the cluster scalars using UnicodeScalarView
+        // to preserve the exact sequence (Character append may break ZWJ joining).
+        var str = ""
+        for i in 0..<count {
+            guard let uni = UnicodeScalar(scalars[i]) else { continue }
+            str.unicodeScalars.append(uni)
+        }
+        if str.isEmpty { return false }
+
+        // Use Apple Color Emoji as the primary font
+        guard let ef = emojiFont(size: CTFontGetSize(font)) else { return false }
+
+        // Create an attributed string with the emoji font
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), str as CFString)
+        let fullRange = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, fullRange, kCTFontAttributeName, ef)
+
+        // Create a CTLine and measure its bounds
+        let line = CTLineCreateWithAttributedString(attrStr)
+        var lineAscent: CGFloat = 0
+        var lineDescent: CGFloat = 0
+        var lineLeading: CGFloat = 0
+        let lineWidth = CTLineGetTypographicBounds(line, &lineAscent, &lineDescent, &lineLeading)
+
+        if lineWidth < 1 || (lineAscent + lineDescent) < 1 { return false }
+
+        let pad: Int = 1
+        let bitmapW = Int(ceil(lineWidth)) + pad * 2
+        let bitmapH = Int(ceil(lineAscent + lineDescent)) + pad * 2
+        let rowBytes = bitmapW * 4
+
+        // Ensure scratch buffer
+        let needed = rowBytes * bitmapH
+        if rasterizeScratch.count < needed {
+            rasterizeScratch = Array(repeating: 0, count: needed)
+        }
+        _ = rasterizeScratch.withUnsafeMutableBufferPointer { buf in
+            memset(buf.baseAddress!, 0, needed)
+        }
+
+        // Draw into RGBA context
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let drawOK = rasterizeScratch.withUnsafeMutableBufferPointer { buf -> Bool in
+            guard let ctx = CGContext(
+                data: buf.baseAddress,
+                width: bitmapW,
+                height: bitmapH,
+                bitsPerComponent: 8,
+                bytesPerRow: rowBytes,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+
+            // Position: baseline at (pad, pad + lineDescent)
+            let originX = CGFloat(pad)
+            let originY = CGFloat(pad) + lineDescent
+            ctx.textPosition = CGPoint(x: originX, y: originY)
+            CTLineDraw(line, ctx)
+            return true
+        }
+        if !drawOK { return false }
+
+        // Compute advance from the first scalar
+        var firstGlyph = CGGlyph(0)
+        if let gid = glyphID(in: ef, scalar: scalars[0]) {
+            firstGlyph = CGGlyph(gid)
+        }
+        var advance = CGSize.zero
+        CTFontGetAdvancesForGlyphs(ef, .default, &firstGlyph, &advance, 1)
+
+        // Fill outBitmap
+        let bearingX = Int32(0) - Int32(pad)
+        let bearingY = Int32(ceil(lineAscent)) + Int32(pad)
+
+        rasterizeScratch.withUnsafeBufferPointer { buf in
+            outBitmap.pointee.pixels = buf.baseAddress
+        }
+        outBitmap.pointee.width = UInt32(bitmapW)
+        outBitmap.pointee.height = UInt32(bitmapH)
+        outBitmap.pointee.pitch = Int32(rowBytes)
+        outBitmap.pointee.bearing_x = bearingX
+        outBitmap.pointee.bearing_y = bearingY
+        outBitmap.pointee.advance_26_6 = Int32(advance.width * 64.0)
+        outBitmap.pointee.bytes_per_pixel = 4
+        outBitmap.pointee.ascent_px = ascentPx
+        outBitmap.pointee.descent_px = descentPx
+
+        return true
+    }
+
     /// Phase 2: Rasterize a glyph without atlas packing.
     /// Fills outBitmap with the FreeType bitmap data.
     /// The pixel pointer is valid until the next rasterize call.
-    func rasterizeOnly(scalar: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+    func rasterizeOnly(scalar: UInt32, styleFlags: UInt32, corePtr: OpaquePointer?, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
+
+        // Check if flush set an emoji cluster context (e.g., base + VS16,
+        // ZWJ sequence, flag sequence). Render the full cluster via CTLine
+        // so multi-codepoint emoji display correctly — matching Windows which
+        // converts the cluster to UTF-16 for DirectWrite.
+        var clusterLen: UInt8 = 0
+        let clusterPtr = zonvie_core_get_emoji_cluster(corePtr, &clusterLen)
+        if clusterLen > 0, let ptr = clusterPtr {
+            outBitmap.pointee.ascent_px = ascentPx
+            outBitmap.pointee.descent_px = descentPx
+            if renderEmojiClusterWithCoreGraphics_locked(
+                scalars: ptr, count: Int(clusterLen), outBitmap: outBitmap
+            ) {
+                return true
+            }
+            // Fall through to normal path if cluster rendering failed
+        }
 
         guard let resolved = resolveHbftAndGlyph_locked(scalar: scalar, styleFlags: styleFlags) else {
             return false

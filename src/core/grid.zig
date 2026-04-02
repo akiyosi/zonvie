@@ -16,6 +16,37 @@ pub const Cell = struct {
     hl: u32,
 };
 
+/// Overflow map key: grid_id (full i64) combined with row and col.
+/// Uses a struct key with AutoHashMap's default hashing to avoid
+/// bit-packing collisions between negative reserved grid IDs and
+/// positive Neovim grid IDs.
+pub const OverflowKey = struct {
+    grid_id: i64,
+    row: u32,
+    col: u32,
+};
+
+/// Inline storage for extra codepoints (after the first) in a multi-codepoint cell.
+/// Fixed-size to eliminate per-cell heap allocation on the redraw hot path.
+/// 15 elements matches scanEmojiCluster extras and emoji_cluster_buf capacity,
+/// covering the longest ZWJ sequences (e.g., kiss with skin tones = 9 extras).
+pub const OverflowExtras = struct {
+    buf: [15]u32 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const OverflowExtras) []const u32 {
+        return self.buf[0..self.len];
+    }
+
+    pub fn fromSlice(src: []const u32) OverflowExtras {
+        var e = OverflowExtras{};
+        const n: u8 = @intCast(@min(src.len, e.buf.len));
+        for (0..n) |i| e.buf[i] = src[i];
+        e.len = n;
+        return e;
+    }
+};
+
 pub const CursorShape = enum(u8) { block, vertical, horizontal };
 
 // ext_cmdline types
@@ -797,6 +828,12 @@ pub const Grid = struct {
 
     cells: []Cell = &[_]Cell{},
 
+    /// Extra codepoints for cells with multi-codepoint sequences (e.g., U+26A0 + U+FE0F).
+    /// Key: OverflowKey{grid_id, row, col}. Value: heap-allocated slice of extra codepoints
+    /// (codepoints after the first, which is stored in Cell.cp).
+    /// Only populated for the rare cells where Neovim sends >1 codepoint per cell.
+    cell_overflow: std.AutoHashMapUnmanaged(OverflowKey, OverflowExtras) = .{},
+
     // ext_multigrid: sub-grids and their positions
     sub_grids: std.AutoHashMapUnmanaged(i64, GridBuf) = .{},
     win_pos: std.AutoHashMapUnmanaged(i64, GridPos) = .{},
@@ -980,7 +1017,171 @@ pub const Grid = struct {
 
         // mode info
         self.mode_infos.deinit(self.alloc);
+
+        // cell overflow (values are inline, no per-entry free needed)
+        self.cell_overflow.deinit(self.alloc);
     }
+
+    // ── Cell overflow helpers ────────────────────────────────────────
+
+    /// Store extra codepoints for a multi-codepoint cell.
+    /// `extras` contains codepoints after the first (which lives in Cell.cp).
+    /// Store extra codepoints for a multi-codepoint cell (zero heap allocation).
+    pub fn putOverflow(self: *Grid, grid_id: i64, row: u32, col: u32, extras: []const u32) void {
+        const key = OverflowKey{ .grid_id = grid_id, .row = row, .col = col };
+        const val = OverflowExtras.fromSlice(extras);
+        self.cell_overflow.put(self.alloc, key, val) catch {};
+    }
+
+    /// Get extra codepoints for a cell, or null if it has only one codepoint.
+    pub fn getOverflow(self: *const Grid, grid_id: i64, row: u32, col: u32) ?[]const u32 {
+        if (self.cell_overflow.getPtr(.{ .grid_id = grid_id, .row = row, .col = col })) |v| {
+            return v.slice();
+        }
+        return null;
+    }
+
+    /// Remove overflow entry for a single cell.
+    pub fn removeOverflow(self: *Grid, grid_id: i64, row: u32, col: u32) void {
+        _ = self.cell_overflow.remove(.{ .grid_id = grid_id, .row = row, .col = col });
+    }
+
+    /// Remove all overflow entries.
+    pub fn clearAllOverflow(self: *Grid) void {
+        self.cell_overflow.clearRetainingCapacity();
+    }
+
+    /// Remove all overflow entries for a specific grid_id.
+    pub fn clearOverflowForGrid(self: *Grid, grid_id: i64) void {
+        if (self.cell_overflow.count() == 0) return;
+        // Batched removal: collect matching keys, remove, repeat.
+        while (true) {
+            var remove_buf: [64]OverflowKey = undefined;
+            var remove_count: usize = 0;
+            var it = self.cell_overflow.iterator();
+            while (it.next()) |e| {
+                if (e.key_ptr.grid_id == grid_id) {
+                    if (remove_count < remove_buf.len) {
+                        remove_buf[remove_count] = e.key_ptr.*;
+                        remove_count += 1;
+                    } else break;
+                }
+            }
+            if (remove_count == 0) break;
+            for (remove_buf[0..remove_count]) |key| {
+                _ = self.cell_overflow.remove(key);
+            }
+        }
+    }
+
+    /// Remove overflow entries for a grid that fall outside [0, rows) x [0, cols).
+    /// Entries within the overlap region are preserved (matching resize cell copy).
+    pub fn trimOverflowForGrid(self: *Grid, grid_id: i64, rows: u32, cols: u32) void {
+        if (self.cell_overflow.count() == 0) return;
+        while (true) {
+            var remove_buf: [64]OverflowKey = undefined;
+            var remove_count: usize = 0;
+            var it = self.cell_overflow.iterator();
+            while (it.next()) |e| {
+                if (e.key_ptr.grid_id != grid_id) continue;
+                if (e.key_ptr.row >= rows or e.key_ptr.col >= cols) {
+                    if (remove_count < remove_buf.len) {
+                        remove_buf[remove_count] = e.key_ptr.*;
+                        remove_count += 1;
+                    } else break;
+                }
+            }
+            if (remove_count == 0) break;
+            for (remove_buf[0..remove_count]) |key| {
+                _ = self.cell_overflow.remove(key);
+            }
+        }
+    }
+
+    /// Move overflow entries during a scroll operation.
+    /// Entries in the scroll region are shifted by `shift_rows`, entries in the
+    /// vacated band are removed.
+    pub fn scrollOverflow(self: *Grid, grid_id: i64, top: u32, bot: u32, left: u32, right: u32, rows_delta: i32) void {
+        if (self.cell_overflow.count() == 0) return;
+
+        const shift: u32 = blk: {
+            if (rows_delta == std.math.minInt(i32)) break :blk bot - top;
+            const a: i32 = if (rows_delta < 0) -rows_delta else rows_delta;
+            break :blk @as(u32, @intCast(a));
+        };
+
+        // Phase 1: Remove all entries in the scroll region from the map.
+        // Values are inline (no heap), so no free needed.
+        const MovedEntry = struct { new_key: OverflowKey, value: OverflowExtras };
+        var moved = std.ArrayListUnmanaged(MovedEntry){};
+        defer moved.deinit(self.alloc);
+
+        while (true) {
+            var remove_buf: [64]OverflowKey = undefined;
+            var remove_count: usize = 0;
+            var it = self.cell_overflow.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                if (k.grid_id != grid_id) continue;
+                if (k.row < top or k.row >= bot) continue;
+                if (k.col < left or k.col >= right) continue;
+                if (remove_count < remove_buf.len) {
+                    remove_buf[remove_count] = k;
+                    remove_count += 1;
+                } else break;
+            }
+            if (remove_count == 0) break;
+            for (remove_buf[0..remove_count]) |key| {
+                if (self.cell_overflow.fetchRemove(key)) |kv| {
+                    const should_move = if (rows_delta > 0)
+                        key.row >= top + shift
+                    else
+                        key.row < bot - shift;
+
+                    if (should_move) {
+                        const new_row = if (rows_delta > 0) key.row - shift else key.row + shift;
+                        moved.append(self.alloc, .{
+                            .new_key = .{ .grid_id = grid_id, .row = new_row, .col = key.col },
+                            .value = kv.value,
+                        }) catch {};
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Re-insert moved entries with new keys.
+        for (moved.items) |m| {
+            self.cell_overflow.put(self.alloc, m.new_key, m.value) catch {};
+        }
+    }
+
+    /// Remove overflow entries in a rectangular cell region.
+    pub fn clearOverflowRect(self: *Grid, grid_id: i64, row_start: u32, row_end: u32, col_start: u32, col_end: u32) void {
+        if (self.cell_overflow.count() == 0) return;
+        while (true) {
+            var remove_buf: [64]OverflowKey = undefined;
+            var remove_count: usize = 0;
+            var it = self.cell_overflow.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                if (k.grid_id != grid_id) continue;
+                if (k.row >= row_start and k.row < row_end and
+                    k.col >= col_start and k.col < col_end)
+                {
+                    if (remove_count < remove_buf.len) {
+                        remove_buf[remove_count] = k;
+                        remove_count += 1;
+                    } else break;
+                }
+            }
+            if (remove_count == 0) break;
+            for (remove_buf[0..remove_count]) |key| {
+                _ = self.cell_overflow.remove(key);
+            }
+        }
+    }
+
+    // ── End cell overflow helpers ────────────────────────────────────
 
     // Per-grid cell metrics in drawable pixels (for goneovim-like float positioning).
     pub const CellMetricsPx = struct {
@@ -1238,6 +1439,8 @@ pub const Grid = struct {
                 const slice = self.cells[off .. off + @as(usize, width)];
                 @memset(slice, .{ .cp = ' ', .hl = 0 });
             }
+            // Clear overflow for the entire scrolled-out region
+            self.clearOverflowRect(1, top, bot, left, right);
             return;
         }
 
@@ -1294,6 +1497,9 @@ pub const Grid = struct {
         }
 
         self.markDirtyRect(top, bot);
+
+        // Move overflow entries with the scrolled cells
+        self.scrollOverflow(1, top, bot, left, right, rows);
     }
 
     fn getOrCreateSub(self: *Grid, grid_id: i64) !*GridBuf {
@@ -1309,11 +1515,16 @@ pub const Grid = struct {
         if (grid_id == 1) {
             self.content_rev +%= 1;
             try self.resize(rows, cols);
+            // Remove overflow entries that fall outside the new dimensions.
+            // Entries within [0, rows) x [0, cols) are preserved (matching
+            // the cell copy behavior of resize()).
+            self.trimOverflowForGrid(grid_id, rows, cols);
             self.markAllDirty();
             return;
         }
         const sg = try self.getOrCreateSub(grid_id);
         try sg.resize(self.alloc, rows, cols);
+        self.trimOverflowForGrid(grid_id, rows, cols);
 
         // Only affect global grid state for composited grids (in win_pos).
         // External grids (not in win_pos) are rendered independently.
@@ -1327,10 +1538,12 @@ pub const Grid = struct {
         if (grid_id == 1) {
             self.content_rev +%= 1;
             self.clear();
+            self.clearOverflowForGrid(1);
             self.markAllDirty();
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| sg.clear();
+        self.clearOverflowForGrid(grid_id);
 
         // Only affect global grid state for composited grids.
         if (self.win_pos.contains(grid_id)) {
@@ -1338,6 +1551,36 @@ pub const Grid = struct {
         }
     }
     
+    /// Force-mark a cell's row dirty (for overflow-only changes where putCellGrid
+    /// would no-op because cp+hl are unchanged).
+    /// Also advances cursor_rev when the cursor is on this cell.
+    pub fn markDirtyCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32) void {
+        if (grid_id == 1) {
+            self.content_rev +%= 1;
+            self.markDirtyRow(row);
+            self.recordScrollTouchedRow(row);
+            if (self.cursor_grid == 1 and self.cursor_row == row and self.cursor_col == col) {
+                self.cursor_rev +%= 1;
+            }
+            return;
+        }
+        if (self.sub_grids.getPtr(grid_id)) |sg| {
+            sg.dirty = true;
+            if (sg.dirty_rows.bit_length > row) {
+                sg.dirty_rows.set(row);
+            }
+            if (self.win_pos.get(grid_id)) |p| {
+                self.content_rev +%= 1;
+                const tr = p.row + row;
+                self.markDirtyRow(tr);
+                self.recordScrollTouchedRow(tr);
+            }
+            if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
+                self.cursor_rev +%= 1;
+            }
+        }
+    }
+
     pub fn putCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
         if (grid_id == 1) {
             self.putCell(row, col, cp, hl);
@@ -1411,6 +1654,7 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll(top, bot, left, right, rows, cols);
+            self.scrollOverflow(grid_id, top, bot, left, right, rows);
             // Multiple scrolls in same batch block the fast path (same as global grid)
             if (sg.last_scroll_op != null) {
                 sg.scroll_fast_path_blocked = true;
@@ -1497,6 +1741,7 @@ pub const Grid = struct {
             var buf = kv.value;
             buf.deinit(self.alloc);
         }
+        self.clearOverflowForGrid(grid_id);
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);

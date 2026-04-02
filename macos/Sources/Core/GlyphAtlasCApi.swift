@@ -45,9 +45,9 @@ public func zonvie_macos_rasterize_glyph(
     _ outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>?
 ) -> Int32 {
     guard let ctx, let outBitmap else { return 0 }
-    let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = core.terminalView else { return 0 }
-    return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, outBitmap: outBitmap) ? 1 : 0
+    let zc = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+    guard let view = zc.terminalView else { return 0 }
+    return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
 }
 
 @_cdecl("zonvie_macos_atlas_upload")

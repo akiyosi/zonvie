@@ -17,11 +17,19 @@ const vertexgen = @import("vertexgen.zig");
 const block_elements = @import("block_elements.zig");
 
 // Emoji cluster context: set before ensureGlyphPhase2 so the frontend
-// rasterizer can access the full cluster text (for multi-scalar emoji
-// like flag sequences, ZWJ sequences, VS16 emoji).
-// Single-threaded: only written/read during flush on the core thread.
-pub var emoji_cluster_buf: [16]u32 = undefined;
-pub var emoji_cluster_len: u8 = 0;
+// emoji_cluster_buf / emoji_cluster_len are now per-instance fields on Core
+// (nvim_core.zig) so that the public ABI zonvie_core_get_emoji_cluster() is
+// instance-safe. Accessed via core.emoji_cluster_buf / core.emoji_cluster_len.
+
+/// Key for float overlay overflow map during ext grid composition.
+pub const FloatOverlayKey = packed struct { row: u32, col: u32 };
+
+/// Float overlay overflow map for ext grid composition.
+/// Maps (row, col) → optional extras. null extras means "float occupies this cell
+/// but has no overflow" (shadows the base grid's overflow).
+/// Using a HashMap gives O(1) lookup and last-write-wins when multiple floats
+/// overlap the same cell (matching composite_cells overwrite semantics).
+pub const FloatOverlayMap = std.AutoHashMapUnmanaged(FloatOverlayKey, ?[]const u32);
 
 pub const GridEntry = struct {
     grid_id: i64,
@@ -354,6 +362,22 @@ pub inline fn simdFillSequential(out: [*]u32, count: usize) void {
     }
     while (i < count) : (i += 1) {
         out[i] = @intCast(i);
+    }
+}
+
+/// SIMD fill with sequential u32 values starting from `start` (start, start+1, start+2, ...).
+pub inline fn simdFillSequentialFrom(out: [*]u32, count: usize, start: u32) void {
+    const V = @Vector(4, u32);
+    const step: V = @splat(@as(u32, 4));
+    var base: V = .{ start, start + 1, start + 2, start + 3 };
+    var i: usize = 0;
+    while (i + 4 <= count) {
+        @as(*[4]u32, @ptrCast(out + i)).* = base;
+        base += step;
+        i += 4;
+    }
+    while (i < count) : (i += 1) {
+        out[i] = start + @as(u32, @intCast(i));
     }
 }
 
@@ -1160,14 +1184,21 @@ pub fn generateRowVertices(
                     const style_index: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) @as(u32, 1) else 0) +
                         @as(u32, if (first_style & STYLE_ITALIC != 0) @as(u32, 2) else 0);
 
-                    // Collect scalars (skip wide char continuations) and track column widths
+                    // Collect scalars (skip wide char continuations) and track column widths.
+                    // Also track the composited column for each scalar so we can look up
+                    // cell overflow (e.g., VS16) during vertex generation.
                     core.shaping_scalars.clearRetainingCapacity();
                     core.shaping_col_widths.clearRetainingCapacity();
+                    core.shaping_src_cols.clearRetainingCapacity();
                     core.shaping_scalars.ensureTotalCapacity(core.alloc, run_len) catch {
                         c = end;
                         continue;
                     };
                     core.shaping_col_widths.ensureTotalCapacity(core.alloc, run_len) catch {
+                        c = end;
+                        continue;
+                    };
+                    core.shaping_src_cols.ensureTotalCapacity(core.alloc, run_len) catch {
                         c = end;
                         continue;
                     };
@@ -1177,6 +1208,9 @@ pub fn generateRowVertices(
                         core.shaping_scalars.items.len = run_len;
                         @memset(core.shaping_col_widths.items.ptr[0..run_len], 1);
                         core.shaping_col_widths.items.len = run_len;
+                        // src_cols: sequential from run_start
+                        simdFillSequentialFrom(core.shaping_src_cols.items.ptr, run_len, run_start);
+                        core.shaping_src_cols.items.len = run_len;
                     } else {
                         var si: u32 = run_start;
                         while (si < end) : (si += 1) {
@@ -1187,6 +1221,7 @@ pub fn generateRowVertices(
                             core.shaping_scalars.appendAssumeCapacity(s);
                             const col_w: u32 = if (si + 1 < end and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
                             core.shaping_col_widths.appendAssumeCapacity(col_w);
+                            core.shaping_src_cols.appendAssumeCapacity(si);
                         }
                     }
 
@@ -1448,6 +1483,15 @@ pub fn generateRowVertices(
                                     penX += blk_w;
                                     continue;
                                 }
+                                // Set emoji cluster context for .notdef emoji scalars
+                                // so the frontend rasterizer can use color emoji path.
+                                const fb_src_col = core.shaping_src_cols.items[@intCast(ci)];
+                                const fb_is_emoji = isEmojiPresentation(fb_scalar) or cellIsEmojiCluster(core, rc, r, fb_src_col);
+                                if (fb_is_emoji) {
+                                    setEmojiClusterFromOverflow(core, rc, r, fb_src_col, fb_scalar);
+                                }
+                                defer core.emoji_cluster_len = 0;
+
                                 if (core.ensureGlyphPhase2(fb_scalar, c_style)) |fb_ge| {
                                     if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
                                         const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
@@ -1503,7 +1547,10 @@ pub fn generateRowVertices(
                         // (D2D + Segoe UI Emoji on Windows, CoreGraphics on macOS).
                         var ge: c_api.GlyphEntry = undefined;
                         const first_scalar: u32 = core.shaping_scalars.items[@intCast(this_cluster)];
-                        const cluster_is_emoji = isEmojiPresentation(first_scalar) or clusterHasVS16(core, this_cluster, next_cluster);
+                        // Check if this cell has VS16 in its overflow map (e.g., ⚠️ = U+26A0 + U+FE0F)
+                        const src_col = core.shaping_src_cols.items[@intCast(this_cluster)];
+                        const cell_is_emoji_cluster = cellIsEmojiCluster(core, rc, r, src_col);
+                        const cluster_is_emoji = isEmojiPresentation(first_scalar) or cell_is_emoji_cluster;
                         var glyph_ok = gid_blk: {
                             if (gid == 0 or cluster_is_emoji) {
                                 break :gid_blk false;
@@ -1540,12 +1587,14 @@ pub fn generateRowVertices(
                         const glyph_empty = glyph_ok and (ge.bbox_size_px[0] <= 0 or ge.bbox_size_px[1] <= 0);
                         if ((!glyph_ok or glyph_empty) and (next_cluster == this_cluster + 1 or cluster_is_emoji)) {
                             if (first_scalar != 0 and first_scalar != 0x20) {
-                                // Check non-ASCII glyph cache before rasterizing.
-                                // For single-scalar clusters and single-scalar emoji,
-                                // the scalar+style key is sufficient.
+                                // Build cache key that includes the full cluster content
+                                // (base scalar + overflow extras) so different emoji clusters
+                                // with the same first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct entries.
+                                const overflow_extras = getOverflowForCell(core, rc, r, src_col);
+                                const fb_key = clusterCacheKey(first_scalar, style_index, overflow_extras);
+                                const fb_hash = clusterCacheHash(first_scalar, style_index, overflow_extras);
+
                                 const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) blk: {
-                                    const fb_key = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
-                                    const fb_hash = (first_scalar *% 2654435761) ^ style_index;
                                     const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
                                     if (glyph_keys_non_ascii.?[fb_idx] == fb_key) {
                                         ge = glyph_cache_non_ascii.?[fb_idx];
@@ -1557,25 +1606,18 @@ pub fn generateRowVertices(
                                 if (fb_cached) {
                                     glyph_ok = true;
                                 } else {
-                                    // Set cluster context only for emoji clusters so the
-                                    // frontend rasterizer knows to use color emoji path.
+                                    // Set cluster context for emoji so the frontend rasterizer
+                                    // uses color emoji path. Uses overflow map for VS16 sequences.
                                     if (cluster_is_emoji) {
-                                        const cl_len = @min(next_cluster - this_cluster, emoji_cluster_buf.len);
-                                        var ci: u32 = 0;
-                                        while (ci < cl_len) : (ci += 1) {
-                                            emoji_cluster_buf[ci] = core.shaping_scalars.items[@intCast(this_cluster + ci)];
-                                        }
-                                        emoji_cluster_len = @intCast(cl_len);
+                                        setEmojiClusterFromOverflow(core, rc, r, src_col, first_scalar);
                                     }
-                                    defer emoji_cluster_len = 0;
+                                    defer core.emoji_cluster_len = 0;
 
                                     if (core.ensureGlyphPhase2(first_scalar, c_style)) |fb_ge| {
                                         ge = fb_ge;
                                         glyph_ok = true;
                                         // Store in non-ASCII cache for subsequent rows
                                         if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) {
-                                            const fb_key = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
-                                            const fb_hash = (first_scalar *% 2654435761) ^ style_index;
                                             const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
                                             glyph_cache_non_ascii.?[fb_idx] = fb_ge;
                                             glyph_keys_non_ascii.?[fb_idx] = fb_key;
@@ -3949,6 +3991,23 @@ pub const FlushCtx = struct {
                                     @as(u32, if (cursor_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
+                                // Set emoji cluster context for cursor cell if its overflow
+                                // contains emoji-significant codepoints (VS16, ZWJ, skin tone).
+                                if (ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col)) |extras| {
+                                    const is_emoji = isEmojiPresentation(cursor_cp) or for (extras) |e| {
+                                        if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
+                                    } else false;
+                                    if (is_emoji) {
+                                        ctx.core.emoji_cluster_buf[0] = cursor_cp;
+                                        const elen = @min(extras.len, ctx.core.emoji_cluster_buf.len - 1);
+                                        for (0..elen) |ei| {
+                                            ctx.core.emoji_cluster_buf[1 + ei] = extras[ei];
+                                        }
+                                        ctx.core.emoji_cluster_len = @intCast(1 + elen);
+                                    }
+                                }
+                                defer ctx.core.emoji_cluster_len = 0;
+
                                 // Get glyph entry from atlas using actual style
                                 if (ctx.core.isPhase2Atlas()) {
                                     if (ctx.core.ensureGlyphPhase2(cursor_cp, cursor_c_style)) |entry| {
@@ -4434,6 +4493,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         };
         defer self.alloc.free(composite_cells);
 
+        // Float overlay overflow: reuse persistent map (cleared each ext grid).
+        self.flush_float_overlay_buf.clearRetainingCapacity();
+
         // Copy external grid cells to composite array
         if (sg.cells.len >= n_cells) {
             @memcpy(composite_cells[0..n_cells], sg.cells[0..n_cells]);
@@ -4515,6 +4577,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                             // Overwrite composite cell with float window cell
                             composite_cells[target_idx] = float_sg.cells[float_cell_idx];
+
+                            // Record float overlay for emoji lookup during row composition.
+                            // Always record (even without overflow) so the float shadows
+                            // any base grid overflow at this position. put() overwrites
+                            // so the last float wins (matching composite_cells semantics).
+                            self.flush_float_overlay_buf.put(self.alloc, .{
+                                .row = @intCast(target_row),
+                                .col = @intCast(target_col),
+                            }, self.grid.getOverflow(float_grid_id, fr, fc)) catch {};
+
                             overlay_cell_count += 1;
                         }
                     }
@@ -4688,6 +4760,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             };
             self.row_cells.setLen(sg.cols);
 
+            // Set float overlay context (used by getOverflowForCell for O(1) lookup)
+            self.flush_float_overlay = &self.flush_float_overlay_buf;
+
             const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
             for (0..sg.cols) |c| {
                 const cell_idx = row_start + c;
@@ -4753,6 +4828,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
             }
         }
+        // Clear float overlay context pointer (buffer is persistent, cleared next ext grid)
+        self.flush_float_overlay = null;
         break :ext_retry; // Normal exit from retry loop
         }
 
@@ -4842,6 +4919,22 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                 const ext_cursor_c_style: u32 =
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+
+                                // Set emoji cluster context for ext grid cursor if emoji-significant
+                                if (self.grid.getOverflow(grid_id, cur_row, cursor_col)) |extras| {
+                                    const is_emoji = isEmojiPresentation(cursor_cell.cp) or for (extras) |e| {
+                                        if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
+                                    } else false;
+                                    if (is_emoji) {
+                                        self.emoji_cluster_buf[0] = cursor_cell.cp;
+                                        const elen = @min(extras.len, self.emoji_cluster_buf.len - 1);
+                                        for (0..elen) |ei| {
+                                            self.emoji_cluster_buf[1 + ei] = extras[ei];
+                                        }
+                                        self.emoji_cluster_len = @intCast(1 + elen);
+                                    }
+                                }
+                                defer self.emoji_cluster_len = 0;
 
                                 if (self.isPhase2Atlas()) {
                                     if (self.ensureGlyphPhase2(cursor_cell.cp, ext_cursor_c_style)) |entry| {
@@ -5099,15 +5192,22 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             if (!writer.writeCell(state.firstc, 0)) {}
         }
 
-        // prompt - use prompt_hl_id
+        // prompt - use prompt_hl_id (cluster-aware)
         if (state.prompt.len > 0) {
-            var piter = std.unicode.Utf8View.initUnchecked(state.prompt).iterator();
-            while (piter.nextCodepoint()) |cp| {
-                if (!writer.writeCell(cp, state.prompt_hl_id)) break;
-                // Add continuation cell for wide characters
-                if (isWideChar(cp)) {
+            var pbyte_i: usize = 0;
+            while (pbyte_i < state.prompt.len) {
+                const pc = scanEmojiCluster(state.prompt, pbyte_i);
+                if (pc.codepoint_count == 0) break;
+                const pre_col = grid_col;
+                if (!writer.writeCell(pc.first_cp, state.prompt_hl_id)) break;
+                const written = grid_col > pre_col;
+                if (pc.display_width >= 2) {
                     if (!writer.writeCell(0, state.prompt_hl_id)) break;
                 }
+                if (pc.extras_len > 0 and written) {
+                    self.grid.putOverflow(cmdline_grid_id, 0, pre_col, pc.extras[0..pc.extras_len]);
+                }
+                pbyte_i = pc.end_byte;
             }
         }
 
@@ -5117,60 +5217,104 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             if (!writer.writeCell(' ', 0)) break;
         }
 
-        // content chunks - use each chunk's hl_id, with caret notation for control chars
+        // content chunks - use each chunk's hl_id, with caret notation for control chars.
+        // Multi-codepoint sequences (emoji ZWJ, VS16, etc.) are stored as:
+        //   first codepoint → Cell.cp, extra codepoints → overflow map.
         for (state.content.items) |chunk| {
-            var citer = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-            while (citer.nextCodepoint()) |cp| {
-                if (cp < 0x20) {
-                    // Control character: display as ^X with chunk's hl_id
+            const text = chunk.text;
+            var byte_i: usize = 0;
+            while (byte_i < text.len) {
+                const cluster = scanEmojiCluster(text, byte_i);
+                if (cluster.codepoint_count == 0) break;
+
+                if (cluster.first_cp < 0x20) {
                     if (!writer.writeCell('^', chunk.hl_id)) break;
-                    const ctrl_char: u32 = '@' + cp;
-                    if (!writer.writeCell(ctrl_char, chunk.hl_id)) break;
-                } else if (cp == 0x7F) {
-                    // DEL character: display as ^?
+                    if (!writer.writeCell('@' + cluster.first_cp, chunk.hl_id)) break;
+                    byte_i = cluster.end_byte;
+                    continue;
+                }
+                if (cluster.first_cp == 0x7F) {
                     if (!writer.writeCell('^', chunk.hl_id)) break;
                     if (!writer.writeCell('?', chunk.hl_id)) break;
-                } else {
-                    if (!writer.writeCell(cp, chunk.hl_id)) break;
-                    // Add continuation cell for wide characters
-                    if (isWideChar(cp)) {
-                        if (!writer.writeCell(0, chunk.hl_id)) break;
-                    }
+                    byte_i = cluster.end_byte;
+                    continue;
                 }
+
+                // Write the base cell. Track whether it was actually written
+                // (scrolled-off cells are skipped by writeCell).
+                const pre_grid_col = grid_col;
+                if (!writer.writeCell(cluster.first_cp, chunk.hl_id)) break;
+                const cell_was_written = grid_col > pre_grid_col;
+
+                // Continuation cell only for double-width characters
+                if (cluster.display_width >= 2) {
+                    if (!writer.writeCell(0, chunk.hl_id)) break;
+                }
+
+                // Store extras in overflow map only if the cell was actually
+                // written to the grid (not scrolled off the left edge).
+                if (cluster.extras_len > 0 and cell_was_written) {
+                    self.grid.putOverflow(cmdline_grid_id, 0, pre_grid_col, cluster.extras[0..cluster.extras_len]);
+                }
+
+                byte_i = cluster.end_byte;
             }
         }
 
-        // special_char (shown at cursor position after Ctrl-V etc.)
+        // special_char (shown at cursor position after Ctrl-V etc.) - cluster-aware
         if (!has_control_chars and special.len > 0) {
-            var siter = std.unicode.Utf8View.initUnchecked(special).iterator();
-            while (siter.nextCodepoint()) |cp| {
-                if (!writer.writeCell(cp, 0)) break;
-                // Add continuation cell for wide characters
-                if (isWideChar(cp)) {
+            var sbyte_i: usize = 0;
+            while (sbyte_i < special.len) {
+                const sc = scanEmojiCluster(special, sbyte_i);
+                if (sc.codepoint_count == 0) break;
+                const pre_col = grid_col;
+                if (!writer.writeCell(sc.first_cp, 0)) break;
+                const written = grid_col > pre_col;
+                if (sc.display_width >= 2) {
                     if (!writer.writeCell(0, 0)) break;
                 }
+                if (sc.extras_len > 0 and written) {
+                    self.grid.putOverflow(cmdline_grid_id, 0, pre_col, sc.extras[0..sc.extras_len]);
+                }
+                sbyte_i = sc.end_byte;
             }
         }
 
-        // Cursor position: firstc + prompt + indent + display_pos - scroll_offset
+        // Cursor position: firstc + prompt + indent + display_pos - scroll_offset.
+        // Neovim's state.pos is a BYTE offset into the concatenated content text.
+        // We iterate through content bytes, tracking display columns.
         var cursor_col: u32 = 0;
         if (state.firstc != 0) cursor_col += 1;
         cursor_col += countDisplayWidth(state.prompt);
         cursor_col += state.indent;
-        // Calculate display position by counting through content
-        var pos_remaining: u32 = state.pos;
+        var bytes_remaining: u32 = state.pos;
         outer: for (state.content.items) |chunk| {
-            var piter = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-            while (piter.nextCodepoint()) |cp| {
-                if (pos_remaining == 0) break :outer;
-                pos_remaining -= 1;
-                if (cp < 0x20 or cp == 0x7F) {
-                    cursor_col += 2; // ^X notation
-                } else if (isWideChar(cp)) {
-                    cursor_col += 2; // Wide character
+            const ctext = chunk.text;
+            if (bytes_remaining == 0) break :outer;
+            if (bytes_remaining >= ctext.len) {
+                // This entire chunk is before the cursor
+                cursor_col += countDisplayWidth(ctext);
+                bytes_remaining -= @intCast(ctext.len);
+                continue;
+            }
+            // Cursor is within this chunk — count display width up to the byte offset
+            var cbyte_i: usize = 0;
+            while (cbyte_i < ctext.len) {
+                if (bytes_remaining == 0) break :outer;
+                const cluster = scanEmojiCluster(ctext, cbyte_i);
+                if (cluster.codepoint_count == 0) break;
+                const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
+                if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
+                    cursor_col += 2;
                 } else {
-                    cursor_col += 1;
+                    cursor_col += cluster.display_width;
                 }
+                if (bytes_remaining >= cluster_bytes) {
+                    bytes_remaining -= cluster_bytes;
+                } else {
+                    bytes_remaining = 0;
+                }
+                cbyte_i = cluster.end_byte;
             }
         }
         // Adjust cursor position for scroll offset
@@ -5261,23 +5405,36 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
             if (current_width + 1 > max_width) max_width = current_width + 1;
 
             // Cursor position: firstc + prompt + indent + display_pos
+            // pos is a byte offset (same as regular cmdline).
             if (state.firstc != 0) cursor_col += 1;
             cursor_col += countDisplayWidth(state.prompt);
             cursor_col += state.indent;
-            // Calculate display position by counting through content
-            var pos_remaining: u32 = state.pos;
+            var bytes_remaining: u32 = state.pos;
             outer: for (state.content.items) |chunk| {
-                var piter = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-                while (piter.nextCodepoint()) |cp| {
-                    if (pos_remaining == 0) break :outer;
-                    pos_remaining -= 1;
-                    if (cp < 0x20 or cp == 0x7F) {
-                        cursor_col += 2; // ^X notation
-                    } else if (isWideChar(cp)) {
-                        cursor_col += 2; // Wide character
+                const ctext = chunk.text;
+                if (bytes_remaining == 0) break :outer;
+                if (bytes_remaining >= ctext.len) {
+                    cursor_col += countDisplayWidth(ctext);
+                    bytes_remaining -= @intCast(ctext.len);
+                    continue;
+                }
+                var cbyte_i: usize = 0;
+                while (cbyte_i < ctext.len) {
+                    if (bytes_remaining == 0) break :outer;
+                    const cluster = scanEmojiCluster(ctext, cbyte_i);
+                    if (cluster.codepoint_count == 0) break;
+                    const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
+                    if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
+                        cursor_col += 2;
                     } else {
-                        cursor_col += 1;
+                        cursor_col += cluster.display_width;
                     }
+                    if (bytes_remaining >= cluster_bytes) {
+                        bytes_remaining -= cluster_bytes;
+                    } else {
+                        bytes_remaining = 0;
+                    }
+                    cbyte_i = cluster.end_byte;
                 }
             }
         }
@@ -5295,38 +5452,44 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     // Clear the grid first
     self.grid.clearGrid(cmdline_grid_id);
 
-    // Write block lines to grid (with caret notation for control characters)
+    // Write block lines to grid using scanEmojiCluster for multi-codepoint emoji
     for (block_lines, 0..) |line, row_idx| {
+        const row: u32 = @intCast(row_idx);
         var col: u32 = 0;
         for (line.items) |chunk| {
-            var iter = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-            while (iter.nextCodepoint()) |cp| {
+            const text = chunk.text;
+            var byte_i: usize = 0;
+            while (byte_i < text.len) {
                 if (col >= max_width) break;
-                if (cp < 0x20) {
-                    // Control character: display as ^X (caret notation)
-                    self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, '^', chunk.hl_id);
+                const cluster = scanEmojiCluster(text, byte_i);
+                if (cluster.codepoint_count == 0) break;
+
+                if (cluster.first_cp < 0x20) {
+                    self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
                     col += 1;
-                    if (col >= max_width) break;
-                    const ctrl_char: u32 = '@' + cp;
-                    self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, ctrl_char, chunk.hl_id);
+                    if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                    self.grid.putCellGrid(cmdline_grid_id, row, col, '@' + cluster.first_cp, chunk.hl_id);
                     col += 1;
-                } else if (cp == 0x7F) {
-                    // DEL character: display as ^?
-                    self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, '^', chunk.hl_id);
+                } else if (cluster.first_cp == 0x7F) {
+                    self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
                     col += 1;
-                    if (col >= max_width) break;
-                    self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, '?', chunk.hl_id);
+                    if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                    self.grid.putCellGrid(cmdline_grid_id, row, col, '?', chunk.hl_id);
                     col += 1;
                 } else {
-                    self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, cp, chunk.hl_id);
+                    self.grid.putCellGrid(cmdline_grid_id, row, col, cluster.first_cp, chunk.hl_id);
+                    if (cluster.extras_len > 0) {
+                        self.grid.putOverflow(cmdline_grid_id, row, col, cluster.extras[0..cluster.extras_len]);
+                    }
                     col += 1;
-                    // Add continuation cell for wide characters
-                    if (isWideChar(cp)) {
-                        if (col >= max_width) break;
-                        self.grid.putCellGrid(cmdline_grid_id, @intCast(row_idx), col, 0, chunk.hl_id);
+                    if (cluster.display_width >= 2) {
+                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                        self.grid.putCellGrid(cmdline_grid_id, row, col, 0, chunk.hl_id);
                         col += 1;
                     }
                 }
+
+                byte_i = cluster.end_byte;
             }
         }
     }
@@ -5342,19 +5505,24 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                 col += 1;
             }
 
-            // prompt - use prompt_hl_id
+            // prompt - use prompt_hl_id (cluster-aware)
             if (state.prompt.len > 0) {
-                var piter = std.unicode.Utf8View.initUnchecked(state.prompt).iterator();
-                while (piter.nextCodepoint()) |cp| {
+                var pbyte_i: usize = 0;
+                while (pbyte_i < state.prompt.len) {
                     if (col >= max_width) break;
-                    self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, cp, state.prompt_hl_id);
+                    const pc = scanEmojiCluster(state.prompt, pbyte_i);
+                    if (pc.codepoint_count == 0) break;
+                    self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, pc.first_cp, state.prompt_hl_id);
+                    if (pc.extras_len > 0) {
+                        self.grid.putOverflow(cmdline_grid_id, block_line_count, col, pc.extras[0..pc.extras_len]);
+                    }
                     col += 1;
-                    // Add continuation cell for wide characters
-                    if (isWideChar(cp)) {
-                        if (col >= max_width) break;
+                    if (pc.display_width >= 2) {
+                        if (col >= max_width) { pbyte_i = pc.end_byte; break; }
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, state.prompt_hl_id);
                         col += 1;
                     }
+                    pbyte_i = pc.end_byte;
                 }
             }
 
@@ -5365,54 +5533,64 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                 col += 1;
             }
 
-            // content chunks - use each chunk's hl_id
+            // content chunks - cluster-aware (matching regular cmdline path)
             for (state.content.items) |chunk| {
-                var citer = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-                while (citer.nextCodepoint()) |cp| {
+                const text = chunk.text;
+                var byte_i: usize = 0;
+                while (byte_i < text.len) {
                     if (col >= max_width) break;
-                    if (cp < 0x20) {
-                        // Control character: display as ^X with chunk's hl_id
+                    const cluster = scanEmojiCluster(text, byte_i);
+                    if (cluster.codepoint_count == 0) break;
+
+                    if (cluster.first_cp < 0x20) {
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
                         col += 1;
-                        if (col >= max_width) break;
-                        const ctrl_char: u32 = '@' + cp;
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, ctrl_char, chunk.hl_id);
+                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '@' + cluster.first_cp, chunk.hl_id);
                         col += 1;
-                    } else if (cp == 0x7F) {
-                        // DEL character: display as ^?
+                    } else if (cluster.first_cp == 0x7F) {
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
                         col += 1;
-                        if (col >= max_width) break;
+                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '?', chunk.hl_id);
                         col += 1;
                     } else {
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, cp, chunk.hl_id);
+                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, cluster.first_cp, chunk.hl_id);
+                        if (cluster.extras_len > 0) {
+                            self.grid.putOverflow(cmdline_grid_id, block_line_count, col, cluster.extras[0..cluster.extras_len]);
+                        }
                         col += 1;
-                        // Add continuation cell for wide characters
-                        if (isWideChar(cp)) {
-                            if (col >= max_width) break;
+                        if (cluster.display_width >= 2) {
+                            if (col >= max_width) { byte_i = cluster.end_byte; break; }
                             self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, chunk.hl_id);
                             col += 1;
                         }
                     }
+
+                    byte_i = cluster.end_byte;
                 }
             }
 
-            // special_char (shown at cursor position after Ctrl-V etc.)
+            // special_char (shown at cursor position after Ctrl-V etc.) - cluster-aware
             if (!current_has_control_chars) {
                 const special = state.getSpecialChar();
                 if (special.len > 0) {
-                    var siter = std.unicode.Utf8View.initUnchecked(special).iterator();
-                    while (siter.nextCodepoint()) |cp| {
+                    var sbyte_i: usize = 0;
+                    while (sbyte_i < special.len) {
                         if (col >= max_width) break;
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, cp, 0);
+                        const sc = scanEmojiCluster(special, sbyte_i);
+                        if (sc.codepoint_count == 0) break;
+                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, sc.first_cp, 0);
+                        if (sc.extras_len > 0) {
+                            self.grid.putOverflow(cmdline_grid_id, block_line_count, col, sc.extras[0..sc.extras_len]);
+                        }
                         col += 1;
-                        // Add continuation cell for wide characters
-                        if (isWideChar(cp)) {
-                            if (col >= max_width) break;
+                        if (sc.display_width >= 2) {
+                            if (col >= max_width) { sbyte_i = sc.end_byte; break; }
                             self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, 0);
                             col += 1;
                         }
+                        sbyte_i = sc.end_byte;
                     }
                 }
             }
@@ -6756,6 +6934,173 @@ pub fn hideMsgHistory(self: *Core) void {
     self.log.write("[msg_history] hide\n", .{});
 }
 
+/// Look up overflow extras for a composited column.
+/// First checks the ephemeral float overlay buffer (for ext grid composites),
+/// then falls back to the persistent overflow map.
+pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) ?[]const u32 {
+    // Check ephemeral float overlay map first (set during ext grid flush).
+    // A hit means a float occupies this cell: value non-null = float has overflow,
+    // value null = float shadows base (no overflow). Either way, do NOT fall back.
+    if (core.flush_float_overlay) |map| {
+        const key = FloatOverlayKey{ .row = comp_row, .col = comp_col };
+        if (map.contains(key)) return map.get(key).?;
+    }
+
+    // Fall back to persistent overflow map (no float overlay at this cell)
+    if (core.grid.cell_overflow.count() == 0) return null;
+    const gid = rc.grid_ids.items[@intCast(comp_col)];
+    const src_row: u32 = if (gid == 1) comp_row else blk: {
+        if (core.grid.win_pos.get(gid)) |pos| break :blk comp_row -| pos.row;
+        break :blk comp_row;
+    };
+    const src_col: u32 = if (gid == 1) comp_col else blk: {
+        if (core.grid.win_pos.get(gid)) |pos| break :blk comp_col -| pos.col;
+        break :blk comp_col;
+    };
+    return core.grid.getOverflow(gid, src_row, src_col);
+}
+
+/// Check if a composited cell's overflow contains emoji-significant codepoints
+/// (VS16 U+FE0F, ZWJ U+200D, or skin tone modifiers U+1F3FB..1F3FF).
+/// Any of these indicate the cell is part of a multi-codepoint emoji cluster
+/// that needs color emoji rendering.
+pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) bool {
+    const extras = getOverflowForCell(core, rc, comp_row, comp_col) orelse return false;
+    for (extras) |extra| {
+        if (extra == 0xFE0F or extra == 0x200D or (extra >= 0x1F3FB and extra <= 0x1F3FF)) return true;
+    }
+    return false;
+}
+
+/// Build a cache key for a cell's full cluster (base scalar + overflow extras + style).
+/// Overflow extras are folded into the key so different ZWJ sequences with the same
+/// first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct cache entries.
+pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u64 {
+    // Start with base key: scalar + style
+    var key: u64 = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
+    // Fold in overflow codepoints
+    if (overflow) |extras| {
+        for (extras) |cp| {
+            // FNV-1a-like mixing into upper bits
+            key ^= @as(u64, cp) *% 0x517cc1b727220a95;
+        }
+    }
+    return key;
+}
+
+/// Build a cache hash index for a cell's full cluster.
+fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u32 {
+    var h: u32 = (first_scalar *% 2654435761) ^ style_index;
+    if (overflow) |extras| {
+        for (extras) |cp| {
+            h ^= cp *% 2246822519;
+            h = (h << 13) | (h >> 19); // rotate
+        }
+    }
+    return h;
+}
+
+/// Populate core.emoji_cluster_buf from a cell's base scalar + overflow extras.
+fn setEmojiClusterFromOverflow(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32, base_scalar: u32) void {
+    core.emoji_cluster_buf[0] = base_scalar;
+    var len: u8 = 1;
+    if (getOverflowForCell(core, rc, comp_row, comp_col)) |extras| {
+        for (extras) |extra| {
+            if (len < core.emoji_cluster_buf.len) {
+                core.emoji_cluster_buf[len] = extra;
+                len += 1;
+            }
+        }
+    }
+    core.emoji_cluster_len = len;
+}
+
+/// Result of scanning one emoji/grapheme cluster from a UTF-8 string.
+pub const EmojiCluster = struct {
+    first_cp: u32,
+    /// Number of codepoints in the cluster (including the first).
+    codepoint_count: u32,
+    /// Display width in cells (1 or 2).
+    display_width: u32,
+    /// Byte offset past the end of the cluster in the source string.
+    end_byte: usize,
+    /// Extra codepoints (after the first). Valid up to codepoint_count - 1.
+    extras: [15]u32,
+    extras_len: u32,
+};
+
+/// Scan one emoji cluster starting at `start` in a UTF-8 string.
+/// Recognizes VS16, ZWJ sequences, skin tone modifiers, keycap sequences,
+/// regional indicator pairs, and tag sequences.
+pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = start };
+    const first_slice = it.nextCodepointSlice() orelse return .{
+        .first_cp = 0, .codepoint_count = 0, .display_width = 0,
+        .end_byte = start, .extras = undefined, .extras_len = 0,
+    };
+    const first_cp = std.unicode.utf8Decode(first_slice) catch return .{
+        .first_cp = 0xFFFD, .codepoint_count = 1, .display_width = 1,
+        .end_byte = it.i, .extras = undefined, .extras_len = 0,
+    };
+
+    var extras: [15]u32 = undefined;
+    var extras_len: u32 = 0;
+    var prev_cp: u32 = first_cp;
+
+    var scan = it;
+    while (scan.i < text.len) {
+        const save_i = scan.i;
+        const sl = scan.nextCodepointSlice() orelse break;
+        const cp2 = std.unicode.utf8Decode(sl) catch break;
+
+        // Regional indicators pair: only accept one more RI (flags are exactly 2 RIs).
+        const ri_count: u32 = if (first_cp >= 0x1F1E6 and first_cp <= 0x1F1FF) 1 else 0;
+        const cur_ri_count = ri_count + blk: {
+            var c: u32 = 0;
+            for (extras[0..extras_len]) |e| {
+                if (e >= 0x1F1E6 and e <= 0x1F1FF) c += 1;
+            }
+            break :blk c;
+        };
+        const is_cluster_ext = (cp2 == 0xFE0F or cp2 == 0xFE0E or cp2 == 0x200D or
+            cp2 == 0x20E3 or (cp2 >= 0x1F3FB and cp2 <= 0x1F3FF) or
+            (cp2 >= 0x1F1E6 and cp2 <= 0x1F1FF and first_cp >= 0x1F1E6 and first_cp <= 0x1F1FF and cur_ri_count < 2) or
+            (cp2 >= 0xE0020 and cp2 <= 0xE007F));
+        const after_zwj = prev_cp == 0x200D;
+
+        if (is_cluster_ext or after_zwj) {
+            if (extras_len < extras.len) {
+                extras[extras_len] = cp2;
+                extras_len += 1;
+            }
+            prev_cp = cp2;
+        } else {
+            scan.i = save_i;
+            break;
+        }
+    }
+
+    const cp_count: u32 = 1 + extras_len;
+    // Display width: 2 cells for emoji, matching Neovim's strwidth().
+    // - Emoji_Presentation=Yes (👩, 😀) → 2
+    // - East Asian Wide (CJK) → 2
+    // - VS16-qualified (⚠️, #️⃣) → 2 (VS16 requests emoji presentation = wide)
+    // - Plain narrow text → 1
+    const has_vs16 = for (extras[0..extras_len]) |e| {
+        if (e == 0xFE0F) break true;
+    } else false;
+    const dw: u32 = if (isWideChar(first_cp) or isEmojiPresentation(first_cp) or has_vs16) 2 else 1;
+
+    return .{
+        .first_cp = first_cp,
+        .codepoint_count = cp_count,
+        .display_width = dw,
+        .end_byte = scan.i,
+        .extras = extras,
+        .extras_len = extras_len,
+    };
+}
+
 pub fn countUtf8Codepoints(s: []const u8) u32 {
     var count: u32 = 0;
     var iter = std.unicode.Utf8View.initUnchecked(s).iterator();
@@ -6791,17 +7136,21 @@ pub fn isWideChar(cp: u32) bool {
 /// Count display width accounting for control characters (^X notation) and wide characters.
 /// Control characters (0x00-0x1F) and DEL (0x7F) take 2 columns.
 /// Wide characters (CJK, etc.) take 2 columns.
+/// Count display width of a UTF-8 string, recognizing emoji clusters.
+/// Control characters (^X) take 2 columns. Emoji clusters take 2 columns.
+/// Wide CJK characters take 2 columns. Everything else takes 1 column.
 pub fn countDisplayWidth(s: []const u8) u32 {
     var count: u32 = 0;
-    var iter = std.unicode.Utf8View.initUnchecked(s).iterator();
-    while (iter.nextCodepoint()) |cp| {
-        if (cp < 0x20 or cp == 0x7F) {
-            count += 2; // ^X notation takes 2 columns
-        } else if (isWideChar(cp)) {
-            count += 2; // Wide character takes 2 columns
+    var byte_i: usize = 0;
+    while (byte_i < s.len) {
+        const cluster = scanEmojiCluster(s, byte_i);
+        if (cluster.codepoint_count == 0) break;
+        if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
+            count += 2; // ^X notation
         } else {
-            count += 1;
+            count += cluster.display_width;
         }
+        byte_i = cluster.end_byte;
     }
     return count;
 }

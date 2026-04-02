@@ -1163,6 +1163,24 @@ pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
     return box.core.hl.default_bg;
 }
 
+/// Get the current emoji cluster context set during flush.
+/// Returns a pointer to the cluster scalars and writes the count to out_len.
+/// Valid only during on_rasterize_glyph callbacks (single-threaded flush context).
+/// Returns null with *out_len=0 when no cluster context is active.
+/// Returns the emoji cluster context from the core instance.
+/// Valid only during on_rasterize_glyph callbacks (single-threaded flush context).
+pub export fn zonvie_core_get_emoji_cluster(p: ?*zonvie_core, out_len: ?*u8) callconv(.c) ?[*]const u32 {
+    if (p == null) {
+        if (out_len) |ol| ol.* = 0;
+        return null;
+    }
+    const box = asBox(p.?);
+    const len = box.core.emoji_cluster_len;
+    if (out_len) |ol| ol.* = len;
+    if (len == 0) return null;
+    return &box.core.emoji_cluster_buf;
+}
+
 /// Query whether post-process bloom glow is enabled (lock-free atomic read).
 pub export fn zonvie_core_get_glow_enabled(p: ?*zonvie_core) callconv(.c) bool {
     if (p == null) return false;

@@ -16,6 +16,9 @@ final class ZonvieCore {
     private var core: OpaquePointer?
     private var ctxPtr: UnsafeMutableRawPointer?
 
+    /// Public accessor for the core pointer (needed by atlas callbacks).
+    var corePtr: OpaquePointer? { core }
+
     // SSH_ASKPASS script path for cleanup
     private var sshAskpassPath: String?
 

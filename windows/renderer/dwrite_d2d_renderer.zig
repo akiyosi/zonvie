@@ -1271,7 +1271,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     /// D2D color emoji rendering: render a Unicode scalar (or cluster) via D2D
     /// DrawTextW into a 32-bit BGRA DIB section, then copy to glyph_tmp as RGBA.
     /// Returns true if color emoji was successfully rendered.
-    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, out_bitmap: *core.GlyphBitmap) bool {
+    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
         // Use oversized buffer so emoji glyphs are not clipped.
         // Emoji fonts often render taller than the cell height (ascent + descent
         // can exceed em size). The actual glyph bounds are scanned afterwards and
@@ -1361,12 +1361,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         // Convert cluster scalars to UTF-16.
         // If flush set a multi-scalar cluster context, use the full cluster;
         // otherwise fall back to the single scalar argument.
-        const flush_mod = core.flush_mod;
-        const cluster_len = flush_mod.emoji_cluster_len;
+        var gdi_cl_len: u8 = 0;
+        const gdi_cl_ptr = core.zonvie_core_get_emoji_cluster(corep, &gdi_cl_len);
         var text_buf: [32]c.WCHAR = undefined; // max 16 scalars * 2 UTF-16 units
         var text_len: u32 = 0;
-        if (cluster_len > 1) {
-            for (flush_mod.emoji_cluster_buf[0..cluster_len]) |sc| {
+        if (gdi_cl_len > 1 and gdi_cl_ptr != null) {
+            for (gdi_cl_ptr.?[0..gdi_cl_len]) |sc| {
                 if (sc <= 0xFFFF) {
                     if (text_len < text_buf.len) {
                         text_buf[text_len] = @intCast(sc);
@@ -1529,7 +1529,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
     /// Phase 2: Rasterize glyph via DWrite without atlas packing.
     /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
-    pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
+    pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
@@ -1563,9 +1563,10 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         // Emoji codepoints: always prefer system color emoji (D2D + Segoe UI Emoji).
         // Also check the cluster context: flush sets emoji_cluster_len > 0 for
         // VS16-qualified and multi-scalar emoji clusters (e.g., ☀️ = U+2600 + FE0F).
-        const flush_mod = core.flush_mod;
-        if (isEmojiPresentation(scalar) or flush_mod.emoji_cluster_len > 0) {
-            if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+        var emoji_cl_len: u8 = 0;
+        _ = core.zonvie_core_get_emoji_cluster(corep, &emoji_cl_len);
+        if (isEmojiPresentation(scalar) or emoji_cl_len > 0) {
+            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
                 return;
             }
         }
@@ -1573,7 +1574,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         // .notdef (glyph_index==0): font doesn't have this glyph.
         // Try GDI color emoji fallback for non-emoji non-ASCII scalars.
         if (glyph_index == 0 and scalar > 0xFF) {
-            if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
                 return;
             }
         }
@@ -1642,7 +1643,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             // color emoji that DWrite ClearType/aliased can't render.
             // Try GDI color emoji fallback before giving up.
             if (scalar > 0xFF) {
-                if (self.rasterizeColorEmojiGDI(scalar, out_bitmap)) {
+                if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
                     return;
                 }
             }

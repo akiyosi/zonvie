@@ -280,8 +280,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     // Phase 2: Core-managed atlas pass-through
 
-    func rasterizeGlyphOnly(scalar: UInt32, styleFlags: UInt32, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
-        return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, outBitmap: outBitmap)
+    func rasterizeGlyphOnly(scalar: UInt32, styleFlags: UInt32, corePtr: OpaquePointer?, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
+        return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: corePtr, outBitmap: outBitmap)
     }
 
     func uploadAtlasRegion(destX: UInt32, destY: UInt32, width: UInt32, height: UInt32, bitmap: UnsafePointer<zonvie_glyph_bitmap>) {

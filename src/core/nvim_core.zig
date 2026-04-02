@@ -556,6 +556,21 @@ pub const Core = struct {
     shaping_bufs: vertexgen.ShapingBuffers = .{},
     shaping_scalars: std.ArrayListUnmanaged(u32) = .{},
     shaping_col_widths: std.ArrayListUnmanaged(u32) = .{},
+    /// Maps each shaping_scalars entry back to its composited column index.
+    shaping_src_cols: std.ArrayListUnmanaged(u32) = .{},
+
+    /// Pointer to the float overlay overflow map for the current ext grid.
+    /// Set during ext grid composition, null during main grid / non-ext-grid paths.
+    flush_float_overlay: ?*const flush.FloatOverlayMap = null,
+
+    /// Persistent float overlay map reused across flushes (avoids per-flush allocation).
+    /// Cleared and repopulated for each ext grid that has float overlays.
+    flush_float_overlay_buf: flush.FloatOverlayMap = .{},
+
+    /// Per-instance emoji cluster context for the current rasterize callback.
+    /// Set during flush vertex generation, read by on_rasterize_glyph callbacks.
+    emoji_cluster_buf: [16]u32 = undefined,
+    emoji_cluster_len: u8 = 0,
 
     // Phase B: Shaping result cache (4-way set associative, keyed by text content + style)
     shape_cache_size: u32 = 4096, // total entries (configurable via [performance] in config.toml)
@@ -674,6 +689,8 @@ pub const Core = struct {
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
+        self.shaping_src_cols.deinit(self.alloc);
+        self.flush_float_overlay_buf.deinit(self.alloc);
         self.freeGlowGroupNames();
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
@@ -765,6 +782,8 @@ pub const Core = struct {
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
+        self.shaping_src_cols.deinit(self.alloc);
+        self.flush_float_overlay_buf.deinit(self.alloc);
 
         // Free glow state
         self.freeGlowGroupNames();

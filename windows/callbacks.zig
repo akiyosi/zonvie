@@ -1882,7 +1882,7 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
     if (atlas_ptr) |a| {
         if (applog.isEnabled()) {
             const t0 = std.time.nanoTimestamp();
-            a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+            a.rasterizeGlyphOnly(scalar, style_flags, app.corep, out_bitmap) catch return 0;
             const elapsed_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t0));
             _ = app.rasterize_call_count.fetchAdd(1, .monotonic);
             _ = app.rasterize_total_ns.fetchAdd(elapsed_ns, .monotonic);
@@ -1893,7 +1893,7 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
                 } else break;
             }
         } else {
-            a.rasterizeGlyphOnly(scalar, style_flags, out_bitmap) catch return 0;
+            a.rasterizeGlyphOnly(scalar, style_flags, app.corep, out_bitmap) catch return 0;
         }
         return 1;
     }
