@@ -20,10 +20,10 @@ Zonvie is a Fast, feature-rich Neovim GUI built with Zig, native on macOS and Wi
 |---|------|--------|
 | 1 | Standard Neovim GUI functionality | ✅ |
 | 2 | Multigrid Events compliance and rich window integration | ⚠️ |
-| 3 | Basic customization (fonts, colors, blur, etc.) | ✅ |
+| 3 | Basic customization (fonts, colors, blur, variable fonts, etc.) | ✅ |
 | 4 | Cross-platform (macOS, Windows, Linux) | ⚠️ |
 | 5 | Remote connection (SSH, server mode, devcontainer) | ⚠️ |
-| 6 | Fancy features (cursor animation, neon/glow effects, etc.) | ❌ |
+| 6 | Fancy features (cursor animation, neon/glow, smooth scroll, etc.) | ⚠️ |
 
 ## Platforms
 
@@ -59,16 +59,19 @@ zonvie [OPTIONS] [--] [NVIM_ARGS...]
 | Option | Description |
 |--------|-------------|
 | `--nofork` | Don't fork; stay attached to terminal, keep cwd |
+| `--nvim <path>` | Path to Neovim executable (overrides config) |
 | `--log <path>` | Write application logs to specified file path |
 | `--extcmdline` | Enable external command line UI |
 | `--extpopup` | Enable external popup menu UI |
 | `--extmessages` | Enable external messages UI |
-| `--exttabline` | Enable external tabline UI (Chrome-style tabs) |
+| `--exttabline` | Enable external tabline UI |
+| `--extwindows` | Enable external windows (each Neovim window as OS window) |
 | `--ssh=<user@host[:port]>` | Connect to remote host via SSH |
 | `--ssh-identity=<path>` | Path to SSH private key file |
 | `--devcontainer=<workspace>` | Run inside a devcontainer |
 | `--devcontainer-config=<path>` | Path to devcontainer.json |
 | `--devcontainer-rebuild` | Rebuild devcontainer before starting |
+| `--install` | Create default config file and exit |
 | `--` | Pass all remaining arguments to nvim |
 | `--help`, `-h` | Show help message |
 
@@ -173,6 +176,12 @@ view = "split"
 
 [tabline]
 external = true
+style = "titlebar"  # "titlebar", "menu", or "sidebar"
+sidebar_position = "left"  # "left" or "right" (for sidebar style)
+sidebar_width = 200  # 100-500 (for sidebar style)
+
+[windows]
+external = false  # Each Neovim window as a separate OS window
 
 [log]
 enabled = false
@@ -181,11 +190,14 @@ path = "/tmp/zonvie.log"
 [performance]
 glyph_cache_ascii_size = 512
 glyph_cache_non_ascii_size = 256
-hl_cache_size = 512
+hl_cache_size = 2048
+shape_cache_size = 4096
+atlas_size = 2048
 
 [ime]
 disable_on_activate = false
 disable_on_modechange = false
+option_as_meta = "both"  # "both", "none", "only_left", "only_right"
 ```
 
 ### Configuration Options
@@ -257,6 +269,14 @@ Message routing rules are processed in order; first match wins.
 | Key | Description |
 |-----|-------------|
 | `external` | Use external tabline UI (true/false) |
+| `style` | Tabline style: "titlebar", "menu", or "sidebar" |
+| `sidebar_position` | Sidebar position: "left" or "right" (for sidebar style) |
+| `sidebar_width` | Sidebar width in pixels (100-500, for sidebar style) |
+
+#### [windows]
+| Key | Description |
+|-----|-------------|
+| `external` | Each Neovim window as a separate OS window (true/false) |
 
 #### [log]
 | Key | Description |
@@ -269,13 +289,59 @@ Message routing rules are processed in order; first match wins.
 |-----|-------------|
 | `glyph_cache_ascii_size` | Cache size for ASCII glyphs (min: 128, default: 512) |
 | `glyph_cache_non_ascii_size` | Cache size for non-ASCII glyphs (min: 64, default: 256) |
-| `hl_cache_size` | Highlight attribute cache size for vertex generation (range: 64-2048, default: 512) |
+| `hl_cache_size` | Highlight attribute cache size for vertex generation (range: 64-2048, default: 2048) |
+| `shape_cache_size` | Text shaping result cache size (range: 512-65536, default: 4096) |
+| `atlas_size` | Glyph atlas texture size in pixels (range: 1024-4096, default: 2048) |
 
 #### [ime]
 | Key | Description |
 |-----|-------------|
 | `disable_on_activate` | Disable IME when app becomes active (true/false) |
 | `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
+| `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
+
+## Neovim Integration
+
+Zonvie exposes several Neovim-side variables and RPC notifications for runtime customization.
+
+### vim.g.zonvie_channel
+
+Set automatically on startup. Contains the RPC channel ID for communication with Zonvie.
+
+### vim.g.zonvie_glow (Neon Glow Effect)
+
+Configure a bloom/glow post-processing effect for specific highlight groups:
+
+```lua
+vim.g.zonvie_glow = {
+  groups = { "Keyword", "String", "Function" },  -- or "all" for every cell
+  radius = 6,       -- blur radius in pixels (2-16)
+  intensity = 0.8,  -- glow brightness (0.0-1.0)
+}
+```
+
+Zonvie reads this variable on startup (with automatic retry for lazy plugin initialization) and applies a Dual Kawase bloom shader to matching highlight groups.
+
+### zonvie_option_as_meta (RPC notification)
+
+Dynamically change the Option-as-Meta behavior at runtime, equivalent to Neovim-Qt's `macmeta` option:
+
+```lua
+vim.rpcnotify(vim.g.zonvie_channel, "zonvie_option_as_meta", "both")
+-- Values: "both", "none", "only_left", "only_right"
+```
+
+This can also be set statically via the `[ime] option_as_meta` config key.
+
+### zonvie_ime_off (RPC notification)
+
+Programmatically disable the IME input method:
+
+```lua
+vim.rpcnotify(vim.g.zonvie_channel, "zonvie_ime_off")
+```
+
+Useful for automatically switching off IME when entering normal mode via autocommands.
 
 ## License
 

@@ -151,6 +151,11 @@ Text-related functionality is split between core and text helpers:
 - `src/text/rasterize_freetype.zig`
 - `src/text/gpu_atlas.zig`
 
+The glyph atlas uses a two-phase core-managed approach:
+- Core manages shelf packing and glyph cache (zero per-cell allocation)
+- Frontend handles rasterization (FreeType on macOS, DirectWrite on Windows) and texture upload
+- Atlas textures are double-buffered with COW detach for safe concurrent read/write
+
 ### Frontends
 
 macOS frontend:
@@ -203,8 +208,13 @@ High-level flow:
 2. The core updates grid and UI-extension state.
 3. A flush cycle begins.
 4. `on_flush_begin` gives the frontend a chance to prepare or abort the flush.
+   - Atlas back-texture sync: two-phase approach — phase 1 handles CPU sync and no-op cases without a command buffer; phase 2 creates a command buffer only when GPU blit is needed.
+   - Vertex buffer sets are shallow-copied (COW) from the committed set.
 5. The core performs atlas work and vertex generation.
+   - Glyph rasterization and atlas upload callbacks fire synchronously.
 6. Vertex callbacks submit main-grid, cursor, row, and external-grid updates.
+   - Row buffers use COW detach: shared buffers are written in-place when the GPU semaphore guarantees no in-flight read.
+   - Cursor buffers are independently owned per buffer set (no COW sharing).
 7. `on_flush_end` commits the flush on the frontend side.
 
 This matters for correctness:
@@ -212,6 +222,7 @@ This matters for correctness:
 - partial redraw must preserve prior buffers when update flags do not include them
 - aborted flushes must preserve dirty state for retry
 - layout-dependent rendering must stay synchronized with the dimensions used during flush
+- COW detach must not create unbounded MTLBuffer allocations (pool-alias safety)
 
 ## Development Features To Be Aware Of
 
@@ -221,7 +232,9 @@ The current codebase includes development-sensitive behavior for:
 - ext_popupmenu
 - ext_messages
 - ext_tabline
-- ext_windows
+- ext_windows (each Neovim window as a separate OS window)
+- neon/glow effects (Dual Kawase bloom post-processing)
+- variable font support (fvar variation axes)
 - SSH mode and askpass flow
 - devcontainer mode and rebuild flow
 - quit confirmation / unsaved-buffer checks

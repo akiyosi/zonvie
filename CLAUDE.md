@@ -36,12 +36,16 @@ Applies especially to:
 - `src/core/vertexgen.zig`
 - `src/core/redraw_handler.zig`
 - text shaping / rasterization / atlas code
+- `macos/Sources/Rendering/MetalTerminalRenderer.swift` (triple-buffered vertex sets, COW detach)
+- `macos/Sources/Font/GlyphAtlas.swift` (double-buffered atlas, two-phase prepare)
 
 Requirements:
 - avoid heap work on per-frame or per-cell paths
 - prefer persistent buffers and capacity reuse
 - avoid adding lock contention to render/input paths
 - keep dirty-region behavior correct under partial redraw
+- do not create MTLBuffer/MTLTexture objects in per-flush or per-frame paths (IOAccelerator leak risk)
+- COW detach pool buffers may alias the committed set; removing the alias guard is safe only when the GPU semaphore guarantees no in-flight read
 - if performance-sensitive behavior changes, include a short measurement note in the final summary
 
 ## Neovim UI Compliance Checklist
@@ -72,6 +76,16 @@ Common commands:
 Before finishing:
 - run the narrowest relevant test/build command available
 - report what was verified and what was not verified
+
+## Metal Memory Management (macOS)
+
+Key constraints learned from leak investigations:
+
+- Never create and drop uncommitted `MTLCommandBuffer` objects — they leak IOAccelerator GPU memory regions that are never reclaimed.
+- Atlas back-texture sync uses a two-phase API: `prepareBackTexture()` returns whether GPU blit is needed; only then create a command buffer and call `encodeBackTextureBlit()`.
+- Cursor vertex buffers must NOT be COW-shared across buffer sets — each set owns its own buffer to avoid pool-alias allocation leaks.
+- Row vertex buffers reuse pool buffers even when they alias the committed set's buffers, because the GPU semaphore (value=1) guarantees no in-flight draw during flush.
+- Atlas textures use `.shared` storage mode (not `.managed`) to avoid Metal internal dirty-region tracking overhead on Apple Silicon.
 
 ## If Unsure
 
