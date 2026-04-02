@@ -506,25 +506,30 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         lock.unlock()
 
-        // Prepare atlas back texture
+        // Prepare atlas back texture.
+        // Phase 1: handle non-GPU cases (rebuild, CPU sync, no-op).
+        // Phase 2: only create a Metal command buffer if GPU blit is needed.
+        // This avoids leaking IOAccelerator GPU memory regions from uncommitted
+        // command buffers (observed: ~70 leaked regions/sec without this fix).
         var needsCoreInvalidation = false
-        if let cmd = queue.makeCommandBuffer() {
-            let tAtlasPrepareStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            let result = atlas.prepareBackTexture(commandBuffer: cmd)
-            if perfEnabled {
-                atlasPrepareUs = (CFAbsoluteTimeGetCurrent() - tAtlasPrepareStart) * 1_000_000
-            }
-            needsCoreInvalidation = result.needsCoreInvalidation
-            atlasNeedsCoreInvalidation = result.needsCoreInvalidation
-            atlasDidBlit = result.didBlit
-            atlasDidCpuSync = result.didCpuSync
-            atlasSyncedWasRecreate = result.syncedWasRecreate
-            if result.shouldAbort {
-                isInFlush = false
-                ZonvieCore.appLog("[WARNING] beginFlush: atlas back-texture sync failed (nil texture/resize/encoder), dropping flush")
-                return .dropped
-            }
-            if result.didBlit {
+        let tAtlasPrepareStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let prepResult = atlas.prepareBackTexture()
+        if perfEnabled {
+            atlasPrepareUs = (CFAbsoluteTimeGetCurrent() - tAtlasPrepareStart) * 1_000_000
+        }
+        needsCoreInvalidation = prepResult.needsCoreInvalidation
+        atlasNeedsCoreInvalidation = prepResult.needsCoreInvalidation
+        atlasDidCpuSync = prepResult.didCpuSync
+        atlasSyncedWasRecreate = prepResult.syncedWasRecreate
+        if prepResult.shouldAbort {
+            isInFlush = false
+            ZonvieCore.appLog("[WARNING] beginFlush: atlas prepare failed, dropping flush")
+            return .dropped
+        }
+        if prepResult.needsGpuBlit {
+            // GPU blit required — create command buffer now
+            if let cmd = queue.makeCommandBuffer() {
+                atlas.encodeBackTextureBlit(commandBuffer: cmd)
                 let tAtlasCommitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 cmd.commit()
                 if perfEnabled {
@@ -536,24 +541,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     atlasWaitUs = (CFAbsoluteTimeGetCurrent() - tAtlasWaitStart) * 1_000_000
                 }
                 if cmd.status == .completed {
+                    atlasDidBlit = true
                     atlas.markBackSynced()
                 } else {
-                    // Blit failed (device loss, encoding error, etc.).
-                    // backDirty stays true; drop this flush to avoid writing
-                    // incremental glyph changes into a stale back texture.
                     isInFlush = false
                     ZonvieCore.appLog("[WARNING] beginFlush: atlas blit command buffer failed (status=\(cmd.status.rawValue)), dropping flush")
                     return .dropped
                 }
-            }
-        } else {
-            // commandBuffer creation failed.
-            // If atlas state requires attention (backDirty, needsAtlasRebuild,
-            // or atlasModified), we must abort — continuing would let uploadRegion
-            // write to an un-synced back texture or leave stale cache active.
-            if atlas.hasAtlasStateRequiringAttention() {
+            } else {
                 isInFlush = false
-                ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed with pending atlas state, dropping flush")
+                ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
                 return .dropped
             }
         }
@@ -572,11 +569,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         copySurfaceBufferSetRowState(from: src, to: dst)
         let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
-        // Save dst's main/cursor buffers into the detach pool before shallow-copying src.
+        // Save dst's main buffer into the detach pool before shallow-copying src.
         dst.detachPoolMainBuffer = dst.mainVertexBuffer
         dst.detachPoolMainCap = dst.mainVertexBufferCap
-        dst.detachPoolCursorBuffer = dst.cursorVertexBuffer
-        dst.detachPoolCursorCap = dst.cursorVertexBufferCap
 
         let sharedMainBytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
         let tMainCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -585,10 +580,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         dst.mainVertexCount = src.mainVertexCount
         let tMainCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
+        // Cursor buffer: do NOT COW-share with committed set.
+        // Cursor data is small (typically <1KB) and fully overwritten every flush.
+        // Sharing causes pool-alias failures that leak MTLBuffers (~32KB/flush).
+        // Instead, copy cursor data into dst's OWN buffer (reuse existing or allocate once).
         let sharedCursorBytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
         let tCursorCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        dst.cursorVertexBuffer = src.cursorVertexBuffer
-        dst.cursorVertexBufferCap = src.cursorVertexBufferCap
+        if src.cursorVertexCount > 0, let srcBuf = src.cursorVertexBuffer {
+            // Ensure dst has its own buffer with enough capacity
+            if dst.cursorVertexBuffer == nil || dst.cursorVertexBufferCap < sharedCursorBytes {
+                let newCap = max(sharedCursorBytes, 48 * MemoryLayout<Vertex>.stride)
+                dst.cursorVertexBuffer = device.makeBuffer(length: newCap, options: .storageModeShared)
+                dst.cursorVertexBufferCap = dst.cursorVertexBuffer != nil ? newCap : 0
+            }
+            if let dstBuf = dst.cursorVertexBuffer {
+                memcpy(dstBuf.contents(), srcBuf.contents(), sharedCursorBytes)
+            }
+        }
         dst.cursorVertexCount = src.cursorVertexCount
         let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
 
@@ -663,11 +671,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         lock.unlock()
         isInFlush = false
+        let bs = bufferSets[ws]
         if ZonvieCore.appLogEnabled {
-            let rowCount = bufferSets[ws].rowState.buffers.count
+            let rowCount = bs.rowState.buffers.count
             var totalVerts = 0
             for i in 0..<rowCount {
-                totalVerts += bufferSets[ws].rowState.counts[i]
+                totalVerts += bs.rowState.counts[i]
             }
             ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
         }
@@ -2322,32 +2331,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let vc = max(0, vertexCount)
         guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else { return }
 
-        let srcCursor = bufferSets[flushSourceSetIndex].cursorVertexBuffer
-        let sharesSource = setIdx == writeSetIndex && srcCursor != nil
-            && bufferSets[setIdx].cursorVertexBuffer === srcCursor
-        let needsNew = sharesSource
-            || bufferSets[setIdx].cursorVertexBuffer == nil
-            || needed > bufferSets[setIdx].cursorVertexBufferCap
+        // Cursor buffer is NOT COW-shared (beginFlush copies data into dst's own buffer).
+        // Only allocate if nil or too small.
+        let bs = bufferSets[setIdx]
+        let needsNew = bs.cursorVertexBuffer == nil || needed > bs.cursorVertexBufferCap
 
         if needsNew {
-            guard let nextCap = surfaceGrowCapacity(current: bufferSets[setIdx].cursorVertexBufferCap, needed: max(1, needed)) else { return }
-
-            // Try detach pool first.
-            // Guard: pool buffer must not alias source.
-            let bs = bufferSets[setIdx]
-            if let poolBuf = bs.detachPoolCursorBuffer,
-               bs.detachPoolCursorCap >= nextCap,
-               poolBuf !== srcCursor
-            {
-                bs.cursorVertexBuffer = poolBuf
-                bs.cursorVertexBufferCap = bs.detachPoolCursorCap
-                bs.detachPoolCursorBuffer = nil
-            } else {
-                bs.cursorVertexBufferCap = nextCap
-                bs.cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
-                if bs.cursorVertexBuffer == nil {
-                    bs.cursorVertexBufferCap = 0
-                }
+            guard let nextCap = surfaceGrowCapacity(current: bs.cursorVertexBufferCap, needed: max(1, needed)) else { return }
+            bs.cursorVertexBufferCap = nextCap
+            bs.cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            if bs.cursorVertexBuffer == nil {
+                bs.cursorVertexBufferCap = 0
             }
         }
     }

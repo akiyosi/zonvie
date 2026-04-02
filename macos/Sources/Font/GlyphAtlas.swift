@@ -936,13 +936,13 @@ final class GlyphAtlas {
             mipmapped: false
         )
         desc.usage = [.shaderRead, .shaderWrite]
-        desc.storageMode = .managed
+        desc.storageMode = .shared
         guard let tex = device.makeTexture(descriptor: desc) else {
             ZonvieCore.appLog("[GlyphAtlas] Failed to create atlas texture (\(w)x\(h))")
             return nil
         }
 
-        // Zero-clear: reuse persistent 1-row buffer (RGBA = 4 bytes per pixel)
+        // Zero-clear
         let rowBytes = w * 4
         if zeroRow.count < rowBytes { zeroRow = Array<UInt8>(repeating: 0, count: rowBytes) }
         zeroRow.withUnsafeBytes { raw in
@@ -1076,7 +1076,7 @@ final class GlyphAtlas {
 
         // Upload to RGBA texture.
         scratch.withUnsafeBytes { raw in
-            guard let baseAddr = raw.baseAddress else { return }  // Safe unwrap
+            guard let baseAddr = raw.baseAddress else { return }
             let region = MTLRegionMake2D(rectX, rectY, packedW, packedH)
             tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: packedW * 4)
         }
@@ -1645,7 +1645,6 @@ final class GlyphAtlas {
 
         let bi = 1 - frontIndex
         guard let newTex = makeTexture(device: device, w: width, h: height) else {
-            // makeTexture failed: invalidate back so uploadRegion cannot write stale data.
             textures[bi] = nil
             ZonvieCore.appLog("[GlyphAtlas] recreateTexture: makeTexture failed, back invalidated, will retry next flush")
             return
@@ -1673,38 +1672,38 @@ final class GlyphAtlas {
     // MARK: - Double-Buffer Lifecycle
 
     struct PrepareResult {
-        let didBlit: Bool
+        let needsGpuBlit: Bool  // true = caller must create command buffer and call encodeBackTextureBlit
         let didCpuSync: Bool
         let needsCoreInvalidation: Bool
-        let shouldAbort: Bool  // true when backDirty but blit is impossible (textures nil, resize/encoder failed)
+        let shouldAbort: Bool
         let syncedWasRecreate: Bool
     }
 
-    /// Called from beginFlush() on core thread.
-    /// Applies deferred atlas rebuild, then syncs front -> back if needed.
-    func prepareBackTexture(commandBuffer: MTLCommandBuffer) -> PrepareResult {
+    // State captured during prepareBackTexture for deferred GPU blit.
+    // Valid only when prepareBackTexture returns needsGpuBlit=true.
+    private var pendingBlitFront: MTLTexture?
+    private var pendingBlitBack: MTLTexture?
+    private var pendingBlitWasRecreate: Bool = false
+    private var pendingBlitRect: AtlasDirtyRect?
+
+    /// Phase 1: Called from beginFlush() on core thread.
+    /// Handles atlas rebuild, CPU sync, and no-op cases WITHOUT a command buffer.
+    /// If GPU blit is needed, returns needsGpuBlit=true and the caller should
+    /// create a command buffer and call encodeBackTextureBlit().
+    func prepareBackTexture() -> PrepareResult {
         os_unfair_lock_lock(&mu)
 
-        // Phase 1: Apply deferred atlas rebuild (from setBackingScale)
+        // Apply deferred atlas rebuild (from setBackingScale)
         if needsAtlasRebuild {
-            // DO NOT clear needsAtlasRebuild here.
-            // It is cleared by recreateTexture() when the core invalidation path
-            // successfully creates a new back texture (on_atlas_create -> recreateTexture).
-            // If flush is dropped before invalidation, or makeTexture fails inside
-            // recreateTexture, needsAtlasRebuild stays true -> retried next flush.
-            //
-            // clearCaches_locked() is idempotent: on retry, caches are already empty
-            // (fallbackFacesByURL destroyed, all maps cleared). Safe to call repeatedly.
             clearCaches_locked()
-            backDirty = false  // old front content is for wrong scale, don't blit
+            backDirty = false
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: true, shouldAbort: false, syncedWasRecreate: false)
+            return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: true, shouldAbort: false, syncedWasRecreate: false)
         }
 
-        // Phase 2: Sync front -> back if dirty
         guard backDirty else {
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: false)
+            return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: false)
         }
 
         let fi = frontIndex
@@ -1712,26 +1711,23 @@ final class GlyphAtlas {
         let syncedWasRecreate = pendingBackSyncWasRecreate
         let syncedRect = pendingBackSyncRect
         guard let front = textures[fi], var back = textures[bi] else {
-            // backDirty is true but textures are nil — cannot sync.
-            // Continuing would let atlas modifications write to an unsynced back;
-            // on swap the new front would be missing glyphs from the old front.
             os_unfair_lock_unlock(&mu)
-            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
+            return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
         }
 
         // Defensive: recreate back if size mismatch
         if back.width != front.width || back.height != front.height {
             guard let newBack = makeTexture(device: device, w: front.width, h: front.height) else {
-                // Cannot recreate back texture — same risk as nil textures above.
                 os_unfair_lock_unlock(&mu)
-                return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
+                return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
             }
             textures[bi] = newBack
             back = newBack
         }
 
+        // Try CPU sync path first (small dirty rect)
         if !syncedWasRecreate, let rect = syncedRect {
-            let bytesPerRow = rect.width * 4  // RGBA = 4 bytes per pixel
+            let bytesPerRow = rect.width * 4
             let totalBytes = rect.width * rect.height * 4
             if totalBytes > 0 {
                 if backSyncScratch.count < totalBytes {
@@ -1746,28 +1742,35 @@ final class GlyphAtlas {
                 pendingBackSyncWasRecreate = false
                 pendingBackSyncRect = nil
                 os_unfair_lock_unlock(&mu)
-                return PrepareResult(didBlit: false, didCpuSync: true, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
+                return PrepareResult(needsGpuBlit: false, didCpuSync: true, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
             }
         }
 
-        // DO NOT set backDirty = false here for GPU blit.
-        // Caller must call markBackSynced() after blit completes successfully.
+        // GPU blit needed — save state for encodeBackTextureBlit()
+        pendingBlitFront = front
+        pendingBlitBack = back
+        pendingBlitWasRecreate = syncedWasRecreate
+        pendingBlitRect = syncedRect
+        // DO NOT set backDirty = false here — caller must call markBackSynced() after blit completes.
         os_unfair_lock_unlock(&mu)
+        return PrepareResult(needsGpuBlit: true, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
+    }
 
-        // Encode blit outside mu (texture refs are stable, no contention in this interval)
-        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
-            // Cannot encode blit — same risk as nil textures above.
-            return PrepareResult(didBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
-        }
+    /// Phase 2: Encode GPU blit into the given command buffer.
+    /// Only call this when prepareBackTexture() returned needsGpuBlit=true.
+    func encodeBackTextureBlit(commandBuffer: MTLCommandBuffer) {
+        guard let front = pendingBlitFront, let back = pendingBlitBack else { return }
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+
         let sourceOrigin: MTLOrigin
         let sourceSize: MTLSize
         let destinationOrigin: MTLOrigin
-        if syncedWasRecreate || syncedRect == nil {
+        if pendingBlitWasRecreate || pendingBlitRect == nil {
             sourceOrigin = MTLOrigin(x: 0, y: 0, z: 0)
             sourceSize = MTLSize(width: front.width, height: front.height, depth: 1)
             destinationOrigin = MTLOrigin(x: 0, y: 0, z: 0)
         } else {
-            let rect = syncedRect!
+            let rect = pendingBlitRect!
             sourceOrigin = MTLOrigin(x: rect.x, y: rect.y, z: 0)
             sourceSize = MTLSize(width: rect.width, height: rect.height, depth: 1)
             destinationOrigin = MTLOrigin(x: rect.x, y: rect.y, z: 0)
@@ -1778,7 +1781,10 @@ final class GlyphAtlas {
                   to: back, destinationSlice: 0, destinationLevel: 0,
                   destinationOrigin: destinationOrigin)
         blit.endEncoding()
-        return PrepareResult(didBlit: true, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
+
+        pendingBlitFront = nil
+        pendingBlitBack = nil
+        pendingBlitRect = nil
     }
 
     /// Called after blit command buffer completes successfully.

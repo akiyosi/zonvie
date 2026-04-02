@@ -288,6 +288,7 @@ final class SurfaceBufferSet {
     var detachPoolMainCap: Int = 0
     var detachPoolCursorBuffer: MTLBuffer? = nil
     var detachPoolCursorCap: Int = 0
+
 }
 
 /// Pick a free buffer set index for writing during a flush.
