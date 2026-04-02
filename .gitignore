@@ -17,5 +17,6 @@ build/
 .DS_Store
 
 # Local Claude instructions
+.claude
 CLAUDE.local.md
 AGENTS.md
