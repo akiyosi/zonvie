@@ -66,6 +66,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var committedSetIndex: Int = 0        // Protected by tripleBufferLock
     private var gpuInFlightCount: [Int] = [0, 0, 0] // Protected by tripleBufferLock
     private var isInFlush: Bool = false           // Flush bracket thread only
+
+    /// Check whether any draw() is currently in-flight (GPU reading buffers).
+    private func isAnyGpuInFlight() -> Bool {
+        tripleBufferLock.lock()
+        let result = gpuInFlightCount[0] > 0 || gpuInFlightCount[1] > 0 || gpuInFlightCount[2] > 0
+        tripleBufferLock.unlock()
+        return result
+    }
     private var flushHadContent: Bool = false     // True if vertices were submitted during this flush
     private var commitRevision: UInt64 = 0        // Protected by tripleBufferLock
     private var lastDrawnRevision: UInt64 = 0     // Draw only
@@ -557,7 +565,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             ptr: UnsafeRawPointer(ptr),
             count: count,
             maxRowBuffers: maxRowBuffers,
-            totalRows: totalRows
+            totalRows: totalRows,
+            gpuInFlight: isAnyGpuInFlight()
         )
 
         // Track dirty rows for GPU scroll copy path (match MetalTerminalRenderer.markDirtyRows)

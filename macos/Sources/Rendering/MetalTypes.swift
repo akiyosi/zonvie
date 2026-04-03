@@ -402,7 +402,8 @@ func ensureSurfaceRowBuffer(
     device: MTLDevice,
     row: Int,
     vertexCount: Int,
-    maxRowBuffers: Int
+    maxRowBuffers: Int,
+    gpuInFlight: Bool = false
 ) -> MTLBuffer? {
     guard row >= 0 && row < maxRowBuffers else { return nil }
     ensureSurfaceRowStorage(bufferSet: bufferSet, row, maxRowBuffers: maxRowBuffers)
@@ -433,12 +434,14 @@ func ensureSurfaceRowBuffer(
         if row < bufferSet.detachPoolRowBuffers.count,
            let poolBuf = bufferSet.detachPoolRowBuffers[row],
            row < bufferSet.detachPoolRowCapacities.count,
-           bufferSet.detachPoolRowCapacities[row] >= nextCap
+           bufferSet.detachPoolRowCapacities[row] >= nextCap,
+           !gpuInFlight || poolBuf !== srcRowBuffer
         {
-            // Pool buffer may alias the source (committed) buffer when all 3 sets
-            // share the same buffer for this row. This is safe during flush because
-            // the GPU semaphore guarantees no in-flight draw is reading the buffer.
-            // The row is about to be overwritten via memcpy anyway.
+            // Pool buffer reuse from the detach pool.  When no draw() is in flight
+            // (gpuInFlight == false), alias with the committed buffer is safe because
+            // nobody is reading the buffer contents.  When a draw IS in flight, the
+            // committed buffer may be referenced by the GPU encoder on another thread,
+            // so we must not write into it — fall through to device.makeBuffer().
             bufferSet.rowState.buffers[row] = poolBuf
             bufferSet.rowState.capacities[row] = bufferSet.detachPoolRowCapacities[row]
             bufferSet.detachPoolRowBuffers[row] = nil  // consumed
@@ -538,7 +541,8 @@ func submitSurfaceRowVertices(
     ptr: UnsafeRawPointer?,
     count: Int,
     maxRowBuffers: Int,
-    totalRows: Int
+    totalRows: Int,
+    gpuInFlight: Bool = false
 ) {
     prepareSurfaceRowModeSetForWrite(bufferSet: target, totalRows: totalRows)
 
@@ -569,7 +573,8 @@ func submitSurfaceRowVertices(
         device: device,
         row: slot,
         vertexCount: count,
-        maxRowBuffers: maxRowBuffers
+        maxRowBuffers: maxRowBuffers,
+        gpuInFlight: gpuInFlight
     ) else {
         target.rowState.counts[slot] = 0
         return

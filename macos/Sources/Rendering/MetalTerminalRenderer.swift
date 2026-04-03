@@ -197,6 +197,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var defaultBgRGB: UInt32 = 0               // Protected by lock
 
+    /// Check whether any draw() is currently in-flight (GPU reading buffers).
+    /// Must be called from core thread during flush to get a real-time snapshot.
+    private func isAnyGpuInFlight() -> Bool {
+        lock.lock()
+        let result = gpuInFlightCount[0] > 0 || gpuInFlightCount[1] > 0 || gpuInFlightCount[2] > 0
+        lock.unlock()
+        return result
+    }
+
     // Drawable size from the most recent committed flush.
     // Set by commitFlush() (core thread, grid_mu held) by reading the core's
     // layout directly — this guarantees the values match the NDC coordinates
@@ -2365,7 +2374,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             device: device,
             row: row,
             vertexCount: vertexCount,
-            maxRowBuffers: maxRowBuffers
+            maxRowBuffers: maxRowBuffers,
+            gpuInFlight: isAnyGpuInFlight()
         )
     }
 
@@ -2662,7 +2672,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ptr: UnsafeRawPointer(ptr),
             count: count,
             maxRowBuffers: maxRowBuffers,
-            totalRows: totalRows
+            totalRows: totalRows,
+            gpuInFlight: isAnyGpuInFlight()
         )
     }
 
