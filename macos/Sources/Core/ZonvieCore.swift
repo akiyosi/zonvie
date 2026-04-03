@@ -676,8 +676,12 @@ final class ZonvieCore {
                     }
                 }
                 // (scrollbar update is handled per-row in submitVerticesRaw/submitVerticesRowRaw)
-                // Ensure repaint after every flush (needed for glow config changes
-                // that arrive via RPC response outside the normal vertex submission path).
+                // Activate continuous draw loop so the new commit gets rendered
+                // at display refresh rate without async dispatch latency.
+                me.terminalView?.activateDrawLoop()
+                // requestRedraw as fallback: triggers setNeedsDisplay for the
+                // first frame when still in paused mode.  No-op in active mode
+                // (enableSetNeedsDisplay=false).
                 me.terminalView?.requestRedraw()
                 // Commit external grids directly from core thread — commitFlush()
                 // is thread-safe (uses tripleBufferLock). This eliminates async

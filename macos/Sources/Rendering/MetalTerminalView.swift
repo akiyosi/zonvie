@@ -101,6 +101,13 @@ final class MetalTerminalView: MTKView {
     /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
     private static let scrollOffsetEpsilon: CGFloat = 1.0
 
+    // --- Active draw loop (mirrors ExternalGridView.activateDrawLoop pattern) ---
+    // During rapid updates (scrolling, typing), switch MTKView to continuous
+    // vsync-driven rendering to eliminate the requestRedraw → setNeedsDisplay
+    // async dispatch latency.  Revert to on-demand mode after idle frames.
+    private var activeDrawIdleFrames: Int = 0
+    private let activeDrawIdleThreshold = 15
+
     // --- Input throttling to prevent event accumulation during slow rendering ---
     private var pendingInput: String? = nil
     private let inputLock = NSLock()
@@ -186,11 +193,14 @@ final class MetalTerminalView: MTKView {
             inputLock.lock()
             pendingInput = text
             inputLock.unlock()
+            // Keep draw loop active while input is queued
+            activeDrawIdleFrames = 0
             return true
         }
 
         // Non-repeat: send immediately
         core?.sendInput(text)
+        activeDrawIdleFrames = 0
         return true
     }
 
@@ -205,6 +215,10 @@ final class MetalTerminalView: MTKView {
 
         if let text = pending {
             core?.sendInput(text)
+            // Keep draw loop active while input is being sent.
+            // Prevents deactivation during Neovim processing lag
+            // (input arrives faster than Neovim flushes responses).
+            activeDrawIdleFrames = 0
         }
     }
 
@@ -231,8 +245,43 @@ final class MetalTerminalView: MTKView {
         }
     }
 
-    // INSERT near requestRedraw(_:)
-    
+    // MARK: - Active Draw Loop
+
+    /// Activate continuous vsync-driven rendering.
+    /// Called from core thread (on_flush_end) — dispatches to main.
+    func activateDrawLoop() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.window != nil else { return }
+            self.activeDrawIdleFrames = 0
+            if self.isPaused {
+                ZonvieCore.appLog("[drawloop] activate: switching to continuous rendering")
+                self.isPaused = false
+                self.enableSetNeedsDisplay = false
+            }
+        }
+    }
+
+    /// Switch back to on-demand rendering (setNeedsDisplay-driven).
+    private func deactivateDrawLoop() {
+        guard !isPaused else { return }
+        ZonvieCore.appLog("[drawloop] deactivate: switching to on-demand rendering (idle=\(activeDrawIdleFrames))")
+        isPaused = true
+        enableSetNeedsDisplay = true
+    }
+
+    /// Called from draw() early-return paths when no rendering was needed.
+    func notifyDrawIdle() {
+        activeDrawIdleFrames += 1
+        if activeDrawIdleFrames > activeDrawIdleThreshold {
+            deactivateDrawLoop()
+        }
+    }
+
+    /// Called from draw() when actual rendering proceeds.
+    func notifyDrawActive() {
+        activeDrawIdleFrames = 0
+    }
+
     private func drawablePxRectToViewRect(_ rectPxTopOrigin: NSRect) -> NSRect {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
     

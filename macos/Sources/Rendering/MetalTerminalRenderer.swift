@@ -1084,6 +1084,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                !blinkStateChanged,
                !drawableSizeChanged {
                 // Still reset redrawPending so future redraws are not blocked.
+                (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
@@ -1093,9 +1094,24 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
             // destroys the backbuffer between GPU-blit scroll frames.
             if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce {
+                (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
+
+            // Defer draw during resize until new vertex data arrives.
+            // macOS compositor stretches the old frame, which looks better
+            // than rendering stale NDC vertices with a mismatched viewport.
+            // Placed before lastDrawnRevision/lastDrawnDrawableSize updates
+            // so the next draw re-checks both hasNewCommit and drawableSizeChanged.
+            if drawableSizeChanged && !hasNewCommit && hasPresentedOnce {
+                (view as? MetalTerminalView)?.notifyDrawIdle()
+                (view as? MetalTerminalView)?.didDrawFrame()
+                return
+            }
+
+            // Rendering will proceed — reset active draw loop idle counter.
+            (view as? MetalTerminalView)?.notifyDrawActive()
 
             // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision

@@ -1062,21 +1062,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             // --- Row-mode rendering branches — match MetalTerminalRenderer structure ---
             if rowMode {
-                // Debug: log translationY for all rows to detect slot remap drift
-                var nonZeroTranslations: [(Int, Float, Int, Int)] = []
-                for row in 0..<safeRowCount {
-                    let slot = row < committed.rowLogicalToSlot.count ? committed.rowLogicalToSlot[row] : -1
-                    let src = (slot >= 0 && slot < committed.rowSlotSourceRows.count) ? committed.rowSlotSourceRows[slot] : -1
-                    if src != row {
-                        if let resolved = resolvedRowState(row) {
-                            nonZeroTranslations.append((row, resolved.translationY, slot, src))
+                if ZonvieCore.appLogEnabled {
+                    // Debug: log translationY for all rows to detect slot remap drift
+                    var nonZeroTranslations: [(Int, Float, Int, Int)] = []
+                    for row in 0..<safeRowCount {
+                        let slot = row < committed.rowLogicalToSlot.count ? committed.rowLogicalToSlot[row] : -1
+                        let src = (slot >= 0 && slot < committed.rowSlotSourceRows.count) ? committed.rowSlotSourceRows[slot] : -1
+                        if src != row {
+                            if let resolved = resolvedRowState(row) {
+                                nonZeroTranslations.append((row, resolved.translationY, slot, src))
+                            }
                         }
                     }
+                    if !nonZeroTranslations.isEmpty {
+                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
+                    }
+                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows)")
                 }
-                if !nonZeroTranslations.isEmpty {
-                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
-                }
-                ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows)")
 
                 let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
                 let cellH = max(1, Int(ch.rounded(.up)))

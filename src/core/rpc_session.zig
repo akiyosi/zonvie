@@ -183,6 +183,8 @@ pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 pub fn logEnvHints(self: *Core) void {
+    if (self.log.cb == null) return;
+
     const cwd = std.process.getCwdAlloc(self.alloc) catch null;
     defer if (cwd) |s| self.alloc.free(s);
     if (cwd) |s|
