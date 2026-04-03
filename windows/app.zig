@@ -14,8 +14,6 @@ pub const config_mod = @import("config.zig");
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
-pub const BgSpan = core.BgSpan;
-pub const TextRun = core.TextRun;
 pub const Cursor = core.Cursor;
 pub const GlyphEntry = core.GlyphEntry;
 pub const GlyphBitmap = core.GlyphBitmap;
@@ -2393,13 +2391,6 @@ pub const App = struct {
     // Flag to ignore delayed quit responses after timeout fired
     quit_timeout_fired: bool = false,
 
-    // Latest plan snapshot (copied from callback; valid beyond callback)
-    bg_spans: std.ArrayListUnmanaged(BgSpan) = .{},
-
-    // IMPORTANT:
-    // Keep the exact C-compatible layout for renderer: core.TextRun (scalars is a pointer).
-    text_runs: std.ArrayListUnmanaged(TextRun) = .{},
-
     // Main surface vertex state (shared structure with external windows).
     // paint_full=false: main window uses explicit dirty tracking; external windows default to true.
     surface: SurfaceState = .{ .paint_full = false },
@@ -2427,9 +2418,6 @@ pub const App = struct {
     // Cursor overlay VB for row-mode (avoid extra g.drawEx per paint).
     cursor_vb: ?*c.ID3D11Buffer = null,
     cursor_vb_bytes: usize = 0,
-
-    // Owned scalar buffers corresponding to each text run (same order as text_runs).
-    text_run_scalars: std.ArrayListUnmanaged([]u32) = .{},
 
     cursor: ?Cursor = null,
 
@@ -2792,18 +2780,6 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        // Free owned text-run scalar buffers first
-        for (self.text_run_scalars.items) |buf| {
-            self.alloc.free(buf);
-        }
-        self.text_run_scalars.deinit(self.alloc);
-
-        // Then drop the C-layout run array itself
-        self.text_runs.deinit(self.alloc);
-
-        // Bg spans
-        self.bg_spans.deinit(self.alloc);
-
         // Main surface: release GPU VBs from row_verts, then CPU state
         for (self.surface.row_verts.items) |*rv| {
             if (rv.vb) |p| {

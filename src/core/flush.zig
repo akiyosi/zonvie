@@ -2187,10 +2187,8 @@ pub const FlushCtx = struct {
         }
 
         // --- fast path: build vertices directly (skip bg_spans/text_runs/scalars_buf) ---
-        // Prefer partial updates when available.
-        if (ctx.core.cb.on_vertices_partial != null or ctx.core.cb.on_vertices != null) {
+        if (ctx.core.cb.on_vertices_partial != null) {
             const pf_opt = ctx.core.cb.on_vertices_partial;
-            const vf_opt = ctx.core.cb.on_vertices;
 
             // Decide what needs rebuilding/sending.
             const need_main: bool = (ctx.core.grid.content_rev != ctx.core.last_sent_content_rev);
@@ -4109,26 +4107,8 @@ pub const FlushCtx = struct {
             }
 
             // If main was sent via row callback, do not call legacy full callback.
-            // Row-mode path already cleared dirty/scroll state before reaching here.
             if (sent_main_by_rows) return;
 
-            // Legacy path: must always provide BOTH buffers to avoid frontend clearing main on cursor-only updates.
-            if (vf_opt) |vf| {
-                vf(
-                    ctx.core.ctx,
-                    main.items.ptr, main.items.len,
-                    cursor.items.ptr, cursor.items.len,
-                );
-                if (need_cursor) {
-                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
-                }
-                if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
-                ctx.core.grid.clearDirty();
-                ctx.core.grid.clearScrollState();
-                return;
-            }
-
-            // No callback (shouldn't happen because we gated above), but keep safe:
             if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
             ctx.core.grid.clearDirty();
             ctx.core.grid.clearScrollState();

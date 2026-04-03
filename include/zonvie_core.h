@@ -124,30 +124,6 @@ typedef int (*zonvie_atlas_ensure_glyph_styled_fn)(
     zonvie_glyph_entry* out_entry
 );
 
-/* Render-ready terminal cell (resolved fg/bg already). */
-typedef struct zonvie_cell {
-    uint32_t scalar;   /* Unicode scalar (U+0000..U+10FFFF) */
-    uint32_t fgRGB;    /* 0x00RRGGBB */
-    uint32_t bgRGB;    /* 0x00RRGGBB */
-} zonvie_cell;
-
-/* --- Render plan types (data-only) --- */
-typedef struct zonvie_bg_span {
-    uint32_t row;        /* 0-based */
-    uint32_t col_start;  /* inclusive */
-    uint32_t col_end;    /* exclusive */
-    uint32_t bgRGB;      /* 0x00RRGGBB */
-} zonvie_bg_span;
-
-typedef struct zonvie_text_run {
-    uint32_t row;        /* 0-based */
-    uint32_t col_start;  /* 0-based */
-    uint32_t len;        /* number of cells (UTF-32 scalars) */
-    uint32_t fgRGB;      /* 0x00RRGGBB */
-    uint32_t bgRGB;      /* 0x00RRGGBB */
-    const uint32_t* scalars; /* points to len UTF-32 scalars, valid only during callback */
-} zonvie_text_run;
-
 /* Cursor info for rendering. */
 /* Cursor shape numeric constants for language bindings (Swift, etc.) */
 #define ZONVIE_CURSOR_BLOCK_VALUE       0u
@@ -188,12 +164,6 @@ typedef struct __attribute__((aligned(16))) zonvie_vertex {
     uint32_t deco_flags;  /* ZONVIE_DECO_* flags for decoration type */
     float deco_phase;     /* phase offset for undercurl (cell column position) */
 } zonvie_vertex;
-
-typedef void (*zonvie_on_vertices_fn)(
-    void* ctx,
-    const zonvie_vertex* main_verts, size_t main_count,
-    const zonvie_vertex* cursor_verts, size_t cursor_count
-);
 
 /* Which buffers are included in on_vertices_partial */
 enum {
@@ -270,14 +240,6 @@ typedef void (*zonvie_on_vertices_partial_fn)(
 #define ZONVIE_MOD_SHIFT (1u << 2)
 #define ZONVIE_MOD_SUPER (1u << 3) /* Command on macOS, Win key on Windows */
 
-typedef void (*zonvie_on_render_plan_fn)(
-    void* ctx,
-    const zonvie_bg_span* bg_spans, size_t bg_span_count,
-    const zonvie_text_run* text_runs, size_t text_run_count,
-    uint32_t rows, uint32_t cols,
-    const zonvie_cursor* cursor /* may be NULL */
-);
-
 typedef void (*zonvie_on_log_fn)(
     void* ctx,
     const uint8_t* bytes, size_t len
@@ -344,17 +306,6 @@ typedef void (*zonvie_on_external_window_fn)(
 typedef void (*zonvie_on_external_window_close_fn)(
     void* ctx,
     int64_t grid_id
-);
-
-/* Called to update vertices for an external grid.
-   Frontend should render these vertices in the external window for grid_id. */
-typedef void (*zonvie_on_external_vertices_fn)(
-    void* ctx,
-    int64_t grid_id,
-    const zonvie_vertex* verts,
-    size_t vert_count,
-    uint32_t rows,
-    uint32_t cols
 );
 
 /* --- ext_windows layout operation callbacks --- */
@@ -657,12 +608,10 @@ typedef int (*zonvie_on_clipboard_set_fn)(
 );
 
 typedef struct zonvie_callbacks {
-    zonvie_on_vertices_fn on_vertices;                 /* NEW: preferred when present */
-    zonvie_on_vertices_partial_fn on_vertices_partial; /* NEW: optional partial update */
-    zonvie_on_vertices_row_fn on_vertices_row;   /* NEW */
+    zonvie_on_vertices_partial_fn on_vertices_partial;
+    zonvie_on_vertices_row_fn on_vertices_row;
     zonvie_atlas_ensure_glyph_fn on_atlas_ensure_glyph;
-    zonvie_atlas_ensure_glyph_styled_fn on_atlas_ensure_glyph_styled; /* NEW: styled glyph lookup */
-    zonvie_on_render_plan_fn on_render_plan;
+    zonvie_atlas_ensure_glyph_styled_fn on_atlas_ensure_glyph_styled;
     zonvie_on_log_fn on_log;
     zonvie_on_guifont_fn on_guifont;
     zonvie_on_linespace_fn on_linespace;
@@ -673,7 +622,6 @@ typedef struct zonvie_callbacks {
     /* External window callbacks (ext_multigrid) */
     zonvie_on_external_window_fn on_external_window;
     zonvie_on_external_window_close_fn on_external_window_close;
-    zonvie_on_external_vertices_fn on_external_vertices;
 
     /* Called when cursor moves to a different grid.
        grid_id: the grid where cursor now resides (1 = global grid).

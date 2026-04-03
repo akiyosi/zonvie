@@ -16,14 +16,6 @@ const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
 
 pub const Callbacks = struct {
-    on_vertices: ?*const fn (
-        ctx: ?*anyopaque,
-        main_verts: [*]const c_api.Vertex,
-        main_count: usize,
-        cursor_verts: [*]const c_api.Vertex,
-        cursor_count: usize,
-    ) callconv(.c) void = null,
-
     on_vertices_partial: ?*const fn (
         ctx: ?*anyopaque,
         main_verts: ?[*]const c_api.Vertex,
@@ -48,17 +40,6 @@ pub const Callbacks = struct {
     on_atlas_ensure_glyph: ?c_api.AtlasEnsureGlyphFn = null,
     on_atlas_ensure_glyph_styled: ?c_api.AtlasEnsureGlyphStyledFn = null,
 
-    on_render_plan: ?*const fn (
-        ctx: ?*anyopaque,
-        bg_spans: [*]const c_api.BgSpan,
-        bg_span_count: usize,
-        text_runs: [*]const c_api.TextRun,
-        text_run_count: usize,
-        rows: u32,
-        cols: u32,
-        cursor: ?*const c_api.Cursor,
-    ) callconv(.c) void = null,
-
     on_log: ?*const fn (ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void = null,
 
     /// UTF-8 "<name>\t<size>"
@@ -79,9 +60,6 @@ pub const Callbacks = struct {
 
     /// Called when an external grid is closed.
     on_external_window_close: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
-
-    /// Called to update vertices for an external grid.
-    on_external_vertices: ?*const fn (ctx: ?*anyopaque, grid_id: i64, verts: [*]const c_api.Vertex, vert_count: usize, rows: u32, cols: u32) callconv(.c) void = null,
 
     /// Called when cursor moves to a different grid.
     on_cursor_grid_changed: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,

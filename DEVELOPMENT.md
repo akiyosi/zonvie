@@ -180,7 +180,6 @@ Important contract areas:
 - exported C API functions
 - callback struct layout
 - vertex update modes:
-  - `on_vertices`
   - `on_vertices_partial`
   - `on_vertices_row`
 - flush bracketing callbacks:

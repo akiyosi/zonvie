@@ -465,57 +465,6 @@ pub fn unionRect(a: c.RECT, b: c.RECT) c.RECT {
 // Vertex / rendering callbacks
 // =========================================================================
 
-pub fn onVertices(
-    ctx: ?*anyopaque,
-    main_ptr: [*]const app_mod.Vertex,
-    main_count: usize,
-    cursor_ptr: [*]const app_mod.Vertex,
-    cursor_count: usize,
-) callconv(.c) void {
-        const app: *App = @ptrCast(@alignCast(ctx.?));
-        app.mu.lock();
-        defer app.mu.unlock();
-
-    app.surface.verts.clearRetainingCapacity();
-    app.surface.cursor_verts.clearRetainingCapacity();
-
-    // On OOM, skip ALL vertex copies (all-or-nothing to avoid drawing
-    // cursor-only frames) but still fall through to InvalidateRect
-    // so the screen can retry on the next frame.
-    const main_ok = if (app.surface.verts.ensureTotalCapacity(app.alloc, main_count)) true else |_| false;
-    const cursor_ok = if (main_ok)
-        (if (app.surface.cursor_verts.ensureTotalCapacity(app.alloc, cursor_count)) true else |_| false)
-    else
-        false;
-    if (main_ok and cursor_ok) {
-        app.surface.verts.appendSliceAssumeCapacity(main_ptr[0..main_count]);
-        app.surface.cursor_verts.appendSliceAssumeCapacity(cursor_ptr[0..cursor_count]);
-    }
-
-    if (app.surface.row_mode) {
-        app.surface.row_mode = false;
-    }
-
-    // TBS: write to write set.
-    if (app.tbs.is_in_flush) {
-        const ws = app.tbs.writeSet();
-        ws.row_mode = false;
-        ws.flat_verts.clearRetainingCapacity();
-        ws.cursor_verts.clearRetainingCapacity();
-        if (main_ok and cursor_ok) {
-            ws.flat_verts.appendSlice(app.alloc, main_ptr[0..main_count]) catch {};
-            ws.cursor_verts.appendSlice(app.alloc, cursor_ptr[0..cursor_count]) catch {};
-        }
-        app.tbs.flush_paint_full = true;
-    }
-
-    if (app.hwnd) |_| {
-        // InvalidateRect deferred to onFlushEnd for coalescing.
-        app.paint_rects.clearRetainingCapacity();
-        app.flush_needs_invalidate = true;
-    }
-}
-
 pub fn onVerticesPartial(
     ctx: ?*anyopaque,
     main_ptr: ?[*]const app_mod.Vertex,
@@ -709,80 +658,6 @@ pub fn onVerticesPartial(
             _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
         }
     }
-}
-
-pub fn onRenderPlan(
-    ctx: ?*anyopaque,
-    bg_spans: ?[*]const app_mod.BgSpan,
-    bg_span_count: usize,
-    text_runs: ?[*]const app_mod.TextRun,
-    text_run_count: usize,
-    rows: u32,
-    cols: u32,
-    cursor_ptr: ?*const app_mod.Cursor,
-) callconv(.c) void {
-    _ = bg_spans;
-    _ = bg_span_count;
-    _ = text_runs;
-    _ = text_run_count;
-
-    const app: *App = @ptrCast(@alignCast(ctx.?));
-
-    // Read cursor outside lock (cursor_ptr is valid for duration of callback)
-    var new_cursor: ?app_mod.Cursor = null;
-    if (cursor_ptr) |p| new_cursor = p.*;
-
-    // Keep the latest grid size for bounds checks / clamping.
-    // Use single lock region to prevent race conditions.
-    app.mu.lock();
-    defer app.mu.unlock();
-
-    if (rows != app.surface.rows or cols != app.surface.cols) {
-        app.surface.rows = rows;
-        app.surface.cols = cols;
-        app.seed_pending = true;
-        app.seed_clear_pending = true;
-        app.row_valid_count = 0;
-        app.row_mode_max_row_end = 0;
-        app.row_layout_gen +%= 1;
-        if (rows != 0) {
-            app.row_valid.resize(app.alloc, @intCast(rows), false) catch {};
-            app.row_valid.unsetAll();
-        } else if (app.row_valid.bit_length != 0) {
-            app.row_valid.unsetAll();
-        }
-        // Clear old row vertex data to prevent ghost rendering from stale vertices.
-        // Each RowVerts entry's verts array is cleared; GPU VBs will be re-uploaded.
-        for (app.surface.row_verts.items) |*rv| {
-            rv.verts.clearRetainingCapacity();
-            rv.gen +%= 1; // Invalidate any cached GPU upload
-        }
-    } else {
-        app.surface.rows = rows;
-        app.surface.cols = cols;
-    }
-
-    // TBS: update write set rows/cols.
-    if (app.tbs.is_in_flush) {
-        const ws = app.tbs.writeSet();
-        if (rows != ws.rows or cols != ws.cols) {
-            ws.rows = rows;
-            ws.cols = cols;
-            // Release all old slot references and resize row_map.
-            ws.releaseAllSlots(app.alloc, &app.tbs.pool);
-            ws.row_map.resize(app.alloc, rows) catch {};
-            for (ws.row_map.items) |*m| {
-                m.slot = app_mod.SLOT_NONE;
-            }
-            app.tbs.flush_dirty.resize(app.alloc, rows, false) catch {};
-            app.tbs.flush_paint_full = true;
-        }
-    }
-
-    // NOTE: cursor_ptr may be null => treat as disabled/none
-    app.cursor = new_cursor;
-
-    if (applog.isEnabled()) applog.appLog("[win] on_render_plan rows={d} cols={d}\n", .{ rows, cols });
 }
 
 pub fn onVerticesRow(

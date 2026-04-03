@@ -9,12 +9,6 @@ pub const flush_mod = @import("flush.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 
-pub const Cell = extern struct {
-    scalar: u32,
-    fgRGB: u32,
-    bgRGB: u32,
-};
-
 pub const CursorShape = enum(u32) {
     block = 0,
     vertical = 1,
@@ -33,42 +27,6 @@ pub const Cursor = extern struct {
     blink_on_ms: u32,    // on time for blink cycle (ms)
     blink_off_ms: u32,   // off time for blink cycle (ms)
 };
-
-pub const BgSpan = extern struct {
-    row: u32,
-    col_start: u32, // inclusive
-    col_end: u32, // exclusive
-    bgRGB: u32, // 0x00RRGGBB
-};
-
-pub const TextRun = extern struct {
-    row: u32,
-    col_start: u32,
-    len: u32, // number of UTF-32 scalars / cells
-    fgRGB: u32, // 0x00RRGGBB
-    bgRGB: u32, // 0x00RRGGBB
-    scalars: [*]const u32, // points to len scalars (valid only during callback)
-};
-
-pub const OnRenderPlanFn = *const fn (
-    ctx: ?*anyopaque,
-    bg_spans: [*]const BgSpan,
-    bg_span_count: usize,
-    text_runs: [*]const TextRun,
-    text_run_count: usize,
-    rows: u32,
-    cols: u32,
-    cursor: ?*const Cursor,
-) callconv(.c) void;
-
-pub const OnFrameFn = *const fn (
-    ctx: ?*anyopaque,
-    cells: [*]const Cell,
-    cell_count: usize,
-    rows: u32,
-    cols: u32,
-    cursor: ?*const Cursor,
-) callconv(.c) void;
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
 pub const DECO_UNDERCURL: u32 = 1 << 0;
@@ -222,14 +180,6 @@ pub const GetAsciiTableFn = *const fn (
     out_lig_triggers: [*]u8,
 ) callconv(.c) c_int;
 
-pub const OnVerticesFn = *const fn (
-    ctx: ?*anyopaque,
-    main_verts: [*]const Vertex,
-    main_count: usize,
-    cursor_verts: [*]const Vertex,
-    cursor_count: usize,
-) callconv(.c) void;
-
 pub const VERT_UPDATE_MAIN: u32 = 1 << 0;
 pub const VERT_UPDATE_CURSOR: u32 = 1 << 1;
 
@@ -325,15 +275,11 @@ pub const BufferEntry = extern struct {
 };
 
 pub const Callbacks = extern struct {
-    on_vertices: ?OnVerticesFn = null,
-
     on_vertices_partial: ?OnVerticesPartialFn = null,
     on_vertices_row: ?OnVerticesRowFn = null,
 
     on_atlas_ensure_glyph: ?AtlasEnsureGlyphFn = null,
     on_atlas_ensure_glyph_styled: ?AtlasEnsureGlyphStyledFn = null,
-
-    on_render_plan: ?OnRenderPlanFn = null,
 
     on_log: ?*const fn (ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void = null,
 
@@ -346,7 +292,6 @@ pub const Callbacks = extern struct {
     // External window callbacks (ext_multigrid)
     on_external_window: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void = null,
     on_external_window_close: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
-    on_external_vertices: ?*const fn (ctx: ?*anyopaque, grid_id: i64, verts: [*]const Vertex, vert_count: usize, rows: u32, cols: u32) callconv(.c) void = null,
 
     // Cursor grid change notification
     on_cursor_grid_changed: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
@@ -541,7 +486,6 @@ pub const Callbacks = extern struct {
     ) callconv(.c) void = null,
 };
 
-pub const zonvie_render_plan = opaque {};
 
 pub const zonvie_core = opaque {};
 
@@ -590,14 +534,11 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
     // Build core.Callbacks from the C-facing callback struct.
     const cb_core: core.Callbacks = .{
-        .on_vertices = box.cb.on_vertices,
-
         .on_vertices_partial = box.cb.on_vertices_partial,
         .on_vertices_row = box.cb.on_vertices_row,
 
         .on_atlas_ensure_glyph = box.cb.on_atlas_ensure_glyph,
         .on_atlas_ensure_glyph_styled = box.cb.on_atlas_ensure_glyph_styled,
-        .on_render_plan = box.cb.on_render_plan,
 
         .on_log = box.cb.on_log,
 
@@ -609,7 +550,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         .on_external_window = box.cb.on_external_window,
         .on_external_window_close = box.cb.on_external_window_close,
-        .on_external_vertices = box.cb.on_external_vertices,
 
         .on_cursor_grid_changed = box.cb.on_cursor_grid_changed,
 

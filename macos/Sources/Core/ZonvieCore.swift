@@ -142,34 +142,6 @@ final class ZonvieCore {
         self.ctxPtr = unmanaged.toOpaque()
 
         var cb = zonvie_callbacks(
-            on_vertices: { ctx, mainVerts, mainCount, cursorVerts, cursorCount in
-                guard let ctx else { return }
-
-                // INSERT inside on_vertices callback, after `guard let ctx else { return }`
-                ZonvieCore.appLog("cb:on_vertices mainCount=\(mainCount) cursorCount=\(cursorCount)")
-
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onVertices(
-                    mainVerts: mainVerts,
-                    mainCount: Int(mainCount),
-                    cursorVerts: cursorVerts,
-                    cursorCount: Int(cursorCount)
-                )
-
-                // Notify that Neovim is ready (first vertices received)
-                if !me.hasNotifiedReady {
-                    me.hasNotifiedReady = true
-                    DispatchQueue.main.async {
-                        NotificationCenter.default.post(name: ZonvieCore.neovimReadyNotification, object: nil)
-                    }
-                }
-
-                // Close devcontainer progress dialog on first render
-                if me.isDevcontainerMode && me.progressWindow != nil {
-                    me.hideDevcontainerProgress()
-                }
-            },
-
             on_vertices_partial: { ctx, mainVerts, mainCount, cursorVerts, cursorCount, flags in
                 guard let ctx else { return }
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
@@ -416,7 +388,6 @@ final class ZonvieCore {
                 return zonvie_macos_atlas_ensure_glyph_styled(ctx, scalar, styleFlags, outEntry)
             },
 
-            on_render_plan: nil,
             on_log: { ctx, bytes, len in
                 guard let ctx, let bytes else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
@@ -453,11 +424,6 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onExternalWindowClose(gridId: gridId)
-            },
-            on_external_vertices: { ctx, gridId, verts, vertCount, rows, cols in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onExternalVertices(gridId: gridId, verts: verts, vertCount: vertCount, rows: rows, cols: cols)
             },
             on_cursor_grid_changed: { ctx, gridId in
                 guard let ctx else { return }
@@ -2143,26 +2109,6 @@ final class ZonvieCore {
         return zonvie_core_is_cursor_visible(core)
     }
 
-    private func onVertices(
-        mainVerts: UnsafePointer<zonvie_vertex>?,
-        mainCount: Int,
-        cursorVerts: UnsafePointer<zonvie_vertex>?,
-        cursorCount: Int
-    ) {
-        guard let view = terminalView else { return }
-    
-        // Safety: ensure Swift Vertex layout matches zonvie_vertex layout.
-        // (If this fails, you must do a per-vertex conversion instead.)
-        assert(MemoryLayout<Vertex>.stride == MemoryLayout<zonvie_vertex>.stride)
-    
-        view.submitVerticesRaw(
-            mainPtr: mainVerts,
-            mainCount: mainCount,
-            cursorPtr: cursorVerts,
-            cursorCount: cursorCount
-        )
-    }
-
     private func onLog(bytes: UnsafePointer<UInt8>, len: Int) {
         // Skip Data allocation if logging is disabled
         guard ZonvieCore.appLogEnabled else { return }
@@ -3289,68 +3235,6 @@ final class ZonvieCore {
     }
 
     /// Called to update vertices for an external grid.
-    private func onExternalVertices(gridId: Int64, verts: UnsafePointer<zonvie_vertex>?, vertCount: Int, rows: UInt32, cols: UInt32) {
-        ZonvieCore.appLog("[external_vertices] gridId=\(gridId) vertCount=\(vertCount) rows=\(rows) cols=\(cols)")
-
-        guard let verts = verts, vertCount > 0 else { return }
-
-        // Debug: Count vertex types (background vs glyph)
-        // Background vertices have texCoord.x < 0, glyph vertices have texCoord.x >= 0
-        var bgCount = 0
-        var glyphCount = 0
-        for i in 0..<min(vertCount, 100) { // Sample first 100 vertices
-            let v = verts[i]
-            if v.texCoord.0 < 0 {
-                bgCount += 1
-            } else {
-                glyphCount += 1
-            }
-        }
-        ZonvieCore.appLog("[external_vertices] sample: bg=\(bgCount) glyph=\(glyphCount) (of \(min(vertCount, 100)) sampled)")
-
-        let prepared = prepareExternalVertexSubmission(gridId: gridId, verts: verts, vertCount: vertCount)
-        let bgColor = prepared.bgColor
-        let vertexDataCopy = prepared.vertexData
-
-        // Submit vertices to the external grid view on main thread
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            guard let gridView = self.externalGridViews[gridId] else {
-                ZonvieCore.appLog("[external_vertices] no grid view for gridId=\(gridId)")
-                return
-            }
-            if self.classifyExternalGridKind(gridId) != .normal {
-                self.updateDecoratedExternalGrid(gridId: gridId, gridView: gridView, bgColor: bgColor, rows: rows, cols: cols)
-            }
-
-            vertexDataCopy.withUnsafeBytes { rawBuffer in
-                guard let ptr = rawBuffer.baseAddress else { return }
-                gridView.submitVertices(
-                    ptr: ptr,
-                    count: vertCount,
-                    rows: rows,
-                    cols: cols
-                )
-            }
-            gridView.requestRedraw()
-        }
-    }
-
-    private func prepareExternalVertexSubmission(
-        gridId: Int64,
-        verts: UnsafePointer<zonvie_vertex>,
-        vertCount: Int
-    ) -> (vertexData: Data, bgColor: NSColor?) {
-        let vertexArray = Array(UnsafeBufferPointer(start: verts, count: vertCount))
-        let prepared = prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
-        let byteCount = prepared.vertices.count * MemoryLayout<zonvie_vertex>.stride
-        let vertexDataCopy = prepared.vertices.withUnsafeBufferPointer {
-            Data(buffer: $0)
-        }
-        assert(vertexDataCopy.count == byteCount)
-        return (vertexDataCopy, prepared.bgColor)
-    }
-
     private func prepareExternalVertexArray(
         gridId: Int64,
         vertices: [zonvie_vertex]

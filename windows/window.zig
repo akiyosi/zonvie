@@ -2121,12 +2121,10 @@ pub export fn WndProc(
                 // PHASE 1: Start nvim spawn FIRST (runs in parallel with renderer init)
                 // ============================================================
                 var cb: core.Callbacks = .{
-                    .on_vertices = callbacks.onVertices,
                     .on_vertices_partial = callbacks.onVerticesPartial,
                     .on_vertices_row = callbacks.onVerticesRow,
                     .on_atlas_ensure_glyph = callbacks.onAtlasEnsureGlyph,
                     .on_atlas_ensure_glyph_styled = callbacks.onAtlasEnsureGlyphStyled,
-                    .on_render_plan = callbacks.onRenderPlan,
                     .on_log = callbacks.onLog,
                     .on_guifont = callbacks.onGuiFont,
                     .on_linespace = callbacks.onLineSpace,
@@ -2135,7 +2133,6 @@ pub export fn WndProc(
                     .on_set_title = callbacks.onSetTitle,
                     .on_external_window = external_windows.onExternalWindow,
                     .on_external_window_close = external_windows.onExternalWindowClose,
-                    .on_external_vertices = external_windows.onExternalVertices,
                     .on_cursor_grid_changed = external_windows.onCursorGridChanged,
                     .on_cmdline_show = callbacks.onCmdlineShow,
                     .on_cmdline_hide = callbacks.onCmdlineHide,
