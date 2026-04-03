@@ -71,6 +71,7 @@ pub const CmdlineState = struct {
     special_char_len: u8 = 0,
     special_shift: bool = false,
     visible: bool = false,
+    scroll_offset: u32 = 0, // horizontal scroll for cursor-tracking
 
     pub fn deinit(self: *CmdlineState, alloc: std.mem.Allocator) void {
         // Free all duped text in chunks
@@ -2116,9 +2117,9 @@ pub const Grid = struct {
         state.level = level;
         state.prompt_hl_id = prompt_hl_id;
         state.visible = true;
-        // Note: Do NOT reset special_char here!
-        // special_char is set by cmdline_special_char event and should persist
-        // until cleared by another cmdline_special_char event or cmdline_hide.
+        // Per Neovim UI protocol (:help ui-cmdline), cmdline_special_char
+        // "should be hidden at next cmdline_show". Clear on every show event.
+        state.special_char_len = 0;
 
         self.cmdline_dirty = true;
     }
@@ -2129,6 +2130,7 @@ pub const Grid = struct {
             state.visible = false;
             state.special_char_len = 0;
             state.special_shift = false;
+            state.scroll_offset = 0;
         }
         self.cmdline_dirty = true;
     }

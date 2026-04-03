@@ -191,6 +191,7 @@ pub const CMDLINE_ICON_MARGIN_LEFT: u32 = 2; // Left margin for icon (pixels)
 pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = 4; // Right margin for icon (pixels)
 pub const CMDLINE_BORDER_WIDTH: u32 = 1; // Border width (pixels)
 pub const CMDLINE_CORNER_RADIUS: f32 = 8.0; // Corner radius for rounded rect
+pub const CMDLINE_SCREEN_MARGIN: u32 = 40; // Margin from screen edges (matching macOS cmdlineScreenMargin)
 
 // --- Msg_show window styling constants ---
 pub const MSG_PADDING: u32 = 8; // Padding around content (pixels)
@@ -3192,8 +3193,23 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     );
     core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
 
-    // Note: screen_cols is now set automatically inside updateLayoutPxLocked
-    // to avoid deadlock issues when called from within redraw callbacks.
+    // Override screen_cols with monitor work area minus margin (matching macOS).
+    // updateLayoutPxLocked sets screen_cols = drawable_cols, but for cmdline
+    // max width we want the screen-based value with margin subtracted.
+    if (app.hwnd) |main_hwnd| {
+        const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
+        if (monitor) |mon| {
+            var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+            mi.cbSize = @sizeOf(c.MONITORINFO);
+            if (c.GetMonitorInfoW(mon, &mi) != 0) {
+                const work_w: u32 = @intCast(@max(1, mi.rcWork.right - mi.rcWork.left));
+                const overhead: u32 = CMDLINE_PADDING * 2 + CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT + CMDLINE_SCREEN_MARGIN;
+                const available_w: u32 = if (work_w > overhead) work_w - overhead else 1;
+                const screen_cols: u32 = @max(40, available_w / cw);
+                core.zonvie_core_set_screen_cols(app.corep, screen_cols);
+            }
+        }
+    }
 }
 
 pub fn rowHeightPxFromClient(hwnd: c.HWND, rows: u32, fallback: u32) u32 {

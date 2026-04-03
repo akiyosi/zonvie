@@ -1598,7 +1598,16 @@ pub const Core = struct {
     }
 
     /// Set screen width in cells (for cmdline max width).
+    /// Uses the same thread-ID check as updateLayoutPx to avoid deadlock
+    /// when called from within redraw callbacks (where grid_mu is already held).
     pub fn setScreenCols(self: *Core, cols: u32) void {
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
+        if (redraw_tid != 0 and redraw_tid == current_tid) {
+            // Already holding grid_mu on this thread (inside handleRedraw).
+            self.grid.screen_cols = cols;
+            return;
+        }
         self.grid_mu.lock();
         defer self.grid_mu.unlock();
         self.grid.screen_cols = cols;

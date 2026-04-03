@@ -586,7 +586,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding;
     const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
 
-    // Clamp cmdline width to monitor work area to prevent overflow beyond screen edge
+    // Clamp cmdline width to monitor work area minus margin (matching macOS cmdlineScreenMargin)
     if (is_cmdline) {
         if (app.hwnd) |main_hwnd| {
             const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
@@ -595,8 +595,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 mi.cbSize = @sizeOf(c.MONITORINFO);
                 if (c.GetMonitorInfoW(mon, &mi) != 0) {
                     const work_w: c_int = mi.rcWork.right - mi.rcWork.left;
-                    if (client_w > work_w) {
-                        client_w = work_w;
+                    const screen_margin: c_int = @intCast(app_mod.CMDLINE_SCREEN_MARGIN);
+                    const max_w: c_int = work_w - screen_margin;
+                    if (client_w > max_w) {
+                        client_w = max_w;
                     }
                 }
             }

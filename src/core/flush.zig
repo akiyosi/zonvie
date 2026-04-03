@@ -5142,10 +5142,63 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         const content_width: u32 = display_width + 1; // +1 for cursor
         const width: u32 = @min(@max(content_width, min_width), max_width);
 
-        // Calculate scroll offset: if content exceeds width, scroll to show cursor (end)
-        // We want cursor position (+ 1 for cursor cell) to be visible at the right edge
-        const total_width: u32 = display_width + 1; // +1 for cursor at end
-        const scroll_offset: u32 = if (total_width > width) total_width - width else 0;
+        // Calculate cursor display column (before scroll) for scroll offset calculation.
+        // This duplicates the cursor_col logic below but is needed before grid writing.
+        var cursor_display_col: u32 = 0;
+        if (state.firstc != 0) cursor_display_col += 1;
+        cursor_display_col += countDisplayWidth(state.prompt);
+        cursor_display_col += state.indent;
+        {
+            var cdc_bytes_remaining: u32 = state.pos;
+            for (state.content.items) |chunk| {
+                const ctext = chunk.text;
+                if (cdc_bytes_remaining == 0) break;
+                if (cdc_bytes_remaining >= ctext.len) {
+                    cursor_display_col += countDisplayWidth(ctext);
+                    cdc_bytes_remaining -= @intCast(ctext.len);
+                    continue;
+                }
+                var cbyte_i: usize = 0;
+                while (cbyte_i < ctext.len) {
+                    if (cdc_bytes_remaining == 0) break;
+                    const cluster = scanEmojiCluster(ctext, cbyte_i);
+                    if (cluster.codepoint_count == 0) break;
+                    const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
+                    if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
+                        cursor_display_col += 2;
+                    } else {
+                        cursor_display_col += cluster.display_width;
+                    }
+                    if (cdc_bytes_remaining >= cluster_bytes) {
+                        cdc_bytes_remaining -= cluster_bytes;
+                    } else {
+                        cdc_bytes_remaining = 0;
+                    }
+                    cbyte_i = cluster.end_byte;
+                }
+                break;
+            }
+        }
+
+        // Calculate scroll offset: keep cursor visible within the viewport.
+        // Start from previous scroll offset and adjust only when cursor escapes
+        // the visible range, providing smooth scrolling in both directions.
+        const scroll_offset: u32 = blk: {
+            var off = state.scroll_offset;
+            const cursor_right_edge = cursor_display_col + 1; // +1 for cursor cell
+            if (cursor_right_edge > off + width) {
+                // Cursor past right edge of viewport: scroll right
+                off = cursor_right_edge - width;
+            } else if (cursor_display_col < off) {
+                // Cursor past left edge of viewport: scroll left
+                off = cursor_display_col;
+            }
+            // Clamp: don't scroll past end of content
+            const max_off = if (display_width + 1 > width) display_width + 1 - width else 0;
+            off = @min(off, max_off);
+            break :blk off;
+        };
+        state.scroll_offset = scroll_offset;
 
         // Create or resize cmdline grid
         self.grid.resizeGrid(cmdline_grid_id, 1, width) catch |e| {
@@ -5280,45 +5333,9 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             }
         }
 
-        // Cursor position: firstc + prompt + indent + display_pos - scroll_offset.
-        // Neovim's state.pos is a BYTE offset into the concatenated content text.
-        // We iterate through content bytes, tracking display columns.
-        var cursor_col: u32 = 0;
-        if (state.firstc != 0) cursor_col += 1;
-        cursor_col += countDisplayWidth(state.prompt);
-        cursor_col += state.indent;
-        var bytes_remaining: u32 = state.pos;
-        outer: for (state.content.items) |chunk| {
-            const ctext = chunk.text;
-            if (bytes_remaining == 0) break :outer;
-            if (bytes_remaining >= ctext.len) {
-                // This entire chunk is before the cursor
-                cursor_col += countDisplayWidth(ctext);
-                bytes_remaining -= @intCast(ctext.len);
-                continue;
-            }
-            // Cursor is within this chunk — count display width up to the byte offset
-            var cbyte_i: usize = 0;
-            while (cbyte_i < ctext.len) {
-                if (bytes_remaining == 0) break :outer;
-                const cluster = scanEmojiCluster(ctext, cbyte_i);
-                if (cluster.codepoint_count == 0) break;
-                const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
-                if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
-                    cursor_col += 2;
-                } else {
-                    cursor_col += cluster.display_width;
-                }
-                if (bytes_remaining >= cluster_bytes) {
-                    bytes_remaining -= cluster_bytes;
-                } else {
-                    bytes_remaining = 0;
-                }
-                cbyte_i = cluster.end_byte;
-            }
-        }
-        // Adjust cursor position for scroll offset
-        cursor_col = if (cursor_col >= scroll_offset) cursor_col - scroll_offset else 0;
+        // Cursor position in the visible grid: reuse pre-computed cursor_display_col,
+        // adjusted for scroll offset.
+        const cursor_col: u32 = if (cursor_display_col >= scroll_offset) cursor_display_col - scroll_offset else 0;
 
         // Mark as external grid
         _ = self.grid.setWinExternalPos(cmdline_grid_id, 0) catch |e| {

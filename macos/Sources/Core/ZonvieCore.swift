@@ -4140,8 +4140,9 @@ final class ZonvieCore {
         guard let context = makeDecoratedGridContext(gridId: gridId) else { return }
 
         updateDecoratedBackground(context: context, gridView: gridView, bgColor: bgColor)
-        updateDecoratedWindowChrome(kind: kind, context: context)
         updateDecoratedLayout(kind: kind, context: context, gridView: gridView, rows: rows, cols: cols)
+        // Chrome must be updated AFTER layout so border uses the new layer.bounds
+        updateDecoratedWindowChrome(kind: kind, context: context)
     }
 
     private func makeDecoratedGridContext(gridId: Int64) -> DecoratedGridContext? {
