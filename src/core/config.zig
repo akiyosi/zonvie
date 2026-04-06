@@ -166,7 +166,7 @@ pub const Config = struct {
 
     pub const FontConfig = struct {
         family: []const u8 = if (builtin.os.tag == .macos) "Menlo" else "Consolas",
-        size: f32 = 14.0,
+        size: f32 = if (builtin.os.tag == .macos) 14.0 else 18.0,
         linespace: i32 = 0,
     };
 

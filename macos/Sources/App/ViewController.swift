@@ -97,12 +97,34 @@ final class ViewController: NSViewController {
             core.setExtMessages(true)
         }
 
-        // Delay start to ensure RunLoop is running (needed for SSH password dialog)
+        // Dispatch core.start() off the main thread so viewDidLoad can return
+        // immediately and AppDelegate.makeKeyAndOrderFront runs without
+        // waiting for nvim spawn / Zig core init. nvim startup proceeds in
+        // parallel with the AppKit window-shown work on main, shaving ~80ms
+        // off perceived window-appear latency.
+        //
+        // SSH/devcontainer modes still use main.async because their auth
+        // dialogs require a running main RunLoop and they perform AppKit
+        // work (NSWindow, osascript) inside start(). SSH detection mirrors
+        // ZonvieCore.start()'s combined CLI flag / config.toml check.
+        //
+        // rows/cols here are placeholders (1×1). The RPC thread blocks in
+        // waitForLayoutReady() until MetalTerminalView signals
+        // notifyInitialLayout() with the actual rows/cols computed from
+        // the post-layout drawable size, so nvim_ui_attach is sent with the
+        // correct dimensions on the first try.
         let nvimPath = cliNvimPath ?? config.neovim.path
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            // rows/cols initial is decided by Zig core; current bootstrap uses 1x1.
-            _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+        let sshEnabled = sshModeEnabled || config.neovim.ssh
+        if sshEnabled || devcontainerModeEnabled {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            }
+        } else {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            }
         }
     }
 

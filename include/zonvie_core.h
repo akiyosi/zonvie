@@ -797,6 +797,29 @@ void zonvie_core_stop(zonvie_core *core);
    Must be called after zonvie_core_start() (including devcontainer restarts). */
 void zonvie_core_notify_layout_ready(zonvie_core *core, unsigned rows, unsigned cols);
 
+/* Acquire / release the core's grid mutex from a frontend (UI) thread.
+   Lets a frontend run a multi-step state mutation (e.g. font change +
+   layout update + glyph cache invalidation) atomically with respect to
+   the RPC thread's redraw cycle, in the same way that the in-flush
+   onGuifont path is atomic.
+   Every lock MUST be balanced with an unlock; while holding the lock,
+   the caller MUST NOT call any core API that itself acquires grid_mu
+   (use zonvie_core_update_layout_px_locked instead of the regular
+   updateLayoutPx wrapper, etc.). */
+void zonvie_core_lock_grid(zonvie_core *core);
+void zonvie_core_unlock_grid(zonvie_core *core);
+
+/* updateLayoutPx variant for callers that already hold grid_mu via
+   zonvie_core_lock_grid. Skips the redraw_thread_id check and the
+   internal grid_mu acquisition that the regular API performs. */
+void zonvie_core_update_layout_px_locked(
+    zonvie_core *core,
+    unsigned drawable_w_px,
+    unsigned drawable_h_px,
+    unsigned cell_w_px,
+    unsigned cell_h_px
+);
+
 void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int len);
 
 /* Timestamp helper for perf-log correlation across frontend/core stages. */

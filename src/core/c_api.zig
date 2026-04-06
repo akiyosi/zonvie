@@ -1490,3 +1490,38 @@ pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     const box = asBox(p.?);
     box.core.flush_aborted = true;
 }
+
+// Acquire grid_mu from a frontend (UI) thread.
+//
+// Lets a frontend run a multi-step state mutation (e.g. atlas rebuild +
+// updateLayoutPx + invalidate_glyph_cache) atomically with respect to the
+// RPC thread's handleRedraw cycle, in the same way that the original
+// in-flush onGuifont path is atomic. The caller MUST balance every lock
+// with zonvie_core_unlock_grid and MUST NOT call any core API that itself
+// tries to acquire grid_mu while holding it (use the *_locked variants).
+pub export fn zonvie_core_lock_grid(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.grid_mu.lock();
+}
+
+pub export fn zonvie_core_unlock_grid(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.grid_mu.unlock();
+}
+
+// updateLayoutPx variant for callers that already hold grid_mu (typically
+// via zonvie_core_lock_grid). Skips the redraw_thread_id check and the
+// internal grid_mu acquisition that the regular API performs.
+pub export fn zonvie_core_update_layout_px_locked(
+    p: ?*zonvie_core,
+    drawable_w_px: u32,
+    drawable_h_px: u32,
+    cell_w_px: u32,
+    cell_h_px: u32,
+) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+}
