@@ -2624,7 +2624,9 @@ pub const App = struct {
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,
 
-    window_shown: bool = false,
+    // Atomic: written by RPC thread (onFlushEnd), read by UI thread
+    // (WM_SIZE handler) to gate updateLayoutToCore vs notify_layout_ready.
+    window_shown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pending_show_window: bool = false,
 

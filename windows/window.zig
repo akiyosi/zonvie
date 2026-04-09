@@ -1709,12 +1709,15 @@ pub export fn WndProc(
                 }
 
                 // 2) core layout update must be outside lock (can re-enter via callbacks).
-                if (app.window_shown) {
+                // Snapshot window_shown once (atomic) to avoid the TOCTOU race
+                // where the RPC thread's onFlushEnd flips it between our two reads.
+                const shown = app.window_shown.load(.acquire);
+                if (shown) {
                     updateLayoutToCore(hwnd, app);
                 }
 
                 // Unblock RPC thread once layout is known (before window is shown)
-                if (app.early_core_init_done and app.nvim_spawned and !app.window_shown) {
+                if (app.early_core_init_done and app.nvim_spawned and !shown) {
                     if (app.corep) |corep| {
                         if (app.surface.rows > 0 and app.surface.cols > 0) {
                             core.zonvie_core_notify_layout_ready(corep, app.surface.rows, app.surface.cols);

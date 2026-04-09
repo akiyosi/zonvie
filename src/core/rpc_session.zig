@@ -584,28 +584,43 @@ pub fn sendClipboardGetResponse(self: *Core, msgid: i64, content: []const u8) !v
 pub fn setupClipboard(self: *Core) void {
     if (self.clipboard_setup_done) return;
 
-    // Use vim.fn.chanNr() for dynamic channel ID retrieval instead of
-    // depending on get_api_info response. This eliminates the round-trip.
+    // Discover our channel_id from Lua by scanning nvim_list_chans() for
+    // the channel whose client.name == "zonvie" (set by the preceding
+    // requestSetClientInfo on the same RPC pipe, so it's guaranteed to
+    // be visible by the time nvim processes this exec_lua).
+    //
+    // This avoids the nvim_get_api_info round-trip that main used:
+    // clipboard setup is fire-and-forget, no extra RPC cycle needed.
+    // vim.api.nvim_get_api_info is not available from Lua in Neovim 0.11+,
+    // and vim.fn.chanNr does not exist — nvim_list_chans is the only
+    // reliable Lua-side mechanism.
     const lua_code =
-        \\local ch = vim.fn.chanNr()
+        \\local ch
+        \\for _, c in ipairs(vim.api.nvim_list_chans()) do
+        \\  if c.client and c.client.name == 'zonvie' then
+        \\    ch = c.id
+        \\    break
+        \\  end
+        \\end
+        \\if not ch then return end
         \\vim.g.zonvie_channel = ch
         \\vim.schedule(function()
         \\  vim.g.clipboard = {
         \\    name = 'zonvie',
         \\    copy = {
         \\      ['+'] = function(lines, regtype)
-        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.set_clipboard', '+', lines)
+        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '+', lines)
         \\      end,
         \\      ['*'] = function(lines, regtype)
-        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.set_clipboard', '*', lines)
+        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '*', lines)
         \\      end,
         \\    },
         \\    paste = {
         \\      ['+'] = function()
-        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.get_clipboard', '+')
+        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '+')
         \\      end,
         \\      ['*'] = function()
-        \\        return vim.rpcrequest(vim.fn.chanNr(), 'zonvie.get_clipboard', '*')
+        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '*')
         \\      end,
         \\    },
         \\  }
@@ -618,7 +633,7 @@ pub fn setupClipboard(self: *Core) void {
     };
 
     self.clipboard_setup_done = true;
-    self.log.write("clipboard setup done (via vim.fn.chanNr())\n", .{});
+    self.log.write("clipboard setup done (via nvim_list_chans lookup)\n", .{});
 }
 
 pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
@@ -1280,7 +1295,9 @@ pub fn runLoop(self: *Core) void {
     self.ui_attached.store(true, .seq_cst);
     self.flushPendingFocus();
 
-    // Setup clipboard immediately after ui_attach (no get_api_info round-trip needed)
+    // Setup clipboard immediately after ui_attach (no get_api_info
+    // round-trip). The Lua code discovers our channel_id via
+    // nvim_list_chans() + client.name match.
     setupClipboard(self);
 
     // Glow config is requested via glow_startup_retries during flush processing.

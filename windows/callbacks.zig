@@ -1525,8 +1525,8 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrFromInt(ctx_bits);
 
     // First flush triggers window show: keep window hidden until nvim sends first frame
-    if (!app.window_shown) {
-        app.window_shown = true;
+    if (!app.window_shown.load(.acquire)) {
+        app.window_shown.store(true, .release);
         if (app.hwnd) |hwnd| {
             _ = c.PostMessageW(hwnd, app_mod.WM_APP_SHOW_WINDOW, 0, 0);
         }
