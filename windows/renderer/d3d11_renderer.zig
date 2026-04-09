@@ -245,7 +245,8 @@ pub const Renderer = struct {
     // visible whenever client_px is not an exact multiple of cell_px.
     // 0xFFFFFFFF means "not yet set" — fall back to black to match
     // pre-existing behavior until onDefaultColorsSet fires.
-    default_bg_rgb: u32 = 0xFFFFFFFF,
+    // Atomic: written by RPC thread (onDefaultColorsSet), read by draw thread.
+    default_bg_rgb: std.atomic.Value(u32) = std.atomic.Value(u32).init(0xFFFFFFFF),
 
     // DirectComposition for transparency
     dcomp_device: ?*IDCompositionDevice = null,
@@ -392,12 +393,11 @@ pub const Renderer = struct {
         return self;
     }
 
-    /// Lock the D3D11 device context for thread-safe access.
-    /// Call this before rendering operations when accessed from multiple threads.
     /// Update the default background color used by ClearRenderTargetView.
     /// Pass 0x00RRGGBB; pass 0xFFFFFFFF to fall back to black.
+    /// Thread-safe: called from RPC thread, read by draw thread.
     pub fn setDefaultBgColor(self: *Renderer, rgb: u32) void {
-        self.default_bg_rgb = rgb;
+        self.default_bg_rgb.store(rgb, .release);
     }
 
     pub fn lockContext(self: *Renderer) void {
@@ -743,13 +743,14 @@ pub const Renderer = struct {
         // must be multiplied by the opacity used as alpha). Falls back to
         // black before onDefaultColorsSet has fired so behavior matches
         // the previous hardcoded clear in that early window.
+        const bg_rgb = self.default_bg_rgb.load(.acquire);
         const clear: [4]f32 = blk: {
-            if (self.default_bg_rgb == 0xFFFFFFFF) {
+            if (bg_rgb == 0xFFFFFFFF) {
                 break :blk .{ 0, 0, 0, self.opacity };
             }
-            const r_u: u32 = (self.default_bg_rgb >> 16) & 0xFF;
-            const g_u: u32 = (self.default_bg_rgb >> 8) & 0xFF;
-            const b_u: u32 = self.default_bg_rgb & 0xFF;
+            const r_u: u32 = (bg_rgb >> 16) & 0xFF;
+            const g_u: u32 = (bg_rgb >> 8) & 0xFF;
+            const b_u: u32 = bg_rgb & 0xFF;
             const r: f32 = (@as(f32, @floatFromInt(r_u)) / 255.0) * self.opacity;
             const g: f32 = (@as(f32, @floatFromInt(g_u)) / 255.0) * self.opacity;
             const b: f32 = (@as(f32, @floatFromInt(b_u)) / 255.0) * self.opacity;

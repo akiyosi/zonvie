@@ -696,7 +696,7 @@ const default_config_toml =
     \\
     \\[font]
     \\# family = "Consolas"
-    \\# size = 14.0
+    \\# size = 18.0
     \\# linespace = 0
     \\
     \\[neovim]

@@ -1945,7 +1945,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
     // Font priority: guifont > config.font.family > OS default (Consolas)
     const os_default_font = "Consolas";
-    const default_font_pt: f32 = 14.0;
+    const default_font_pt: f32 = 18.0;
 
     // Get config font (fallback to OS default if empty)
     const config_font = if (app.config.font.family.len > 0) app.config.font.family else os_default_font;
