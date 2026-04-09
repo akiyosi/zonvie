@@ -2347,13 +2347,77 @@ final class ZonvieCore {
         zonvie_core_invalidate_glyph_cache(c)
 
         // GUI-only updates (redraw, external window notify) can be async.
+        // Window content size snap also runs here so it executes after the
+        // current grid_mu hold is released — setFrame on the main NSWindow
+        // can trigger windowDidResize → updateLayoutPx, which would deadlock
+        // if grid_mu were still held by this thread.
         DispatchQueue.main.async { [weak self] in
+            self?.snapMainWindowContentToCell()
             view.requestRedraw()
             self?.externalGridViews.values.forEach {
                 $0.notifyFontChanged()
                 $0.requestRedraw()
             }
         }
+    }
+
+    /// Snap the main NSWindow's content size down to the largest multiple of
+    /// the current cell dimensions that still fits inside the existing
+    /// content rect. Called whenever the cell metrics change (deferred
+    /// guifont apply, steady-state guifont change). Without this snap, the
+    /// drawable's bottom/right remainder strip — `clientPx % cellPx` — is
+    /// outside the cell-aligned NDC viewport used by both the core's vertex
+    /// generator and the renderer's RSSetViewports, so it never receives
+    /// any draw or clear and shows whatever was first written there (black
+    /// from the very first .clear pass before bg was known).
+    ///
+    /// Must run on the main thread (touches NSWindow). Must be called with
+    /// grid_mu NOT held — setFrame can trigger windowDidResize synchronously.
+    /// No-op when the remainder is already zero on both axes, so it does
+    /// not interfere with steady-state user resizes.
+    private func snapMainWindowContentToCell() {
+        guard let view = terminalView else { return }
+        guard let window = view.window else { return }
+        guard let renderer = view.renderer else { return }
+        let cellWPx = max(1, Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+        let cellHPx = max(1, Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let scale = window.backingScaleFactor
+        guard scale > 0 else { return }
+
+        // Use the view's bounds (in points) as the authoritative current
+        // content size. drawableSize is in pixels and may lag bounds by one
+        // frame; bounds is what NSWindow setContentSize would round-trip to.
+        let currentContentPt = view.bounds.size
+        let currentWPx = Int((currentContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
+        let currentHPx = Int((currentContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
+
+        let snappedWPx = (currentWPx / cellWPx) * cellWPx
+        let snappedHPx = (currentHPx / cellHPx) * cellHPx
+        if snappedWPx <= 0 || snappedHPx <= 0 { return }
+
+        let remainderW = currentWPx - snappedWPx
+        let remainderH = currentHPx - snappedHPx
+        if remainderW == 0 && remainderH == 0 { return }
+
+        let newContentPt = CGSize(
+            width: CGFloat(snappedWPx) / scale,
+            height: CGFloat(snappedHPx) / scale
+        )
+
+        // Keep the top-left corner fixed (macOS frame origin is bottom-left).
+        let oldFrame = window.frame
+        let oldTop = oldFrame.origin.y + oldFrame.height
+        let contentRect = NSRect(x: oldFrame.origin.x, y: 0,
+                                 width: newContentPt.width, height: newContentPt.height)
+        let frameRect = window.frameRect(forContentRect: contentRect)
+        let newFrame = NSRect(
+            x: oldFrame.origin.x,
+            y: oldTop - frameRect.height,
+            width: frameRect.width,
+            height: frameRect.height
+        )
+        Self.appLog("[snap] cell=(\(cellWPx)x\(cellHPx)) content_px=(\(currentWPx)x\(currentHPx)) -> (\(snappedWPx)x\(snappedHPx)) remainder=(\(remainderW),\(remainderH))")
+        window.setFrame(newFrame, display: true)
     }
 
     /// Called from MetalTerminalRenderer's first present-completed handler

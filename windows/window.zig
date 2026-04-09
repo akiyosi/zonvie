@@ -74,6 +74,7 @@ const WM_APP_DEFERRED_WIN_POS = app_mod.WM_APP_DEFERRED_WIN_POS;
 const WM_APP_SHOW_WINDOW = app_mod.WM_APP_SHOW_WINDOW;
 const WM_APP_SWP_FRAMECHANGED = app_mod.WM_APP_SWP_FRAMECHANGED;
 const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
+const WM_APP_SNAP_MAIN_WINDOW = app_mod.WM_APP_SNAP_MAIN_WINDOW;
 
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
@@ -527,12 +528,37 @@ pub export fn WndProc(
                     app.first_paint_logged = true;
                 }
 
-                // If renderer not yet initialized (deferred init pending), just fill with black
+                // Renderer not yet initialized (deferred init pending). Fill
+                // the paint rect with the colorscheme bg if Neovim has
+                // already pushed default_colors_set; otherwise fall back to
+                // black to match the legacy behavior. Without the bg path,
+                // the early frames of startup show a black flash even when
+                // the colorscheme is light.
                 if (app.renderer == null) {
-                    if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling black", .{});
                     const hdc = ps.hdc;
-                    const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
-                    _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
+                    app.mu.lock();
+                    const bg_rgb = app.colorscheme_bg;
+                    app.mu.unlock();
+                    if (bg_rgb != 0xFFFFFFFF) {
+                        // Win32 COLORREF is 0x00BBGGRR — swap from our 0x00RRGGBB.
+                        const r: u32 = (bg_rgb >> 16) & 0xFF;
+                        const g: u32 = (bg_rgb >> 8) & 0xFF;
+                        const b: u32 = bg_rgb & 0xFF;
+                        const colorref: c.COLORREF = @intCast((b << 16) | (g << 8) | r);
+                        if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling bg=0x{x:0>6}", .{bg_rgb});
+                        const brush = c.CreateSolidBrush(colorref);
+                        if (brush != null) {
+                            _ = c.FillRect(hdc, &ps.rcPaint, brush);
+                            _ = c.DeleteObject(@ptrCast(brush));
+                        } else {
+                            const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
+                            _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
+                        }
+                    } else {
+                        if (log_enabled) applog.appLog("[win] WM_PAINT: renderer not ready, filling black (bg unset)", .{});
+                        const black_brush: c.HBRUSH = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
+                        _ = c.FillRect(hdc, &ps.rcPaint, black_brush);
+                    }
                     return 0;
                 }
 
@@ -2133,6 +2159,67 @@ pub export fn WndProc(
                     local_buf[len] = 0; // null terminate
                     _ = c.SetWindowTextW(hwnd, &local_buf);
                 }
+            }
+            return 0;
+        },
+
+        WM_APP_SNAP_MAIN_WINDOW => {
+            // Snap the main window's client rect down to a multiple of the
+            // current cell size in both axes. Posted from the RPC thread by
+            // onGuiFont/onLineSpace after cell metrics change. The actual
+            // SetWindowPos must run on the UI thread because it triggers a
+            // synchronous WM_SIZE → updateLayoutToCore → grid_mu, which
+            // would deadlock if invoked from the RPC thread (which already
+            // holds grid_mu via handleRedraw).
+            //
+            // No-op when the remainder is already zero on both axes, so
+            // this does not interfere with steady-state user resizes.
+            if (getApp(hwnd)) |app| {
+                var client_rc: c.RECT = undefined;
+                var window_rc: c.RECT = undefined;
+                if (c.GetClientRect(hwnd, &client_rc) == 0) return 0;
+                if (c.GetWindowRect(hwnd, &window_rc) == 0) return 0;
+
+                app.mu.lock();
+                const cell_w: u32 = app.cell_w_px;
+                const cell_h: u32 = app.cell_h_px + app.linespace_px;
+                app.mu.unlock();
+                if (cell_w == 0 or cell_h == 0) return 0;
+
+                const client_w_i: i32 = client_rc.right - client_rc.left;
+                const client_h_i: i32 = client_rc.bottom - client_rc.top;
+                if (client_w_i <= 0 or client_h_i <= 0) return 0;
+                const client_w: u32 = @intCast(client_w_i);
+                const client_h: u32 = @intCast(client_h_i);
+
+                const snapped_w: u32 = (client_w / cell_w) * cell_w;
+                const snapped_h: u32 = (client_h / cell_h) * cell_h;
+                if (snapped_w == 0 or snapped_h == 0) return 0;
+                if (snapped_w == client_w and snapped_h == client_h) return 0;
+
+                // Frame delta = outer - client. AdjustWindowRectEx is not
+                // reliable here because the window may use a custom NCCALCSIZE
+                // (DWM titlebar mode), so derive the delta from the live rects.
+                const outer_w: i32 = window_rc.right - window_rc.left;
+                const outer_h: i32 = window_rc.bottom - window_rc.top;
+                const frame_dw: i32 = outer_w - client_w_i;
+                const frame_dh: i32 = outer_h - client_h_i;
+                const new_outer_w: c_int = @as(c_int, @intCast(snapped_w)) + frame_dw;
+                const new_outer_h: c_int = @as(c_int, @intCast(snapped_h)) + frame_dh;
+
+                if (applog.isEnabled()) applog.appLog(
+                    "[win] WM_APP_SNAP_MAIN_WINDOW: client=({d},{d}) -> ({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
+                    .{ client_w, client_h, snapped_w, snapped_h, cell_w, cell_h, new_outer_w, new_outer_h },
+                );
+                _ = c.SetWindowPos(
+                    hwnd,
+                    null,
+                    0,
+                    0,
+                    new_outer_w,
+                    new_outer_h,
+                    c.SWP_NOZORDER | c.SWP_NOMOVE | c.SWP_NOACTIVATE,
+                );
             }
             return 0;
         },

@@ -238,6 +238,15 @@ pub const Renderer = struct {
     // Background transparency (0.0-1.0, 1.0 = opaque)
     opacity: f32 = 1.0,
 
+    // Neovim default background color (0x00RRGGBB), used for the
+    // ClearRenderTargetView color. Without this, the bottom/right
+    // remainder strip below/right of the cell-aligned NDC viewport
+    // shows the hardcoded clear color (historically black) which is
+    // visible whenever client_px is not an exact multiple of cell_px.
+    // 0xFFFFFFFF means "not yet set" — fall back to black to match
+    // pre-existing behavior until onDefaultColorsSet fires.
+    default_bg_rgb: u32 = 0xFFFFFFFF,
+
     // DirectComposition for transparency
     dcomp_device: ?*IDCompositionDevice = null,
     dcomp_target: ?*IDCompositionTarget = null,
@@ -385,6 +394,12 @@ pub const Renderer = struct {
 
     /// Lock the D3D11 device context for thread-safe access.
     /// Call this before rendering operations when accessed from multiple threads.
+    /// Update the default background color used by ClearRenderTargetView.
+    /// Pass 0x00RRGGBB; pass 0xFFFFFFFF to fall back to black.
+    pub fn setDefaultBgColor(self: *Renderer, rgb: u32) void {
+        self.default_bg_rgb = rgb;
+    }
+
     pub fn lockContext(self: *Renderer) void {
         self.ctx_mu.lock();
     }
@@ -724,15 +739,29 @@ pub const Renderer = struct {
                 (self.opacity < 1.0)
             );
 
+        // Compute clear color from default bg (premultiplied alpha: RGB
+        // must be multiplied by the opacity used as alpha). Falls back to
+        // black before onDefaultColorsSet has fired so behavior matches
+        // the previous hardcoded clear in that early window.
+        const clear: [4]f32 = blk: {
+            if (self.default_bg_rgb == 0xFFFFFFFF) {
+                break :blk .{ 0, 0, 0, self.opacity };
+            }
+            const r_u: u32 = (self.default_bg_rgb >> 16) & 0xFF;
+            const g_u: u32 = (self.default_bg_rgb >> 8) & 0xFF;
+            const b_u: u32 = self.default_bg_rgb & 0xFF;
+            const r: f32 = (@as(f32, @floatFromInt(r_u)) / 255.0) * self.opacity;
+            const g: f32 = (@as(f32, @floatFromInt(g_u)) / 255.0) * self.opacity;
+            const b: f32 = (@as(f32, @floatFromInt(b_u)) / 255.0) * self.opacity;
+            break :blk .{ r, g, b, self.opacity };
+        };
+
         if (should_clear) {
             const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
-            // Apply background opacity (premultiplied alpha: RGB must be multiplied by alpha)
-            const clear: [4]f32 = .{ 0, 0, 0, self.opacity };
             clear_rtv(ctx, back_rtv, &clear);
         } else if (self.opacity < 1.0) {
             // Force clear in transparency mode even if should_clear is false
             const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
-            const clear: [4]f32 = .{ 0, 0, 0, self.opacity };
             clear_rtv(ctx, back_rtv, &clear);
         }
     

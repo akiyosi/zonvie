@@ -113,6 +113,15 @@ pub const WM_APP_DEFERRED_WIN_POS: c.UINT = c.WM_APP + 24;
 pub const WM_APP_SHOW_WINDOW: c.UINT = c.WM_APP + 25;
 pub const WM_APP_SWP_FRAMECHANGED: c.UINT = c.WM_APP + 26;
 pub const WM_APP_POST_SHOW_INIT: c.UINT = c.WM_APP + 27;
+/// Posted from onGuiFont/onLineSpace after cell metrics change. The UI
+/// thread handler computes the largest window size whose client area is
+/// an exact multiple of the new cell, and SetWindowPos's the window to
+/// that size. Without this, the bottom/right `client_px % cell_px`
+/// remainder strip is outside the cell-aligned NDC viewport used by both
+/// the core's vertex generator and the d3d11 renderer's RSSetViewports,
+/// so it never receives any draw and shows whatever the renderer last
+/// cleared it to (historically hardcoded black).
+pub const WM_APP_SNAP_MAIN_WINDOW: c.UINT = c.WM_APP + 28;
 
 // =========================================================================
 // Timer IDs and timing constants

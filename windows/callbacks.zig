@@ -2122,6 +2122,15 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.mu.unlock();
+
+        // Snap the main window's client rect to a multiple of the new
+        // cell size. Without this, drawable_px % cell_px leaves a strip
+        // along the bottom/right edge that the cell-aligned NDC viewport
+        // never covers, so it shows whatever the renderer last cleared
+        // there. Posted (not sent) because we are on the RPC thread with
+        // grid_mu held; the UI handler does the SetWindowPos and lets
+        // WM_SIZE drive the rest of the resize pipeline.
+        _ = c.PostMessageW(h, app_mod.WM_APP_SNAP_MAIN_WINDOW, 0, 0);
     }
 }
 
@@ -2208,6 +2217,10 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.mu.unlock();
+
+        // Same client-rect snap as onGuiFont — linespace changes the row
+        // height, so the same drawable_h % cell_h remainder problem applies.
+        _ = c.PostMessageW(h, app_mod.WM_APP_SNAP_MAIN_WINDOW, 0, 0);
     }
 }
 
@@ -2254,6 +2267,14 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     app.mu.lock();
     if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
     if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
+    // Push the bg into the d3d11 renderer so its ClearRenderTargetView
+    // call uses the colorscheme bg instead of the historical hardcoded
+    // black. This is what makes the bottom/right remainder strip
+    // (drawable_px % cell_px) blend with the rest of the grid instead
+    // of showing as a black band.
+    if (bg != 0xFFFFFFFF) {
+        if (app.renderer) |*r| r.setDefaultBgColor(bg);
+    }
     app.mu.unlock();
 
     // Invalidate tabline/sidebar to repaint with new colors
