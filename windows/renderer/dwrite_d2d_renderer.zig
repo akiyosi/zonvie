@@ -45,7 +45,10 @@ pub const Renderer = struct {
     mu: std.Thread.Mutex = .{},
 
     d2d_factory: ?*c.ID2D1Factory = null,
-    rt: ?*c.ID2D1HwndRenderTarget = null,
+    d2d_factory1: ?*c.ID2D1Factory1 = null,
+    d2d_device: ?*c.ID2D1Device = null,
+    d2d_device_ctx: ?*c.ID2D1DeviceContext = null,
+    rt: ?*c.ID2D1HwndRenderTarget = null, // legacy, kept for fallback
 
     dwrite_factory: ?*c.IDWriteFactory = null,
     text_format: ?*c.IDWriteTextFormat = null,
@@ -136,6 +139,11 @@ pub const Renderer = struct {
     // so stale UV coordinates in cached row vertices are refreshed.
     atlas_reset_pending: bool = false,
 
+    // Font change detection: track name + generation to skip redundant setFont calls
+    font_name_utf8: [128]u8 = [_]u8{0} ** 128,
+    font_name_utf8_len: u32 = 0,
+    font_generation: u32 = 0,
+
     // OpenType font features for DWrite shaping.
     font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
     font_feature_count: u32 = 0,
@@ -145,8 +153,10 @@ pub const Renderer = struct {
     // Invalidated on font/DPI/device changes.
     gsub_cache: [4]GsubCacheEntry = [_]GsubCacheEntry{.{}} ** 4,
 
-    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
-        // Timing for init steps
+    /// Phase 1 of two-phase init: creates D2D/DWrite factories, sets font, and
+    /// computes cellW/cellH. Does NOT create the D2D render target (~30ms).
+    /// Call initRenderTarget() to complete initialization before rendering.
+    pub fn initMetrics(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
@@ -155,8 +165,6 @@ pub const Renderer = struct {
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
-
-            // ★ Initialize required fields (guard against missing struct fields)
             .glyph_map = std.AutoHashMap(u32, core.GlyphEntry).init(alloc),
             .styled_glyph_map = std.AutoHashMap(u32, core.GlyphEntry).init(alloc),
         };
@@ -177,6 +185,16 @@ pub const Renderer = struct {
         if (hr_d2d != 0 or d2d_factory == null) return error.D2DFactoryCreateFailed;
         self.d2d_factory = d2d_factory;
         errdefer safeRelease(self.d2d_factory);
+
+        // QueryInterface for ID2D1Factory1 (needed for D2D device context creation)
+        var factory1: ?*c.ID2D1Factory1 = null;
+        const fac_unk: *c.IUnknown = @ptrCast(d2d_factory.?);
+        if (fac_unk.lpVtbl.*.QueryInterface) |qi| {
+            _ = qi(fac_unk, &c.IID_ID2D1Factory1, @ptrCast(&factory1));
+        }
+        self.d2d_factory1 = factory1;
+        if (applog.isEnabled()) applog.appLog("[d2d] ID2D1Factory1: {s}\n", .{if (factory1 != null) "available" else "not available"});
+
         if (applog.isEnabled()) {
             _ = c.QueryPerformanceCounter(&t1);
             applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
@@ -198,24 +216,14 @@ pub const Renderer = struct {
             applog.appLog("[d2d] [TIMING] DWriteCreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
         }
 
-        // Create render target for hwnd
-        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
-        try self.recreateRenderTarget();
-        errdefer safeRelease(self.rt);
-        if (applog.isEnabled()) {
-            _ = c.QueryPerformanceCounter(&t1);
-            applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
-        }
-
         // Get DPI for the window (Per-Monitor DPI Aware V2)
         const window_dpi = GetDpiForWindow(hwnd);
         self.dpi = if (window_dpi > 0) window_dpi else 96;
         if (applog.isEnabled()) applog.appLog("[d2d] window DPI: {d}\n", .{self.dpi});
 
-        // Initial font (from config or OS default)
+        // Initial font → cell metrics become valid
         if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         self.setFontUtf8(initial_font, initial_pt) catch |e| {
-            // Fallback to OS default if initial font fails
             if (applog.isEnabled()) applog.appLog("[d2d] initial font '{s}' failed: {any}, trying Consolas\n", .{ initial_font, e });
             try self.setFontUtf8("Consolas", 14.0);
         };
@@ -224,6 +232,87 @@ pub const Renderer = struct {
             applog.appLog("[d2d] [TIMING] setFontUtf8: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
         }
 
+        return self;
+    }
+
+    /// Phase 2: Create D2D device context from a D3D11 device via DXGI.
+    /// Falls back to legacy HwndRenderTarget if Factory1 is not available.
+    pub fn initD2DDeviceContext(self: *Renderer, d3d_device: *c.ID3D11Device) !void {
+        var freq: c.LARGE_INTEGER = undefined;
+        var t0: c.LARGE_INTEGER = undefined;
+        var t1: c.LARGE_INTEGER = undefined;
+        if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
+
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
+
+        const factory1 = self.d2d_factory1 orelse {
+            // Fallback to legacy HwndRenderTarget
+            if (applog.isEnabled()) applog.appLog("[d2d] No ID2D1Factory1, falling back to HwndRenderTarget\n", .{});
+            try self.recreateRenderTarget();
+            if (applog.isEnabled()) {
+                _ = c.QueryPerformanceCounter(&t1);
+                applog.appLog("[d2d] [TIMING] initRenderTarget (fallback): {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+            }
+            return;
+        };
+
+        // Get IDXGIDevice from D3D11 device
+        var dxgi_dev: ?*c.IDXGIDevice = null;
+        const dev_unk: *c.IUnknown = @ptrCast(d3d_device);
+        const qi = dev_unk.lpVtbl.*.QueryInterface orelse return error.D2DDeviceContextFailed;
+        const hr_dxgi = qi(dev_unk, &c.IID_IDXGIDevice, @ptrCast(&dxgi_dev));
+        if (c.FAILED(hr_dxgi) or dxgi_dev == null) return error.D2DDeviceContextFailed;
+        defer {
+            const rel = dxgi_dev.?.lpVtbl.*.Release orelse null;
+            if (rel) |f| _ = f(dxgi_dev.?);
+        }
+
+        // Create ID2D1Device from IDXGIDevice
+        var d2d_device: ?*c.ID2D1Device = null;
+        const fac1_vtbl = factory1.lpVtbl.*;
+        const create_dev_fn = fac1_vtbl.CreateDevice orelse return error.D2DDeviceContextFailed;
+        const hr_dev = create_dev_fn(factory1, @ptrCast(dxgi_dev.?), @ptrCast(&d2d_device));
+        if (c.FAILED(hr_dev) or d2d_device == null) return error.D2DDeviceContextFailed;
+        self.d2d_device = d2d_device;
+
+        // Create ID2D1DeviceContext from ID2D1Device
+        var d2d_ctx: ?*c.ID2D1DeviceContext = null;
+        const dev_vtbl = d2d_device.?.lpVtbl.*;
+        const create_ctx_fn = dev_vtbl.CreateDeviceContext orelse return error.D2DDeviceContextFailed;
+        const hr_ctx = create_ctx_fn(d2d_device.?, c.D2D1_DEVICE_CONTEXT_OPTIONS_NONE, @ptrCast(&d2d_ctx));
+        if (c.FAILED(hr_ctx) or d2d_ctx == null) return error.D2DDeviceContextFailed;
+        self.d2d_device_ctx = d2d_ctx;
+
+        if (applog.isEnabled()) applog.appLog("[d2d] D2D device context created from D3D11 device\n", .{});
+
+        // Create atlas resources on the device context
+        try self.createAtlasResources();
+
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
+    }
+
+    /// Legacy phase 2: creates the D2D HwndRenderTarget and atlas resources.
+    pub fn initRenderTarget(self: *Renderer) !void {
+        var freq: c.LARGE_INTEGER = undefined;
+        var t0: c.LARGE_INTEGER = undefined;
+        var t1: c.LARGE_INTEGER = undefined;
+        if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
+        try self.recreateRenderTarget();
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] initRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
+    }
+
+    /// Full single-phase init (for callers that do not need the two-phase split).
+    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
+        var self = try initMetrics(alloc, hwnd, initial_font, initial_pt);
+        errdefer self.deinit();
+        try self.initRenderTarget();
         return self;
     }
 
@@ -252,6 +341,9 @@ pub const Renderer = struct {
         safeRelease(self.italic_font_face);
         safeRelease(self.bold_italic_font_face);
         safeRelease(self.rt);
+        safeRelease(self.d2d_device_ctx);
+        safeRelease(self.d2d_device);
+        safeRelease(self.d2d_factory1);
         safeRelease(self.dwrite_factory);
         safeRelease(self.d2d_factory);
         self.* = undefined;
@@ -394,20 +486,26 @@ pub const Renderer = struct {
     }
 
     fn createAtlasResources(self: *Renderer) !void {
-        const rt = self.rt orelse return;
-    
+        // Use D2D device context if available, otherwise fall back to HwndRenderTarget.
+        const rt_base: *c.ID2D1RenderTarget = if (self.d2d_device_ctx) |ctx|
+            @as(*c.ID2D1RenderTarget, @ptrCast(ctx))
+        else if (self.rt) |rt|
+            @as(*c.ID2D1RenderTarget, @ptrCast(rt))
+        else
+            return;
+
         safeRelease(self.atlas_bitmap);
         self.atlas_bitmap = null;
-        
+
         safeRelease(self.solid_brush);
         self.solid_brush = null;
-    
+
         self.glyph_map.clearRetainingCapacity();
         self.styled_glyph_map.clearRetainingCapacity();
         self.atlas_next_x = 1;
         self.atlas_next_y = 1;
         self.atlas_row_h = 0;
-    
+
         // RGBA format for true ClearType subpixel rendering
         const props = c.D2D1_BITMAP_PROPERTIES{
             .pixelFormat = c.D2D1_PIXEL_FORMAT{
@@ -417,12 +515,9 @@ pub const Renderer = struct {
             .dpiX = 96.0,
             .dpiY = 96.0,
         };
-    
+
         var bmp: ?*c.ID2D1Bitmap = null;
         const sz = c.D2D1_SIZE_U{ .width = self.atlas_w, .height = self.atlas_h };
-
-        // ★ HwndRenderTarget vtbl doesn't expose CreateBitmap, so cast to base RenderTarget
-        const rt_base: *c.ID2D1RenderTarget = @as(*c.ID2D1RenderTarget, @ptrCast(rt));
         const vtbl = rt_base.lpVtbl.*;
         
         const hr = if (vtbl.CreateBitmap) |create_bitmap_fn| blk: {
@@ -2268,6 +2363,17 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const dpi_scale: f32 = @as(f32, @floatFromInt(self.dpi)) / 96.0;
         const scaled_size: f32 = point_size * dpi_scale;
 
+        // Early return if font is unchanged - preserve pre-warmed caches
+        if (self.font_face != null and
+            self.base_point_size == point_size and
+            self.font_em_size == scaled_size and
+            features_str.len == 0 and self.font_feature_count == 0 and
+            self.font_name_utf8_len == @as(u32, @intCast(name_utf8.len)) and
+            std.mem.eql(u8, self.font_name_utf8[0..self.font_name_utf8_len], name_utf8))
+        {
+            return; // font unchanged - preserve pre-warmed caches
+        }
+
         const name_w = try utf8ToUtf16Alloc(self.alloc, name_utf8);
         defer self.alloc.free(name_w);
 
@@ -2386,6 +2492,13 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         @memset(&self.font_name, 0);
         const copy_len = @min(name_w.len, self.font_name.len - 1);
         @memcpy(self.font_name[0..copy_len], name_w[0..copy_len]);
+
+        // Update font change tracking (UTF-8 name + generation counter)
+        const utf8_copy_len = @min(name_utf8.len, self.font_name_utf8.len);
+        @memset(&self.font_name_utf8, 0);
+        @memcpy(self.font_name_utf8[0..utf8_copy_len], name_utf8[0..utf8_copy_len]);
+        self.font_name_utf8_len = @intCast(utf8_copy_len);
+        self.font_generation +%= 1;
 
         // Parse and store OpenType features
         self.font_feature_count = 0;

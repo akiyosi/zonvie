@@ -420,7 +420,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let initialSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
         ZonvieCore.appLog("[Renderer] init: initial font='\(initialFont)' size=\(initialSize)")
 
-        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize))
+        // Pull configured atlas size up-front so the GlyphAtlas allocates its
+        // texture at the correct dimensions immediately, avoiding a wasteful
+        // recreate when core.start() later calls setAtlasSize() during nvim
+        // bring-up. Clamp lower bound to 1024 to match Config validation.
+        let configuredAtlasSize = max(1024, ZonvieConfig.shared.performance.atlasSize)
+        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize), atlasSize: configuredAtlasSize)
         self.blurEnabled = ZonvieConfig.shared.blurEnabled
 
         super.init()
@@ -1099,16 +1104,31 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Defer draw during resize until new vertex data arrives.
-            // macOS compositor stretches the old frame, which looks better
-            // than rendering stale NDC vertices with a mismatched viewport.
-            // Placed before lastDrawnRevision/lastDrawnDrawableSize updates
-            // so the next draw re-checks both hasNewCommit and drawableSizeChanged.
-            if drawableSizeChanged && !hasNewCommit && hasPresentedOnce {
-                (view as? MetalTerminalView)?.notifyDrawIdle()
-                (view as? MetalTerminalView)?.didDrawFrame()
-                return
-            }
+            // Drawable resized but no new commit yet — proceed with the draw
+            // anyway. The snapped-viewport mechanism (drawableWi/drawableHi
+            // below) renders the LAST committed vertices into a viewport
+            // sized to the *previous* commit's drawable, so the cells appear
+            // at their correct pixel size in the upper-left of the new
+            // drawable. The remainder of the new drawable is cleared to the
+            // default bg via loadAction=.clear (resolveSurfaceColorLoadAction
+            // returns .clear when drawableSizeChanged).
+            //
+            // Skipping the draw here used to seem cleaner: the macOS
+            // compositor would scale the previously-presented frame to the
+            // new drawable size, hiding the brief gap before nvim sends
+            // grid_resize. That assumption breaks badly when nvim is busy
+            // (e.g. lazy.nvim plugin loading blocks the main loop for 1-2
+            // seconds): the user sees a stretched-out frame for the entire
+            // blocked window. Drawing through the resize keeps content at
+            // its true pixel size with a clean bg fill until the new flush
+            // arrives, which is much less disorienting.
+            //
+            // Safety: the snapped viewport (vpWidth/vpHeight derived from
+            // snappedCommittedDrawableW/H) matches exactly the dw/dh used
+            // by the core's vertex generator at the time those vertices
+            // were committed (both compute (drawable / cell) * cell), so
+            // the "stale NDC with mismatched viewport" stretching that the
+            // earlier code warned about cannot happen.
 
             // Rendering will proceed — reset active draw loop idle counter.
             (view as? MetalTerminalView)?.notifyDrawActive()
@@ -1754,6 +1774,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             var t_present_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
                 t_present_start = CFAbsoluteTimeGetCurrent()
+                if !hasPresentedOnce {
+                    ZonvieCore.appLog("[startup] first present scheduled (cmd.present called)")
+                }
             }
             cmd.present(drawable)
             // Capture semaphore and lock directly so the signal fires even
@@ -1770,6 +1793,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
+                if ZonvieCore.appLogEnabled, wasFirstPresent {
+                    ZonvieCore.appLog("[startup] first present completed (GPU done)")
+                }
+                if wasFirstPresent {
+                    // Now that the first frame is on screen, flush any
+                    // guifont payload that was deferred from onGuiFont. The
+                    // atlas rebuild and updateLayoutPx must run on main so
+                    // they don't race with another draw cycle.
+                    DispatchQueue.main.async { [weak view] in
+                        (view as? MetalTerminalView)?.core?.markFirstPresentDone()
+                    }
+                }
 
                 // Force shadow recalculation on first present when blur is enabled
                 // Transparent windows (isOpaque=false, backgroundColor=.clear) need this

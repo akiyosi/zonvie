@@ -38,6 +38,32 @@ final class ZonvieCore {
     static var appLogEnabled = false
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
+    /// Process start time captured at first appLog reference; used to prefix
+    /// log lines with elapsed milliseconds for startup latency diagnostics.
+    private static let appLogStartNs: UInt64 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+
+    // First-occurrence flags for startup latency diagnostics. Each is set
+    // once and gates a single appLog call, so they have no effect on
+    // steady-state hot paths.
+    private var loggedFirstFlushBegin: Bool = false
+    private var loggedFirstFlushEnd: Bool = false
+
+    // Tracks whether the very first frame has been presented to the screen,
+    // and stashes any guifont payload that arrives before that point.
+    //
+    // The RPC thread reads firstPresentDone (and writes pendingGuiFontPayload)
+    // from onGuiFont; MetalTerminalRenderer flips firstPresentDone to true from
+    // its first present-completed handler (dispatched to main). Both fields
+    // are guarded by pendingGuiFontLock so the test/store sequences are
+    // atomic with respect to each other.
+    //
+    // Purpose: defer the real-font atlas rebuild past the first present,
+    // eliminating a 100-150ms present-stall when nvim's `option_set guifont=…`
+    // event lands in the same window as the main thread's first draw(in:)
+    // call (the atlas reset and the draw both want the atlas mutex).
+    private let pendingGuiFontLock = NSLock()
+    private var firstPresentDone: Bool = false
+    private var pendingGuiFontPayload: (name: String, size: Double, features: String)?
 
     // Notification posted when Neovim is ready (first vertices received)
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
@@ -75,7 +101,11 @@ final class ZonvieCore {
 
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
-        let line = "[zonvie] \(message())\n"
+        // Prefix with elapsed milliseconds since process start for startup
+        // latency diagnostics. Sub-millisecond resolution on Apple Silicon.
+        let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let elapsedMs = Double(nowNs &- appLogStartNs) / 1_000_000.0
+        let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, message())
 
         if let handle = logFileHandle {
             if let data = line.data(using: .utf8) {
@@ -581,6 +611,10 @@ final class ZonvieCore {
             on_flush_begin: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                if ZonvieCore.appLogEnabled, !me.loggedFirstFlushBegin {
+                    me.loggedFirstFlushBegin = true
+                    ZonvieCore.appLog("[startup] first on_flush_begin")
+                }
                 let result = me.terminalView?.renderer.beginFlush() ?? .dropped
                 guard let corePtr = me.core else { return }
 
@@ -619,6 +653,10 @@ final class ZonvieCore {
             on_flush_end: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                if ZonvieCore.appLogEnabled, !me.loggedFirstFlushEnd {
+                    me.loggedFirstFlushEnd = true
+                    ZonvieCore.appLog("[startup] first on_flush_end")
+                }
                 // Read drawable size from core while grid_mu is still held.
                 // These values match exactly what the flush used for NDC computation.
                 var dw: UInt32 = 0
@@ -1117,10 +1155,26 @@ final class ZonvieCore {
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
 
+        // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
+        // here. The RPC thread blocks in waitForLayoutReady() until the actual
+        // post-layout drawable size is known. MetalTerminalView.maybeResizeCoreGrid()
+        // calls notifyInitialLayout() with computed rows/cols on its first valid
+        // drawable update, which is what unblocks ui_attach. This mirrors the
+        // Windows doEarlyCoreInit() / WM_SIZE flow where notify_layout_ready
+        // also fires after the actual window dimensions settle.
+
         // Enable Zig core logging based on app log setting
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
 
         return result
+    }
+
+    /// Notify the Zig core that the actual rows/cols layout is known.
+    /// Called by MetalTerminalView on its first valid drawable size, and
+    /// is idempotent on the core side (subsequent calls are no-ops).
+    func notifyInitialLayout(rows: UInt32, cols: UInt32) {
+        guard let core else { return }
+        zonvie_core_notify_layout_ready(core, rows, cols)
     }
 
     func stop() {
@@ -1388,6 +1442,14 @@ final class ZonvieCore {
 
         let cstr = (cmd as NSString).utf8String
         _ = zonvie_core_start(core, cstr, rows, cols)
+        // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
+        // here. The rows/cols passed in from ViewController are placeholders
+        // (1×1) — calling notify with them would race with the legitimate
+        // notify from MetalTerminalView.maybeResizeCoreGrid() and, if it
+        // arrives first, latch ui_attach_ready to (1, 1) forever (the core
+        // call is idempotent: first writer wins). Trust the
+        // MetalTerminalView path to deliver the actual rows/cols computed
+        // from the post-layout drawable size, exactly like the native path.
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
 
         // Note: Progress dialog will be closed by neovimReadyNotification observer
@@ -2193,38 +2255,214 @@ final class ZonvieCore {
 
         Self.appLog("[onGuiFont] name='\(name)' size=\(size) features='\(features)'")
 
-        // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
-        // the same flush's vertex generation) uses the new font immediately.
-        // atlas.setFont() is thread-safe (protected by os_unfair_lock).
+        // Defer the real-font atlas rebuild until after the first present.
+        //
+        // The very first guifont event from nvim usually lands within ~50ms
+        // of the first frame's flush_end on macOS. If we let setFont() run
+        // synchronously here, its rebuildFont_locked() → resetAtlas_locked()
+        // → makeTexture path takes the atlas mutex while the main thread is
+        // already trying to draw the first frame. The mutex stall pushes
+        // first present from ~350ms to ~490ms (a ~140ms regression that is
+        // visible to the user as a delayed first paint).
+        //
+        // Stash the payload and bail. The actual setFont/updateLayoutPx/
+        // invalidate sequence runs from markFirstPresentDone() once the
+        // first frame is on screen. The first frame is rendered with the
+        // initial (config-derived) font; the next frame uses the real font.
+        //
+        // After first present, this branch is never taken again because
+        // firstPresentDone stays true for the lifetime of the core.
+        // Lock order discipline: this path runs on the RPC thread inside
+        // handleRedraw, so grid_mu is ALREADY held. We acquire
+        // pendingGuiFontLock under it. The deferred path
+        // (markFirstPresentDone) takes the same locks in the same order
+        // (grid_mu via zonvie_core_lock_grid first, then
+        // pendingGuiFontLock), so the two paths cannot deadlock.
+        pendingGuiFontLock.lock()
+        if !firstPresentDone {
+            pendingGuiFontPayload = (name: name, size: size, features: features)
+            pendingGuiFontLock.unlock()
+            Self.appLog("[onGuiFont] deferred (first present not yet complete)")
+            return
+        }
+        // Sync path: clear any stale deferred payload BEFORE applying the
+        // new font. Otherwise a markFirstPresentDone() racing with us could
+        // observe the old payload (captured before this sync apply) and
+        // overwrite our new font with the stale one. With this clear, the
+        // deferred path will read pending=nil and skip; the most recent
+        // sync apply always wins.
+        pendingGuiFontPayload = nil
+        pendingGuiFontLock.unlock()
+
+        applyGuiFontPayload(name: name, size: size, features: features, view: view, alreadyHoldingGridMu: true)
+    }
+
+    /// Apply a guifont payload: rebuild atlas, push new cell metrics into
+    /// the core, invalidate caches, and trigger a redraw. Called either
+    /// inline from onGuiFont (when first present has already happened) or
+    /// from markFirstPresentDone() to flush a deferred payload.
+    ///
+    /// The whole sequence (atlas setFont → updateLayoutPx → invalidate)
+    /// MUST run while grid_mu is held so the RPC thread cannot run a
+    /// handleRedraw cycle in between and observe a partially-updated state
+    /// (atlas reset but core caches still pointing to old UVs, or cell
+    /// metrics changed but glyph cache stale, etc.). When this is invoked
+    /// from inside onGuiFont we are already on the RPC thread under
+    /// grid_mu (via handleRedraw), so we can call the locked variants
+    /// directly. When this is invoked from markFirstPresentDone (a
+    /// deferred payload from a different thread), we acquire grid_mu via
+    /// zonvie_core_lock_grid() to obtain the same atomicity.
+    private func applyGuiFontPayload(name: String, size: Double, features: String, view: MetalTerminalView, alreadyHoldingGridMu: Bool) {
+        guard let c = core else { return }
+        if !alreadyHoldingGridMu {
+            zonvie_core_lock_grid(c)
+        }
+        defer {
+            if !alreadyHoldingGridMu {
+                zonvie_core_unlock_grid(c)
+            }
+        }
+
+        // atlas.setFont() is thread-safe (protected by os_unfair_lock) and
+        // is safe to call regardless of who holds grid_mu.
         view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
 
         // Notify core of new cell dimensions so vertex positions match
-        // the new glyph metrics. updateLayoutPx detects in_handle_redraw
-        // and takes the lock-free path (grid_mu already held by flush).
+        // the new glyph metrics. We hold grid_mu either via handleRedraw
+        // or via zonvie_core_lock_grid above, so use the *_locked variant
+        // to skip the regular wrapper's grid_mu acquisition.
         let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
         let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
         let ds = view.currentDrawableSize
         let dw = max(1, Int(ds.width))
         let dh = max(1, Int(ds.height))
-        updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
-                       cellW: UInt32(cw), cellH: UInt32(ch))
+        zonvie_core_update_layout_px_locked(c, UInt32(dw), UInt32(dh), UInt32(cw), UInt32(ch))
 
         // Force-dirty all rows and invalidate glyph/scroll caches.
         // When only the font weight changes (same cell dimensions), Neovim
         // does not send a full redraw.  Without this, row-mode reuses cached
         // vertex data whose atlas UVs point into the old (now cleared) texture.
-        if let c = core {
-            zonvie_core_invalidate_glyph_cache(c)
-        }
+        // zonvie_core_invalidate_glyph_cache mutates grid state and assumes
+        // its caller holds grid_mu — both call paths satisfy this.
+        zonvie_core_invalidate_glyph_cache(c)
 
         // GUI-only updates (redraw, external window notify) can be async.
+        // Window content size snap also runs here so it executes after the
+        // current grid_mu hold is released — setFrame on the main NSWindow
+        // can trigger windowDidResize → updateLayoutPx, which would deadlock
+        // if grid_mu were still held by this thread.
         DispatchQueue.main.async { [weak self] in
+            self?.snapMainWindowContentToCell()
             view.requestRedraw()
             self?.externalGridViews.values.forEach {
                 $0.notifyFontChanged()
                 $0.requestRedraw()
             }
         }
+    }
+
+    /// Snap the main NSWindow's content size down to the largest multiple of
+    /// the current cell dimensions that still fits inside the existing
+    /// content rect. Called whenever the cell metrics change (deferred
+    /// guifont apply, steady-state guifont change). Without this snap, the
+    /// drawable's bottom/right remainder strip — `clientPx % cellPx` — is
+    /// outside the cell-aligned NDC viewport used by both the core's vertex
+    /// generator and the renderer's RSSetViewports, so it never receives
+    /// any draw or clear and shows whatever was first written there (black
+    /// from the very first .clear pass before bg was known).
+    ///
+    /// Must run on the main thread (touches NSWindow). Must be called with
+    /// grid_mu NOT held — setFrame can trigger windowDidResize synchronously.
+    /// No-op when the remainder is already zero on both axes, so it does
+    /// not interfere with steady-state user resizes.
+    private func snapMainWindowContentToCell() {
+        guard let view = terminalView else { return }
+        guard let window = view.window else { return }
+        guard let renderer = view.renderer else { return }
+        let cellWPx = max(1, Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+        let cellHPx = max(1, Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let scale = window.backingScaleFactor
+        guard scale > 0 else { return }
+
+        // Use the view's bounds (in points) as the authoritative current
+        // content size. drawableSize is in pixels and may lag bounds by one
+        // frame; bounds is what NSWindow setContentSize would round-trip to.
+        let currentContentPt = view.bounds.size
+        let currentWPx = Int((currentContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
+        let currentHPx = Int((currentContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
+
+        let snappedWPx = (currentWPx / cellWPx) * cellWPx
+        let snappedHPx = (currentHPx / cellHPx) * cellHPx
+        if snappedWPx <= 0 || snappedHPx <= 0 { return }
+
+        let remainderW = currentWPx - snappedWPx
+        let remainderH = currentHPx - snappedHPx
+        if remainderW == 0 && remainderH == 0 { return }
+
+        let newContentPt = CGSize(
+            width: CGFloat(snappedWPx) / scale,
+            height: CGFloat(snappedHPx) / scale
+        )
+
+        // Keep the top-left corner fixed (macOS frame origin is bottom-left).
+        let oldFrame = window.frame
+        let oldTop = oldFrame.origin.y + oldFrame.height
+        let contentRect = NSRect(x: oldFrame.origin.x, y: 0,
+                                 width: newContentPt.width, height: newContentPt.height)
+        let frameRect = window.frameRect(forContentRect: contentRect)
+        let newFrame = NSRect(
+            x: oldFrame.origin.x,
+            y: oldTop - frameRect.height,
+            width: frameRect.width,
+            height: frameRect.height
+        )
+        Self.appLog("[snap] cell=(\(cellWPx)x\(cellHPx)) content_px=(\(currentWPx)x\(currentHPx)) -> (\(snappedWPx)x\(snappedHPx)) remainder=(\(remainderW),\(remainderH))")
+        window.setFrame(newFrame, display: true)
+    }
+
+    /// Called from MetalTerminalRenderer's first present-completed handler
+    /// (dispatched to main). Marks the firstPresentDone flag and applies any
+    /// guifont payload that was deferred from onGuiFont.
+    func markFirstPresentDone() {
+        guard let c = core else { return }
+        guard let view = terminalView else { return }
+
+        // Lock order discipline: acquire grid_mu FIRST, then
+        // pendingGuiFontLock. Both onGuiFont (inline sync path) and this
+        // method follow the same order, so the two cannot deadlock with
+        // an RPC-thread handleRedraw cycle that is concurrently entering
+        // onGuiFont (handleRedraw holds grid_mu and then attempts to take
+        // pendingGuiFontLock for the same clear-or-stash decision).
+        //
+        // Setting firstPresentDone, reading the pending payload, clearing
+        // it, AND running setFont/updateLayoutPx_locked/invalidate ALL
+        // happen under the same continuous grid_mu hold. That makes the
+        // deferred apply atomic with respect to handleRedraw exactly like
+        // the inline path: an onGuiFont arriving on the RPC thread either
+        // (a) blocks on grid_mu until we finish, then runs its sync apply
+        //     on top — last writer wins,
+        // or (b) runs first if it acquired grid_mu before us; on entry it
+        //     observes firstPresentDone=true and clears the pending payload,
+        //     so we then read pending=nil and skip — the sync apply also
+        //     wins.
+        zonvie_core_lock_grid(c)
+        defer { zonvie_core_unlock_grid(c) }
+
+        pendingGuiFontLock.lock()
+        if firstPresentDone {
+            pendingGuiFontLock.unlock()
+            return
+        }
+        firstPresentDone = true
+        let pending = pendingGuiFontPayload
+        pendingGuiFontPayload = nil
+        pendingGuiFontLock.unlock()
+
+        guard let pending else { return }
+        Self.appLog("[markFirstPresentDone] applying deferred guifont '\(pending.name)' size=\(pending.size)")
+        // grid_mu is already held by us — call the inline (already-locked)
+        // path so applyGuiFontPayload doesn't try to re-acquire it.
+        applyGuiFontPayload(name: pending.name, size: pending.size, features: pending.features, view: view, alreadyHoldingGridMu: true)
     }
 
     private func onLineSpace(px: Int32) {

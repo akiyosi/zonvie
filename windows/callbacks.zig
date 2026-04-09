@@ -1524,6 +1524,14 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     if (ctx_bits % @alignOf(App) != 0) return;
     const app: *App = @ptrFromInt(ctx_bits);
 
+    // First flush triggers window show: keep window hidden until nvim sends first frame
+    if (!app.window_shown.load(.acquire)) {
+        app.window_shown.store(true, .release);
+        if (app.hwnd) |hwnd| {
+            _ = c.PostMessageW(hwnd, app_mod.WM_APP_SHOW_WINDOW, 0, 0);
+        }
+    }
+
     // Report DWrite rasterization stats for this flush (only when logging enabled)
     if (applog.isEnabled()) {
         const raster_count = app.rasterize_call_count.swap(0, .monotonic);
@@ -1937,7 +1945,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
     // Font priority: guifont > config.font.family > OS default (Consolas)
     const os_default_font = "Consolas";
-    const default_font_pt: f32 = 14.0;
+    const default_font_pt: f32 = 18.0;
 
     // Get config font (fallback to OS default if empty)
     const config_font = if (app.config.font.family.len > 0) app.config.font.family else os_default_font;
@@ -1957,6 +1965,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     app.mu.lock();
 
     if (app.atlas) |*a| {
+        const prev_font_generation = a.font_generation;
         var applied_name: []const u8 = config_font;
         var applied_pt: f32 = config_pt;
         var font_set = false;
@@ -2029,6 +2038,15 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app.cell_w_px = a.cellW();
         app.cell_h_px = a.cellH();
         if (applog.isEnabled()) applog.appLog("onGuiFont: applied name='{s}' pt={d} cell=({d},{d})", .{ applied_name, applied_pt, app.cell_w_px, app.cell_h_px });
+
+        if (a.font_generation != prev_font_generation) {
+            if (applog.isEnabled()) applog.appLog("onGuiFont: font changed (gen {}->{}), invalidating core glyph cache\n", .{ prev_font_generation, a.font_generation });
+            if (app.corep) |cp| {
+                app.mu.unlock();
+                app_mod.zonvie_core_invalidate_glyph_cache(cp);
+                app.mu.lock();
+            }
+        }
     } else {
         if (applog.isEnabled()) applog.appLog("onGuiFont: atlas is null", .{});
     }
@@ -2104,6 +2122,15 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.mu.unlock();
+
+        // Snap the main window's client rect to a multiple of the new
+        // cell size. Without this, drawable_px % cell_px leaves a strip
+        // along the bottom/right edge that the cell-aligned NDC viewport
+        // never covers, so it shows whatever the renderer last cleared
+        // there. Posted (not sent) because we are on the RPC thread with
+        // grid_mu held; the UI handler does the SetWindowPos and lets
+        // WM_SIZE drive the rest of the resize pipeline.
+        _ = c.PostMessageW(h, app_mod.WM_APP_SNAP_MAIN_WINDOW, 0, 0);
     }
 }
 
@@ -2190,6 +2217,10 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.mu.unlock();
+
+        // Same client-rect snap as onGuiFont — linespace changes the row
+        // height, so the same drawable_h % cell_h remainder problem applies.
+        _ = c.PostMessageW(h, app_mod.WM_APP_SNAP_MAIN_WINDOW, 0, 0);
     }
 }
 
@@ -2236,6 +2267,14 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     app.mu.lock();
     if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
     if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
+    // Push the bg into the d3d11 renderer so its ClearRenderTargetView
+    // call uses the colorscheme bg instead of the historical hardcoded
+    // black. This is what makes the bottom/right remainder strip
+    // (drawable_px % cell_px) blend with the rest of the grid instead
+    // of showing as a black band.
+    if (bg != 0xFFFFFFFF) {
+        if (app.renderer) |*r| r.setDefaultBgColor(bg);
+    }
     app.mu.unlock();
 
     // Invalidate tabline/sidebar to repaint with new colors

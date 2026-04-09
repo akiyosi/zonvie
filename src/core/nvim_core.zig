@@ -434,6 +434,15 @@ pub const Core = struct {
     init_rows: u32 = 24,
     init_cols: u32 = 80,
 
+    // Synchronization for delaying nvim_ui_attach until actual layout is known.
+    // The RPC thread waits on ui_attach_cond before sending nvim_ui_attach.
+    // Call notifyLayoutReady() from the UI thread after renderer init.
+    ui_attach_mutex: std.Thread.Mutex = .{},
+    ui_attach_cond: std.Thread.Condition = .{},
+    ui_attach_ready: bool = false,
+    ui_attach_rows: u32 = 0,
+    ui_attach_cols: u32 = 0,
+
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
     pending_resize_rows: u32 = 0,
@@ -685,8 +694,34 @@ pub const Core = struct {
         self.started = true;
     }
 
+    /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
+    /// can be sent with the correct dimensions. Must be called from the UI
+    /// thread after the renderer is initialized and actual rows/cols are computed.
+    /// Idempotent: subsequent calls after the first are no-ops.
+    pub fn notifyLayoutReady(self: *Core, rows: u32, cols: u32) void {
+        self.ui_attach_mutex.lock();
+        defer self.ui_attach_mutex.unlock();
+        if (self.ui_attach_ready) return;
+        self.ui_attach_rows = rows;
+        self.ui_attach_cols = cols;
+        // Pre-set last_layout to suppress a redundant resize after attach.
+        self.last_layout_rows = rows;
+        self.last_layout_cols = cols;
+        self.ui_attach_ready = true;
+        self.ui_attach_cond.signal();
+        self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
+    }
+
     pub fn stop(self: *Core) void {
         self.stop_flag.store(true, .seq_cst);
+
+        // Unblock RPC thread if it is waiting on ui_attach_cond
+        {
+            self.ui_attach_mutex.lock();
+            defer self.ui_attach_mutex.unlock();
+            self.ui_attach_ready = true;
+            self.ui_attach_cond.signal();
+        }
 
         // Signal writer thread to stop and capture thread handle under lock
         var wt: ?std.Thread = null;
@@ -1521,7 +1556,9 @@ pub const Core = struct {
     }
 
     // Internal implementation: assumes grid_mu is already held or we're in a safe context.
-    fn updateLayoutPxLocked(
+    // Exposed via zonvie_core_update_layout_px_locked C ABI for frontends that
+    // hold grid_mu themselves (see zonvie_core_lock_grid).
+    pub fn updateLayoutPxLocked(
         self: *Core,
         drawable_w_px: u32,
         drawable_h_px: u32,
@@ -2072,6 +2109,12 @@ pub const Core = struct {
         try rpc.packStr(buf, self.alloc, method);
     }
 
+    pub fn sendNotificationHeader(self: *Core, buf: *rpc.Buf, method: []const u8) !void {
+        try rpc.packArray(buf, self.alloc, 3);
+        try rpc.packInt(buf, self.alloc, 2); // msgtype=2 (notification)
+        try rpc.packStr(buf, self.alloc, method);
+    }
+
     pub fn requestGetApiInfo(self: *Core) !void {
         const id = self.nextMsgId();
         self.get_api_info_msgid = id;  // Save msgid for response matching
@@ -2109,18 +2152,17 @@ pub const Core = struct {
     }
 
     pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
-        const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
-        try self.sendRequestHeader(&buf, id, "nvim_ui_attach");
+        try self.sendNotificationHeader(&buf, "nvim_ui_attach");
 
         try rpc.packArray(&buf, self.alloc, 3);
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, ext_hlstate, rgb (always) + optional ext_*
-        var opt_count: u32 = 3;
+        // Option count: ext_multigrid, rgb (always) + optional ext_*
+        var opt_count: u32 = 2;
         if (self.ext_windows_enabled) opt_count += 1;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
@@ -2128,8 +2170,6 @@ pub const Core = struct {
         if (self.ext_tabline_enabled) opt_count += 1;
         try rpc.packMap(&buf, self.alloc, opt_count);
         try rpc.packStr(&buf, self.alloc, "ext_multigrid");
-        try rpc.packBool(&buf, self.alloc, true);
-        try rpc.packStr(&buf, self.alloc, "ext_hlstate");
         try rpc.packBool(&buf, self.alloc, true);
         try rpc.packStr(&buf, self.alloc, "rgb");
         try rpc.packBool(&buf, self.alloc, true);
@@ -2161,7 +2201,7 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_ui_attach (id={d}, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ id, rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
+        self.log.write("rpc send: nvim_ui_attach (notification, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
     }
 
     /// Notify Neovim of window focus change via nvim_ui_set_focus.
