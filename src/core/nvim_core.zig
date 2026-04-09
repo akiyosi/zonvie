@@ -1556,7 +1556,9 @@ pub const Core = struct {
     }
 
     // Internal implementation: assumes grid_mu is already held or we're in a safe context.
-    fn updateLayoutPxLocked(
+    // Exposed via zonvie_core_update_layout_px_locked C ABI for frontends that
+    // hold grid_mu themselves (see zonvie_core_lock_grid).
+    pub fn updateLayoutPxLocked(
         self: *Core,
         drawable_w_px: u32,
         drawable_h_px: u32,

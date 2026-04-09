@@ -180,11 +180,17 @@ final class GlyphAtlas {
     private(set) var cellWidthPx: Float = 9
     private(set) var cellHeightPx: Float = 18
 
-    init(device: MTLDevice, fontName: String = "Menlo", pointSize: CGFloat = 14.0) {
+    init(device: MTLDevice, fontName: String = "Menlo", pointSize: CGFloat = 14.0, atlasSize: Int = 2048) {
         self.device = device
         self.fontName = fontName
         self.pointSize = pointSize
         self.font = CTFontCreateWithName(fontName as CFString, pointSize, nil) // temporary
+        // Use the configured atlas size from the start. Otherwise the initial
+        // 2048×2048 texture allocated here would be discarded ~150ms later when
+        // core.start() calls setAtlasSize() with the configured value, causing
+        // an extra Atlas RESET on the startup hot path.
+        self.atlasW = atlasSize
+        self.atlasH = atlasSize
 
         os_unfair_lock_lock(&mu)
         // rebuildFont_locked → resetAtlas_locked creates textures[1 - frontIndex] (back).
@@ -201,9 +207,31 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
+        // Skip when nothing actually changes. The first guifont event from
+        // nvim usually matches the font we already initialized with from
+        // ZonvieConfig, so the rebuildFont_locked() → resetAtlas_locked()
+        // path otherwise wastes a texture allocation on the startup path
+        // (and stalls the first present behind the rebuild).
+        let parsedFeatures = Self.parseFontFeatures(features)
+        var featuresEqual = parsedFeatures.count == self.fontFeatures.count
+        if featuresEqual {
+            for i in 0..<parsedFeatures.count {
+                if parsedFeatures[i].tag != self.fontFeatures[i].tag ||
+                   parsedFeatures[i].value != self.fontFeatures[i].value
+                {
+                    featuresEqual = false
+                    break
+                }
+            }
+        }
+        if name == self.fontName, pointSize == self.pointSize, featuresEqual {
+            ZonvieCore.appLog("[GlyphAtlas.setFont] no-op (name/size/features unchanged)")
+            return
+        }
+
         self.fontName = name
         self.pointSize = pointSize
-        self.fontFeatures = Self.parseFontFeatures(features)
+        self.fontFeatures = parsedFeatures
         ZonvieCore.appLog("[GlyphAtlas.setFont] name='\(name)' pt=\(pointSize) features_str='\(features)' parsed_count=\(self.fontFeatures.count) hasFeatures=\(hasFeatures)")
         rebuildFont_locked()
         atlasModified = true  // atlas generation changed, ensure commit swaps

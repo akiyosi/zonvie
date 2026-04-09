@@ -958,6 +958,21 @@ final class MetalTerminalView: MTKView {
             cellH: UInt32(cellHi)
         )
 
+        // Unblock the RPC thread's waitForLayoutReady() once we know real
+        // dimensions, so nvim_ui_attach is sent with the correct rows/cols
+        // on the first try (mirrors Windows' WM_SIZE → notify_layout_ready
+        // path). The Zig core treats notifyLayoutReady as idempotent, so any
+        // later drawable changes go through the normal resize path —
+        // meaning a transient 1×N or N×1 drawable observed during initial
+        // layout would otherwise lock nvim_ui_attach to a bogus rows=1 or
+        // cols=1. Require BOTH axes to exceed the placeholder size and to
+        // be at least one full cell wide before signalling.
+        if pxWi >= cellWi && pxHi >= cellHi {
+            let cols = UInt32(max(1, pxWi / cellWi))
+            let rows = UInt32(max(1, pxHi / cellHi))
+            core.notifyInitialLayout(rows: rows, cols: cols)
+        }
+
         // Set screen width in cells for cmdline max width.
         // Must match the contentWidth constraint in resizeCmdlineWindow
         // to keep NDC viewport == drawable size.
