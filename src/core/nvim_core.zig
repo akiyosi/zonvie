@@ -105,6 +105,22 @@ pub const Callbacks = struct {
     /// Called when cmdline block should be hidden.
     on_cmdline_block_hide: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
+    // ext_popupmenu callbacks
+    on_popupmenu_show: ?*const fn (
+        ctx: ?*anyopaque,
+        items: ?*const anyopaque, // zonvie_popupmenu_item*
+        item_count: usize,
+        selected: i32,
+        row: i32,
+        col: i32,
+        grid_id: i64,
+        colors: ?*const c_api.PopupmenuColors,
+    ) callconv(.c) void = null,
+
+    on_popupmenu_hide: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
+
+    on_popupmenu_select: ?*const fn (ctx: ?*anyopaque, selected: i32) callconv(.c) void = null,
+
     // ext_messages callbacks
     /// Called when a message should be shown.
     on_msg_show: ?*const fn (

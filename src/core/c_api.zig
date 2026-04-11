@@ -274,6 +274,14 @@ pub const BufferEntry = extern struct {
     name_len: usize,
 };
 
+/// Resolved Pmenu / PmenuSel colors (0x00RRGGBB), passed with popupmenu_show.
+pub const PopupmenuColors = extern struct {
+    pmenu_bg: u32,
+    pmenu_fg: u32,
+    pmenu_sel_bg: u32,
+    pmenu_sel_fg: u32,
+};
+
 pub const Callbacks = extern struct {
     on_vertices_partial: ?OnVerticesPartialFn = null,
     on_vertices_row: ?OnVerticesRowFn = null,
@@ -339,6 +347,7 @@ pub const Callbacks = extern struct {
         row: i32,
         col: i32,
         grid_id: i64,
+        colors: ?*const PopupmenuColors,
     ) callconv(.c) void = null,
 
     on_popupmenu_hide: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
@@ -561,6 +570,11 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_cmdline_block_show = box.cb.on_cmdline_block_show,
         .on_cmdline_block_append = box.cb.on_cmdline_block_append,
         .on_cmdline_block_hide = box.cb.on_cmdline_block_hide,
+
+        // ext_popupmenu callbacks
+        .on_popupmenu_show = box.cb.on_popupmenu_show,
+        .on_popupmenu_hide = box.cb.on_popupmenu_hide,
+        .on_popupmenu_select = box.cb.on_popupmenu_select,
 
         // ext_messages callbacks
         .on_msg_show = box.cb.on_msg_show,

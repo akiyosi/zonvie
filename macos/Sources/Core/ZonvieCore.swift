@@ -302,7 +302,12 @@ final class ZonvieCore {
                                 }
                                 // First-row config for decorated grids
                                 if rs == 0 && fl & 2 == 0 {
-                                    if let bgColor = prepared.bgColor {
+                                    // For popupmenu, use the core-delivered Pmenu bg
+                                    // instead of the vertex-extracted color (which
+                                    // varies per row depending on selection state).
+                                    let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                    let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                    if let bgColor = effectiveBgColor {
                                         DispatchQueue.main.async { [weak core] in
                                             guard let core = core else { return }
                                             guard let window = core.externalWindows[gridId] else { return }
@@ -361,7 +366,10 @@ final class ZonvieCore {
                                         )
                                     }
                                     if rs == 0 && fl & 2 == 0 {
-                                        if let bgColor = prepared.bgColor {
+                                        // For popupmenu, use the core-delivered Pmenu bg
+                                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                        let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                        if let bgColor = effectiveBgColor {
                                             guard let window = core.externalWindows[gridId] else { return }
                                             core.applyExternalGridConfig(
                                                 gridId: gridId,
@@ -371,7 +379,7 @@ final class ZonvieCore {
                                                 rows: totalRows,
                                                 cols: totalCols
                                             )
-                                        } else {
+                                        } else if !isPopupmenu {
                                             prepared.vertices.withUnsafeBufferPointer { buffer in
                                                 if let baseAddr = buffer.baseAddress {
                                                     core.configureExternalGridFromRow(
@@ -390,9 +398,14 @@ final class ZonvieCore {
                                     // the flush bracket.
                                     gridView.bumpRevisionAndRedraw()
                                 } else {
-                                    // Still no gridView: save to pending for window creation replay
-                                    if rs == 0, let bgColor = prepared.bgColor {
-                                        core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                    // Still no gridView: save to pending for window creation replay.
+                                    // For popupmenu, use the core-delivered Pmenu bg.
+                                    if rs == 0 {
+                                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                        let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                        if let bgColor = effectiveBgColor {
+                                            core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                        }
                                     }
                                     ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
                                     if var existing = core.pendingExternalVertices[gridId] {
@@ -502,10 +515,10 @@ final class ZonvieCore {
                 me.onCmdlineBlockHide()
             },
             // ext_popupmenu callbacks
-            on_popupmenu_show: { ctx, items, itemCount, selected, row, col, gridId in
+            on_popupmenu_show: { ctx, items, itemCount, selected, row, col, gridId, colors in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onPopupmenuShow(items: items, itemCount: itemCount, selected: selected, row: row, col: col, gridId: gridId)
+                me.onPopupmenuShow(items: items, itemCount: itemCount, selected: selected, row: row, col: col, gridId: gridId, colors: colors)
             },
             on_popupmenu_hide: { ctx in
                 guard let ctx else { return }
@@ -2783,6 +2796,12 @@ final class ZonvieCore {
     private var popupmenuAnchorRow: Int32? = nil
     private var popupmenuAnchorCol: Int32? = nil
 
+    /// Pmenu background color delivered by the core via on_popupmenu_show.
+    /// Used as the container background for the popupmenu external grid view
+    /// so that margin/padding areas always show the unselected (Pmenu) color.
+    /// Updated on every popupmenu_show (including re-shows without hide).
+    private var popupmenuBgColor: NSColor? = nil
+
     /// Pending main window activation work item (can be cancelled by popupmenu_show)
     private var mainWindowActivationWorkItem: DispatchWorkItem? = nil
 
@@ -3480,6 +3499,46 @@ final class ZonvieCore {
         let kind = classifyExternalGridKind(gridId)
         guard kind != .normal else { return (vertices, nil) }
 
+        // For popupmenu, the container bg color comes from the core callback
+        // (on_popupmenu_show delivers resolved Pmenu bg). We do NOT inspect
+        // vertex colors because the grid is sent row-by-row and the selected
+        // row's PmenuSel would be mistaken for the dominant color.
+        // Vertex alpha adjustment is still applied so Pmenu bg cells become
+        // transparent and blur shows through, while PmenuSel cells keep
+        // their opaque bg (the shader alpha override in ExternalGridView
+        // ensures this works).
+        if kind == .popupmenu {
+            let bgColor = self.popupmenuBgColor
+            guard let bgColor else { return (vertices, nil) }
+
+            var adjustedVertices = vertices
+            let adjustedBg = bgColor.adjustedForCmdlineBackground()
+            var adjR: CGFloat = 0, adjG: CGFloat = 0, adjB: CGFloat = 0, adjA: CGFloat = 0
+            adjustedBg.usingColorSpace(.sRGB)?.getRed(&adjR, green: &adjG, blue: &adjB, alpha: &adjA)
+            adjA = ZonvieConfig.shared.blurEnabled ? 0.0 : 1.0
+
+            var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
+            bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
+
+            for i in adjustedVertices.indices {
+                if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
+                if adjustedVertices[i].texCoord.0 < 0 {
+                    let vr = CGFloat(adjustedVertices[i].color.0)
+                    let vg = CGFloat(adjustedVertices[i].color.1)
+                    let vb = CGFloat(adjustedVertices[i].color.2)
+                    let tolerance: CGFloat = 0.005
+                    if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
+                        adjustedVertices[i].color.0 = Float(adjR)
+                        adjustedVertices[i].color.1 = Float(adjG)
+                        adjustedVertices[i].color.2 = Float(adjB)
+                        adjustedVertices[i].color.3 = Float(adjA)
+                    }
+                }
+            }
+            return (adjustedVertices, bgColor)
+        }
+
+        // Non-popupmenu decorated grids (cmdline, msg): use first bg vertex
         var bgColor: NSColor? = nil
         for v in vertices {
             if v.texCoord.0 < 0 {
@@ -3912,18 +3971,23 @@ final class ZonvieCore {
             return NSRect(x: 100, y: 100, width: containerWidth, height: containerHeight)
 
         case .popupmenu:
-            let anchorRow = popupmenuAnchorRow ?? startRow
-            let anchorCol = popupmenuAnchorCol ?? startCol
-            let anchorGrid = popupmenuAnchorGrid
-            let isCmdlineCompletion = (anchorRow == -1)
+            // Use startRow/startCol from external_grids directly — these are
+            // Neovim's popupmenu_show row/col without async indirection.
+            // popupmenuAnchorGrid is used only for cmdline detection.
+            let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
             if isCmdlineCompletion {
                 if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
                     let cmdlineFrame = cmdlineWindow.frame
                     let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
                     let popupmenuPadding: CGFloat = 8.0
-                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(anchorCol) * cellW / scale - popupmenuPadding
-                    let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
-                    ZonvieCore.appLog("[external_window] popupmenu positioned above cmdline at (\(x),\(y))")
+                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
+                    let gap: CGFloat = 4.0
+                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
+                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
+                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
+                    let direction = (y == aboveY) ? "above" : "below"
+                    ZonvieCore.appLog("[external_window] popupmenu positioned \(direction) cmdline at (\(x),\(y))")
                     return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
                 }
 
@@ -3937,15 +4001,16 @@ final class ZonvieCore {
                 return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
             }
 
-            if (anchorGrid ?? win) > 0,
-               let anchorWindow = self.externalWindows[anchorGrid ?? win],
+            // Buffer completion: position using Neovim's anchor (row, col)
+            if win > 0,
+               let anchorWindow = self.externalWindows[win],
                let anchorContentView = anchorWindow.contentView {
                 anchorContentView.layoutSubtreeIfNeeded()
                 let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
                 let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
                 let frame = popupmenuWindowRect(
-                    anchorRow: anchorRow,
-                    anchorCol: anchorCol,
+                    anchorRow: startRow,
+                    anchorCol: startCol,
                     windowWidth: windowWidth,
                     windowHeight: windowHeight,
                     cellW: cellW,
@@ -3954,14 +4019,14 @@ final class ZonvieCore {
                     referenceFrame: anchorContentFrame,
                     screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
                 )
-                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) relative to ext_win=\(anchorGrid ?? win)")
+                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) relative to ext_win=\(win)")
                 return frame
             }
 
             if let tvFrame = self.terminalViewScreenFrame() {
                 let frame = popupmenuWindowRect(
-                    anchorRow: anchorRow,
-                    anchorCol: anchorCol,
+                    anchorRow: startRow,
+                    anchorCol: startCol,
                     windowWidth: windowWidth,
                     windowHeight: windowHeight,
                     cellW: cellW,
@@ -3970,7 +4035,7 @@ final class ZonvieCore {
                     referenceFrame: tvFrame,
                     screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
                 )
-                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) from cursor pos (\(anchorRow),\(anchorCol))")
+                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) from anchor (\(startRow),\(startCol))")
                 return frame
             }
 
@@ -4061,6 +4126,11 @@ final class ZonvieCore {
         return NSRect(x: 100, y: 100, width: geometry.windowWidth, height: geometry.windowHeight)
     }
 
+    /// Position popupmenu relative to the anchor cell from Neovim's
+    /// popupmenu_show event. Per the Neovim UI protocol, (anchorRow, anchorCol)
+    /// is "where the first character of the completed word will be".
+    /// Default: place the popup directly below that row.
+    /// Flip above if it would exceed the reference frame bottom.
     private func popupmenuWindowRect(
         anchorRow: Int32,
         anchorCol: Int32,
@@ -4072,13 +4142,25 @@ final class ZonvieCore {
         referenceFrame: NSRect,
         screenTop: CGFloat
     ) -> NSRect {
-        let pxX = CGFloat(anchorCol) * cellW / scale
-        let pxY = CGFloat(anchorRow) * cellH / scale
+        let cellWidth = cellW / scale
         let cellHeight = cellH / scale
 
-        let x = referenceFrame.origin.x + pxX
-        let belowY = referenceFrame.origin.y + referenceFrame.height - pxY - cellHeight - windowHeight
-        let aboveY = referenceFrame.origin.y + referenceFrame.height - pxY
+        // Anchor cell in points relative to referenceFrame top-left
+        let anchorX = CGFloat(anchorCol) * cellWidth
+        let anchorY = CGFloat(anchorRow) * cellHeight // distance from top of ref
+
+        // macOS screen coords (origin = bottom-left, y increases upward)
+        let refTop = referenceFrame.origin.y + referenceFrame.height
+
+        let x = referenceFrame.origin.x + anchorX
+
+        // Below: popup window top edge at anchor row bottom edge
+        let belowY = refTop - anchorY - cellHeight - windowHeight
+        // Above: popup window bottom edge at anchor row top edge
+        let aboveY = refTop - anchorY
+
+        ZonvieCore.appLog("[popupmenuWindowRect] anchorRow=\(anchorRow) anchorCol=\(anchorCol) cellH=\(cellH) cellW=\(cellW) scale=\(scale) cellHeight=\(cellHeight) anchorY=\(anchorY) refTop=\(refTop) ref=\(referenceFrame) belowY=\(belowY) aboveY=\(aboveY) windowH=\(windowHeight)")
+
         let y: CGFloat
         if belowY >= referenceFrame.origin.y {
             y = belowY
@@ -4108,30 +4190,33 @@ final class ZonvieCore {
             let windowWidth = geometry.windowWidth
             let windowHeight = geometry.windowHeight
             var windowRect = existingWindow.frame
-            let anchorRow = popupmenuAnchorRow ?? startRow
-            let anchorCol = popupmenuAnchorCol ?? startCol
-            let anchorGrid = popupmenuAnchorGrid
-            let isCmdlineCompletion = (anchorRow == -1)
+            let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
 
             if isCmdlineCompletion {
                 if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
                     let cmdlineFrame = cmdlineWindow.frame
-                    let x = cmdlineFrame.origin.x + CGFloat(anchorCol) * cellW / scale
-                    let y = cmdlineFrame.origin.y + cmdlineFrame.height + 4.0
+                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
+                    let popupmenuPadding: CGFloat = 8.0
+                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
+                    let gap: CGFloat = 4.0
+                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
+                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
+                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
                     windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
                 }
                 return windowRect
             }
 
-            if (anchorGrid ?? win) > 0,
-               let anchorWindow = self.externalWindows[anchorGrid ?? win],
+            if win > 0,
+               let anchorWindow = self.externalWindows[win],
                let anchorContentView = anchorWindow.contentView {
                 anchorContentView.layoutSubtreeIfNeeded()
                 let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
                 let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
                 return popupmenuWindowRect(
-                    anchorRow: anchorRow,
-                    anchorCol: anchorCol,
+                    anchorRow: startRow,
+                    anchorCol: startCol,
                     windowWidth: windowWidth,
                     windowHeight: windowHeight,
                     cellW: cellW,
@@ -4144,8 +4229,8 @@ final class ZonvieCore {
 
             if let tvFrame = self.terminalViewScreenFrame() {
                 return popupmenuWindowRect(
-                    anchorRow: anchorRow,
-                    anchorCol: anchorCol,
+                    anchorRow: startRow,
+                    anchorCol: startCol,
                     windowWidth: windowWidth,
                     windowHeight: windowHeight,
                     cellW: cellW,
@@ -4413,18 +4498,20 @@ final class ZonvieCore {
         let cellW = CGFloat(context.renderer.cellWidthPx)
         let cellH = CGFloat(context.renderer.cellHeightPx)
         let oldFrame = context.window.frame
-        let oldTop = oldFrame.origin.y + oldFrame.height
         let popupmenuPadding: CGFloat = 8.0
         let contentWidth = CGFloat(cols) * cellW / context.scale
         let contentHeight = CGFloat(rows) * cellH / context.scale
         let containerWidth = contentWidth + (popupmenuPadding * 2)
         let containerHeight = contentHeight + (popupmenuPadding * 2)
-        let newY = oldTop - containerHeight
 
+        // Window position is managed by popupmenuWindowRect (called from
+        // on_external_window). Do not recalculate it here — just keep the
+        // current frame so internal layout (padding, viewport, chrome) is
+        // updated without moving the window.
         return DecoratedExternalLayout(
             containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
             gridFrame: NSRect(x: popupmenuPadding, y: popupmenuPadding, width: contentWidth, height: contentHeight),
-            windowFrame: NSRect(x: oldFrame.origin.x, y: newY, width: containerWidth, height: containerHeight),
+            windowFrame: oldFrame,
             iconFrame: nil,
             linkedMsgShowFrame: nil
         )
@@ -4774,24 +4861,21 @@ final class ZonvieCore {
         selected: Int32,
         row: Int32,
         col: Int32,
-        gridId: Int64
+        gridId: Int64,
+        colors: UnsafePointer<zonvie_popupmenu_colors>?
     ) {
-        // Log the event (actual display is handled by Neovim's external float window)
-        var itemsStr = ""
-        if let items = items, itemCount > 0 {
-            let maxItems = min(itemCount, 5)
-            for i in 0..<maxItems {
-                let item = items[i]
-                if let wordPtr = item.word {
-                    let word = String(bytes: UnsafeBufferPointer(start: wordPtr, count: item.word_len), encoding: .utf8) ?? ""
-                    itemsStr += (i > 0 ? ", " : "") + word
-                }
-            }
-            if itemCount > maxItems {
-                itemsStr += "... (\(itemCount) total)"
-            }
+        ZonvieCore.appLog("[popupmenu_show] items=\(itemCount) selected=\(selected) pos=(\(row),\(col)) grid=\(gridId)")
+
+        // Capture Pmenu bg color from the core-resolved highlight.
+        // This runs on the core thread; store it thread-safely so the
+        // main-thread container bg update can read it.
+        if let c = colors?.pointee {
+            let r = CGFloat((c.pmenu_bg >> 16) & 0xFF) / 255.0
+            let g = CGFloat((c.pmenu_bg >> 8) & 0xFF) / 255.0
+            let b = CGFloat(c.pmenu_bg & 0xFF) / 255.0
+            self.popupmenuBgColor = NSColor(red: r, green: g, blue: b, alpha: 1.0)
+            ZonvieCore.appLog("[popupmenu] pmenu_bg=\(String(format: "#%06X", c.pmenu_bg)) pmenu_sel_bg=\(String(format: "#%06X", c.pmenu_sel_bg))")
         }
-        ZonvieCore.appLog("[popupmenu_show] items=[\(itemsStr)] selected=\(selected) pos=(\(row),\(col)) grid=\(gridId)")
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -4802,17 +4886,17 @@ final class ZonvieCore {
 
             // Cancel any pending main window activation if popupmenu is anchored to external window
             if self.externalWindows[gridId] != nil {
-                self.cancelMainWindowActivation = true  // Set flag to cancel
+                self.cancelMainWindowActivation = true
                 self.mainWindowActivationWorkItem?.cancel()
                 self.mainWindowActivationWorkItem = nil
                 ZonvieCore.appLog("[popupmenu] cancelled main window activation (anchor on ext grid \(gridId))")
             }
-            ZonvieCore.appLog("[popupmenu] show: anchor_grid=\(gridId) anchor_row=\(row) anchor_col=\(col) items=\(itemCount)")
         }
     }
 
     private func onPopupmenuHide() {
         ZonvieCore.appLog("[popupmenu_hide]")
+        self.popupmenuBgColor = nil
         DispatchQueue.main.async { [weak self] in
             self?.popupmenuAnchorGrid = nil
             self?.popupmenuAnchorRow = nil

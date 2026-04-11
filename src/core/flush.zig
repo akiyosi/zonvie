@@ -5716,6 +5716,9 @@ pub fn notifyTablineChanges(self: *Core) void {
 }
 
 /// Show popupmenu as external window by creating a grid.
+/// Grid content is rendered from the structured Neovim data (word, kind, menu).
+/// The on_popupmenu_show callback delivers resolved Pmenu/PmenuSel colors so
+/// the frontend can style the container background without inspecting vertices.
 pub fn sendPopupmenuShow(self: *Core) void {
     const pum_grid_id = grid_mod.POPUPMENU_GRID_ID;
     const items = self.grid.popupmenu.items.items;
@@ -5728,22 +5731,57 @@ pub fn sendPopupmenuShow(self: *Core) void {
 
     self.log.write("[popupmenu] show: anchor_grid={d} anchor_row={d} anchor_col={d} items={d}\n", .{ anchor_grid, anchor_row, anchor_col, items.len });
 
-    // Calculate dimensions
-    var max_width: u32 = 10;
-    for (items) |item| {
-        const item_width = countDisplayWidth(item.word);
-        if (item_width > max_width) max_width = item_width;
+    // Resolve highlight IDs for Pmenu / PmenuSel from the highlight group
+    // table sent by Neovim via hl_group_set. Fall back to 0 (default attr)
+    // if the group is not yet defined, in which case the popupmenu will
+    // render with default colors.
+    const pmenu_hl_id: u32 = self.hl.groups.get("Pmenu") orelse 0;
+    const pmenu_sel_hl_id: u32 = self.hl.groups.get("PmenuSel") orelse pmenu_hl_id;
+
+    // Resolve RGBA colors and notify the frontend via callback so it can
+    // set the container background directly (no vertex color guessing).
+    const pmenu_attr = self.hl.getWithStyles(pmenu_hl_id);
+    const pmenu_sel_attr = self.hl.getWithStyles(pmenu_sel_hl_id);
+    const colors = c_api.PopupmenuColors{
+        .pmenu_bg = pmenu_attr.bg,
+        .pmenu_fg = pmenu_attr.fg,
+        .pmenu_sel_bg = pmenu_sel_attr.bg,
+        .pmenu_sel_fg = pmenu_sel_attr.fg,
+    };
+    if (self.cb.on_popupmenu_show) |cb| {
+        // items pointer is null: grid rendering handles display content.
+        // item_count is 0 to match the null items contract.
+        // The callback primarily delivers colors and anchor info.
+        cb(self.ctx, null, 0, selected, anchor_row, anchor_col, anchor_grid, &colors);
     }
+
+    // Calculate column widths: | pad | word | gap | kind | gap | menu | pad |
+    var max_word_w: u32 = 0;
+    var max_kind_w: u32 = 0;
+    var max_menu_w: u32 = 0;
+    for (items) |item| {
+        const ww = countDisplayWidth(item.word);
+        const kw = countDisplayWidth(item.kind);
+        const mw = countDisplayWidth(item.menu);
+        if (ww > max_word_w) max_word_w = ww;
+        if (kw > max_kind_w) max_kind_w = kw;
+        if (mw > max_menu_w) max_menu_w = mw;
+    }
+    if (max_word_w < 10) max_word_w = 10; // minimum word column
+
+    // Total width: 1(pad) + word + gap? + kind? + gap? + menu? + 1(pad)
+    var width: u32 = 1 + max_word_w + 1; // left pad + word + right pad
+    if (max_kind_w > 0) width += 1 + max_kind_w; // gap + kind
+    if (max_menu_w > 0) width += 1 + max_menu_w; // gap + menu
+
     // Limit height to reasonable number
     const max_height: u32 = 15;
     const height: u32 = @intCast(@min(items.len, max_height));
-    const width: u32 = max_width + 2; // +2 for padding
 
     // Calculate scroll offset to keep selected item visible
     const selected_u: usize = if (selected >= 0) @intCast(selected) else 0;
     var scroll_offset: usize = 0;
     if (selected_u >= height) {
-        // Selected item is below visible range, scroll to show it at bottom
         scroll_offset = selected_u - height + 1;
     }
     const display_start = scroll_offset;
@@ -5760,39 +5798,57 @@ pub fn sendPopupmenuShow(self: *Core) void {
     for (items[display_start..display_end], 0..) |item, row_idx| {
         const row: u32 = @intCast(row_idx);
         const item_idx = display_start + row_idx;
-        // Use different hl_id for selected item (PmenuSel vs Pmenu)
-        // Note: selected = -1 means no selection, so only compare when selected >= 0
         const is_selected = (selected >= 0) and (item_idx == selected_u);
-        const hl_id: u32 = if (is_selected) 1 else 0; // TODO: proper highlight
+        const hl_id: u32 = if (is_selected) pmenu_sel_hl_id else pmenu_hl_id;
 
-        // Write item.word to grid with padding
-        var col: u32 = 1; // Start with 1 cell padding
-        var iter = std.unicode.Utf8View.initUnchecked(item.word).iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col >= width - 1) break; // Leave 1 cell padding at end
-            self.grid.putCellGrid(pum_grid_id, row, col, cp, hl_id);
-            col += 1;
-            // Handle wide characters
-            if (isWideChar(cp)) {
-                if (col >= width - 1) break;
-                self.grid.putCellGrid(pum_grid_id, row, col, 0, hl_id);
-                col += 1;
+        // Fill entire row with spaces so bg covers all cells including padding
+        {
+            var fill_col: u32 = 0;
+            while (fill_col < width) : (fill_col += 1) {
+                self.grid.putCellGrid(pum_grid_id, row, fill_col, ' ', hl_id);
             }
+        }
+
+        // Column layout: | 1 pad | word (max_word_w) | 1 gap | kind (max_kind_w) | 1 gap | menu (max_menu_w) | 1 pad |
+        var col: u32 = 1; // left padding
+        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id);
+
+        if (max_kind_w > 0) {
+            col = 1 + max_word_w + 1; // jump to kind column start
+            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id);
+        }
+
+        if (max_menu_w > 0) {
+            col = 1 + max_word_w + (if (max_kind_w > 0) 1 + max_kind_w else @as(u32, 0)) + 1; // jump to menu column start
+            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id);
         }
     }
 
     // Register as external grid with position.
-    // popupmenu_show reports the anchor cell directly. The frontend decides
-    // whether to place the popupmenu below that row or flip it above.
+    // anchor_row/col are local to anchor_grid. Convert to global (grid 1)
+    // coordinates using win_pos so the frontend can position the popup
+    // relative to the terminal view without knowing about sub-grid offsets.
     const is_cmdline_completion = (anchor_grid < 0 or anchor_grid == -1);
-    const start_row: i32 = if (is_cmdline_completion)
-        -1 // Special marker for cmdline completion (Swift will position above cmdline)
-    else
-        anchor_row;
-    const start_col: i32 = anchor_col;
+    var start_row: i32 = undefined;
+    var start_col: i32 = undefined;
+    if (is_cmdline_completion) {
+        start_row = -1;
+        start_col = anchor_col;
+    } else if (anchor_grid != 1) {
+        if (self.grid.win_pos.get(anchor_grid)) |pos| {
+            start_row = anchor_row + @as(i32, @intCast(pos.row));
+            start_col = anchor_col + @as(i32, @intCast(pos.col));
+        } else {
+            start_row = anchor_row;
+            start_col = anchor_col;
+        }
+    } else {
+        start_row = anchor_row;
+        start_col = anchor_col;
+    }
 
     self.grid.external_grids.put(self.alloc, pum_grid_id, .{
-        .win = anchor_grid, // Store anchor grid ID for positioning
+        .win = anchor_grid,
         .start_row = start_row,
         .start_col = start_col,
     }) catch |e| {
@@ -5800,13 +5856,38 @@ pub fn sendPopupmenuShow(self: *Core) void {
         return;
     };
 
-    // Verbose logging disabled for performance
-    // self.log.write("[popupmenu] show: size={d}x{d} pos=({d},{d})\n", .{width, height, start_row, start_col});
+    // Remove from known set so notifyExternalWindowChanges re-fires
+    // on_external_window, which runs popupmenuWindowRect with the
+    // current anchor position from the Neovim event.
+    _ = self.known_external_grids.remove(pum_grid_id);
+}
+
+/// Write a UTF-8 string to grid cells starting at (row, start_col).
+/// Returns the column after the last written cell.
+fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) u32 {
+    if (text.len == 0) return start_col;
+    var col = start_col;
+    var iter = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (col >= col_limit) break;
+        self.grid.putCellGrid(grid_id, row, col, cp, hl_id);
+        col += 1;
+        if (isWideChar(cp)) {
+            if (col >= col_limit) break;
+            self.grid.putCellGrid(grid_id, row, col, 0, hl_id);
+            col += 1;
+        }
+    }
+    return col;
 }
 
 /// Hide popupmenu by removing from external grids.
 pub fn sendPopupmenuHide(self: *Core) void {
     const pum_grid_id = grid_mod.POPUPMENU_GRID_ID;
+
+    if (self.cb.on_popupmenu_hide) |cb| {
+        cb(self.ctx);
+    }
 
     // Remove from external grids.
     // Note: Don't call on_external_window_close here - it will be called by

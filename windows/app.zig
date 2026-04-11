@@ -2581,6 +2581,9 @@ pub const App = struct {
     sidebar_position_right: bool = false, // false = left, true = right
     sidebar_width_px: u32 = 200,
 
+    // ext_popupmenu: Pmenu bg color (0x00RRGGBB) from on_popupmenu_show callback
+    popupmenu_bg_rgb: u32 = 0xFFFFFFFF,
+
     // Colorscheme default colors (0x00RRGGBB, or 0xFFFFFFFF = not set)
     colorscheme_bg: u32 = 0xFFFFFFFF,
     colorscheme_fg: u32 = 0xFFFFFFFF,

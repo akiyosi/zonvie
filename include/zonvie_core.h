@@ -522,20 +522,33 @@ typedef struct zonvie_popupmenu_item {
     size_t info_len;
 } zonvie_popupmenu_item;
 
+/* Resolved Pmenu / PmenuSel colors (0x00RRGGBB).
+   Passed alongside popupmenu_show so the frontend can style the container
+   and selection without reverse-engineering colors from vertex data. */
+typedef struct zonvie_popupmenu_colors {
+    uint32_t pmenu_bg;
+    uint32_t pmenu_fg;
+    uint32_t pmenu_sel_bg;
+    uint32_t pmenu_sel_fg;
+} zonvie_popupmenu_colors;
+
 /* Called when popup menu should be shown.
-   items: array of completion items
-   item_count: number of items
+   items: array of completion items, or NULL when the core renders
+          popup content via grid vertices (item_count is 0 in that case)
+   item_count: number of items (0 when items is NULL)
    selected: currently selected item index (-1 if none)
    row: anchor row position
    col: anchor column position
-   grid_id: which grid the popup is anchored to (1 = main, -100 = cmdline) */
+   grid_id: which grid the popup is anchored to (1 = main, -100 = cmdline)
+   colors: resolved Pmenu / PmenuSel highlight colors */
 typedef void (*zonvie_on_popupmenu_show_fn)(
     void* ctx,
     const zonvie_popupmenu_item* items, size_t item_count,
     int32_t selected,
     int32_t row,
     int32_t col,
-    int64_t grid_id
+    int64_t grid_id,
+    const zonvie_popupmenu_colors* colors
 );
 
 /* Called when popup menu should be hidden. */

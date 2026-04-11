@@ -158,6 +158,8 @@ fn makeCoreCbs() core.Callbacks {
         .on_cursor_grid_changed = external_windows.onCursorGridChanged,
         .on_cmdline_show = callbacks.onCmdlineShow,
         .on_cmdline_hide = callbacks.onCmdlineHide,
+        .on_popupmenu_show = callbacks.onPopupmenuShow,
+        .on_popupmenu_hide = callbacks.onPopupmenuHide,
         .on_msg_show = messages.onMsgShow,
         .on_msg_clear = messages.onMsgClear,
         .on_msg_showmode = messages.onMsgShowmode,

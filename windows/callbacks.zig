@@ -5,6 +5,7 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
+const core = @import("zonvie_core");
 
 
 // ---- Logging globals for atlas ensure callbacks ----
@@ -2364,6 +2365,37 @@ pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
     app.mu.lock();
     app.cmdline_firstc = 0;
     app.mu.unlock();
+}
+
+// =========================================================================
+// ext_popupmenu callbacks
+// =========================================================================
+
+pub fn onPopupmenuShow(
+    ctx: ?*anyopaque,
+    _: ?*const anyopaque, // items (unused — grid rendering handles display)
+    _: usize, // item_count
+    _: i32, // selected
+    _: i32, // row
+    _: i32, // col
+    _: i64, // grid_id
+    colors: ?*const core.PopupmenuColors,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (colors) |clrs| {
+        app.mu.lock();
+        app.popupmenu_bg_rgb = clrs.pmenu_bg;
+        app.mu.unlock();
+        if (applog.isEnabled()) applog.appLog("[win] on_popupmenu_show: pmenu_bg=0x{x:0>6}\n", .{clrs.pmenu_bg});
+    }
+}
+
+pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.mu.lock();
+    app.popupmenu_bg_rgb = 0xFFFFFFFF;
+    app.mu.unlock();
+    if (applog.isEnabled()) applog.appLog("[win] on_popupmenu_hide\n", .{});
 }
 
 // =========================================================================

@@ -232,7 +232,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 blurEnabled: blurEnabled,
                 decoratedSurface: isDecoratedSurface
             )
-            ZonvieCore.appLog("[ExternalGridView] backgroundAlphaBuffer alpha=\(alpha) isDecoratedSurface=\(isDecoratedSurface)")
+            // Popupmenu has per-row bg colors (Pmenu vs PmenuSel) that the
+            // user must be able to tell apart. The decorated-surface alpha
+            // override above forces the shader to multiply every bg color
+            // by 0 so the cmdline-style "show blur through cells" trick
+            // works for the single-color cmdline / msg surfaces, but it
+            // collapses the popupmenu into a uniform transparent block and
+            // hides the selection. Use 1.0 instead so each cell renders
+            // with its own opaque bg; the popupmenu's surrounding blur is
+            // still preserved by the container view's transparent layer
+            // around the Metal viewport.
+            // -101 = POPUPMENU_GRID_ID (matches grid.zig:9 / ZonvieCore.popupmenuGridId)
+            if gridId == -101 {
+                alpha = 1.0
+            }
+            ZonvieCore.appLog("[ExternalGridView] backgroundAlphaBuffer alpha=\(alpha) isDecoratedSurface=\(isDecoratedSurface) gridId=\(gridId)")
             memcpy(buf.contents(), &alpha, MemoryLayout<Float>.size)
         }
 
