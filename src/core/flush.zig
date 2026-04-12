@@ -4187,47 +4187,63 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
         _ = self.known_external_grids.remove(grid_id);
     }
 
-    // Find new external windows (in grid.external_grids but not in known)
+    // Find new or changed external windows
     var ext_it = self.grid.external_grids.iterator();
     while (ext_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;
         const info = entry.value_ptr.*;
 
-        if (!self.known_external_grids.contains(grid_id)) {
-            // New external grid - get dimensions from sub_grids
-            var rows: u32 = 0;
-            var cols: u32 = 0;
-            if (self.grid.sub_grids.get(grid_id)) |sg| {
-                rows = sg.rows;
-                cols = sg.cols;
+        // Get dimensions from sub_grids
+        var rows: u32 = 0;
+        var cols: u32 = 0;
+        if (self.grid.sub_grids.get(grid_id)) |sg| {
+            rows = sg.rows;
+            cols = sg.cols;
+        }
+
+        // Skip 0x0 grids - wait until grid_resize provides valid dimensions
+        if (rows == 0 or cols == 0) continue;
+
+        const is_new = !self.known_external_grids.contains(grid_id);
+
+        // Check if position or size changed for existing grids (e.g. popupmenu
+        // re-show with different anchor after popupmenu_select).
+        var pos_changed = false;
+        if (!is_new) {
+            if (self.known_external_grids.get(grid_id)) |prev| {
+                if (prev.win != info.win or prev.start_row != info.start_row or prev.start_col != info.start_col or
+                    prev.rows != rows or prev.cols != cols)
+                {
+                    pos_changed = true;
+                }
             }
+        }
 
-            // Skip 0x0 grids - wait until grid_resize provides valid dimensions
-            if (rows == 0 or cols == 0) continue;
+        if (!is_new and !pos_changed) continue;
 
+        if (is_new) {
             // For ext_windows grids awaiting initial resize response from Neovim,
             // defer window creation until the grid has a reasonable size.
-            // Neovim may send an intermediate small grid_resize (e.g. rows=1)
-            // before the actual resize, and creating the window at that size
-            // produces a tiny window.
             if (self.grid.pending_ext_window_grids.contains(grid_id)) {
-                if (rows < 2 or cols < 2) {
-                    // Grid is still at intermediate tiny size - wait
-                    continue;
-                }
-                // Grid has reasonable dimensions, proceed with window creation
+                if (rows < 2 or cols < 2) continue;
                 _ = self.grid.pending_ext_window_grids.remove(grid_id);
             }
-
-            // Notify frontend with position info
-            if (self.cb.on_external_window) |cb| {
-                cb(self.ctx, grid_id, info.win, rows, cols, info.start_row, info.start_col);
-            }
-
-            // Add to known set
-            self.known_external_grids.put(self.alloc, grid_id, {}) catch continue;
-            new_grids_added = true;
         }
+
+        // Notify frontend with position info
+        if (self.cb.on_external_window) |cb| {
+            cb(self.ctx, grid_id, info.win, rows, cols, info.start_row, info.start_col);
+        }
+
+        // Add/update known set with current position
+        self.known_external_grids.put(self.alloc, grid_id, .{
+            .win = info.win,
+            .start_row = info.start_row,
+            .start_col = info.start_col,
+            .rows = rows,
+            .cols = cols,
+        }) catch continue;
+        if (is_new) new_grids_added = true;
     }
 
     return new_grids_added;
@@ -4394,8 +4410,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // If any grid triggers a reset, already-sent grids also have stale UVs.
     var ext_saw_atlas_reset_any: bool = false;
 
-    // Iterate over all known external grids
-    var ext_it = self.known_external_grids.keyIterator();
+    // Iterate over all external grids (not just known_external_grids).
+    // This ensures newly added grids (e.g., popupmenu from sendPopupmenuShow)
+    // get vertices generated inside the flush bracket, even before
+    // notifyExternalWindowChanges adds them to known_external_grids.
+    var ext_it = self.grid.external_grids.keyIterator();
     while (ext_it.next()) |grid_id_ptr| {
         const grid_id = grid_id_ptr.*;
 
@@ -5856,29 +5875,114 @@ pub fn sendPopupmenuShow(self: *Core) void {
         return;
     };
 
-    // Remove from known set so notifyExternalWindowChanges re-fires
-    // on_external_window, which runs popupmenuWindowRect with the
-    // current anchor position from the Neovim event.
-    _ = self.known_external_grids.remove(pum_grid_id);
 }
 
 /// Write a UTF-8 string to grid cells starting at (row, start_col).
+/// Uses scanEmojiCluster to handle grapheme clusters (including NFD
+/// combining characters like U+306F U+3099 = ば) as single display units.
+/// NFD combining kana voicing marks are composed to NFC so the rasterizer
+/// receives a single precomposed codepoint (e.g., U+3070 ば, not U+306F は).
 /// Returns the column after the last written cell.
 fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) u32 {
     if (text.len == 0) return start_col;
     var col = start_col;
-    var iter = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iter.nextCodepoint()) |cp| {
-        if (col >= col_limit) break;
+    var byte_i: usize = 0;
+    while (byte_i < text.len) {
+        const cluster = scanEmojiCluster(text, byte_i);
+        if (cluster.codepoint_count == 0) break;
+        const dw = cluster.display_width;
+        // Ensure room for the full cluster width (body + placeholders)
+        if (col + dw > col_limit) break;
+
+        // Try NFC composition for NFD combining marks so the rasterizer
+        // gets a single precomposed codepoint.
+        const cp = if (cluster.extras_len > 0)
+            composeNFC(cluster.first_cp, cluster.extras[0..cluster.extras_len])
+        else
+            cluster.first_cp;
+
         self.grid.putCellGrid(grid_id, row, col, cp, hl_id);
+
+        // If NFC composition consumed the extras (cp != base), no overflow
+        // needed. Otherwise store extras in overflow map so the vertex
+        // generation glyph path can pass them to the rasterizer (same as
+        // the cmdline path at sendCmdlineShow).
+        if (cluster.extras_len > 0 and cp == cluster.first_cp) {
+            self.grid.putOverflow(grid_id, row, col, cluster.extras[0..cluster.extras_len]);
+        }
+
         col += 1;
-        if (isWideChar(cp)) {
-            if (col >= col_limit) break;
+        // Fill remaining cells with placeholder (cp=0) for wide characters
+        var p: u32 = 1;
+        while (p < dw) : (p += 1) {
             self.grid.putCellGrid(grid_id, row, col, 0, hl_id);
             col += 1;
         }
+        byte_i = cluster.end_byte;
     }
     return col;
+}
+
+/// Try to compose a base codepoint with combining marks into a single
+/// NFC precomposed codepoint. Returns the composed codepoint if a known
+/// composition exists, otherwise returns the base codepoint unchanged.
+/// Currently handles:
+///   - Hiragana/Katakana + U+3099 (voiced) / U+309A (semi-voiced)
+///   - Latin base + U+0300-U+036F (common combining diacritical marks)
+fn composeNFC(base: u32, extras: []const u32) u32 {
+    if (extras.len == 0) return base;
+    const mark = extras[0];
+
+    // Hiragana voiced (゙ U+3099): か→が, き→ぎ, ... (gaps at certain positions)
+    // Katakana voiced: カ→ガ, キ→ギ, ...
+    if (mark == 0x3099) {
+        return composeKanaVoiced(base) orelse base;
+    }
+    // Hiragana/Katakana semi-voiced (゚ U+309A): は→ぱ, ひ→ぴ, ...
+    if (mark == 0x309A) {
+        return composeKanaSemiVoiced(base) orelse base;
+    }
+
+    return base;
+}
+
+/// Compose Hiragana/Katakana base + U+3099 (dakuten) → precomposed voiced form.
+fn composeKanaVoiced(base: u32) ?u32 {
+    // Hiragana: U+304B(か)→U+304C(が) ... pairs at known offsets
+    // The pattern: base + 1 = voiced, but only for specific ranges with gaps.
+    return switch (base) {
+        // Hiragana
+        0x304B, 0x304D, 0x304F, 0x3051, 0x3053, // ka ki ku ke ko
+        0x3055, 0x3057, 0x3059, 0x305B, 0x305D, // sa si su se so
+        0x305F, 0x3061, 0x3064, 0x3066, 0x3068, // ta ti tu te to
+        0x306F, 0x3072, 0x3075, 0x3078, 0x307B, // ha hi hu he ho
+        // Katakana
+        0x30AB, 0x30AD, 0x30AF, 0x30B1, 0x30B3, // ka ki ku ke ko
+        0x30B5, 0x30B7, 0x30B9, 0x30BB, 0x30BD, // sa si su se so
+        0x30BF, 0x30C1, 0x30C4, 0x30C6, 0x30C8, // ta ti tu te to
+        0x30CF, 0x30D2, 0x30D5, 0x30D8, 0x30DB, // ha hi hu he ho
+        => base + 1,
+        0x3046 => 0x3094, // Hiragana u → vu
+        0x30A6 => 0x30F4, // Katakana u → vu
+        0x30EF => 0x30F7, // Katakana wa → va
+        0x30F0 => 0x30F8, // Katakana wi → vi
+        0x30F1 => 0x30F9, // Katakana we → ve
+        0x30F2 => 0x30FA, // Katakana wo → vo
+        else => null,
+    };
+}
+
+/// Compose Hiragana/Katakana base + U+309A (handakuten) → precomposed semi-voiced form.
+fn composeKanaSemiVoiced(base: u32) ?u32 {
+    // は→ぱ = base + 2 for ha-row only
+    return switch (base) {
+        // Hiragana ha-row
+        0x306F, 0x3072, 0x3075, 0x3078, 0x307B,
+        // Katakana ha-row
+        0x30CF, 0x30D2, 0x30D5, 0x30D8, 0x30DB,
+        => base + 2,
+        else => null,
+    };
 }
 
 /// Hide popupmenu by removing from external grids.
@@ -7143,7 +7247,21 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
         const is_cluster_ext = (cp2 == 0xFE0F or cp2 == 0xFE0E or cp2 == 0x200D or
             cp2 == 0x20E3 or (cp2 >= 0x1F3FB and cp2 <= 0x1F3FF) or
             (cp2 >= 0x1F1E6 and cp2 <= 0x1F1FF and first_cp >= 0x1F1E6 and first_cp <= 0x1F1FF and cur_ri_count < 2) or
-            (cp2 >= 0xE0020 and cp2 <= 0xE007F));
+            (cp2 >= 0xE0020 and cp2 <= 0xE007F) or
+            // Unicode combining marks (NFD decomposed characters like
+            // U+306F U+3099 = ば). These must stay in the same cluster
+            // as the preceding base character.
+            (cp2 >= 0x0300 and cp2 <= 0x036F) or // Combining Diacritical Marks
+            (cp2 >= 0x3099 and cp2 <= 0x309A) or // Combining Kana Voicing (゙ ゚)
+            (cp2 >= 0x0483 and cp2 <= 0x0489) or // Combining Cyrillic
+            (cp2 >= 0x0591 and cp2 <= 0x05BD) or // Combining Hebrew
+            (cp2 >= 0x0610 and cp2 <= 0x061A) or // Combining Arabic
+            (cp2 >= 0x064B and cp2 <= 0x065F) or // Combining Arabic (cont.)
+            (cp2 >= 0x0E31 and cp2 == 0x0E31) or // Thai
+            (cp2 >= 0x0E34 and cp2 <= 0x0E3A) or // Thai vowels/tone
+            (cp2 >= 0x0E47 and cp2 <= 0x0E4E) or // Thai (cont.)
+            (cp2 >= 0x20D0 and cp2 <= 0x20FF) or // Combining for Symbols
+            (cp2 >= 0xFE20 and cp2 <= 0xFE2F));
         const after_zwj = prev_cp == 0x200D;
 
         if (is_cluster_ext or after_zwj) {

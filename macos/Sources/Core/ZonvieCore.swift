@@ -300,25 +300,41 @@ final class ZonvieCore {
                                         totalCols: tc
                                     )
                                 }
-                                // First-row config for decorated grids
-                                if rs == 0 && fl & 2 == 0 {
-                                    // For popupmenu, use the core-delivered Pmenu bg
-                                    // instead of the vertex-extracted color (which
-                                    // varies per row depending on selection state).
-                                    let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                    let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                    if let bgColor = effectiveBgColor {
-                                        DispatchQueue.main.async { [weak core] in
-                                            guard let core = core else { return }
-                                            guard let window = core.externalWindows[gridId] else { return }
-                                            core.applyExternalGridConfig(
-                                                gridId: gridId,
-                                                window: window,
-                                                gridView: gridView,
-                                                bgColor: bgColor,
-                                                rows: totalRows,
-                                                cols: totalCols
-                                            )
+                                // Save main vertices to pending as fallback for
+                                // the hide/re-show race: the gridView found above
+                                // may belong to the previous session (close dispatch
+                                // pending on main). Skip cursor-only updates (fl & 2)
+                                // — cursor vertices carry the cursor fg color as bg,
+                                // which would overwrite the correct Normal bg in
+                                // pending config and replace main content.
+                                if fl & 2 == 0 {
+                                    let savedVerts = prepared.vertices
+                                    let savedBgColor: NSColor? = (rs == 0) ? {
+                                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                        return isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                    }() : nil
+                                    DispatchQueue.main.async { [weak core] in
+                                        guard let core = core else { return }
+                                        if var existing = core.pendingExternalVertices[gridId] {
+                                            existing.rowVertices[rs] = savedVerts
+                                            existing.rows = totalRows
+                                            existing.cols = totalCols
+                                            core.pendingExternalVertices[gridId] = existing
+                                        } else {
+                                            core.pendingExternalVertices[gridId] = (rowVertices: [rs: savedVerts], rows: totalRows, cols: totalCols)
+                                        }
+                                        if let bgColor = savedBgColor {
+                                            core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                            if let window = core.externalWindows[gridId] {
+                                                core.applyExternalGridConfig(
+                                                    gridId: gridId,
+                                                    window: window,
+                                                    gridView: gridView,
+                                                    bgColor: bgColor,
+                                                    rows: totalRows,
+                                                    cols: totalCols
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -399,22 +415,28 @@ final class ZonvieCore {
                                     gridView.bumpRevisionAndRedraw()
                                 } else {
                                     // Still no gridView: save to pending for window creation replay.
-                                    // For popupmenu, use the core-delivered Pmenu bg.
-                                    if rs == 0 {
-                                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                        let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                        if let bgColor = effectiveBgColor {
-                                            core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                    // Skip cursor-only updates (flags & 2): cursor vertices have
+                                    // the cursor foreground as bg color (white in dark themes),
+                                    // which would overwrite the correct Normal bg in pending config
+                                    // and replace main content vertices with cursor-only data.
+                                    let isCursorOnly = (fl & 2) != 0
+                                    if !isCursorOnly {
+                                        if rs == 0 {
+                                            let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                            let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                            if let bgColor = effectiveBgColor {
+                                                core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                            }
                                         }
-                                    }
-                                    ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
-                                    if var existing = core.pendingExternalVertices[gridId] {
-                                        existing.rowVertices[rs] = prepared.vertices
-                                        existing.rows = totalRows
-                                        existing.cols = totalCols
-                                        core.pendingExternalVertices[gridId] = existing
-                                    } else {
-                                        core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
+                                        ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
+                                        if var existing = core.pendingExternalVertices[gridId] {
+                                            existing.rowVertices[rs] = prepared.vertices
+                                            existing.rows = totalRows
+                                            existing.cols = totalCols
+                                            core.pendingExternalVertices[gridId] = existing
+                                        } else {
+                                            core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
+                                        }
                                     }
                                 }
                             }
@@ -3006,6 +3028,7 @@ final class ZonvieCore {
             )
 
             self.applyPendingExternalState(gridId: gridId, window: window, gridView: gridView)
+
             self.repositionMessageShowBelowHistoryWindowIfNeeded(gridId: gridId, historyWindow: window)
 
             // Refresh main window's blur effect after external window is shown
@@ -4158,8 +4181,6 @@ final class ZonvieCore {
         let belowY = refTop - anchorY - cellHeight - windowHeight
         // Above: popup window bottom edge at anchor row top edge
         let aboveY = refTop - anchorY
-
-        ZonvieCore.appLog("[popupmenuWindowRect] anchorRow=\(anchorRow) anchorCol=\(anchorCol) cellH=\(cellH) cellW=\(cellW) scale=\(scale) cellHeight=\(cellHeight) anchorY=\(anchorY) refTop=\(refTop) ref=\(referenceFrame) belowY=\(belowY) aboveY=\(aboveY) windowH=\(windowHeight)")
 
         let y: CGFloat
         if belowY >= referenceFrame.origin.y {

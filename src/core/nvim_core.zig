@@ -15,6 +15,11 @@ const rpc_session = @import("rpc_session.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
 
+/// Position/size snapshot for a known external grid. Used to detect
+/// changes in anchor position (e.g. popupmenu re-show) and re-fire
+/// on_external_window so the frontend can update window position.
+pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
+
 pub const Callbacks = struct {
     on_vertices_partial: ?*const fn (
         ctx: ?*anyopaque,
@@ -473,7 +478,7 @@ pub const Core = struct {
     redraw_thread_id: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     // Tracking for external windows (to detect new/closed external grids)
-    known_external_grids: std.AutoHashMapUnmanaged(i64, void) = .{},
+    known_external_grids: std.AutoHashMapUnmanaged(i64, KnownExtGridInfo) = .{},
 
     // ext_cmdline UI extension flag (set before start)
     ext_cmdline_enabled: bool = false,

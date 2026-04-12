@@ -917,15 +917,14 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
 
-        // Check for external window changes and notify frontend
-        const new_ext_grids = self.notifyExternalWindowChanges();
-
-        // Generate vertices for newly added external grids only.
-        // Existing grids are handled inside the flush bracket (onFlush defer)
-        // to ensure vertices arrive before commitFlush on the frontend.
-        if (new_ext_grids) {
-            self.sendExternalGridVertices(true);
-        }
+        // Check for external window changes and notify frontend.
+        // Vertex generation for all external grids (including newly added ones)
+        // is handled inside the flush bracket (onFlush defer iterates
+        // external_grids, not known_external_grids). Do NOT generate vertices
+        // here — it runs after commitFlush/atlas-swap, so rasterized glyphs
+        // would go to the new back texture while the front (used for drawing)
+        // would have empty texels, causing non-ASCII text to be invisible.
+        _ = self.notifyExternalWindowChanges();
 
         // Check IME off request (from mode_change event)
         if (self.grid.ime_off_requested) {
