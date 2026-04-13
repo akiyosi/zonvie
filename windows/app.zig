@@ -1120,6 +1120,7 @@ pub const ExternalWindow = struct {
     scroll_accum: i16 = 0, // Accumulated vertical scroll delta for high-resolution scrolling
     h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
+    is_float_external: bool = false, // True if float-origin external (nvim_open_win external=true)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
     flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .{}, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
@@ -2563,6 +2564,13 @@ pub const App = struct {
     // Border uses Search highlight bg, icon uses Comment highlight fg
     cmdline_border_color: [3]f32 = .{ 1.0, 1.0, 0.0 }, // default yellow
     cmdline_icon_color: [3]f32 = .{ 0.5, 0.5, 0.5 }, // default gray
+
+    // Cached highlight group bg colors for external window clear color.
+    // Updated in updateExternalWindowColors (UI thread) to avoid grid_mu during WM_PAINT.
+    // 0xFFFFFFFF = not set (fall back to colorscheme_bg).
+    cached_normal_float_bg: u32 = 0xFFFFFFFF,
+    cached_msg_area_bg: u32 = 0xFFFFFFFF,
+    cached_pmenu_bg: u32 = 0xFFFFFFFF,
 
     // ext_cmdline enabled flag (set from --extcmdline command line arg)
     ext_cmdline_enabled: bool = false,

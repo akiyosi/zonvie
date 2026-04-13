@@ -2278,9 +2278,11 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     }
     app.mu.unlock();
 
-    // Invalidate tabline/sidebar to repaint with new colors
+    // Invalidate tabline/sidebar to repaint with new colors, and
+    // update cached highlight group bg colors for external window clear color.
     if (app.hwnd) |hwnd| {
         _ = c.PostMessageW(hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+        _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CMDLINE_COLORS, 0, 0);
     }
 }
 

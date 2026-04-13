@@ -873,6 +873,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     var deferred_setpos: ?DeferredSetWindowPos = null;
     var deferred_setpos_cmdline: ?DeferredSetWindowPos = null;
 
+    // Determine if this is a float-origin external window (nvim_open_win external=true)
+    // vs a regular split externalized by ext_windows. Query core before acquiring app.mu.
+    const is_float = if (app.corep) |cp| core.zonvie_core_is_float_external(cp, req.grid_id) != 0 else false;
+
     app.mu.lock();
 
     // Store external window
@@ -881,6 +885,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         .win_id = req.win,
         .renderer = renderer,
         .surface = .{ .rows = req.rows, .cols = req.cols },
+        .is_float_external = is_float,
     };
 
     app.external_windows.put(app.alloc, req.grid_id, ext_window) catch |e| {
@@ -1871,6 +1876,26 @@ pub export fn ExternalWndProc(
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/// Set the clear color for an external window from cached highlight group bg colors.
+/// Uses values pre-resolved in updateExternalWindowColors (UI thread, safe context).
+/// Does NOT call core APIs that acquire grid_mu — safe for WM_PAINT context.
+/// Float-origin normal windows use NormalFloat; ext_windows splits use default bg.
+fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind, ext_win: *const app_mod.ExternalWindow) void {
+    app.mu.lock();
+    const cached_bg: u32 = switch (kind) {
+        .normal => if (ext_win.is_float_external) app.cached_normal_float_bg else 0xFFFFFFFF,
+        .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
+        .popupmenu => app.cached_pmenu_bg,
+    };
+    const fallback_bg = app.colorscheme_bg;
+    app.mu.unlock();
+
+    const bg_rgb = if (cached_bg != 0xFFFFFFFF) cached_bg else fallback_bg;
+    if (bg_rgb != 0xFFFFFFFF) {
+        g.setDefaultBgColor(bg_rgb);
+    }
+}
+
 pub fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
     app.mu.lock();
     var should_post_close = false;
@@ -1938,9 +1963,30 @@ pub fn updateExternalWindowColors(app: *App) void {
         }
     }
 
+    // Resolve highlight group bg colors for external window clear color cache.
+    // Read during WM_PAINT (setExternalWindowClearColor) where grid_mu is unsafe.
+    var normal_float_bg: u32 = 0xFFFFFFFF;
+    var msg_area_bg: u32 = 0xFFFFFFFF;
+    var pmenu_bg: u32 = 0xFFFFFFFF;
+    if (app.corep) |corep| {
+        var discard_fg: u32 = 0;
+        if (core.zonvie_core_get_hl_by_name(corep, "NormalFloat", &discard_fg, &normal_float_bg) == 0) {
+            normal_float_bg = 0xFFFFFFFF;
+        }
+        if (core.zonvie_core_get_hl_by_name(corep, "MsgArea", &discard_fg, &msg_area_bg) == 0) {
+            msg_area_bg = 0xFFFFFFFF;
+        }
+        if (core.zonvie_core_get_hl_by_name(corep, "Pmenu", &discard_fg, &pmenu_bg) == 0) {
+            pmenu_bg = 0xFFFFFFFF;
+        }
+    }
+
     app.mu.lock();
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
+    app.cached_normal_float_bg = normal_float_bg;
+    app.cached_msg_area_bg = msg_area_bg;
+    app.cached_pmenu_bg = pmenu_bg;
     app.mu.unlock();
 }
 
@@ -2128,6 +2174,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             }
             ext_win.atlas_upload_cursor = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
         }
+
+        // Set clear color from cached highlight group bg colors (no grid_mu acquisition).
+        // NormalFloat for float-origin externals, MsgArea for cmdline/messages, Pmenu for popupmenu.
+        setExternalWindowClearColor(g, app, surface_kind, ext_win);
 
         if (surface_kind != .normal) {
             drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, glow_enabled, glow_intensity) catch |e| {

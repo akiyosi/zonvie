@@ -3183,12 +3183,9 @@ final class ZonvieCore {
             ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
         }
 
-        // Set clear color so viewport-edge pixels match the grid background.
-        // For blur: use backgroundAlpha so edges match the semi-transparent content.
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        bgColor.usingColorSpace(.sRGB)?.getRed(&r, green: &g, blue: &b, alpha: &a)
-        let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
-        gridView.gridClearColor = MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
+        // Set clear color from the NormalFloat highlight group (external windows are floats).
+        // Falls back to vertex-extracted bgColor if the group is not defined.
+        gridView.gridClearColor = resolveExternalWindowClearColor(kind: .normal, gridId: gridId, vertexBgColor: bgColor)
     }
 
     /// Called when an external grid is closed.
@@ -4360,6 +4357,54 @@ final class ZonvieCore {
         }
     }
 
+    /// Resolve the background color from the appropriate highlight group for the window kind.
+    /// NormalFloat for regular external windows, MsgArea for cmdline/messages, Pmenu for popupmenu.
+    /// Returns nil if the group is not defined (caller should fall back).
+    /// Resolve bg color from the appropriate highlight group for the window kind.
+    /// Float-origin normal windows use NormalFloat; ext_windows splits use default bg.
+    /// Cmdline/messages use MsgArea, popupmenu uses Pmenu.
+    /// Returns nil if the group is not defined or the window is a regular split (caller should fall back).
+    private func resolveHlGroupBgColor(kind: ExternalGridKind, gridId: Int64) -> NSColor? {
+        guard let corePtr = self.core else { return nil }
+        var bg: UInt32 = 0
+        let name: String?
+        switch kind {
+        case .normal:
+            // Only use NormalFloat for float-origin externals (nvim_open_win external=true).
+            // Regular splits externalized by --extwindows use default bg.
+            if zonvie_core_is_float_external(corePtr, gridId) != 0 {
+                name = "NormalFloat"
+            } else {
+                name = nil
+            }
+        case .cmdline, .msgShow, .msgHistory:
+            name = "MsgArea"
+        case .popupmenu:
+            name = "Pmenu"
+        }
+        guard let name else { return nil }
+        let found = zonvie_core_get_hl_by_name(corePtr, name, nil, &bg)
+        if found == 0 { return nil }
+        let r = CGFloat((bg >> 16) & 0xFF) / 255.0
+        let g = CGFloat((bg >> 8) & 0xFF) / 255.0
+        let b = CGFloat(bg & 0xFF) / 255.0
+        return NSColor(red: r, green: g, blue: b, alpha: 1.0)
+    }
+
+    /// Resolve the Metal clear color for an external window from its highlight group.
+    /// Falls back to the vertex-extracted bgColor if the highlight group is not defined.
+    private func resolveExternalWindowClearColor(kind: ExternalGridKind, gridId: Int64, vertexBgColor: NSColor?) -> MTLClearColor {
+        let bgColor = resolveHlGroupBgColor(kind: kind, gridId: gridId) ?? vertexBgColor
+        let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
+        if let bgColor, let srgb = bgColor.usingColorSpace(.sRGB) {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
+            return MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
+        }
+        // Fallback: black
+        return MTLClearColor(red: 0, green: 0, blue: 0, alpha: clearAlpha)
+    }
+
     private func updateDecoratedExternalGrid(
         gridId: Int64,
         gridView: ExternalGridView,
@@ -4371,7 +4416,7 @@ final class ZonvieCore {
         guard kind != .normal else { return }
         guard let context = makeDecoratedGridContext(gridId: gridId) else { return }
 
-        updateDecoratedBackground(context: context, gridView: gridView, bgColor: bgColor)
+        updateDecoratedBackground(kind: kind, gridId: gridId, context: context, gridView: gridView, bgColor: bgColor)
         updateDecoratedLayout(kind: kind, context: context, gridView: gridView, rows: rows, cols: cols)
         // Chrome must be updated AFTER layout so border uses the new layer.bounds
         updateDecoratedWindowChrome(kind: kind, context: context)
@@ -4386,10 +4431,13 @@ final class ZonvieCore {
         return DecoratedGridContext(window: window, containerView: containerView, renderer: renderer, scale: scale)
     }
 
-    private func updateDecoratedBackground(context: DecoratedGridContext, gridView: ExternalGridView, bgColor: NSColor?) {
-        guard let bgColor else { return }
+    private func updateDecoratedBackground(kind: ExternalGridKind, gridId: Int64, context: DecoratedGridContext, gridView: ExternalGridView, bgColor: NSColor?) {
+        // Resolve container bg from the appropriate highlight group.
+        // Falls back to vertex-extracted bgColor if the group is not defined.
+        let resolvedBg = resolveHlGroupBgColor(kind: kind, gridId: gridId) ?? bgColor
+        guard let resolvedBg else { return }
 
-        let adjustedBg = bgColor.adjustedForCmdlineBackground()
+        let adjustedBg = resolvedBg.adjustedForCmdlineBackground()
         let containerAlpha = ZonvieConfig.shared.blurEnabled
             ? CGFloat(ZonvieConfig.shared.backgroundAlpha)
             : 1.0

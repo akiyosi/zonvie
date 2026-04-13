@@ -1060,6 +1060,11 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
 // Safe to call from within callbacks (no lock acquisition).
 ZONVIE_API uint32_t zonvie_core_get_default_bg(zonvie_core *core);
 
+// Check whether an external grid originated from a floating window
+// (nvim_open_win with external=true) vs a regular split externalized by ext_windows.
+// Returns 1 if float-origin external, 0 otherwise.
+ZONVIE_API int zonvie_core_is_float_external(zonvie_core *core, int64_t grid_id);
+
 // Get the current emoji cluster context during flush.
 // Returns a pointer to the cluster scalars (uint32_t codepoints) and writes the
 // count to *out_len.  Valid only during on_rasterize_glyph callbacks.

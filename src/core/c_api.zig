@@ -1127,6 +1127,21 @@ pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
     return box.core.hl.default_bg;
 }
 
+/// Check whether an external grid originated from a floating window
+/// (nvim_open_win with external=true) as opposed to a regular split
+/// window externalized by ext_windows mode.
+/// Returns 1 if the grid is a float-origin external, 0 otherwise.
+/// Thread-safe: acquires grid_mu.
+pub export fn zonvie_core_is_float_external(p: ?*zonvie_core, grid_id: i64) callconv(.c) i32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    box.core.grid_mu.lock();
+    defer box.core.grid_mu.unlock();
+    const info = box.core.grid.external_grids.get(grid_id) orelse return 0;
+    // start_row == -1 means no prior win_pos → created directly as external (float origin)
+    return if (info.start_row < 0) 1 else 0;
+}
+
 /// Get the current emoji cluster context set during flush.
 /// Returns a pointer to the cluster scalars and writes the count to out_len.
 /// Valid only during on_rasterize_glyph callbacks (single-threaded flush context).
