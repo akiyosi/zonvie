@@ -389,7 +389,11 @@ fn drawNormalExternalSurfaceRowMode(
     // The full back_tex→swapchain copy in presentOnlyFromBack handles
     // FLIP_SEQUENTIAL buffer rotation (swapchain buffers don't retain
     // previous content, but back_tex does).
-    const force_full_rows = force_full or glow_enabled;
+    // Transparency mode (opacity < 1.0) must also force full rows:
+    // premultiplied alpha blending accumulates alpha on redrawn rows
+    // unless back_tex is cleared first, which requires force_full to
+    // set preserve_back=false → should_clear=true in drawEx.
+    const force_full_rows = force_full or glow_enabled or (g.opacity < 1.0);
 
     // Build sorted, deduplicated rows_to_draw list.
     var rows_to_draw: std.ArrayListUnmanaged(u32) = .{};
@@ -2101,7 +2105,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             dirty_row_keys.append(app.alloc, @intCast(row_idx)) catch break;
         }
     }
-    const ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
+    var ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
     ext_win.surface.paint_full = false;
 
     // Check if renderer resize is needed (deferred from onExternalVertices to avoid deadlock)
@@ -2148,10 +2152,25 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         // WARNING: D3D/DXGI operations can pump Win32 messages internally.
         // This means WM_APP_CLOSE_EXTERNAL_WINDOW could be processed during resize,
         // freeing ext_win and invalidating our `g` pointer. We must re-validate after resize.
-        if (needs_resize) {
+        //
+        // Also detect client-area size mismatch (e.g. WM_SIZE from user drag-resize)
+        // that was not captured by needs_renderer_resize. If the renderer back_tex
+        // is recreated inside presentOnlyFromBack AFTER row drawing, all drawn
+        // content is lost. Resizing here and forcing a full repaint prevents that.
+        const size_mismatch = blk: {
+            if (needs_resize) break :blk true;
+            var rc: c.RECT = undefined;
+            _ = c.GetClientRect(g.hwnd, &rc);
+            const cw: u32 = @intCast(@max(1, rc.right - rc.left));
+            const ch: u32 = @intCast(@max(1, rc.bottom - rc.top));
+            break :blk (cw != g.width or ch != g.height);
+        };
+        if (size_mismatch) {
             g.resize() catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
             };
+            // back_tex was recreated — force full repaint so all rows are redrawn.
+            ext_paint_full = true;
 
             // After resize, DXGI may have pumped messages. Check if ext_win was closed.
             app.mu.lock();

@@ -760,10 +760,6 @@ pub const Renderer = struct {
         if (should_clear) {
             const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
             clear_rtv(ctx, back_rtv, &clear);
-        } else if (self.opacity < 1.0) {
-            // Force clear in transparency mode even if should_clear is false
-            const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
-            clear_rtv(ctx, back_rtv, &clear);
         }
     
         // ---- Viewport ----
