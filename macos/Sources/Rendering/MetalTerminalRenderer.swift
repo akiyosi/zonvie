@@ -192,6 +192,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var isInFlush: Bool = false       // Core thread only
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
+    private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
     private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
@@ -683,6 +684,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 pendingScrollAccum = ps
             }
         }
+        // Only update lastCommitTime when there are pending visual changes
+        // (dirty rows, dirty rect, or scroll delta). Empty flushes should not
+        // prevent the draw loop from deactivating.
+        if !pendingDirtyRows.isEmpty || pendingDirtyRectPx != nil || pendingScrollAccum != nil {
+            lastCommitTime = mach_absolute_time()
+        }
         lock.unlock()
         isInFlush = false
         let bs = bufferSets[ws]
@@ -694,6 +701,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
         }
+    }
+
+    /// Returns true if a flush was committed within the given time window.
+    /// Used by the draw loop idle detector to avoid premature deactivation
+    /// when flushes complete between vsync intervals.
+    private static let machTimebaseInfo: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    func hadRecentCommit(withinNs: UInt64) -> Bool {
+        lock.lock()
+        let t = lastCommitTime
+        lock.unlock()
+        if t == 0 { return false }
+        let now = mach_absolute_time()
+        let info = Self.machTimebaseInfo
+        let elapsedNs = (now - t) * UInt64(info.numer) / UInt64(info.denom)
+        return elapsedNs < withinNs
     }
 
     /// Returns the committed atlas texture for external grid views.

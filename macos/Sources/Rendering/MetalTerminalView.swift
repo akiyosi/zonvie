@@ -271,6 +271,15 @@ final class MetalTerminalView: MTKView {
 
     /// Called from draw() early-return paths when no rendering was needed.
     func notifyDrawIdle() {
+        // If a flush committed data recently (within ~50ms = ~3 vsync periods),
+        // the "idle" frame is likely a timing race: the flush completed between
+        // the draw's lock snapshot and the next vsync.  Don't count it toward
+        // deactivation, so rapid scrolling doesn't trigger premature on-demand
+        // switching that causes periodic stuttering.
+        if renderer?.hadRecentCommit(withinNs: 50_000_000) == true {
+            activeDrawIdleFrames = 0
+            return
+        }
         activeDrawIdleFrames += 1
         if activeDrawIdleFrames > activeDrawIdleThreshold {
             deactivateDrawLoop()

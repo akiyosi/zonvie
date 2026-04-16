@@ -76,6 +76,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
     private var flushHadContent: Bool = false     // True if vertices were submitted during this flush
     private var commitRevision: UInt64 = 0        // Protected by tripleBufferLock
+    private var lastCommitTime: UInt64 = 0        // Protected by tripleBufferLock — mach_absolute_time of last visual commit
     private var lastDrawnRevision: UInt64 = 0     // Draw only
     private var committedGridRows: UInt32 = 0     // Protected by tripleBufferLock
     private var committedGridCols: UInt32 = 0     // Protected by tripleBufferLock
@@ -326,6 +327,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         enableSetNeedsDisplay = true
     }
 
+    private static let machTimebaseInfo: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    private func hadRecentCommit(withinNs: UInt64) -> Bool {
+        tripleBufferLock.lock()
+        let t = lastCommitTime
+        tripleBufferLock.unlock()
+        if t == 0 { return false }
+        let now = mach_absolute_time()
+        let info = Self.machTimebaseInfo
+        let elapsedNs = (now - t) * UInt64(info.numer) / UInt64(info.denom)
+        return elapsedNs < withinNs
+    }
+
     private func setupScrollbar() {
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled else { return }
@@ -441,6 +459,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             committedGridRows = gridRows
             committedGridCols = gridCols
             commitRevision &+= 1
+            if !pendingDirtyRows.isEmpty || pendingScrollAccum != nil {
+                lastCommitTime = mach_absolute_time()
+            }
             tripleBufferLock.unlock()
         }
         isInFlush = false
@@ -888,7 +909,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
-                // Auto-pause: if no new content for several frames, switch to idle mode
+                // If a visual commit occurred recently, a timing race likely caused
+                // this idle frame. Don't count toward deactivation.
+                if hadRecentCommit(withinNs: 50_000_000) {
+                    activeDrawIdleFrames = 0
+                    return
+                }
                 activeDrawIdleFrames += 1
                 if activeDrawIdleFrames > activeDrawIdleThreshold {
                     deactivateDrawLoop()
