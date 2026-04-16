@@ -242,11 +242,13 @@ fn swapAndShiftRows(
 }
 
 /// Remap slot indices in row_map for a scroll region. Physical data does not move.
-/// Vacated rows get their slots cleared (verts.clearRetainingCapacity + ver bump).
+/// Vacated rows retain their old slot references (shared pool data is NOT modified
+/// to preserve COW safety with the committed set). The caller must ensure that
+/// vacated rows are regenerated via on_vertices_row → cowDetachRow before commit.
 /// ref_counts do not change (same VertexSet, just index rearrangement).
 fn remapRowSlots(
     row_map: []app_mod.RowMapping,
-    pool: *app_mod.SlotPool,
+    _: *app_mod.SlotPool,
     row_start: u32,
     row_end: u32,
     rows_delta: i32,
@@ -279,13 +281,15 @@ fn remapRowSlots(
             if (vi < save_count) {
                 row_map[vacated] = saved[vi];
             }
-            // Clear vacated slot contents (keep slot allocated for reuse)
-            if (row_map[vacated].slot != app_mod.SLOT_NONE) {
-                const slot = &pool.slots.items[row_map[vacated].slot];
-                slot.verts.clearRetainingCapacity();
-                slot.ver +%= 1;
-                slot.origin_row = @intCast(vacated);
-            }
+            // Do NOT modify the shared pool slot data here.
+            // The slot may be referenced by the committed set (ref_count > 1
+            // after shallowCopyVertexSet).  Clearing verts / bumping ver /
+            // changing origin_row would corrupt the committed set's view,
+            // causing empty or mispositioned rows when WM_PAINT reads the
+            // committed set during this flush.
+            // The subsequent on_vertices_row → cowDetachRow will allocate a
+            // fresh slot (ref_count > 1 triggers COW) and write the new
+            // vertex data there, so this clearing was always redundant.
         }
     } else {
         // Scroll down: save vacated slots from bottom of region
@@ -311,13 +315,8 @@ fn remapRowSlots(
             if (vi < save_count) {
                 row_map[vacated] = saved[vi];
             }
-            // Clear vacated slot contents
-            if (row_map[vacated].slot != app_mod.SLOT_NONE) {
-                const slot = &pool.slots.items[row_map[vacated].slot];
-                slot.verts.clearRetainingCapacity();
-                slot.ver +%= 1;
-                slot.origin_row = @intCast(vacated);
-            }
+            // Do NOT modify the shared pool slot data here (same reason
+            // as the scroll-up branch above: COW safety).
         }
     }
 }
