@@ -2708,7 +2708,7 @@ pub const FlushCtx = struct {
                     // Build the set of rows to compose this pass.
                     // Fast path: only touched_rows + prev_cursor_row (frontend retains other rows).
                     // Fallback: all dirty rows (existing behavior).
-                    var regen_rows: [32]u32 = undefined; // 8 touched + cursor + non-scroll dirty rows
+                    var regen_rows: [48]u32 = undefined; // 32 touched + cursor + non-scroll dirty rows
                     var regen_count: u32 = 0;
                     var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
 

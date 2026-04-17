@@ -89,23 +89,26 @@ test "putCellGrid with 3 distinct touched rows" {
     try std.testing.expectEqual(@as(u8, 3), g.scroll_touched_count);
 }
 
-test "touched row overflow invalidates pending_scroll" {
+test "touched row overflow blocks fast path but preserves pending_scroll" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
 
     g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
-    // Fill up all 8 slots
+    // Fill up all 32 slots (scroll_touched_rows capacity)
     var i: u32 = 0;
-    while (i < 8) : (i += 1) {
+    while (i < 32) : (i += 1) {
         g.putCellGrid(2, i, 0, 'X', i);
     }
     try std.testing.expect(g.pending_scroll != null);
+    try std.testing.expect(!g.scroll_fast_path_blocked);
 
-    // 9th distinct row overflows
-    g.putCellGrid(2, 8, 0, 'Y', 8);
-    try std.testing.expect(g.pending_scroll == null);
-    try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
+    // 33rd distinct row overflows — blocks fast path but keeps pending_scroll
+    // so subsequent grid_scroll events in the same batch can still accumulate.
+    g.putCellGrid(2, 32, 0, 'Y', 32);
+    try std.testing.expect(g.pending_scroll != null);
+    try std.testing.expect(g.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(u8, 32), g.scroll_touched_count);
 }
 
 test "second scrollGrid accumulates when same grid and region" {

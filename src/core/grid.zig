@@ -936,8 +936,10 @@ pub const Grid = struct {
 
     // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
     // These are global grid coordinates (already offset by win_pos for sub-grids).
-    // Tracked as a fixed-size array to avoid allocation. Overflow invalidates pending_scroll.
-    scroll_touched_rows: [8]u32 = undefined,
+    // Tracked as a fixed-size array to avoid allocation.  Capacity 32 covers
+    // high-speed mouse wheel batches (e.g. 10 grid_scroll × 3 grid_line rows).
+    // Overflow blocks fast path but preserves pending_scroll for delta accumulation.
+    scroll_touched_rows: [32]u32 = undefined,
     scroll_touched_count: u8 = 0,
 
     // Previous cursor row before grid_cursor_goto update.
@@ -1294,7 +1296,15 @@ pub const Grid = struct {
 
     /// Record a row touched by grid_line while a pending_scroll is active.
     /// Uses global grid coordinates. Deduplicates entries.
-    /// On overflow, invalidates pending_scroll (too many touched rows for fast path).
+    /// On overflow, blocks fast path but preserves pending_scroll for delta accumulation.
+    ///
+    /// Overflow fallback behaviour per frontend:
+    ///   macOS  – applyMainRowScrollRaw (MetalTerminalRenderer.swift) is NOT called;
+    ///            fallback clears back texture and redraws all dirty rows from scratch.
+    ///   Windows – onMainRowScroll (callbacks.zig) is NOT called;
+    ///            fallback regenerates all dirty rows via on_vertices_row.
+    /// Both paths produce correct output because the full dirty set covers
+    /// every row affected by the accumulated scroll.
     fn recordScrollTouchedRow(self: *Grid, row: u32) void {
         if (self.pending_scroll == null) return;
 
@@ -1303,10 +1313,15 @@ pub const Grid = struct {
             if (r == row) return;
         }
 
-        // Overflow: too many distinct touched rows, invalidate scroll optimization
+        // Overflow: too many distinct touched rows for fast path tracking.
+        // Block fast path but KEEP pending_scroll so the accumulated delta
+        // is preserved for subsequent grid_scroll events in the same batch.
+        // Setting pending_scroll = null here would lose the accumulated rows
+        // delta; the next grid_scroll would create a fresh pending_scroll
+        // with only its own partial delta, causing the scroll cache fast
+        // path to shift by the wrong amount.
         if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
-            self.pending_scroll = null;
-            self.scroll_touched_count = 0;
+            self.scroll_fast_path_blocked = true;
             return;
         }
 

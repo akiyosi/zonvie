@@ -173,6 +173,10 @@ pub const Renderer = struct {
     // Staging texture for back_tex scroll (same size/format, lazily created)
     scroll_staging_tex: ?*c.ID3D11Texture2D = null,
 
+    // Cached VB for drawing bg-fill quads on empty rows (6 verts, lazily created).
+    clear_row_vb: ?*c.ID3D11Buffer = null,
+    clear_row_vb_bg: u32 = 0xFFFFFFFF,
+
     // Pipeline
     vs: ?*c.ID3D11VertexShader = null,
     ps: ?*c.ID3D11PixelShader = null,
@@ -448,6 +452,7 @@ pub const Renderer = struct {
         safeRelease(&self.back_rtv);
         safeRelease(&self.back_tex);
         safeRelease(&self.scroll_staging_tex);
+        safeRelease(&self.clear_row_vb);
 
         if (applog.isEnabled()) {
             applog.appLog(
@@ -580,6 +585,7 @@ pub const Renderer = struct {
         safeRelease(&self.back_rtv);
         safeRelease(&self.back_tex);
         safeRelease(&self.scroll_staging_tex);
+        safeRelease(&self.clear_row_vb);
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -2085,6 +2091,43 @@ pub const Renderer = struct {
 
         const draw_fn = ctx_vtbl.*.Draw orelse return error.D3DDrawMissing;
         draw_fn(ctx, @intCast(vert_count), 0);
+    }
+
+    /// Draw a fullscreen bg-fill quad clipped by the current scissor rect.
+    /// Used for rows with vert_count==0 ("clear row" per core contract).
+    /// Lazily creates and caches a 6-vertex VB with the default bg color.
+    pub fn drawClearRow(self: *Renderer) !void {
+        const bg_rgb = self.default_bg_rgb.load(.acquire);
+        const need_rebuild = (self.clear_row_vb == null or bg_rgb != self.clear_row_vb_bg);
+
+        if (need_rebuild) {
+            // Straight-alpha (non-premultiplied) bg color.
+            // Pixel shader applies premultiply(i.col) for UV==(-1,-1) vertices.
+            var r_f: f32 = 0;
+            var g_f: f32 = 0;
+            var b_f: f32 = 0;
+            if (bg_rgb != 0xFFFFFFFF) {
+                r_f = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
+                g_f = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
+                b_f = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
+            }
+            const col = [4]f32{ r_f, g_f, b_f, self.opacity };
+            const verts = [6]core.Vertex{
+                .{ .position = .{ -1.0, -1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+                .{ .position = .{ 1.0, -1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+                .{ .position = .{ -1.0, 1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+                .{ .position = .{ -1.0, 1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+                .{ .position = .{ 1.0, -1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+                .{ .position = .{ 1.0, 1.0 }, .texCoord = .{ -1.0, -1.0 }, .color = col, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 },
+            };
+            if (self.clear_row_vb == null) {
+                var dummy_bytes: usize = 0;
+                try self.ensureExternalVertexBuffer(&self.clear_row_vb, &dummy_bytes, 6 * @sizeOf(core.Vertex));
+            }
+            try self.uploadVertsToVB(self.clear_row_vb.?, &verts);
+            self.clear_row_vb_bg = bg_rgb;
+        }
+        try self.drawVB(self.clear_row_vb.?, 6);
     }
 
     /// Set viewport and scissor to full window size.

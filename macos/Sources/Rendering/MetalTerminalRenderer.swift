@@ -1278,6 +1278,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             guard let cmd = queue.makeCommandBuffer() else {
                 return
             }
+            // GPU scroll blit: shift back texture pixels and expand dirty rows.
+            // Windows equivalent: applyScrollShift (windows/app.zig) which calls
+            // scrollBackTex + shiftRowVBs + gap row expansion.
+            // When fast path is blocked (pendingScroll == nil), both platforms
+            // skip the blit and redraw all dirty rows from scratch.
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             if useGpuScrollCopy, let pendingScroll = pendingScroll {
                 scrollClearBand = encodePendingMainRowScrollCopy(
@@ -2463,6 +2468,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return hasPresentedOnce && backBuffer != nil
     }
 
+    /// Shift row slot indices for scroll region. Windows equivalent: remapRowSlots (windows/callbacks.zig).
+    /// Vacated rows retain old slot references (COW safety); on_vertices_row replaces them later.
     private func remapMainRowSlots(
         setIdx: Int,
         rowStart: Int,
@@ -2694,6 +2701,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Core on_main_row_scroll callback — shift row slot mappings for scroll fast path.
+    /// Windows equivalent: onMainRowScroll (windows/callbacks.zig).
+    /// Called only when core's checkScrollFastPath returns eligible.
+    /// When scroll_fast_path_blocked (e.g. touched-row overflow in
+    /// Grid.recordScrollTouchedRow), this is NOT called and both frontends
+    /// fall back to full dirty-row regeneration via on_vertices_row.
     func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
         guard isInFlush else {
             ZonvieCore.appLog("[WARNING] applySurfaceRowScrollRaw called outside flush bracket")

@@ -242,6 +242,7 @@ fn swapAndShiftRows(
 }
 
 /// Remap slot indices in row_map for a scroll region. Physical data does not move.
+/// macOS equivalent: remapMainRowSlots (MetalTerminalRenderer.swift).
 /// Vacated rows retain their old slot references (shared pool data is NOT modified
 /// to preserve COW safety with the committed set). The caller must ensure that
 /// vacated rows are regenerated via on_vertices_row → cowDetachRow before commit.
@@ -1185,14 +1186,17 @@ pub fn onVerticesRow(
     }
 
     // Mark the row valid only when we have exact single-row vertex data.
-    if (app.surface.rows != 0 and row_count == 1) {
+    // Use total_rows (content rows from core) for seed completion, not
+    // app.surface.rows (global grid rows) which includes tabline/statusline
+    // rows that never receive on_vertices_row callbacks.
+    if (total_rows != 0 and row_count == 1) {
         const idx: usize = @intCast(row_start);
         if (idx < app.row_valid.bit_length and !app.row_valid.isSet(idx)) {
             app.row_valid.set(idx);
             app.row_valid_count += 1;
         }
-        if (app.row_valid_count == app.surface.rows) {
-            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{app.surface.rows});
+        if (app.row_valid_count >= total_rows) {
+            if (applog.isEnabled()) applog.appLog("[win] on_vertices_row seed_ready rows={d}\n", .{total_rows});
         }
     }
 
@@ -1200,6 +1204,12 @@ pub fn onVerticesRow(
     app.flush_needs_invalidate = true;
 }
 
+/// Core on_main_row_scroll callback — shift row slot mappings for scroll fast path.
+/// macOS equivalent: applyMainRowScrollRaw (MetalTerminalRenderer.swift).
+/// Called only when core's checkScrollFastPath returns eligible.
+/// When scroll_fast_path_blocked (e.g. touched-row overflow in
+/// Grid.recordScrollTouchedRow), this is NOT called and both frontends
+/// fall back to full dirty-row regeneration via on_vertices_row.
 pub fn onMainRowScroll(
     ctx: ?*anyopaque,
     row_start: u32,
@@ -1213,6 +1223,11 @@ pub fn onMainRowScroll(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     app.mu.lock();
     defer app.mu.unlock();
+
+    if (applog.isEnabled()) applog.appLog(
+        "[scroll_diag] onMainRowScroll row_start={d} row_end={d} rows_delta={d} total_rows={d} total_cols={d}\n",
+        .{ row_start, row_end, rows_delta, total_rows, total_cols },
+    );
 
     if (rows_delta == 0 or row_end <= row_start) return;
     if (col_start != 0 or col_end != total_cols) return;

@@ -690,7 +690,10 @@ pub export fn WndProc(
                     }
                 }
 
-                var effective_rows: u32 = rows_snapshot;
+                // Use committed.rows (content rows from core) as the baseline,
+                // not app.surface.rows (global grid rows) which includes
+                // tabline/statusline rows that never receive vertex data.
+                var effective_rows: u32 = committed.rows;
                 var rows_mismatch: bool = false;
                 if (row_mode and row_mode_max_row_end_snapshot != 0 and row_mode_max_row_end_snapshot < effective_rows) {
                     effective_rows = row_mode_max_row_end_snapshot;
@@ -1339,8 +1342,8 @@ pub export fn WndProc(
                         };
 
                         if (log_enabled) applog.appLog(
-                            "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d}\n",
-                            .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len },
+                            "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d} committed_rows={d} committed_cols={d} row_map_len={d}\n",
+                            .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
                         );
 
                         const drawn_rows = row_draw_result.metrics.drawn_rows;

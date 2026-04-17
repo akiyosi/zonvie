@@ -1418,6 +1418,10 @@ pub const ScrollShiftResult = struct {
 
 /// Apply scroll pixel shift to back_tex, shift row_vbs, and add cursor ghost
 /// rows to rows_to_draw.  Shared between main window and external windows.
+/// macOS equivalent: encodePendingMainRowScrollCopy + dirty row expansion
+/// in MetalTerminalRenderer.draw().
+/// When fast path is blocked (no scroll_rect), both platforms skip this
+/// entirely and redraw all dirty rows from scratch.
 ///
 /// Parameters:
 ///   g:                   Renderer owning back_tex
@@ -1445,6 +1449,11 @@ pub fn applyScrollShift(
     y_offset: i32,
 ) ScrollShiftResult {
     if (scroll_dy_px == 0) return .{};
+
+    if (applog.isEnabled()) applog.appLog(
+        "[scroll_diag] applyScrollShift dy_px={d} vb_shift={d} row_vbs_len={d} rect=({d},{d},{d},{d}) row_h={d} eff_rows={d}\n",
+        .{ scroll_dy_px, vb_shift_rows, row_vbs.len, scroll_rect.left, scroll_rect.top, scroll_rect.right, scroll_rect.bottom, row_h_px, effective_rows },
+    );
 
     // 1. Shift row_vbs to keep VB upload state aligned with row_map.
     if (vb_shift_rows != 0) {
@@ -1596,9 +1605,25 @@ pub fn drawSurfaceRowsVBFromSlots(
         const slot = &pool.slots.items[mapping.slot];
         const src = slot.verts.items;
         if (src.len == 0) {
-            metrics.skipped_empty += 1;
-            if (metrics.first_empty_row == null) {
-                metrics.first_empty_row = row;
+            // Core sends vert_count==0 as "clear row" (flush.zig:2904).
+            // Draw a bg-fill quad to overwrite stale back_tex pixels.
+            if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
+                const clear_top = y_offset + @as(i32, @intCast(row)) * row_h_px;
+                const clear_bot = clear_top + row_h_px;
+                var sc: c.D3D11_RECT = .{ .left = x_offset, .top = clear_top, .right = content_right, .bottom = clear_bot };
+                rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+                if (vp_dirty) {
+                    if (rs_set_vp_fn) |vp_fn| {
+                        var vp: c.D3D11_VIEWPORT = .{ .TopLeftX = base_vp.x, .TopLeftY = base_vp.y, .Width = base_vp.w, .Height = base_vp.h, .MinDepth = 0, .MaxDepth = 1 };
+                        vp_fn(ctx_ptr, 1, &vp);
+                        vp_dirty = false;
+                    }
+                }
+                g.drawClearRow() catch {};
+                metrics.drawn_rows += 1;
+            } else {
+                metrics.skipped_empty += 1;
+                if (metrics.first_empty_row == null) metrics.first_empty_row = row;
             }
             continue;
         }
