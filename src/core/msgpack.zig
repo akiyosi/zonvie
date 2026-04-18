@@ -254,3 +254,86 @@ pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
         else => {},
     }
 }
+
+/// Bridge helper: materialize a single `Value` tree from a streaming decoder.
+///
+/// Not used in production: the streaming redraw fast path that exercised
+/// this helper was reverted after microbenchmarks (`zig build bench`)
+/// showed a 1.24x–1.94x decode-path slowdown. The helper is retained as
+/// a reference implementation for any future rewrite that drops the
+/// intermediate `Value` tree on the `grid_line` hot path — that future
+/// design will want a stream-oriented bridge and this is the shape of
+/// it. String / bin / ext payloads are duplicated into `alloc` since
+/// `InnerDecoder` returns zero-copy views into the caller's input buffer
+/// (e.g., `FrameReader`'s backing store, which can be moved by a later
+/// `fill()`), and long-lived `Value`s must not alias that storage.
+///
+/// Possible errors:
+///   * `error.UnsupportedType` — MessagePack `u64` values exceeding
+///     `maxInt(i64)`. Neovim never emits these in practice.
+///   * `Allocator.Error.OutOfMemory` — from any nested allocation.
+pub fn decodeFromStream(alloc: std.mem.Allocator, in: *mps.InnerDecoder) !Value {
+    const head = try in.readHead();
+    return switch (head) {
+        .Null => .nil,
+        .Bool => |b| .{ .bool = b },
+        .Int => |v| .{ .int = v },
+        .UInt => |v| if (v > std.math.maxInt(i64))
+            error.UnsupportedType
+        else
+            .{ .int = @intCast(v) },
+        .Float32 => |f| .{ .float = @floatCast(f) },
+        .Float64 => |f| .{ .float = f },
+        .Str => |n| blk: {
+            if (in.data.len < n) return error.EOFError;
+            const slice = in.data[0..n];
+            in.data = in.data[n..];
+            const owned = try alloc.dupe(u8, slice);
+            break :blk .{ .str = owned };
+        },
+        .Bin => |n| blk: {
+            if (in.data.len < n) return error.EOFError;
+            const slice = in.data[0..n];
+            in.data = in.data[n..];
+            const owned = try alloc.dupe(u8, slice);
+            break :blk .{ .str = owned };
+        },
+        .Ext => |h| blk: {
+            if (in.data.len < h.size) return error.EOFError;
+            const slice = in.data[0..h.size];
+            in.data = in.data[h.size..];
+            // Match `mp.decode` behaviour: if the payload parses as a single
+            // integer, unwrap it into `.int` for the Neovim handle convention.
+            var probe = mps.InnerDecoder{ .data = slice };
+            if (probe.readHead()) |ph| {
+                switch (ph) {
+                    .Int => |iv| if (probe.data.len == 0) break :blk .{ .int = iv },
+                    .UInt => |uv| if (probe.data.len == 0 and uv <= std.math.maxInt(i64)) break :blk .{ .int = @intCast(uv) },
+                    else => {},
+                }
+            } else |_| {}
+            const owned = try alloc.dupe(u8, slice);
+            break :blk .{ .ext = .{ .type_code = h.kind, .data = owned } };
+        },
+        .Array => |n| blk: {
+            const items = try alloc.alloc(Value, n);
+            var idx: usize = 0;
+            while (idx < n) : (idx += 1) {
+                items[idx] = try decodeFromStream(alloc, in);
+            }
+            break :blk .{ .arr = items };
+        },
+        .Map => |n| blk: {
+            const pairs = try alloc.alloc(Pair, n);
+            var idx: usize = 0;
+            while (idx < n) : (idx += 1) {
+                const k = try decodeFromStream(alloc, in);
+                const v = try decodeFromStream(alloc, in);
+                pairs[idx] = .{ .key = k, .val = v };
+            }
+            break :blk .{ .map = pairs };
+        },
+    };
+}
+
+const mps = @import("mpack_stream.zig");

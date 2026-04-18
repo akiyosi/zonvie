@@ -127,6 +127,17 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(msgpack_tests).step);
 
+    // Streaming MessagePack decoder tests (inline tests in src/core/mpack_stream.zig)
+    const mpack_stream_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/mpack_stream.zig"),
+    });
+    const mpack_stream_tests = b.addTest(.{
+        .root_module = mpack_stream_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(mpack_stream_tests).step);
+
     // Scroll fast path tests
     const scroll_test_mod = b.createModule(.{
         .target = target,
@@ -186,4 +197,33 @@ pub fn build(b: *std.Build) !void {
         .root_module = lig_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(lig_tests).step);
+
+    // mpack decode-path micro benchmark. Built in ReleaseFast regardless
+    // of the top-level optimize option so numbers reflect release perf.
+    // Run: `zig build bench`.
+    const bench_step = b.step("bench", "Run mpack decode-path benchmarks (ReleaseFast)");
+    const bench_core_mod = b.createModule(.{
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .root_source_file = b.path("src/core/c_api.zig"),
+        .imports = &.{
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const bench_mod = b.createModule(.{
+        .target = target,
+        .optimize = .ReleaseFast,
+        .root_source_file = b.path("test/mpack_bench.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = bench_core_mod },
+        },
+    });
+    const bench_tests = b.addTest(.{
+        .root_module = bench_mod,
+    });
+    const bench_run = b.addRunArtifact(bench_tests);
+    // Force rerun — benchmarks are not cached.
+    bench_run.has_side_effects = true;
+    bench_step.dependOn(&bench_run.step);
 }
