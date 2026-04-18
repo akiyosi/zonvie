@@ -842,7 +842,13 @@ pub fn handleRedrawStream(
         const synth_params = try arena.alloc(mp.Value, 1);
         synth_params[0] = .{ .arr = synth_ev };
 
-        try handleRedraw(
+        // Dispatch errors from `handleRedraw` (e.g. frontend vertex-submission
+        // callback failures) are logged and swallowed here, matching the
+        // Value-tree path which catches `handleRedraw` at the rpc_session
+        // call site. Only decode-side failures in the `decodeFromStream`
+        // loop above are fatal and propagate upward — mirroring the old
+        // `mp.decode` failure semantics.
+        handleRedraw(
             grid,
             hl,
             arena,
@@ -856,7 +862,9 @@ pub fn handleRedrawStream(
             linespace_fn,
             set_title_fn,
             default_colors_fn,
-        );
+        ) catch |re| {
+            log.write("redraw dispatch err: {any}\n", .{re});
+        };
     }
 }
 
