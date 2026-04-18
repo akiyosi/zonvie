@@ -13,6 +13,60 @@ const Highlights = hlmod.Highlights;
 const Styles = hlmod.Styles;
 const Logger = @import("log.zig").Logger;
 
+/// All redraw events handled by `handleRedraw`. Order is not significant;
+/// `std.meta.stringToEnum` is used for perfect-hash-style dispatch.
+/// Unknown event names (e.g., future Neovim additions) return null and are skipped.
+pub const RedrawEvent = enum {
+    grid_resize,
+    grid_clear,
+    grid_cursor_goto,
+    grid_destroy,
+    win_split,
+    win_resize,
+    win_move,
+    win_exchange,
+    win_rotate,
+    win_resize_equal,
+    win_pos,
+    win_hide,
+    win_close,
+    win_viewport,
+    win_viewport_margins,
+    win_float_pos,
+    win_external_pos,
+    msg_set_pos,
+    grid_scroll,
+    hl_attr_define,
+    hl_group_set,
+    default_colors_set,
+    option_set,
+    mode_info_set,
+    mode_change,
+    busy_start,
+    busy_stop,
+    grid_line,
+    cmdline_show,
+    cmdline_hide,
+    cmdline_pos,
+    cmdline_special_char,
+    cmdline_block_show,
+    cmdline_block_append,
+    cmdline_block_hide,
+    popupmenu_show,
+    popupmenu_hide,
+    popupmenu_select,
+    tabline_update,
+    msg_show,
+    msg_clear,
+    msg_showmode,
+    msg_showcmd,
+    msg_ruler,
+    msg_history_show,
+    msg_history_clear,
+    set_title,
+    flush,
+};
+
 /// Parse Neovim ext type handle (tab, buffer, window handles).
 /// Neovim sends handles as ext types with data containing big-endian integer.
 fn parseExtHandle(ext: mp.Ext) i64 {
@@ -492,7 +546,8 @@ pub fn handleRedraw(
             }
         }
 
-        if (std.mem.eql(u8, name, "grid_resize")) {
+        const ev_tag = std.meta.stringToEnum(RedrawEvent, name) orelse continue;
+        switch (ev_tag) { .grid_resize => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -519,7 +574,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });
             }
 
-        } else if (std.mem.eql(u8, name, "grid_clear")) {
+        }, .grid_clear => {
             if (tuples.len == 0) {
                 grid.clearGrid(1);
             } else {
@@ -534,7 +589,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "grid_cursor_goto")) {
+        }, .grid_cursor_goto => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -549,7 +604,7 @@ pub fn handleRedraw(
                 grid.setCursor(grid_id, row, col);
             }
 
-        } else if (std.mem.eql(u8, name, "grid_destroy")) {
+        }, .grid_destroy => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -559,7 +614,7 @@ pub fn handleRedraw(
                 grid.destroyGrid(grid_id);
             }
 
-        } else if (std.mem.eql(u8, name, "win_split")) {
+        }, .win_split => {
             // win_split (ext_windows): [win1, grid1, win2, grid2, flags]
             // win1/grid1 = source window, win2/grid2 = new window
             // flags: 0=below, 1=above, 2=right, 3=left
@@ -589,7 +644,7 @@ pub fn handleRedraw(
                 grid.ext_windows_grids.put(grid.alloc, grid2, win2) catch {};
             }
 
-        } else if (std.mem.eql(u8, name, "win_resize")) {
+        }, .win_resize => {
             // win_resize (ext_windows): [win, grid, width, height]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -622,7 +677,7 @@ pub fn handleRedraw(
                 };
             }
 
-        } else if (std.mem.eql(u8, name, "win_move")) {
+        }, .win_move => {
             // win_move (ext_windows): [win, grid, flags]
             // flags: 0=below, 1=above, 2=right, 3=left
             for (tuples) |tv| {
@@ -646,7 +701,7 @@ pub fn handleRedraw(
                 };
             }
 
-        } else if (std.mem.eql(u8, name, "win_exchange")) {
+        }, .win_exchange => {
             // win_exchange (ext_windows): [win, grid, count]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -669,7 +724,7 @@ pub fn handleRedraw(
                 };
             }
 
-        } else if (std.mem.eql(u8, name, "win_rotate")) {
+        }, .win_rotate => {
             // win_rotate (ext_windows): [win, grid, direction, count]
             // direction: 0=downward, 1=upward
             for (tuples) |tv| {
@@ -695,7 +750,7 @@ pub fn handleRedraw(
                 };
             }
 
-        } else if (std.mem.eql(u8, name, "win_resize_equal")) {
+        }, .win_resize_equal => {
             // win_resize_equal (ext_windows): no parameters
             log.write("[win_resize_equal]\n", .{});
 
@@ -705,7 +760,7 @@ pub fn handleRedraw(
                 log.write("[win_resize_equal] pending_win_ops.append failed: {any}\n", .{e});
             };
 
-        } else if (std.mem.eql(u8, name, "win_pos")) {
+        }, .win_pos => {
             // win_pos: [grid, win, startrow, startcol, width, height]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -743,9 +798,9 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "win_hide") or std.mem.eql(u8, name, "win_close")) {
+        }, .win_hide, .win_close => {
             // win_hide/win_close: [grid]
-            const is_close = std.mem.eql(u8, name, "win_close");
+            const is_close = ev_tag == .win_close;
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -766,7 +821,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "win_viewport")) {
+        }, .win_viewport => {
             // win_viewport: [grid, win, topline, botline, curline, curcol, line_count, scroll_delta]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -787,7 +842,7 @@ pub fn handleRedraw(
                 try grid.setViewport(grid_id, topline, botline, curline, curcol, line_count, scroll_delta);
             }
 
-        } else if (std.mem.eql(u8, name, "win_viewport_margins")) {
+        }, .win_viewport_margins => {
             // win_viewport_margins: [grid, win, top, bottom, left, right]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -806,7 +861,7 @@ pub fn handleRedraw(
                 try grid.setViewportMargins(grid_id, top, bottom, left, right);
             }
 
-        } else if (std.mem.eql(u8, name, "win_float_pos")) {
+        }, .win_float_pos => {
 
 
             // Observed (older nvim): [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled, zindex]
@@ -954,7 +1009,7 @@ pub fn handleRedraw(
                 );
             }
 
-        } else if (std.mem.eql(u8, name, "win_external_pos")) {
+        }, .win_external_pos => {
             // win_external_pos: [grid, win]
             // Marks a grid as "external" - to be displayed in a separate top-level window.
             for (tuples) |tv| {
@@ -973,7 +1028,7 @@ pub fn handleRedraw(
                 _ = is_new; // Callback notification is handled by nvim_core after redraw processing
             }
 
-        } else if (std.mem.eql(u8, name, "msg_set_pos")) {
+        }, .msg_set_pos => {
             // msg_set_pos: [grid, row, scrolled, sep_char, zindex, compindex]
             // The message grid is positioned on the default grid (grid=1) at the given row,
             // covering the full width. Treat it like an overlay layer (zindex is typically 200).
@@ -1009,7 +1064,7 @@ pub fn handleRedraw(
 
             }
 
-        } else if (std.mem.eql(u8, name, "grid_scroll")) {
+        }, .grid_scroll => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1056,7 +1111,7 @@ pub fn handleRedraw(
                 grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
             }
 
-        } else if (std.mem.eql(u8, name, "hl_attr_define")) {
+        }, .hl_attr_define => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1102,7 +1157,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "hl_group_set")) {
+        }, .hl_group_set => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1114,7 +1169,7 @@ pub fn handleRedraw(
                 try hl.setGroup(group_name, hl_id_u32);
             }
 
-        } else if (std.mem.eql(u8, name, "default_colors_set")) {
+        }, .default_colors_set => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1130,7 +1185,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "option_set")) {
+        }, .option_set => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1214,7 +1269,7 @@ pub fn handleRedraw(
 
             }
 
-        } else if (std.mem.eql(u8, name, "mode_info_set")) {
+        }, .mode_info_set => {
             // ["mode_info_set", cursor_style_enabled, mode_info]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1293,7 +1348,7 @@ pub fn handleRedraw(
             grid.cursor_rev +%= 1;
 
 
-        } else if (std.mem.eql(u8, name, "mode_change")) {
+        }, .mode_change => {
             // ["mode_change", mode, mode_idx]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1363,14 +1418,14 @@ pub fn handleRedraw(
             grid.cursor_rev +%= 1;
 
 
-        } else if (std.mem.eql(u8, name, "busy_start")) {
+        }, .busy_start => {
             grid.cursor_visible = false;
             grid.cursor_rev +%= 1;
-        } else if (std.mem.eql(u8, name, "busy_stop")) {
+        }, .busy_stop => {
             grid.cursor_visible = true;
             grid.cursor_rev +%= 1;
 
-        } else if (std.mem.eql(u8, name, "grid_line")) {
+        }, .grid_line => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1481,7 +1536,7 @@ pub fn handleRedraw(
         // =====================================================================
         // ext_cmdline events
         // =====================================================================
-        } else if (std.mem.eql(u8, name, "cmdline_show")) {
+        }, .cmdline_show => {
             // cmdline_show: [[content, pos, firstc, prompt, indent, level, hl_id], ...]
             // content is array of [attr, text, hl_id] tuples
             for (tuples) |tv| {
@@ -1521,7 +1576,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("cmdline_show pos={d} firstc={c} level={d}\n", .{ pos, firstc, level });
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_hide")) {
+        }, .cmdline_hide => {
             // cmdline_hide: [[level], ...] or [level, abort]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1533,7 +1588,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("cmdline_hide level={d}\n", .{level});
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_pos")) {
+        }, .cmdline_pos => {
             // cmdline_pos: [[pos, level], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1548,7 +1603,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("cmdline_pos pos={d} level={d}\n", .{ pos, level });
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_special_char")) {
+        }, .cmdline_special_char => {
             // cmdline_special_char: [[c, shift, level], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1573,7 +1628,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_block_show")) {
+        }, .cmdline_block_show => {
             // cmdline_block_show: [[lines], ...]
             // lines is array of arrays of [attrs, text] tuples (same format as cmdline content)
             for (tuples) |tv| {
@@ -1602,7 +1657,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("cmdline_block_show lines={d}\n", .{lines.items.len});
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_block_append")) {
+        }, .cmdline_block_append => {
             // cmdline_block_append: [[line], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1625,7 +1680,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("cmdline_block_append\n", .{});
             }
 
-        } else if (std.mem.eql(u8, name, "cmdline_block_hide")) {
+        }, .cmdline_block_hide => {
             // cmdline_block_hide: []
             grid.hideCmdlineBlock();
             if (log.cb != null) log.write("cmdline_block_hide\n", .{});
@@ -1633,7 +1688,7 @@ pub fn handleRedraw(
         // =====================================================================
         // ext_popupmenu events
         // =====================================================================
-        } else if (std.mem.eql(u8, name, "popupmenu_show")) {
+        }, .popupmenu_show => {
             // popupmenu_show: [[items, selected, row, col, grid], ...]
             // items: [[word, kind, menu, info], ...]
             for (tuples) |tv| {
@@ -1671,12 +1726,12 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("popupmenu_show items={d} selected={d} row={d} col={d} grid={d}\n", .{ items.items.len, selected, row, col, grid_id });
             }
 
-        } else if (std.mem.eql(u8, name, "popupmenu_hide")) {
+        }, .popupmenu_hide => {
             // popupmenu_hide: []
             grid.setPopupmenuHide();
             if (log.cb != null) log.write("popupmenu_hide\n", .{});
 
-        } else if (std.mem.eql(u8, name, "popupmenu_select")) {
+        }, .popupmenu_select => {
             // popupmenu_select: [[selected], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1688,7 +1743,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("popupmenu_select selected={d}\n", .{selected});
             }
 
-        } else if (std.mem.eql(u8, name, "tabline_update")) {
+        }, .tabline_update => {
             // tabline_update: [[curtab, tabs, curbuf, buffers], ...]
             // tabs: [{tab: Integer, name: String}, ...]
             // buffers: [{buffer: Integer, name: String}, ...]
@@ -1755,7 +1810,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("tabline_update curtab={d} tabs={d} curbuf={d} buffers={d}\n", .{ curtab, tabs.items.len, curbuf, buffers.items.len });
             }
 
-        } else if (std.mem.eql(u8, name, "msg_show")) {
+        }, .msg_show => {
             // msg_show: [[kind, content, replace_last, history, append, msg_id], ...]
             // content: [[attr_id, text_chunk, hl_id], ...]
             for (tuples) |tv| {
@@ -1792,12 +1847,12 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("msg_show kind={s} chunks={d} replace_last={} history={} append={} msg_id={d}\n", .{ kind, chunks.items.len, replace_last, history, append_flag, msg_id });
             }
 
-        } else if (std.mem.eql(u8, name, "msg_clear")) {
+        }, .msg_clear => {
             // msg_clear: []
             grid.setMsgClear();
             if (log.cb != null) log.write("msg_clear\n", .{});
 
-        } else if (std.mem.eql(u8, name, "msg_showmode")) {
+        }, .msg_showmode => {
             // msg_showmode: [[content], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1817,7 +1872,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("msg_showmode chunks={d}\n", .{chunks.items.len});
             }
 
-        } else if (std.mem.eql(u8, name, "msg_showcmd")) {
+        }, .msg_showcmd => {
             // msg_showcmd: [[content], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1837,7 +1892,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("msg_showcmd chunks={d}\n", .{chunks.items.len});
             }
 
-        } else if (std.mem.eql(u8, name, "msg_ruler")) {
+        }, .msg_ruler => {
             // msg_ruler: [[content], ...]
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1857,7 +1912,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("msg_ruler chunks={d}\n", .{chunks.items.len});
             }
 
-        } else if (std.mem.eql(u8, name, "msg_history_show")) {
+        }, .msg_history_show => {
             // msg_history_show: [[entries, prev_cmd], ...]
             // entries: [[kind, content, append], ...]
             // content: [[hl_id, text], ...]
@@ -1922,12 +1977,12 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("msg_history_show entries={d} prev_cmd={}\n", .{ entries.items.len, prev_cmd });
             }
 
-        } else if (std.mem.eql(u8, name, "msg_history_clear")) {
+        }, .msg_history_clear => {
             // msg_history_clear: []
             grid.setMsgHistoryClear();
             if (log.cb != null) log.write("msg_history_clear\n", .{});
 
-        } else if (std.mem.eql(u8, name, "set_title")) {
+        }, .set_title => {
             // set_title: [title]
             if (set_title_fn) |fn_ptr| {
                 for (tuples) |tv| {
@@ -1941,7 +1996,7 @@ pub fn handleRedraw(
                 }
             }
 
-        } else if (std.mem.eql(u8, name, "flush")) {
+        }, .flush => {
             if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
             if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
                 const now_ns = std.time.nanoTimestamp();
@@ -1955,7 +2010,7 @@ pub fn handleRedraw(
             // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
             // inside onFlush on successful completion. On abort, all state is
             // preserved for the next flush attempt.
-        }
+        } }
     }
 }
 
