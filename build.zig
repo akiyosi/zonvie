@@ -138,6 +138,22 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(mpack_stream_tests).step);
 
+    // Redraw parity tests: identical byte streams through mp.decode+handleRedraw
+    // vs handleRedrawStream must produce bit-identical grid/hl/callback state.
+    const redraw_parity_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/redraw_parity_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const redraw_parity_tests = b.addTest(.{
+        .root_module = redraw_parity_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(redraw_parity_tests).step);
+
     // Scroll fast path tests
     const scroll_test_mod = b.createModule(.{
         .target = target,
