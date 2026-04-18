@@ -1,19 +1,42 @@
-// mpack_bench.zig — decode-path micro benchmark.
+// mpack_bench.zig — redraw decode-path and full-path micro benchmarks.
 //
-// SCOPE: this benchmark measures the MessagePack *decode path only* —
-// reading bytes into a `Value` tree. It does NOT capture end-to-end
-// redraw timing, which is also influenced by flush scheduling, grid
-// state updates, highlight resolution, vertex generation, and frontend
-// rendering. A 1.9x slowdown on decode translates to a much smaller
-// fraction of a real redraw's wall-clock. Use these numbers to reason
-// about decoder design only; use instrumented end-to-end measurements
-// when reasoning about user-visible latency.
+// Two independent `test`-blocks:
 //
-// The Variant B/C helpers below intentionally retain references to
-// `mp.decodeFromStream` after the streaming redraw bridge was removed
-// from production (see the git history around the Phase 5 revert).
-// Keeping this bench compilable preserves the A/B/C evidence for any
-// future attempt at a handler-level streaming rewrite.
+//   1. "bench: redraw grid_line decode paths" — isolates the decoder
+//      alone and compares `mp.decode` vs `InnerDecoder + decodeFromStream`.
+//   2. "bench: redraw full-path (old ... vs new handleRedrawStream)" —
+//      measures the full redraw pipeline including `grid.putCell`,
+//      dirty tracking, and a noop flush callback.
+//
+// SCOPE AND GATE HISTORY
+// ----------------------
+// Both benches are unwired from production: they exist to evaluate
+// streaming-decoder designs without requiring a live Neovim. A
+// "streaming fast path" for redraw notifications was prototyped on top
+// of `handleRedrawStream`, wired into rpc_session, and measured here.
+// The gate criterion was "new full-path faster than old on this bench".
+//
+// Result (Apple Silicon, ReleaseFast):
+//
+//   n_cells = 100     old  2190 ns/iter   new  3119 ns/iter  (1.42x)
+//   n_cells = 1000    old 21222 ns/iter   new 29908 ns/iter  (1.41x)
+//   n_cells = 10000   old 216834 ns/iter  new 293443 ns/iter (1.35x)
+//
+//   arena peak bytes: old 14 KiB / 254 KiB / 2.3 MiB respectively;
+//                     new  0 / 0 / 0 (streamGridLine doesn't alloc).
+//
+// The new path LOST on wall-clock by ~1.35x-1.42x despite eliminating
+// per-cell `Value` allocation entirely. Root cause: the
+// `InnerDecoder.readHead -> ValueHead union -> switch` abstraction
+// costs more per cell than `mp.decode`'s direct byte-to-Value
+// dispatch, and the savings from skipping arena allocs are smaller
+// than that overhead at grid_line cell counts typical on this bench.
+// The behaviour flip was reverted; handleRedrawStream and its bridge
+// helper remain in the tree as unwired reference implementations,
+// and this bench stays as the baseline that any future attempt must
+// beat. A future attempt is likely to succeed only by dropping the
+// generic ValueHead layer in favour of a grid_line-specific
+// tag-byte direct parser.
 //
 // Compares three decode strategies for a synthetic Neovim `redraw`
 // notification frame, keeping the workload identical across variants so
@@ -40,8 +63,13 @@
 // many cells dominates the allocation budget in real redraws.
 
 const std = @import("std");
-const mp = @import("zonvie_core").msgpack;
-const mps = @import("zonvie_core").mpack_stream;
+const zc = @import("zonvie_core");
+const mp = zc.msgpack;
+const mps = zc.mpack_stream;
+const redraw = zc.redraw_handler;
+const Grid = zc.grid_mod.Grid;
+const Highlights = zc.highlight.Highlights;
+const Logger = zc.log_mod.Logger;
 
 /// Minimal slice-backed reader for driving `mp.decode` over an in-memory
 /// byte buffer. Duplicates the adapter from `msgpack_test.zig` so the
@@ -266,6 +294,198 @@ test "bench: redraw grid_line decode paths" {
                 v.name, r.ns_per_iter, r.peak_bytes, ratio,
             });
         }
+    }
+    std.debug.print("\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// Full-path bench. In contrast to the decode-only suite above, this one
+// measures the entire redraw pipeline per frame:
+//
+//   old: mp.decode(arena, bytes) → extract params → handleRedraw (walks
+//        the Value tree, calls grid.putCell for every cell, marks dirty,
+//        and runs frontend callbacks)
+//   new: InnerDecoder → probeRedrawFrame equivalent → skipAny validate →
+//        handleRedrawStream (streams grid_line cells directly into the
+//        grid; other events materialise one at a time via the bridge)
+//
+// Both variants write into an identically-sized fresh `Grid` and
+// `Highlights`, using noop callback stubs. A fresh Grid/Highlights is
+// allocated per iteration so the workload stays representative —
+// re-running against an already-populated grid would let `putCell`'s
+// early-return short-circuit the hot path and measure nothing.
+// Timer.read() is sampled around the variant call only, excluding the
+// Grid init / resize / deinit overhead from the measurement.
+// ---------------------------------------------------------------------------
+
+const NoopCtx = struct {};
+
+fn noopFlush(_: *NoopCtx, _: u32, _: u32) anyerror!void {}
+fn noopGuifont(_: *NoopCtx, _: []const u8) anyerror!void {}
+fn noopLinespace(_: *NoopCtx, _: i32) anyerror!void {}
+fn noopSetTitle(_: *NoopCtx, _: []const u8) anyerror!void {}
+fn noopDefaultColors(_: *NoopCtx, _: u32, _: u32) anyerror!void {}
+
+fn runOldFull(
+    arena: std.mem.Allocator,
+    bytes: []const u8,
+    grid: *Grid,
+    hl: *Highlights,
+    log: *Logger,
+    ctx: *NoopCtx,
+) !void {
+    var sr = SliceReader{ .data = bytes };
+    const root = try mp.decode(arena, &sr);
+    if (root != .arr) return error.Malformed;
+    const top = root.arr;
+    if (top.len < 3 or top[2] != .arr) return error.Malformed;
+    const params = top[2].arr;
+
+    try redraw.handleRedraw(
+        grid,
+        hl,
+        arena,
+        params,
+        log,
+        ctx,
+        noopFlush,
+        ctx,
+        noopGuifont,
+        ctx,
+        noopLinespace,
+        noopSetTitle,
+        noopDefaultColors,
+    );
+}
+
+fn runNewFull(
+    arena: std.mem.Allocator,
+    bytes: []const u8,
+    grid: *Grid,
+    hl: *Highlights,
+    log: *Logger,
+    ctx: *NoopCtx,
+) !void {
+    var in = mps.InnerDecoder{ .data = bytes };
+    _ = try in.expectArray(); // top = 3
+    _ = try in.expectUInt(); // msg_type = 2
+    _ = try in.expectString(); // "redraw"
+    const n_events = try in.expectArray();
+
+    // Skip-validate pass, mirroring what rpc_session's main loop does.
+    var v = in;
+    try v.skipAny(n_events);
+
+    try redraw.handleRedrawStream(
+        grid,
+        hl,
+        arena,
+        &in,
+        n_events,
+        log,
+        ctx,
+        noopFlush,
+        ctx,
+        noopGuifont,
+        ctx,
+        noopLinespace,
+        noopSetTitle,
+        noopDefaultColors,
+    );
+}
+
+fn benchFull(
+    backing_alloc: std.mem.Allocator,
+    comptime variant_fn: fn (std.mem.Allocator, []const u8, *Grid, *Highlights, *Logger, *NoopCtx) anyerror!void,
+    bytes: []const u8,
+    rows: u32,
+    cols: u32,
+    n_warmup: u32,
+    n_iter: u32,
+) !struct { ns_per_iter: u64, peak_arena_bytes: usize } {
+    var arena_state = std.heap.ArenaAllocator.init(backing_alloc);
+    defer arena_state.deinit();
+
+    var log: Logger = .{};
+    var ctx = NoopCtx{};
+
+    // Warmup — populates arena capacity too.
+    {
+        var w: u32 = 0;
+        while (w < n_warmup) : (w += 1) {
+            var grid = Grid.init(backing_alloc);
+            defer grid.deinit();
+            try grid.resize(rows, cols);
+            var hl = Highlights.init(backing_alloc);
+            defer hl.deinit();
+            _ = arena_state.reset(.retain_capacity);
+            try variant_fn(arena_state.allocator(), bytes, &grid, &hl, &log, &ctx);
+        }
+    }
+
+    const peak = arena_state.queryCapacity();
+
+    // Timed loop. Grid/Highlights init/resize/deinit overhead is
+    // excluded from the wall-clock sample by bracketing the timer
+    // around just the variant call. Both variants incur the same
+    // setup/teardown, so absolute numbers exclude that noise.
+    var total_ns: u64 = 0;
+    var i: u32 = 0;
+    while (i < n_iter) : (i += 1) {
+        var grid = Grid.init(backing_alloc);
+        defer grid.deinit();
+        try grid.resize(rows, cols);
+        var hl = Highlights.init(backing_alloc);
+        defer hl.deinit();
+        _ = arena_state.reset(.retain_capacity);
+
+        var timer = try std.time.Timer.start();
+        try variant_fn(arena_state.allocator(), bytes, &grid, &hl, &log, &ctx);
+        total_ns += timer.read();
+    }
+
+    return .{
+        .ns_per_iter = total_ns / n_iter,
+        .peak_arena_bytes = peak,
+    };
+}
+
+test "bench: redraw full-path (old mp.decode+handleRedraw vs new handleRedrawStream)" {
+    const gpa = std.heap.page_allocator;
+
+    // Grid must be large enough to hold the widest cell count in the
+    // workload. `buildGridLineFrame` writes all cells into row 0, so
+    // `rows = 2` suffices; columns must be >= n_cells.
+    const Workload = struct { n_cells: u32, rows: u32, cols: u32, n_iter: u32 };
+    const workloads = [_]Workload{
+        .{ .n_cells = 100, .rows = 2, .cols = 200, .n_iter = 20_000 },
+        .{ .n_cells = 1000, .rows = 2, .cols = 1200, .n_iter = 2_000 },
+        .{ .n_cells = 10000, .rows = 2, .cols = 12000, .n_iter = 200 },
+    };
+
+    std.debug.print("\n\n=== redraw full-path bench (old vs new; ns/iter, arena peak B) ===\n", .{});
+    std.debug.print("(decode + grid.putCell + dirty tracking + noop flush; excludes Grid/Highlights setup)\n", .{});
+
+    for (workloads) |w| {
+        const bytes = try buildGridLineFrame(gpa, w.n_cells);
+        defer gpa.free(bytes);
+
+        std.debug.print("\n--- n_cells = {d:<6} frame = {d} bytes  grid = {d}x{d}  iters = {d} ---\n", .{
+            w.n_cells, bytes.len, w.rows, w.cols, w.n_iter,
+        });
+
+        const n_warmup: u32 = @max(10, w.n_iter / 50);
+
+        const r_old = try benchFull(gpa, runOldFull, bytes, w.rows, w.cols, n_warmup, w.n_iter);
+        const r_new = try benchFull(gpa, runNewFull, bytes, w.rows, w.cols, n_warmup, w.n_iter);
+
+        const ratio = @as(f64, @floatFromInt(r_new.ns_per_iter)) /
+            @as(f64, @floatFromInt(r_old.ns_per_iter));
+
+        std.debug.print("  old  {d:>10} ns/iter   {d:>10} B peak\n", .{ r_old.ns_per_iter, r_old.peak_arena_bytes });
+        std.debug.print("  new  {d:>10} ns/iter   {d:>10} B peak   ({d:.2}x vs old)\n", .{
+            r_new.ns_per_iter, r_new.peak_arena_bytes, ratio,
+        });
     }
     std.debug.print("\n", .{});
 }
