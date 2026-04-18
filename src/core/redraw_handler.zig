@@ -774,9 +774,15 @@ fn streamGridLine(
 /// a single-event synthetic params array, which lets the 47 non-grid_line
 /// branches be reused verbatim without copying their bodies here.
 ///
-/// The arena cost of the fallback path is bounded by the individual
-/// event's payload — no accumulation across events beyond what arena
-/// resets (driven by the run loop between RPC frames) already handle.
+/// Arena allocations in the fallback path (`decodeFromStream` per event
+/// plus each event's `synth_ev` / `synth_params` wrappers) accumulate
+/// across every non-grid_line event processed in the current frame: the
+/// arena is reset only by the run loop between RPC frames, not between
+/// events. The peak is therefore bounded by the total non-grid_line
+/// payload in the frame, not by a single event. This is still strictly
+/// smaller than the pre-streaming Value-tree path (which additionally
+/// allocated for every `grid_line` cell), because `streamGridLine`
+/// writes cells directly into `grid` and does not touch the arena.
 ///
 /// The caller is responsible for having skip-validated the full events
 /// array before invoking this function, because the non-grid_line events
@@ -842,12 +848,24 @@ pub fn handleRedrawStream(
         const synth_params = try arena.alloc(mp.Value, 1);
         synth_params[0] = .{ .arr = synth_ev };
 
-        // Dispatch errors from `handleRedraw` (e.g. frontend vertex-submission
-        // callback failures) are logged and swallowed here, matching the
-        // Value-tree path which catches `handleRedraw` at the rpc_session
-        // call site. Only decode-side failures in the `decodeFromStream`
-        // loop above are fatal and propagate upward — mirroring the old
-        // `mp.decode` failure semantics.
+        // Dispatch errors from `handleRedraw` (e.g. a frontend vertex-
+        // submission callback failure). Match the Value-tree path's
+        // failure boundary exactly: in that path `handleRedraw` is
+        // called once over the whole params array, and a failing event's
+        // `try fn_ptr(...)` unwinds the inner for-loop so all remaining
+        // events in the same batch are skipped. The caller of the old
+        // `handleRedraw` catches the error once and then continues with
+        // post-redraw processing for the current frame.
+        //
+        // We mirror that here: on dispatch error, advance `in` past the
+        // still-unread events of this frame (the caller expects `in` to
+        // sit at the end of the events array on success), log the error,
+        // and return normally so a hypothetical wired caller runs its
+        // post-redraw block and moves on to the next RPC frame — NOT
+        // break out of the run loop. Propagating the error would conflate
+        // dispatch-side failures with decode-side failures (`streamGridLine`
+        // / `decodeFromStream`), which the run loop is supposed to treat
+        // as fatal.
         handleRedraw(
             grid,
             hl,
@@ -864,6 +882,9 @@ pub fn handleRedrawStream(
             default_colors_fn,
         ) catch |re| {
             log.write("redraw dispatch err: {any}\n", .{re});
+            const remaining = n_events - ei - 1;
+            in.skipAny(remaining) catch {};
+            return;
         };
     }
 }
