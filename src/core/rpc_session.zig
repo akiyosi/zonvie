@@ -64,6 +64,117 @@ pub const PipeReader = struct {
     }
 };
 
+/// Contiguous buffered reader designed to feed `mpack_stream.SkipDecoder`
+/// with zero-copy slices.
+///
+/// Invariants:
+///   - `buf[pos..end]` is the unconsumed window visible to the decoder
+///   - `buf[end..buf.len]` is available for future reads from the pipe
+///   - slices returned by `view()` are only valid until the next `fill()`
+///     or `consume*()` call, since those may move/reallocate the backing
+///     store.
+///
+/// The buffer grows on demand up to `max_capacity` when a single frame
+/// exceeds the current capacity with no consumable tail to compact.
+pub const FrameReader = struct {
+    file: std.fs.File,
+    alloc: std.mem.Allocator,
+    buf: []u8,
+    pos: usize = 0,
+    end: usize = 0,
+
+    pub const initial_capacity: usize = 64 * 1024;
+
+    pub fn init(alloc: std.mem.Allocator, file: std.fs.File) !FrameReader {
+        const buf = try alloc.alloc(u8, initial_capacity);
+        return .{ .file = file, .alloc = alloc, .buf = buf };
+    }
+
+    pub fn deinit(self: *FrameReader) void {
+        self.alloc.free(self.buf);
+        self.buf = &.{};
+        self.pos = 0;
+        self.end = 0;
+    }
+
+    /// Unconsumed window. Valid until the next `fill()` or `consume*()`.
+    pub fn view(self: *const FrameReader) []const u8 {
+        return self.buf[self.pos..self.end];
+    }
+
+    /// Mark `n` bytes of the current view as consumed.
+    pub fn consume(self: *FrameReader, n: usize) void {
+        std.debug.assert(self.pos + n <= self.end);
+        self.pos += n;
+        if (self.pos == self.end) {
+            self.pos = 0;
+            self.end = 0;
+        }
+    }
+
+    /// Commit an advance position expressed as the remaining (uneaten) slice
+    /// of the view — i.e., the `data` field of an `InnerDecoder` / `SkipDecoder`
+    /// after a successful run. `remaining` must be a sub-slice of `view()`.
+    pub fn consumeTo(self: *FrameReader, remaining: []const u8) void {
+        const base_addr = @intFromPtr(self.buf.ptr) + self.pos;
+        const rem_addr = @intFromPtr(remaining.ptr);
+        std.debug.assert(rem_addr >= base_addr);
+        std.debug.assert(rem_addr <= base_addr + (self.end - self.pos));
+        const consumed_n = rem_addr - base_addr;
+        self.consume(consumed_n);
+    }
+
+    /// Pull more bytes from the pipe into `buf[end..]`. Compacts or grows
+    /// the buffer first if the tail is exhausted. Returns 0 on EOF.
+    ///
+    /// No hard size cap: the previous `PipeReader` accepted any frame size
+    /// (it read byte-at-a-time and the arena held the materialised Value),
+    /// and imposing one here would regress on large clipboard pastes,
+    /// `msg_history_show`, and wide-grid `grid_line` bursts. Buffer grows
+    /// via power-of-two `realloc`; genuine memory exhaustion surfaces as
+    /// the allocator's `error.OutOfMemory` and is handled by the caller.
+    pub fn fill(self: *FrameReader) !usize {
+        if (self.end == self.buf.len) {
+            if (self.pos > 0) {
+                const live = self.end - self.pos;
+                std.mem.copyForwards(u8, self.buf[0..live], self.buf[self.pos..self.end]);
+                self.pos = 0;
+                self.end = live;
+            } else {
+                const new_cap = self.buf.len * 2;
+                self.buf = try self.alloc.realloc(self.buf, new_cap);
+            }
+        }
+        const n = try self.file.read(self.buf[self.end..]);
+        self.end += n;
+        return n;
+    }
+};
+
+/// Reader adapter that feeds `mp.decode` from a `[]const u8` view and tracks
+/// how many bytes were successfully consumed. Used as the bridge between
+/// `FrameReader.view()` and the current reader-based `mp.decode` during the
+/// streaming migration: after a successful decode, the caller commits via
+/// `FrameReader.consume(sr.i)`; on `error.EndOfStream` the caller refills
+/// and retries from the same starting offset.
+pub const FrameSliceReader = struct {
+    data: []const u8,
+    i: usize = 0,
+
+    pub fn readByte(self: *FrameSliceReader) !u8 {
+        if (self.i >= self.data.len) return error.EndOfStream;
+        const b = self.data[self.i];
+        self.i += 1;
+        return b;
+    }
+
+    pub fn readNoEof(self: *FrameSliceReader, dest: []u8) !void {
+        if (self.i + dest.len > self.data.len) return error.EndOfStream;
+        @memcpy(dest, self.data[self.i .. self.i + dest.len]);
+        self.i += dest.len;
+    }
+};
+
 pub const CwdOwner = struct {
     open: bool = false,
     dir: std.fs.Dir = undefined,
@@ -1322,24 +1433,66 @@ pub fn runLoop(self: *Core) void {
         _ = child.wait() catch {};
         return;
     }
-    var pr = PipeReader{ .file = self.stdout_file.? };
+
+    // Contiguous buffered reader. Replaces the byte-at-a-time PipeReader so
+    // the MessagePack decoder sees a `[]const u8` slice it can advance through.
+    // The buffer grows on demand when a single RPC frame exceeds the current
+    // capacity (e.g., a wide-grid `grid_line` carrying thousands of cells).
+    var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
+        self.log.write("FrameReader init failed: {any}\n", .{e});
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return;
+    };
+    defer fr.deinit();
 
     var arena_state = std.heap.ArenaAllocator.init(self.alloc);
     defer arena_state.deinit();
 
-    while (!self.stop_flag.load(.seq_cst)) {
-        _ = arena_state.reset(.retain_capacity);
-        const arena = arena_state.allocator();
+    outer: while (!self.stop_flag.load(.seq_cst)) {
+        // Refill-on-EOF retry loop. The arena is reset between retries so
+        // that partial allocations from a failed decode don't accumulate.
+        //
+        // Note: an earlier iteration of this loop included a streaming
+        // fast path (probe + skipAny + `decodeFromStream`) for redraw
+        // notifications. Microbenchmarks (`zig build bench`) showed it
+        // was 1.24x–1.94x slower on the decode path alone — as long as
+        // handlers keep consuming `Value` trees, the streaming decoder
+        // loses both to the second scan pass and to the extra
+        // `ValueHead` dispatch layer. The fast path was removed; the
+        // streaming decoder (`src/core/mpack_stream.zig`) and its bridge
+        // helper (`msgpack.decodeFromStream`) are retained as reference
+        // implementations for any future rewrite that streams through
+        // the handlers directly (i.e., drops the intermediate `Value`
+        // tree on the `grid_line` hot path).
+        var root: mp.Value = undefined;
+        while (true) {
+            _ = arena_state.reset(.retain_capacity);
+            const arena_once = arena_state.allocator();
 
-        const root = mp.decode(arena, &pr) catch |e| {
-            if (e == error.EndOfStream) {
-                self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
-            } else {
+            var sr = FrameSliceReader{ .data = fr.view() };
+            if (mp.decode(arena_once, &sr)) |v| {
+                fr.consume(sr.i);
+                root = v;
+                break;
+            } else |e| {
+                if (e == error.EndOfStream) {
+                    const n = fr.fill() catch |fe| {
+                        self.log.write("pipe read err: {any}\n", .{fe});
+                        break :outer;
+                    };
+                    if (n == 0) {
+                        self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
+                        break :outer;
+                    }
+                    continue;
+                }
                 self.log.write("decode err: {any}\n", .{e});
+                break :outer;
             }
-            break;
-        };
+        }
 
+        const arena = arena_state.allocator();
         if (root != .arr or root.arr.len < 1) continue;
         const top = root.arr;
         if (top[0] != .int) continue;
