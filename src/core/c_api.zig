@@ -9,6 +9,9 @@ pub const flush_mod = @import("flush.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const mpack_stream = @import("mpack_stream.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
+pub const redraw_handler = @import("redraw_handler.zig");
+pub const highlight = @import("highlight.zig");
+pub const log_mod = @import("log.zig");
 
 pub const CursorShape = enum(u32) {
     block = 0,

@@ -1,5 +1,6 @@
 const std = @import("std");
 const mp = @import("msgpack.zig");
+const mps = @import("mpack_stream.zig");
 const grid_mod = @import("grid.zig");
 const Grid = grid_mod.Grid;
 const ModeInfo = grid_mod.ModeInfo;
@@ -506,6 +507,358 @@ fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Streaming helpers — used by handleRedrawStream / streamGridLine for the
+// zero-copy redraw path. These are defined here rather than in
+// `mpack_stream.zig` to keep the streaming decoder module decoupled from
+// handler-specific "skip malformed tuple" tolerance semantics. The helpers
+// are intentionally tolerant of type mismatches (they skip the value and
+// return `null`), matching the existing Value-tree path's per-tuple
+// `continue` behaviour so that parity tests can assert bit-identical grid
+// state after both code paths consume the same byte sequence.
+// ---------------------------------------------------------------------------
+
+/// Advance `in` past the payload of a `ValueHead` that was already consumed
+/// via `readHead`. For scalars this is a no-op; for Str/Bin/Ext it skips
+/// the payload bytes; for Array/Map it recursively skips nested items.
+fn skipHeadPayload(in: *mps.InnerDecoder, head: mps.ValueHead) mps.MpackError!void {
+    const sz = head.itemSize();
+    if (sz.bytes > 0) {
+        if (in.data.len < sz.bytes) return error.EOFError;
+        in.data = in.data[@intCast(sz.bytes)..];
+    }
+    if (sz.items > 0) try in.skipAny(sz.items);
+}
+
+/// Read one value. If it's an `Int`, or a `UInt` that fits in `i64`,
+/// return the value. Otherwise skip its payload and return `null`.
+/// `EOFError` propagates to the caller.
+fn readIntOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?i64 {
+    const head = try in.readHead();
+    return switch (head) {
+        .Int => |v| v,
+        .UInt => |v| if (v > std.math.maxInt(i64)) null else @intCast(v),
+        else => blk: {
+            try skipHeadPayload(in, head);
+            break :blk null;
+        },
+    };
+}
+
+/// Read one value. If it's an `Array`, return its element count.
+/// Otherwise skip its payload and return `null`.
+fn readArrayLenOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?u32 {
+    const head = try in.readHead();
+    return switch (head) {
+        .Array => |n| n,
+        else => blk: {
+            try skipHeadPayload(in, head);
+            break :blk null;
+        },
+    };
+}
+
+/// Read one value as a `Str` or `Bin`, returning a zero-copy slice into
+/// the caller's input buffer. Non-string types are skipped and `null`
+/// is returned.
+fn readStrOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?[]const u8 {
+    const head = try in.readHead();
+    return switch (head) {
+        .Str, .Bin => |n| blk: {
+            if (in.data.len < n) return error.EOFError;
+            const s = in.data[0..n];
+            in.data = in.data[n..];
+            break :blk s;
+        },
+        else => blk: {
+            try skipHeadPayload(in, head);
+            break :blk null;
+        },
+    };
+}
+
+/// Streaming `grid_line` handler. Consumes `n_tuples` tuples from `in`
+/// without materialising any `Value` tree, writing cells directly into
+/// `grid`. The caller is `handleRedrawStream`; `in` must be positioned
+/// immediately after the `["grid_line", ...]` event-array header has
+/// been consumed (i.e., the next value in the stream is the first tuple
+/// of the event).
+///
+/// Parity guarantees vs. the existing Value-tree `.grid_line` branch of
+/// `handleRedraw`:
+///   * tuples with `t.len < 5` are skipped (`continue`-equivalent);
+///   * non-int `grid_id`/`row`/`col` or non-array cells field aborts the
+///     current tuple and moves on;
+///   * non-array or empty cells within the array are skipped;
+///   * non-str cell text aborts that cell;
+///   * non-int `hl_id` is ignored (hl_state unchanged), non-int `repeat`
+///     is ignored (repeat stays 1) — matching the old code's
+///     `c[1] == .int` / `c[2] == .int` gating;
+///   * `hl_state` is sticky within the event, `hl_state == -1` inherits
+///     from the left cell except at col 0, `repeat <= 0` writes nothing;
+///   * multi-codepoint cells populate the overflow map and force-mark
+///     dirty on overflow change.
+///
+/// Logging differs from the Value-tree path by design: the per-tuple
+/// `logValue()` pretty-print would require materialisation that defeats
+/// the whole purpose of this function, so only the summary "ui_ev
+/// grid_line tuples={N}" line is emitted. Grid/hl/dirty side effects
+/// match bit-for-bit.
+fn streamGridLine(
+    grid: *Grid,
+    in: *mps.InnerDecoder,
+    n_tuples: u32,
+    log: *Logger,
+) !void {
+    if (log.cb != null) log.write("ui_ev grid_line tuples={d}\n", .{n_tuples});
+
+    var ti: u32 = 0;
+    tuples: while (ti < n_tuples) : (ti += 1) {
+        const t_n = try in.expectArray();
+        if (t_n < 5) {
+            try in.skipAny(t_n);
+            continue;
+        }
+
+        var t_consumed: u32 = 0;
+
+        // Field 0: grid_id.
+        const grid_id_opt = try readIntOrSkipped(in);
+        t_consumed = 1;
+        const grid_id = grid_id_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
+
+        // Field 1: row.
+        const row_opt = try readIntOrSkipped(in);
+        t_consumed = 2;
+        const row_i = row_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
+
+        // Field 2: col_start.
+        const col_opt = try readIntOrSkipped(in);
+        t_consumed = 3;
+        const col_i = col_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
+
+        // Field 3: cells array header.
+        const cells_n_opt = try readArrayLenOrSkipped(in);
+        t_consumed = 4;
+        const cells_n = cells_n_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
+
+        if (log.cb != null and grid.input_trace_seq != 0 and
+            grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq)
+        {
+            const now_ns = std.time.nanoTimestamp();
+            const delta_us: i64 = @intCast(@divTrunc(
+                @max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)),
+                1000,
+            ));
+            log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
+                grid.input_trace_seq, delta_us, grid_id, row_i,
+            });
+            grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
+        }
+
+        grid.noteGridLine(grid_id);
+
+        const row = @as(u32, @intCast(row_i));
+        var col = @as(u32, @intCast(col_i));
+
+        // hl_state persists across cells within this grid_line event.
+        var hl_state: i64 = 0;
+
+        var ci: u32 = 0;
+        cells: while (ci < cells_n) : (ci += 1) {
+            // Cell array header.
+            const c_n_opt = try readArrayLenOrSkipped(in);
+            const c_n = c_n_opt orelse continue :cells;
+            if (c_n < 1) {
+                try in.skipAny(c_n);
+                continue :cells;
+            }
+
+            // Field 0: text (str/bin required). Non-string → skip this cell.
+            const text_opt = try readStrOrSkipped(in);
+            var c_consumed: u32 = 1;
+            const text = text_opt orelse {
+                try in.skipAny(c_n - c_consumed);
+                continue :cells;
+            };
+
+            var cp_buf: [16]u32 = undefined;
+            const cp_count = extractAllCodepoints(text, &cp_buf);
+            const cp = cp_buf[0];
+            const has_overflow = cp_count > 1;
+
+            // Field 1: hl_id (optional). Non-int ignored, hl_state unchanged.
+            if (c_n >= 2) {
+                if (try readIntOrSkipped(in)) |v| hl_state = v;
+                c_consumed = 2;
+            }
+
+            // Field 2: repeat (optional). Non-int ignored, stays 1. 0/neg → skip cell.
+            var repeat: u32 = 1;
+            var skip_cell = false;
+            if (c_n >= 3) {
+                if (try readIntOrSkipped(in)) |r64| {
+                    if (r64 <= 0) {
+                        skip_cell = true;
+                    } else {
+                        repeat = @as(u32, @intCast(r64));
+                    }
+                }
+                c_consumed = 3;
+            }
+
+            // Forward-compat: skip any extra fields Neovim may add later.
+            if (c_n > c_consumed) try in.skipAny(c_n - c_consumed);
+
+            if (skip_cell) continue :cells;
+
+            // Write `repeat` copies of the cell starting at `col`.
+            var i: u32 = 0;
+            while (i < repeat) : (i += 1) {
+                var hl_to_use: u32 = 0;
+                if (hl_state != -1 or col == 0) {
+                    if (hl_state >= 0) {
+                        hl_to_use = @as(u32, @intCast(hl_state));
+                    } else {
+                        // hl_state == -1 at col 0 → treat as 0.
+                        hl_to_use = 0;
+                    }
+                } else {
+                    // hl_state == -1 and col > 0 → inherit from left neighbour.
+                    hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
+                }
+
+                grid.putCellGrid(grid_id, row, col, cp, hl_to_use);
+
+                // Overflow-map management. Force dirty on change, because
+                // `putCellGrid` skips the dirty mark when (cp, hl) are
+                // unchanged even though the overflow tail differs
+                // (e.g. ⚠ → ⚠️).
+                if (has_overflow) {
+                    const old = grid.getOverflow(grid_id, row, col);
+                    const changed = if (old) |o| !std.mem.eql(u32, o, cp_buf[1..cp_count]) else true;
+                    grid.putOverflow(grid_id, row, col, cp_buf[1..cp_count]);
+                    if (changed) grid.markDirtyCellGrid(grid_id, row, col);
+                } else {
+                    const had = grid.getOverflow(grid_id, row, col) != null;
+                    grid.removeOverflow(grid_id, row, col);
+                    if (had) grid.markDirtyCellGrid(grid_id, row, col);
+                }
+
+                col += 1;
+            }
+        }
+
+        // Skip remaining outer-tuple fields (field 4 "wrap" and any future extras).
+        try in.skipAny(t_n - t_consumed);
+    }
+}
+
+/// Streaming entry point for "redraw" notifications. Dispatches `grid_line`
+/// events directly via `streamGridLine` (zero Value allocation on the hot
+/// cell loop). Every other event is materialised per-event via
+/// `mp.decodeFromStream` and passed into the existing `handleRedraw` using
+/// a single-event synthetic params array, which lets the 47 non-grid_line
+/// branches be reused verbatim without copying their bodies here.
+///
+/// The arena cost of the fallback path is bounded by the individual
+/// event's payload — no accumulation across events beyond what arena
+/// resets (driven by the run loop between RPC frames) already handle.
+///
+/// The caller is responsible for having skip-validated the full events
+/// array before invoking this function, because the non-grid_line events
+/// that fall through to `handleRedraw` invoke side-effectful frontend
+/// callbacks that cannot safely be re-entered mid-frame.
+///
+/// Currently unused in production (`rpc_session` still materialises the
+/// whole frame via `mp.decode`); the function is kept ready for a later
+/// commit that wires it into the RPC run loop behind a redraw-only fast
+/// path.
+pub fn handleRedrawStream(
+    grid: *Grid,
+    hl: *Highlights,
+    arena: std.mem.Allocator,
+    in: *mps.InnerDecoder,
+    n_events: u32,
+    log: *Logger,
+    flush_ctx: anytype,
+    flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
+    opt_ctx: anytype,
+    guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
+    linespace_ctx: anytype,
+    linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
+    set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
+    default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
+) !void {
+    var ei: u32 = 0;
+    while (ei < n_events) : (ei += 1) {
+        const ev_n = try in.expectArray();
+        if (ev_n < 1) {
+            try in.skipAny(ev_n);
+            continue;
+        }
+
+        // Event name (required). Non-str name → skip the rest of the event.
+        const name_opt = try readStrOrSkipped(in);
+        const name = name_opt orelse {
+            try in.skipAny(ev_n - 1);
+            continue;
+        };
+        const n_tuples = ev_n - 1;
+
+        const tag = std.meta.stringToEnum(RedrawEvent, name) orelse {
+            // Unknown event — forward-compat skip.
+            try in.skipAny(n_tuples);
+            continue;
+        };
+
+        if (tag == .grid_line) {
+            try streamGridLine(grid, in, n_tuples, log);
+            continue;
+        }
+
+        // Fallback: materialise this single event into a `Value` tree and
+        // invoke `handleRedraw` with a 1-event synthetic params array.
+        const synth_ev = try arena.alloc(mp.Value, ev_n);
+        synth_ev[0] = .{ .str = try arena.dupe(u8, name) };
+        var ti: u32 = 0;
+        while (ti < n_tuples) : (ti += 1) {
+            synth_ev[1 + ti] = try mp.decodeFromStream(arena, in);
+        }
+
+        const synth_params = try arena.alloc(mp.Value, 1);
+        synth_params[0] = .{ .arr = synth_ev };
+
+        try handleRedraw(
+            grid,
+            hl,
+            arena,
+            synth_params,
+            log,
+            flush_ctx,
+            flush_fn,
+            opt_ctx,
+            guifont_fn,
+            linespace_ctx,
+            linespace_fn,
+            set_title_fn,
+            default_colors_fn,
+        );
+    }
+}
 
 /// Supported redraw events:
 /// grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
