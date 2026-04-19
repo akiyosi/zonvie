@@ -1342,6 +1342,10 @@ pub const zonvie_config_values = extern struct {
     font_family: [*:0]const u8 = "",
     font_size: f32 = 14.0,
     font_linespace: i32 = 0,
+    // True when the user explicitly set [font] family / size in config.toml.
+    // Frontends should prefer config over nvim's default `guifont`.
+    font_family_explicit: bool = false,
+    font_size_explicit: bool = false,
     // window
     window_blur: bool = false,
     window_opacity: f32 = 1.0,
@@ -1414,6 +1418,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .font_family = dupeZForC(alloc, cfg.font.family, "Menlo"),
         .font_size = cfg.font.size,
         .font_linespace = cfg.font.linespace,
+        .font_family_explicit = cfg.font.family_explicit,
+        .font_size_explicit = cfg.font.size_explicit,
         // window
         .window_blur = cfg.window.blur,
         .window_opacity = cfg.window.opacity,

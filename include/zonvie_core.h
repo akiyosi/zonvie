@@ -1150,6 +1150,11 @@ typedef struct zonvie_config_values {
     const char* font_family;
     float font_size;
     int32_t font_linespace;
+    /* True when the user explicitly set [font] family / size in config.toml.
+       Frontends should prefer config over nvim's default `guifont` (which
+       nvim sends at ui_attach even when the user hasn't set one). */
+    bool font_family_explicit;
+    bool font_size_explicit;
     // window
     bool window_blur;
     float window_opacity;
