@@ -65,6 +65,7 @@ pub const zonvie_core_request_quit = core.zonvie_core_request_quit;
 pub const zonvie_core_quit_confirmed = core.zonvie_core_quit_confirmed;
 pub const zonvie_core_send_stdin_data = core.zonvie_core_send_stdin_data;
 pub const zonvie_core_send_command = core.zonvie_core_send_command;
+pub const zonvie_core_set_option_value = core.zonvie_core_set_option_value;
 pub const zonvie_core_set_background_opacity = core.zonvie_core_set_background_opacity;
 pub const zonvie_core_perf_now_ns = core.zonvie_core_perf_now_ns;
 pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;

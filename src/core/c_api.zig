@@ -701,6 +701,21 @@ pub export fn zonvie_core_set_focus(p: ?*zonvie_core, gained: bool) callconv(.c)
     box.core.requestUiSetFocus(gained);
 }
 
+/// Set a global Neovim option value via `nvim_set_option_value`.
+/// Used by frontends to sync the effective `guifont` back to Neovim so
+/// `:set guifont?` reports what the frontend is actually rendering.
+pub export fn zonvie_core_set_option_value(
+    p: ?*zonvie_core,
+    name: [*]const u8,
+    name_len: usize,
+    value: [*]const u8,
+    value_len: usize,
+) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.requestSetOptionValue(name[0..name_len], value[0..value_len]) catch {};
+}
+
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;

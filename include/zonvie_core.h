@@ -850,6 +850,18 @@ ZONVIE_API void zonvie_core_note_input_trace(
    gained: true when window gains focus, false when it loses focus */
 ZONVIE_API void zonvie_core_set_focus(zonvie_core *core, bool gained);
 
+/* Set a global Neovim option via nvim_set_option_value.
+   Used by frontends to sync the effective `guifont` back to Neovim so
+   `:set guifont?` reports what the frontend is actually rendering.
+   name: option name (e.g. "guifont")
+   value: option value string */
+ZONVIE_API void zonvie_core_set_option_value(
+    zonvie_core *core,
+    const unsigned char *name,
+    size_t name_len,
+    const unsigned char *value,
+    size_t value_len);
+
 /* Send a command to Neovim via nvim_command RPC (does not show in cmdline).
    cmd: command string (e.g., "lua vim.notify('hello')")
    len: length of command string */
