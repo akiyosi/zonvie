@@ -1037,10 +1037,28 @@ pub export fn WndProc(
                             }
                         }
                         if (non_row_draw) {
-                            if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
+                            // When workspace overview is visible, draw terminal contents
+                            // into back_tex without presenting, overlay the workspace
+                            // thumbnails on top, then do a separate full present. The
+                            // row-mode branch handles this inline via its split
+                            // draw/overlay/present helper; this mirrors that for the
+                            // non-row-mode path so Ctrl+` reveals tiles regardless of
+                            // which redraw path the app is currently in.
+                            const overlay_visible = app.workspace.isOverviewVisible();
+                            if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .present = !overlay_visible, .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                             } else |e| {
                                 if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
+                            }
+                            if (render_ok and overlay_visible) {
+                                // Overlay uses NDC and expects a full-window viewport;
+                                // drawEx leaves viewport/scissor clipped to the content
+                                // area (tabline/sidebar offsets applied).
+                                g.setFullViewport();
+                                workspace_overlay.draw(g, &app.workspace, g.width, g.height);
+                                g.presentOnlyFromBackRectsNoResize(&[_]c.RECT{}) catch |e| {
+                                    if (log_enabled) applog.appLog("workspace overlay present failed: {any}\n", .{e});
+                                };
                             }
                         }
                     } else {
@@ -1689,8 +1707,11 @@ pub export fn WndProc(
                             // content shift. Adding pScrollRect/pScrollOffset to Present1 would
                             // cause a double-shift since we CopySubresourceRegion back_tex→bb.
 
-                            // Draw workspace overlay if visible
+                            // Draw workspace overlay if visible. Overlay uses NDC and
+                            // must run with a full-window viewport/scissor regardless
+                            // of whether the scrollbar branch above reset it.
                             if (app.workspace.isOverviewVisible()) {
+                                g.setFullViewport();
                                 workspace_overlay.draw(g, &app.workspace, g.width, g.height);
                             }
 
@@ -4063,6 +4084,13 @@ pub export fn WndProc(
             const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
             if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
                 if (getApp(hwnd)) |app| {
+                    // Reveal the workspace tile view before the modeless
+                    // connection dialog opens, matching the macOS flow where
+                    // "New Session..." animates to the tile grid first so the
+                    // user sees where the new session will land.
+                    if (app.workspace.scale > 0.0) {
+                        animateWorkspaceScale(app, hwnd, 0.0);
+                    }
                     dialogs.showConnectionDialog(app, hwnd);
                 }
                 return 0;
@@ -4331,16 +4359,11 @@ pub fn animateWorkspaceScale(app: *App, hwnd: c.HWND, target: f32) void {
 /// Handle workspace overlay keyboard shortcuts.
 /// Returns true if the key was consumed (caller should return 0).
 fn handleWorkspaceKey(app: *App, hwnd: c.HWND, vk: u32, mods: u32) bool {
-    const ctrl_only = (mods & input.MOD_CTRL) != 0 and (mods & (input.MOD_ALT | input.MOD_SHIFT)) == 0;
+    _ = mods;
 
-    // Ctrl+` (VK_OEM_3 = backtick/tilde key): toggle workspace overview
-    if (ctrl_only and vk == c.VK_OEM_3) {
-        const target: f32 = if (app.workspace.scale >= 1.0) 0.0 else 1.0;
-        animateWorkspaceScale(app, hwnd, target);
-        return true;
-    }
-
-    // When overview is visible, intercept keys
+    // The tile view is entered via the system menu "New Session..." item,
+    // not via a keyboard shortcut. We only intercept keys while the overview
+    // is already visible so the user can navigate / dismiss it.
     if (app.workspace.isOverviewVisible()) {
         // Escape: close overview
         if (vk == c.VK_ESCAPE) {
