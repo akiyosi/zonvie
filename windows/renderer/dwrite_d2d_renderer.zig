@@ -500,11 +500,19 @@ pub const Renderer = struct {
         safeRelease(self.solid_brush);
         self.solid_brush = null;
 
-        self.glyph_map.clearRetainingCapacity();
-        self.styled_glyph_map.clearRetainingCapacity();
-        self.atlas_next_x = 1;
-        self.atlas_next_y = 1;
-        self.atlas_row_h = 0;
+        // Preserve already-rasterized glyph state when atlas_cpu is already
+        // sized (i.e. createAtlasResources is being re-entered, e.g. from a
+        // deferred initD2DDeviceContext after the first flush started).
+        // Resetting packer/glyph_map here would orphan pixels still sitting
+        // in atlas_cpu for vertices that have already been emitted.
+        const cpu_total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
+        if (self.atlas_cpu.items.len != cpu_total) {
+            self.glyph_map.clearRetainingCapacity();
+            self.styled_glyph_map.clearRetainingCapacity();
+            self.atlas_next_x = 1;
+            self.atlas_next_y = 1;
+            self.atlas_row_h = 0;
+        }
 
         // RGBA format for true ClearType subpixel rendering
         const props = c.D2D1_BITMAP_PROPERTIES{
@@ -569,13 +577,17 @@ pub const Renderer = struct {
             self.solid_brush = null;
         }
 
-        // 4 bytes per pixel (RGBA) for true ClearType subpixel rendering
-        const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
-        try self.atlas_cpu.resize(self.alloc, total);
-        @memset(self.atlas_cpu.items, 0);
-
-        self.pending_upload_base_seq += self.pending_uploads.items.len;
-        self.pending_uploads.clearRetainingCapacity();
+        // 4 bytes per pixel (RGBA) for true ClearType subpixel rendering.
+        // Only zero atlas_cpu and drop pending_uploads when the backing
+        // buffer was (re)allocated; preserving both is critical when this
+        // runs mid-flush (see note above and issue #4).
+        const was_sized = (self.atlas_cpu.items.len == cpu_total);
+        try self.atlas_cpu.resize(self.alloc, cpu_total);
+        if (!was_sized) {
+            @memset(self.atlas_cpu.items, 0);
+            self.pending_upload_base_seq += self.pending_uploads.items.len;
+            self.pending_uploads.clearRetainingCapacity();
+        }
 
         const bmp_ptr = self.atlas_bitmap orelse return error.CreateAtlasFailed;
         const bvtbl = bmp_ptr.lpVtbl.*;
