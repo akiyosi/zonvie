@@ -240,21 +240,29 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     var t1: c.LARGE_INTEGER = undefined;
     var t2: c.LARGE_INTEGER = undefined;
 
-    // 1. Create core with callbacks
+    // 1. Create core with callbacks.
+    //
+    // Allocate a TileContext before core creation so every callback fired
+    // by the core can route through extractCallbackCtx and recover
+    // (app, tile_index). Tile 0 is the startup session; further tiles
+    // allocate their own TileContext when the in-process new-tile path
+    // lands.
+    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
+    const tile0_ctx = app.alloc.create(app_mod.workspace_mod.TileContext) catch return error.OutOfMemory;
+    tile0_ctx.* = .{ .app = app, .tile_index = 0 };
+    if (app.workspace.tiles.items.len > 0) {
+        app.workspace.tiles.items[0].ctx = tile0_ctx;
+    }
+
     var cb = makeCoreCbs();
     if (log_enabled) _ = c.QueryPerformanceCounter(&t1);
-    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
+    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), tile0_ctx);
     if (log_enabled) {
         _ = c.QueryPerformanceCounter(&t2);
         const ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
         applog.appLog("[win] doEarlyCoreInit: core_create {d}ms\n", .{ms});
     }
 
-    // Initialize workspace state and attach the early core to tile 0.
-    // WM_CREATE's updateSystemMenu runs right after this helper returns,
-    // so the workspace must already be populated to expose the active
-    // session in the system menu.
-    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
     if (app.corep) |cp| {
         app.workspace.attachCore(0, cp);
     }
@@ -315,11 +323,20 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
     app.nvim_spawned = true;
     app.early_core_init_done = true;
-    if (start_ok != 0) {
+    // zonvie_core_start returns 0 on success, negative on failure (see
+    // src/core/c_api.zig). The `!= 0` form below used to skip
+    // setTileStarted in the happy path, leaving tile 0's isOccupied
+    // returning false — which made the workspace overlay render the
+    // initial session as a `.plus` slot instead of the active tile.
+    //
+    // The caller (WM_CREATE) runs syncPrimaryTileConfig +
+    // refreshWorkspaceSystemMenu right after we return, so we only need
+    // to flip the state flags here; duplicating the refresh calls here
+    // would register the session twice and rebuild the system menu
+    // while WM_CREATE is still in progress.
+    if (start_ok == 0) {
         app.session_started = true;
         app.workspace.setTileStarted(0, true);
-        refreshSessionRegistration(app);
-        refreshWorkspaceSystemMenu(app, hwnd);
     }
 
     // 7. D3D11 device init on separate thread
@@ -359,6 +376,25 @@ fn currentSessionLabel(app: *App, buf: []u8) []const u8 {
     return tile.config.displayName(buf);
 }
 
+/// Wrappers for Win32 APIs that accept an HWND from untrusted sources
+/// (the session registry on disk). Windows HWND values are kernel-
+/// assigned opaque handles with no alignment guarantee — going through
+/// the SDK's `*HWND__` typing trips Zig's Debug `@ptrFromInt` /
+/// `@alignCast` alignment checks the first time a low-bit-set handle
+/// shows up. These extern declarations force `align(1)` on the handle
+/// parameter so we can pass raw addresses safely without Zig panicking
+/// "incorrect alignment"; the pointer is never dereferenced on our side.
+const HwndU = ?*align(1) anyopaque;
+extern "user32" fn IsWindow(hWnd: HwndU) callconv(.winapi) c.BOOL;
+extern "user32" fn IsIconic(hWnd: HwndU) callconv(.winapi) c.BOOL;
+extern "user32" fn ShowWindow(hWnd: HwndU, nCmdShow: c_int) callconv(.winapi) c.BOOL;
+extern "user32" fn BringWindowToTop(hWnd: HwndU) callconv(.winapi) c.BOOL;
+extern "user32" fn SetForegroundWindow(hWnd: HwndU) callconv(.winapi) c.BOOL;
+
+inline fn hwndU(addr: usize) HwndU {
+    return @ptrFromInt(addr);
+}
+
 fn refreshSessionRegistration(app: *App) void {
     const pid = c.GetCurrentProcessId();
     if (!app.session_started or app.hwnd == null) {
@@ -373,20 +409,22 @@ fn refreshSessionRegistration(app: *App) void {
 
 fn focusRegisteredSession(target_hwnd_value: usize) void {
     if (target_hwnd_value == 0) return;
-    const target_hwnd: c.HWND = @ptrFromInt(target_hwnd_value);
-    if (c.IsWindow(target_hwnd) == 0) return;
-    if (c.IsIconic(target_hwnd) != 0) {
-        _ = c.ShowWindow(target_hwnd, c.SW_RESTORE);
+    const target = hwndU(target_hwnd_value);
+    if (IsWindow(target) == 0) return;
+    if (IsIconic(target) != 0) {
+        _ = ShowWindow(target, c.SW_RESTORE);
     } else {
-        _ = c.ShowWindow(target_hwnd, c.SW_SHOW);
+        _ = ShowWindow(target, c.SW_SHOW);
     }
-    _ = c.BringWindowToTop(target_hwnd);
-    _ = c.SetForegroundWindow(target_hwnd);
+    _ = BringWindowToTop(target);
+    _ = SetForegroundWindow(target);
 }
 
 fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: enter\n", .{});
     const sys_menu = c.GetSystemMenu(hwnd, 0);
     if (sys_menu == null) return;
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: got sys_menu\n", .{});
 
     var remaining = app.workspace.system_menu_added_items;
     while (remaining > 0) : (remaining -= 1) {
@@ -394,28 +432,40 @@ fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
         if (count <= 0) break;
         _ = c.RemoveMenu(sys_menu, @intCast(count - 1), c.MF_BYPOSITION);
     }
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: after remove, count={d}\n", .{app.workspace.system_menu_added_items});
     app.workspace.system_menu_added_items = 0;
     app.session_menu_count = 0;
     @memset(&app.session_menu_hwnds, 0);
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: after memset\n", .{});
 
     _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
     app.workspace.system_menu_added_items += 1;
     _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_NEW_SESSION, std.unicode.utf8ToUtf16LeStringLiteral("New Session..."));
     app.workspace.system_menu_added_items += 1;
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: appended New Session\n", .{});
 
     var sessions = std.ArrayListUnmanaged(session_registry.SessionInfo){};
     defer sessions.deinit(app.alloc);
     session_registry.loadSessions(app.alloc, &sessions);
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: loadSessions ok, count={d}\n", .{sessions.items.len});
 
     if (sessions.items.len != 0) {
         _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
         app.workspace.system_menu_added_items += 1;
+        if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: separator appended\n", .{});
     }
 
-    for (sessions.items) |session| {
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: entering session loop\n", .{});
+    for (sessions.items, 0..) |session, si| {
+        if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: enter hwnd=0x{x} pid={d}\n", .{ si, session.hwnd, session.pid });
         if (app.session_menu_count >= app.session_menu_hwnds.len) break;
-        const session_hwnd: c.HWND = @ptrFromInt(session.hwnd);
-        if (c.IsWindow(session_hwnd) == 0) continue;
+        const session_handle = hwndU(session.hwnd);
+        if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: pre-IsWindow\n", .{si});
+        if (IsWindow(session_handle) == 0) {
+            if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: IsWindow=false, skip\n", .{si});
+            continue;
+        }
+        if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: IsWindow=true\n", .{si});
 
         var buf: [300]u16 = undefined;
         var pos: usize = 0;
@@ -431,13 +481,16 @@ fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
             pos += 1;
         }
         buf[pos] = 0;
+        if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: buf built, pos={d}\n", .{ si, pos });
 
         const slot = app.session_menu_count;
         app.session_menu_hwnds[slot] = session.hwnd;
         app.session_menu_count += 1;
-        _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + @as(c_uint, @intCast(slot)), &buf);
+        _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + @as(c_uint, @intCast(slot)) * workspace_mod.WorkspaceState.SC_WS_SESSION_STRIDE, &buf);
         app.workspace.system_menu_added_items += 1;
+        if (applog.isEnabled()) applog.appLog("[diag] session_loop[{d}]: appended slot={d}\n", .{ si, slot });
     }
+    if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: loop done\n", .{});
 }
 
 fn launchNewWindow() bool {
@@ -667,8 +720,11 @@ pub export fn WndProc(
                 // updateSystemMenu call so that the session registry picks up
                 // this process and other running zonvie windows appear in the
                 // menu immediately on open.
+                if (applog.isEnabled()) applog.appLog("[diag] WM_CREATE tail: syncPrimaryTileConfig begin\n", .{});
                 syncPrimaryTileConfig(app);
+                if (applog.isEnabled()) applog.appLog("[diag] WM_CREATE tail: syncPrimaryTileConfig done\n", .{});
                 refreshWorkspaceSystemMenu(app, hwnd);
+                if (applog.isEnabled()) applog.appLog("[diag] WM_CREATE tail: refreshWorkspaceSystemMenu done\n", .{});
 
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
@@ -741,9 +797,11 @@ pub export fn WndProc(
                 const did_need_seed = app.need_full_seed.swap(false, .seq_cst);
                 if (did_need_seed) {
                     // Keep rows/cols synced to client size before we snapshot row-mode state.
+                    if (log_enabled) applog.appLog("[mu] WM_PAINT lock @752 (did_need_seed rows)\n", .{});
                     app.mu.lock();
                     updateRowsColsFromClientForce(hwnd, app);
                     app.mu.unlock();
+                    if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @754\n", .{});
 
                     // IMPORTANT: do not hold app.mu while calling into core.
                     updateLayoutToCore(hwnd, app);
@@ -754,10 +812,12 @@ pub export fn WndProc(
                     // Ensure we get a paint covering the whole surface.
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     {
+                        if (log_enabled) applog.appLog("[mu] WM_PAINT lock @765 (did_need_seed paint_full)\n", .{});
                         app.mu.lock();
                         app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
                         app.mu.unlock();
+                        if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @768\n", .{});
                     }
                 }
 
@@ -786,6 +846,7 @@ pub export fn WndProc(
                 const committed = &app.tbs.sets[tbs_snapshot.committed_index];
 
                 // Step 2: UI metadata snapshot (app.mu short lock).
+                if (log_enabled) applog.appLog("[mu] WM_PAINT lock @797\n", .{});
                 app.mu.lock();
                 if (app.surface.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
@@ -877,6 +938,7 @@ pub export fn WndProc(
                 const paint_full_snapshot = tbs_snapshot.paint_full;
 
                 app.mu.unlock();
+                if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @887\n", .{});
 
                 if (log_enabled) {
                     t_snapshot_end_ns = std.time.nanoTimestamp();
@@ -1056,8 +1118,11 @@ pub export fn WndProc(
                                 // if the renderer wasn't ready at trigger time,
                                 // leaving tile 0 as a bare background color. Catch
                                 // that here now that drawEx has populated back_tex.
+                                // Use the _Locked variant because WM_PAINT already
+                                // holds g.ctx_mu for the whole render phase; the
+                                // wrapper would recurse on it and panic.
                                 if (app.workspace.activeTile().snapshot == null) {
-                                    captureActiveTileSnapshot(app);
+                                    captureActiveTileSnapshotLocked(app, g);
                                 }
                                 // Overlay uses NDC and expects a full-window viewport;
                                 // drawEx leaves viewport/scissor clipped to the content
@@ -1103,10 +1168,12 @@ pub export fn WndProc(
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
                         if (atlas_uploaded and rows_to_draw.items.len == 0) {
+                            if (log_enabled) applog.appLog("[mu] WM_PAINT lock @1114 (atlas_uploaded)\n", .{});
                             app.mu.lock();
                             app.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
                             app.mu.unlock();
+                            if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @1117\n", .{});
                             {
                                 app.tbs.rotation_mu.lock();
                                 app.tbs.pending_paint_full = true;
@@ -1432,6 +1499,7 @@ pub export fn WndProc(
                         // When did_need_seed is true, we must NOT preserve old back buffer contents,
                         // so integrate "seed-clear" behavior here (no extra drawEx).
                         // With TBS, committed set is read-only — only clear row_valid under app.mu.
+                        if (log_enabled) applog.appLog("[mu] WM_PAINT lock @1443 (seed_clear)\n", .{});
                         app.mu.lock();
 
                         const seed_clear = did_need_seed or app.seed_clear_pending;
@@ -1450,6 +1518,7 @@ pub export fn WndProc(
                             }
                         }
                         app.mu.unlock();
+                        if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @1460\n", .{});
 
                         // During seed mode (seed_pending), always clear the back buffer to ensure
                         // all swapchain buffers are properly cleared as they rotate. This prevents
@@ -1641,12 +1710,19 @@ pub export fn WndProc(
                             t_present_start_ns = std.time.nanoTimestamp();
                         }
 
-                        var layout_ok: bool = true;
-                        var rows_current: u32 = 0;
-                        app.mu.lock();
-                        layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
-                        rows_current = committed.rows;
-                        app.mu.unlock();
+                        // row_layout_gen is written from the core thread under
+                        // app.mu and read here as a simple monotonically-increasing
+                        // u64 sentinel ("did anything change since we snapshotted
+                        // under the lock at line 797"). The exact value doesn't
+                        // matter beyond equality with row_layout_gen_snapshot —
+                        // a stale read just makes us re-paint next frame. Skip
+                        // the lock so we don't risk re-entering it in a
+                        // DXGI/CreateProcess message-pump nested stack (see the
+                        // "drawEx calls DXGI Present which can pump Win32
+                        // messages" comment above). committed.rows is fed from
+                        // the TBS snapshot, already lock-free by design.
+                        const layout_ok: bool = app.row_layout_gen == row_layout_gen_snapshot;
+                        const rows_current: u32 = committed.rows;
 
                         const allow_present = blk: {
                             // When seed_clear is true, we must present to sync the cleared back buffer
@@ -1721,8 +1797,10 @@ pub export fn WndProc(
                             // of whether the scrollbar branch above reset it.
                             if (app.workspace.isOverviewVisible()) {
                                 // Safety net (see non-row-mode path for details).
+                                // captureActiveTileSnapshotLocked avoids recursing
+                                // on the ctx_mu WM_PAINT already holds.
                                 if (app.workspace.activeTile().snapshot == null) {
-                                    captureActiveTileSnapshot(app);
+                                    captureActiveTileSnapshotLocked(app, g);
                                 }
                                 g.setFullViewport();
                                 const content_rect = overlayContentRect(app, g.width, g.height);
@@ -1745,12 +1823,14 @@ pub export fn WndProc(
                             }
 
                             if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
+                                if (log_enabled) applog.appLog("[mu] WM_PAINT lock @1756 (seed_complete)\n", .{});
                                 app.mu.lock();
                                 app.seed_pending = false;
                                 app.surface.paint_full = true;
                                 app.paint_rects.clearRetainingCapacity();
                                 app.seed_clear_pending = true;
                                 app.mu.unlock();
+                                if (log_enabled) applog.appLog("[mu] WM_PAINT unlock @1761\n", .{});
                                 // Also set TBS pending_paint_full for next paint cycle.
                                 {
                                     app.tbs.rotation_mu.lock();
@@ -2558,7 +2638,7 @@ pub export fn WndProc(
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
-                                if (start_ok != 0) {
+                                if (start_ok == 0) {
                                     app.session_started = true;
                                     app.workspace.setTileStarted(0, true);
                                     refreshSessionRegistration(app);
@@ -2644,13 +2724,24 @@ pub export fn WndProc(
                     // WSL/SSH/devcontainer mode: full initialization path
                     if (deferred_log_enabled) applog.appLog("[win] DEFERRED_INIT: full init path\n", .{});
 
+                    // Initialize workspace state and allocate the tile-0
+                    // TileContext before core creation so callbacks receive
+                    // a valid ctx on the very first invocation. Mirrors the
+                    // early-core path in doEarlyCoreInit.
+                    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
+                    const tile0_ctx = app.alloc.create(app_mod.workspace_mod.TileContext) catch {
+                        if (deferred_log_enabled) applog.appLog("[win] DEFERRED_INIT: tile0 ctx alloc failed\n", .{});
+                        return 0;
+                    };
+                    tile0_ctx.* = .{ .app = app, .tile_index = 0 };
+                    if (app.workspace.tiles.items.len > 0) {
+                        app.workspace.tiles.items[0].ctx = tile0_ctx;
+                    }
+
                     var cb = makeCoreCbs();
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
+                    app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), tile0_ctx);
 
-                    // Initialize workspace state and attach core to tile 0.
-                    // (The early-core path does this inside doEarlyCoreInit.)
-                    app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
                     if (app.corep) |cp| {
                         app.workspace.attachCore(0, cp);
                     }
@@ -2822,7 +2913,7 @@ pub export fn WndProc(
                         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
                         const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
                         app.nvim_spawned = true;
-                        if (start_ok != 0) {
+                        if (start_ok == 0) {
                             app.session_started = true;
                             app.workspace.setTileStarted(0, true);
                             refreshSessionRegistration(app);
@@ -3028,6 +3119,23 @@ pub export fn WndProc(
                     animateWorkspaceScale(app, hwnd, 0.0);
                 }
                 dialogs.showConnectionDialog(app, hwnd);
+            }
+            return 0;
+        },
+
+        app_mod.WM_APP_CREATE_TILE => {
+            // Ownership of the heap-allocated ConnectionConfig comes from
+            // the dialog via PostMessage lParam. We must destroy it
+            // regardless of whether the tile creation succeeds.
+            const lp_raw: usize = @bitCast(lParam);
+            if (lp_raw != 0) {
+                if (getApp(hwnd)) |app| {
+                    const cfg: *workspace_mod.ConnectionConfig = @ptrFromInt(lp_raw);
+                    defer app.alloc.destroy(cfg);
+                    if (createInProcessTile(app, hwnd, cfg)) |_| {} else {
+                        if (applog.isEnabled()) applog.appLog("[win] WM_APP_CREATE_TILE: createInProcessTile failed\n", .{});
+                    }
+                }
             }
             return 0;
         },
@@ -3365,8 +3473,12 @@ pub export fn WndProc(
                             switchActiveTile(app, hwnd, @intCast(idx));
                             animateWorkspaceScale(app, hwnd, 1.0);
                         },
-                        .plus => {
-                            dialogs.showConnectionDialog(app, hwnd);
+                        .plus => |idx| {
+                            // Pass the clicked slot through so the new tile
+                            // lands exactly where the user pointed, not at
+                            // whatever the next append position happens to
+                            // be (matches macOS overlay behaviour).
+                            dialogs.showConnectionDialogForTile(app, hwnd, @intCast(idx));
                         },
                         .none => {},
                     }
@@ -4113,11 +4225,11 @@ pub export fn WndProc(
                 }
                 return 0;
             }
-            if (cmd >= app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE and
-                cmd < app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + 9)
-            {
+            const base = app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE;
+            const stride = app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_STRIDE;
+            if (cmd >= base and cmd < base + 9 * stride and ((cmd - base) % stride) == 0) {
                 if (getApp(hwnd)) |app| {
-                    const index: usize = @intCast(cmd - app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE);
+                    const index: usize = @intCast((cmd - base) / stride);
                     if (index < app.session_menu_count) {
                         focusRegisteredSession(app.session_menu_hwnds[index]);
                     }
@@ -4189,6 +4301,7 @@ pub export fn WndProc(
 
         // DWM custom titlebar: extend frame into client area on activation
         c.WM_ACTIVATE => {
+            if (applog.isEnabled()) applog.appLog("[diag] WM_ACTIVATE wParam={d}\n", .{wParam});
             if (getApp(hwnd)) |app| {
                 if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
                     // Enable DWM shadow for borderless window by extending frame with minimal margins.
@@ -4199,10 +4312,14 @@ pub export fn WndProc(
                     if (applog.isEnabled()) applog.appLog("[win] WM_ACTIVATE: DwmExtendFrameIntoClientArea applied for shadow\n", .{});
                 }
             }
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (applog.isEnabled()) applog.appLog("[diag] WM_ACTIVATE: calling DefWindowProcW\n", .{});
+            const rv = c.DefWindowProcW(hwnd, msg, wParam, lParam);
+            if (applog.isEnabled()) applog.appLog("[diag] WM_ACTIVATE: returned from DefWindowProcW\n", .{});
+            return rv;
         },
 
         c.WM_ACTIVATEAPP => {
+            if (applog.isEnabled()) applog.appLog("[diag] WM_ACTIVATEAPP wParam={d}\n", .{wParam});
             // Notify Neovim of focus change (triggers FocusGained/FocusLost autocmds)
             if (getApp(hwnd)) |app| {
                 const is_activating = wParam != 0;
@@ -4343,22 +4460,200 @@ pub fn switchActiveTile(app: *App, hwnd: c.HWND, index: u8) void {
     if (app.workspace.activeCorep()) |cp| {
         app.corep = cp;
     }
+    resetSharedRenderingState(app);
+    // Ask the new tile's core for a full redraw so the cleared surface
+    // gets repopulated immediately. Without this, the window would stay
+    // blank until nvim next emits an update. `redraw!` (bang) forces the
+    // UI to redraw even when nvim thinks nothing has changed.
+    if (app.workspace.activeCorep()) |cp| {
+        const cmd = "redraw!";
+        core.zonvie_core_send_command(cp, cmd.ptr, cmd.len);
+    }
     _ = c.InvalidateRect(hwnd, null, 0);
+}
+
+/// Clear the app-wide rendering state that belongs to "whichever tile is
+/// currently active". Called on tile switch so the incoming tile starts
+/// with a clean surface / cursor / seed flags; the core will repopulate
+/// on the next redraw cycle. Keeps shared infrastructure (renderer,
+/// atlas, VB pool) untouched — only per-tile visible state is reset.
+///
+/// IMPORTANT: this runs on the UI thread from paths (dialog WM_COMMAND,
+/// system menu handler) that may be nested inside a message-pump from
+/// CreateProcessW / CreateWindowExW / MessageBoxW etc. Those pumps can
+/// re-enter WM_PAINT while we're still on the call stack, and WM_PAINT
+/// takes `app.mu`. Acquiring `app.mu` here would then recurse on the
+/// same thread and panic with "Deadlock detected". We rely on the
+/// `is_active_tile` gate in the callback layer plus the caller's timing
+/// (invoked synchronously from the switch point, before any core events
+/// can race us) to keep the state transitions consistent.
+fn resetSharedRenderingState(app: *App) void {
+    app.surface.verts.clearRetainingCapacity();
+    app.surface.cursor_verts.clearRetainingCapacity();
+    for (app.surface.row_verts.items) |*rv| rv.verts.clearRetainingCapacity();
+    app.surface.paint_full = true;
+    app.paint_rects.clearRetainingCapacity();
+    app.row_mode_max_row_end = 0;
+    app.cursor = null;
+    app.last_cursor_rect_px = null;
+    app.last_painted_cursor_row = null;
+    app.seed_pending = true;
+    app.seed_clear_pending = true;
+    app.need_full_seed.store(true, .release);
+    var i: usize = 0;
+    while (i < app.row_valid.bit_length) : (i += 1) {
+        if (app.row_valid.isSet(i)) app.row_valid.unset(i);
+    }
+    app.row_valid_count = 0;
+}
+
+/// Add a new in-process tile for the given connection config, create a
+/// core for it, switch the active tile, and start nvim. Returns the new
+/// tile index on success. This is the Windows counterpart of the macOS
+/// `addTile + startTile + switchToTile` sequence in WorkspaceManager —
+/// prior to this path the Windows "New Session" dialog spawned a
+/// separate zonvie.exe process which opened a new OS window. Now the
+/// new session lives on the same window as a tile.
+pub fn createInProcessTile(app: *App, hwnd: c.HWND, config: *const workspace_mod.ConnectionConfig) ?u8 {
+    const log_enabled = applog.isEnabled();
+
+    // IMPORTANT: do NOT capture the active tile's snapshot here. By the
+    // time Connect was clicked the tile overview was already open
+    // (scale == 0), so back_tex contains (terminal + overlay) from the
+    // previous paint. Capturing now would store an image of the tile
+    // view itself and tile 0 would then render nested overlays inside
+    // its own slot. animateWorkspaceScale(target=0.0) already captured
+    // the snapshot back when scale was still 1.0 (pure terminal), which
+    // is the image we want to show on the outgoing tile.
+
+    // Prefer the user-requested slot (clicked "+" cell in the overview);
+    // fall back to appending if no hint was supplied or the hinted slot
+    // is already occupied. Invalid hints (out of range) fail fast so we
+    // don't silently drop a miss-targeted New Session.
+    const index = blk: {
+        if (config.target_tile_index) |hint| {
+            break :blk app.workspace.reserveTileAt(hint, config.connectionType()) catch |err| {
+                if (log_enabled) applog.appLog(
+                    "[win] createInProcessTile: reserveTileAt({d}) failed: {any} — falling back to addTile\n",
+                    .{ hint, err },
+                );
+                break :blk app.workspace.addTile(config.connectionType()) catch {
+                    if (log_enabled) applog.appLog("[win] createInProcessTile: addTile fallback failed\n", .{});
+                    return null;
+                };
+            };
+        }
+        break :blk app.workspace.addTile(config.connectionType()) catch {
+            if (log_enabled) applog.appLog("[win] createInProcessTile: addTile failed (at capacity?)\n", .{});
+            return null;
+        };
+    };
+    app.workspace.setTileConfig(index, config.*);
+
+    const new_ctx = app.alloc.create(workspace_mod.TileContext) catch {
+        if (log_enabled) applog.appLog("[win] createInProcessTile: TileContext alloc failed\n", .{});
+        return null;
+    };
+    new_ctx.* = .{ .app = app, .tile_index = index };
+    app.workspace.tiles.items[index].ctx = new_ctx;
+
+    var cb = makeCoreCbs();
+    const new_corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), new_ctx) orelse {
+        if (log_enabled) applog.appLog("[win] createInProcessTile: zonvie_core_create returned null\n", .{});
+        app.alloc.destroy(new_ctx);
+        app.workspace.tiles.items[index].ctx = null;
+        return null;
+    };
+    app.workspace.attachCore(index, new_corep);
+
+    // Mirror the per-core configuration the startup path applies in
+    // doEarlyCoreInit, overridden by the dialog-supplied config.
+    if (config.ext_cmdline) core.zonvie_core_set_ext_cmdline(new_corep, 1);
+    if (config.ext_popupmenu) core.zonvie_core_set_ext_popupmenu(new_corep, 1);
+    if (config.ext_messages) core.zonvie_core_set_ext_messages(new_corep, 1);
+    if (config.ext_tabline) core.zonvie_core_set_ext_tabline(new_corep, 1);
+    if (config.ext_windows) core.zonvie_core_set_ext_windows(new_corep, 1);
+    core.zonvie_core_set_background_opacity(new_corep, app.config.window.opacity);
+    core.zonvie_core_set_atlas_size(new_corep, app.config.performance.atlas_size);
+    core.zonvie_core_set_glyph_cache_size(
+        new_corep,
+        app.config.performance.glyph_cache_ascii_size,
+        app.config.performance.glyph_cache_non_ascii_size,
+    );
+
+    // Load the same config file so fonts / colors remain consistent.
+    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
+        defer app.alloc.free(config_path);
+        if (app.alloc.dupeZ(u8, config_path)) |cpath| {
+            defer app.alloc.free(cpath);
+            _ = core.zonvie_core_load_config(new_corep, cpath.ptr);
+        } else |_| {}
+    } else |_| {}
+
+    // Flip active tile to the newly created one BEFORE starting nvim so
+    // the very first callbacks from the new core pass the isActiveTile
+    // gate and reach the shared rendering state.
+    app.workspace.switchToTile(index);
+    app.corep = new_corep;
+    resetSharedRenderingState(app);
+
+    // Mark started; workspace overview uses this to decide occupied slots.
+    app.workspace.setTileStarted(index, true);
+
+    const rows = app.surface.rows;
+    const cols = app.surface.cols;
+    const nvim_path_slice = if (config.nvimPath().len > 0) config.nvimPath() else app.config.neovim.path;
+    const nvim_path_z = app.alloc.dupeZ(u8, nvim_path_slice) catch null;
+    defer if (nvim_path_z) |p| app.alloc.free(p);
+    const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
+    const start_ok = core.zonvie_core_start(new_corep, nvim_path_ptr, rows, cols);
+    if (log_enabled) applog.appLog(
+        "[win] createInProcessTile: tile={d} start_ok={d} rows={d} cols={d}\n",
+        .{ index, start_ok, rows, cols },
+    );
+
+    _ = c.InvalidateRect(hwnd, null, 0);
+    return index;
 }
 
 /// Capture a snapshot of the current frame for the active tile. No-op if
 /// the renderer is not ready. Safe to call before entering tile grid view.
+///
+/// Caller must NOT already hold renderer.ctx_mu — this wraps the capture
+/// in lockContext/unlockContext. WM_PAINT holds ctx_mu across its whole
+/// render phase, so call sites inside the paint path must go through
+/// `captureActiveTileSnapshotLocked` instead to avoid recursive locking.
 pub fn captureActiveTileSnapshot(app: *App) void {
     if (app.renderer) |*renderer| {
         renderer.lockContext();
         defer renderer.unlockContext();
-        if (renderer.captureSnapshot()) |snap| {
-            var tile = app.workspace.activeTile();
-            if (tile.snapshot) |*old| {
-                d3d11.Renderer.releaseSnapshot(old);
-            }
-            tile.snapshot = snap;
-        } else |_| {}
+        captureActiveTileSnapshotLocked(app, renderer);
+    } else {
+        if (applog.isEnabled()) applog.appLog("[win] captureActiveTileSnapshot: renderer not ready\n", .{});
+    }
+}
+
+/// Same as captureActiveTileSnapshot but assumes the caller already holds
+/// `renderer.ctx_mu`. Used from WM_PAINT's render phase, where the whole
+/// paint runs inside a single g.lockContext() scope — calling the wrapper
+/// form there would recurse on the same ctx_mu and Zig's DebugImpl would
+/// panic with "Deadlock detected".
+pub fn captureActiveTileSnapshotLocked(app: *App, renderer: *d3d11.Renderer) void {
+    if (renderer.captureSnapshot()) |snap| {
+        var tile = app.workspace.activeTile();
+        if (tile.snapshot) |*old| {
+            d3d11.Renderer.releaseSnapshot(old);
+        }
+        tile.snapshot = snap;
+        if (applog.isEnabled()) applog.appLog(
+            "[win] captureActiveTileSnapshot: ok tile={d} {d}x{d}\n",
+            .{ app.workspace.active_tile, snap.width, snap.height },
+        );
+    } else |err| {
+        if (applog.isEnabled()) applog.appLog(
+            "[win] captureActiveTileSnapshot: captureSnapshot failed: {any}\n",
+            .{err},
+        );
     }
 }
 

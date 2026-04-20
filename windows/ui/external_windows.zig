@@ -9,6 +9,7 @@ const scrollbar = @import("scrollbar.zig");
 const input = @import("../input.zig");
 const messages = @import("messages.zig");
 const core = @import("zonvie_core");
+const callbacks = @import("../callbacks.zig");
 
 const ExternalSurfaceKind = enum {
     normal,
@@ -527,7 +528,7 @@ fn drawNormalExternalSurfaceRowMode(
 }
 
 pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_external_window: grid_id={d} win={d} rows={d} cols={d} pos=({d},{d})\n", .{ grid_id, win, rows, cols, start_row, start_col });
 
     app.mu.lock();
@@ -1056,7 +1057,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 }
 
 pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_external_window_close: grid_id={d}\n", .{grid_id});
 
     // Mark the window as pending close (don't remove from HashMap yet to avoid use-after-free)
@@ -1152,7 +1153,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 }
 
 pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_cursor_grid_changed: grid_id={d}\n", .{grid_id});
 
     // Post message to UI thread to handle window activation
@@ -2450,7 +2451,7 @@ fn sortSpatially(infos: []WindowInfo) void {
 
 pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
     _ = win;
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_win_move: grid={d} flags={d}\n", .{ grid_id, flags });
 
     app.mu.lock();
@@ -2471,7 +2472,7 @@ pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(
 
 pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
     _ = win;
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: grid={d} count={d}\n", .{ grid_id, count });
 
     app.mu.lock();
@@ -2506,7 +2507,7 @@ pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callc
 pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
     _ = grid_id;
     _ = win;
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: direction={d} count={d}\n", .{ direction, count });
 
     app.mu.lock();
@@ -2587,7 +2588,7 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
 /// SetWindowPos on the main window from core thread sends WM_SIZE → updateLayoutToCore → grid_mu.lock()
 /// while grid_mu is already held by the core thread during this callback.
 pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
 
     app.mu.lock();
@@ -2638,7 +2639,7 @@ pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return 0).app;
     if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: direction={d} count={d}\n", .{ direction, count });
 
     app.mu.lock();

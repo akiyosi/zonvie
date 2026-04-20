@@ -6,7 +6,81 @@ const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
+const workspace_mod = app_mod.workspace_mod;
 
+// =========================================================================
+// Callback ctx dispatch
+//
+// Every core is created with a workspace_mod.TileContext as its ctx so that
+// callbacks can identify which tile the event belongs to. Tile 0 (the
+// startup tile) owns the first TileContext; additional tiles will allocate
+// their own when the in-process multi-tile path lands (see workspace.zig).
+// All callbacks go through extractCallbackCtx to recover the app pointer
+// and tile_index; the app-wide state is still the primary consumer today
+// but tile_index is already threaded so per-tile routing can slot in
+// without another callback refactor.
+// =========================================================================
+
+pub const CallbackCtx = struct {
+    app: *App,
+    tile_index: u8,
+};
+
+pub inline fn extractCallbackCtx(ctx: ?*anyopaque) ?CallbackCtx {
+    const ctxp = ctx orelse return null;
+    // Defensive: a TileContext allocated by the app lives on a regular
+    // heap and should always satisfy its own alignment. If anything ends
+    // up passing a raw *App or a misaligned pointer here, the implicit
+    // @alignCast would trip the Debug panic "incorrect alignment" and we
+    // would lose all debugging context. Check explicitly so we can log
+    // what the ctx bits look like before the cast.
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(workspace_mod.TileContext) != 0) {
+        if (applog.isEnabled()) applog.appLog(
+            "[cb] misaligned TileContext ctx=0x{x} align={d}\n",
+            .{ ctx_bits, @alignOf(workspace_mod.TileContext) },
+        );
+        return null;
+    }
+    const tc: *workspace_mod.TileContext = @ptrFromInt(ctx_bits);
+    const app_bits: usize = @intFromPtr(tc.app);
+    if (app_bits % @alignOf(App) != 0) {
+        if (applog.isEnabled()) applog.appLog(
+            "[cb] misaligned App ptr app=0x{x} align={d} tile={d}\n",
+            .{ app_bits, @alignOf(App), tc.tile_index },
+        );
+        return null;
+    }
+    const app: *App = @ptrFromInt(app_bits);
+    return .{ .app = app, .tile_index = tc.tile_index };
+}
+
+/// True when this callback's tile currently owns the app's shared
+/// rendering resources (surface / TBS / atlas / extension UI). Non-active
+/// tiles still run their own core (nvim keeps producing events), but we
+/// drop the events that would otherwise clobber the visible tile's state.
+/// macOS achieves the same isolation via per-core tileRenderer + separate
+/// glyph atlas; the Windows path stays single-surface for now and relies
+/// on a full redraw when the active tile changes (see switchActiveTile).
+pub inline fn isActiveTile(cb_ctx: CallbackCtx) bool {
+    // active_tile is written from the UI thread and read from the core
+    // thread. On x86_64 u8 loads are atomic enough for this flag; if the
+    // UI thread flips the value mid-callback we might drop one frame — the
+    // subsequent InvalidateRect always follows.
+    return cb_ctx.app.workspace.active_tile == cb_ctx.tile_index;
+}
+
+/// Like extractCallbackCtx but also filters out callbacks from non-active
+/// tiles. Use this in callbacks whose side effects would clobber the
+/// visible tile's shared state (surface, TBS, atlas, ext UI, window
+/// title / colors). Callbacks that must fire for any tile (onExit,
+/// onSetTitle → tile title buffer, onSSHAuthPrompt, onQuitRequested,
+/// onLog) should keep extractCallbackCtx and route by tile_index instead.
+pub inline fn activeCallbackCtx(ctx: ?*anyopaque) ?CallbackCtx {
+    const cb_ctx = extractCallbackCtx(ctx) orelse return null;
+    if (!isActiveTile(cb_ctx)) return null;
+    return cb_ctx;
+}
 
 // ---- Logging globals for atlas ensure callbacks ----
 var log_atlas_ensure_calls: u64 = 0;
@@ -474,7 +548,7 @@ pub fn onVerticesPartial(
     cursor_count: usize,
     flags: u32,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     if (applog.isEnabled()) applog.appLog(
         "[win] onVerticesPartial flags=0x{x} main_count={d} cursor_count={d}\n",
@@ -672,7 +746,7 @@ pub fn onVerticesRow(
     total_rows: u32,
     total_cols: u32,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     app.mu.lock();
     defer app.mu.unlock();
 
@@ -1220,7 +1294,7 @@ pub fn onMainRowScroll(
     total_rows: u32,
     total_cols: u32,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     app.mu.lock();
     defer app.mu.unlock();
 
@@ -1370,7 +1444,7 @@ pub fn onGridRowScroll(
     total_rows: u32,
     total_cols: u32,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     app.mu.lock();
     defer app.mu.unlock();
 
@@ -1482,10 +1556,7 @@ pub fn onGridRowScroll(
 /// Prepares triple-buffered write sets for all surfaces. If any surface lacks
 /// a free set (UI still reading) or alloc fails, aborts the flush.
 pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
-    const ctxp = ctx orelse return;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     // Phase 1: Pre-flight — check all surfaces have a free set.
     var can_flush = app.tbs.hasFreeSet();
@@ -1538,10 +1609,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
 /// Posts a single WM_APP_UPDATE_SCROLLBAR with atomic coalescing to avoid
 /// flooding the message queue when flushes are frequent.
 pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
-    const ctxp = ctx orelse return;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     // First flush triggers window show: keep window hidden until nvim sends first frame
     if (!app.window_shown.load(.acquire)) {
@@ -1628,13 +1696,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.GlyphEntry) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) {
-        if (applog.isEnabled()) applog.appLog("onAtlasEnsureGlyph: MISALIGNED ctx=0x{x} align={d} scalar=0x{x}", .{ ctx_bits, @alignOf(App), scalar });
-        return 0;
-    }
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     // ---- aggregate stats (very low overhead) ----
     log_atlas_ensure_calls += 1;
@@ -1716,13 +1778,7 @@ pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.Gly
 }
 
 pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_entry: *app_mod.GlyphEntry) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) {
-        if (applog.isEnabled()) applog.appLog("onAtlasEnsureGlyphStyled: MISALIGNED ctx=0x{x} align={d} scalar=0x{x} style=0x{x}", .{ ctx_bits, @alignOf(App), scalar, style_flags });
-        return 0;
-    }
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     log_styled_glyph_calls += 1;
 
@@ -1770,10 +1826,7 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
 // =========================================================================
 
 pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *app_mod.GlyphBitmap) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return 0;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1803,10 +1856,7 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
 }
 
 pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const app_mod.GlyphBitmap) callconv(.c) void {
-    const ctxp = ctx orelse return;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1820,10 +1870,7 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
 }
 
 pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
-    const ctxp = ctx orelse return;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1852,10 +1899,7 @@ pub fn onShapeTextRun(
     out_y_offset: [*]i32,
     out_cap: usize,
 ) callconv(.c) usize {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return 0;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1885,10 +1929,7 @@ pub fn onRasterizeGlyphById(
     style_flags: u32,
     out_bitmap: *app_mod.GlyphBitmap,
 ) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return 0;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1924,10 +1965,7 @@ pub fn onGetAsciiTable(
     out_x_advances: [*]i32,
     out_lig_triggers: [*]u8,
 ) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) return 0;
-    const app: *App = @ptrFromInt(ctx_bits);
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
@@ -1960,7 +1998,7 @@ pub fn onLog(ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) voi
 // =========================================================================
 
 pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     // Font priority: guifont > config.font.family > OS default (Consolas)
     const os_default_font = "Consolas";
@@ -2154,7 +2192,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 }
 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     const v: u32 = if (linespace_px <= 0) 0 else @intCast(linespace_px);
 
@@ -2248,8 +2286,14 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 // =========================================================================
 
 pub fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_exit: code={d}\n", .{exit_code});
+    // Handle nvim exit for the emitting tile regardless of active status —
+    // an inactive tile's core crashing still needs WM_CLOSE routing.
+    const cb_ctx = extractCallbackCtx(ctx) orelse return;
+    const app = cb_ctx.app;
+    if (applog.isEnabled()) applog.appLog(
+        "[win] on_exit: tile={d} code={d}\n",
+        .{ cb_ctx.tile_index, exit_code },
+    );
     // Mark Neovim as exited (to skip requestQuit in WM_CLOSE)
     app.neovim_exited.store(true, .release);
     // Store exit code globally (Nvy style - returned from main instead of ExitProcess)
@@ -2260,7 +2304,7 @@ pub fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
 }
 
 pub fn onIMEOff(ctx: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     if (app.hwnd) |hwnd| {
         // Post message to main thread (IME APIs must be called from the window's thread)
         _ = c.PostMessageW(hwnd, app_mod.WM_APP_IME_OFF, 0, 0);
@@ -2268,8 +2312,16 @@ pub fn onIMEOff(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] onQuitRequested: has_unsaved={d}\n", .{has_unsaved});
+    // Quit prompts fire per-tile (e.g. closing a backgrounded session); we
+    // keep extractCallbackCtx so non-active tiles can still deliver the
+    // prompt. WM_APP_QUIT_REQUESTED routing assumes tile 0 today; the
+    // per-tile dispatch lands with the UI-side quit flow.
+    const cb_ctx = extractCallbackCtx(ctx) orelse return;
+    const app = cb_ctx.app;
+    if (applog.isEnabled()) applog.appLog(
+        "[win] onQuitRequested: tile={d} has_unsaved={d}\n",
+        .{ cb_ctx.tile_index, has_unsaved },
+    );
 
     // Post message to main thread to avoid blocking RPC thread
     if (app.hwnd) |hwnd| {
@@ -2278,7 +2330,7 @@ pub fn onQuitRequested(ctx: ?*anyopaque, has_unsaved: c_int) callconv(.c) void {
 }
 
 pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
 
     if (applog.isEnabled()) applog.appLog("[win] onDefaultColorsSet: fg=0x{x:0>8} bg=0x{x:0>8}\n", .{ fg, bg });
 
@@ -2305,44 +2357,49 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
 }
 
 pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    // Route to the emitting tile's title buffer regardless of active
+    // status so the overview shows up-to-date titles for inactive
+    // sessions. Only the active tile updates the main window title.
+    const cb_ctx = extractCallbackCtx(ctx) orelse return;
+    const app = cb_ctx.app;
 
-    if (applog.isEnabled()) applog.appLog("[win] onSetTitle: len={d}\n", .{title_len});
+    if (applog.isEnabled()) applog.appLog(
+        "[win] onSetTitle: tile={d} len={d}\n",
+        .{ cb_ctx.tile_index, title_len },
+    );
 
     if (title_ptr == null or title_len == 0) return;
 
     const title = title_ptr.?[0..title_len];
-    if (applog.isEnabled()) applog.appLog("[win] onSetTitle: {s}\n", .{title});
 
-    // Defer SetWindowTextW to UI thread via PostMessage to avoid deadlock.
-    // SetWindowTextW from a non-owning thread is an implicit cross-thread
-    // SendMessage(WM_SETTEXT), which blocks with grid_mu held.
     const hwnd = app.hwnd orelse return;
 
-    // Truncate UTF-8 input to fit the pending_title buffer (511 UTF-16 units + null).
-    // If the full title doesn't fit, progressively shorten the UTF-8 slice at
-    // codepoint boundaries until it fits, so we always get a partial update
-    // rather than silently dropping the title.
     app.mu.lock();
-    var src = title;
-    var wide_len: usize = 0;
-    while (src.len > 0) {
-        wide_len = std.unicode.utf8ToUtf16Le(&app.pending_title, src) catch {
-            // Shorten src by one codepoint from the end and retry.
-            var trim = src.len - 1;
-            while (trim > 0 and (src[trim] & 0xC0) == 0x80) trim -= 1;
-            src = src[0..trim];
-            continue;
-        };
-        break;
+    // Always stash the title on the tile so the workspace overview shows
+    // the correct label even for inactive sessions.
+    app.workspace.setTileTitle(cb_ctx.tile_index, title);
+
+    const is_active = cb_ctx.tile_index == app.workspace.active_tile;
+    var clamped_len: usize = 0;
+    if (is_active) {
+        var src = title;
+        var wide_len: usize = 0;
+        while (src.len > 0) {
+            wide_len = std.unicode.utf8ToUtf16Le(&app.pending_title, src) catch {
+                var trim = src.len - 1;
+                while (trim > 0 and (src[trim] & 0xC0) == 0x80) trim -= 1;
+                src = src[0..trim];
+                continue;
+            };
+            break;
+        }
+        clamped_len = @min(wide_len, app.pending_title.len - 1);
+        app.pending_title[clamped_len] = 0;
+        app.pending_title_len = clamped_len;
     }
-    const clamped_len = @min(wide_len, app.pending_title.len - 1);
-    app.pending_title[clamped_len] = 0; // null terminate
-    app.pending_title_len = clamped_len;
-    app.workspace.setTileTitle(0, src);
     app.mu.unlock();
 
-    if (clamped_len > 0) {
+    if (is_active and clamped_len > 0) {
         _ = c.PostMessageW(hwnd, app_mod.WM_APP_SET_TITLE, 0, 0);
     }
 }
@@ -2363,7 +2420,7 @@ pub fn onCmdlineShow(
     _: u32, // level
     _: u32, // prompt_hl_id
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_cmdline_show: firstc={c}({d})\n", .{ firstc, firstc });
 
     app.mu.lock();
@@ -2380,7 +2437,7 @@ pub fn onCmdlineShow(
 }
 
 pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_cmdline_hide\n", .{});
 
     app.mu.lock();
@@ -2402,7 +2459,7 @@ pub fn onPopupmenuShow(
     _: i64, // grid_id
     colors: ?*const core.PopupmenuColors,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     if (colors) |clrs| {
         app.mu.lock();
         app.popupmenu_bg_rgb = clrs.pmenu_bg;
@@ -2412,7 +2469,7 @@ pub fn onPopupmenuShow(
 }
 
 pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (activeCallbackCtx(ctx) orelse return).app;
     app.mu.lock();
     app.popupmenu_bg_rgb = 0xFFFFFFFF;
     app.mu.unlock();
@@ -2434,10 +2491,10 @@ pub fn onClipboardGet(
 
     if (applog.isEnabled()) applog.appLog("[win] clipboard_get: called\n", .{});
 
-    const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else {
+    const app = (extractCallbackCtx(ctx) orelse {
         out_len.* = 0;
         return 1;
-    };
+    }).app;
 
     const hwnd = app.hwnd orelse {
         out_len.* = 0;
@@ -2495,7 +2552,7 @@ pub fn onClipboardSet(
 
     if (len == 0) return 1;
 
-    const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else return 0;
+    const app = (activeCallbackCtx(ctx) orelse return 0).app;
 
     const hwnd = app.hwnd orelse return 0;
 
@@ -2539,9 +2596,14 @@ pub fn onSSHAuthPrompt(
     prompt: [*]const u8,
     prompt_len: usize,
 ) callconv(.c) void {
-    if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt: called len={d}\n", .{prompt_len});
-
-    const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else return;
+    // SSH prompts must reach the UI even when the tile is inactive (e.g.
+    // starting a backgrounded remote session); don't gate on active tile.
+    const cb_ctx = extractCallbackCtx(ctx) orelse return;
+    const app = cb_ctx.app;
+    if (applog.isEnabled()) applog.appLog(
+        "[win] ssh_auth_prompt: tile={d} len={d}\n",
+        .{ cb_ctx.tile_index, prompt_len },
+    );
 
     // Post message to UI thread to show password dialog
     const hwnd = app.hwnd orelse return;

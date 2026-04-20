@@ -39,7 +39,11 @@ pub const ContentRect = struct {
 };
 
 /// Kind of slot, determined by the WorkspaceState at layout time.
-pub const SlotKind = enum { occupied, plus, empty };
+/// `occupied` = tile has a running core. `empty` = tile is free — drawn
+/// with a "+" glyph so the user can click any free slot to open a new
+/// session (matching the macOS overlay, which puts "+" in every empty
+/// slot instead of only the first one).
+pub const SlotKind = enum { occupied, empty };
 
 /// Compute the pixel rect and slot kind for tile index `idx` at the current
 /// workspace scale. Returns null if `idx` is out of range (>= max_tiles).
@@ -95,17 +99,7 @@ pub fn layoutTile(workspace: *const WorkspaceState, content: ContentRect, idx: u
             const tile = &workspace.tiles.items[idx];
             if (tile.isOccupied()) break :blk .occupied;
         }
-        // First non-occupied slot is the "+" slot; others are hidden empties.
-        var first_empty: u32 = workspace.max_tiles;
-        var i: u32 = 0;
-        while (i < workspace.max_tiles) : (i += 1) {
-            const occupied = i < workspace.tiles.items.len and workspace.tiles.items[i].isOccupied();
-            if (!occupied) {
-                first_empty = i;
-                break;
-            }
-        }
-        break :blk if (idx == first_empty) .plus else .empty;
+        break :blk .empty;
     };
 
     return .{ .rect = rect, .kind = kind };
@@ -125,8 +119,7 @@ pub fn hitTest(workspace: *const WorkspaceState, content: ContentRect, px: f32, 
         if (!layout.rect.contains(px, py)) continue;
         return switch (layout.kind) {
             .occupied => .{ .tile = idx },
-            .plus => .{ .plus = idx },
-            .empty => .none,
+            .empty => .{ .plus = idx },
         };
     }
     return .none;
@@ -171,22 +164,25 @@ pub fn draw(renderer: *d3d11.Renderer, workspace: *const WorkspaceState, content
                     const tile = &workspace.tiles.items[idx];
                     if (tile.snapshot) |snap| {
                         renderer.drawOverlayQuad(snap.srv, ndc, 1.0) catch {};
+                    } else if (is_active and applog.isEnabled()) {
+                        applog.appLog("[win] overlay: active tile {d} has no snapshot\n", .{idx});
                     }
                 }
                 if (is_active) {
                     drawBorder(renderer, ndc, .{ 0.4, 0.6, 1.0, 0.9 }, 2.0, wf, hf) catch {};
                 }
             },
-            .plus => {
-                const bg_color: [4]f32 = .{ 0.05, 0.05, 0.08, 1.0 };
+            .empty => {
+                // Every empty slot is drawn with a visible background, a
+                // subtle border and a "+" glyph so the grid is
+                // recognizable as 3x3 and every slot is obviously
+                // clickable — matches the macOS WorkspaceOverlayView
+                // which puts "+" in every empty slot, not just the
+                // first-unoccupied one.
+                const bg_color: [4]f32 = .{ 0.10, 0.10, 0.12, 0.9 };
                 renderer.drawOverlaySolid(ndc, bg_color) catch continue;
                 drawBorder(renderer, ndc, .{ 0.35, 0.35, 0.42, 0.8 }, 1.5, wf, hf) catch {};
                 drawPlusGlyph(renderer, rect, wf, hf) catch {};
-            },
-            .empty => {
-                // Leave fully empty slots faintly visible for structure.
-                const bg_color: [4]f32 = .{ 0.04, 0.04, 0.05, 0.9 };
-                renderer.drawOverlaySolid(ndc, bg_color) catch continue;
             },
         }
     }

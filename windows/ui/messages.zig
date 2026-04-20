@@ -7,6 +7,7 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
+const callbacks = @import("../callbacks.zig");
 
 pub fn onMsgShow(
     ctx: ?*anyopaque,
@@ -21,7 +22,7 @@ pub fn onMsgShow(
     msg_id: i64,
     timeout_ms: u32,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     const kind_str = kind[0..kind_len];
 
     // Build message text and get primary hl_id from first chunk
@@ -77,7 +78,7 @@ pub fn onMsgShow(
 }
 
 pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_msg_clear\n", .{});
 
     // Post message to UI thread to hide window
@@ -87,17 +88,17 @@ pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMsgShowmode(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     handleMsgMiniOrExtFloat(app, view, .msg_showmode, .showmode, "showmode", chunks, chunk_count);
 }
 
 pub fn onMsgShowcmd(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     handleMsgMiniOrExtFloat(app, view, .msg_showcmd, .showcmd, "showcmd", chunks, chunk_count);
 }
 
 pub fn onMsgRuler(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     handleMsgMiniOrExtFloat(app, view, .msg_ruler, .ruler, "ruler", chunks, chunk_count);
 }
 
@@ -234,7 +235,7 @@ pub fn onMsgHistoryShow(
     entry_count: usize,
     prev_cmd: c_int,
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
 
     if (entries == null or entry_count == 0) {
         if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: empty entries\n", .{});

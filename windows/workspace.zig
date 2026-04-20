@@ -35,6 +35,11 @@ pub const ConnectionConfig = struct {
     ext_tabline: bool = false,
     ext_windows: bool = false,
     devcontainer_rebuild: bool = false,
+    /// Tile slot the user explicitly clicked in the workspace overview
+    /// (from a "+" cell). `createInProcessTile` uses this to place the
+    /// new session at that position instead of appending after the
+    /// existing tiles. `null` = append at the next free slot.
+    target_tile_index: ?u8 = null,
 
     pub fn setName(self: *ConnectionConfig, value: []const u8) void {
         self.name_len = copyInto(&self.name_buf, value);
@@ -119,7 +124,8 @@ pub const ConnectionType = enum(u8) {
 
 /// Per-tile callback context. Passed as the `ctx` parameter to
 /// zonvie_core_create so that callbacks can identify which tile they
-/// belong to.
+/// belong to. The concrete dispatch helpers live in callbacks.zig
+/// (extractCallbackCtx / activeCallbackCtx / isActiveTile).
 pub const TileContext = struct {
     app: *anyopaque, // *App (avoid circular import)
     tile_index: u8,
@@ -206,6 +212,25 @@ pub const WorkspaceState = struct {
         if (self.tiles.items.len >= self.max_tiles) return error.MaxTilesReached;
         try self.tiles.append(self.alloc, .{ .connection = connection });
         return @intCast(self.tiles.items.len - 1);
+    }
+
+    /// Ensure a tile exists at `index` so a new session can be parked
+    /// there. Grows the tile list with empty slots up to `index` if
+    /// needed. Returns the final index (== input) on success, or
+    /// error.MaxTilesReached if `index` is out of range. If the slot
+    /// already holds a running tile the call fails with
+    /// error.SlotOccupied. Used by the workspace overview: clicking a
+    /// specific "+" cell places the new session at that grid position,
+    /// not the next free append slot.
+    pub fn reserveTileAt(self: *WorkspaceState, index: u8, connection: ConnectionType) !u8 {
+        if (index >= self.max_tiles) return error.MaxTilesReached;
+        while (self.tiles.items.len <= index) {
+            try self.tiles.append(self.alloc, .{});
+        }
+        const tile = &self.tiles.items[index];
+        if (tile.isOccupied()) return error.SlotOccupied;
+        tile.* = .{ .connection = connection };
+        return index;
     }
 
     /// Attach a core to an existing tile.
@@ -305,9 +330,13 @@ pub const WorkspaceState = struct {
     // MARK: - Window system menu (title bar icon / Alt+Space)
 
     // Command IDs for system menu items (must not collide with SC_* constants).
-    // SC_* values are in the 0xF000+ range; we use 0xE000+.
-    pub const SC_WS_NEW_SESSION: c_uint = 0xE001;
-    pub const SC_WS_SESSION_BASE: c_uint = 0xE100; // + tile index
+    // SC_* values are in the 0xF000+ range; we use 0xE000+. The low four bits
+    // of wParam are reserved by the system in WM_SYSCOMMAND (MSDN: apply
+    // `wParam & 0xFFF0` before comparing), so every ID here must be aligned
+    // to 16 — otherwise the masked value never matches the raw constant.
+    pub const SC_WS_NEW_SESSION: c_uint = 0xE010;
+    pub const SC_WS_SESSION_BASE: c_uint = 0xE100; // + tile index * 16
+    pub const SC_WS_SESSION_STRIDE: c_uint = 0x10;
 
     /// Populate the system menu with workspace items.
     /// Called on WM_CREATE and can be called again to refresh.
@@ -350,7 +379,7 @@ pub const WorkspaceState = struct {
                 pos += 1;
             }
             buf[pos] = 0;
-            _ = c.AppendMenuW(sys_menu, c.MF_STRING, SC_WS_SESSION_BASE + @as(c_uint, @intCast(i)), &buf);
+            _ = c.AppendMenuW(sys_menu, c.MF_STRING, SC_WS_SESSION_BASE + @as(c_uint, @intCast(i)) * SC_WS_SESSION_STRIDE, &buf);
             self.system_menu_added_items += 1;
         }
     }

@@ -130,6 +130,16 @@ pub const WM_APP_SNAP_MAIN_WINDOW: c.UINT = c.WM_APP + 28;
 /// matching the macOS Workspaces menu flow.
 pub const WM_APP_REQUEST_NEW_SESSION: c.UINT = c.WM_APP + 29;
 
+/// Posted by the connection dialog's Connect button so that the actual
+/// tile creation runs in a fresh UI message dispatch, not nested inside
+/// the dialog's WM_COMMAND. zonvie_core_start calls CreateProcessW which
+/// pumps messages internally — running this synchronously from inside
+/// WM_COMMAND re-enters WM_PAINT on the same thread and trips the debug
+/// mutex "Deadlock detected" check on `app.mu`. lParam carries a heap-
+/// allocated `*workspace_mod.ConnectionConfig` that the handler owns and
+/// frees after consuming.
+pub const WM_APP_CREATE_TILE: c.UINT = c.WM_APP + 30;
+
 // =========================================================================
 // Timer IDs and timing constants
 // =========================================================================

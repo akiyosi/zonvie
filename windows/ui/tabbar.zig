@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
+const callbacks = @import("../callbacks.zig");
 
 // ---- Shared helpers for titlebar and sidebar tab operations ----
 
@@ -1504,7 +1505,7 @@ pub fn onTablineUpdate(
     _: ?[*]const core.BufferEntry, // buffers
     _: usize, // buffer_count
 ) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
 
     {
         app.mu.lock();
@@ -1536,7 +1537,7 @@ pub fn onTablineUpdate(
 }
 
 pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const app = (callbacks.activeCallbackCtx(ctx) orelse return).app;
     if (applog.isEnabled()) applog.appLog("[win] on_tabline_hide\n", .{});
 
     app.mu.lock();

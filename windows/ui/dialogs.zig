@@ -925,6 +925,13 @@ var g_session_overview_new_hwnd: ?c.HWND = null;
 var g_session_overview_close_hwnd: ?c.HWND = null;
 var g_connection_dialog_hwnd: ?c.HWND = null;
 
+/// Set by the workspace overlay when the user clicks a specific "+"
+/// cell (see WM_LBUTTONDOWN handler in window.zig). Consumed by
+/// launchConfiguredSession and fed to ConnectionConfig.target_tile_index
+/// so the new session lands on the clicked slot instead of appending at
+/// the next free position. `null` means "no explicit target — append".
+var g_connection_dialog_target_idx: ?u8 = null;
+
 var g_conn_name_hwnd: ?c.HWND = null;
 var g_conn_nvim_hwnd: ?c.HWND = null;
 var g_conn_local_hwnd: ?c.HWND = null;
@@ -993,6 +1000,16 @@ pub fn showSessionOverview(app: *App, owner: c.HWND) void {
     g_session_overview_hwnd = hwnd;
     _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
     _ = c.UpdateWindow(hwnd);
+}
+
+/// Open the new-session dialog and, when the user clicks Connect, place
+/// the resulting tile at the specific slot the user clicked in the
+/// workspace overview. Used by the "+" click path so overlay geometry
+/// (e.g. clicking the center cell) becomes the actual target slot, not
+/// just "next free append".
+pub fn showConnectionDialogForTile(app: *App, owner: c.HWND, target_idx: u8) void {
+    g_connection_dialog_target_idx = target_idx;
+    showConnectionDialog(app, owner);
 }
 
 pub fn showConnectionDialog(app: *App, owner: c.HWND) void {
@@ -1067,19 +1084,29 @@ fn sessionOverviewProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LP
         },
         c.WM_COMMAND => {
             const code = (wParam >> 16) & 0xFFFF;
-            const source_hwnd: ?c.HWND = if (lParam == 0) null else @ptrFromInt(@as(usize, @bitCast(lParam)));
-            if (source_hwnd == g_session_overview_new_hwnd) {
+            // Button HWND values arriving in lParam have no alignment
+            // guarantee; comparing raw addresses instead of going through
+            // @ptrFromInt (which would trip Zig's Debug alignment check
+            // on low-bit-set handles) sidesteps the issue.
+            const source_addr: usize = if (lParam == 0) 0 else @bitCast(lParam);
+            const new_addr: usize = if (g_session_overview_new_hwnd) |h| @intFromPtr(h) else 0;
+            const close_addr: usize = if (g_session_overview_close_hwnd) |h| @intFromPtr(h) else 0;
+            const activate_addr: usize = if (g_session_overview_activate_hwnd) |h| @intFromPtr(h) else 0;
+            const list_addr: usize = if (g_session_overview_list_hwnd) |h| @intFromPtr(h) else 0;
+            if (source_addr == new_addr and new_addr != 0) {
                 if (g_session_overview_owner) |owner| {
                     const app: *App = @ptrFromInt(@as(usize, @bitCast(c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA))));
                     showConnectionDialog(app, owner);
                 }
                 return 0;
             }
-            if (source_hwnd == g_session_overview_close_hwnd) {
+            if (source_addr == close_addr and close_addr != 0) {
                 _ = c.DestroyWindow(hwnd);
                 return 0;
             }
-            if (source_hwnd == g_session_overview_activate_hwnd or (source_hwnd == g_session_overview_list_hwnd and code == c.LBN_DBLCLK)) {
+            if ((source_addr == activate_addr and activate_addr != 0) or
+                (source_addr == list_addr and list_addr != 0 and code == c.LBN_DBLCLK))
+            {
                 activateSelectedOverviewSession();
                 return 0;
             }
@@ -1144,14 +1171,38 @@ fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.L
             return 0;
         },
         c.WM_COMMAND => {
-            const source_hwnd: ?c.HWND = if (lParam == 0) null else @ptrFromInt(@as(usize, @bitCast(lParam)));
-            if (source_hwnd == g_conn_cancel_hwnd) {
+            // Button HWND values arriving in lParam have no alignment
+            // guarantee; compare raw addresses instead of going through
+            // @ptrFromInt (which would trip Zig's Debug alignment check
+            // on low-bit-set handles).
+            const source_addr: usize = if (lParam == 0) 0 else @bitCast(lParam);
+            const cancel_addr: usize = if (g_conn_cancel_hwnd) |h| @intFromPtr(h) else 0;
+            const connect_addr: usize = if (g_conn_connect_hwnd) |h| @intFromPtr(h) else 0;
+            if (source_addr == cancel_addr and cancel_addr != 0) {
                 _ = c.DestroyWindow(hwnd);
                 return 0;
             }
-            if (source_hwnd == g_conn_connect_hwnd) {
-                if (launchConfiguredSession()) {
-                    _ = c.DestroyWindow(hwnd);
+            if (source_addr == connect_addr and connect_addr != 0) {
+                if (applog.isEnabled()) applog.appLog("[win] connection dialog: Connect clicked\n", .{});
+                // The owner window's handle is the parent passed to
+                // CreateWindowExW — that's where we dispatch the deferred
+                // tile-creation message so it runs against the main zonvie
+                // window, not the dialog.
+                const owner = c.GetWindow(hwnd, c.GW_OWNER);
+                const owner_for_tile = owner orelse hwnd;
+                const app_opt: ?*App = blk: {
+                    const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
+                    if (v == 0) break :blk null;
+                    break :blk @ptrFromInt(@as(usize, @bitCast(v)));
+                };
+                if (app_opt) |app| {
+                    const ok = launchConfiguredSession(app, owner_for_tile);
+                    if (applog.isEnabled()) applog.appLog("[win] connection dialog: launchConfiguredSession -> {}\n", .{ok});
+                    if (ok) {
+                        _ = c.DestroyWindow(hwnd);
+                    }
+                } else if (applog.isEnabled()) {
+                    applog.appLog("[win] connection dialog: GWLP_USERDATA missing, leaving dialog open\n", .{});
                 }
                 return 0;
             }
@@ -1180,7 +1231,11 @@ fn refreshSessionOverview(app: *App) void {
     session_registry.loadSessions(app.alloc, &sessions);
 
     for (sessions.items) |session| {
-        const target_hwnd: c.HWND = @ptrFromInt(session.hwnd);
+        // HWND values have no alignment guarantee; go through align(1)
+        // opaque to bypass Zig's Debug @ptrFromInt check (see
+        // window.zig:hwndFromUsize comment).
+        const target_raw: *align(1) anyopaque = @ptrFromInt(session.hwnd);
+        const target_hwnd: c.HWND = @ptrCast(target_raw);
         if (c.IsWindow(target_hwnd) == 0) continue;
 
         var label_w: [320]u16 = std.mem.zeroes([320]u16);
@@ -1197,7 +1252,10 @@ fn activateSelectedOverviewSession() void {
     if (sel == c.LB_ERR) return;
     const hwnd_value: usize = @intCast(c.SendMessageW(list_hwnd, c.LB_GETITEMDATA, @bitCast(sel), 0));
     if (hwnd_value == 0) return;
-    const target_hwnd: c.HWND = @ptrFromInt(hwnd_value);
+    // Same alignment-bypass pattern as the loop above; HWND values may
+    // carry low-bits set.
+    const target_raw: *align(1) anyopaque = @ptrFromInt(hwnd_value);
+    const target_hwnd: c.HWND = @ptrCast(target_raw);
     if (c.IsWindow(target_hwnd) == 0) return;
     if (c.IsIconic(target_hwnd) != 0) {
         _ = c.ShowWindow(target_hwnd, c.SW_RESTORE);
@@ -1207,8 +1265,14 @@ fn activateSelectedOverviewSession() void {
     _ = c.SetForegroundWindow(target_hwnd);
 }
 
-fn launchConfiguredSession() bool {
+fn launchConfiguredSession(app: *App, owner_hwnd: c.HWND) bool {
     var config = app_mod.workspace_mod.ConnectionConfig{};
+
+    // Consume the target slot the user clicked in the overview (if any).
+    // Reset immediately so a subsequent plain "New Session..." from the
+    // system menu doesn't inherit the stale hint.
+    config.target_tile_index = g_connection_dialog_target_idx;
+    g_connection_dialog_target_idx = null;
 
     var utf8_buf: [512]u8 = undefined;
     const name = readWindowTextUtf8(g_conn_name_hwnd, &utf8_buf);
@@ -1246,7 +1310,23 @@ fn launchConfiguredSession() bool {
     config.ext_tabline = isChecked(g_conn_ext_tabline_hwnd);
     config.ext_windows = isChecked(g_conn_ext_windows_hwnd);
 
-    return spawnConfiguredSession(&config);
+    // Defer the actual tile creation to a fresh message dispatch on the
+    // UI thread. zonvie_core_start → CreateProcessW pumps messages and
+    // can re-enter WM_PAINT; running everything here would panic on the
+    // debug mutex recursion check. Allocate the config on the heap and
+    // hand the pointer to the handler via WM_APP_CREATE_TILE lParam.
+    const heap_config = app.alloc.create(app_mod.workspace_mod.ConnectionConfig) catch {
+        if (applog.isEnabled()) applog.appLog("[win] launchConfiguredSession: config alloc failed, falling back to spawn\n", .{});
+        return spawnConfiguredSession(&config);
+    };
+    heap_config.* = config;
+    const lp_val: c.LPARAM = @bitCast(@as(usize, @intFromPtr(heap_config)));
+    if (c.PostMessageW(owner_hwnd, app_mod.WM_APP_CREATE_TILE, 0, lp_val) == 0) {
+        if (applog.isEnabled()) applog.appLog("[win] launchConfiguredSession: PostMessage failed, falling back to spawn\n", .{});
+        app.alloc.destroy(heap_config);
+        return spawnConfiguredSession(&config);
+    }
+    return true;
 }
 
 fn spawnConfiguredSession(config: *const app_mod.workspace_mod.ConnectionConfig) bool {
@@ -1318,7 +1398,12 @@ fn spawnConfiguredSession(config: *const app_mod.workspace_mod.ConnectionConfig)
     var si: c.STARTUPINFOW = std.mem.zeroes(c.STARTUPINFOW);
     si.cb = @sizeOf(c.STARTUPINFOW);
     var pi: c.PROCESS_INFORMATION = std.mem.zeroes(c.PROCESS_INFORMATION);
+    if (applog.isEnabled()) applog.appLog("[win] spawnConfiguredSession: cmd={s}\n", .{cmd_utf8});
     const create_ok = c.CreateProcessW(&exe_path_w, &cmd_w, null, null, 0, 0, null, null, &si, &pi);
+    if (create_ok == 0 and applog.isEnabled()) {
+        const err = c.GetLastError();
+        applog.appLog("[win] spawnConfiguredSession: CreateProcessW failed, GetLastError={d}\n", .{err});
+    }
 
     if (had_previous) {
         previous_name[previous_len] = 0;
