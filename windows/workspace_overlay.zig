@@ -26,14 +26,26 @@ pub const TileRect = struct {
     }
 };
 
+/// Content area (in window pixel coords) the overlay may occupy.
+/// The ext_tabline / sidebar regions sit outside this rect and are left
+/// untouched so they remain visible while the tile view is shown — macOS
+/// achieves the same effect by stacking the tabBar subview above the
+/// overlay view in the NSView hierarchy.
+pub const ContentRect = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    w: f32,
+    h: f32,
+};
+
 /// Kind of slot, determined by the WorkspaceState at layout time.
 pub const SlotKind = enum { occupied, plus, empty };
 
 /// Compute the pixel rect and slot kind for tile index `idx` at the current
 /// workspace scale. Returns null if `idx` is out of range (>= max_tiles).
 /// Keep this in sync with the loop body in `draw`.
-pub fn layoutTile(workspace: *const WorkspaceState, window_w: u32, window_h: u32, idx: u32) ?struct { rect: TileRect, kind: SlotKind } {
-    if (window_w == 0 or window_h == 0) return null;
+pub fn layoutTile(workspace: *const WorkspaceState, content: ContentRect, idx: u32) ?struct { rect: TileRect, kind: SlotKind } {
+    if (content.w <= 0 or content.h <= 0) return null;
     if (idx >= workspace.max_tiles) return null;
 
     const scale = workspace.scale;
@@ -42,8 +54,8 @@ pub fn layoutTile(workspace: *const WorkspaceState, window_w: u32, window_h: u32
     const cols: u32 = @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(workspace.max_tiles)))));
     const rows: u32 = (workspace.max_tiles + cols - 1) / cols;
 
-    const wf: f32 = @floatFromInt(window_w);
-    const hf: f32 = @floatFromInt(window_h);
+    const wf: f32 = content.w;
+    const hf: f32 = content.h;
     const pad_px: f32 = 12.0;
 
     const grid_tile_w: f32 = (wf - pad_px * @as(f32, @floatFromInt(cols + 1))) / @as(f32, @floatFromInt(cols));
@@ -75,7 +87,9 @@ pub fn layoutTile(workspace: *const WorkspaceState, window_w: u32, window_h: u32
     const px_x: f32 = offset_x + @as(f32, @floatFromInt(col)) * (tile_w + pad_px * t) + pad_px * t;
     const px_y: f32 = offset_y + @as(f32, @floatFromInt(row)) * (tile_h + pad_px * t) + pad_px * t;
 
-    const rect = TileRect{ .x = px_x, .y = px_y, .w = tile_w, .h = tile_h };
+    // Translate content-local pixel coords into window coords so hit-testing
+    // against raw mouse positions works without extra conversion.
+    const rect = TileRect{ .x = content.x + px_x, .y = content.y + px_y, .w = tile_w, .h = tile_h };
     const kind: SlotKind = blk: {
         if (idx < workspace.tiles.items.len) {
             const tile = &workspace.tiles.items[idx];
@@ -104,10 +118,10 @@ pub const HitResult = union(enum) {
     plus: u32,
 };
 
-pub fn hitTest(workspace: *const WorkspaceState, window_w: u32, window_h: u32, px: f32, py: f32) HitResult {
+pub fn hitTest(workspace: *const WorkspaceState, content: ContentRect, px: f32, py: f32) HitResult {
     var idx: u32 = 0;
     while (idx < workspace.max_tiles) : (idx += 1) {
-        const layout = layoutTile(workspace, window_w, window_h, idx) orelse continue;
+        const layout = layoutTile(workspace, content, idx) orelse continue;
         if (!layout.rect.contains(px, py)) continue;
         return switch (layout.kind) {
             .occupied => .{ .tile = idx },
@@ -120,21 +134,28 @@ pub fn hitTest(workspace: *const WorkspaceState, window_w: u32, window_h: u32, p
 
 /// Draw the workspace overlay on top of the current back_tex.
 /// Call this from WM_PAINT when workspace.isOverviewVisible() is true.
-pub fn draw(renderer: *d3d11.Renderer, workspace: *const WorkspaceState, window_w: u32, window_h: u32) void {
+/// `content` is the pixel region the overlay may cover (tabline / sidebar
+/// areas are excluded); `window_w/h` are the full D3D surface dimensions
+/// used for NDC conversion.
+pub fn draw(renderer: *d3d11.Renderer, workspace: *const WorkspaceState, content: ContentRect, window_w: u32, window_h: u32) void {
     if (window_w == 0 or window_h == 0) return;
+    if (content.w <= 0 or content.h <= 0) return;
 
     const scale = workspace.scale;
     const t = 1.0 - scale;
 
-    const bg_alpha = @min(t * 1.5, 0.88);
-    renderer.drawOverlaySolid(.{ -1, 1, 1, -1 }, .{ 0, 0, 0, bg_alpha }) catch return;
-
     const wf: f32 = @floatFromInt(window_w);
     const hf: f32 = @floatFromInt(window_h);
 
+    // Dark translucent background, but only over the content area so the
+    // ext_tabline / sidebar rendered into back_tex stays visible.
+    const bg_alpha = @min(t * 1.5, 0.88);
+    const bg_ndc = pixelToNDC(content.x, content.y, content.w, content.h, wf, hf);
+    renderer.drawOverlaySolid(bg_ndc, .{ 0, 0, 0, bg_alpha }) catch return;
+
     var idx: u32 = 0;
     while (idx < workspace.max_tiles) : (idx += 1) {
-        const layout = layoutTile(workspace, window_w, window_h, idx) orelse continue;
+        const layout = layoutTile(workspace, content, idx) orelse continue;
         const rect = layout.rect;
 
         const ndc = pixelToNDC(rect.x, rect.y, rect.w, rect.h, wf, hf);

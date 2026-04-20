@@ -1051,11 +1051,20 @@ pub export fn WndProc(
                                 if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
                             }
                             if (render_ok and overlay_visible) {
+                                // Safety net: captureActiveTileSnapshot inside
+                                // animateWorkspaceScale can fall through silently
+                                // if the renderer wasn't ready at trigger time,
+                                // leaving tile 0 as a bare background color. Catch
+                                // that here now that drawEx has populated back_tex.
+                                if (app.workspace.activeTile().snapshot == null) {
+                                    captureActiveTileSnapshot(app);
+                                }
                                 // Overlay uses NDC and expects a full-window viewport;
                                 // drawEx leaves viewport/scissor clipped to the content
                                 // area (tabline/sidebar offsets applied).
                                 g.setFullViewport();
-                                workspace_overlay.draw(g, &app.workspace, g.width, g.height);
+                                const content_rect = overlayContentRect(app, g.width, g.height);
+                                workspace_overlay.draw(g, &app.workspace, content_rect, g.width, g.height);
                                 g.presentOnlyFromBackRectsNoResize(&[_]c.RECT{}) catch |e| {
                                     if (log_enabled) applog.appLog("workspace overlay present failed: {any}\n", .{e});
                                 };
@@ -1711,8 +1720,13 @@ pub export fn WndProc(
                             // must run with a full-window viewport/scissor regardless
                             // of whether the scrollbar branch above reset it.
                             if (app.workspace.isOverviewVisible()) {
+                                // Safety net (see non-row-mode path for details).
+                                if (app.workspace.activeTile().snapshot == null) {
+                                    captureActiveTileSnapshot(app);
+                                }
                                 g.setFullViewport();
-                                workspace_overlay.draw(g, &app.workspace, g.width, g.height);
+                                const content_rect = overlayContentRect(app, g.width, g.height);
+                                workspace_overlay.draw(g, &app.workspace, content_rect, g.width, g.height);
                             }
 
                             if (g.presentFromBackRectsWithCursorNoResize(
@@ -3335,10 +3349,14 @@ pub export fn WndProc(
                 if (app.workspace.isOverviewVisible() and msg == c.WM_LBUTTONDOWN) {
                     var client_rect: c.RECT = undefined;
                     _ = c.GetClientRect(hwnd, &client_rect);
-                    const hit = workspace_overlay.hitTest(
-                        &app.workspace,
+                    const content_rect = overlayContentRect(
+                        app,
                         @intCast(client_rect.right - client_rect.left),
                         @intCast(client_rect.bottom - client_rect.top),
+                    );
+                    const hit = workspace_overlay.hitTest(
+                        &app.workspace,
+                        content_rect,
                         @floatFromInt(x),
                         @floatFromInt(y),
                     );
@@ -4342,6 +4360,34 @@ pub fn captureActiveTileSnapshot(app: *App) void {
             tile.snapshot = snap;
         } else |_| {}
     }
+}
+
+/// Compute the window-pixel rect the workspace overlay may cover. Excludes
+/// the ext_tabline titlebar area and any sidebar column so those regions
+/// (already rendered into back_tex by drawEx) remain visible while the
+/// tile view is shown. On macOS the equivalent exclusion happens naturally
+/// because tabBar / sidebar are sibling NSViews stacked above the overlay.
+fn overlayContentRect(app: *App, window_w: u32, window_h: u32) workspace_overlay.ContentRect {
+    const y_off: f32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+        @floatFromInt(app.scalePx(TablineState.TAB_BAR_HEIGHT))
+    else
+        0;
+    const x_off: f32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+        @floatFromInt(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        0;
+    const right_w: f32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+        @floatFromInt(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        0;
+    const wf: f32 = @floatFromInt(window_w);
+    const hf: f32 = @floatFromInt(window_h);
+    return .{
+        .x = x_off,
+        .y = y_off,
+        .w = @max(0, wf - x_off - right_w),
+        .h = @max(0, hf - y_off),
+    };
 }
 
 /// Animate the workspace scale toward `target`. Captures a snapshot when
