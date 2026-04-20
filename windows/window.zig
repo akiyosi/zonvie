@@ -1316,6 +1316,7 @@ pub export fn WndProc(
                                     g,
                                     app.alloc,
                                     app.row_vbs.items,
+                                    &app.row_vbs_shift_scratch,
                                     rows_to_draw,
                                     sr,
                                     tbs_snapshot.scroll_dy_px,
@@ -1331,7 +1332,9 @@ pub export fn WndProc(
                         } else {
                             // No scroll shift, but still apply pending vb shift to scroll region.
                             if (tbs_snapshot.vb_shift != 0 and tbs_snapshot.scroll_row_end > tbs_snapshot.scroll_row_start) {
-                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end);
+                                const abs_shift: u32 = @intCast(if (tbs_snapshot.vb_shift < 0) -tbs_snapshot.vb_shift else tbs_snapshot.vb_shift);
+                                app_mod.ensureShiftScratch(app.alloc, &app.row_vbs_shift_scratch, abs_shift);
+                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end, app.row_vbs_shift_scratch.items);
                             }
                         }
 

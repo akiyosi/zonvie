@@ -446,6 +446,7 @@ fn drawNormalExternalSurfaceRowMode(
                 g,
                 app.alloc,
                 ext_win.row_vbs.items,
+                &ext_win.row_vbs_shift_scratch,
                 &rows_to_draw,
                 sr,
                 tbs_snap.scroll_dy_px,
@@ -461,7 +462,9 @@ fn drawNormalExternalSurfaceRowMode(
     } else {
         // Consume pending shift state to avoid stale accumulation.
         if (tbs_snap.vb_shift != 0 and tbs_snap.scroll_row_end > tbs_snap.scroll_row_start) {
-            app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, tbs_snap.scroll_row_start, tbs_snap.scroll_row_end);
+            const abs_shift: u32 = @intCast(if (tbs_snap.vb_shift < 0) -tbs_snap.vb_shift else tbs_snap.vb_shift);
+            app_mod.ensureShiftScratch(app.alloc, &ext_win.row_vbs_shift_scratch, abs_shift);
+            app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, tbs_snap.scroll_row_start, tbs_snap.scroll_row_end, ext_win.row_vbs_shift_scratch.items);
         }
     }
 

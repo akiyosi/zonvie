@@ -1159,6 +1159,9 @@ pub const ExternalWindow = struct {
     cursor_vb_bytes: usize = 0,
     // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    // Persistent scratch buffer for shiftRowVBs; sized to abs(vb_shift) before each shift.
+    // Owned here (not on stack) so large scrolls never overflow a fixed stack array.
+    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .{},
     scrollbar_vb: ?*c.ID3D11Buffer = null,
     scrollbar_vb_bytes: usize = 0,
 
@@ -1221,6 +1224,10 @@ pub const ExternalWindow = struct {
             if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
         }
         self.row_vbs.deinit(alloc);
+        // Scratch holds copies of RowVB entries during a shift; the GPU
+        // buffers are owned by row_vbs, never by the scratch, so just free
+        // the list backing without touching .vb pointers.
+        self.row_vbs_shift_scratch.deinit(alloc);
         self.tbs.deinit(alloc); // Handles slot release + pool deinit
         if (self.vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
@@ -1387,7 +1394,17 @@ pub fn ensureRowVBReadyFromSlot(
 /// After scroll up by N (delta > 0): row_vbs[i] = row_vbs[i+N], vacated tail entries reset.
 /// After scroll down by N (delta < 0): row_vbs[i] = row_vbs[i-N], vacated head entries reset.
 /// This keeps uploaded_slot aligned with row_map so VBs don't need re-upload for shifted rows.
-pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) void {
+///
+/// `saved_scratch` must have capacity >= abs(delta); the caller owns it and
+/// typically reuses a persistent per-window buffer so this path stays
+/// allocation-free across flushes.
+pub fn shiftRowVBs(
+    row_vbs: []RowVB,
+    delta: i32,
+    row_start: u32,
+    row_end: u32,
+    saved_scratch: []RowVB,
+) void {
     if (delta == 0) return;
     const start: usize = @intCast(row_start);
     const end: usize = @min(@as(usize, @intCast(row_end)), row_vbs.len);
@@ -1403,12 +1420,25 @@ pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) v
         return;
     }
 
+    // The vacated side reuses `abs_delta` RowVBs from the scrolled-off side
+    // to keep their GPU buffers (just resets upload state for re-upload).
+    // If the caller failed to size `saved_scratch`, fall back to resetting
+    // the entire region: this leaks the original GPU buffers for the
+    // scrolled-off rows, but never corrupts memory. Callers are expected to
+    // size the scratch via `ensureShiftScratch` so this fallback is unreachable.
+    if (saved_scratch.len < abs_delta) {
+        for (region) |*vb| {
+            vb.uploaded_slot = SLOT_NONE;
+            vb.uploaded_ver = 0;
+        }
+        return;
+    }
+
     if (delta > 0) {
         // Scroll up: row_vbs[start] gets row_vbs[start + abs_delta], etc.
         // Save VBs that scroll off (at the top of the region).
-        var saved: [64]RowVB = undefined;
         for (0..abs_delta) |s| {
-            saved[s] = region[s];
+            saved_scratch[s] = region[s];
         }
         var i: usize = 0;
         while (i + abs_delta < region.len) : (i += 1) {
@@ -1416,15 +1446,14 @@ pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) v
         }
         // Vacated tail entries: reuse saved VBs (keep GPU buffer, reset upload state).
         for (0..abs_delta) |s| {
-            region[region.len - abs_delta + s] = saved[s];
+            region[region.len - abs_delta + s] = saved_scratch[s];
             region[region.len - abs_delta + s].uploaded_slot = SLOT_NONE;
             region[region.len - abs_delta + s].uploaded_ver = 0;
         }
     } else {
         // Scroll down: row_vbs[end-1] gets row_vbs[end-1-abs_delta], etc.
-        var saved: [64]RowVB = undefined;
         for (0..abs_delta) |s| {
-            saved[s] = region[region.len - 1 - s];
+            saved_scratch[s] = region[region.len - 1 - s];
         }
         var i: usize = region.len;
         while (i > abs_delta) {
@@ -1434,11 +1463,23 @@ pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) v
         // Vacated head entries: reuse saved VBs.
         // Index is region-local (region = row_vbs[start..end]).
         for (0..abs_delta) |s| {
-            region[s] = saved[s];
+            region[s] = saved_scratch[s];
             region[s].uploaded_slot = SLOT_NONE;
             region[s].uploaded_ver = 0;
         }
     }
+}
+
+/// Ensure `list` has at least `need` capacity+length, growing via `alloc` if
+/// needed. Used by scroll paths to size the scratch slice passed to
+/// `shiftRowVBs` so the shift itself is allocation-free.
+pub fn ensureShiftScratch(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(RowVB),
+    need: usize,
+) void {
+    if (list.items.len >= need) return;
+    list.resize(alloc, need) catch {};
 }
 
 /// Scroll state consumed by paint. Returned by consumeScrollState / applyScrollShift.
@@ -1470,6 +1511,7 @@ pub fn applyScrollShift(
     g: *d3d11.Renderer,
     alloc: std.mem.Allocator,
     row_vbs: []RowVB,
+    shift_scratch: *std.ArrayListUnmanaged(RowVB),
     rows_to_draw: *std.ArrayListUnmanaged(u32),
     scroll_rect: c.RECT,
     scroll_dy_px: i32,
@@ -1492,7 +1534,9 @@ pub fn applyScrollShift(
     //    [row_start, row_end) range.  Shifting the full array corrupts VB
     //    tracking for rows outside the scroll region (e.g. tabline at row 0).
     if (vb_shift_rows != 0 and scroll_row_end > scroll_row_start) {
-        shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end);
+        const abs_shift: u32 = @intCast(if (vb_shift_rows < 0) -vb_shift_rows else vb_shift_rows);
+        ensureShiftScratch(alloc, shift_scratch, abs_shift);
+        shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end, shift_scratch.items);
     }
 
     // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to rows_to_draw.
@@ -2488,6 +2532,8 @@ pub const App = struct {
     tbs: TripleBufferedSurface = .{},
     // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
+    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .{},
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
@@ -2906,6 +2952,9 @@ pub const App = struct {
             }
         }
         self.row_vbs.deinit(self.alloc);
+        // Scratch holds shallow copies during a shift; GPU buffers belong to
+        // row_vbs, so only free the list storage.
+        self.row_vbs_shift_scratch.deinit(self.alloc);
 
         // WM_PAINT(row) scratch
         self.row_tmp_verts.deinit(self.alloc);
