@@ -363,6 +363,9 @@ pub const PaintSnapshot = struct {
     scroll_rect: ?c.RECT = null,
     scroll_dy_px: i32 = 0,
     vb_shift: i32 = 0,
+    /// Scroll region in rows, matching remapRowSlots' [row_start, row_end).
+    scroll_row_start: u32 = 0,
+    scroll_row_end: u32 = 0,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -405,12 +408,18 @@ pub const TripleBufferedSurface = struct {
     flush_scroll_rect: ?c.RECT = null,
     flush_scroll_dy_px: i32 = 0,
     flush_vb_shift: i32 = 0,
+    // Scroll region bounds in rows, matching remapRowSlots' [row_start, row_end).
+    // Used by applyScrollShift to limit shiftRowVBs to the same range.
+    flush_scroll_row_start: u32 = 0,
+    flush_scroll_row_end: u32 = 0,
 
     // Pending scroll state (rotation_mu protected).
     // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
     pending_scroll_rect: ?c.RECT = null,
     pending_scroll_dy_px: i32 = 0,
     pending_vb_shift: i32 = 0,
+    pending_scroll_row_start: u32 = 0,
+    pending_scroll_row_end: u32 = 0,
 
     // Paint-time dirty snapshot (rotation_mu protected, persistent, no per-paint alloc).
     paint_dirty_snapshot: std.DynamicBitSetUnmanaged = .{},
@@ -466,6 +475,8 @@ pub const TripleBufferedSurface = struct {
         self.flush_scroll_rect = null;
         self.flush_scroll_dy_px = 0;
         self.flush_vb_shift = 0;
+        self.flush_scroll_row_start = 0;
+        self.flush_scroll_row_end = 0;
 
         self.is_in_flush = true;
         return true;
@@ -525,19 +536,30 @@ pub const TripleBufferedSurface = struct {
                 {
                     self.pending_scroll_dy_px += self.flush_scroll_dy_px;
                     self.pending_vb_shift += self.flush_vb_shift;
+                    // row_start/end unchanged: same region by definition
                 } else {
                     // Different scroll region: invalidate optimization, fall back to full paint.
                     self.pending_scroll_rect = null;
                     self.pending_scroll_dy_px = 0;
                     self.pending_vb_shift = 0;
+                    self.pending_scroll_row_start = 0;
+                    self.pending_scroll_row_end = 0;
                     self.pending_paint_full = true;
                 }
             } else {
                 self.pending_scroll_rect = flush_rect;
                 self.pending_scroll_dy_px = self.flush_scroll_dy_px;
                 self.pending_vb_shift = self.flush_vb_shift;
+                self.pending_scroll_row_start = self.flush_scroll_row_start;
+                self.pending_scroll_row_end = self.flush_scroll_row_end;
             }
         }
+        // Non-fast-path flushes (flush_scroll_rect == null) do NOT invalidate
+        // an existing pending_scroll_rect.  beginFlush shallow-copies the
+        // committed set, so the write set inherits the prior scroll-shifted
+        // row_map.  A subsequent non-scroll flush only updates specific rows
+        // via on_vertices_row; the shift described by pending_scroll_* still
+        // matches the committed row_map at paint time.
 
         self.committed_index = self.write_index;
         self.commit_rev +%= 1;
@@ -580,13 +602,19 @@ pub const TripleBufferedSurface = struct {
         var scroll_rect: ?c.RECT = null;
         var scroll_dy_px: i32 = 0;
         var vb_shift: i32 = 0;
+        var scroll_row_start: u32 = 0;
+        var scroll_row_end: u32 = 0;
         if (self.paint_nesting == 0) {
             scroll_rect = self.pending_scroll_rect;
             scroll_dy_px = self.pending_scroll_dy_px;
             vb_shift = self.pending_vb_shift;
+            scroll_row_start = self.pending_scroll_row_start;
+            scroll_row_end = self.pending_scroll_row_end;
             self.pending_scroll_rect = null;
             self.pending_scroll_dy_px = 0;
             self.pending_vb_shift = 0;
+            self.pending_scroll_row_start = 0;
+            self.pending_scroll_row_end = 0;
         }
 
         self.paint_nesting += 1;
@@ -596,6 +624,8 @@ pub const TripleBufferedSurface = struct {
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
+            .scroll_row_start = scroll_row_start,
+            .scroll_row_end = scroll_row_end,
         };
     }
 
@@ -1402,10 +1432,11 @@ pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) v
             region[i] = region[i - abs_delta];
         }
         // Vacated head entries: reuse saved VBs.
+        // Index is region-local (region = row_vbs[start..end]).
         for (0..abs_delta) |s| {
-            region[start + s] = saved[s];
-            region[start + s].uploaded_slot = SLOT_NONE;
-            region[start + s].uploaded_ver = 0;
+            region[s] = saved[s];
+            region[s].uploaded_slot = SLOT_NONE;
+            region[s].uploaded_ver = 0;
         }
     }
 }
@@ -1443,6 +1474,8 @@ pub fn applyScrollShift(
     scroll_rect: c.RECT,
     scroll_dy_px: i32,
     vb_shift_rows: i32,
+    scroll_row_start: u32,
+    scroll_row_end: u32,
     last_cursor_row_ptr: *?u32,
     row_h_px: i32,
     effective_rows: u32,
@@ -1451,13 +1484,15 @@ pub fn applyScrollShift(
     if (scroll_dy_px == 0) return .{};
 
     if (applog.isEnabled()) applog.appLog(
-        "[scroll_diag] applyScrollShift dy_px={d} vb_shift={d} row_vbs_len={d} rect=({d},{d},{d},{d}) row_h={d} eff_rows={d}\n",
-        .{ scroll_dy_px, vb_shift_rows, row_vbs.len, scroll_rect.left, scroll_rect.top, scroll_rect.right, scroll_rect.bottom, row_h_px, effective_rows },
+        "[scroll_diag] applyScrollShift dy_px={d} vb_shift={d} row_range=[{d},{d}) row_vbs_len={d} rect=({d},{d},{d},{d}) row_h={d} eff_rows={d}\n",
+        .{ scroll_dy_px, vb_shift_rows, scroll_row_start, scroll_row_end, row_vbs.len, scroll_rect.left, scroll_rect.top, scroll_rect.right, scroll_rect.bottom, row_h_px, effective_rows },
     );
 
-    // 1. Shift row_vbs to keep VB upload state aligned with row_map.
-    if (vb_shift_rows != 0) {
-        shiftRowVBs(row_vbs, vb_shift_rows, 0, @intCast(row_vbs.len));
+    // 1. Shift row_vbs within the scroll region only, matching remapRowSlots'
+    //    [row_start, row_end) range.  Shifting the full array corrupts VB
+    //    tracking for rows outside the scroll region (e.g. tabline at row 0).
+    if (vb_shift_rows != 0 and scroll_row_end > scroll_row_start) {
+        shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end);
     }
 
     // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to rows_to_draw.

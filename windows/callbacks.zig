@@ -1348,6 +1348,8 @@ pub fn onMainRowScroll(
         app.tbs.flush_scroll_rect = new_rect;
         app.tbs.flush_scroll_dy_px = delta_px;
         app.tbs.flush_vb_shift = rows_delta;
+        app.tbs.flush_scroll_row_start = row_start;
+        app.tbs.flush_scroll_row_end = row_end;
     }
 
     // InvalidateRect deferred to onFlushEnd for coalescing.
@@ -1467,6 +1469,8 @@ pub fn onGridRowScroll(
         ext_win.tbs.flush_scroll_rect = new_rect;
         ext_win.tbs.flush_scroll_dy_px = delta_px;
         ext_win.tbs.flush_vb_shift = rows_delta;
+        ext_win.tbs.flush_scroll_row_start = row_start;
+        ext_win.tbs.flush_scroll_row_end = row_end;
     }
 
     ext_win.recomputeVertCount();

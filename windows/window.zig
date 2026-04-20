@@ -887,8 +887,12 @@ pub export fn WndProc(
                         // Build sorted, deduplicated list of rows to draw.
                         const rows_to_draw = &app.wm_paint_rows_to_draw;
 
+                        // Transparency mode (opacity<1.0) must force full rows too:
+                        // preserve_back=false clears back_tex entirely in drawEx, so if only
+                        // dirty rows are drawn the unchanged rows disappear.  Matches
+                        // drawNormalExtRowMode's force_full_rows logic for external windows.
                         const force_full_rows =
-                            did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot or glow_enabled;
+                            did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot or glow_enabled or (g.opacity < 1.0);
 
                         const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                         const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
@@ -1256,7 +1260,11 @@ pub export fn WndProc(
                         // During seed mode (seed_pending), always clear the back buffer to ensure
                         // all swapchain buffers are properly cleared as they rotate. This prevents
                         // ghost artifacts in the gutter area when grid shrinks.
-                        const preserve_back = !seed_clear and !seed_pending_snapshot and !glow_enabled;
+                        // Transparency mode (opacity<1.0) must also force clear: premultiplied alpha
+                        // blending accumulates on retained back_tex, producing faint ghost text on
+                        // rows that are drawn over without an intervening clear (matches external
+                        // window logic in drawNormalExtRowMode).
+                        const preserve_back = !seed_clear and !seed_pending_snapshot and !glow_enabled and g.opacity >= 1.0;
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{
@@ -1312,6 +1320,8 @@ pub export fn WndProc(
                                     sr,
                                     tbs_snapshot.scroll_dy_px,
                                     tbs_snapshot.vb_shift,
+                                    tbs_snapshot.scroll_row_start,
+                                    tbs_snapshot.scroll_row_end,
                                     &app.last_painted_cursor_row,
                                     row_h_px,
                                     effective_rows,
@@ -1319,9 +1329,9 @@ pub export fn WndProc(
                                 );
                             }
                         } else {
-                            // No scroll shift, but still apply pending vb shift to avoid stale state.
-                            if (tbs_snapshot.vb_shift != 0) {
-                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, 0, @intCast(app.row_vbs.items.len));
+                            // No scroll shift, but still apply pending vb shift to scroll region.
+                            if (tbs_snapshot.vb_shift != 0 and tbs_snapshot.scroll_row_end > tbs_snapshot.scroll_row_start) {
+                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end);
                             }
                         }
 
