@@ -297,6 +297,17 @@ final class WorkspaceManager {
             ZonvieCore.appLog("[Workspace] switchToTile: tile \(index) has no core; clearing tv.core")
             terminalView?.core = nil
         }
+
+        // Notify listeners (ViewController) that the active tile has
+        // changed so UI chrome that depends on the active tile's
+        // ConnectionConfig — e.g. whether ext_tabline is on — can
+        // refresh itself. Without this the previous tile's tab strip
+        // stays visible over a new tile whose config has tabline
+        // disabled.
+        NotificationCenter.default.post(
+            name: ZonvieCore.activeTileChangedNotification,
+            object: index as NSNumber
+        )
     }
 
     /// Create a TileRenderer for a core if it doesn't have one yet.

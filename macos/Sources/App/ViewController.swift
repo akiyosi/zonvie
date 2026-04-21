@@ -29,6 +29,7 @@ final class ViewController: NSViewController {
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
     private var tablineHideObserver: Any?
+    private var activeTileChangedObserver: Any?
 
     // Current tab list for lookup
     private var currentTabs: [(handle: Int64, name: String)] = []
@@ -387,6 +388,10 @@ final class ViewController: NSViewController {
             NotificationCenter.default.removeObserver(observer)
             tablineHideObserver = nil
         }
+        if let observer = activeTileChangedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            activeTileChangedObserver = nil
+        }
     }
 
     override func viewDidAppear() {
@@ -420,6 +425,44 @@ final class ViewController: NSViewController {
         ) { [weak self] _ in
             self?.handleTablineHide()
         }
+
+        // React to active tile changes so the tab strip / sidebar
+        // reflect the incoming tile's ext_tabline config. Without this
+        // the UI keeps showing the previous tile's tabs after a switch
+        // to a session whose ConnectionConfig has ext_tabline disabled.
+        activeTileChangedObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.activeTileChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshTablineForActiveTile()
+        }
+    }
+
+    private func refreshTablineForActiveTile() {
+        let idx = workspaceManager.activeTileIndex
+        guard idx >= 0, idx < workspaceManager.tiles.count else { return }
+        let config = workspaceManager.tiles[idx].config
+        // Clear stale labels either way so the user doesn't see the
+        // previous tile's tabs flash while the new core redraws.
+        tabBarView?.updateTabs([], currentTab: 0)
+        sidebarView?.updateTabs([], currentTab: 0)
+        if config.extTabline {
+            // Tabs will repopulate when the fresh tile's core emits a
+            // tabline_update on its next redraw cycle.
+        } else {
+            // Titlebar-mode windows were created with
+            // `titlebarAppearsTransparent = true` and
+            // `fullSizeContentView` so TabBarView fully owns the
+            // titlebar paint. Hiding the view here would reveal the
+            // transparent system titlebar underneath (the bug the user
+            // hit). Keep the view visible with an empty tab list so
+            // the bar background still paints an opaque strip and the
+            // window's chrome stays solid. The sidebar is off to the
+            // side, not in the titlebar, so hiding it is safe.
+            currentTabs = []
+            sidebarView?.isHidden = true
+        }
     }
 
     private func handleTablineUpdate(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
@@ -431,7 +474,12 @@ final class ViewController: NSViewController {
     }
 
     private func handleTablineHide() {
-        tabBarView?.isHidden = true
+        // Titlebar-mode windows rely on TabBarView to paint an opaque
+        // strip over the transparent system titlebar — if we hide the
+        // view here the system chrome bleeds through. Keep it visible
+        // with an empty tab list so the background stays solid; the
+        // sidebar is an independent side pane and can be hidden safely.
+        tabBarView?.updateTabs([], currentTab: 0)
         sidebarView?.isHidden = true
     }
 

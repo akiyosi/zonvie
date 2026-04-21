@@ -1569,6 +1569,18 @@ pub const Renderer = struct {
         try self.drawEx(main, cursor, dirty_rect, .{});
     }
 
+    /// Drop the cached tabline texture so the tabbar region falls back
+    /// to the normal draw path (solid bg / no tab strip). Used when the
+    /// active tile switches to a session whose config disables
+    /// ext_tabline — without this the previously rendered tabs linger
+    /// until a subsequent `updateTablineTexture` call replaces them.
+    pub fn releaseTablineTexture(self: *Renderer) void {
+        safeRelease(&self.tabline_srv);
+        safeRelease(&self.tabline_tex);
+        self.tabline_width = 0;
+        self.tabline_height = 0;
+    }
+
     /// Update tabline texture from BGRA pixel data (rendered by GDI offscreen).
     /// This allows tabline to be composited via D3D11, avoiding DWM GDI/D3D mixing issues.
     pub fn updateTablineTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {

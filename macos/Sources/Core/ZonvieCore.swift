@@ -109,6 +109,13 @@ final class ZonvieCore {
     // Notification posted when a nvim process exits (object = ZonvieCore instance)
     static let nvimExitedNotification = NSNotification.Name("ZonvieNvimExited")
 
+    // Notification posted when the active tile changes (object = Int, new active tile index).
+    // ViewController listens so it can refresh the tabline / sidebar
+    // visibility based on the incoming tile's ext_tabline setting —
+    // without this a previous ext_tabline-enabled session's tabs
+    // linger over a session that has the extension disabled.
+    static let activeTileChangedNotification = NSNotification.Name("ZonvieActiveTileChanged")
+
     // Notification posted when colorscheme (default bg/fg) changes
     static let colorschemeDidChangeNotification = NSNotification.Name("ZonvieColorschemeDidChange")
 

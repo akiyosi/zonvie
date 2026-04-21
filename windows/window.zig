@@ -4477,6 +4477,48 @@ pub export fn WndProc(
 /// Switch the active tile and update all per-active pointers accordingly.
 /// Keeps `app.corep` in sync with `workspace.activeCorep()` so input/flush
 /// routing follows the selected tile. Capture a snapshot of the outgoing
+/// Pull the ext_* extension flags from the active tile's
+/// ConnectionConfig onto the app and clear any state residual from a
+/// previous tile that had the extension enabled. Without this, the
+/// tab strip (ext_tabline), cmdline popup, popupmenu and messages
+/// overlays painted by a previous session linger over a new session
+/// that doesn't use those extensions.
+fn syncExtensionsFromActiveTile(app: *App) void {
+    if (app.workspace.active_tile >= app.workspace.tiles.items.len) return;
+    const tile = &app.workspace.tiles.items[app.workspace.active_tile];
+    const cfg = &tile.config;
+
+    app.ext_tabline_enabled = cfg.ext_tabline;
+    app.ext_cmdline_enabled = cfg.ext_cmdline;
+    app.ext_messages_enabled = cfg.ext_messages;
+    app.ext_windows_enabled = cfg.ext_windows;
+    // popupmenu is read from app.config.popup.external rather than a
+    // mirror flag, so nothing to sync there.
+
+    // Always clear the tabline state on switch: the tab list was built
+    // from the previous tile's nvim and has no meaning for the incoming
+    // tile. If the incoming tile has ext_tabline enabled, the redraw!
+    // we send right after switching will make its nvim emit
+    // tabline_update events to repopulate the strip. If disabled, the
+    // area stays clear because tab_count == 0 gates the draw paths.
+    app.mu.lock();
+    app.tabline_state.tab_count = 0;
+    app.tabline_state.visible = false;
+    app.mu.unlock();
+    if (app.tabline_state.hwnd) |tabline_hwnd| {
+        if (!cfg.ext_tabline) {
+            _ = c.ShowWindow(tabline_hwnd, c.SW_HIDE);
+        }
+    }
+    // Drop the cached tabline texture unconditionally so the tabbar
+    // area doesn't show a stale set of tabs during the next paint; the
+    // incoming tile will re-upload its own tabline on the first
+    // tabline_update callback.
+    if (app.renderer) |*g| {
+        g.releaseTablineTexture();
+    }
+}
+
 /// Count the tiles that are currently running a session. Used by the
 /// close / exit paths to decide whether to tear down a single tile and
 /// return the user to the overview, or to close the whole app because
@@ -4592,6 +4634,14 @@ pub fn switchActiveTile(app: *App, hwnd: c.HWND, index: u8) void {
     if (app.workspace.activeCorep()) |cp| {
         app.corep = cp;
     }
+    // Sync the ext_* flags to the incoming tile's config so the
+    // titlebar tab strip, cmdline popup, popupmenu, messages overlay
+    // etc. reflect the session the user is switching into. Without
+    // this, residual state from the previous tile (e.g. an
+    // ext_tabline=true session that painted tabs) sticks around when
+    // the new tile has those extensions disabled — the user sees an
+    // empty tab strip even though the new session isn't using it.
+    syncExtensionsFromActiveTile(app);
     resetSharedRenderingState(app);
     // Ask the new tile's core for a full redraw so the cleared surface
     // gets repopulated immediately. Without this, the window would stay
