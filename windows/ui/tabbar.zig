@@ -681,6 +681,17 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         return;
     }
 
+    // While the workspace overview is visible the tab strip is dimmed
+    // and the user interacts with the grid, not the tabs. Drop any
+    // tab / "+" / drag clicks so they don't reach into nvim ":tabnext"
+    // or into starting a drag on an invisible tab. Window caption
+    // buttons (handled above) still work so the user can minimize /
+    // close the app while in overview.
+    if (app.workspace.isOverviewVisible()) {
+        if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: ignored — overview visible\n", .{});
+        return;
+    }
+
     // Check close button on tabs
     const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
@@ -1151,31 +1162,35 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     // Draw tabline to the memory DC
     drawTablineContent(app, mem_dc, @intCast(width));
 
-    // GDI doesn't set alpha channel, so we need to set it to 255 (opaque)
     // When the workspace overview is open (tile view visible), dim the
-    // tabline to match the macOS behavior — the tab bar is disabled
-    // while the user is picking a session / slot to act on.
+    // tab area to match the macOS behavior — the tabs are disabled
+    // while the user is picking a session / slot to act on. The window
+    // caption buttons (min / max / close) on the right must stay at
+    // full brightness so they remain clearly clickable, so we scope
+    // the dim to x < btn_start_x only.
     const pixels: [*]u8 = @ptrCast(pixels_ptr);
-    const pixel_count = width * height;
     const dim_active = app.workspace.isOverviewVisible();
-    // Dim factor: scale in [0,1], we want stronger dim when scale near
-    // 0 (full overview) and near-opaque at scale near 1 (just opening).
-    // Simple linear ramp from 1.0 at scale=1 to 0.4 at scale=0.
     const scale = app.workspace.scale;
     const dim_mul: u32 = blk: {
         if (!dim_active) break :blk 256;
         const f: f32 = 0.4 + 0.6 * scale;
         break :blk @as(u32, @intFromFloat(@max(0.0, @min(1.0, f)) * 256.0));
     };
-    var i: u32 = 0;
-    while (i < pixel_count) : (i += 1) {
-        if (dim_active and dim_mul != 256) {
-            const base = i * 4;
-            pixels[base + 0] = @intCast((@as(u32, pixels[base + 0]) * dim_mul) >> 8);
-            pixels[base + 1] = @intCast((@as(u32, pixels[base + 1]) * dim_mul) >> 8);
-            pixels[base + 2] = @intCast((@as(u32, pixels[base + 2]) * dim_mul) >> 8);
+    const btns_total: u32 = @intCast(app.scalePx(TablineState.WINDOW_BTNS_TOTAL));
+    const tabs_end_x: u32 = if (width > btns_total) width - btns_total else 0;
+    // GDI doesn't set alpha channel, so we also force it to 255 (opaque) here.
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const base = (y * width + x) * 4;
+            if (dim_active and dim_mul != 256 and x < tabs_end_x) {
+                pixels[base + 0] = @intCast((@as(u32, pixels[base + 0]) * dim_mul) >> 8);
+                pixels[base + 1] = @intCast((@as(u32, pixels[base + 1]) * dim_mul) >> 8);
+                pixels[base + 2] = @intCast((@as(u32, pixels[base + 2]) * dim_mul) >> 8);
+            }
+            pixels[base + 3] = 255;
         }
-        pixels[i * 4 + 3] = 255; // Set alpha to opaque
     }
 
     // Update D3D11 texture

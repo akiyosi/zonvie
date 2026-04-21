@@ -3465,36 +3465,51 @@ pub export fn WndProc(
                 const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
                 const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
 
-                // Workspace overlay intercepts input while visible.
+                // Workspace overlay intercepts input while visible, but
+                // the ext_tabline titlebar area (tabs + window caption
+                // buttons) must stay clickable — dragging the window,
+                // min / max / close still need to work. Clicks inside
+                // that strip fall through to the normal titlebar-click
+                // path below; clicks in the overlay area route to the
+                // overlay hit-test.
                 if (app.workspace.isOverviewVisible() and msg == c.WM_LBUTTONDOWN) {
-                    var client_rect: c.RECT = undefined;
-                    _ = c.GetClientRect(hwnd, &client_rect);
-                    const content_rect = overlayContentRect(
-                        app,
-                        @intCast(client_rect.right - client_rect.left),
-                        @intCast(client_rect.bottom - client_rect.top),
-                    );
-                    const hit = workspace_overlay.hitTest(
-                        &app.workspace,
-                        content_rect,
-                        @floatFromInt(x),
-                        @floatFromInt(y),
-                    );
-                    switch (hit) {
-                        .tile => |idx| {
-                            switchActiveTile(app, hwnd, @intCast(idx));
-                            animateWorkspaceScale(app, hwnd, 1.0);
-                        },
-                        .plus => |idx| {
-                            // Pass the clicked slot through so the new tile
-                            // lands exactly where the user pointed, not at
-                            // whatever the next append position happens to
-                            // be (matches macOS overlay behaviour).
-                            dialogs.showConnectionDialogForTile(app, hwnd, @intCast(idx));
-                        },
-                        .none => {},
+                    const in_tabbar = app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null and y < app.scalePx(TablineState.TAB_BAR_HEIGHT);
+                    if (!in_tabbar) {
+                        var client_rect: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect);
+                        const content_rect = overlayContentRect(
+                            app,
+                            @intCast(client_rect.right - client_rect.left),
+                            @intCast(client_rect.bottom - client_rect.top),
+                        );
+                        const hit = workspace_overlay.hitTest(
+                            &app.workspace,
+                            content_rect,
+                            @floatFromInt(x),
+                            @floatFromInt(y),
+                        );
+                        switch (hit) {
+                            .tile => |idx| {
+                                switchActiveTile(app, hwnd, @intCast(idx));
+                                animateWorkspaceScale(app, hwnd, 1.0);
+                            },
+                            .plus => |idx| {
+                                // Pass the clicked slot through so the new tile
+                                // lands exactly where the user pointed, not at
+                                // whatever the next append position happens to
+                                // be (matches macOS overlay behaviour).
+                                dialogs.showConnectionDialogForTile(app, hwnd, @intCast(idx));
+                            },
+                            .none => {},
+                        }
+                        return 0;
                     }
-                    return 0;
+                    // Fall through to the titlebar click path; the tab
+                    // body is dimmed in the rendered texture but clicks
+                    // there do nothing because handleTablineMouseDown
+                    // itself no-ops on tab selections while overview is
+                    // visible — only the window caption buttons
+                    // (min / max / close) pass through.
                 }
 
                 // Check tabline/sidebar area first (when ext_tabline enabled)
