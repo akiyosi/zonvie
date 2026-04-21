@@ -395,7 +395,7 @@ fn registerJumpList(exe_path: [*:0]const u16) void {
     var new_session_args_buf: [1024]u16 = std.mem.zeroes([1024]u16);
     const new_session_args = buildNewSessionTaskArgs(&new_session_args_buf, exe_path) orelse null;
 
-    if (createTaskLink(cmd_path, new_session_args, std.unicode.utf8ToUtf16LeStringLiteral("New Session"), exe_path)) |link| {
+    if (createTaskLink(cmd_path, new_session_args, std.unicode.utf8ToUtf16LeStringLiteral("New Sessions"), exe_path)) |link| {
         hr = comVtbl(IObjectCollectionVtbl, coll).AddObject(coll, link);
         if (applog.isEnabled()) applog.appLog("[win] Jump List: AddObject hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
         comRelease(link);

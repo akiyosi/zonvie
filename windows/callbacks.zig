@@ -2287,19 +2287,24 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 
 pub fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
     // Handle nvim exit for the emitting tile regardless of active status —
-    // an inactive tile's core crashing still needs WM_CLOSE routing.
+    // an inactive tile's core crashing still needs routing.
     const cb_ctx = extractCallbackCtx(ctx) orelse return;
     const app = cb_ctx.app;
     if (applog.isEnabled()) applog.appLog(
         "[win] on_exit: tile={d} code={d}\n",
         .{ cb_ctx.tile_index, exit_code },
     );
-    // Mark Neovim as exited (to skip requestQuit in WM_CLOSE)
-    app.neovim_exited.store(true, .release);
-    // Store exit code globally (Nvy style - returned from main instead of ExitProcess)
+    // Store exit code globally (Nvy style - returned from main instead of
+    // ExitProcess). Safe for multi-tile: whichever tile's code wins
+    // reaches the caller via main's return path only when the process
+    // eventually terminates, and a single "which tile decided our exit
+    // status" is acceptable.
     app_mod.g_exit_code.store(@intCast(@as(u32, @bitCast(exit_code)) & 0xFF), .seq_cst);
+    // Let the UI thread decide whether to tear down just this tile or
+    // close the whole app. WM_APP_TILE_EXITED carries the tile index in
+    // wParam so the handler can release the correct core/TileContext.
     if (app.hwnd) |hwnd| {
-        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        _ = c.PostMessageW(hwnd, app_mod.WM_APP_TILE_EXITED, @as(c.WPARAM, cb_ctx.tile_index), 0);
     }
 }
 

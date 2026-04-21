@@ -140,6 +140,16 @@ pub const WM_APP_REQUEST_NEW_SESSION: c.UINT = c.WM_APP + 29;
 /// frees after consuming.
 pub const WM_APP_CREATE_TILE: c.UINT = c.WM_APP + 30;
 
+/// Posted from `onExit` when a tile's nvim terminates. wParam carries
+/// the tile_index. The UI-thread handler tears down the core/context
+/// for the exited tile; if other tiles still hold running sessions it
+/// switches active to the next occupied slot and re-enters the tile
+/// overview (matching macOS where closing a backgrounded session only
+/// removes that tile instead of quitting the app). When the closing
+/// tile was the last occupied one, the handler falls through to
+/// WM_CLOSE so the existing single-session quit path runs as before.
+pub const WM_APP_TILE_EXITED: c.UINT = c.WM_APP + 31;
+
 // =========================================================================
 // Timer IDs and timing constants
 // =========================================================================

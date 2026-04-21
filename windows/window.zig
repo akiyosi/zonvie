@@ -440,7 +440,7 @@ fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
 
     _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
     app.workspace.system_menu_added_items += 1;
-    _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_NEW_SESSION, std.unicode.utf8ToUtf16LeStringLiteral("New Session..."));
+    _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_NEW_SESSION, std.unicode.utf8ToUtf16LeStringLiteral("New Sessions..."));
     app.workspace.system_menu_added_items += 1;
     if (applog.isEnabled()) applog.appLog("[diag] refreshWorkspaceSystemMenu: appended New Session\n", .{});
 
@@ -3115,10 +3115,14 @@ pub export fn WndProc(
 
         WM_APP_REQUEST_NEW_SESSION => {
             if (getApp(hwnd)) |app| {
+                // Just reveal the tile overview — matches macOS where
+                // the Workspaces "New Sessions..." menu entry only
+                // animates to the tile grid and the user picks the
+                // target slot by clicking "+" there; the connection
+                // dialog only appears once a specific slot is chosen.
                 if (app.workspace.scale > 0.0) {
                     animateWorkspaceScale(app, hwnd, 0.0);
                 }
-                dialogs.showConnectionDialog(app, hwnd);
             }
             return 0;
         },
@@ -3136,6 +3140,14 @@ pub export fn WndProc(
                         if (applog.isEnabled()) applog.appLog("[win] WM_APP_CREATE_TILE: createInProcessTile failed\n", .{});
                     }
                 }
+            }
+            return 0;
+        },
+
+        app_mod.WM_APP_TILE_EXITED => {
+            if (getApp(hwnd)) |app| {
+                const exited_idx: u8 = @intCast(wParam & 0xFF);
+                handleTileExited(app, hwnd, exited_idx);
             }
             return 0;
         },
@@ -4214,14 +4226,13 @@ pub export fn WndProc(
             const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
             if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
                 if (getApp(hwnd)) |app| {
-                    // Reveal the workspace tile view before the modeless
-                    // connection dialog opens, matching the macOS flow where
-                    // "New Session..." animates to the tile grid first so the
-                    // user sees where the new session will land.
+                    // Reveal the tile overview only — the connection
+                    // dialog is deferred until the user picks a specific
+                    // "+" cell there, matching the macOS Workspaces menu
+                    // flow.
                     if (app.workspace.scale > 0.0) {
                         animateWorkspaceScale(app, hwnd, 0.0);
                     }
-                    dialogs.showConnectionDialog(app, hwnd);
                 }
                 return 0;
             }
@@ -4451,6 +4462,102 @@ pub export fn WndProc(
 /// Switch the active tile and update all per-active pointers accordingly.
 /// Keeps `app.corep` in sync with `workspace.activeCorep()` so input/flush
 /// routing follows the selected tile. Capture a snapshot of the outgoing
+/// Count the tiles that are currently running a session. Used by the
+/// close / exit paths to decide whether to tear down a single tile and
+/// return the user to the overview, or to close the whole app because
+/// no other sessions are left.
+fn countOccupiedTiles(app: *App) u32 {
+    var n: u32 = 0;
+    for (app.workspace.tiles.items) |*tile| {
+        if (tile.isOccupied()) n += 1;
+    }
+    return n;
+}
+
+/// Pick a tile index that still holds a running session, preferring
+/// indices different from `excluded`. Returns null when no other tile is
+/// occupied — callers use that as a signal to close the whole app.
+fn findAnyOccupiedExcept(app: *App, excluded: u8) ?u8 {
+    for (app.workspace.tiles.items, 0..) |*tile, i| {
+        if (i == excluded) continue;
+        if (tile.isOccupied()) return @intCast(i);
+    }
+    return null;
+}
+
+/// Release the core and TileContext attached to `index` and mark the
+/// slot unoccupied so the overlay renders it as a "+" cell again. Does
+/// not remove the slot from the tiles array so that explicit-slot
+/// positioning (from ConnectionConfig.target_tile_index) stays stable
+/// across sessions.
+fn tearDownTile(app: *App, index: u8) void {
+    if (index >= app.workspace.tiles.items.len) return;
+    var tile = &app.workspace.tiles.items[index];
+    if (tile.corep) |cp| {
+        app_mod.zonvie_core_destroy(cp);
+        tile.corep = null;
+    }
+    if (tile.ctx) |ctx_ptr| {
+        const typed: *workspace_mod.TileContext = @ptrCast(@alignCast(ctx_ptr));
+        app.alloc.destroy(typed);
+        tile.ctx = null;
+    }
+    if (tile.snapshot) |*snap| {
+        d3d11.Renderer.releaseSnapshot(snap);
+        tile.snapshot = null;
+    }
+    tile.started = false;
+    tile.title_len = 0;
+}
+
+/// WM_APP_TILE_EXITED handler. Invoked on the UI thread once a tile's
+/// nvim has terminated and core callbacks have ceased. If other tiles
+/// are still running the app stays open: we tear down the exited tile,
+/// switch active to a surviving session, and drop back to the tile
+/// overview so the user can pick where to go next. When the exited tile
+/// was the only running one, falls through to WM_CLOSE so the
+/// single-session shutdown path handles the app exit as before.
+fn handleTileExited(app: *App, hwnd: c.HWND, exited_idx: u8) void {
+    const log_enabled = applog.isEnabled();
+    if (log_enabled) applog.appLog(
+        "[win] handleTileExited: exited={d} occupied_before_tear={d}\n",
+        .{ exited_idx, countOccupiedTiles(app) },
+    );
+
+    // Find a surviving tile BEFORE tearing down so we know where to
+    // switch if we're keeping the app open.
+    const survivor = findAnyOccupiedExcept(app, exited_idx);
+
+    tearDownTile(app, exited_idx);
+
+    if (survivor) |next_idx| {
+        // Multiple sessions case: stay alive and hand the user back to
+        // the overview so they can pick. Switch active now so app.corep
+        // and the visible tile are coherent.
+        app.workspace.active_tile = next_idx;
+        app.corep = app.workspace.tiles.items[next_idx].corep;
+        // The window may currently be fullscreen on the dying tile;
+        // animate out to the overview so the user can see what
+        // sessions remain.
+        if (app.workspace.scale > 0.0) {
+            animateWorkspaceScale(app, hwnd, 0.0);
+        } else {
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+        // Keep quit state clean so a later close on the survivor runs
+        // the normal prompt flow.
+        app.neovim_exited.store(false, .release);
+        app.quit_pending = false;
+        return;
+    }
+
+    // No survivors: this was the last tile. Fall back to the existing
+    // app shutdown path — mark exited + post WM_CLOSE.
+    if (log_enabled) applog.appLog("[win] handleTileExited: last tile — closing app\n", .{});
+    app.neovim_exited.store(true, .release);
+    _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+}
+
 /// tile first so its thumbnail remains visible in the overview.
 pub fn switchActiveTile(app: *App, hwnd: c.HWND, index: u8) void {
     if (index >= app.workspace.tiles.items.len) return;

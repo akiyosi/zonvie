@@ -356,8 +356,8 @@ pub const WorkspaceState = struct {
         _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
         self.system_menu_added_items += 1;
 
-        // "New Session..."
-        _ = c.AppendMenuW(sys_menu, c.MF_STRING, SC_WS_NEW_SESSION, toWide("New Session..."));
+        // "New Sessions..." — matches the macOS Workspaces menu label.
+        _ = c.AppendMenuW(sys_menu, c.MF_STRING, SC_WS_NEW_SESSION, toWide("New Sessions..."));
         self.system_menu_added_items += 1;
 
         // Active sessions
