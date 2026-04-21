@@ -1130,8 +1130,12 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
 /// and only using D3D11 for final display.
 pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer == null) return;
-    if (app.tabline_state.tab_count == 0) return;
     if (width == 0 or height == 0) return;
+    // Keep rendering an empty bar (background + window caption
+    // buttons) when there are no tabs so the DWM-extended titlebar
+    // doesn't go transparent — otherwise a session that disables
+    // ext_tabline mid-run leaves a visible gap where the titlebar
+    // used to be painted.
 
     // Create memory DC and DIB section
     const screen_dc = c.GetDC(null);
@@ -1202,12 +1206,12 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     }
 }
 
-/// Draw tabline content (called from offscreen DC or child window WM_PAINT)
+/// Draw tabline content (called from offscreen DC or child window WM_PAINT).
+/// Safe to call with tab_count == 0 — in that case only the bar
+/// background and the window caption buttons are drawn, so a tile that
+/// disables ext_tabline still paints an opaque strip over the DWM
+/// extended titlebar (otherwise that region would go transparent).
 pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
-    if (app.tabline_state.tab_count == 0) {
-        return;
-    }
-
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
     const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
@@ -1236,11 +1240,16 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     };
     _ = c.FillRect(hdc, &bar_rect, bg_brush);
 
-    // Calculate tab width
+    // Calculate tab width. With no tabs the tab strip becomes an
+    // empty expanse between the leading controls and the window
+    // buttons; we short-circuit the layout loops below instead of
+    // dividing by zero here.
     const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-    const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+    const tab_width: c_int = if (tab_count > 0)
+        @min(tab_max_w, @max(tab_min_w, @divTrunc(available_width, tab_count)))
+    else
+        tab_min_w;
 
     // Brushes
     const selected_brush = c.CreateSolidBrush(c.RGB(255, 255, 255));
@@ -1357,10 +1366,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         x += tab_width + 1;
     }
 
-    // Draw new tab button (+)
+    // Draw new tab button (+) — only when there are tabs to append to.
+    // A session that isn't using ext_tabline has nothing to "add" to
+    // and the plus icon would look misplaced hovering at the left of
+    // the empty bar.
     const plus_x = x + plus_offset;
     const plus_y = @divTrunc(bar_height - plus_btn_size, 2);
-    {
+    if (app.tabline_state.tab_count > 0) {
         // Draw hover background (circular) if hovered
         if (app.tabline_state.hovered_new_tab_btn) {
             const plus_hover_brush = c.CreateSolidBrush(c.RGB(200, 200, 200));

@@ -4480,40 +4480,49 @@ pub export fn WndProc(
 /// Pull the ext_* extension flags from the active tile's
 /// ConnectionConfig onto the app and clear any state residual from a
 /// previous tile that had the extension enabled. Without this, the
-/// tab strip (ext_tabline), cmdline popup, popupmenu and messages
-/// overlays painted by a previous session linger over a new session
-/// that doesn't use those extensions.
+/// tab strip (ext_tabline), cmdline popup, messages overlays painted
+/// by a previous session linger over a new session that doesn't use
+/// those extensions.
+///
+/// IMPORTANT: `app.ext_tabline_enabled` is intentionally NOT rewritten
+/// here. The titlebar-style tab strip is baked into the window's
+/// non-client area at creation time (see WM_NCCALCSIZE) and toggling
+/// the flag mid-run would desynchronize the extended-client-area
+/// computation from the actual frame — the visible symptoms are the
+/// titlebar going transparent or the grid painting over the top
+/// strip. Instead, the tab LIST is cleared so a non-tabline tile
+/// shows just the opaque bar background + window buttons (matching
+/// the macOS approach where TabBarView stays visible with empty
+/// labels).
 fn syncExtensionsFromActiveTile(app: *App) void {
     if (app.workspace.active_tile >= app.workspace.tiles.items.len) return;
     const tile = &app.workspace.tiles.items[app.workspace.active_tile];
     const cfg = &tile.config;
 
-    app.ext_tabline_enabled = cfg.ext_tabline;
+    // cmdline / messages / external windows are pure-overlay features
+    // that do not affect window chrome geometry; syncing their flags
+    // at runtime is safe.
     app.ext_cmdline_enabled = cfg.ext_cmdline;
     app.ext_messages_enabled = cfg.ext_messages;
     app.ext_windows_enabled = cfg.ext_windows;
-    // popupmenu is read from app.config.popup.external rather than a
-    // mirror flag, so nothing to sync there.
 
     // Always clear the tabline state on switch: the tab list was built
     // from the previous tile's nvim and has no meaning for the incoming
     // tile. If the incoming tile has ext_tabline enabled, the redraw!
     // we send right after switching will make its nvim emit
     // tabline_update events to repopulate the strip. If disabled, the
-    // area stays clear because tab_count == 0 gates the draw paths.
+    // area stays clear because tab_count == 0 gates the draw paths —
+    // but renderTablineToD3D still paints a solid background + window
+    // caption buttons so the titlebar stays opaque.
     app.mu.lock();
     app.tabline_state.tab_count = 0;
     app.tabline_state.visible = false;
     app.mu.unlock();
-    if (app.tabline_state.hwnd) |tabline_hwnd| {
-        if (!cfg.ext_tabline) {
-            _ = c.ShowWindow(tabline_hwnd, c.SW_HIDE);
-        }
-    }
     // Drop the cached tabline texture unconditionally so the tabbar
     // area doesn't show a stale set of tabs during the next paint; the
     // incoming tile will re-upload its own tabline on the first
-    // tabline_update callback.
+    // tabline_update callback (or just the empty bar + buttons if the
+    // new tile has ext_tabline disabled).
     if (app.renderer) |*g| {
         g.releaseTablineTexture();
     }
