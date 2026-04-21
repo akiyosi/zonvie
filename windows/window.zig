@@ -4455,7 +4455,17 @@ pub export fn WndProc(
 pub fn switchActiveTile(app: *App, hwnd: c.HWND, index: u8) void {
     if (index >= app.workspace.tiles.items.len) return;
     if (index == app.workspace.active_tile) return;
-    captureActiveTileSnapshot(app);
+    // Only snapshot if the outgoing tile currently owns the window
+    // (scale == 1.0, i.e. fullscreen). When this runs from the overlay
+    // click path the overview is already open — back_tex contains the
+    // overlay itself, so capturing now would bake the tile grid into the
+    // outgoing tile's thumbnail and render nested overviews on the next
+    // frame. The outgoing tile's snapshot was already taken when
+    // animateWorkspaceScale transitioned from fullscreen to overview at
+    // scale=1.0 (pure terminal); that image is still correct.
+    if (app.workspace.scale >= 0.999) {
+        captureActiveTileSnapshot(app);
+    }
     app.workspace.switchToTile(index);
     if (app.workspace.activeCorep()) |cp| {
         app.corep = cp;
@@ -4611,6 +4621,17 @@ pub fn createInProcessTile(app: *App, hwnd: c.HWND, config: *const workspace_mod
         "[win] createInProcessTile: tile={d} start_ok={d} rows={d} cols={d}\n",
         .{ index, start_ok, rows, cols },
     );
+
+    // Unblock the new core's RPC thread. zonvie_core_start spawns runLoop
+    // which then blocks in waitForLayoutReady until notifyLayoutReady is
+    // called — without this, nvim_ui_attach is never sent and the new
+    // session never reaches the keyboard-input-ready state (the tile
+    // appears to ignore all keystrokes). The startup tile is unblocked by
+    // the WM_SIZE handler's `!shown` branch, which only fires once, so
+    // every subsequent in-process tile has to notify here explicitly.
+    if (rows > 0 and cols > 0) {
+        core.zonvie_core_notify_layout_ready(new_corep, rows, cols);
+    }
 
     _ = c.InvalidateRect(hwnd, null, 0);
     return index;
