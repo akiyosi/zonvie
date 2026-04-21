@@ -210,11 +210,18 @@ fn drawBorder(renderer: *d3d11.Renderer, ndc: [4]f32, color: [4]f32, thickness_p
 }
 
 /// Draw a "+" glyph centered inside `rect` (pixel-space rect). Two solid
-/// crossed rectangles, sized to remain visible at every animation frame.
+/// crossed rectangles, sized to match the macOS `WorkspaceOverlayView`
+/// plus — `clamp(tileWidth / 6, 18, 48)` for the total glyph size with
+/// thin ultra-light-style strokes. Scaled to the shorter edge so the
+/// mark stays square even when tiles are non-square during animation.
 fn drawPlusGlyph(renderer: *d3d11.Renderer, rect: TileRect, win_w: f32, win_h: f32) !void {
     const short_dim = @min(rect.w, rect.h);
-    const arm_len = short_dim * 0.35;
-    const arm_thickness = @max(short_dim * 0.08, 2.0);
+    // Total visible "+" size, mirroring macOS's plusSize computation.
+    const plus_size = @max(18.0, @min(48.0, short_dim / 6.0));
+    // Arm length = half the glyph (arms extend from center outwards).
+    const arm_len = plus_size * 0.5;
+    // Thin stroke, matching NSFont.systemFont(weight: .ultraLight).
+    const arm_thickness = @max(plus_size * 0.06, 1.0);
     const cx = rect.x + rect.w * 0.5;
     const cy = rect.y + rect.h * 0.5;
 

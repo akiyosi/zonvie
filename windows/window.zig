@@ -1050,9 +1050,15 @@ pub export fn WndProc(
                     );
 
                     // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
-                    // This avoids DWM composition issues by keeping GDI rendering offscreen
+                    // This avoids DWM composition issues by keeping GDI rendering offscreen.
+                    // For the titlebar tab strip we render unconditionally on ext_tabline (no
+                    // tab_count gate): a session that temporarily has no tabs (tile just
+                    // switched in, or config.ext_tabline=false for this tile) still needs
+                    // the bar to paint a solid background + window caption buttons — if we
+                    // skip the upload the cached texture stays null and the DWM extended
+                    // titlebar region shows through transparent.
                     if (app.ext_tabline_enabled) {
-                        if (app.tabline_style == .titlebar and app.tabline_state.tab_count > 0) {
+                        if (app.tabline_style == .titlebar) {
                             const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
                             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
