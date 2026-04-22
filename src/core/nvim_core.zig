@@ -2501,6 +2501,27 @@ pub const Core = struct {
         self.log.write("rpc send: requestGlowConfig (id={d})\n", .{id});
     }
 
+    /// Set a global option value in Neovim via nvim_set_option_value.
+    /// Used e.g. to sync the effective `guifont` back to Neovim so `:set
+    /// guifont?` reports what the frontend is actually rendering.
+    pub fn requestSetOptionValue(self: *Core, name: []const u8, value: []const u8) !void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_set_option_value");
+
+        // nvim_set_option_value(name, value, opts{}) — empty opts applies globally.
+        try rpc.packArray(&buf, self.alloc, 3);
+        try rpc.packStr(&buf, self.alloc, name);
+        try rpc.packStr(&buf, self.alloc, value);
+        try rpc.packMap(&buf, self.alloc, 0);
+
+        try self.sendRaw(buf.items);
+
+        self.log.write("rpc send: nvim_set_option_value {s}='{s}' (id={d})\n", .{ name, value, id });
+    }
+
     /// Execute Lua code in Neovim via nvim_exec_lua.
     pub fn requestExecLua(self: *Core, lua_code: []const u8) !void {
         const id = self.nextMsgId();

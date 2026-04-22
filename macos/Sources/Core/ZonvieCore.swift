@@ -2226,13 +2226,15 @@ final class ZonvieCore {
 
     /// Parse a single guifont entry: "<name>\t<size>" or "<name>\t<size>\t<features>".
     /// Returns (name, size, features) or nil if unparseable.
-    private static func parseGuiFontEntry(_ entry: String, configSize: Double) -> (String, Double, String)? {
+    /// When `sizeExplicit` is true, the parsed size is ignored and `configSize`
+    /// is used so that config.toml [font] size wins over nvim's default guifont.
+    private static func parseGuiFontEntry(_ entry: String, configSize: Double, sizeExplicit: Bool) -> (String, Double, String)? {
         let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
         guard parts.count >= 2 else { return nil }
         let name = String(parts[0])
         guard !name.isEmpty else { return nil }
         let parsedSize = Double(parts[1]) ?? 0
-        let size = parsedSize > 0 ? parsedSize : configSize
+        let size = (sizeExplicit || parsedSize <= 0) ? configSize : parsedSize
         let features = parts.count >= 3 ? String(parts[2]) : ""
         return (name, size, features)
     }
@@ -2243,9 +2245,21 @@ final class ZonvieCore {
         let data = Data(bytes: bytes, count: max(0, len))
         guard let s = String(data: data, encoding: .utf8) else { return }
 
-        // Font priority: guifont > config.font.family > OS default (Menlo)
+        // Font priority:
+        //   1. config.font.family/size when explicitly set in config.toml
+        //   2. guifont payload from nvim
+        //   3. config.font defaults
+        //   4. OS default (Menlo)
+        //
+        // Nvim sends its own default `guifont` at ui_attach time even when
+        // the user hasn't set one. Letting that default override an explicit
+        // config.toml [font] entry surprises users. If the user wants
+        // `:set guifont=...` to control the font, they should leave [font]
+        // out of config.toml.
         let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
+        let familyExplicit = ZonvieConfig.shared.font.familyExplicit
+        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit
 
         // The payload may contain multiple newline-separated candidates
         // (guifont fallback list).  Try each in order; use the first
@@ -2257,30 +2271,36 @@ final class ZonvieCore {
         var features: String = ""
         var found = false
 
-        for candidate in candidates {
-            guard let parsed = Self.parseGuiFontEntry(String(candidate), configSize: configSize) else {
-                continue
+        // If the user explicitly set font.family in config.toml, skip guifont
+        // candidates entirely and go straight to the config fallback below.
+        if familyExplicit {
+            Self.appLog("[onGuiFont] family_explicit set, ignoring nvim guifont payload")
+        } else {
+            for candidate in candidates {
+                guard let parsed = Self.parseGuiFontEntry(String(candidate), configSize: configSize, sizeExplicit: sizeExplicit) else {
+                    continue
+                }
+                if Self.isFontAvailable(parsed.0) {
+                    name = parsed.0
+                    size = parsed.1
+                    features = parsed.2
+                    found = true
+                    Self.appLog("[onGuiFont] selected '\(name)' size=\(size) features='\(features)'")
+                    break
+                }
+                Self.appLog("[onGuiFont] skipped unavailable font '\(parsed.0)'")
             }
-            if Self.isFontAvailable(parsed.0) {
-                name = parsed.0
-                size = parsed.1
-                features = parsed.2
-                found = true
-                Self.appLog("[onGuiFont] selected '\(name)' size=\(size) features='\(features)'")
-                break
-            }
-            Self.appLog("[onGuiFont] skipped unavailable font '\(parsed.0)'")
-        }
 
-        // Single-entry payload (no newline) — use as-is even if not "available"
-        // to preserve backward compatibility with direct :set guifont=... usage.
-        if !found && candidates.count == 1 {
-            if let parsed = Self.parseGuiFontEntry(String(candidates[0]), configSize: configSize) {
-                name = parsed.0
-                size = parsed.1
-                features = parsed.2
-                found = true
-                Self.appLog("[onGuiFont] single candidate, using '\(name)' size=\(size)")
+            // Single-entry payload (no newline) — use as-is even if not "available"
+            // to preserve backward compatibility with direct :set guifont=... usage.
+            if !found && candidates.count == 1 {
+                if let parsed = Self.parseGuiFontEntry(String(candidates[0]), configSize: configSize, sizeExplicit: sizeExplicit) {
+                    name = parsed.0
+                    size = parsed.1
+                    features = parsed.2
+                    found = true
+                    Self.appLog("[onGuiFont] single candidate, using '\(name)' size=\(size)")
+                }
             }
         }
 

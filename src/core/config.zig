@@ -168,6 +168,11 @@ pub const Config = struct {
         family: []const u8 = if (builtin.os.tag == .macos) "Menlo" else "Consolas",
         size: f32 = if (builtin.os.tag == .macos) 14.0 else 18.0,
         linespace: i32 = 0,
+        // Whether the user explicitly set the value in config.toml. When true,
+        // the frontend should prefer config over nvim's default `guifont`
+        // (which nvim sends at ui_attach even when the user hasn't set it).
+        family_explicit: bool = false,
+        size_explicit: bool = false,
     };
 
     pub const WindowConfig = struct {
@@ -323,8 +328,14 @@ pub const Config = struct {
         }
 
         if (cfg.font) |f| {
-            if (f.family) |fam| self.font.family = alloc.dupe(u8, fam) catch self.font.family;
-            if (f.size) |s| self.font.size = s;
+            if (f.family) |fam| {
+                self.font.family = alloc.dupe(u8, fam) catch self.font.family;
+                self.font.family_explicit = true;
+            }
+            if (f.size) |s| {
+                self.font.size = s;
+                self.font.size_explicit = true;
+            }
             if (f.linespace) |l| self.font.linespace = l;
         }
 

@@ -1395,6 +1395,24 @@ pub fn runLoop(self: *Core) void {
 
     self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
     self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
+
+    // If config.toml [font] family is set, push it to nvim's `guifont` BEFORE
+    // ui_attach. Sending it after ui_attach would arrive mid-redraw: nvim
+    // would emit an option_set during its initial paint, then re-emit after
+    // processing our set. The second paint round-trip caused the statusline
+    // to briefly drop its text on Windows at startup.
+    if (self.msg_config.font.family_explicit) {
+        var guifont_buf: [256]u8 = undefined;
+        const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
+            self.msg_config.font.family,
+            self.msg_config.font.size,
+        }) catch null;
+        if (guifont_str) |val| {
+            self.requestSetOptionValue("guifont", val) catch |e|
+                self.log.write("pre-attach set guifont failed: {any}\n", .{e});
+        }
+    }
+
     self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
         self.log.write("ui_attach send failed: {any}\n", .{e});
         _ = child.kill() catch {};

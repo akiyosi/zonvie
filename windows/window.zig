@@ -1731,8 +1731,16 @@ pub export fn WndProc(
                     updateLayoutToCore(hwnd, app);
                 }
 
-                // Unblock RPC thread once layout is known (before window is shown)
-                if (app.early_core_init_done and app.nvim_spawned and !shown) {
+                // Unblock RPC thread once layout is known (before window is shown).
+                // Guard: app.atlas must be set (done in WM_APP_DEFERRED_INIT) before
+                // unblocking. WM_SIZE fires synchronously during CreateWindowExW right
+                // after WM_CREATE, at which point early_atlas exists but app.atlas is
+                // still null. If we unblock here, onGuiFont fires with a null atlas and
+                // the configured font is silently dropped. WM_APP_DEFERRED_INIT sets
+                // app.atlas first and then calls notify_layout_ready; this WM_SIZE path
+                // only matters for subsequent WM_SIZE events that arrive with updated
+                // dimensions before the window is shown.
+                if (app.early_core_init_done and app.nvim_spawned and !shown and app.atlas != null) {
                     if (app.corep) |corep| {
                         if (app.surface.rows > 0 and app.surface.cols > 0) {
                             core.zonvie_core_notify_layout_ready(corep, app.surface.rows, app.surface.cols);

@@ -41,6 +41,10 @@ struct ZonvieConfig {
         var family: String = "Menlo"
         var size: Double = 14.0
         var linespace: Int = 0
+        /// True when the user explicitly set [font] family / size in config.toml.
+        /// When true, onGuiFont prefers config over nvim's default guifont list.
+        var familyExplicit: Bool = false
+        var sizeExplicit: Bool = false
     }
 
     struct WindowConfig {
@@ -175,6 +179,8 @@ struct ZonvieConfig {
         if let s = v.font_family { config.font.family = String(cString: s) }
         config.font.size = Double(v.font_size)
         config.font.linespace = Int(v.font_linespace)
+        config.font.familyExplicit = v.font_family_explicit
+        config.font.sizeExplicit = v.font_size_explicit
 
         // Window
         config.window.blur = v.window_blur

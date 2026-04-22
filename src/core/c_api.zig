@@ -701,6 +701,21 @@ pub export fn zonvie_core_set_focus(p: ?*zonvie_core, gained: bool) callconv(.c)
     box.core.requestUiSetFocus(gained);
 }
 
+/// Set a global Neovim option value via `nvim_set_option_value`.
+/// Used by frontends to sync the effective `guifont` back to Neovim so
+/// `:set guifont?` reports what the frontend is actually rendering.
+pub export fn zonvie_core_set_option_value(
+    p: ?*zonvie_core,
+    name: [*]const u8,
+    name_len: usize,
+    value: [*]const u8,
+    value_len: usize,
+) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.requestSetOptionValue(name[0..name_len], value[0..value_len]) catch {};
+}
+
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;
@@ -1327,6 +1342,10 @@ pub const zonvie_config_values = extern struct {
     font_family: [*:0]const u8 = "",
     font_size: f32 = 14.0,
     font_linespace: i32 = 0,
+    // True when the user explicitly set [font] family / size in config.toml.
+    // Frontends should prefer config over nvim's default `guifont`.
+    font_family_explicit: bool = false,
+    font_size_explicit: bool = false,
     // window
     window_blur: bool = false,
     window_opacity: f32 = 1.0,
@@ -1399,6 +1418,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .font_family = dupeZForC(alloc, cfg.font.family, "Menlo"),
         .font_size = cfg.font.size,
         .font_linespace = cfg.font.linespace,
+        .font_family_explicit = cfg.font.family_explicit,
+        .font_size_explicit = cfg.font.size_explicit,
         // window
         .window_blur = cfg.window.blur,
         .window_opacity = cfg.window.opacity,
