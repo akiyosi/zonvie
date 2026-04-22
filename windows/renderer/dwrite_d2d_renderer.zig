@@ -603,10 +603,6 @@ pub const Renderer = struct {
         );
         
         if (c.FAILED(hr3)) return error.ClearAtlasFailed;
-
-
-
-        if (c.FAILED(hr3)) return error.ClearAtlasFailed;
     }
 
 pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
