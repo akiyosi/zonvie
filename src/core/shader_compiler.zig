@@ -1,14 +1,25 @@
 //! GLSL -> MSL / HLSL cross-compilation wrapper.
 //!
-//! Accepts Shadertoy-compatible GLSL fragment shader source (with a
-//! `mainImage(out vec4 fragColor, in vec2 fragCoord)` entry point and the
-//! usual `iResolution` / `iTime` / `iChannel0` uniforms) and emits source
+//! Accepts Shadertoy/Ghostty-style GLSL fragment shaders and emits source
 //! code for the target graphics API via:
 //!   glslang (GLSL -> SPIR-V)  ->  SPIRV-Cross (SPIR-V -> target)
 //!
-//! Phase 1c wires the real pipeline; upstream uniform wrapping (Shadertoy
-//! mainImage entry) is Phase 4's job. For now we accept any GLSL 450
-//! fragment shader that defines `void main()`.
+//! Input forms (auto-detected by content):
+//!
+//!   1. **Shadertoy / Ghostty form** — the source defines
+//!      `void mainImage(out vec4 fragColor, in vec2 fragCoord)` and is
+//!      automatically wrapped with a preamble that declares the standard
+//!      Shadertoy uniforms (`iResolution`, `iTime`, `iChannel0`, …) and a
+//!      bridge `void main()`. Ghostty's shader zoo drops in verbatim.
+//!
+//!   2. **Raw form** — the source defines `void main()` directly. It is
+//!      passed to glslang as-is and must declare its own `iChannel0`
+//!      sampler (`layout(binding=0)`) and `vUV` input
+//!      (`layout(location=0) in vec2 vUV`).
+//!
+//! The shared uniform layout (64 bytes, std140) matches
+//! `include/zonvie_core.h`'s `zonvie_shader_uniforms`, which both
+//! frontends populate and upload per frame as a UBO at binding=1.
 
 const std = @import("std");
 
@@ -45,8 +56,70 @@ fn initGlslangProcess() void {
     _ = glslang.glslang_initialize_process();
 }
 
+/// Shadertoy-compatible wrapper prepended to Shadertoy-style user sources.
+/// Member order and sizes are kept in lock-step with
+/// `zonvie_shader_uniforms` in `include/zonvie_core.h` (64 bytes, std140).
+const shadertoy_preamble =
+    \\#version 450
+    \\
+    \\layout(binding = 0) uniform sampler2D iChannel0;
+    \\
+    \\layout(std140, binding = 1) uniform ZonvieShaderUniforms {
+    \\    vec3 iResolution;
+    \\    float iTime;
+    \\    vec4 iMouse;
+    \\    vec4 iDate;
+    \\    float iTimeDelta;
+    \\    int iFrame;
+    \\    float iSampleRate;
+    \\    float iFrameRate;
+    \\};
+    \\
+    \\layout(location = 0) in vec2 vUV;
+    \\layout(location = 0) out vec4 zonvie_fragColor;
+    \\
+    \\// ----- user source (mainImage) follows -----
+    \\
+;
+
+const shadertoy_epilogue =
+    \\
+    \\// ----- bridge from Shadertoy mainImage to the pipeline output -----
+    \\void main() {
+    \\    // Shadertoy: fragCoord is in pixels, origin bottom-left.
+    \\    vec2 fragCoord = vUV * iResolution.xy;
+    \\    fragCoord.y = iResolution.y - fragCoord.y;
+    \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
+    \\    mainImage(color, fragCoord);
+    \\    zonvie_fragColor = color;
+    \\}
+    \\
+;
+
+/// Decide whether user source looks like a Shadertoy-style shader
+/// (defines `void mainImage(...)`) and therefore needs the preamble +
+/// bridge main(), or like a raw form that already has its own main()
+/// and uniforms declared. Detection is purely textual — we avoid
+/// pre-tokenizing since both forms have to survive preprocessing in
+/// glslang anyway.
+fn isShadertoyStyle(src: []const u8) bool {
+    return std.mem.indexOf(u8, src, "mainImage") != null;
+}
+
+fn wrapShadertoy(alloc: std.mem.Allocator, user_src: []const u8) ![]u8 {
+    const total_len = shadertoy_preamble.len + user_src.len + shadertoy_epilogue.len;
+    var buf = try alloc.alloc(u8, total_len);
+    @memcpy(buf[0..shadertoy_preamble.len], shadertoy_preamble);
+    @memcpy(buf[shadertoy_preamble.len..][0..user_src.len], user_src);
+    @memcpy(buf[shadertoy_preamble.len + user_src.len ..][0..shadertoy_epilogue.len], shadertoy_epilogue);
+    return buf;
+}
+
 /// Compile a GLSL fragment shader to the target shading language.
 /// Returned slice is allocated with `alloc` and owned by the caller.
+/// Shadertoy-style sources (those containing `mainImage`) are
+/// auto-wrapped with the preamble defined above before being handed to
+/// glslang.
 pub fn compileGlslToTarget(
     alloc: std.mem.Allocator,
     glsl_source: []const u8,
@@ -56,8 +129,15 @@ pub fn compileGlslToTarget(
 
     glslang_init_once.call();
 
+    // Auto-wrap Shadertoy-style sources.
+    const wrapped: []u8 = if (isShadertoyStyle(glsl_source))
+        wrapShadertoy(alloc, glsl_source) catch return CompileError.OutOfMemory
+    else
+        alloc.dupe(u8, glsl_source) catch return CompileError.OutOfMemory;
+    defer alloc.free(wrapped);
+
     // glslang wants a null-terminated C string.
-    const glsl_z = alloc.dupeZ(u8, glsl_source) catch return CompileError.OutOfMemory;
+    const glsl_z = alloc.dupeZ(u8, wrapped) catch return CompileError.OutOfMemory;
     defer alloc.free(glsl_z);
 
     // Build the glslang input descriptor. Vulkan 1.0 + SPIR-V 1.0 is the
@@ -204,4 +284,33 @@ test "compile trivial GLSL fragment shader to HLSL" {
     try std.testing.expect(out.len > 0);
     // HLSL output should include a float4 main() declaration.
     try std.testing.expect(std.mem.indexOf(u8, out, "float4") != null);
+}
+
+test "compile Shadertoy-style mainImage source to MSL with auto-wrap" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec2 uv = fragCoord / iResolution.xy;
+        \\    fragColor = vec4(uv, 0.5 + 0.5 * sin(iTime), 1.0);
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.len > 0);
+    // Metal stdlib must be present; the Shadertoy uniforms must be visible
+    // somewhere in the emitted MSL to prove the wrapper took effect.
+    try std.testing.expect(std.mem.indexOf(u8, out, "metal_stdlib") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "iResolution") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "iTime") != null);
+}
+
+test "compile Shadertoy-style mainImage source to HLSL with auto-wrap" {
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = vec4(1.0, 0.5, 0.25, 1.0) * (0.5 + 0.5 * sin(iTime));
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, out, "iTime") != null);
 }

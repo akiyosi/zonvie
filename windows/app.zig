@@ -152,6 +152,13 @@ pub const TIMER_QUIT_TIMEOUT: c.UINT_PTR = 7;
 pub const TIMER_REPOSITION_FLOATS: c.UINT_PTR = 8;
 /// Timer ID for deferred tray icon initialization
 pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
+/// Timer ID for custom shader animation loop (~60Hz redraw trigger).
+/// Armed only while a loaded custom shader references time-varying
+/// Shadertoy uniforms (iTime / iFrame / etc.). Otherwise rendering stays
+/// flush-driven and the process remains 0-CPU idle.
+pub const TIMER_CUSTOM_SHADER_ANIM: c.UINT_PTR = 10;
+/// ~60Hz cadence for TIMER_CUSTOM_SHADER_ANIM.
+pub const CUSTOM_SHADER_ANIM_INTERVAL_MS: c.UINT = 16;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)

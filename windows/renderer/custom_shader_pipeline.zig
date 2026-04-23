@@ -18,6 +18,12 @@ pub const CustomShaderPipeline = struct {
     source_path: []u8,
     /// Compiled pixel shader. Released in `deinit`.
     pixel_shader: ?*c.ID3D11PixelShader,
+    /// True when the user GLSL references a time-varying Shadertoy
+    /// uniform (iTime / iTimeDelta / iFrame / iFrameRate / iMouse /
+    /// iDate). Populated by the renderer after reading the source so the
+    /// renderer knows to run a ~60Hz WM_TIMER loop instead of relying
+    /// purely on flush-driven WM_PAINT.
+    needs_animation: bool = false,
 
     pub fn deinit(self: *CustomShaderPipeline) void {
         if (self.pixel_shader) |ps| {
@@ -26,5 +32,37 @@ pub const CustomShaderPipeline = struct {
             self.pixel_shader = null;
         }
         self.alloc.free(self.source_path);
+    }
+
+    /// Whole-word scan for animation-driving Shadertoy uniforms. iResolution,
+    /// iSampleRate, and iChannel0 are excluded — they do not change between
+    /// frames unless the window resizes or the input texture changes.
+    pub fn detectNeedsAnimation(source: []const u8) bool {
+        const tokens = [_][]const u8{
+            "iTime",
+            "iTimeDelta",
+            "iFrame",
+            "iFrameRate",
+            "iMouse",
+            "iDate",
+        };
+        for (tokens) |tok| {
+            var search: usize = 0;
+            while (std.mem.indexOfPos(u8, source, search, tok)) |pos| {
+                const before_ok = pos == 0 or !isWordPart(source[pos - 1]);
+                const after_idx = pos + tok.len;
+                const after_ok = after_idx >= source.len or !isWordPart(source[after_idx]);
+                if (before_ok and after_ok) return true;
+                search = after_idx;
+            }
+        }
+        return false;
+    }
+
+    fn isWordPart(ch: u8) bool {
+        return (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or
+            ch == '_';
     }
 };

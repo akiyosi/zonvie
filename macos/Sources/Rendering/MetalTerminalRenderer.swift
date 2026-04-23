@@ -370,6 +370,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
     /// path does not need to re-read config each frame.
     private(set) var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
+    /// True when any loaded custom shader references a time-varying
+    /// Shadertoy uniform. Used by `MetalTerminalView` to keep the vsync
+    /// draw loop active instead of falling back to flush-driven rendering.
+    private(set) var anyCustomShaderNeedsAnimation: Bool = false
+
+    // Shadertoy-style uniforms block (64 bytes, std140) updated in place
+    // each frame and bound to the custom shader at buffer(1). The GPU may
+    // still be reading the previous frame; for a 64-byte scratch this is
+    // cheap enough to accept the pipelining hazard without ring-buffering.
+    private(set) var customShaderUniformBuffer: MTLBuffer?
+    private var customShaderFrameIndex: Int32 = 0
+    private var customShaderStartTimeSec: CFTimeInterval = 0
+    private var customShaderLastTimeSec: CFTimeInterval = 0
+    private var customShaderEmaFrameRate: Float = 60.0
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -952,6 +966,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let window = view.window, window.isMiniaturized {
             (view as? MetalTerminalView)?.didDrawFrame()
             return
+        }
+
+        // Keep the vsync draw loop alive while any custom shader references
+        // animation-driving uniforms (iTime etc.). activateDrawLoop resets
+        // the idle counter and unpauses the MTKView; without this the
+        // shader would be frozen between Neovim flush events.
+        if anyCustomShaderNeedsAnimation {
+            (view as? MetalTerminalView)?.activateDrawLoop()
         }
 
         // Process pending scroll clears before rendering
@@ -1780,12 +1802,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                let bilinSamp = bilinearSampler,
                let pipeline = customShaderPipelines.first
             {
+                updateCustomShaderUniforms(drawableSize: view.drawableSize)
                 pipeline.encode(
                     cmd: cmd,
                     input: backTex,
                     output: drawable.texture,
                     copyVertexBuffer: copyVB,
-                    sampler: bilinSamp
+                    sampler: bilinSamp,
+                    uniforms: customShaderUniformBuffer
                 )
                 customShaderHandled = true
             }
@@ -2208,6 +2232,51 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
     }
 
+    /// Populate `customShaderUniformBuffer` for the current frame. Must be
+    /// called immediately before encoding a custom shader pass. Nop when
+    /// no custom shader pipelines are loaded.
+    func updateCustomShaderUniforms(drawableSize: CGSize) {
+        if customShaderPipelines.isEmpty { return }
+        if customShaderUniformBuffer == nil {
+            // zonvie_shader_uniforms matches the std140 layout expected by
+            // the SPIRV-Cross-emitted MSL (64 bytes).
+            let size = MemoryLayout<zonvie_shader_uniforms>.stride
+            customShaderUniformBuffer = device.makeBuffer(length: size, options: [.storageModeShared])
+            customShaderUniformBuffer?.label = "CustomShaderUniforms"
+        }
+        guard let buf = customShaderUniformBuffer else { return }
+
+        let now = CACurrentMediaTime()
+        if customShaderStartTimeSec == 0 {
+            customShaderStartTimeSec = now
+            customShaderLastTimeSec = now
+        }
+        let iTime = Float(now - customShaderStartTimeSec)
+        let dt = Float(max(0, now - customShaderLastTimeSec))
+        customShaderLastTimeSec = now
+        // Low-pass the instantaneous 1/dt into a running FPS estimate.
+        if dt > 0 {
+            let instant = 1.0 / dt
+            customShaderEmaFrameRate = customShaderEmaFrameRate * 0.9 + instant * 0.1
+        }
+
+        var uniforms = zonvie_shader_uniforms()
+        uniforms.iResolution.0 = Float(drawableSize.width)
+        uniforms.iResolution.1 = Float(drawableSize.height)
+        uniforms.iResolution.2 = 1.0 // pixel aspect
+        uniforms.iTime = iTime
+        uniforms.iTimeDelta = dt
+        uniforms.iFrame = customShaderFrameIndex
+        uniforms.iSampleRate = 44100.0
+        uniforms.iFrameRate = customShaderEmaFrameRate
+        // iMouse / iDate left zero for now; will be filled in Phase 6.
+
+        let dst = buf.contents()
+        memcpy(dst, &uniforms, MemoryLayout<zonvie_shader_uniforms>.size)
+
+        customShaderFrameIndex &+= 1
+    }
+
     /// Load user-supplied custom post-process shaders listed in config.toml's
     /// `[shaders].paths`, cross-compile them to MSL, and create one pipeline
     /// state per entry. Called once alongside the bloom-pipeline construction.
@@ -2219,6 +2288,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let config = ZonvieConfig.shared.shaders
         customShaderPostProcess = config.postProcess
         customShaderPipelines.removeAll()
+        anyCustomShaderNeedsAnimation = false
         if !config.enabled || config.paths.isEmpty {
             return
         }
@@ -2237,9 +2307,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 pixelFormat: pixelFormat
             ) {
                 customShaderPipelines.append(pipeline)
+                if pipeline.needsAnimation {
+                    anyCustomShaderNeedsAnimation = true
+                }
             }
         }
-        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders")
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders, anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
     }
 
     /// Try to load pipeline from binary archive

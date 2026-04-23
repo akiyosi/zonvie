@@ -1248,6 +1248,25 @@ typedef enum {
     ZONVIE_SHADER_TARGET_HLSL = 1, /* High-Level Shading Language (D3D11 on Windows) */
 } zonvie_shader_target;
 
+/* Per-frame uniforms made available to custom shaders. Layout mirrors the
+   `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
+   declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
+   Frontends populate this struct in place and upload 64 bytes to the
+   uniform buffer each frame.
+
+   Field order and offsets are load-bearing; do not reorder. std140 lays
+   iTime into the trailing 4 bytes of iResolution's 16-byte slot. */
+typedef struct zonvie_shader_uniforms {
+    float    iResolution[3];   /* 0..11  xy = viewport px, z = pixel aspect */
+    float    iTime;            /* 12..15 seconds since shader start */
+    float    iMouse[4];        /* 16..31 xy = cursor px, zw = click px */
+    float    iDate[4];         /* 32..47 year, month, day, seconds in day */
+    float    iTimeDelta;       /* 48..51 seconds since previous frame */
+    int32_t  iFrame;           /* 52..55 frame counter */
+    float    iSampleRate;      /* 56..59 not used; always 44100 */
+    float    iFrameRate;       /* 60..63 frames per second (running average) */
+} zonvie_shader_uniforms;
+
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */
 typedef struct zonvie_shader_result {

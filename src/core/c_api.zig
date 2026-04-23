@@ -1630,6 +1630,26 @@ pub const zonvie_shader_target = enum(u8) {
     hlsl = 1, // HLSL (shader model 5.0)
 };
 
+/// Per-frame Shadertoy-style uniforms. Layout matches the std140
+/// `ZonvieShaderUniforms` block emitted by `shader_compiler.zig`'s
+/// Shadertoy preamble; keep this struct and the C header version
+/// (`zonvie_shader_uniforms` in `include/zonvie_core.h`) in lock-step.
+/// Total size is 64 bytes; field ordering is load-bearing.
+pub const zonvie_shader_uniforms = extern struct {
+    iResolution: [3]f32 = .{ 0, 0, 0 }, // 0..11
+    iTime: f32 = 0, // 12..15 (packs into iResolution's trailing std140 slot)
+    iMouse: [4]f32 = .{ 0, 0, 0, 0 }, // 16..31
+    iDate: [4]f32 = .{ 0, 0, 0, 0 }, // 32..47
+    iTimeDelta: f32 = 0, // 48..51
+    iFrame: i32 = 0, // 52..55
+    iSampleRate: f32 = 44100.0, // 56..59
+    iFrameRate: f32 = 60.0, // 60..63
+};
+
+comptime {
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 64);
+}
+
 /// Result of a shader compile. Owns an internal allocation; the caller must
 /// invoke zonvie_shader_result_destroy exactly once to release it.
 pub const zonvie_shader_result = extern struct {

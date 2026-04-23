@@ -1392,12 +1392,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                let bilinSamp = renderer.bilinearSampler
             {
                 if let pipeline = renderer.customShaderPipelines.first {
+                    renderer.updateCustomShaderUniforms(drawableSize: view.drawableSize)
                     pipeline.encode(
                         cmd: cmd,
                         input: backTex,
                         output: drawable.texture,
                         copyVertexBuffer: copyVB,
-                        sampler: bilinSamp
+                        sampler: bilinSamp,
+                        uniforms: renderer.customShaderUniformBuffer
                     )
                     customShaderHandled = true
                 }

@@ -245,6 +245,20 @@ pub const Renderer = struct {
     custom_shader_scratch_srv: ?*c.ID3D11ShaderResourceView = null,
     custom_shader_scratch_w: u32 = 0,
     custom_shader_scratch_h: u32 = 0,
+    // Shadertoy uniform block (64 bytes, std140). Bound to register(b1)
+    // in the SPIRV-Cross-emitted HLSL. Dynamic usage so UpdateSubresource
+    // or Map/Unmap can refresh it each frame; single buffer is fine for
+    // 64 bytes since the driver pipelines the CB write.
+    custom_shader_uniforms_cb: ?*c.ID3D11Buffer = null,
+    custom_shader_frame_index: i32 = 0,
+    custom_shader_start_qpc: i64 = 0,
+    custom_shader_last_qpc: i64 = 0,
+    custom_shader_ema_frame_rate: f32 = 60.0,
+    /// True when any loaded custom shader references a time-varying
+    /// Shadertoy uniform. The main loop reads this to decide whether to
+    /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
+    /// that depend on iTime would only advance on Neovim flushes.
+    any_custom_shader_needs_animation: bool = false,
 
     // Sizing
     width: u32 = 1,
@@ -459,6 +473,7 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.deinit(self.alloc);
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
+        safeRelease(&self.custom_shader_uniforms_cb);
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -2892,6 +2907,7 @@ pub const Renderer = struct {
         self.custom_shader_post_process = @intFromEnum(cfg.shaders.post_process);
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.clearRetainingCapacity();
+        self.any_custom_shader_needs_animation = false;
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
         const dev = self.device orelse return;
@@ -2906,10 +2922,11 @@ pub const Renderer = struct {
                 dead.deinit();
                 continue;
             };
+            if (pipeline.needs_animation) self.any_custom_shader_needs_animation = true;
         }
         applog.appLog(
-            "[CustomShader] loaded {d}/{d} custom shaders\n",
-            .{ self.custom_shader_pipelines.items.len, cfg.shaders.paths.len },
+            "[CustomShader] loaded {d}/{d} custom shaders, anyNeedsAnimation={}\n",
+            .{ self.custom_shader_pipelines.items.len, cfg.shaders.paths.len, self.any_custom_shader_needs_animation },
         );
     }
 
@@ -2998,7 +3015,71 @@ pub const Renderer = struct {
             .alloc = self.alloc,
             .source_path = path_copy,
             .pixel_shader = ps_out,
+            .needs_animation = CustomShaderPipeline.detectNeedsAnimation(glsl),
         };
+    }
+
+    /// Populate `custom_shader_uniforms_cb` with Shadertoy-style uniforms
+    /// for the current frame. Safe to call every frame; lazily creates
+    /// the constant buffer on first use.
+    fn updateCustomShaderUniforms(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) void {
+        if (self.custom_shader_pipelines.items.len == 0) return;
+
+        const dev = self.device orelse return;
+        if (self.custom_shader_uniforms_cb == null) {
+            var bd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            bd.ByteWidth = @sizeOf(core.zonvie_shader_uniforms);
+            bd.Usage = c.D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+            bd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return;
+            var cb: ?*c.ID3D11Buffer = null;
+            if (c.FAILED(create_buf(dev, &bd, null, &cb)) or cb == null) return;
+            self.custom_shader_uniforms_cb = cb;
+        }
+        const cb = self.custom_shader_uniforms_cb orelse return;
+
+        var freq: c.LARGE_INTEGER = undefined;
+        var now: c.LARGE_INTEGER = undefined;
+        _ = c.QueryPerformanceFrequency(&freq);
+        _ = c.QueryPerformanceCounter(&now);
+        if (self.custom_shader_start_qpc == 0) {
+            self.custom_shader_start_qpc = now.QuadPart;
+            self.custom_shader_last_qpc = now.QuadPart;
+        }
+        const denom: f64 = @floatFromInt(freq.QuadPart);
+        const iTime: f32 = @floatCast(@as(f64, @floatFromInt(now.QuadPart - self.custom_shader_start_qpc)) / denom);
+        const dt_ticks = now.QuadPart - self.custom_shader_last_qpc;
+        const dt: f32 = @floatCast(@as(f64, @floatFromInt(@max(@as(i64, 0), dt_ticks))) / denom);
+        self.custom_shader_last_qpc = now.QuadPart;
+        if (dt > 0) {
+            const instant: f32 = 1.0 / dt;
+            self.custom_shader_ema_frame_rate =
+                self.custom_shader_ema_frame_rate * 0.9 + instant * 0.1;
+        }
+
+        var u: core.zonvie_shader_uniforms = std.mem.zeroes(core.zonvie_shader_uniforms);
+        u.iResolution[0] = @floatFromInt(self.width);
+        u.iResolution[1] = @floatFromInt(self.height);
+        u.iResolution[2] = 1.0;
+        u.iTime = iTime;
+        u.iTimeDelta = dt;
+        u.iFrame = self.custom_shader_frame_index;
+        u.iSampleRate = 44100.0;
+        u.iFrameRate = self.custom_shader_ema_frame_rate;
+        // iMouse / iDate stay zero for now; filled in Phase 6.
+
+        // Map / Unmap — cheap for a 64-byte dynamic CB.
+        const map_fn = ctx_vtbl.*.Map orelse return;
+        const unmap_fn = ctx_vtbl.*.Unmap orelse return;
+        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+        const hr_map = map_fn(ctx, @ptrCast(cb), 0, c.D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (c.FAILED(hr_map)) return;
+        @memcpy(@as([*]u8, @ptrCast(mapped.pData))[0..@sizeOf(core.zonvie_shader_uniforms)], @as([*]const u8, @ptrCast(&u))[0..@sizeOf(core.zonvie_shader_uniforms)]);
+        unmap_fn(ctx, @ptrCast(cb), 0);
+
+        self.custom_shader_frame_index +%= 1;
     }
 
     /// Apply the custom shader chain. Reads a scratch copy of back_tex
@@ -3018,6 +3099,7 @@ pub const Renderer = struct {
         const sampler = self.bilinear_sampler orelse return;
 
         self.ensureCustomShaderScratch();
+        self.updateCustomShaderUniforms(ctx, ctx_vtbl);
         const scratch = self.custom_shader_scratch_tex orelse return;
         const scratch_srv = self.custom_shader_scratch_srv orelse return;
 
@@ -3058,6 +3140,14 @@ pub const Renderer = struct {
         if (ctx_vtbl.*.PSSetSamplers) |set_samplers| {
             var samps: [1]?*c.ID3D11SamplerState = .{ sampler };
             set_samplers(ctx, 0, 1, &samps[0]);
+        }
+        // Bind Shadertoy uniforms at register(b1) per SPIRV-Cross HLSL
+        // convention for `layout(std140, binding = 1)`.
+        if (self.custom_shader_uniforms_cb) |cb| {
+            if (ctx_vtbl.*.PSSetConstantBuffers) |set_cbs| {
+                var cbs: [1]?*c.ID3D11Buffer = .{ cb };
+                set_cbs(ctx, 1, 1, &cbs[0]);
+            }
         }
         if (ctx_vtbl.*.OMSetBlendState) |set_blend| {
             set_blend(ctx, null, null, 0xFFFFFFFF);

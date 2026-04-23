@@ -2317,6 +2317,11 @@ pub export fn WndProc(
                 if (getApp(hwnd)) |app| {
                     input.handleCursorBlinkTimer(hwnd, app);
                 }
+            } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
+                // Continuous-redraw tick for animated custom shaders.
+                // Posts WM_PAINT without dirtying anything else; the
+                // renderer's per-frame uniforms refresh inside draw().
+                _ = c.InvalidateRect(hwnd, null, c.FALSE);
             } else if (wParam == TIMER_DEVCONTAINER_POLL) {
                 // Poll for devcontainer up completion
                 if (dialogs.g_devcontainer_up_done.load(.seq_cst)) {
@@ -2716,6 +2721,17 @@ pub export fn WndProc(
                 // live D3D11 device.
                 if (app.renderer) |*r| {
                     r.loadCustomShaderPipelines(&app.config);
+                    if (r.any_custom_shader_needs_animation) {
+                        // Kick continuous-redraw ticker. Runs ~60Hz until
+                        // the renderer (or a future config reload) tells
+                        // us no animated shader is loaded anymore.
+                        _ = c.SetTimer(
+                            hwnd,
+                            app_mod.TIMER_CUSTOM_SHADER_ANIM,
+                            app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS,
+                            null,
+                        );
+                    }
                 }
 
                 // Process pending glyphs
