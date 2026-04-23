@@ -1378,7 +1378,31 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 redrawScheduler.didDrawFrame()
                 return
             }
-            if let blitEnc = cmd.makeBlitCommandEncoder() {
+            // User-supplied custom post-process shaders take over the
+            // backTex -> drawable copy when configured in `.afterBloom`
+            // mode. The shader samples backTex (which already contains
+            // main render + optional bloom) and writes directly to the
+            // drawable, replacing the normal blit. Phase 2 applies a
+            // single shader; multi-pass chaining is Phase 5's scope.
+            var customShaderHandled = false
+            if let renderer = mainTerminalView?.renderer,
+               !renderer.customShaderPipelines.isEmpty,
+               renderer.customShaderPostProcess == .afterBloom,
+               let copyVB = renderer.copyVertexBuffer,
+               let bilinSamp = renderer.bilinearSampler
+            {
+                if let pipeline = renderer.customShaderPipelines.first {
+                    pipeline.encode(
+                        cmd: cmd,
+                        input: backTex,
+                        output: drawable.texture,
+                        copyVertexBuffer: copyVB,
+                        sampler: bilinSamp
+                    )
+                    customShaderHandled = true
+                }
+            }
+            if !customShaderHandled, let blitEnc = cmd.makeBlitCommandEncoder() {
                 let w = min(backTex.width, drawable.texture.width)
                 let h = min(backTex.height, drawable.texture.height)
                 blitEnc.copy(

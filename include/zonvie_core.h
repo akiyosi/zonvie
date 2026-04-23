@@ -1194,6 +1194,10 @@ typedef struct zonvie_config_values {
     bool ime_disable_on_activate;
     bool ime_disable_on_modechange;
     uint8_t ime_option_as_meta;  // 0=both, 1=none, 2=only_left, 3=only_right
+    // shaders (custom post-process). Path array accessed via
+    // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
+    bool shader_enabled;
+    uint8_t shader_post_process;  // 0=after_bloom, 1=before_bloom, 2=replace_bloom
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.
@@ -1206,6 +1210,13 @@ ZONVIE_API zonvie_config_values zonvie_config_get_values(const zonvie_config* co
 
 /* Free config handle and all associated memory. */
 ZONVIE_API void zonvie_config_destroy(zonvie_config* config);
+
+/* Number of custom shader passes configured in [shaders].paths. */
+ZONVIE_API uint32_t zonvie_config_get_shader_count(const zonvie_config* config);
+
+/* Get the i-th custom shader path. Returns NULL if index is out of range.
+   String is valid until zonvie_config_destroy. */
+ZONVIE_API const char* zonvie_config_get_shader_path(const zonvie_config* config, uint32_t index);
 
 /* Non-blocking check whether a cell's highlight has a URL attribute.
    Returns: 1 = has url, 0 = no url, -1 = lock unavailable.
@@ -1227,6 +1238,37 @@ ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
    on_flush_end is still called (via defer) so the frontend can clean up.
    The aborted flush's dirty state is preserved — next flush retries everything. */
 ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
+
+/* ========================================================================
+   Custom shader cross-compilation (Shadertoy / Ghostty compatible GLSL)
+   ======================================================================== */
+
+typedef enum {
+    ZONVIE_SHADER_TARGET_MSL  = 0, /* Metal Shading Language (macOS) */
+    ZONVIE_SHADER_TARGET_HLSL = 1, /* High-Level Shading Language (D3D11 on Windows) */
+} zonvie_shader_target;
+
+/* Result of a GLSL -> target shading language compile.
+   Owns an internal allocation; pass to zonvie_shader_result_destroy. */
+typedef struct zonvie_shader_result {
+    const char *data;        /* Null-terminated compiled source; NULL on error. */
+    size_t      data_len;    /* Length of data, excluding null terminator. */
+    const char *error_msg;   /* Null-terminated error message; NULL on success. */
+    void       *internal;    /* Opaque cleanup pointer. */
+} zonvie_shader_result;
+
+/* Compile a Shadertoy/Ghostty style GLSL fragment shader to the target
+   shading language. Caller must release the result with
+   zonvie_shader_result_destroy. */
+ZONVIE_API zonvie_shader_result zonvie_shader_compile_glsl(
+    const char *glsl_source,
+    size_t      glsl_len,
+    zonvie_shader_target target
+);
+
+/* Release all memory owned by a zonvie_shader_result. Safe to call on a
+   zero-initialized or already-destroyed result. */
+ZONVIE_API void zonvie_shader_result_destroy(zonvie_shader_result *result);
 
 #ifdef __cplusplus
 }

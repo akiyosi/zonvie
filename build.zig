@@ -10,6 +10,32 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
 
+    // Shader-compile dependency: glslang (GLSL -> SPIR-V).
+    // Games-by-Mason's Zig-0.15-compatible port. Pulls upstream
+    // KhronosGroup/glslang + SPIRV-Tools + SPIRV-Headers as transitive deps.
+    //
+    // We always build the shader-compile deps with ReleaseFast regardless
+    // of the parent optimize mode. Rationale: Zig's Debug mode enables
+    // UBSan for C/C++ code and references __ubsan_* runtime symbols. Those
+    // do not cascade through static-lib-to-static-lib linkage, so Xcode
+    // (which links the merged archive without a UBSan runtime) cannot
+    // resolve them. Shader compilation is a startup-time operation where
+    // Debug/ReleaseFast tradeoff is irrelevant.
+    const shader_dep_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+
+    const glslang_dep = b.dependency("glslang", .{
+        .target = target,
+        .optimize = shader_dep_optimize,
+    });
+
+    // Shader-compile dependency: SPIRV-Cross (SPIR-V -> MSL / HLSL).
+    // Locally vendored wrapper under pkg/spirv_cross/. Fetches upstream
+    // KhronosGroup/SPIRV-Cross via the Zig package manager.
+    const spirv_cross_dep = b.dependency("spirv_cross", .{
+        .target = target,
+        .optimize = shader_dep_optimize,
+    });
+
     const core_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -26,11 +52,56 @@ pub fn build(b: *std.Build) !void {
         .root_module = core_mod,
     });
     core_lib.bundle_compiler_rt = true;
+
+    // Link glslang static library into core_lib so its symbols are
+    // available to zonvie_shader_compile_glsl. Headers installed by the
+    // upstream package become visible to the core module's C translation.
+    const glslang_lib = glslang_dep.artifact("glslang");
+    core_lib.linkLibrary(glslang_lib);
+    core_mod.linkLibrary(glslang_lib);
+
+    // Link SPIRV-Cross static library.
+    const spirv_cross_lib = spirv_cross_dep.artifact("spirv_cross");
+    core_lib.linkLibrary(spirv_cross_lib);
+    core_mod.linkLibrary(spirv_cross_lib);
+
     b.installArtifact(core_lib);
 
-    // Core-only step for macOS
+    // glslang has many transitive static libraries (MachineIndependent,
+    // OSDependent, GenericCodeGen, SPIRV, SPIRV-Tools + its family). They
+    // are automatically propagated for Zig-built consumers (zonvie.exe on
+    // Windows) but NOT for the Xcode-linked macOS app. Install each one so
+    // the macOS Xcode build script can merge them into a single archive.
+    const shader_dep_lib_names = [_][]const u8{
+        "glslang",
+        "MachineIndependent",
+        "OSDependent",
+        "GenericCodeGen",
+        "SPIRV",
+        "SPVRemapper",
+        "glslang-default-resource-limits",
+        "SPIRV-Tools",
+        "SPIRV-Tools-opt",
+        "SPIRV-Tools-link",
+        "SPIRV-Tools-reduce",
+    };
+
+    // Core-only step for macOS. Installs zonvie_core plus every shader
+    // dep library into zig-out/lib so the Xcode script can libtool them
+    // into one merged libzonvie_core.a.
     const core_step = b.step("core", "Build core library only");
     core_step.dependOn(&b.addInstallArtifact(core_lib, .{}).step);
+    for (shader_dep_lib_names) |name| {
+        const lib = glslang_dep.artifact(name);
+        const install_step = b.addInstallArtifact(lib, .{});
+        b.getInstallStep().dependOn(&install_step.step);
+        core_step.dependOn(&install_step.step);
+    }
+    {
+        const install_step = b.addInstallArtifact(spirv_cross_lib, .{});
+        b.getInstallStep().dependOn(&install_step.step);
+        core_step.dependOn(&install_step.step);
+    }
 
     const win_mod = b.createModule(.{
         .target = target,
@@ -137,6 +208,22 @@ pub fn build(b: *std.Build) !void {
         .root_module = mpack_stream_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(mpack_stream_tests).step);
+
+    // Shader cross-compile tests (inline tests in src/core/shader_compiler.zig).
+    // Requires glslang + SPIRV-Cross linked.
+    const shader_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+        .root_source_file = b.path("src/core/shader_compiler.zig"),
+    });
+    shader_test_mod.linkLibrary(glslang_lib);
+    shader_test_mod.linkLibrary(spirv_cross_lib);
+    const shader_tests = b.addTest(.{
+        .root_module = shader_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(shader_tests).step);
 
     // Redraw parity tests: identical byte streams through mp.decode+handleRedraw
     // vs handleRedrawStream must produce bit-identical grid/hl/callback state.

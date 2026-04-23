@@ -362,6 +362,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     let glowTextures = SurfaceGlowTextures()
     private(set) var bilinearSampler: MTLSamplerState?
 
+    // --- User-supplied custom post-process shaders ---
+    // Loaded once from config paths during bloom-pipeline construction.
+    // Empty array when `[shaders].enabled = false` or no paths are listed.
+    private(set) var customShaderPipelines: [CustomShaderPipeline] = []
+    /// Where the custom shader chain inserts relative to bloom. Mirrored from
+    /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
+    /// path does not need to re-read config each frame.
+    private(set) var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
+
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
 
@@ -1760,7 +1769,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // - Blit shaders cannot be cached in MTLBinaryArchive
             // - After fork(), XPC compiler service is unavailable
             // - Render pipelines can be cached and work without XPC
-            if let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
+
+            // User-supplied custom post-process shaders take over the
+            // backTex -> drawable step when configured in `.afterBloom`
+            // mode. See ExternalGridView.draw for the external-grid path.
+            var customShaderHandled = false
+            if !customShaderPipelines.isEmpty,
+               customShaderPostProcess == .afterBloom,
+               let copyVB = copyVertexBuffer,
+               let bilinSamp = bilinearSampler,
+               let pipeline = customShaderPipelines.first
+            {
+                pipeline.encode(
+                    cmd: cmd,
+                    input: backTex,
+                    output: drawable.texture,
+                    copyVertexBuffer: copyVB,
+                    sampler: bilinSamp
+                )
+                customShaderHandled = true
+            }
+
+            if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
                 let copyRPD = MTLRenderPassDescriptor()
                 copyRPD.colorAttachments[0].texture = drawable.texture
                 copyRPD.colorAttachments[0].loadAction = .dontCare
@@ -1774,13 +1804,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     copyEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
                     copyEnc.endEncoding()
                 }
+            }
 
-                // === PERF LOG: Copy終了 ===
-                if ZonvieCore.appLogEnabled {
-                    let t_copy_end = CFAbsoluteTimeGetCurrent()
-                    let copy_us = (t_copy_end - t_copy_start) * 1_000_000
-                    ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
-                }
+            // === PERF LOG: Copy終了 ===
+            if ZonvieCore.appLogEnabled {
+                let t_copy_end = CFAbsoluteTimeGetCurrent()
+                let copy_us = (t_copy_end - t_copy_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
             }
 
             // Cursor is composited only on the final drawable.
@@ -1953,6 +1983,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             // Build bloom pipelines for neon glow
             buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+            buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
             // Build copy vertex buffer
             buildCopyVertexBuffer()
             return
@@ -2020,6 +2051,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // Build bloom pipelines for neon glow (always, glow check is at draw time)
         buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+        buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
 
         // Cache all pipelines to binary archive for future use
         cacheToArchive(mainDesc: desc, bgDesc: bgDesc, glyphDesc: glyphDesc, copyDesc: copyDesc)
@@ -2174,6 +2206,40 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
+    }
+
+    /// Load user-supplied custom post-process shaders listed in config.toml's
+    /// `[shaders].paths`, cross-compile them to MSL, and create one pipeline
+    /// state per entry. Called once alongside the bloom-pipeline construction.
+    private func buildCustomShaderPipelines(
+        lib: MTLLibrary,
+        copyVertexDesc: MTLVertexDescriptor,
+        pixelFormat: MTLPixelFormat
+    ) {
+        let config = ZonvieConfig.shared.shaders
+        customShaderPostProcess = config.postProcess
+        customShaderPipelines.removeAll()
+        if !config.enabled || config.paths.isEmpty {
+            return
+        }
+        guard let vsCustomPost = lib.makeFunction(name: "vs_custom_post") else {
+            ZonvieCore.appLog("[Renderer] WARNING: Missing vs_custom_post shader (custom shaders disabled)")
+            return
+        }
+        for path in config.paths {
+            let expanded = (path as NSString).expandingTildeInPath
+            if let pipeline = CustomShaderPipeline.load(
+                device: device,
+                library: lib,
+                vsCustomPost: vsCustomPost,
+                copyVertexDescriptor: copyVertexDesc,
+                sourcePath: expanded,
+                pixelFormat: pixelFormat
+            ) {
+                customShaderPipelines.append(pipeline)
+            }
+        }
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders")
     }
 
     /// Try to load pipeline from binary archive

@@ -27,6 +27,7 @@
 		AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */; };
 		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
 		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
+		ABCA11BA2EFB01020072639A /* CustomShaderPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */; };
 
 /* End PBXBuildFile section */
 
@@ -53,6 +54,7 @@
 		AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlasCApi.swift; sourceTree = "<group>"; };
 		AB9AE9D02EF900000072639A /* ExternalGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalGridView.swift; sourceTree = "<group>"; };
 		AB9AE9D22F0000010072639A /* zonvie.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = zonvie.icns; sourceTree = "<group>"; };
+		ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomShaderPipeline.swift; sourceTree = "<group>"; };
 
 /* End PBXFileReference section */
 
@@ -137,6 +139,7 @@
 				AB9AE9B82EF22AED0072639A /* MetalTerminalRenderer.swift */,
 				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
 				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
+				ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */,
 			);
 			path = Rendering;
 			sourceTree = "<group>";
@@ -226,12 +229,14 @@
 /* Begin PBXShellScriptBuildPhase section */
 		AB9AE9B52EF1BC3C0072639A /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			inputFileListPaths = (
 			);
 			inputPaths = (
+				"$(SRCROOT)/Scripts/build_zig_core.sh",
 			);
 			outputFileListPaths = (
 			);
@@ -239,7 +244,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\n# Ensure zig is discoverable (Profile/Archive may not inherit shell PATH)\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH\"\n\ncommand -v zig >/dev/null 2>&1 || {\n  echo \"error: zig not found. PATH=$PATH\"\n  exit 1\n}\n\nROOT=\"${SRCROOT}/..\"\nOUT=\"${ROOT}/zig-out/lib\"\nmkdir -p \"${OUT}\"\n\n# Map Xcode configuration -> Zig optimize mode\ncase \"${CONFIGURATION}\" in\n  Debug)\n    ZIG_OPT=Debug\n    ;;\n  Release|Profile)\n    ZIG_OPT=ReleaseSafe\n    ;;\n  *)\n    ZIG_OPT=ReleaseSafe\n    ;;\nesac\n\necho \"Building Zig core (${ZIG_OPT}) for CONFIGURATION=${CONFIGURATION}\"\n\ncd \"${ROOT}\"\n\n# Build per-arch using zig build (includes dependencies from build.zig.zon)\nzig build core -Dtarget=aarch64-macos -Doptimize=\"${ZIG_OPT}\" --prefix \"${ROOT}/zig-out-arm64\"\nzig build core -Dtarget=x86_64-macos -Doptimize=\"${ZIG_OPT}\" --prefix \"${ROOT}/zig-out-x64\"\n\n# Universal static lib\nlipo -create \\\n  \"${ROOT}/zig-out-arm64/lib/libzonvie_core.a\" \\\n  \"${ROOT}/zig-out-x64/lib/libzonvie_core.a\" \\\n  -output \"${OUT}/libzonvie_core.a\"\n";
+			shellScript = "exec /bin/sh \"${SRCROOT}/Scripts/build_zig_core.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -251,6 +256,7 @@
 				AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */,
 				AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */,
 				AB9AE9BD2EF22AED0072639A /* MetalTerminalRenderer.swift in Sources */,
+				ABCA11BA2EFB01020072639A /* CustomShaderPipeline.swift in Sources */,
 				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
 				AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */,
 				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
@@ -423,6 +429,7 @@
 				OTHER_LDFLAGS = (
 					"-lfreetype",
 					"-lharfbuzz",
+					"-lc++",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.zonvie.zonvie;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -471,6 +478,7 @@
 				OTHER_LDFLAGS = (
 					"-lfreetype",
 					"-lharfbuzz",
+					"-lc++",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.zonvie.zonvie;
 				PRODUCT_NAME = "$(TARGET_NAME)";

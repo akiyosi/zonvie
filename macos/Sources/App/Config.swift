@@ -14,6 +14,7 @@ struct ZonvieConfig {
     var log: LogConfig = LogConfig()
     var performance: PerformanceConfig = PerformanceConfig()
     var ime: IMEConfig = IMEConfig()
+    var shaders: ShaderConfig = ShaderConfig()
 
     /// Tabline display style
     enum TablineStyle: String {
@@ -143,6 +144,22 @@ struct ZonvieConfig {
         var optionAsMeta: OptionAsMeta = .both
     }
 
+    /// Insertion point for custom shader chain relative to bloom.
+    enum ShaderPostProcess: UInt8 {
+        case afterBloom = 0    // run after bloom composite (default)
+        case beforeBloom = 1   // run before bloom
+        case replaceBloom = 2  // skip bloom, only run custom shader
+    }
+
+    struct ShaderConfig {
+        /// Enable custom post-process shader chain.
+        var enabled: Bool = false
+        /// Ordered list of GLSL shader file paths (Shadertoy / Ghostty compatible).
+        var paths: [String] = []
+        /// Where the custom shader chain inserts relative to bloom.
+        var postProcess: ShaderPostProcess = .afterBloom
+    }
+
     /// Shared instance loaded at app startup
     static var shared: ZonvieConfig = ZonvieConfig.load()
 
@@ -227,6 +244,19 @@ struct ZonvieConfig {
         config.ime.disableOnActivate = v.ime_disable_on_activate
         config.ime.disableOnModechange = v.ime_disable_on_modechange
         config.ime.optionAsMeta = OptionAsMeta(rawValue: v.ime_option_as_meta) ?? .both
+
+        // Shaders
+        config.shaders.enabled = v.shader_enabled
+        config.shaders.postProcess = ShaderPostProcess(rawValue: v.shader_post_process) ?? .afterBloom
+        let shaderCount = zonvie_config_get_shader_count(handle)
+        if shaderCount > 0 {
+            config.shaders.paths.reserveCapacity(Int(shaderCount))
+            for i in 0..<shaderCount {
+                if let cstr = zonvie_config_get_shader_path(handle, i) {
+                    config.shaders.paths.append(String(cString: cstr))
+                }
+            }
+        }
 
         zonvie_config_destroy(handle)
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
+const shader_compiler = @import("shader_compiler.zig");
 
 // Re-exports for test access
 pub const nvim_core = core;
@@ -1385,12 +1386,18 @@ pub const zonvie_config_values = extern struct {
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
     ime_option_as_meta: u8 = 0,  // 0=both, 1=none, 2=only_left, 3=only_right
+    // shaders (custom post-process). Path array accessed via
+    // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
+    shader_enabled: bool = false,
+    shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
 };
 
 const ConfigHandle = struct {
     arena: std.heap.ArenaAllocator,
     cfg: config.Config,
     values: zonvie_config_values,
+    // Null-terminated copies of cfg.shaders.paths, arena-owned.
+    shader_paths_c: []?[*:0]const u8 = &.{},
 };
 
 fn dupeZForC(alloc: std.mem.Allocator, s: []const u8, fallback: [*:0]const u8) [*:0]const u8 {
@@ -1459,6 +1466,9 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .ime_disable_on_activate = cfg.ime.disable_on_activate,
         .ime_disable_on_modechange = cfg.ime.disable_on_modechange,
         .ime_option_as_meta = @intFromEnum(cfg.ime.option_as_meta),
+        // shaders
+        .shader_enabled = cfg.shaders.enabled,
+        .shader_post_process = @intFromEnum(cfg.shaders.post_process),
     };
 }
 
@@ -1478,7 +1488,17 @@ pub export fn zonvie_config_load(path: ?[*:0]const u8) callconv(.c) ?*zonvie_con
     handle.cfg.alloc = arena_alloc;
 
     handle.values = buildConfigValues(arena_alloc, &handle.cfg);
+    handle.shader_paths_c = buildShaderPathArray(arena_alloc, &handle.cfg);
     return @ptrCast(handle);
+}
+
+fn buildShaderPathArray(alloc: std.mem.Allocator, cfg: *const config.Config) []?[*:0]const u8 {
+    if (cfg.shaders.paths.len == 0) return &.{};
+    const c_paths = alloc.alloc(?[*:0]const u8, cfg.shaders.paths.len) catch return &.{};
+    for (cfg.shaders.paths, 0..) |p, i| {
+        c_paths[i] = dupeZForCOpt(alloc, p);
+    }
+    return c_paths;
 }
 
 /// Get flat config values from handle.
@@ -1486,6 +1506,23 @@ pub export fn zonvie_config_get_values(p: ?*const zonvie_config) callconv(.c) zo
     if (p == null) return zonvie_config_values{};
     const handle: *const ConfigHandle = @ptrCast(@alignCast(p.?));
     return handle.values;
+}
+
+/// Number of configured custom shader passes.
+pub export fn zonvie_config_get_shader_count(p: ?*const zonvie_config) callconv(.c) u32 {
+    if (p == null) return 0;
+    const handle: *const ConfigHandle = @ptrCast(@alignCast(p.?));
+    return @intCast(handle.shader_paths_c.len);
+}
+
+/// Get the i-th custom shader path as a null-terminated C string.
+/// Returns NULL if index out of range or allocation failed.
+/// String is valid until zonvie_config_destroy.
+pub export fn zonvie_config_get_shader_path(p: ?*const zonvie_config, index: u32) callconv(.c) ?[*:0]const u8 {
+    if (p == null) return null;
+    const handle: *const ConfigHandle = @ptrCast(@alignCast(p.?));
+    if (index >= handle.shader_paths_c.len) return null;
+    return handle.shader_paths_c[index];
 }
 
 /// Free config handle and all associated memory.
@@ -1578,4 +1615,127 @@ pub export fn zonvie_core_update_layout_px_locked(
     if (p == null) return;
     const box = asBox(p.?);
     box.core.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+}
+
+// ========================================================================
+// Custom shader cross-compilation API
+// ========================================================================
+//
+// Input: Shadertoy / Ghostty compatible GLSL fragment shader source.
+// Output: compiled source in the target shading language (MSL or HLSL).
+// Implementation: glslang (GLSL -> SPIR-V) + SPIRV-Cross (SPIR-V -> target).
+
+pub const zonvie_shader_target = enum(u8) {
+    msl = 0, // Metal Shading Language
+    hlsl = 1, // HLSL (shader model 5.0)
+};
+
+/// Result of a shader compile. Owns an internal allocation; the caller must
+/// invoke zonvie_shader_result_destroy exactly once to release it.
+pub const zonvie_shader_result = extern struct {
+    /// Null-terminated compiled source; NULL on failure.
+    data: ?[*:0]const u8 = null,
+    /// Length of data, excluding the null terminator.
+    data_len: usize = 0,
+    /// Null-terminated error message; NULL on success.
+    error_msg: ?[*:0]const u8 = null,
+    /// Opaque pointer used by zonvie_shader_result_destroy.
+    internal: ?*anyopaque = null,
+};
+
+const ShaderResultHandle = struct {
+    alloc: std.mem.Allocator,
+    data: ?[:0]u8,
+    error_msg: ?[:0]u8,
+};
+
+fn buildShaderError(comptime msg: []const u8) zonvie_shader_result {
+    const gpa = std.heap.page_allocator;
+    const handle = gpa.create(ShaderResultHandle) catch {
+        return .{};
+    };
+    handle.* = .{
+        .alloc = gpa,
+        .data = null,
+        .error_msg = gpa.dupeZ(u8, msg) catch null,
+    };
+    return .{
+        .data = null,
+        .data_len = 0,
+        .error_msg = if (handle.error_msg) |s| s.ptr else null,
+        .internal = @ptrCast(handle),
+    };
+}
+
+fn buildShaderSuccess(alloc: std.mem.Allocator, compiled: []u8) zonvie_shader_result {
+    const handle = alloc.create(ShaderResultHandle) catch {
+        alloc.free(compiled);
+        return buildShaderError("out of memory");
+    };
+    // Null-terminate for C consumers.
+    const data_z = alloc.allocSentinel(u8, compiled.len, 0) catch {
+        alloc.free(compiled);
+        alloc.destroy(handle);
+        return buildShaderError("out of memory");
+    };
+    @memcpy(data_z, compiled);
+    alloc.free(compiled);
+    handle.* = .{
+        .alloc = alloc,
+        .data = data_z,
+        .error_msg = null,
+    };
+    return .{
+        .data = data_z.ptr,
+        .data_len = data_z.len,
+        .error_msg = null,
+        .internal = @ptrCast(handle),
+    };
+}
+
+/// Compile a GLSL fragment shader (Shadertoy/Ghostty style) to the target
+/// shading language. The returned result owns its buffers; pass it to
+/// zonvie_shader_result_destroy to release them.
+pub export fn zonvie_shader_compile_glsl(
+    glsl_source: ?[*]const u8,
+    glsl_len: usize,
+    target: zonvie_shader_target,
+) callconv(.c) zonvie_shader_result {
+    if (glsl_source == null or glsl_len == 0) {
+        return buildShaderError("empty shader source");
+    }
+    const src: []const u8 = glsl_source.?[0..glsl_len];
+    const gpa = std.heap.page_allocator;
+    const t: shader_compiler.Target = switch (target) {
+        .msl => .msl,
+        .hlsl => .hlsl,
+    };
+    const compiled = shader_compiler.compileGlslToTarget(gpa, src, t) catch |err| {
+        return switch (err) {
+            error.EmptySource => buildShaderError("empty shader source"),
+            error.ParseFailed => buildShaderError("GLSL parse failed"),
+            error.LinkFailed => buildShaderError("GLSL link failed"),
+            error.SpirvGenFailed => buildShaderError("SPIR-V generation failed"),
+            error.CrossCompileFailed => buildShaderError("SPIR-V cross-compile failed"),
+            error.OutOfMemory => buildShaderError("out of memory"),
+            error.NotImplemented => buildShaderError("shader compiler not implemented"),
+        };
+    };
+    return buildShaderSuccess(gpa, compiled);
+}
+
+/// Release the internal allocation held by a result. Safe to call on a
+/// default-initialized / already-destroyed result; the function is a no-op
+/// when internal is NULL.
+pub export fn zonvie_shader_result_destroy(result: ?*zonvie_shader_result) callconv(.c) void {
+    const r = result orelse return;
+    const internal = r.internal orelse return;
+    const handle: *ShaderResultHandle = @ptrCast(@alignCast(internal));
+    if (handle.data) |d| handle.alloc.free(d);
+    if (handle.error_msg) |e| handle.alloc.free(e);
+    handle.alloc.destroy(handle);
+    r.internal = null;
+    r.data = null;
+    r.data_len = 0;
+    r.error_msg = null;
 }

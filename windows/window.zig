@@ -2709,6 +2709,15 @@ pub export fn WndProc(
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
 
+                // Load user-supplied custom post-process shaders. Disabled
+                // by default; fails soft and logs on broken config. Must
+                // run after the renderer is installed into `app.renderer`
+                // because compilation + pixel-shader creation need the
+                // live D3D11 device.
+                if (app.renderer) |*r| {
+                    r.loadCustomShaderPipelines(&app.config);
+                }
+
                 // Process pending glyphs
                 {
                     app.mu.lock();

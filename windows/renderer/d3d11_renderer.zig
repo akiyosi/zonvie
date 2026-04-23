@@ -4,6 +4,8 @@ const core = @import("zonvie_core");
 const c = @import("../win32.zig").c;
 const applog = @import("../app_log.zig");
 const compiled_shaders = @import("../shaders/compiled_shaders.zig");
+const custom_shader_mod = @import("custom_shader_pipeline.zig");
+const CustomShaderPipeline = custom_shader_mod.CustomShaderPipeline;
 
 const MaxSwapchainBuffers: usize = 4;
 
@@ -231,6 +233,19 @@ pub const Renderer = struct {
     bilinear_sampler: ?*c.ID3D11SamplerState = null,
     glow_cb: ?*c.ID3D11Buffer = null,
 
+    // User-supplied custom post-process shaders (Phase 2 macOS parity).
+    // Loaded from config `[shaders].paths` after renderer init. Empty when
+    // `shaders.enabled = false` or no paths configured.
+    custom_shader_pipelines: std.ArrayListUnmanaged(CustomShaderPipeline) = .{},
+    custom_shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
+    // Scratch copy of back_tex used as the pixel-shader input when running
+    // the custom shader pass (reading and writing the same texture is
+    // undefined in D3D11). Lazily sized and recreated on resize.
+    custom_shader_scratch_tex: ?*c.ID3D11Texture2D = null,
+    custom_shader_scratch_srv: ?*c.ID3D11ShaderResourceView = null,
+    custom_shader_scratch_w: u32 = 0,
+    custom_shader_scratch_h: u32 = 0,
+
     // Sizing
     width: u32 = 1,
     height: u32 = 1,
@@ -439,6 +454,12 @@ pub const Renderer = struct {
         safeRelease(&self.bilinear_sampler);
         safeRelease(&self.glow_cb);
 
+        // Custom shader resources
+        for (self.custom_shader_pipelines.items) |*p| p.deinit();
+        self.custom_shader_pipelines.deinit(self.alloc);
+        safeRelease(&self.custom_shader_scratch_srv);
+        safeRelease(&self.custom_shader_scratch_tex);
+
         safeRelease(&self.vb);
         safeRelease(&self.rs);
         safeRelease(&self.blend);
@@ -586,6 +607,12 @@ pub const Renderer = struct {
         safeRelease(&self.back_tex);
         safeRelease(&self.scroll_staging_tex);
         safeRelease(&self.clear_row_vb);
+        // Scratch belongs to the old back buffer's size/format; drop it
+        // and let ensureCustomShaderScratch rebuild on the next draw.
+        safeRelease(&self.custom_shader_scratch_srv);
+        safeRelease(&self.custom_shader_scratch_tex);
+        self.custom_shader_scratch_w = 0;
+        self.custom_shader_scratch_h = 0;
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -1023,6 +1050,15 @@ pub const Renderer = struct {
             if (self.glowTexturesComplete()) {
                 self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, opts.glow_intensity, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height);
             }
+        }
+
+        // ---- User-supplied custom post-process shader pass ----
+        // Runs after bloom in `after_bloom` mode (Phase 3 default; other
+        // modes land in later phases). Reads a scratch copy of back_tex
+        // and writes back into back_rtv, so the subsequent back->swapchain
+        // copy picks up the shader's output.
+        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+            self.drawCustomShaderPass(ctx, ctx_vtbl);
         }
 
         if (opts.present) {
@@ -2796,6 +2832,244 @@ pub const Renderer = struct {
 
         self.glow_half_w = hw;
         self.glow_half_h = hh;
+    }
+
+    /// Ensure a scratch texture matching the persistent back buffer exists,
+    /// so the custom shader pass can sample a stable copy of `back_tex`
+    /// while writing back into `back_rtv` (reading and writing the same
+    /// resource is disallowed in D3D11).
+    fn ensureCustomShaderScratch(self: *Renderer) void {
+        if (self.custom_shader_scratch_tex != null
+            and self.custom_shader_scratch_w == self.width
+            and self.custom_shader_scratch_h == self.height) return;
+
+        safeRelease(&self.custom_shader_scratch_srv);
+        safeRelease(&self.custom_shader_scratch_tex);
+
+        const dev = self.device orelse return;
+        const back = self.back_tex orelse return;
+
+        // Inherit size/format from back_tex.
+        var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+        const back_vtbl = back.*.lpVtbl;
+        const get_desc = back_vtbl.*.GetDesc orelse return;
+        get_desc(back, &back_desc);
+
+        var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        td.Width = back_desc.Width;
+        td.Height = back_desc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = back_desc.Format;
+        td.SampleDesc.Count = 1;
+        td.Usage = c.D3D11_USAGE_DEFAULT;
+        td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_tex = dev_vtbl.*.CreateTexture2D orelse return;
+        const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return;
+
+        var scratch: ?*c.ID3D11Texture2D = null;
+        if (c.FAILED(create_tex(dev, &td, null, &scratch)) or scratch == null) return;
+        self.custom_shader_scratch_tex = scratch;
+
+        var srv: ?*c.ID3D11ShaderResourceView = null;
+        if (c.FAILED(create_srv(dev, @ptrCast(scratch.?), null, &srv)) or srv == null) {
+            safeRelease(&self.custom_shader_scratch_tex);
+            return;
+        }
+        self.custom_shader_scratch_srv = srv;
+        self.custom_shader_scratch_w = back_desc.Width;
+        self.custom_shader_scratch_h = back_desc.Height;
+    }
+
+    /// Load user-supplied custom post-process shaders: read each GLSL file
+    /// listed in config, cross-compile to HLSL via the core C ABI, then
+    /// D3DCompile to a pixel shader. Called once after renderer init.
+    /// Failures are logged and skipped — a missing custom shader falls
+    /// back to the normal back->swapchain copy path.
+    pub fn loadCustomShaderPipelines(self: *Renderer, cfg: *const core.config.Config) void {
+        self.custom_shader_post_process = @intFromEnum(cfg.shaders.post_process);
+        for (self.custom_shader_pipelines.items) |*p| p.deinit();
+        self.custom_shader_pipelines.clearRetainingCapacity();
+
+        if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
+        const dev = self.device orelse return;
+
+        for (cfg.shaders.paths) |path| {
+            const pipeline = self.compileCustomShader(dev, path) catch |e| {
+                applog.appLog("[CustomShader] skipped {s}: {any}\n", .{ path, e });
+                continue;
+            };
+            self.custom_shader_pipelines.append(self.alloc, pipeline) catch {
+                var dead = pipeline;
+                dead.deinit();
+                continue;
+            };
+        }
+        applog.appLog(
+            "[CustomShader] loaded {d}/{d} custom shaders\n",
+            .{ self.custom_shader_pipelines.items.len, cfg.shaders.paths.len },
+        );
+    }
+
+    const CustomShaderCompileError = error{
+        FileOpenFailed,
+        FileReadFailed,
+        EmptySource,
+        GlslCompileFailed,
+        HlslCompileFailed,
+        PixelShaderCreateFailed,
+        OutOfMemory,
+    };
+
+    fn compileCustomShader(
+        self: *Renderer,
+        dev: *c.ID3D11Device,
+        source_path: []const u8,
+    ) CustomShaderCompileError!CustomShaderPipeline {
+        const file = std.fs.cwd().openFile(source_path, .{}) catch |e| {
+            applog.appLog("[CustomShader] open failed {s}: {any}\n", .{ source_path, e });
+            return CustomShaderCompileError.FileOpenFailed;
+        };
+        defer file.close();
+        const glsl = file.readToEndAlloc(self.alloc, 1024 * 1024) catch {
+            return CustomShaderCompileError.FileReadFailed;
+        };
+        defer self.alloc.free(glsl);
+        if (glsl.len == 0) return CustomShaderCompileError.EmptySource;
+
+        var result = core.zonvie_shader_compile_glsl(
+            @ptrCast(glsl.ptr),
+            glsl.len,
+            .hlsl,
+        );
+        defer core.zonvie_shader_result_destroy(&result);
+        if (result.error_msg) |err_ptr| {
+            const err_span = std.mem.span(err_ptr);
+            applog.appLog("[CustomShader] GLSL->HLSL failed for {s}: {s}\n", .{ source_path, err_span });
+            return CustomShaderCompileError.GlslCompileFailed;
+        }
+        const hlsl_ptr = result.data orelse return CustomShaderCompileError.GlslCompileFailed;
+        const hlsl_len = result.data_len;
+
+        var ps_blob: ?*ID3DBlob = null;
+        var err_blob: ?*ID3DBlob = null;
+        const hr = D3DCompile(
+            @ptrCast(hlsl_ptr),
+            hlsl_len,
+            null,
+            null,
+            null,
+            "main",
+            "ps_5_0",
+            0,
+            0,
+            &ps_blob,
+            &err_blob,
+        );
+        defer blobRelease(err_blob);
+        if (c.FAILED(hr)) {
+            dumpBlobAsText("[CustomShader] D3DCompile error: ", err_blob);
+            applog.appLog("[CustomShader] D3DCompile hr=0x{x} for {s}\n", .{ @as(u32, @bitCast(hr)), source_path });
+            return CustomShaderCompileError.HlslCompileFailed;
+        }
+        defer blobRelease(ps_blob);
+
+        const ps_ptr = blobPtr(ps_blob) orelse return CustomShaderCompileError.HlslCompileFailed;
+        const ps_size = blobSize(ps_blob);
+
+        var ps_out: ?*c.ID3D11PixelShader = null;
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_ps = dev_vtbl.*.CreatePixelShader orelse return CustomShaderCompileError.PixelShaderCreateFailed;
+        const hr2 = create_ps(dev, ps_ptr, ps_size, null, &ps_out);
+        if (c.FAILED(hr2) or ps_out == null) {
+            return CustomShaderCompileError.PixelShaderCreateFailed;
+        }
+
+        const path_copy = self.alloc.dupe(u8, source_path) catch {
+            if (ps_out) |ps| {
+                const ps_vtbl = ps.*.lpVtbl;
+                if (ps_vtbl.*.Release) |rel| _ = rel(ps);
+            }
+            return CustomShaderCompileError.OutOfMemory;
+        };
+        return .{
+            .alloc = self.alloc,
+            .source_path = path_copy,
+            .pixel_shader = ps_out,
+        };
+    }
+
+    /// Apply the custom shader chain. Reads a scratch copy of back_tex
+    /// through `custom_shader_scratch_srv` and writes to `back_rtv`. Phase 3
+    /// applies a single shader; multi-pass (ping-pong) lands in Phase 5.
+    fn drawCustomShaderPass(
+        self: *Renderer,
+        ctx: *c.ID3D11DeviceContext,
+        ctx_vtbl: anytype,
+    ) void {
+        if (self.custom_shader_pipelines.items.len == 0) return;
+        const pipeline = self.custom_shader_pipelines.items[0];
+        const ps = pipeline.pixel_shader orelse return;
+        const back = self.back_tex orelse return;
+        const back_rtv = self.back_rtv orelse return;
+        const vs_fs = self.vs_fullscreen orelse return;
+        const sampler = self.bilinear_sampler orelse return;
+
+        self.ensureCustomShaderScratch();
+        const scratch = self.custom_shader_scratch_tex orelse return;
+        const scratch_srv = self.custom_shader_scratch_srv orelse return;
+
+        // Copy back -> scratch so the pixel shader can read from a
+        // resource that is not currently bound as an RTV.
+        if (ctx_vtbl.*.CopyResource) |copy_res| {
+            copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
+        } else return;
+
+        // Bind scratch SRV as input, back RTV as output.
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return;
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{ back_rtv };
+        set_rtvs(ctx, 1, &rtvs[0], null);
+
+        // Full viewport.
+        if (ctx_vtbl.*.RSSetViewports) |set_vp| {
+            var vp: c.D3D11_VIEWPORT = .{
+                .TopLeftX = 0,
+                .TopLeftY = 0,
+                .Width = @floatFromInt(self.width),
+                .Height = @floatFromInt(self.height),
+                .MinDepth = 0.0,
+                .MaxDepth = 1.0,
+            };
+            set_vp(ctx, 1, &vp);
+        }
+
+        if (ctx_vtbl.*.IASetPrimitiveTopology) |set_topo| {
+            set_topo(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        if (ctx_vtbl.*.IASetInputLayout) |set_il| set_il(ctx, null);
+        if (ctx_vtbl.*.VSSetShader) |set_vs| set_vs(ctx, vs_fs, null, 0);
+        if (ctx_vtbl.*.PSSetShader) |set_ps| set_ps(ctx, ps, null, 0);
+        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ scratch_srv };
+            set_srvs(ctx, 0, 1, &srvs[0]);
+        }
+        if (ctx_vtbl.*.PSSetSamplers) |set_samplers| {
+            var samps: [1]?*c.ID3D11SamplerState = .{ sampler };
+            set_samplers(ctx, 0, 1, &samps[0]);
+        }
+        if (ctx_vtbl.*.OMSetBlendState) |set_blend| {
+            set_blend(ctx, null, null, 0xFFFFFFFF);
+        }
+        if (ctx_vtbl.*.Draw) |draw_fn| draw_fn(ctx, 3, 0);
+
+        // Unbind SRV slot 0 so a later pass (or bloom on the next frame)
+        // is not refused because scratch_srv is still bound as input.
+        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
+            var null_srv: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            set_srvs(ctx, 0, 1, &null_srv[0]);
+        }
     }
 
     /// Check whether all glow texture resources (tex/RTV/SRV) were fully created.

@@ -427,6 +427,23 @@ fragment float4 ps_copy(CopyVSOut in [[stage_in]],
     return srcTexture.sample(samp, in.uv);
 }
 
+// Vertex shader paired with user-supplied fragment shaders compiled from
+// GLSL via glslang + SPIRV-Cross. SPIRV-Cross emits fragment inputs with
+// explicit `[[user(locnN)]]` attributes derived from `layout(location=N)` in
+// GLSL, so we must match that convention here instead of reusing `vs_copy`
+// (whose `uv` field has no explicit location).
+struct CustomPostVSOut {
+    float4 position [[position]];
+    float2 vUV [[user(locn0)]];
+};
+
+vertex CustomPostVSOut vs_custom_post(CopyVertexIn in [[stage_in]]) {
+    CustomPostVSOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    out.vUV = in.texCoord;
+    return out;
+}
+
 // ============================================================================
 // Post-Process Bloom Shaders (Neon Glow)
 // ============================================================================
