@@ -375,11 +375,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// draw loop active instead of falling back to flush-driven rendering.
     private(set) var anyCustomShaderNeedsAnimation: Bool = false
 
-    // Shadertoy-style uniforms block (64 bytes, std140) updated in place
-    // each frame and bound to the custom shader at buffer(1). The GPU may
-    // still be reading the previous frame; for a 64-byte scratch this is
-    // cheap enough to accept the pipelining hazard without ring-buffering.
-    private(set) var customShaderUniformBuffer: MTLBuffer?
+    // Shadertoy-style uniforms block (64 bytes, std140). Populated per
+    // draw into a local `zonvie_shader_uniforms` value and handed to the
+    // pipeline via `setFragmentBytes(_:length:index:)`, so each MTKView
+    // (main window, external grids, cmdline, popupmenu) gets its own
+    // independent copy with no shared-buffer write race.
     private var customShaderFrameIndex: Int32 = 0
     private var customShaderStartTimeSec: CFTimeInterval = 0
     private var customShaderLastTimeSec: CFTimeInterval = 0
@@ -1140,13 +1140,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
+            //
+            // Exception: when a loaded custom shader references time-varying
+            // uniforms (iTime etc.), we MUST proceed every frame so the
+            // shader pass sees an advancing clock. Otherwise the shader only
+            // runs on Neovim flushes and the animation appears frozen
+            // between keystrokes.
             if hasPresentedOnce,
                !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
                !smoothScrolling,
                !blinkStateChanged,
-               !drawableSizeChanged {
+               !drawableSizeChanged,
+               !anyCustomShaderNeedsAnimation {
                 // Still reset redrawPending so future redraws are not blocked.
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -1157,7 +1164,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Also skip when a new commit arrived but carried no visual changes
             // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
             // destroys the backbuffer between GPU-blit scroll frames.
-            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce {
+            // Same animation exception as above.
+            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce && !anyCustomShaderNeedsAnimation {
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -1802,14 +1810,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                let bilinSamp = bilinearSampler,
                let pipeline = customShaderPipelines.first
             {
-                updateCustomShaderUniforms(drawableSize: view.drawableSize)
+                // Main window is its own "screen" — offset 0, size equals
+                // resolution, so user shaders see exactly the same coord
+                // space they would with the pre-unification preamble.
+                let uniforms = makeCustomShaderUniforms(
+                    screenResolution: view.drawableSize,
+                    windowOffset: .zero,
+                    windowSize: view.drawableSize
+                )
                 pipeline.encode(
                     cmd: cmd,
                     input: backTex,
                     output: drawable.texture,
                     copyVertexBuffer: copyVB,
                     sampler: bilinSamp,
-                    uniforms: customShaderUniformBuffer
+                    uniforms: uniforms
                 )
                 customShaderHandled = true
             }
@@ -2232,20 +2247,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
     }
 
-    /// Populate `customShaderUniformBuffer` for the current frame. Must be
-    /// called immediately before encoding a custom shader pass. Nop when
-    /// no custom shader pipelines are loaded.
-    func updateCustomShaderUniforms(drawableSize: CGSize) {
-        if customShaderPipelines.isEmpty { return }
-        if customShaderUniformBuffer == nil {
-            // zonvie_shader_uniforms matches the std140 layout expected by
-            // the SPIRV-Cross-emitted MSL (64 bytes).
-            let size = MemoryLayout<zonvie_shader_uniforms>.stride
-            customShaderUniformBuffer = device.makeBuffer(length: size, options: [.storageModeShared])
-            customShaderUniformBuffer?.label = "CustomShaderUniforms"
-        }
-        guard let buf = customShaderUniformBuffer else { return }
-
+    /// Build a `zonvie_shader_uniforms` value for the current frame.
+    ///
+    /// `screenResolution` is always the MAIN window's drawable size, so
+    /// every view shares one coordinate space — stars and other effects
+    /// line up seamlessly across ext-cmdline / ext-popupmenu / extra OS
+    /// windows. `windowOffset` is the current view's top-left corner in
+    /// the main window's drawable pixels (top-left origin); `windowSize`
+    /// is the current view's own drawable size.
+    ///
+    /// Each caller passes the result inline via `setFragmentBytes`, so
+    /// multiple MTKViews animating at 60fps never race on a shared
+    /// buffer.
+    func makeCustomShaderUniforms(
+        screenResolution: CGSize,
+        windowOffset: CGPoint,
+        windowSize: CGSize
+    ) -> zonvie_shader_uniforms {
         let now = CACurrentMediaTime()
         if customShaderStartTimeSec == 0 {
             customShaderStartTimeSec = now
@@ -2254,27 +2272,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let iTime = Float(now - customShaderStartTimeSec)
         let dt = Float(max(0, now - customShaderLastTimeSec))
         customShaderLastTimeSec = now
-        // Low-pass the instantaneous 1/dt into a running FPS estimate.
         if dt > 0 {
             let instant = 1.0 / dt
             customShaderEmaFrameRate = customShaderEmaFrameRate * 0.9 + instant * 0.1
         }
 
         var uniforms = zonvie_shader_uniforms()
-        uniforms.iResolution.0 = Float(drawableSize.width)
-        uniforms.iResolution.1 = Float(drawableSize.height)
-        uniforms.iResolution.2 = 1.0 // pixel aspect
+        uniforms.iResolution.0 = Float(screenResolution.width)
+        uniforms.iResolution.1 = Float(screenResolution.height)
+        uniforms.iResolution.2 = 1.0
         uniforms.iTime = iTime
         uniforms.iTimeDelta = dt
         uniforms.iFrame = customShaderFrameIndex
         uniforms.iSampleRate = 44100.0
         uniforms.iFrameRate = customShaderEmaFrameRate
+        uniforms.iWindowOffset.0 = Float(windowOffset.x)
+        uniforms.iWindowOffset.1 = Float(windowOffset.y)
+        uniforms.iWindowSize.0 = Float(windowSize.width)
+        uniforms.iWindowSize.1 = Float(windowSize.height)
         // iMouse / iDate left zero for now; will be filled in Phase 6.
 
-        let dst = buf.contents()
-        memcpy(dst, &uniforms, MemoryLayout<zonvie_shader_uniforms>.size)
-
         customShaderFrameIndex &+= 1
+        return uniforms
     }
 
     /// Load user-supplied custom post-process shaders listed in config.toml's

@@ -1251,13 +1251,19 @@ typedef enum {
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
    declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
-   Frontends populate this struct in place and upload 64 bytes to the
+   Frontends populate this struct in place and upload 80 bytes to the
    uniform buffer each frame.
 
    Field order and offsets are load-bearing; do not reorder. std140 lays
-   iTime into the trailing 4 bytes of iResolution's 16-byte slot. */
+   iTime into the trailing 4 bytes of iResolution's 16-byte slot.
+
+   iResolution is the MAIN window's drawable size for every view (so the
+   shader sees one unified coordinate space across windows). iWindowOffset
+   and iWindowSize describe the view's rectangle within that coordinate
+   space in pixels, with top-left origin. For the main window itself,
+   iWindowOffset is (0,0) and iWindowSize equals iResolution.xy. */
 typedef struct zonvie_shader_uniforms {
-    float    iResolution[3];   /* 0..11  xy = viewport px, z = pixel aspect */
+    float    iResolution[3];   /* 0..11  xy = main window drawable px, z = pixel aspect */
     float    iTime;            /* 12..15 seconds since shader start */
     float    iMouse[4];        /* 16..31 xy = cursor px, zw = click px */
     float    iDate[4];         /* 32..47 year, month, day, seconds in day */
@@ -1265,6 +1271,8 @@ typedef struct zonvie_shader_uniforms {
     int32_t  iFrame;           /* 52..55 frame counter */
     float    iSampleRate;      /* 56..59 not used; always 44100 */
     float    iFrameRate;       /* 60..63 frames per second (running average) */
+    float    iWindowOffset[2]; /* 64..71 this view's top-left in main drawable px */
+    float    iWindowSize[2];   /* 72..79 this view's own drawable size in px */
 } zonvie_shader_uniforms;
 
 /* Result of a GLSL -> target shading language compile.

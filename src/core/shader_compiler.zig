@@ -57,12 +57,31 @@ fn initGlslangProcess() void {
 }
 
 /// Shadertoy-compatible wrapper prepended to Shadertoy-style user sources.
-/// Member order and sizes are kept in lock-step with
-/// `zonvie_shader_uniforms` in `include/zonvie_core.h` (64 bytes, std140).
+/// Member order and sizes match `zonvie_shader_uniforms` in
+/// `include/zonvie_core.h` (80 bytes, std140).
+///
+/// Screen-space unification: `iResolution` is the main window's drawable
+/// size for every view, and `iWindowOffset` / `iWindowSize` describe the
+/// current view's rectangle within that space. fragCoord is screen-space
+/// (absolute on the main window), so effects that depend on it — stars,
+/// gradients, spotlights — line up seamlessly across ext-cmdline,
+/// ext-popupmenu, and extra OS windows.
+///
+/// `iChannel0` is tricky: users expect `texture(iChannel0, fragCoord /
+/// iResolution)` to return the terminal pixel under the fragment, but
+/// each view's iChannel0 backTex only contains that view's own content
+/// (sized iWindowSize, not iResolution). To bridge that gap we shadow
+/// `iChannel0` with a wrapper type and provide a `texture()` overload
+/// that remaps screen-space UV back into the local backTex UV before
+/// sampling. Shadertoy code is unchanged.
 const shadertoy_preamble =
     \\#version 450
     \\
-    \\layout(binding = 0) uniform sampler2D iChannel0;
+    \\// Sampler name deliberately does not start with an underscore —
+    \\// SPIRV-Cross's HLSL backend appends `_sampler` when it splits the
+    \\// combined sampler, and a leading `_` on the texture would yield a
+    \\// `__..._sampler` identifier that some d3dcompiler versions mishandle.
+    \\layout(binding = 0) uniform sampler2D zonvie_iChannel0Tex;
     \\
     \\layout(std140, binding = 1) uniform ZonvieShaderUniforms {
     \\    vec3 iResolution;
@@ -73,10 +92,28 @@ const shadertoy_preamble =
     \\    int iFrame;
     \\    float iSampleRate;
     \\    float iFrameRate;
+    \\    vec2 iWindowOffset;
+    \\    vec2 iWindowSize;
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;
     \\layout(location = 0) out vec4 zonvie_fragColor;
+    \\
+    \\// Wrapper type + `texture()` overload: user code keeps writing
+    \\// `texture(iChannel0, uv)` with a screen-space `uv`, and we
+    \\// translate that to this window's local backTex UV under the hood.
+    \\struct zonvie_iChannel0_t { int _d; };
+    \\const zonvie_iChannel0_t iChannel0 = zonvie_iChannel0_t(0);
+    \\vec4 texture(zonvie_iChannel0_t _ch, vec2 screen_uv) {
+    \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
+    \\    vec2 local_uv = local_px / iWindowSize;
+    \\    return texture(zonvie_iChannel0Tex, local_uv);
+    \\}
+    \\vec4 textureLod(zonvie_iChannel0_t _ch, vec2 screen_uv, float lod) {
+    \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
+    \\    vec2 local_uv = local_px / iWindowSize;
+    \\    return textureLod(zonvie_iChannel0Tex, local_uv, lod);
+    \\}
     \\
     \\// ----- user source (mainImage) follows -----
     \\
@@ -85,13 +122,26 @@ const shadertoy_preamble =
 const shadertoy_epilogue =
     \\
     \\// ----- bridge from Shadertoy mainImage to the pipeline output -----
+    \\// `vUV` comes from our vertex stage in top-left origin (UV.y=0 at
+    \\// the top of the window); both `vs_custom_post` (Metal) and
+    \\// `VSFullscreen` (D3D11) emit UVs matching the top-left texture
+    \\// layout. fragCoord is screen-space — the absolute position of the
+    \\// fragment on the main window's drawable — so the same shader
+    \\// universe shows through every view.
+    \\//
+    \\// Decorated surfaces (ext-cmdline, popupmenu, msg windows) paint
+    \\// their backTex with a pre-multiplied alpha of 0 so that the
+    \\// system blur shows through underneath. Shadertoy shaders that
+    \\// preserve `terminalColor.a` (starfield, negative, …) would then
+    \\// produce an output alpha of 0 too and the shader becomes
+    \\// invisible. Force the final alpha to 1 so the shader wins — if
+    \\// you want blur you disable the custom shader, not the other way
+    \\// around.
     \\void main() {
-    \\    // Shadertoy: fragCoord is in pixels, origin bottom-left.
-    \\    vec2 fragCoord = vUV * iResolution.xy;
-    \\    fragCoord.y = iResolution.y - fragCoord.y;
+    \\    vec2 fragCoord = iWindowOffset + vUV * iWindowSize;
     \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     \\    mainImage(color, fragCoord);
-    \\    zonvie_fragColor = color;
+    \\    zonvie_fragColor = vec4(color.rgb, 1.0);
     \\}
     \\
 ;
@@ -245,6 +295,34 @@ fn crossCompileSpirv(
         }
     }
 
+    // For MSL, SPIRV-Cross auto-remaps Vulkan bindings into compact MSL
+    // slots — the UBO at Vulkan `binding = 1` typically ends up at
+    // `[[buffer(0)]]` because `[[buffer]]`, `[[texture]]`, and
+    // `[[sampler]]` are independent namespaces. That breaks the Swift /
+    // Zig frontends which expect consistent slot numbers regardless of
+    // which resources a given shader happens to use. Force an explicit
+    // mapping that matches what the HLSL side emits naturally:
+    //   iChannel0  → texture(0) + sampler(0)
+    //   UBO        → buffer(1)
+    if (target == .msl) {
+        var bind_ubo: spvc.spvc_msl_resource_binding = undefined;
+        spvc.spvc_msl_resource_binding_init(&bind_ubo);
+        bind_ubo.stage = spvc.SpvExecutionModelFragment;
+        bind_ubo.desc_set = 0;
+        bind_ubo.binding = 1;
+        bind_ubo.msl_buffer = 1;
+        _ = spvc.spvc_compiler_msl_add_resource_binding(compiler, &bind_ubo);
+
+        var bind_tex: spvc.spvc_msl_resource_binding = undefined;
+        spvc.spvc_msl_resource_binding_init(&bind_tex);
+        bind_tex.stage = spvc.SpvExecutionModelFragment;
+        bind_tex.desc_set = 0;
+        bind_tex.binding = 0;
+        bind_tex.msl_texture = 0;
+        bind_tex.msl_sampler = 0;
+        _ = spvc.spvc_compiler_msl_add_resource_binding(compiler, &bind_tex);
+    }
+
     var compiled_src: [*c]const u8 = undefined;
     if (spvc.spvc_compiler_compile(compiler, &compiled_src) != spvc.SPVC_SUCCESS) {
         return CompileError.CrossCompileFailed;
@@ -287,30 +365,44 @@ test "compile trivial GLSL fragment shader to HLSL" {
 }
 
 test "compile Shadertoy-style mainImage source to MSL with auto-wrap" {
+    // Real Ghostty/Shadertoy shape: samples iChannel0 AND references iTime.
     const glsl =
         \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         \\    vec2 uv = fragCoord / iResolution.xy;
-        \\    fragColor = vec4(uv, 0.5 + 0.5 * sin(iTime), 1.0);
+        \\    vec4 color = texture(iChannel0, uv);
+        \\    fragColor = vec4(1.0 - color.x, 1.0 - color.y, 1.0 - color.z + 0.001 * sin(iTime), color.w);
         \\}
     ;
     const out = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
-    // Metal stdlib must be present; the Shadertoy uniforms must be visible
-    // somewhere in the emitted MSL to prove the wrapper took effect.
     try std.testing.expect(std.mem.indexOf(u8, out, "metal_stdlib") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "iResolution") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "iTime") != null);
+    // Pin the MSL resource mapping Swift relies on. Without the explicit
+    // spvc_compiler_msl_add_resource_binding calls in crossCompileSpirv,
+    // SPIRV-Cross auto-remaps the UBO to [[buffer(0)]] and the texture
+    // sample falls over with garbage uniforms (observed as a pure-white
+    // screen when negative.glsl was first tested on macOS).
+    try std.testing.expect(std.mem.indexOf(u8, out, "[[buffer(1)]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[[texture(0)]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[[sampler(0)]]") != null);
 }
 
 test "compile Shadertoy-style mainImage source to HLSL with auto-wrap" {
     const glsl =
         \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-        \\    fragColor = vec4(1.0, 0.5, 0.25, 1.0) * (0.5 + 0.5 * sin(iTime));
+        \\    vec2 uv = fragCoord / iResolution.xy;
+        \\    vec4 color = texture(iChannel0, uv);
+        \\    fragColor = vec4(1.0 - color.x, 1.0 - color.y, 1.0 - color.z + 0.001 * sin(iTime), color.w);
         \\}
     ;
     const out = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, out, "iTime") != null);
+    // HLSL preserves Vulkan binding indices by default.
+    try std.testing.expect(std.mem.indexOf(u8, out, "register(b1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "register(t0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "register(s0)") != null);
 }

@@ -146,17 +146,18 @@ final class CustomShaderPipeline {
     /// Encode a single fullscreen pass: sample `input`, draw to `output`.
     /// `copyVertexBuffer` is the same 6-vertex fullscreen quad used by the
     /// existing `vs_copy` bloom passes. `uniforms` is the 64-byte
-    /// `zonvie_shader_uniforms` block bound as buffer(1) to match the
-    /// Shadertoy preamble's `layout(std140, binding = 1)`. Pass nil only
-    /// when the shader is in the raw form and does not reference any
-    /// Shadertoy uniforms (the GPU still reads unbound buffers as zero).
+    /// `zonvie_shader_uniforms` block passed inline via
+    /// `setFragmentBytes(_:length:index:)` at index 1 — matches the
+    /// Shadertoy preamble's `layout(std140, binding = 1)`. Inlining
+    /// avoids write races when several MTKViews animate simultaneously
+    /// (each gets its own copy in the command buffer).
     func encode(
         cmd: MTLCommandBuffer,
         input: MTLTexture,
         output: MTLTexture,
         copyVertexBuffer: MTLBuffer,
         sampler: MTLSamplerState,
-        uniforms: MTLBuffer?
+        uniforms: zonvie_shader_uniforms
     ) {
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = output
@@ -168,9 +169,8 @@ final class CustomShaderPipeline {
         enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
         enc.setFragmentTexture(input, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
-        if let ubo = uniforms {
-            enc.setFragmentBuffer(ubo, offset: 0, index: 1)
-        }
+        var u = uniforms
+        enc.setFragmentBytes(&u, length: MemoryLayout<zonvie_shader_uniforms>.size, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         enc.endEncoding()
     }

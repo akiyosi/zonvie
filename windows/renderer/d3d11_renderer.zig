@@ -3068,6 +3068,14 @@ pub const Renderer = struct {
         u.iFrame = self.custom_shader_frame_index;
         u.iSampleRate = 44100.0;
         u.iFrameRate = self.custom_shader_ema_frame_rate;
+        // Screen-space unification: the Windows frontend currently only
+        // runs one HWND. Treat it as its own screen — offset (0,0), size
+        // matches iResolution. If external HWNDs ever arrive, populate
+        // these per-window to line up shader effects across them.
+        u.iWindowOffset[0] = 0;
+        u.iWindowOffset[1] = 0;
+        u.iWindowSize[0] = @floatFromInt(self.width);
+        u.iWindowSize[1] = @floatFromInt(self.height);
         // iMouse / iDate stay zero for now; filled in Phase 6.
 
         // Map / Unmap — cheap for a 64-byte dynamic CB.
@@ -3103,18 +3111,35 @@ pub const Renderer = struct {
         const scratch = self.custom_shader_scratch_tex orelse return;
         const scratch_srv = self.custom_shader_scratch_srv orelse return;
 
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return;
+
+        // Unbind everything from render-target / SRV slots BEFORE copying
+        // back_tex into scratch. back_tex was almost certainly still bound
+        // as an RTV from the previous pass (main grid or bloom composite);
+        // issuing CopyResource on a currently-bound render target forces
+        // the driver to hazard-track the copy and can leave scratch
+        // partially populated on some Windows GPU drivers, which then
+        // shows up as `texture(iChannel0, uv)` returning zero — the
+        // classic "shader runs, terminal text vanishes" symptom.
+        set_rtvs(ctx, 0, null, null);
+        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
+            var null_srv: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            set_srvs(ctx, 0, 1, &null_srv[0]);
+        }
+
         // Copy back -> scratch so the pixel shader can read from a
         // resource that is not currently bound as an RTV.
         if (ctx_vtbl.*.CopyResource) |copy_res| {
             copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
         } else return;
 
-        // Bind scratch SRV as input, back RTV as output.
-        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return;
+        // Re-bind: scratch SRV as input, back RTV as output.
         var rtvs: [1]?*c.ID3D11RenderTargetView = .{ back_rtv };
         set_rtvs(ctx, 1, &rtvs[0], null);
 
-        // Full viewport.
+        // Full viewport + scissor. Previous passes may have left a
+        // restricted scissor rect that would clip this pass to a
+        // sub-region and present stale RT content elsewhere.
         if (ctx_vtbl.*.RSSetViewports) |set_vp| {
             var vp: c.D3D11_VIEWPORT = .{
                 .TopLeftX = 0,
@@ -3125,6 +3150,15 @@ pub const Renderer = struct {
                 .MaxDepth = 1.0,
             };
             set_vp(ctx, 1, &vp);
+        }
+        if (ctx_vtbl.*.RSSetScissorRects) |set_sr| {
+            var sr: c.D3D11_RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = @intCast(self.width),
+                .bottom = @intCast(self.height),
+            };
+            set_sr(ctx, 1, &sr);
         }
 
         if (ctx_vtbl.*.IASetPrimitiveTopology) |set_topo| {

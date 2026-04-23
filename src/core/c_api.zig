@@ -1634,7 +1634,13 @@ pub const zonvie_shader_target = enum(u8) {
 /// `ZonvieShaderUniforms` block emitted by `shader_compiler.zig`'s
 /// Shadertoy preamble; keep this struct and the C header version
 /// (`zonvie_shader_uniforms` in `include/zonvie_core.h`) in lock-step.
-/// Total size is 64 bytes; field ordering is load-bearing.
+/// Total size is 80 bytes; field ordering is load-bearing.
+///
+/// iResolution is the main window's drawable size for every view, so the
+/// shader sees a single coordinate space across windows. iWindowOffset
+/// and iWindowSize describe the current view's rectangle within that
+/// space. For the main window itself, iWindowOffset is (0,0) and
+/// iWindowSize == iResolution.xy.
 pub const zonvie_shader_uniforms = extern struct {
     iResolution: [3]f32 = .{ 0, 0, 0 }, // 0..11
     iTime: f32 = 0, // 12..15 (packs into iResolution's trailing std140 slot)
@@ -1644,10 +1650,12 @@ pub const zonvie_shader_uniforms = extern struct {
     iFrame: i32 = 0, // 52..55
     iSampleRate: f32 = 44100.0, // 56..59
     iFrameRate: f32 = 60.0, // 60..63
+    iWindowOffset: [2]f32 = .{ 0, 0 }, // 64..71
+    iWindowSize: [2]f32 = .{ 0, 0 }, // 72..79
 };
 
 comptime {
-    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 64);
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 80);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must

@@ -3,6 +3,42 @@ import Metal
 import MetalKit
 import simd
 
+/// Compute the screen-space parameters (custom shader uniforms) for an
+/// external MTKView relative to the main terminal view. `screenResolution`
+/// is the main MTKView's drawable size in pixels; `windowOffset` is the
+/// external view's top-left corner in that drawable-pixel coordinate space
+/// (top-left origin). Falls back to the external view's own drawable when
+/// the main window is unavailable, so shaders still render sensibly
+/// during early startup.
+fileprivate func screenSpaceParameters(
+    mainView: MetalTerminalView?,
+    selfView: MTKView
+) -> (screenResolution: CGSize, windowOffset: CGPoint) {
+    let selfDrawable = selfView.drawableSize
+    guard let mainView = mainView,
+          let mainWin = mainView.window,
+          let selfWin = selfView.window else {
+        return (selfDrawable, .zero)
+    }
+    let scale = selfWin.backingScaleFactor
+    // Convert each MTKView's local bounds -> screen coords (bottom-left
+    // origin, in points).
+    let selfInWindow = selfView.convert(selfView.bounds, to: nil)
+    let mainInWindow = mainView.convert(mainView.bounds, to: nil)
+    let selfOnScreen = selfWin.convertToScreen(selfInWindow)
+    let mainOnScreen = mainWin.convertToScreen(mainInWindow)
+    // NSWindow uses bottom-left screen origin. The TOP of each MTKView is
+    // origin.y + height in those coords. Y in drawable pixels uses a
+    // top-left origin, so we subtract to get the external view's top-left
+    // offset from the main view's top-left in top-left coords.
+    let mainTopY = mainOnScreen.origin.y + mainOnScreen.height
+    let selfTopY = selfOnScreen.origin.y + selfOnScreen.height
+    let dxPts = selfOnScreen.origin.x - mainOnScreen.origin.x
+    let dyPts = mainTopY - selfTopY
+    let offsetPx = CGPoint(x: dxPts * scale, y: dyPts * scale)
+    return (mainView.drawableSize, offsetPx)
+}
+
 /// A Metal view for rendering external Neovim grids (from win_external_pos).
 /// Shares the glyph atlas with the main renderer for consistent text rendering.
 /// Forwards key events to the main terminal view so keyboard input still works.
@@ -907,7 +943,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let hasCursorUpdate = cursorDirty
             if hasCursorUpdate { cursorDirty = false }
 
-            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling {
+            // Animation exception mirrors MetalTerminalRenderer: when a
+            // loaded custom shader references iTime / iFrame / etc., we
+            // must proceed every frame and keep this view's draw loop
+            // active, even with no Neovim-side changes. Without this,
+            // popupmenu / messages / cmdline / ext-window background stays
+            // frozen while the main window animates.
+            let shaderAnimates = mainTerminalView?.renderer.anyCustomShaderNeedsAnimation ?? false
+            if shaderAnimates {
+                activateDrawLoop()
+            }
+
+            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling && !shaderAnimates {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // If a visual commit occurred recently, a timing race likely caused
                 // this idle frame. Don't count toward deactivation.
@@ -1392,17 +1439,32 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                let bilinSamp = renderer.bilinearSampler
             {
                 if let pipeline = renderer.customShaderPipelines.first {
-                    renderer.updateCustomShaderUniforms(drawableSize: view.drawableSize)
+                    // Screen-space unification: use the MAIN window's
+                    // drawable as the shader's iResolution, and tell the
+                    // shader where this external view sits inside that
+                    // coordinate space so effects (stars, gradients,
+                    // spotlights) line up across all windows.
+                    let (screenRes, windowOffset) = screenSpaceParameters(
+                        mainView: mainTerminalView,
+                        selfView: self
+                    )
+                    let uniforms = renderer.makeCustomShaderUniforms(
+                        screenResolution: screenRes,
+                        windowOffset: windowOffset,
+                        windowSize: view.drawableSize
+                    )
                     pipeline.encode(
                         cmd: cmd,
                         input: backTex,
                         output: drawable.texture,
                         copyVertexBuffer: copyVB,
                         sampler: bilinSamp,
-                        uniforms: renderer.customShaderUniformBuffer
+                        uniforms: uniforms
                     )
                     customShaderHandled = true
                 }
+            } else {
+                ZonvieCore.appLog("[CustomShader.ext] SKIP gridId=\(gridId) decorated=\(isDecoratedSurface) mainRenderer=\(mainTerminalView?.renderer != nil) pipelines=\(mainTerminalView?.renderer.customShaderPipelines.count ?? -1) copyVB=\(mainTerminalView?.renderer.copyVertexBuffer != nil) sampler=\(mainTerminalView?.renderer.bilinearSampler != nil)")
             }
             if !customShaderHandled, let blitEnc = cmd.makeBlitCommandEncoder() {
                 let w = min(backTex.width, drawable.texture.width)
