@@ -29,12 +29,12 @@ final class CustomShaderPipeline {
     }
 
     /// Whole-word regex scan for animation-bearing Shadertoy uniforms.
-    /// Matches inside comments get treated as animated too — cheaper than
-    /// missing a real reference and leaving the shader frozen. iResolution
-    /// / iSampleRate / iChannel0 are excluded because they do not drive
-    /// per-frame change unless the window size or input texture does.
+    /// Only lists uniforms whose values actually change per frame in
+    /// this build — iResolution / iSampleRate / iChannel0 are constant,
+    /// and iMouse is unimplemented (always zero) so referencing it
+    /// must not arm the continuous draw loop.
     static func detectNeedsAnimation(in source: String) -> Bool {
-        let pattern = #"\b(iTime|iTimeDelta|iFrame|iFrameRate|iMouse|iDate)\b"#
+        let pattern = #"\b(iTime|iTimeDelta|iFrame|iFrameRate|iDate)\b"#
         return source.range(of: pattern, options: .regularExpression) != nil
     }
 

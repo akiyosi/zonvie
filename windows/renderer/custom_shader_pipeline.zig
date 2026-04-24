@@ -34,16 +34,17 @@ pub const CustomShaderPipeline = struct {
         self.alloc.free(self.source_path);
     }
 
-    /// Whole-word scan for animation-driving Shadertoy uniforms. iResolution,
-    /// iSampleRate, and iChannel0 are excluded — they do not change between
-    /// frames unless the window resizes or the input texture changes.
+    /// Whole-word scan for animation-driving Shadertoy uniforms. Only
+    /// list uniforms whose values actually change per frame in this
+    /// build — iResolution / iSampleRate / iChannel0 are constant, and
+    /// iMouse is unimplemented (stays zero) so referencing it must not
+    /// arm the 60 Hz ticker.
     pub fn detectNeedsAnimation(source: []const u8) bool {
         const tokens = [_][]const u8{
             "iTime",
             "iTimeDelta",
             "iFrame",
             "iFrameRate",
-            "iMouse",
             "iDate",
         };
         for (tokens) |tok| {

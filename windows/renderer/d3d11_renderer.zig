@@ -3548,7 +3548,21 @@ pub const Renderer = struct {
         u.iCurrentCursorColor = self.shader_cursor_current_color;
         u.iPreviousCursorColor = self.shader_cursor_previous_color;
         u.iTimeCursorChange = self.shader_cursor_change_time;
-        // iMouse / iDate stay zero for now.
+        // Shadertoy iDate: (year, month [0-indexed], day, seconds in day).
+        {
+            var st: c.SYSTEMTIME = undefined;
+            c.GetLocalTime(&st);
+            const secs_in_day: f32 =
+                @as(f32, @floatFromInt(st.wHour)) * 3600.0 +
+                @as(f32, @floatFromInt(st.wMinute)) * 60.0 +
+                @as(f32, @floatFromInt(st.wSecond)) +
+                @as(f32, @floatFromInt(st.wMilliseconds)) / 1000.0;
+            u.iDate[0] = @floatFromInt(st.wYear);
+            u.iDate[1] = @floatFromInt(@as(i32, @intCast(st.wMonth)) - 1);
+            u.iDate[2] = @floatFromInt(st.wDay);
+            u.iDate[3] = secs_in_day;
+        }
+        // iMouse unimplemented on Windows — stays zero.
 
         // Map / Unmap — cheap for a 64-byte dynamic CB.
         const map_fn = ctx_vtbl.*.Map orelse return;

@@ -2381,7 +2381,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iCurrentCursorColor = shaderCursorCurrentColor
         uniforms.iPreviousCursorColor = shaderCursorPreviousColor
         uniforms.iTimeCursorChange = shaderCursorChangeTime
-        // iMouse / iDate left zero for now.
+        // Shadertoy iDate: (year, month [0-indexed], day, seconds in day).
+        let cal = Calendar(identifier: .gregorian)
+        let comp = cal.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second, .nanosecond],
+            from: Date()
+        )
+        let secsInDay: Float =
+            Float(comp.hour ?? 0) * 3600.0 +
+            Float(comp.minute ?? 0) * 60.0 +
+            Float(comp.second ?? 0) +
+            Float(comp.nanosecond ?? 0) / 1_000_000_000.0
+        uniforms.iDate.0 = Float(comp.year ?? 0)
+        uniforms.iDate.1 = Float((comp.month ?? 1) - 1)
+        uniforms.iDate.2 = Float(comp.day ?? 0)
+        uniforms.iDate.3 = secsInDay
+        // iMouse unimplemented on macOS — stays zero.
 
         customShaderFrameIndex &+= 1
         return uniforms
