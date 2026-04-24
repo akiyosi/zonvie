@@ -229,14 +229,6 @@ pub const Renderer = struct {
     /// output struct field name is `vUV` so it matches the PS input name
     /// that SPIRV-Cross generates for `layout(location=0) in vec2 vUV`.
     vs_custom_post: ?*c.ID3D11VertexShader = null,
-    /// Diagnostic PS: outputs vUV as color.
-    ps_custom_post_diag: ?*c.ID3D11PixelShader = null,
-    /// Diagnostic PS 2: samples scratch/back at vUV, bypasses cbuffer.
-    ps_custom_post_diag2: ?*c.ID3D11PixelShader = null,
-    /// Diagnostic PS 3: outputs cbuffer contents as color.
-    ps_custom_post_diag3: ?*c.ID3D11PixelShader = null,
-    /// Diagnostic PS 4: mimics user PS path (negative of scratch sample).
-    ps_custom_post_diag4: ?*c.ID3D11PixelShader = null,
     ps_glow_extract: ?*c.ID3D11PixelShader = null,
     ps_kawase_down: ?*c.ID3D11PixelShader = null,
     ps_kawase_up: ?*c.ID3D11PixelShader = null,
@@ -501,10 +493,6 @@ pub const Renderer = struct {
         for (&self.glow_mip_tex) |*t| safeRelease(t);
         safeRelease(&self.vs_fullscreen);
         safeRelease(&self.vs_custom_post);
-        safeRelease(&self.ps_custom_post_diag);
-        safeRelease(&self.ps_custom_post_diag2);
-        safeRelease(&self.ps_custom_post_diag3);
-        safeRelease(&self.ps_custom_post_diag4);
         safeRelease(&self.ps_glow_extract);
         safeRelease(&self.ps_kawase_down);
         safeRelease(&self.ps_kawase_up);
@@ -1114,7 +1102,7 @@ pub const Renderer = struct {
         try self.drawVertices(cursor);
 
         // ---- Post-process bloom (neon glow) ----
-        if (opts.glow_enabled and self.vs_fullscreen != null and self.ps_glow_extract != null) {
+        if (opts.glow_enabled and self.ensureBloomShaders()) {
             self.ensureGlowTextures();
             if (self.glowTexturesComplete()) {
                 self.drawBloomPasses(ctx, ctx_vtbl, main, cursor, opts.glow_intensity, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height);
@@ -3111,6 +3099,102 @@ pub const Renderer = struct {
         self.custom_shader_pong_h = back_desc.Height;
     }
 
+    /// Compile the five bloom shaders (VSFullscreen + four PS entries)
+    /// the first time bloom is rendered. No-op once built. Moving
+    /// these five D3DCompile calls out of createPipeline shaves
+    /// ~50 ms off startup for configs that never enable glow.
+    /// Returns `true` when every shader is ready to use.
+    fn ensureBloomShaders(self: *Renderer) bool {
+        if (self.vs_fullscreen != null
+            and self.ps_glow_extract != null
+            and self.ps_kawase_down != null
+            and self.ps_kawase_up != null
+            and self.ps_glow_composite != null) return true;
+
+        const dev = self.device orelse return false;
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return false;
+        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return false;
+        const hlsl = @embedFile("../shaders/main.hlsl");
+
+        const BloomEntry = struct {
+            entry: [*:0]const u8,
+            target: [*:0]const u8,
+        };
+        const bloom_entries = [_]BloomEntry{
+            .{ .entry = "VSFullscreen", .target = "vs_5_0" },
+            .{ .entry = "PSGlowExtract", .target = "ps_5_0" },
+            .{ .entry = "PSKawaseDown", .target = "ps_5_0" },
+            .{ .entry = "PSKawaseUp", .target = "ps_5_0" },
+            .{ .entry = "PSGlowComposite", .target = "ps_5_0" },
+        };
+
+        var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{ null, null, null, null, null };
+        defer for (&bloom_blobs) |*b| blobRelease(b.*);
+
+        for (bloom_entries, 0..) |be, idx| {
+            var blob: ?*ID3DBlob = null;
+            var err_b: ?*ID3DBlob = null;
+            defer blobRelease(err_b);
+            const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
+            if (hr_b != 0 or blob == null) {
+                dumpBlobAsText("[D3DCompile bloom] ", err_b);
+                dbgLog("[d3d] WARNING: bloom shader '{s}' compile failed, bloom disabled\n", .{be.entry});
+                return false;
+            }
+            bloom_blobs[idx] = blob;
+        }
+
+        if (self.vs_fullscreen == null) {
+            const bp0 = blobPtr(bloom_blobs[0]) orelse return false;
+            const bs0 = blobSize(bloom_blobs[0]);
+            var vs_fs: ?*c.ID3D11VertexShader = null;
+            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) return false;
+            self.vs_fullscreen = vs_fs;
+        }
+
+        inline for (.{ 1, 2, 3, 4 }, .{ &self.ps_glow_extract, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
+            if (field.* == null) {
+                const bp = blobPtr(bloom_blobs[idx]) orelse return false;
+                const bs = blobSize(bloom_blobs[idx]);
+                var ps_out: ?*c.ID3D11PixelShader = null;
+                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return false;
+                field.* = ps_out;
+            }
+        }
+        return true;
+    }
+
+    /// Compile `VSCustomPost` from main.hlsl the first time it's needed.
+    /// No-op when already built. Deferred to
+    /// `loadCustomShaderPipelines` to skip the ~20 ms D3DCompile when
+    /// no custom shaders are configured.
+    fn ensureVsCustomPost(self: *Renderer, dev: *c.ID3D11Device) void {
+        if (self.vs_custom_post != null) return;
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return;
+        const hlsl = @embedFile("../shaders/main.hlsl");
+        var vcp_blob: ?*ID3DBlob = null;
+        var vcp_err: ?*ID3DBlob = null;
+        defer blobRelease(vcp_blob);
+        defer blobRelease(vcp_err);
+        const hr_vcp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSCustomPost", "vs_5_0", 0, 0, &vcp_blob, &vcp_err);
+        if (hr_vcp != 0 or vcp_blob == null) {
+            applog.appLog("[d3d] VSCustomPost D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_vcp))});
+            dumpBlobAsText("[D3DCompile VSCustomPost] ", vcp_err);
+            return;
+        }
+        const vcp_p = blobPtr(vcp_blob).?;
+        const vcp_s = blobSize(vcp_blob);
+        var vs_cp: ?*c.ID3D11VertexShader = null;
+        if (c.FAILED(create_vs_fn(dev, vcp_p, vcp_s, null, &vs_cp)) or vs_cp == null) {
+            applog.appLog("[d3d] VSCustomPost create shader FAILED\n", .{});
+            return;
+        }
+        self.vs_custom_post = vs_cp;
+        applog.appLog("[d3d] VSCustomPost compiled ok\n", .{});
+    }
+
     /// Load user-supplied custom post-process shaders: read each GLSL file
     /// listed in config, cross-compile to HLSL via the core C ABI, then
     /// D3DCompile to a pixel shader. Called once after renderer init.
@@ -3124,6 +3208,11 @@ pub const Renderer = struct {
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
         const dev = self.device orelse return;
+
+        // Compile the custom-post VS lazily — only when at least one
+        // user shader is about to be loaded. Skipping this in
+        // shaders-disabled startups saves ~20 ms.
+        self.ensureVsCustomPost(dev);
 
         for (cfg.shaders.paths) |path| {
             const pipeline = self.compileCustomShader(dev, path) catch |e| {
@@ -3902,7 +3991,7 @@ pub const Renderer = struct {
     /// Public entry point for bloom passes (used by row-mode rendering).
     /// Requires vertices to be passed in (collected from row VBs).
     pub fn drawBloomFromVerts(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex, intensity: f32, vp_x: u32, vp_y: u32, vp_w: u32, vp_h: u32) void {
-        if (self.vs_fullscreen == null or self.ps_glow_extract == null) return;
+        if (!self.ensureBloomShaders()) return;
         self.ensureGlowTextures();
         if (!self.glowTexturesComplete()) return;
         const ctx = self.ctx orelse return;
@@ -4181,169 +4270,9 @@ pub const Renderer = struct {
             self.rs = rs;
         }
 
-        // --- Bloom shaders (runtime compile only, no pre-compiled bytecode) ---
-        {
-            const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return error.D3DCreateVSFailed;
-            const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return error.D3DCreatePSFailed;
-
-            const BloomEntry = struct {
-                entry: [*:0]const u8,
-                target: [*:0]const u8,
-                is_vs: bool,
-            };
-            const bloom_entries = [_]BloomEntry{
-                .{ .entry = "VSFullscreen", .target = "vs_5_0", .is_vs = true },
-                .{ .entry = "PSGlowExtract", .target = "ps_5_0", .is_vs = false },
-                .{ .entry = "PSKawaseDown", .target = "ps_5_0", .is_vs = false },
-                .{ .entry = "PSKawaseUp", .target = "ps_5_0", .is_vs = false },
-                .{ .entry = "PSGlowComposite", .target = "ps_5_0", .is_vs = false },
-            };
-
-            var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{ null, null, null, null, null };
-            defer for (&bloom_blobs) |*b| blobRelease(b.*);
-
-            for (bloom_entries, 0..) |be, idx| {
-                var blob: ?*ID3DBlob = null;
-                var err_b: ?*ID3DBlob = null;
-                defer blobRelease(err_b);
-
-                const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
-                if (hr_b != 0 or blob == null) {
-                    dumpBlobAsText("[D3DCompile bloom] ", err_b);
-                    dbgLog("[d3d] WARNING: bloom shader '{s}' compile failed, bloom disabled\n", .{be.entry});
-                    return; // Non-fatal: bloom just won't work
-                }
-                bloom_blobs[idx] = blob;
-            }
-
-            // Create shader objects
-            const bp0 = blobPtr(bloom_blobs[0]) orelse return;
-            const bs0 = blobSize(bloom_blobs[0]);
-            var vs_fs: ?*c.ID3D11VertexShader = null;
-            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) return;
-            self.vs_fullscreen = vs_fs;
-
-            inline for (.{ 1, 2, 3, 4 }, .{ &self.ps_glow_extract, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
-                const bp = blobPtr(bloom_blobs[idx]) orelse return;
-                const bs = blobSize(bloom_blobs[idx]);
-                var ps_out: ?*c.ID3D11PixelShader = null;
-                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return;
-                field.* = ps_out;
-            }
-
-            // VSCustomPost: same geometry as VSFullscreen but with an
-            // output field named `vUV` to match the SPIRV-Cross-generated
-            // custom-shader PS input. Non-fatal if compile fails —
-            // drawCustomShaderPass falls back to VSFullscreen.
-            {
-                var vcp_blob: ?*ID3DBlob = null;
-                var vcp_err: ?*ID3DBlob = null;
-                defer blobRelease(vcp_blob);
-                defer blobRelease(vcp_err);
-                const hr_vcp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSCustomPost", "vs_5_0", 0, 0, &vcp_blob, &vcp_err);
-                if (hr_vcp == 0 and vcp_blob != null) {
-                    const vcp_p = blobPtr(vcp_blob).?;
-                    const vcp_s = blobSize(vcp_blob);
-                    var vs_cp: ?*c.ID3D11VertexShader = null;
-                    if (!c.FAILED(create_vs_fn(dev, vcp_p, vcp_s, null, &vs_cp)) and vs_cp != null) {
-                        self.vs_custom_post = vs_cp;
-                        applog.appLog("[d3d] VSCustomPost compiled ok\n", .{});
-                    } else {
-                        applog.appLog("[d3d] VSCustomPost create shader FAILED\n", .{});
-                    }
-                } else {
-                    applog.appLog("[d3d] VSCustomPost D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_vcp))});
-                    dumpBlobAsText("[D3DCompile VSCustomPost] ", vcp_err);
-                }
-            }
-
-            // PSCustomPostDiag: outputs vUV as color for pipeline wiring
-            // diagnosis.
-            {
-                var pcd_blob: ?*ID3DBlob = null;
-                var pcd_err: ?*ID3DBlob = null;
-                defer blobRelease(pcd_blob);
-                defer blobRelease(pcd_err);
-                const hr_pcd = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag", "ps_5_0", 0, 0, &pcd_blob, &pcd_err);
-                if (hr_pcd == 0 and pcd_blob != null) {
-                    const pcd_p = blobPtr(pcd_blob).?;
-                    const pcd_s = blobSize(pcd_blob);
-                    var ps_pcd: ?*c.ID3D11PixelShader = null;
-                    if (!c.FAILED(create_ps_fn(dev, pcd_p, pcd_s, null, &ps_pcd)) and ps_pcd != null) {
-                        self.ps_custom_post_diag = ps_pcd;
-                        applog.appLog("[d3d] PSCustomPostDiag compiled ok\n", .{});
-                    }
-                } else {
-                    applog.appLog("[d3d] PSCustomPostDiag D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd))});
-                    dumpBlobAsText("[D3DCompile PSCustomPostDiag] ", pcd_err);
-                }
-            }
-
-            // PSCustomPostDiag2: samples input texture at vUV, bypassing
-            // cbuffer, to isolate whether the bug is in cbuffer path.
-            {
-                var pcd2_blob: ?*ID3DBlob = null;
-                var pcd2_err: ?*ID3DBlob = null;
-                defer blobRelease(pcd2_blob);
-                defer blobRelease(pcd2_err);
-                const hr_pcd2 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag2", "ps_5_0", 0, 0, &pcd2_blob, &pcd2_err);
-                if (hr_pcd2 == 0 and pcd2_blob != null) {
-                    const pcd2_p = blobPtr(pcd2_blob).?;
-                    const pcd2_s = blobSize(pcd2_blob);
-                    var ps_pcd2: ?*c.ID3D11PixelShader = null;
-                    if (!c.FAILED(create_ps_fn(dev, pcd2_p, pcd2_s, null, &ps_pcd2)) and ps_pcd2 != null) {
-                        self.ps_custom_post_diag2 = ps_pcd2;
-                        applog.appLog("[d3d] PSCustomPostDiag2 compiled ok\n", .{});
-                    }
-                } else {
-                    applog.appLog("[d3d] PSCustomPostDiag2 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd2))});
-                    dumpBlobAsText("[D3DCompile PSCustomPostDiag2] ", pcd2_err);
-                }
-            }
-
-            // PSCustomPostDiag3: outputs cbuffer contents as color to
-            // verify whether uniform data reaches the PS.
-            {
-                var pcd3_blob: ?*ID3DBlob = null;
-                var pcd3_err: ?*ID3DBlob = null;
-                defer blobRelease(pcd3_blob);
-                defer blobRelease(pcd3_err);
-                const hr_pcd3 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag3", "ps_5_0", 0, 0, &pcd3_blob, &pcd3_err);
-                if (hr_pcd3 == 0 and pcd3_blob != null) {
-                    const pcd3_p = blobPtr(pcd3_blob).?;
-                    const pcd3_s = blobSize(pcd3_blob);
-                    var ps_pcd3: ?*c.ID3D11PixelShader = null;
-                    if (!c.FAILED(create_ps_fn(dev, pcd3_p, pcd3_s, null, &ps_pcd3)) and ps_pcd3 != null) {
-                        self.ps_custom_post_diag3 = ps_pcd3;
-                        applog.appLog("[d3d] PSCustomPostDiag3 compiled ok\n", .{});
-                    }
-                } else {
-                    applog.appLog("[d3d] PSCustomPostDiag3 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd3))});
-                    dumpBlobAsText("[D3DCompile PSCustomPostDiag3] ", pcd3_err);
-                }
-            }
-
-            // PSCustomPostDiag4: mimics user PS (negative of scratch).
-            {
-                var pcd4_blob: ?*ID3DBlob = null;
-                var pcd4_err: ?*ID3DBlob = null;
-                defer blobRelease(pcd4_blob);
-                defer blobRelease(pcd4_err);
-                const hr_pcd4 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag4", "ps_5_0", 0, 0, &pcd4_blob, &pcd4_err);
-                if (hr_pcd4 == 0 and pcd4_blob != null) {
-                    const pcd4_p = blobPtr(pcd4_blob).?;
-                    const pcd4_s = blobSize(pcd4_blob);
-                    var ps_pcd4: ?*c.ID3D11PixelShader = null;
-                    if (!c.FAILED(create_ps_fn(dev, pcd4_p, pcd4_s, null, &ps_pcd4)) and ps_pcd4 != null) {
-                        self.ps_custom_post_diag4 = ps_pcd4;
-                        applog.appLog("[d3d] PSCustomPostDiag4 compiled ok\n", .{});
-                    }
-                } else {
-                    applog.appLog("[d3d] PSCustomPostDiag4 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd4))});
-                    dumpBlobAsText("[D3DCompile PSCustomPostDiag4] ", pcd4_err);
-                }
-            }
-        }
+        // Bloom shaders are compiled lazily on first use (see
+        // ensureBloomShaders). Skipping 5 D3DCompile calls here keeps
+        // startup quick for configs that never enable glow.
 
         // --- Additive blend state (ONE, ONE) for bloom composite ---
         {
