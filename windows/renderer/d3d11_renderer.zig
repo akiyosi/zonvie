@@ -3548,7 +3548,11 @@ pub const Renderer = struct {
         u.iCurrentCursorColor = self.shader_cursor_current_color;
         u.iPreviousCursorColor = self.shader_cursor_previous_color;
         u.iTimeCursorChange = self.shader_cursor_change_time;
-        // Shadertoy iDate: (year, month [0-indexed], day, seconds in day).
+        // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
+        // Shadertoy's howto just lists the fields as "Year, month, day,
+        // time in seconds" without spelling out indexing. Forward
+        // SYSTEMTIME.wMonth verbatim (already 1..12) which matches the
+        // most common interpretation community shaders assume.
         {
             var st: c.SYSTEMTIME = undefined;
             c.GetLocalTime(&st);
@@ -3558,7 +3562,7 @@ pub const Renderer = struct {
                 @as(f32, @floatFromInt(st.wSecond)) +
                 @as(f32, @floatFromInt(st.wMilliseconds)) / 1000.0;
             u.iDate[0] = @floatFromInt(st.wYear);
-            u.iDate[1] = @floatFromInt(@as(i32, @intCast(st.wMonth)) - 1);
+            u.iDate[1] = @floatFromInt(st.wMonth);
             u.iDate[2] = @floatFromInt(st.wDay);
             u.iDate[3] = secs_in_day;
         }

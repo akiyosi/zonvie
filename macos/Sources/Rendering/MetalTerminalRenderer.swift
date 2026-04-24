@@ -2381,7 +2381,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iCurrentCursorColor = shaderCursorCurrentColor
         uniforms.iPreviousCursorColor = shaderCursorPreviousColor
         uniforms.iTimeCursorChange = shaderCursorChangeTime
-        // Shadertoy iDate: (year, month [0-indexed], day, seconds in day).
+        // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
+        // Shadertoy's howto lists the fields as "Year, month, day,
+        // time in seconds" without specifying month indexing. Forward
+        // Calendar's .month component verbatim (already 1..12), which
+        // matches the most common interpretation.
         let cal = Calendar(identifier: .gregorian)
         let comp = cal.dateComponents(
             [.year, .month, .day, .hour, .minute, .second, .nanosecond],
@@ -2393,7 +2397,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             Float(comp.second ?? 0) +
             Float(comp.nanosecond ?? 0) / 1_000_000_000.0
         uniforms.iDate.0 = Float(comp.year ?? 0)
-        uniforms.iDate.1 = Float((comp.month ?? 1) - 1)
+        uniforms.iDate.1 = Float(comp.month ?? 1)
         uniforms.iDate.2 = Float(comp.day ?? 0)
         uniforms.iDate.3 = secsInDay
         // iMouse unimplemented on macOS — stays zero.
