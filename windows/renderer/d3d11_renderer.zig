@@ -1646,16 +1646,24 @@ pub const Renderer = struct {
             t_cursor_ns = std.time.nanoTimestamp();
         }
 
+        // When the custom shader pass wrote the full frame, every pixel
+        // of the bb was touched — passing the old partial dirty-rect
+        // list to Present1 would hint DWM that only part of the
+        // backbuffer changed and could leave shader output on pixels
+        // outside the dirty set stale. Treat shader-handled frames as
+        // full-present (no dirty rects, no scroll hint).
+        const present_full_frame = force_full_copy_effective or shader_handled;
+
         var hrp: c.HRESULT = 0;
         if (self.swapchain1) |sc1p| {
             const sc1_vtbl = sc1p.*.lpVtbl;
             if (sc1_vtbl.*.Present1) |present1| {
                 var params: c.DXGI_PRESENT_PARAMETERS = std.mem.zeroes(c.DXGI_PRESENT_PARAMETERS);
-                if (!force_full_copy_effective and rects.len != 0) {
+                if (!present_full_frame and rects.len != 0) {
                     params.DirtyRectsCount = @intCast(rects.len);
                     params.pDirtyRects = @constCast(rects.ptr);
                 }
-                if (!force_full_copy_effective) {
+                if (!present_full_frame) {
                     if (scroll_rect) |sr| {
                         params.pScrollRect = @constCast(sr);
                     }
@@ -3574,8 +3582,19 @@ pub const Renderer = struct {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: back_tex null\n", .{});
             return false;
         };
-        const out_rtv = self.bb_rtvs[0] orelse {
-            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: bb_rtvs[0] null\n", .{});
+        // Write into whichever swapchain buffer DXGI says is current.
+        // Hardcoding index 0 mismatches the "Present uses current bb"
+        // semantics in flip-model configurations where
+        // GetCurrentBackBufferIndex actually rotates (IDXGISwapChain3).
+        // Fall back to bb_rtvs[0] only if the current-indexed RTV
+        // couldn't be created (older FLIP_DISCARD fallback).
+        const sc_idx: usize = @intCast(self.currentSwapchainIndex());
+        const out_rtv = blk: {
+            if (sc_idx < self.bb_rtvs.len) {
+                if (self.bb_rtvs[sc_idx]) |rtv| break :blk rtv;
+            }
+            if (self.bb_rtvs[0]) |rtv0| break :blk rtv0;
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: no bb_rtv for idx={d}\n", .{sc_idx});
             return false;
         };
         // Prefer the custom-post VS (output field name `vUV` matches the
