@@ -864,11 +864,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     _ = c.ShowWindow(hwnd, 8);
 
     // Initialize D3D11 renderer for external window (with transparency if enabled)
-    const renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
+    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
         _ = c.DestroyWindow(hwnd);
         return;
     };
+    // Load the same custom post-process shaders the main window uses,
+    // so cmdline/popupmenu/msg/etc. overlay get the same shader effect
+    // applied through their own back_tex.
+    renderer.loadCustomShaderPipelines(&app.config);
 
     // Collect SetWindowPos info while holding the lock, then call SetWindowPos after releasing
     // to avoid deadlock (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
@@ -2068,6 +2072,41 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
+
+    // Update custom-shader screen-space override so this HWND samples
+    // the main window's shader universe at its own offset/size. Without
+    // this, each ext window would get its own compressed shader space
+    // (a star field squeezed into the cmdline bar, etc.).
+    if (gpu_ptr) |g_sh| {
+        if (g_sh.custom_shader_pipelines.items.len > 0) {
+            var screen_w: u32 = g_sh.width;
+            var screen_h: u32 = g_sh.height;
+            var off_x: f32 = 0;
+            var off_y: f32 = 0;
+            if (app.hwnd) |main_hwnd| {
+                if (app.renderer) |*main_r| {
+                    if (main_r.width != 0 and main_r.height != 0) {
+                        screen_w = main_r.width;
+                        screen_h = main_r.height;
+                    }
+                }
+                var main_rect: c.RECT = undefined;
+                var ext_rect: c.RECT = undefined;
+                if (c.GetWindowRect(main_hwnd, &main_rect) != 0 and c.GetWindowRect(hwnd, &ext_rect) != 0) {
+                    // Translate main-window client origin into screen
+                    // coordinates; offset is ext_rect - main client top-left.
+                    var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                    _ = c.ClientToScreen(main_hwnd, &main_client_origin);
+                    off_x = @floatFromInt(ext_rect.left - main_client_origin.x);
+                    off_y = @floatFromInt(ext_rect.top - main_client_origin.y);
+                }
+            }
+            g_sh.shader_screen_w = screen_w;
+            g_sh.shader_screen_h = screen_h;
+            g_sh.shader_window_offset_x = off_x;
+            g_sh.shader_window_offset_y = off_y;
+        }
+    }
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;

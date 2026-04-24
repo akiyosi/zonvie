@@ -2319,9 +2319,24 @@ pub export fn WndProc(
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
                 // Continuous-redraw tick for animated custom shaders.
-                // Posts WM_PAINT without dirtying anything else; the
-                // renderer's per-frame uniforms refresh inside draw().
-                _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                // Runs a minimal shader-only present on the UI thread
+                // (no row VB draws, no overlays). Using InvalidateRect +
+                // full WM_PAINT here stalls input at 60 Hz because each
+                // tick re-runs the full row-mode paint path.
+                if (getApp(hwnd)) |app| {
+                    if (app.renderer) |*r| {
+                        r.presentShaderAnimationFrame();
+                    }
+                    app.mu.lock();
+                    defer app.mu.unlock();
+                    var it = app.external_windows.iterator();
+                    while (it.next()) |entry| {
+                        const ew = entry.value_ptr;
+                        if (!ew.is_pending_close) {
+                            ew.renderer.presentShaderAnimationFrame();
+                        }
+                    }
+                }
             } else if (wParam == TIMER_DEVCONTAINER_POLL) {
                 // Poll for devcontainer up completion
                 if (dialogs.g_devcontainer_up_done.load(.seq_cst)) {
@@ -2725,12 +2740,15 @@ pub export fn WndProc(
                         // Kick continuous-redraw ticker. Runs ~60Hz until
                         // the renderer (or a future config reload) tells
                         // us no animated shader is loaded anymore.
-                        _ = c.SetTimer(
+                        const tr = c.SetTimer(
                             hwnd,
                             app_mod.TIMER_CUSTOM_SHADER_ANIM,
                             app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS,
                             null,
                         );
+                        if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM SetTimer hwnd={*} interval={d}ms -> {d}\n", .{ hwnd, app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS, tr });
+                    } else {
+                        if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM not started (no animated shader)\n", .{});
                     }
                 }
 

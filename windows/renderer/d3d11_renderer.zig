@@ -225,6 +225,18 @@ pub const Renderer = struct {
     glow_half_w: u32 = 0,
     glow_half_h: u32 = 0,
     vs_fullscreen: ?*c.ID3D11VertexShader = null,
+    /// Vertex shader paired with the user's custom post-process PS. The
+    /// output struct field name is `vUV` so it matches the PS input name
+    /// that SPIRV-Cross generates for `layout(location=0) in vec2 vUV`.
+    vs_custom_post: ?*c.ID3D11VertexShader = null,
+    /// Diagnostic PS: outputs vUV as color.
+    ps_custom_post_diag: ?*c.ID3D11PixelShader = null,
+    /// Diagnostic PS 2: samples scratch/back at vUV, bypasses cbuffer.
+    ps_custom_post_diag2: ?*c.ID3D11PixelShader = null,
+    /// Diagnostic PS 3: outputs cbuffer contents as color.
+    ps_custom_post_diag3: ?*c.ID3D11PixelShader = null,
+    /// Diagnostic PS 4: mimics user PS path (negative of scratch sample).
+    ps_custom_post_diag4: ?*c.ID3D11PixelShader = null,
     ps_glow_extract: ?*c.ID3D11PixelShader = null,
     ps_kawase_down: ?*c.ID3D11PixelShader = null,
     ps_kawase_up: ?*c.ID3D11PixelShader = null,
@@ -264,6 +276,18 @@ pub const Renderer = struct {
     width: u32 = 1,
     height: u32 = 1,
     has_presented_once: bool = false,
+
+    /// Screen-space override for the custom shader uniforms. When
+    /// non-zero, `updateCustomShaderUniforms` uses these instead of
+    /// treating this HWND as its own screen. External windows set these
+    /// to the main window's drawable size + the external HWND's
+    /// top-left / size in main-window coordinates, so Shadertoy-style
+    /// effects (starfield, glow) line up with the main window's
+    /// universe instead of being re-centered per HWND.
+    shader_screen_w: u32 = 0,
+    shader_screen_h: u32 = 0,
+    shader_window_offset_x: f32 = 0,
+    shader_window_offset_y: f32 = 0,
 
     infoq: ?*c.ID3D11InfoQueue = null,
     dbg: ?*c.ID3D11Debug = null,
@@ -460,6 +484,11 @@ pub const Renderer = struct {
         for (&self.glow_mip_rtv) |*r| safeRelease(r);
         for (&self.glow_mip_tex) |*t| safeRelease(t);
         safeRelease(&self.vs_fullscreen);
+        safeRelease(&self.vs_custom_post);
+        safeRelease(&self.ps_custom_post_diag);
+        safeRelease(&self.ps_custom_post_diag2);
+        safeRelease(&self.ps_custom_post_diag3);
+        safeRelease(&self.ps_custom_post_diag4);
         safeRelease(&self.ps_glow_extract);
         safeRelease(&self.ps_kawase_down);
         safeRelease(&self.ps_kawase_up);
@@ -1067,14 +1096,16 @@ pub const Renderer = struct {
             }
         }
 
-        // ---- User-supplied custom post-process shader pass ----
-        // Runs after bloom in `after_bloom` mode (Phase 3 default; other
-        // modes land in later phases). Reads a scratch copy of back_tex
-        // and writes back into back_rtv, so the subsequent back->swapchain
-        // copy picks up the shader's output.
-        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
-            self.drawCustomShaderPass(ctx, ctx_vtbl);
-        }
+        // Custom shader pass used to live here but was moved to the
+        // present paths. Calling it inside drawEx runs the shader on
+        // a back_tex that hasn't been populated yet in row-mode
+        // (rows land via drawSurfaceRowsVB after drawEx returns), and
+        // also leaves the pipeline state (VS/PS/slot0 SRV) dirty, which
+        // breaks subsequent row drawVB calls that inherit that state.
+        // drawCustomShaderPass is now invoked from the present paths
+        // (presentFromBackRectsWithCursorNoResize, presentOnlyFromBack,
+        // et al.) just before the back_tex -> swapchain copy, when the
+        // full frame has landed in back_tex.
 
         if (opts.present) {
             const dst_bb: *c.ID3D11Resource = @ptrCast(bb_tex);
@@ -1188,7 +1219,17 @@ pub const Renderer = struct {
 
         const ctx_vtbl = ctx.*.lpVtbl;
 
-        if (!self.has_presented_once or dirty_rect == null) {
+        // Custom shader pass writes directly into the current bb; skip
+        // the back→bb copy when it ran so terminal content isn't pasted
+        // over the shader output.
+        var shader_handled_po: bool = false;
+        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+            shader_handled_po = self.drawCustomShaderPass(ctx, ctx_vtbl);
+        }
+
+        if (shader_handled_po) {
+            // shader already wrote bb
+        } else if (!self.has_presented_once or dirty_rect == null) {
             const copy_res = ctx_vtbl.*.CopyResource orelse return;
 
             const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
@@ -1249,12 +1290,37 @@ pub const Renderer = struct {
         
         // sync interval: 0 (no vsync wait)
         const hrp: c.HRESULT = present(sc, 0, 0);
-        
+
         if (!c.FAILED(hrp)) {
             self.has_presented_once = true;
         }
         self.advanceSwapchainIndex();
     }
+
+    /// Minimal "animate-only" frame: re-run the custom shader over the
+    /// existing back_tex and present. Skips the full row-mode paint
+    /// (no drawEx clear, no row VB draws, no cursor/scrollbar overlay)
+    /// so the 60 Hz animation ticker doesn't stall input processing on
+    /// the UI thread. Safe to call only after a full paint has
+    /// committed content into back_tex.
+    pub fn presentShaderAnimationFrame(self: *Renderer) void {
+        if (!self.has_presented_once) return; // no committed back_tex yet
+        if (self.custom_shader_pipelines.items.len == 0) return;
+        if (self.custom_shader_post_process != 0) return;
+
+        const ctx = self.ctx orelse return;
+        const sc = self.swapchain orelse return;
+        const ctx_vtbl = ctx.*.lpVtbl;
+
+        const handled = self.drawCustomShaderPass(ctx, ctx_vtbl);
+        if (!handled) return;
+
+        const sc_vtbl = sc.*.lpVtbl;
+        const present = sc_vtbl.*.Present orelse return;
+        _ = present(sc, 0, 0);
+        self.advanceSwapchainIndex();
+    }
+
 
     pub fn presentOnlyFromBackRects(self: *Renderer, rects: []const c.RECT) !void {
         try self.resize();
@@ -1267,6 +1333,13 @@ pub const Renderer = struct {
 
         const ctx_vtbl = ctx.*.lpVtbl;
 
+        // Custom shader pass writes directly into the current bb; skip
+        // the back→bb copy when it ran.
+        var shader_handled_por: bool = false;
+        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+            shader_handled_por = self.drawCustomShaderPass(ctx, ctx_vtbl);
+        }
+
         const copy_sub_opt = ctx_vtbl.*.CopySubresourceRegion;
         const copy_res_opt = ctx_vtbl.*.CopyResource;
 
@@ -1274,7 +1347,9 @@ pub const Renderer = struct {
         const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
 
         // If rects is empty (or first present after resize), use full copy.
-        if (!self.has_presented_once or rects.len == 0) {
+        if (shader_handled_por) {
+            // shader already wrote bb; no copy needed
+        } else if (!self.has_presented_once or rects.len == 0) {
             const copy_res = copy_res_opt orelse return;
             copy_res(ctx, bb_res, back_res);
         } else {
@@ -1340,13 +1415,22 @@ pub const Renderer = struct {
 
         const ctx_vtbl = ctx.*.lpVtbl;
 
+        // Custom shader pass writes directly into the current bb; skip
+        // the back→bb copy when it ran.
+        var shader_handled_ponr: bool = false;
+        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+            shader_handled_ponr = self.drawCustomShaderPass(ctx, ctx_vtbl);
+        }
+
         // If rects is empty (or first present after resize), equivalent to full screen
-        if (!self.has_presented_once or rects.len == 0) {
+        if (shader_handled_ponr) {
+            // shader already wrote bb; no copy needed
+        } else if (!self.has_presented_once or rects.len == 0) {
             const copy_res = ctx_vtbl.*.CopyResource orelse return;
-    
+
             const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
             const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
-    
+
             copy_res(ctx, bb_res, back_res);
         } else {
             // Clamp each rect and CopySubresourceRegion
@@ -1451,8 +1535,20 @@ pub const Renderer = struct {
 
         const force_full_copy_effective = force_full_copy or !self.has_presented_once;
 
-        // If rects is empty, equivalent to full screen
-        if (force_full_copy_effective or rects.len == 0) {
+        // Custom post-process shader pass: runs on the fully-rendered
+        // back_tex and writes its output directly into the current
+        // swapchain bb. When it returns true, the back→bb copy below
+        // must be skipped — otherwise it would overwrite the shader's
+        // output with raw terminal content.
+        var shader_handled: bool = false;
+        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+            shader_handled = self.drawCustomShaderPass(ctx, ctx_vtbl);
+        }
+
+        if (shader_handled) {
+            did_full_copy = true; // shader pass wrote the full frame to bb
+        } else if (force_full_copy_effective or rects.len == 0) {
+            // If rects is empty, equivalent to full screen
             const copy_res = ctx_vtbl.*.CopyResource orelse return;
 
             const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
@@ -2679,8 +2775,30 @@ pub const Renderer = struct {
             @ptrCast(&back_rtv),
         );
         if (c.FAILED(hr_back_rtv) or back_rtv == null) return error.D3DCreateBackRTVFailed;
-        
+
         self.back_rtv = back_rtv;
+
+        // RTVs on each swapchain buffer — used by drawCustomShaderPass
+        // to write shader output directly into the current bb_tex,
+        // leaving back_tex untouched so animation frames can keep
+        // sampling the original terminal contents instead of feeding
+        // the previous shader output back into the shader's input.
+        // In flip-model, only buffer 0 is accessible from D3D11, so
+        // bb_rtvs[1..] creation returns E_INVALIDARG — not fatal.
+        {
+            var bi: u32 = 0;
+            while (bi < self.swapchain_buf_count) : (bi += 1) {
+                const bb_tex_i = self.bb_texs[@intCast(bi)] orelse continue;
+                var bb_rtv_i: ?*c.ID3D11RenderTargetView = null;
+                const hr_bb = create_rtv2(dev, @ptrCast(bb_tex_i), null, @ptrCast(&bb_rtv_i));
+                if (c.FAILED(hr_bb) or bb_rtv_i == null) {
+                    if (applog.isEnabled()) applog.appLog("[d3d] bb_rtvs[{d}] create hr=0x{x} (ok for non-0 in flip model)\n", .{ bi, @as(u32, @bitCast(hr_bb)) });
+                    continue;
+                }
+                self.bb_rtvs[@intCast(bi)] = bb_rtv_i;
+            }
+            self.bb_rtv = self.bb_rtvs[0];
+        }
     }
 
     /// Shift the retained content in back_tex by `dy_px` pixels vertically.
@@ -2940,6 +3058,84 @@ pub const Renderer = struct {
         OutOfMemory,
     };
 
+    /// Rewrite SPIRV-Cross-generated HLSL so the PS input/output are
+    /// passed as explicit function arguments between `main` and
+    /// `frag_main`, instead of file-scope `static` globals.
+    ///
+    /// Observed on at least one Windows D3D11 driver: the emitted
+    /// `static float2 vUV; ... void frag_main() { ...vUV... }` +
+    /// `vUV = stage_input.vUV; frag_main();` pattern leaves `vUV`
+    /// reading as (0, 0) inside frag_main, and the output static
+    /// never populates. Inlining the values via function arguments
+    /// sidesteps the issue and produces the same visual result as
+    /// equivalent hand-written HLSL.
+    ///
+    /// Returns a newly-allocated HLSL string (caller frees) on success,
+    /// or `error.PatternNotFound` if the expected SPIRV-Cross shape
+    /// isn't present (leave the HLSL alone in that case).
+    fn patchSpvCrossPsStaticPattern(
+        alloc: std.mem.Allocator,
+        hlsl: []const u8,
+    ) ![]u8 {
+        const static_vuv = "\nstatic float2 vUV;\n";
+        const static_frag_color = "\nstatic float4 zonvie_fragColor;\n";
+        const frag_main_decl = "\nvoid frag_main()\n";
+        const main_body_target =
+            "    vUV = stage_input.vUV;\n" ++
+            "    frag_main();\n" ++
+            "    SPIRV_Cross_Output stage_output;\n" ++
+            "    stage_output.zonvie_fragColor = zonvie_fragColor;\n";
+        const main_body_replacement =
+            "    SPIRV_Cross_Output stage_output;\n" ++
+            "    frag_main(stage_input.vUV, stage_output.zonvie_fragColor);\n";
+
+        const input_struct_target =
+            "struct SPIRV_Cross_Input\n" ++
+            "{\n" ++
+            "    float2 vUV : TEXCOORD0;\n" ++
+            "};\n";
+        const input_struct_replacement =
+            "struct SPIRV_Cross_Input\n" ++
+            "{\n" ++
+            "    float4 gl_Position : SV_Position;\n" ++
+            "    float2 vUV : TEXCOORD0;\n" ++
+            "};\n";
+
+        if (std.mem.indexOf(u8, hlsl, static_vuv) == null) return error.PatternNotFound;
+        if (std.mem.indexOf(u8, hlsl, static_frag_color) == null) return error.PatternNotFound;
+        if (std.mem.indexOf(u8, hlsl, frag_main_decl) == null) return error.PatternNotFound;
+        if (std.mem.indexOf(u8, hlsl, main_body_target) == null) return error.PatternNotFound;
+
+        // Work in an ArrayList; build up via targeted replacements.
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(alloc);
+        try out.appendSlice(alloc, hlsl);
+
+        const replaceOne = struct {
+            fn f(a: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), needle: []const u8, repl: []const u8) !void {
+                const idx = std.mem.indexOf(u8, buf.items, needle) orelse return;
+                try buf.replaceRange(a, idx, needle.len, repl);
+            }
+        }.f;
+
+        try replaceOne(alloc, &out, main_body_target, main_body_replacement);
+        try replaceOne(alloc, &out, static_vuv, "\n");
+        try replaceOne(alloc, &out, static_frag_color, "\n");
+        try replaceOne(
+            alloc,
+            &out,
+            frag_main_decl,
+            "\nvoid frag_main(float2 vUV, out float4 zonvie_fragColor)\n",
+        );
+        // Include SV_Position in the PS input struct so drivers that
+        // strictly match VS-output / PS-input signatures accept the
+        // pairing with VSCustomPost (which outputs SV_Position +
+        // TEXCOORD0).
+        try replaceOne(alloc, &out, input_struct_target, input_struct_replacement);
+
+        return out.toOwnedSlice(alloc);
+    }
+
     fn compileCustomShader(
         self: *Renderer,
         dev: *c.ID3D11Device,
@@ -2970,11 +3166,35 @@ pub const Renderer = struct {
         const hlsl_ptr = result.data orelse return CustomShaderCompileError.GlslCompileFailed;
         const hlsl_len = result.data_len;
 
+        // SPIRV-Cross emits a `static float2 vUV; ... static float4
+        // zonvie_fragColor; ... void frag_main() { ... }` pattern where
+        // main() writes to the statics, calls frag_main(), and copies
+        // the output static into the SPIRV_Cross_Output struct. On at
+        // least one Windows D3D11 driver we tested, that cross-function
+        // static pattern does not propagate values between main and
+        // frag_main — the PS samples iChannel0 at (0,0) for every
+        // fragment (effectively `vUV == (0,0)` and later the output
+        // static is uninitialized on readback). Post-process the HLSL
+        // to convert the static pattern into explicit function
+        // arguments, which compiles down to deterministic DXBC that
+        // works across all drivers we've tested.
+        const patched_hlsl = patchSpvCrossPsStaticPattern(self.alloc, hlsl_ptr[0..hlsl_len]) catch |e| blk: {
+            applog.appLog("[CustomShader] patchSpvCrossPsStaticPattern failed: {any} (using original)\n", .{e});
+            break :blk null;
+        };
+        defer if (patched_hlsl) |p| self.alloc.free(p);
+
+        const hlsl_for_compile: []const u8 = patched_hlsl orelse hlsl_ptr[0..hlsl_len];
+
+        applog.appLog("[CustomShader] ---- HLSL BEGIN ({s}, {d} bytes) ----\n", .{ source_path, hlsl_for_compile.len });
+        applog.appLog("{s}\n", .{hlsl_for_compile});
+        applog.appLog("[CustomShader] ---- HLSL END ----\n", .{});
+
         var ps_blob: ?*ID3DBlob = null;
         var err_blob: ?*ID3DBlob = null;
         const hr = D3DCompile(
-            @ptrCast(hlsl_ptr),
-            hlsl_len,
+            @ptrCast(hlsl_for_compile.ptr),
+            hlsl_for_compile.len,
             null,
             null,
             null,
@@ -2990,6 +3210,12 @@ pub const Renderer = struct {
             dumpBlobAsText("[CustomShader] D3DCompile error: ", err_blob);
             applog.appLog("[CustomShader] D3DCompile hr=0x{x} for {s}\n", .{ @as(u32, @bitCast(hr)), source_path });
             return CustomShaderCompileError.HlslCompileFailed;
+        }
+        // Even on success, D3DCompile may emit warnings via err_blob.
+        // Those would hint at unused cbuffer fields, register binding
+        // collisions, etc. that can cause silent-black symptoms.
+        if (err_blob != null) {
+            dumpBlobAsText("[CustomShader] D3DCompile warnings: ", err_blob);
         }
         defer blobRelease(ps_blob);
 
@@ -3060,22 +3286,31 @@ pub const Renderer = struct {
         }
 
         var u: core.zonvie_shader_uniforms = std.mem.zeroes(core.zonvie_shader_uniforms);
-        u.iResolution[0] = @floatFromInt(self.width);
-        u.iResolution[1] = @floatFromInt(self.height);
+        // If an external window set the screen-space override, use it —
+        // iResolution is the main window's drawable size (the shader's
+        // "universe") and iWindowOffset/iWindowSize locate this HWND
+        // within that universe. Otherwise the HWND is its own screen.
+        if (self.shader_screen_w != 0 and self.shader_screen_h != 0) {
+            u.iResolution[0] = @floatFromInt(self.shader_screen_w);
+            u.iResolution[1] = @floatFromInt(self.shader_screen_h);
+            u.iWindowOffset[0] = self.shader_window_offset_x;
+            u.iWindowOffset[1] = self.shader_window_offset_y;
+            u.iWindowSize[0] = @floatFromInt(self.width);
+            u.iWindowSize[1] = @floatFromInt(self.height);
+        } else {
+            u.iResolution[0] = @floatFromInt(self.width);
+            u.iResolution[1] = @floatFromInt(self.height);
+            u.iWindowOffset[0] = 0;
+            u.iWindowOffset[1] = 0;
+            u.iWindowSize[0] = @floatFromInt(self.width);
+            u.iWindowSize[1] = @floatFromInt(self.height);
+        }
         u.iResolution[2] = 1.0;
         u.iTime = iTime;
         u.iTimeDelta = dt;
         u.iFrame = self.custom_shader_frame_index;
         u.iSampleRate = 44100.0;
         u.iFrameRate = self.custom_shader_ema_frame_rate;
-        // Screen-space unification: the Windows frontend currently only
-        // runs one HWND. Treat it as its own screen — offset (0,0), size
-        // matches iResolution. If external HWNDs ever arrive, populate
-        // these per-window to line up shader effects across them.
-        u.iWindowOffset[0] = 0;
-        u.iWindowOffset[1] = 0;
-        u.iWindowSize[0] = @floatFromInt(self.width);
-        u.iWindowSize[1] = @floatFromInt(self.height);
         // iMouse / iDate stay zero for now; filled in Phase 6.
 
         // Map / Unmap — cheap for a 64-byte dynamic CB.
@@ -3091,27 +3326,62 @@ pub const Renderer = struct {
     }
 
     /// Apply the custom shader chain. Reads a scratch copy of back_tex
-    /// through `custom_shader_scratch_srv` and writes to `back_rtv`. Phase 3
-    /// applies a single shader; multi-pass (ping-pong) lands in Phase 5.
+    /// through `custom_shader_scratch_srv` and writes directly into the
+    /// current swapchain backbuffer (bb_rtvs[0]) — NOT back_rtv. This
+    /// keeps back_tex untouched between frames, so animation frames
+    /// can resample the original terminal contents instead of feeding
+    /// the previous shader output back into the shader input (otherwise
+    /// starfield/negative recursively compound over time). Returns
+    /// `true` when it wrote to the swapchain, so the caller can skip
+    /// its own back→bb copy.
     fn drawCustomShaderPass(
         self: *Renderer,
         ctx: *c.ID3D11DeviceContext,
         ctx_vtbl: anytype,
-    ) void {
-        if (self.custom_shader_pipelines.items.len == 0) return;
+    ) bool {
+        if (self.custom_shader_pipelines.items.len == 0) return false;
         const pipeline = self.custom_shader_pipelines.items[0];
-        const ps = pipeline.pixel_shader orelse return;
-        const back = self.back_tex orelse return;
-        const back_rtv = self.back_rtv orelse return;
-        const vs_fs = self.vs_fullscreen orelse return;
-        const sampler = self.bilinear_sampler orelse return;
+        const ps = pipeline.pixel_shader orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: ps null\n", .{});
+            return false;
+        };
+        const back = self.back_tex orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: back_tex null\n", .{});
+            return false;
+        };
+        const out_rtv = self.bb_rtvs[0] orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: bb_rtvs[0] null\n", .{});
+            return false;
+        };
+        // Prefer the custom-post VS (output field name `vUV` matches the
+        // SPIRV-Cross PS input). Fall back to VSFullscreen if the custom
+        // VS failed to compile — on drivers where the name-match quirk
+        // does not apply this still works correctly.
+        const vs_fs = self.vs_custom_post orelse self.vs_fullscreen orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: vs_custom_post and vs_fullscreen both null\n", .{});
+            return false;
+        };
+        const sampler = self.bilinear_sampler orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: bilinear_sampler null\n", .{});
+            return false;
+        };
 
         self.ensureCustomShaderScratch();
         self.updateCustomShaderUniforms(ctx, ctx_vtbl);
-        const scratch = self.custom_shader_scratch_tex orelse return;
-        const scratch_srv = self.custom_shader_scratch_srv orelse return;
+        const scratch = self.custom_shader_scratch_tex orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: scratch_tex null\n", .{});
+            return false;
+        };
+        const scratch_srv = self.custom_shader_scratch_srv orelse {
+            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: scratch_srv null\n", .{});
+            return false;
+        };
 
-        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return;
+        if (applog.isEnabled()) {
+            applog.appLog("[CustomShader] draw pass w={d} h={d} back=0x{x} scratch=0x{x}\n", .{ self.width, self.height, @intFromPtr(back), @intFromPtr(scratch) });
+        }
+
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
 
         // Unbind everything from render-target / SRV slots BEFORE copying
         // back_tex into scratch. back_tex was almost certainly still bound
@@ -3131,10 +3401,12 @@ pub const Renderer = struct {
         // resource that is not currently bound as an RTV.
         if (ctx_vtbl.*.CopyResource) |copy_res| {
             copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
-        } else return;
+        } else return false;
 
-        // Re-bind: scratch SRV as input, back RTV as output.
-        var rtvs: [1]?*c.ID3D11RenderTargetView = .{ back_rtv };
+        // Re-bind: scratch SRV as input, swapchain bb RTV as output.
+        // Writing to bb directly (instead of back_rtv) leaves back_tex
+        // pristine for the next frame's shader sample — no recursion.
+        var rtvs: [1]?*c.ID3D11RenderTargetView = .{ out_rtv };
         set_rtvs(ctx, 1, &rtvs[0], null);
 
         // Full viewport + scissor. Previous passes may have left a
@@ -3166,7 +3438,9 @@ pub const Renderer = struct {
         }
         if (ctx_vtbl.*.IASetInputLayout) |set_il| set_il(ctx, null);
         if (ctx_vtbl.*.VSSetShader) |set_vs| set_vs(ctx, vs_fs, null, 0);
-        if (ctx_vtbl.*.PSSetShader) |set_ps| set_ps(ctx, ps, null, 0);
+        // Use the user's compiled PS (SPIRV-Cross HLSL → D3DCompile blob).
+        const ps_eff: *c.ID3D11PixelShader = ps;
+        if (ctx_vtbl.*.PSSetShader) |set_ps| set_ps(ctx, ps_eff, null, 0);
         if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{ scratch_srv };
             set_srvs(ctx, 0, 1, &srvs[0]);
@@ -3188,12 +3462,32 @@ pub const Renderer = struct {
         }
         if (ctx_vtbl.*.Draw) |draw_fn| draw_fn(ctx, 3, 0);
 
-        // Unbind SRV slot 0 so a later pass (or bloom on the next frame)
-        // is not refused because scratch_srv is still bound as input.
+        // Restore the main grid pipeline state. drawCustomShaderPass is
+        // invoked from the present path, but any later pass in the same
+        // frame (cursor overlay re-entry, scrollbar, bloom on the next
+        // frame's drawEx prologue before it rebinds) would otherwise
+        // inherit the custom shader's VS/PS/slot0 SRV and render garbage
+        // glyph data.
         if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
-            var null_srv: [1]?*c.ID3D11ShaderResourceView = .{ null };
-            set_srvs(ctx, 0, 1, &null_srv[0]);
+            var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.atlas_srv };
+            set_srvs(ctx, 0, 1, &atlas_srvs[0]);
         }
+        if (ctx_vtbl.*.VSSetShader) |set_vs| {
+            if (self.vs) |vs_main| set_vs(ctx, vs_main, null, 0);
+        }
+        if (ctx_vtbl.*.PSSetShader) |set_ps| {
+            if (self.ps) |ps_main| set_ps(ctx, ps_main, null, 0);
+        }
+        if (ctx_vtbl.*.IASetInputLayout) |set_il| {
+            if (self.il) |il_main| set_il(ctx, il_main);
+        }
+        if (ctx_vtbl.*.OMSetBlendState) |set_blend| {
+            if (self.blend) |bl| {
+                var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+                set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+            }
+        }
+        return true;
     }
 
     /// Check whether all glow texture resources (tex/RTV/SRV) were fully created.
@@ -3773,6 +4067,119 @@ pub const Renderer = struct {
                 var ps_out: ?*c.ID3D11PixelShader = null;
                 if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return;
                 field.* = ps_out;
+            }
+
+            // VSCustomPost: same geometry as VSFullscreen but with an
+            // output field named `vUV` to match the SPIRV-Cross-generated
+            // custom-shader PS input. Non-fatal if compile fails —
+            // drawCustomShaderPass falls back to VSFullscreen.
+            {
+                var vcp_blob: ?*ID3DBlob = null;
+                var vcp_err: ?*ID3DBlob = null;
+                defer blobRelease(vcp_blob);
+                defer blobRelease(vcp_err);
+                const hr_vcp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSCustomPost", "vs_5_0", 0, 0, &vcp_blob, &vcp_err);
+                if (hr_vcp == 0 and vcp_blob != null) {
+                    const vcp_p = blobPtr(vcp_blob).?;
+                    const vcp_s = blobSize(vcp_blob);
+                    var vs_cp: ?*c.ID3D11VertexShader = null;
+                    if (!c.FAILED(create_vs_fn(dev, vcp_p, vcp_s, null, &vs_cp)) and vs_cp != null) {
+                        self.vs_custom_post = vs_cp;
+                        applog.appLog("[d3d] VSCustomPost compiled ok\n", .{});
+                    } else {
+                        applog.appLog("[d3d] VSCustomPost create shader FAILED\n", .{});
+                    }
+                } else {
+                    applog.appLog("[d3d] VSCustomPost D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_vcp))});
+                    dumpBlobAsText("[D3DCompile VSCustomPost] ", vcp_err);
+                }
+            }
+
+            // PSCustomPostDiag: outputs vUV as color for pipeline wiring
+            // diagnosis.
+            {
+                var pcd_blob: ?*ID3DBlob = null;
+                var pcd_err: ?*ID3DBlob = null;
+                defer blobRelease(pcd_blob);
+                defer blobRelease(pcd_err);
+                const hr_pcd = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag", "ps_5_0", 0, 0, &pcd_blob, &pcd_err);
+                if (hr_pcd == 0 and pcd_blob != null) {
+                    const pcd_p = blobPtr(pcd_blob).?;
+                    const pcd_s = blobSize(pcd_blob);
+                    var ps_pcd: ?*c.ID3D11PixelShader = null;
+                    if (!c.FAILED(create_ps_fn(dev, pcd_p, pcd_s, null, &ps_pcd)) and ps_pcd != null) {
+                        self.ps_custom_post_diag = ps_pcd;
+                        applog.appLog("[d3d] PSCustomPostDiag compiled ok\n", .{});
+                    }
+                } else {
+                    applog.appLog("[d3d] PSCustomPostDiag D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd))});
+                    dumpBlobAsText("[D3DCompile PSCustomPostDiag] ", pcd_err);
+                }
+            }
+
+            // PSCustomPostDiag2: samples input texture at vUV, bypassing
+            // cbuffer, to isolate whether the bug is in cbuffer path.
+            {
+                var pcd2_blob: ?*ID3DBlob = null;
+                var pcd2_err: ?*ID3DBlob = null;
+                defer blobRelease(pcd2_blob);
+                defer blobRelease(pcd2_err);
+                const hr_pcd2 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag2", "ps_5_0", 0, 0, &pcd2_blob, &pcd2_err);
+                if (hr_pcd2 == 0 and pcd2_blob != null) {
+                    const pcd2_p = blobPtr(pcd2_blob).?;
+                    const pcd2_s = blobSize(pcd2_blob);
+                    var ps_pcd2: ?*c.ID3D11PixelShader = null;
+                    if (!c.FAILED(create_ps_fn(dev, pcd2_p, pcd2_s, null, &ps_pcd2)) and ps_pcd2 != null) {
+                        self.ps_custom_post_diag2 = ps_pcd2;
+                        applog.appLog("[d3d] PSCustomPostDiag2 compiled ok\n", .{});
+                    }
+                } else {
+                    applog.appLog("[d3d] PSCustomPostDiag2 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd2))});
+                    dumpBlobAsText("[D3DCompile PSCustomPostDiag2] ", pcd2_err);
+                }
+            }
+
+            // PSCustomPostDiag3: outputs cbuffer contents as color to
+            // verify whether uniform data reaches the PS.
+            {
+                var pcd3_blob: ?*ID3DBlob = null;
+                var pcd3_err: ?*ID3DBlob = null;
+                defer blobRelease(pcd3_blob);
+                defer blobRelease(pcd3_err);
+                const hr_pcd3 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag3", "ps_5_0", 0, 0, &pcd3_blob, &pcd3_err);
+                if (hr_pcd3 == 0 and pcd3_blob != null) {
+                    const pcd3_p = blobPtr(pcd3_blob).?;
+                    const pcd3_s = blobSize(pcd3_blob);
+                    var ps_pcd3: ?*c.ID3D11PixelShader = null;
+                    if (!c.FAILED(create_ps_fn(dev, pcd3_p, pcd3_s, null, &ps_pcd3)) and ps_pcd3 != null) {
+                        self.ps_custom_post_diag3 = ps_pcd3;
+                        applog.appLog("[d3d] PSCustomPostDiag3 compiled ok\n", .{});
+                    }
+                } else {
+                    applog.appLog("[d3d] PSCustomPostDiag3 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd3))});
+                    dumpBlobAsText("[D3DCompile PSCustomPostDiag3] ", pcd3_err);
+                }
+            }
+
+            // PSCustomPostDiag4: mimics user PS (negative of scratch).
+            {
+                var pcd4_blob: ?*ID3DBlob = null;
+                var pcd4_err: ?*ID3DBlob = null;
+                defer blobRelease(pcd4_blob);
+                defer blobRelease(pcd4_err);
+                const hr_pcd4 = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSCustomPostDiag4", "ps_5_0", 0, 0, &pcd4_blob, &pcd4_err);
+                if (hr_pcd4 == 0 and pcd4_blob != null) {
+                    const pcd4_p = blobPtr(pcd4_blob).?;
+                    const pcd4_s = blobSize(pcd4_blob);
+                    var ps_pcd4: ?*c.ID3D11PixelShader = null;
+                    if (!c.FAILED(create_ps_fn(dev, pcd4_p, pcd4_s, null, &ps_pcd4)) and ps_pcd4 != null) {
+                        self.ps_custom_post_diag4 = ps_pcd4;
+                        applog.appLog("[d3d] PSCustomPostDiag4 compiled ok\n", .{});
+                    }
+                } else {
+                    applog.appLog("[d3d] PSCustomPostDiag4 D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_pcd4))});
+                    dumpBlobAsText("[D3DCompile PSCustomPostDiag4] ", pcd4_err);
+                }
             }
         }
 

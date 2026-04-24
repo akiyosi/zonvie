@@ -156,7 +156,7 @@ pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
 /// Armed only while a loaded custom shader references time-varying
 /// Shadertoy uniforms (iTime / iFrame / etc.). Otherwise rendering stays
 /// flush-driven and the process remains 0-CPU idle.
-pub const TIMER_CUSTOM_SHADER_ANIM: c.UINT_PTR = 10;
+pub const TIMER_CUSTOM_SHADER_ANIM: c.UINT_PTR = 11;
 /// ~60Hz cadence for TIMER_CUSTOM_SHADER_ANIM.
 pub const CUSTOM_SHADER_ANIM_INTERVAL_MS: c.UINT = 16;
 /// Tray icon init delay in milliseconds

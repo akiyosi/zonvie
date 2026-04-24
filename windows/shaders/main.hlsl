@@ -248,6 +248,77 @@ FSQuadVSOut VSFullscreen(uint id : SV_VertexID) {
     return o;
 }
 
+// Separate vertex shader for the user's custom post-process shader.
+// SPIRV-Cross emits the PS input struct with a field named `vUV`. D3D11
+// matches stage-in by semantic, but some drivers/runtimes (observed with
+// the `negative.glsl` scratch-copy path on Windows) leave the PS's `vUV`
+// initialized to (0,0) when the VS output field is named `uv`. That made
+// every fragment sample `iChannel0` at (0,0) → single-color output. Using
+// a matching `vUV` field name sidesteps that case.
+struct CustomPostVSOut {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+
+CustomPostVSOut VSCustomPost(uint id : SV_VertexID) {
+    CustomPostVSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.vUV = uv;
+    return o;
+}
+
+// Diagnostic: output vUV as color. If paired with VSCustomPost and the
+// shader pipeline is correct, the screen shows a gradient from black at
+// the top-left (vUV=0) to red/yellow at the right/bottom. If the whole
+// screen is a flat color, vUV is not reaching the PS.
+float4 PSCustomPostDiag(CustomPostVSOut i) : SV_Target {
+    return float4(i.vUV.x, i.vUV.y, 0.0, 1.0);
+}
+
+// Diagnostic 2: sample the input texture (scratch/back copy) at vUV,
+// bypass cbuffer. If the screen looks like the terminal content,
+// texture sampling works and the bug is in the cbuffer path (user PS
+// divides by iResolution -> NaN -> undefined sample).
+Texture2D<float4> _zonvie_diag_tex : register(t0);
+SamplerState _zonvie_diag_samp : register(s0);
+float4 PSCustomPostDiag2(CustomPostVSOut i) : SV_Target {
+    float4 c = _zonvie_diag_tex.Sample(_zonvie_diag_samp, i.vUV);
+    return float4(c.rgb, 1.0);
+}
+
+// Diagnostic 3: output cbuffer contents (iResolution / 2048, iTime)
+// as color. If cbuffer at slot 1 is bound and populated, for a
+// 1000x700 window we expect r≈0.49, g≈0.34, b varies with time.
+// If the screen is black, the cbuffer is not reaching the PS.
+cbuffer ZonvieShaderUniforms_Diag : register(b1) {
+    float3 diag_iResolution : packoffset(c0);
+    float diag_iTime : packoffset(c0.w);
+    float2 diag_iWindowOffset : packoffset(c4);
+    float2 diag_iWindowSize : packoffset(c4.z);
+};
+float4 PSCustomPostDiag3(CustomPostVSOut i) : SV_Target {
+    return float4(
+        diag_iResolution.x / 2048.0,
+        diag_iResolution.y / 2048.0,
+        frac(diag_iTime),
+        1.0
+    );
+}
+
+// Diagnostic 4: mimic user PS path (uv = fragCoord/iResolution, sample
+// iChannel0 at uv) then invert colors. Should produce the same visual
+// as running the user's compiled negative.glsl PS. If this shows
+// inverted terminal but the user's actual PS shows black, the bug is
+// in the compiled user PS specifically (e.g. SPIRV-Cross emitting
+// unexpected register bindings).
+float4 PSCustomPostDiag4(CustomPostVSOut i) : SV_Target {
+    float2 fragCoord = diag_iWindowOffset + i.vUV * diag_iWindowSize;
+    float2 uv = fragCoord / diag_iResolution.xy;
+    float4 c = _zonvie_diag_tex.Sample(_zonvie_diag_samp, uv);
+    return float4(1.0 - c.r, 1.0 - c.g, 1.0 - c.b, 1.0);
+}
+
 // Glow extract: render only DECO_GLOW glyphs with original foreground color.
 // Non-glow vertices and non-glyph vertices are discarded.
 // Output is premultiplied alpha.
