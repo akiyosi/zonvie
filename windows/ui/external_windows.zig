@@ -2090,15 +2090,20 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         screen_h = main_r.height;
                     }
                 }
-                var main_rect: c.RECT = undefined;
-                var ext_rect: c.RECT = undefined;
-                if (c.GetWindowRect(main_hwnd, &main_rect) != 0 and c.GetWindowRect(hwnd, &ext_rect) != 0) {
-                    // Translate main-window client origin into screen
-                    // coordinates; offset is ext_rect - main client top-left.
-                    var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                    _ = c.ClientToScreen(main_hwnd, &main_client_origin);
-                    off_x = @floatFromInt(ext_rect.left - main_client_origin.x);
-                    off_y = @floatFromInt(ext_rect.top - main_client_origin.y);
+                // Use each HWND's client-area origin rather than
+                // GetWindowRect. GetWindowRect includes any window
+                // frame / title bar (WS_OVERLAPPEDWINDOW on regular
+                // external windows), so subtracting it pushes the
+                // shader offset into the decoration strip — the
+                // rendered shader pixels in the client area end up
+                // shifted by the frame thickness. Shader pixels live
+                // in client coords, so use client origins on both
+                // sides.
+                var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
+                    off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
+                    off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
                 }
             }
             g_sh.shader_screen_w = screen_w;
