@@ -1263,16 +1263,26 @@ typedef enum {
    space in pixels, with top-left origin. For the main window itself,
    iWindowOffset is (0,0) and iWindowSize equals iResolution.xy. */
 typedef struct zonvie_shader_uniforms {
-    float    iResolution[3];   /* 0..11  xy = main window drawable px, z = pixel aspect */
-    float    iTime;            /* 12..15 seconds since shader start */
-    float    iMouse[4];        /* 16..31 xy = cursor px, zw = click px */
-    float    iDate[4];         /* 32..47 year, month, day, seconds in day */
-    float    iTimeDelta;       /* 48..51 seconds since previous frame */
-    int32_t  iFrame;           /* 52..55 frame counter */
-    float    iSampleRate;      /* 56..59 not used; always 44100 */
-    float    iFrameRate;       /* 60..63 frames per second (running average) */
-    float    iWindowOffset[2]; /* 64..71 this view's top-left in main drawable px */
-    float    iWindowSize[2];   /* 72..79 this view's own drawable size in px */
+    float    iResolution[3];          /* 0..11   xy = main window drawable px, z = pixel aspect */
+    float    iTime;                   /* 12..15  seconds since shader start */
+    float    iMouse[4];               /* 16..31  xy = cursor px, zw = click px */
+    float    iDate[4];                /* 32..47  year, month, day, seconds in day */
+    float    iTimeDelta;              /* 48..51  seconds since previous frame */
+    int32_t  iFrame;                  /* 52..55  frame counter */
+    float    iSampleRate;             /* 56..59  not used; always 44100 */
+    float    iFrameRate;              /* 60..63  frames per second (running average) */
+    float    iWindowOffset[2];        /* 64..71  this view's top-left in main drawable px */
+    float    iWindowSize[2];          /* 72..79  this view's own drawable size in px */
+    /* Ghostty 1.1+ cursor uniforms.
+       iCurrentCursor/iPreviousCursor: (x, y, w, h) in drawable px.
+       iCurrentCursorColor/iPreviousCursorColor: straight RGBA in [0, 1].
+       iTimeCursorChange: iTime value at the last cursor move/change. */
+    float    iCurrentCursor[4];       /*  80..95  */
+    float    iPreviousCursor[4];      /*  96..111 */
+    float    iCurrentCursorColor[4];  /* 112..127 */
+    float    iPreviousCursorColor[4]; /* 128..143 */
+    float    iTimeCursorChange;       /* 144..147 */
+    float    _pad_cursor[3];          /* 148..159 — UBO size must be 16-aligned */
 } zonvie_shader_uniforms;
 
 /* Result of a GLSL -> target shading language compile.

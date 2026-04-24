@@ -1009,6 +1009,60 @@ pub export fn WndProc(
                             break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
                         } else null;
 
+                        // Feed cursor state into the custom shader
+                        // uniforms (Ghostty 1.1+ iCurrentCursor /
+                        // iPreviousCursor / iTimeCursorChange etc.). No-op
+                        // when the rect + color match the last call.
+                        // Recompute the rect in floating point to avoid
+                        // the 1-pixel inflation that cursor_rc_opt picks
+                        // up from its floor/ceil integer rounding (the
+                        // dirty-rect consumer needs that, the shader
+                        // doesn't).
+                        if (cursor_verts_snapshot.len != 0) {
+                            if (app.renderer) |*r_sh| {
+                                var minx_sh: f32 = cursor_verts_snapshot[0].position[0];
+                                var maxx_sh: f32 = minx_sh;
+                                var miny_sh: f32 = cursor_verts_snapshot[0].position[1];
+                                var maxy_sh: f32 = miny_sh;
+                                for (cursor_verts_snapshot) |v| {
+                                    if (v.position[0] < minx_sh) minx_sh = v.position[0];
+                                    if (v.position[0] > maxx_sh) maxx_sh = v.position[0];
+                                    if (v.position[1] < miny_sh) miny_sh = v.position[1];
+                                    if (v.position[1] > maxy_sh) maxy_sh = v.position[1];
+                                }
+                                const vp_x_sh: u32 = content_x_offset orelse 0;
+                                const vp_y_sh: u32 = content_y_offset orelse 0;
+                                const base_w_sh: u32 = content_width orelse @intCast(@max(1, client.right));
+                                const sidebar_w_sh: u32 = sidebar_right_width orelse 0;
+                                const vp_w_sh: u32 =
+                                    if (base_w_sh > vp_x_sh + sidebar_w_sh)
+                                        base_w_sh - vp_x_sh - sidebar_w_sh
+                                    else
+                                        1;
+                                const vp_h_sh: u32 = content_height;
+                                const wf_sh: f32 = @floatFromInt(vp_w_sh);
+                                const hf_sh: f32 = @floatFromInt(vp_h_sh);
+                                const xo_sh: f32 = @floatFromInt(vp_x_sh);
+                                const yo_sh: f32 = @floatFromInt(vp_y_sh);
+                                const left_sh = xo_sh + (minx_sh + 1.0) * 0.5 * wf_sh;
+                                const right_sh = xo_sh + (maxx_sh + 1.0) * 0.5 * wf_sh;
+                                const top_sh = yo_sh + (1.0 - maxy_sh) * 0.5 * hf_sh;
+                                const bottom_sh = yo_sh + (1.0 - miny_sh) * 0.5 * hf_sh;
+                                // Ghostty's cursor shaders interpret the y
+                                // component as the BOTTOM edge of the
+                                // cursor rect (center is computed as
+                                // `y - h/2`, rect spans `y-h..y`). Pass
+                                // the bottom-edge so the shader renders
+                                // over the actual cursor, not one row
+                                // above it.
+                                const v0 = cursor_verts_snapshot[0];
+                                r_sh.setCursorShaderState(
+                                    .{ left_sh, bottom_sh, right_sh - left_sh, bottom_sh - top_sh },
+                                    v0.color,
+                                );
+                            }
+                        }
+
                         const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
                         const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
                         const row_h_px_u32 = if (rows_mismatch)

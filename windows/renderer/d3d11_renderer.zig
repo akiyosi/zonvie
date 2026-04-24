@@ -266,6 +266,13 @@ pub const Renderer = struct {
     custom_shader_start_qpc: i64 = 0,
     custom_shader_last_qpc: i64 = 0,
     custom_shader_ema_frame_rate: f32 = 60.0,
+    /// Ghostty 1.1+ cursor uniforms. iTimeCursorChange is in seconds
+    /// relative to custom_shader_start_qpc. Updated via setCursorShaderState.
+    shader_cursor_current: [4]f32 = .{ 0, 0, 0, 0 },
+    shader_cursor_previous: [4]f32 = .{ 0, 0, 0, 0 },
+    shader_cursor_current_color: [4]f32 = .{ 0, 0, 0, 0 },
+    shader_cursor_previous_color: [4]f32 = .{ 0, 0, 0, 0 },
+    shader_cursor_change_time: f32 = 0,
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. The main loop reads this to decide whether to
     /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
@@ -3245,6 +3252,45 @@ pub const Renderer = struct {
         };
     }
 
+    /// Update the Ghostty 1.1+ cursor uniforms. rect is (x, y, w, h)
+    /// in drawable pixels within the shader "screen" universe (main
+    /// window's drawable). color is straight RGBA in [0, 1]. Called
+    /// on cursor position/color change only; if the incoming rect and
+    /// color match the current state, the call is a no-op so shaders
+    /// continue to see the last change's iTimeCursorChange.
+    pub fn setCursorShaderState(self: *Renderer, rect: [4]f32, color: [4]f32) void {
+        const same_rect =
+            rect[0] == self.shader_cursor_current[0] and
+            rect[1] == self.shader_cursor_current[1] and
+            rect[2] == self.shader_cursor_current[2] and
+            rect[3] == self.shader_cursor_current[3];
+        const same_color =
+            color[0] == self.shader_cursor_current_color[0] and
+            color[1] == self.shader_cursor_current_color[1] and
+            color[2] == self.shader_cursor_current_color[2] and
+            color[3] == self.shader_cursor_current_color[3];
+        if (same_rect and same_color) return;
+
+        self.shader_cursor_previous = self.shader_cursor_current;
+        self.shader_cursor_previous_color = self.shader_cursor_current_color;
+        self.shader_cursor_current = rect;
+        self.shader_cursor_current_color = color;
+
+        // iTimeCursorChange is in the same "seconds since shader start"
+        // space as iTime, so recompute from QPC here.
+        if (self.custom_shader_start_qpc != 0) {
+            var freq: c.LARGE_INTEGER = undefined;
+            var now: c.LARGE_INTEGER = undefined;
+            _ = c.QueryPerformanceFrequency(&freq);
+            _ = c.QueryPerformanceCounter(&now);
+            const denom: f64 = @floatFromInt(freq.QuadPart);
+            self.shader_cursor_change_time =
+                @floatCast(@as(f64, @floatFromInt(now.QuadPart - self.custom_shader_start_qpc)) / denom);
+        } else {
+            self.shader_cursor_change_time = 0;
+        }
+    }
+
     /// Populate `custom_shader_uniforms_cb` with Shadertoy-style uniforms
     /// for the current frame. Safe to call every frame; lazily creates
     /// the constant buffer on first use.
@@ -3311,7 +3357,13 @@ pub const Renderer = struct {
         u.iFrame = self.custom_shader_frame_index;
         u.iSampleRate = 44100.0;
         u.iFrameRate = self.custom_shader_ema_frame_rate;
-        // iMouse / iDate stay zero for now; filled in Phase 6.
+        // Ghostty 1.1+ cursor uniforms.
+        u.iCurrentCursor = self.shader_cursor_current;
+        u.iPreviousCursor = self.shader_cursor_previous;
+        u.iCurrentCursorColor = self.shader_cursor_current_color;
+        u.iPreviousCursorColor = self.shader_cursor_previous_color;
+        u.iTimeCursorChange = self.shader_cursor_change_time;
+        // iMouse / iDate stay zero for now.
 
         // Map / Unmap — cheap for a 64-byte dynamic CB.
         const map_fn = ctx_vtbl.*.Map orelse return;

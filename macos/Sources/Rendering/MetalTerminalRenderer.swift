@@ -384,6 +384,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var customShaderStartTimeSec: CFTimeInterval = 0
     private var customShaderLastTimeSec: CFTimeInterval = 0
     private var customShaderEmaFrameRate: Float = 60.0
+    // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
+    private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorChangeTime: Float = 0
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -805,6 +811,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             } else {
                 bufferSets[s].cursorVertexCount = 0
             }
+            updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
         } else {
             bufferSets[s].cursorVertexCount = 0
         }
@@ -846,10 +853,48 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else {
                     bufferSets[s].cursorVertexCount = 0
                 }
+                updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
             } else {
                 bufferSets[s].cursorVertexCount = 0
             }
         }
+    }
+
+    /// Compute the cursor bounding rectangle and color from its raw
+    /// vertex data (NDC coords + straight RGBA) and forward the
+    /// result into the Ghostty cursor uniform state. Cheap — scans at
+    /// most ~12 vertices. Called from the vertex-submit path so the
+    /// next shader draw picks up the new iCurrentCursor /
+    /// iTimeCursorChange immediately.
+    private func updateCursorShaderStateFromVerts(cursorPtr: UnsafeRawPointer, cursorCount: Int) {
+        guard cursorCount > 0 else { return }
+        let verts = cursorPtr.bindMemory(to: Vertex.self, capacity: cursorCount)
+        var minX: Float = verts[0].position.x
+        var maxX: Float = minX
+        var minY: Float = verts[0].position.y
+        var maxY: Float = minY
+        for i in 0..<cursorCount {
+            let p = verts[i].position
+            if p.x < minX { minX = p.x }
+            if p.x > maxX { maxX = p.x }
+            if p.y < minY { minY = p.y }
+            if p.y > maxY { maxY = p.y }
+        }
+        // NDC -> main window drawable px. NDC top is y = +1.
+        let w = Float(backBufferSize.width)
+        let h = Float(backBufferSize.height)
+        let xPx = (minX + 1.0) * 0.5 * w
+        let rightPx = (maxX + 1.0) * 0.5 * w
+        let topPx = (1.0 - maxY) * 0.5 * h
+        let botPx = (1.0 - minY) * 0.5 * h
+        // Ghostty's cursor shaders treat iCurrentCursor.y as the BOTTOM
+        // edge of the cursor rect (center = y - h/2, rect = y-h..y).
+        // Pass bottom-edge so the SDF renders over the actual cursor.
+        let c0 = verts[0].color
+        setCursorShaderState(
+            rect: (xPx, botPx, rightPx - xPx, botPx - topPx),
+            color: (c0.x, c0.y, c0.z, c0.w)
+        )
     }
 
     func setLineSpace(px: Int32) {
@@ -2290,10 +2335,45 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iWindowOffset.1 = Float(windowOffset.y)
         uniforms.iWindowSize.0 = Float(windowSize.width)
         uniforms.iWindowSize.1 = Float(windowSize.height)
-        // iMouse / iDate left zero for now; will be filled in Phase 6.
+        // Ghostty 1.1+ cursor uniforms.
+        uniforms.iCurrentCursor = shaderCursorCurrent
+        uniforms.iPreviousCursor = shaderCursorPrevious
+        uniforms.iCurrentCursorColor = shaderCursorCurrentColor
+        uniforms.iPreviousCursorColor = shaderCursorPreviousColor
+        uniforms.iTimeCursorChange = shaderCursorChangeTime
+        // iMouse / iDate left zero for now.
 
         customShaderFrameIndex &+= 1
         return uniforms
+    }
+
+    /// Ghostty 1.1+ cursor uniform update. rect is (x, y, w, h) in
+    /// drawable pixels within the shader "screen" universe (main
+    /// window's drawable). color is straight RGBA in [0, 1]. No-op
+    /// when incoming state matches the current state, so shaders keep
+    /// seeing the last real change's iTimeCursorChange.
+    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float)) {
+        let sameRect =
+            rect.0 == shaderCursorCurrent.0 &&
+            rect.1 == shaderCursorCurrent.1 &&
+            rect.2 == shaderCursorCurrent.2 &&
+            rect.3 == shaderCursorCurrent.3
+        let sameColor =
+            color.0 == shaderCursorCurrentColor.0 &&
+            color.1 == shaderCursorCurrentColor.1 &&
+            color.2 == shaderCursorCurrentColor.2 &&
+            color.3 == shaderCursorCurrentColor.3
+        if sameRect && sameColor { return }
+
+        shaderCursorPrevious = shaderCursorCurrent
+        shaderCursorPreviousColor = shaderCursorCurrentColor
+        shaderCursorCurrent = rect
+        shaderCursorCurrentColor = color
+        if customShaderStartTimeSec != 0 {
+            shaderCursorChangeTime = Float(CACurrentMediaTime() - customShaderStartTimeSec)
+        } else {
+            shaderCursorChangeTime = 0
+        }
     }
 
     /// Load user-supplied custom post-process shaders listed in config.toml's

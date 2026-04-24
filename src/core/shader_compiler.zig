@@ -94,6 +94,12 @@ const shadertoy_preamble =
     \\    float iFrameRate;
     \\    vec2 iWindowOffset;
     \\    vec2 iWindowSize;
+    \\    // Ghostty 1.1+ cursor uniforms
+    \\    vec4 iCurrentCursor;
+    \\    vec4 iPreviousCursor;
+    \\    vec4 iCurrentCursorColor;
+    \\    vec4 iPreviousCursorColor;
+    \\    float iTimeCursorChange;
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;

@@ -1652,10 +1652,21 @@ pub const zonvie_shader_uniforms = extern struct {
     iFrameRate: f32 = 60.0, // 60..63
     iWindowOffset: [2]f32 = .{ 0, 0 }, // 64..71
     iWindowSize: [2]f32 = .{ 0, 0 }, // 72..79
+    // Cursor state (Ghostty 1.1+ custom-shader compatibility). Rect is
+    // (x, y, w, h) in drawable pixels within the shader "screen"
+    // universe (the main window). Color is straight (non-premultiplied)
+    // RGBA in [0, 1]. iTimeCursorChange is the value of iTime at the
+    // moment the cursor position or color last changed.
+    iCurrentCursor: [4]f32 = .{ 0, 0, 0, 0 }, // 80..95
+    iPreviousCursor: [4]f32 = .{ 0, 0, 0, 0 }, // 96..111
+    iCurrentCursorColor: [4]f32 = .{ 0, 0, 0, 0 }, // 112..127
+    iPreviousCursorColor: [4]f32 = .{ 0, 0, 0, 0 }, // 128..143
+    iTimeCursorChange: f32 = 0, // 144..147
+    _pad_cursor: [3]f32 = .{ 0, 0, 0 }, // 148..159 — keep UBO size %16==0
 };
 
 comptime {
-    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 80);
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 160);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must
