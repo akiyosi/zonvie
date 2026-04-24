@@ -506,7 +506,22 @@ pub const Config = struct {
         if (cfg.shaders) |s| {
             if (s.enabled) |e| self.shaders.enabled = e;
             if (s.post_process) |pp| {
-                if (ShaderPostProcess.fromString(pp)) |v| self.shaders.post_process = v;
+                if (ShaderPostProcess.fromString(pp)) |v| {
+                    // Only `after_bloom` is currently wired up in the
+                    // renderers. Accept the ABI-visible `before_bloom` /
+                    // `replace_bloom` values but log a warning and fall
+                    // back to `after_bloom` so shaders still run instead
+                    // of silently disabling.
+                    if (v != .after_bloom) {
+                        std.debug.print(
+                            "[config] [shaders] post_process = \"{s}\" is not implemented yet; falling back to \"after_bloom\"\n",
+                            .{pp},
+                        );
+                        self.shaders.post_process = .after_bloom;
+                    } else {
+                        self.shaders.post_process = v;
+                    }
+                }
             }
             if (s.paths) |paths_in| {
                 var list: std.ArrayList([]const u8) = .{};
