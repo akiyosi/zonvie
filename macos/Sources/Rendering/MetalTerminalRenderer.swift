@@ -384,6 +384,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var customShaderStartTimeSec: CFTimeInterval = 0
     private var customShaderLastTimeSec: CFTimeInterval = 0
     private var customShaderEmaFrameRate: Float = 60.0
+    /// Ping-pong render targets for multi-pass shader chains. Allocated
+    /// only when pipelines.count > 1. Size matches backBufferSize.
+    private var customShaderPong: [MTLTexture?] = [nil, nil]
+    private var customShaderPongSize: CGSize = .zero
     // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
     private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
@@ -417,6 +421,30 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+    }
+
+    /// Allocate the two ping-pong textures used by multi-pass custom
+    /// shader chains. Size/format must match the drawable so the final
+    /// pass can write the same pixel format the drawable expects.
+    private func ensureCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
+        if customShaderPong[0] != nil,
+           customShaderPong[1] != nil,
+           customShaderPongSize == size {
+            return
+        }
+        let w = max(1, Int(size.width))
+        let h = max(1, Int(size.height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: w,
+            height: h,
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        customShaderPong[0] = device.makeTexture(descriptor: desc)
+        customShaderPong[1] = device.makeTexture(descriptor: desc)
+        customShaderPongSize = size
     }
 
     private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
@@ -1848,30 +1876,42 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // User-supplied custom post-process shaders take over the
             // backTex -> drawable step when configured in `.afterBloom`
             // mode. See ExternalGridView.draw for the external-grid path.
+            // Multi-pass chains ping-pong between customShaderPong[0/1];
+            // the final pass writes straight into the drawable.
             var customShaderHandled = false
             if !customShaderPipelines.isEmpty,
                customShaderPostProcess == .afterBloom,
                let copyVB = copyVertexBuffer,
-               let bilinSamp = bilinearSampler,
-               let pipeline = customShaderPipelines.first
+               let bilinSamp = bilinearSampler
             {
-                // Main window is its own "screen" — offset 0, size equals
-                // resolution, so user shaders see exactly the same coord
-                // space they would with the pre-unification preamble.
                 let uniforms = makeCustomShaderUniforms(
                     screenResolution: view.drawableSize,
                     windowOffset: .zero,
                     windowSize: view.drawableSize
                 )
-                pipeline.encode(
-                    cmd: cmd,
-                    input: backTex,
-                    output: drawable.texture,
-                    copyVertexBuffer: copyVB,
-                    sampler: bilinSamp,
-                    uniforms: uniforms
-                )
-                customShaderHandled = true
+                let pipelines = customShaderPipelines
+                if pipelines.count > 1 {
+                    ensureCustomShaderPong(size: view.drawableSize, pixelFormat: drawable.texture.pixelFormat)
+                }
+                let pongsReady =
+                    pipelines.count <= 1
+                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
+                if pongsReady {
+                    for (i, pipeline) in pipelines.enumerated() {
+                        let isLast = (i == pipelines.count - 1)
+                        let inputTex: MTLTexture = (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
+                        let outputTex: MTLTexture = isLast ? drawable.texture : customShaderPong[i % 2]!
+                        pipeline.encode(
+                            cmd: cmd,
+                            input: inputTex,
+                            output: outputTex,
+                            copyVertexBuffer: copyVB,
+                            sampler: bilinSamp,
+                            uniforms: uniforms
+                        )
+                    }
+                    customShaderHandled = true
+                }
             }
 
             if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {

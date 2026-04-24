@@ -257,6 +257,15 @@ pub const Renderer = struct {
     custom_shader_scratch_srv: ?*c.ID3D11ShaderResourceView = null,
     custom_shader_scratch_w: u32 = 0,
     custom_shader_scratch_h: u32 = 0,
+    // Ping-pong render targets for multi-pass shader chains. Only
+    // allocated when paths.len > 1. Each pass reads its input from
+    // (scratch | pong_a | pong_b) and writes to the next pong or the
+    // swapchain backbuffer on the final pass.
+    custom_shader_pong_tex: [2]?*c.ID3D11Texture2D = .{ null, null },
+    custom_shader_pong_srv: [2]?*c.ID3D11ShaderResourceView = .{ null, null },
+    custom_shader_pong_rtv: [2]?*c.ID3D11RenderTargetView = .{ null, null },
+    custom_shader_pong_w: u32 = 0,
+    custom_shader_pong_h: u32 = 0,
     // Shadertoy uniform block (64 bytes, std140). Bound to register(b1)
     // in the SPIRV-Cross-emitted HLSL. Dynamic usage so UpdateSubresource
     // or Map/Unmap can refresh it each frame; single buffer is fine for
@@ -509,6 +518,9 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.deinit(self.alloc);
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
+        for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+        for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+        for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         safeRelease(&self.custom_shader_uniforms_cb);
 
         safeRelease(&self.vb);
@@ -658,12 +670,18 @@ pub const Renderer = struct {
         safeRelease(&self.back_tex);
         safeRelease(&self.scroll_staging_tex);
         safeRelease(&self.clear_row_vb);
-        // Scratch belongs to the old back buffer's size/format; drop it
-        // and let ensureCustomShaderScratch rebuild on the next draw.
+        // Scratch + ping-pong textures belong to the old back buffer's
+        // size/format; drop them and let the shader pass rebuild on
+        // the next draw.
         safeRelease(&self.custom_shader_scratch_srv);
         safeRelease(&self.custom_shader_scratch_tex);
         self.custom_shader_scratch_w = 0;
         self.custom_shader_scratch_h = 0;
+        for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+        for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+        for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
+        self.custom_shader_pong_w = 0;
+        self.custom_shader_pong_h = 0;
 
         const sc = self.swapchain.?;
         const sc_vtbl = sc.*.lpVtbl;
@@ -3023,6 +3041,76 @@ pub const Renderer = struct {
         self.custom_shader_scratch_h = back_desc.Height;
     }
 
+    /// Ensure two ping-pong textures (render-target + shader-resource
+    /// bound) matching back_tex's size/format exist. Only needed when
+    /// the custom shader chain has more than one pass.
+    fn ensureCustomShaderPong(self: *Renderer) void {
+        if (self.custom_shader_pong_tex[0] != null
+            and self.custom_shader_pong_tex[1] != null
+            and self.custom_shader_pong_w == self.width
+            and self.custom_shader_pong_h == self.height) return;
+
+        for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+        for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+        for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
+
+        const dev = self.device orelse return;
+        const back = self.back_tex orelse return;
+
+        var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+        const back_vtbl = back.*.lpVtbl;
+        const get_desc = back_vtbl.*.GetDesc orelse return;
+        get_desc(back, &back_desc);
+
+        var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        td.Width = back_desc.Width;
+        td.Height = back_desc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = back_desc.Format;
+        td.SampleDesc.Count = 1;
+        td.Usage = c.D3D11_USAGE_DEFAULT;
+        td.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
+
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_tex = dev_vtbl.*.CreateTexture2D orelse return;
+        const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return;
+        const create_rtv = dev_vtbl.*.CreateRenderTargetView orelse return;
+
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) {
+                for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+                for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+                for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
+                return;
+            }
+            var srv_i: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv_i)) or srv_i == null) {
+                safeRelease(&tex);
+                for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+                for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+                for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
+                return;
+            }
+            var rtv_i: ?*c.ID3D11RenderTargetView = null;
+            if (c.FAILED(create_rtv(dev, @ptrCast(tex.?), null, &rtv_i)) or rtv_i == null) {
+                safeRelease(&srv_i);
+                safeRelease(&tex);
+                for (&self.custom_shader_pong_srv) |*s| safeRelease(s);
+                for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
+                for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
+                return;
+            }
+            self.custom_shader_pong_tex[i] = tex;
+            self.custom_shader_pong_srv[i] = srv_i;
+            self.custom_shader_pong_rtv[i] = rtv_i;
+        }
+        self.custom_shader_pong_w = back_desc.Width;
+        self.custom_shader_pong_h = back_desc.Height;
+    }
+
     /// Load user-supplied custom post-process shaders: read each GLSL file
     /// listed in config, cross-compile to HLSL via the core C ABI, then
     /// D3DCompile to a pixel shader. Called once after renderer init.
@@ -3391,12 +3479,8 @@ pub const Renderer = struct {
         ctx: *c.ID3D11DeviceContext,
         ctx_vtbl: anytype,
     ) bool {
-        if (self.custom_shader_pipelines.items.len == 0) return false;
-        const pipeline = self.custom_shader_pipelines.items[0];
-        const ps = pipeline.pixel_shader orelse {
-            if (applog.isEnabled()) applog.appLog("[CustomShader] skip: ps null\n", .{});
-            return false;
-        };
+        const pipelines = self.custom_shader_pipelines.items;
+        if (pipelines.len == 0) return false;
         const back = self.back_tex orelse {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: back_tex null\n", .{});
             return false;
@@ -3419,6 +3503,7 @@ pub const Renderer = struct {
         };
 
         self.ensureCustomShaderScratch();
+        if (pipelines.len > 1) self.ensureCustomShaderPong();
         self.updateCustomShaderUniforms(ctx, ctx_vtbl);
         const scratch = self.custom_shader_scratch_tex orelse {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: scratch_tex null\n", .{});
@@ -3428,42 +3513,57 @@ pub const Renderer = struct {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: scratch_srv null\n", .{});
             return false;
         };
+        // For multi-pass chains we need the ping-pong render targets.
+        if (pipelines.len > 1) {
+            if (self.custom_shader_pong_tex[0] == null or self.custom_shader_pong_tex[1] == null) {
+                if (applog.isEnabled()) applog.appLog("[CustomShader] skip: pong textures unavailable\n", .{});
+                return false;
+            }
+        }
 
         if (applog.isEnabled()) {
-            applog.appLog("[CustomShader] draw pass w={d} h={d} back=0x{x} scratch=0x{x}\n", .{ self.width, self.height, @intFromPtr(back), @intFromPtr(scratch) });
+            applog.appLog("[CustomShader] draw pass w={d} h={d} passes={d} back=0x{x} scratch=0x{x}\n", .{ self.width, self.height, pipelines.len, @intFromPtr(back), @intFromPtr(scratch) });
         }
 
         const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
 
-        // Unbind everything from render-target / SRV slots BEFORE copying
-        // back_tex into scratch. back_tex was almost certainly still bound
-        // as an RTV from the previous pass (main grid or bloom composite);
-        // issuing CopyResource on a currently-bound render target forces
-        // the driver to hazard-track the copy and can leave scratch
-        // partially populated on some Windows GPU drivers, which then
-        // shows up as `texture(iChannel0, uv)` returning zero — the
-        // classic "shader runs, terminal text vanishes" symptom.
+        // Unbind RTVs/SRVs before copying back_tex — a copy on a still-
+        // bound RTV turns into hazard-tracked work that has been
+        // observed leaving scratch partially populated on some Windows
+        // drivers.
         set_rtvs(ctx, 0, null, null);
         if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
             var null_srv: [1]?*c.ID3D11ShaderResourceView = .{ null };
             set_srvs(ctx, 0, 1, &null_srv[0]);
         }
 
-        // Copy back -> scratch so the pixel shader can read from a
-        // resource that is not currently bound as an RTV.
+        // Copy back -> scratch so the first pass has a stable read
+        // source. back_tex itself is never rebound as an RTV by this
+        // method, so the next frame's sample still reflects the real
+        // terminal content instead of our own output.
         if (ctx_vtbl.*.CopyResource) |copy_res| {
             copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
         } else return false;
 
-        // Re-bind: scratch SRV as input, swapchain bb RTV as output.
-        // Writing to bb directly (instead of back_rtv) leaves back_tex
-        // pristine for the next frame's shader sample — no recursion.
-        var rtvs: [1]?*c.ID3D11RenderTargetView = .{ out_rtv };
-        set_rtvs(ctx, 1, &rtvs[0], null);
-
-        // Full viewport + scissor. Previous passes may have left a
-        // restricted scissor rect that would clip this pass to a
-        // sub-region and present stale RT content elsewhere.
+        // Shared pipeline/state setup (shared by every pass).
+        if (ctx_vtbl.*.IASetPrimitiveTopology) |set_topo| {
+            set_topo(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        if (ctx_vtbl.*.IASetInputLayout) |set_il| set_il(ctx, null);
+        if (ctx_vtbl.*.VSSetShader) |set_vs| set_vs(ctx, vs_fs, null, 0);
+        if (ctx_vtbl.*.PSSetSamplers) |set_samplers| {
+            var samps: [1]?*c.ID3D11SamplerState = .{ sampler };
+            set_samplers(ctx, 0, 1, &samps[0]);
+        }
+        if (self.custom_shader_uniforms_cb) |cb| {
+            if (ctx_vtbl.*.PSSetConstantBuffers) |set_cbs| {
+                var cbs: [1]?*c.ID3D11Buffer = .{ cb };
+                set_cbs(ctx, 1, 1, &cbs[0]);
+            }
+        }
+        if (ctx_vtbl.*.OMSetBlendState) |set_blend| {
+            set_blend(ctx, null, null, 0xFFFFFFFF);
+        }
         if (ctx_vtbl.*.RSSetViewports) |set_vp| {
             var vp: c.D3D11_VIEWPORT = .{
                 .TopLeftX = 0,
@@ -3485,45 +3585,55 @@ pub const Renderer = struct {
             set_sr(ctx, 1, &sr);
         }
 
-        if (ctx_vtbl.*.IASetPrimitiveTopology) |set_topo| {
-            set_topo(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        }
-        if (ctx_vtbl.*.IASetInputLayout) |set_il| set_il(ctx, null);
-        if (ctx_vtbl.*.VSSetShader) |set_vs| set_vs(ctx, vs_fs, null, 0);
-        // Use the user's compiled PS (SPIRV-Cross HLSL → D3DCompile blob).
-        const ps_eff: *c.ID3D11PixelShader = ps;
-        if (ctx_vtbl.*.PSSetShader) |set_ps| set_ps(ctx, ps_eff, null, 0);
-        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
-            var srvs: [1]?*c.ID3D11ShaderResourceView = .{ scratch_srv };
-            set_srvs(ctx, 0, 1, &srvs[0]);
-        }
-        if (ctx_vtbl.*.PSSetSamplers) |set_samplers| {
-            var samps: [1]?*c.ID3D11SamplerState = .{ sampler };
-            set_samplers(ctx, 0, 1, &samps[0]);
-        }
-        // Bind Shadertoy uniforms at register(b1) per SPIRV-Cross HLSL
-        // convention for `layout(std140, binding = 1)`.
-        if (self.custom_shader_uniforms_cb) |cb| {
-            if (ctx_vtbl.*.PSSetConstantBuffers) |set_cbs| {
-                var cbs: [1]?*c.ID3D11Buffer = .{ cb };
-                set_cbs(ctx, 1, 1, &cbs[0]);
-            }
-        }
-        if (ctx_vtbl.*.OMSetBlendState) |set_blend| {
-            set_blend(ctx, null, null, 0xFFFFFFFF);
-        }
-        if (ctx_vtbl.*.Draw) |draw_fn| draw_fn(ctx, 3, 0);
+        // Run each pass in order, ping-ponging between pong[0]/pong[1]
+        // until the final pass, which writes directly to bb.
+        const set_srvs_fn = ctx_vtbl.*.PSSetShaderResources orelse return false;
+        const set_ps_fn = ctx_vtbl.*.PSSetShader orelse return false;
+        const draw_fn = ctx_vtbl.*.Draw orelse return false;
 
-        // Restore the main grid pipeline state. drawCustomShaderPass is
-        // invoked from the present path, but any later pass in the same
-        // frame (cursor overlay re-entry, scrollbar, bloom on the next
-        // frame's drawEx prologue before it rebinds) would otherwise
-        // inherit the custom shader's VS/PS/slot0 SRV and render garbage
-        // glyph data.
-        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
-            var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.atlas_srv };
-            set_srvs(ctx, 0, 1, &atlas_srvs[0]);
+        for (pipelines, 0..) |pipeline, i| {
+            const ps_i = pipeline.pixel_shader orelse {
+                if (applog.isEnabled()) applog.appLog("[CustomShader] skip pass {d}: ps null\n", .{i});
+                continue;
+            };
+
+            const is_last = (i == pipelines.len - 1);
+            const input_srv: *c.ID3D11ShaderResourceView = blk: {
+                if (i == 0) break :blk scratch_srv;
+                const prev_idx = (i - 1) % 2;
+                break :blk self.custom_shader_pong_srv[prev_idx] orelse {
+                    if (applog.isEnabled()) applog.appLog("[CustomShader] skip pass {d}: pong_srv[{d}] null\n", .{ i, prev_idx });
+                    return false;
+                };
+            };
+            const output_rtv: *c.ID3D11RenderTargetView = blk: {
+                if (is_last) break :blk out_rtv;
+                const cur_idx = i % 2;
+                break :blk self.custom_shader_pong_rtv[cur_idx] orelse {
+                    if (applog.isEnabled()) applog.appLog("[CustomShader] skip pass {d}: pong_rtv[{d}] null\n", .{ i, cur_idx });
+                    return false;
+                };
+            };
+
+            // Unbind slot 0 SRV first: the previous pass's output
+            // texture must not be simultaneously an RTV and an SRV.
+            var null_srv: [1]?*c.ID3D11ShaderResourceView = .{ null };
+            set_srvs_fn(ctx, 0, 1, &null_srv[0]);
+
+            var rtvs_i: [1]?*c.ID3D11RenderTargetView = .{ output_rtv };
+            set_rtvs(ctx, 1, &rtvs_i[0], null);
+
+            var in_srvs: [1]?*c.ID3D11ShaderResourceView = .{ input_srv };
+            set_srvs_fn(ctx, 0, 1, &in_srvs[0]);
+
+            set_ps_fn(ctx, ps_i, null, 0);
+            draw_fn(ctx, 3, 0);
         }
+
+        // Restore the main grid pipeline state so later overlays /
+        // next-frame prologue don't inherit the custom shader's bindings.
+        var atlas_srvs: [1]?*c.ID3D11ShaderResourceView = .{ self.atlas_srv };
+        set_srvs_fn(ctx, 0, 1, &atlas_srvs[0]);
         if (ctx_vtbl.*.VSSetShader) |set_vs| {
             if (self.vs) |vs_main| set_vs(ctx, vs_main, null, 0);
         }

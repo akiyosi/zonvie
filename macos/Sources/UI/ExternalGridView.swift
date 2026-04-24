@@ -147,6 +147,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Persistent back buffer for partial redraw and GPU scroll copy
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
+    /// Ping-pong render targets for multi-pass custom shader chains.
+    /// Allocated lazily inside draw() when pipelines.count > 1.
+    private var customShaderPong: [MTLTexture?] = [nil, nil]
+    private var customShaderPongSize: CGSize = .zero
     private var scrollScratchTexture: MTLTexture? = nil
     private var scrollScratchSize: CGSize = .zero
 
@@ -677,7 +681,34 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         desc.storageMode = .private
         backBuffer = mtlDevice.makeTexture(descriptor: desc)
         backBufferSize = drawableSize
+        // Drop ping-pong too — it must match the drawable.
+        customShaderPong[0] = nil
+        customShaderPong[1] = nil
+        customShaderPongSize = .zero
         hasPresentedOnce = false
+    }
+
+    /// Allocate the two ping-pong textures used by multi-pass custom
+    /// shader chains applied to this external view's backTex.
+    private func ensureExternalCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
+        if customShaderPong[0] != nil,
+           customShaderPong[1] != nil,
+           customShaderPongSize == size {
+            return
+        }
+        let w = max(1, Int(size.width))
+        let h = max(1, Int(size.height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: w,
+            height: h,
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        customShaderPong[0] = mtlDevice.makeTexture(descriptor: desc)
+        customShaderPong[1] = mtlDevice.makeTexture(descriptor: desc)
+        customShaderPongSize = size
     }
 
     private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
@@ -1438,29 +1469,46 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                let copyVB = renderer.copyVertexBuffer,
                let bilinSamp = renderer.bilinearSampler
             {
-                if let pipeline = renderer.customShaderPipelines.first {
-                    // Screen-space unification: use the MAIN window's
-                    // drawable as the shader's iResolution, and tell the
-                    // shader where this external view sits inside that
-                    // coordinate space so effects (stars, gradients,
-                    // spotlights) line up across all windows.
-                    let (screenRes, windowOffset) = screenSpaceParameters(
-                        mainView: mainTerminalView,
-                        selfView: self
+                // Screen-space unification: use the MAIN window's
+                // drawable as the shader's iResolution, and tell the
+                // shader where this external view sits inside that
+                // coordinate space so effects (stars, gradients,
+                // spotlights) line up across all windows.
+                let (screenRes, windowOffset) = screenSpaceParameters(
+                    mainView: mainTerminalView,
+                    selfView: self
+                )
+                let uniforms = renderer.makeCustomShaderUniforms(
+                    screenResolution: screenRes,
+                    windowOffset: windowOffset,
+                    windowSize: view.drawableSize
+                )
+                let pipelines = renderer.customShaderPipelines
+                if pipelines.count > 1 {
+                    ensureExternalCustomShaderPong(
+                        size: view.drawableSize,
+                        pixelFormat: drawable.texture.pixelFormat
                     )
-                    let uniforms = renderer.makeCustomShaderUniforms(
-                        screenResolution: screenRes,
-                        windowOffset: windowOffset,
-                        windowSize: view.drawableSize
-                    )
-                    pipeline.encode(
-                        cmd: cmd,
-                        input: backTex,
-                        output: drawable.texture,
-                        copyVertexBuffer: copyVB,
-                        sampler: bilinSamp,
-                        uniforms: uniforms
-                    )
+                }
+                let pongsReady =
+                    pipelines.count <= 1
+                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
+                if pongsReady {
+                    for (i, pipeline) in pipelines.enumerated() {
+                        let isLast = (i == pipelines.count - 1)
+                        let inputTex: MTLTexture =
+                            (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
+                        let outputTex: MTLTexture =
+                            isLast ? drawable.texture : customShaderPong[i % 2]!
+                        pipeline.encode(
+                            cmd: cmd,
+                            input: inputTex,
+                            output: outputTex,
+                            copyVertexBuffer: copyVB,
+                            sampler: bilinSamp,
+                            uniforms: uniforms
+                        )
+                    }
                     customShaderHandled = true
                 }
             } else {
