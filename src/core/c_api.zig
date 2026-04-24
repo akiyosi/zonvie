@@ -1644,6 +1644,9 @@ pub const zonvie_shader_target = enum(u8) {
 pub const zonvie_shader_uniforms = extern struct {
     iResolution: [3]f32 = .{ 0, 0, 0 }, // 0..11
     iTime: f32 = 0, // 12..15 (packs into iResolution's trailing std140 slot)
+    // Shadertoy iMouse (xy = cursor px, zw = click px). NOT implemented
+    // today — the frontends never update this block, so shaders that
+    // read iMouse see all zeroes. Kept in the ABI for future plumbing.
     iMouse: [4]f32 = .{ 0, 0, 0, 0 }, // 16..31
     iDate: [4]f32 = .{ 0, 0, 0, 0 }, // 32..47
     iTimeDelta: f32 = 0, // 48..51

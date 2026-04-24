@@ -1265,7 +1265,10 @@ typedef enum {
 typedef struct zonvie_shader_uniforms {
     float    iResolution[3];          /* 0..11   xy = main window drawable px, z = pixel aspect */
     float    iTime;                   /* 12..15  seconds since shader start */
-    float    iMouse[4];               /* 16..31  xy = cursor px, zw = click px */
+    float    iMouse[4];               /* 16..31  Shadertoy iMouse (xy = cursor px, zw = click px).
+                                                   NOT implemented — always zero. Mouse plumbing
+                                                   lands in a later revision; shaders that read iMouse
+                                                   see (0, 0, 0, 0) today. */
     float    iDate[4];                /* 32..47  year, month, day, seconds in day */
     float    iTimeDelta;              /* 48..51  seconds since previous frame */
     int32_t  iFrame;                  /* 52..55  frame counter */
