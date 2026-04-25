@@ -2381,14 +2381,39 @@ pub export fn WndProc(
                     if (app.renderer) |*r| {
                         r.presentShaderAnimationFrame();
                     }
+                    // Iterating external_windows under app.mu while
+                    // calling Present on each renderer would self-
+                    // deadlock if DXGI's Present pumps a message whose
+                    // handler also locks app.mu (close, resize,
+                    // repaint, etc.). Snapshot the renderers under
+                    // the lock and bump paint_ref_count so concurrent
+                    // close handlers wait, then drop the lock for the
+                    // actual presents. finishExternalWindowPaint
+                    // releases the ref + drives any deferred close.
+                    const MaxExt: usize = 32;
+                    var ext_grids: [MaxExt]i64 = undefined;
+                    var ext_renderers: [MaxExt]*d3d11.Renderer = undefined;
+                    var ext_count: usize = 0;
                     app.mu.lock();
-                    defer app.mu.unlock();
                     var it = app.external_windows.iterator();
                     while (it.next()) |entry| {
+                        if (ext_count >= MaxExt) break;
                         const ew = entry.value_ptr;
-                        if (!ew.is_pending_close) {
-                            ew.renderer.presentShaderAnimationFrame();
-                        }
+                        if (ew.is_pending_close) continue;
+                        ew.paint_ref_count += 1;
+                        ext_grids[ext_count] = entry.key_ptr.*;
+                        ext_renderers[ext_count] = &ew.renderer;
+                        ext_count += 1;
+                    }
+                    app.mu.unlock();
+
+                    var i: usize = 0;
+                    while (i < ext_count) : (i += 1) {
+                        ext_renderers[i].presentShaderAnimationFrame();
+                    }
+                    var j: usize = 0;
+                    while (j < ext_count) : (j += 1) {
+                        external_windows.finishExternalWindowPaint(app, ext_grids[j]);
                     }
                 }
             } else if (wParam == TIMER_DEVCONTAINER_POLL) {
