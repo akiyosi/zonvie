@@ -612,6 +612,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     memcpy(buf.contents(), validPtr, byteCount)
                     cursorVertexCount = count
                 }
+                // Forward the cursor rect into the main renderer's
+                // shader cursor state so cursor shaders running through
+                // any HWND see the active (cmdline / popupmenu / float)
+                // cursor instead of the main grid's stale cursor. Verts
+                // arrive in this view's local NDC; translate to main
+                // window drawable px using the same screen-space
+                // parameters the shader uniforms use.
+                forwardExternalCursorToMainShader(ptr: validPtr, count: count)
             } else {
                 cursorVertexCount = 0
             }
@@ -690,6 +698,52 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         customShaderPong[1] = nil
         customShaderPongSize = .zero
         hasPresentedOnce = false
+    }
+
+    /// Translate this view's cursor verts (NDC, view-local) into the
+    /// main window's drawable px and forward to the main renderer's
+    /// shader cursor state. Without this, cursor shaders see the main
+    /// grid's stale cursor while the user is editing the cmdline /
+    /// popupmenu / a float window.
+    private func forwardExternalCursorToMainShader(ptr: UnsafePointer<zonvie_vertex>, count: Int) {
+        guard count > 0 else { return }
+        guard let mainView = mainTerminalView,
+              let renderer = mainView.renderer else { return }
+        // Same screen-space parameters the shader uniforms use, so the
+        // cursor rect lands in the same coordinate system the shader
+        // resolves against.
+        let (screenRes, windowOffset) = screenSpaceParameters(
+            mainView: mainView,
+            selfView: self
+        )
+        // Convert NDC bounding box to main drawable pixels.
+        var minX: Float = ptr[0].position.0
+        var maxX: Float = minX
+        var minY: Float = ptr[0].position.1
+        var maxY: Float = minY
+        for i in 0..<count {
+            let p = ptr[i].position
+            if p.0 < minX { minX = p.0 }
+            if p.0 > maxX { maxX = p.0 }
+            if p.1 < minY { minY = p.1 }
+            if p.1 > maxY { maxY = p.1 }
+        }
+        let extW = Float(self.drawableSize.width)
+        let extH = Float(self.drawableSize.height)
+        let offX = Float(windowOffset.x)
+        let offY = Float(windowOffset.y)
+        let leftPx = offX + (minX + 1.0) * 0.5 * extW
+        let rightPx = offX + (maxX + 1.0) * 0.5 * extW
+        let topPx = offY + (1.0 - maxY) * 0.5 * extH
+        let botPx = offY + (1.0 - minY) * 0.5 * extH
+        // Ghostty's cursor shaders treat iCurrentCursor.y as the
+        // BOTTOM edge of the cursor rect (rect spans y-h..y).
+        let c0 = ptr[0].color
+        renderer.setCursorShaderState(
+            rect: (leftPx, botPx, rightPx - leftPx, botPx - topPx),
+            color: (c0.0, c0.1, c0.2, c0.3)
+        )
+        _ = screenRes
     }
 
     /// Allocate the two ping-pong textures used by multi-pass custom

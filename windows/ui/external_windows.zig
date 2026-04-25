@@ -2089,21 +2089,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         screen_w = main_r.width;
                         screen_h = main_r.height;
                     }
-                    // Mirror cursor uniforms + iTime origin from main
-                    // so cursor shaders work in cmdline / popupmenu /
-                    // float windows. Without this, ext renderers see
-                    // (0, 0, 0, 0) for iCurrentCursor and a separate
-                    // iTime origin, so iTime - iTimeCursorChange ends
-                    // up nonsense for shaders rendered through the ext
-                    // renderer's shader pass.
-                    if (main_r.custom_shader_start_qpc != 0) {
-                        g_sh.custom_shader_start_qpc = main_r.custom_shader_start_qpc;
-                    }
-                    g_sh.shader_cursor_current = main_r.shader_cursor_current;
-                    g_sh.shader_cursor_previous = main_r.shader_cursor_previous;
-                    g_sh.shader_cursor_current_color = main_r.shader_cursor_current_color;
-                    g_sh.shader_cursor_previous_color = main_r.shader_cursor_previous_color;
-                    g_sh.shader_cursor_change_time = main_r.shader_cursor_change_time;
                 }
                 // Use each HWND's client-area origin rather than
                 // GetWindowRect. GetWindowRect includes any window
@@ -2119,6 +2104,59 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
                     off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
                     off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
+                }
+                // If this ext surface holds the active cursor (cmdline
+                // / popupmenu / float window currently has focus),
+                // forward its rect into the main renderer's shader
+                // cursor state so cursor shaders track the visible
+                // cursor instead of the main grid's stale cursor. The
+                // ext verts are in this view's local NDC; translate
+                // to main-window drawable px using the offset above.
+                const ext_cursor_verts = ext_win.surface.cursor_verts.items;
+                if (ext_cursor_verts.len != 0) {
+                    if (app.renderer) |*main_r2| {
+                        var minx_c: f32 = ext_cursor_verts[0].position[0];
+                        var maxx_c: f32 = minx_c;
+                        var miny_c: f32 = ext_cursor_verts[0].position[1];
+                        var maxy_c: f32 = miny_c;
+                        for (ext_cursor_verts) |v| {
+                            if (v.position[0] < minx_c) minx_c = v.position[0];
+                            if (v.position[0] > maxx_c) maxx_c = v.position[0];
+                            if (v.position[1] < miny_c) miny_c = v.position[1];
+                            if (v.position[1] > maxy_c) maxy_c = v.position[1];
+                        }
+                        const ext_w_f: f32 = @floatFromInt(g_sh.width);
+                        const ext_h_f: f32 = @floatFromInt(g_sh.height);
+                        const left_main = off_x + (minx_c + 1.0) * 0.5 * ext_w_f;
+                        const right_main = off_x + (maxx_c + 1.0) * 0.5 * ext_w_f;
+                        const top_main = off_y + (1.0 - maxy_c) * 0.5 * ext_h_f;
+                        const bot_main = off_y + (1.0 - miny_c) * 0.5 * ext_h_f;
+                        // Ghostty's cursor shaders treat iCurrentCursor.y
+                        // as the BOTTOM edge of the cursor rect.
+                        const cv0 = ext_cursor_verts[0];
+                        main_r2.setCursorShaderState(
+                            .{ left_main, bot_main, right_main - left_main, bot_main - top_main },
+                            cv0.color,
+                        );
+                    }
+                }
+
+                if (app.renderer) |*main_r3| {
+                    // Mirror cursor uniforms + iTime origin from main
+                    // so cursor shaders work in cmdline / popupmenu /
+                    // float windows. Without this, ext renderers see
+                    // (0, 0, 0, 0) for iCurrentCursor and a separate
+                    // iTime origin, so iTime - iTimeCursorChange ends
+                    // up nonsense for shaders rendered through the ext
+                    // renderer's shader pass.
+                    if (main_r3.custom_shader_start_qpc != 0) {
+                        g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
+                    }
+                    g_sh.shader_cursor_current = main_r3.shader_cursor_current;
+                    g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
+                    g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
+                    g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
+                    g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
                 }
             }
             g_sh.shader_screen_w = screen_w;
