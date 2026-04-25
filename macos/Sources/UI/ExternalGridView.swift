@@ -732,10 +732,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let extH = Float(self.drawableSize.height)
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
-        let leftPx = offX + (minX + 1.0) * 0.5 * extW
-        let rightPx = offX + (maxX + 1.0) * 0.5 * extW
-        let topPx = offY + (1.0 - maxY) * 0.5 * extH
-        let botPx = offY + (1.0 - minY) * 0.5 * extH
+        // Position the cursor at the NDC center, but size it using the
+        // main grid's cell metrics. ext-cmdline / popupmenu drawables
+        // are often taller than a single cell (multi-row prompt /
+        // padding), and cursor verts always span NDC y = -1..+1
+        // regardless. Translating that NDC range across the full
+        // drawable height makes the cursor SDF render at the
+        // ext drawable's height (e.g., 88 px) instead of the actual
+        // cell height (~40 px), so cursor_blaze and friends look
+        // vertically stretched on those surfaces.
+        let centerPxX = offX + (minX + maxX + 2.0) * 0.25 * extW
+        let centerPxY = offY + (2.0 - minY - maxY) * 0.25 * extH
+        let cellW = renderer.cellWidthPx
+        let cellH = renderer.cellHeightPx
+        let leftPx = centerPxX - cellW * 0.5
+        let rightPx = centerPxX + cellW * 0.5
+        let topPx = centerPxY - cellH * 0.5
+        let botPx = centerPxY + cellH * 0.5
         // Ghostty's cursor shaders treat iCurrentCursor.y as the
         // BOTTOM edge of the cursor rect (rect spans y-h..y).
         let c0 = ptr[0].color
@@ -743,7 +756,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rect: (leftPx, botPx, rightPx - leftPx, botPx - topPx),
             color: (c0.0, c0.1, c0.2, c0.3)
         )
-        _ = screenRes
     }
 
     /// Allocate the two ping-pong textures used by multi-pass custom

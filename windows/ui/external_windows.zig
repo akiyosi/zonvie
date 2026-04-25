@@ -2127,10 +2127,23 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         }
                         const ext_w_f: f32 = @floatFromInt(g_sh.width);
                         const ext_h_f: f32 = @floatFromInt(g_sh.height);
-                        const left_main = off_x + (minx_c + 1.0) * 0.5 * ext_w_f;
-                        const right_main = off_x + (maxx_c + 1.0) * 0.5 * ext_w_f;
-                        const top_main = off_y + (1.0 - maxy_c) * 0.5 * ext_h_f;
-                        const bot_main = off_y + (1.0 - miny_c) * 0.5 * ext_h_f;
+                        // Position the cursor at the NDC center, but
+                        // size it using main grid's cell metrics. ext
+                        // cmdline / popupmenu drawables are often
+                        // taller than a single cell (multi-row
+                        // prompt / padding) and cursor verts span the
+                        // full NDC y = -1..+1, so translating that
+                        // across the full ext drawable height makes
+                        // the cursor SDF render at the drawable's
+                        // height instead of the actual cell height.
+                        const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
+                        const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
+                        const cell_w: f32 = @floatFromInt(app.cell_w_px);
+                        const cell_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
+                        const left_main = center_x - cell_w * 0.5;
+                        const right_main = center_x + cell_w * 0.5;
+                        const top_main = center_y - cell_h * 0.5;
+                        const bot_main = center_y + cell_h * 0.5;
                         // Ghostty's cursor shaders treat iCurrentCursor.y
                         // as the BOTTOM edge of the cursor rect.
                         const cv0 = ext_cursor_verts[0];
