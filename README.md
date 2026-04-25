@@ -198,6 +198,19 @@ atlas_size = 2048
 disable_on_activate = false
 disable_on_modechange = false
 option_as_meta = "both"  # "both", "none", "only_left", "only_right"
+
+[shaders]
+enabled = false
+post_process = "after_bloom"  # only "after_bloom" is implemented today
+# Drop-in compatible with Shadertoy / Ghostty GLSL shaders. Multiple
+# entries form a chain: each shader's output feeds the next; the
+# final pass writes to the swapchain. Paths MUST be absolute — they
+# are opened verbatim, so launches from Finder / Explorer (whose
+# CWD is set to the system root) won't find relative entries.
+paths = [
+    # "/absolute/path/to/your/ghostty-shaders/starfield.glsl",
+    # "/absolute/path/to/your/ghostty-shaders/cursor_blaze.glsl",
+]
 ```
 
 ### Configuration Options
@@ -299,6 +312,24 @@ Message routing rules are processed in order; first match wins.
 | `disable_on_activate` | Disable IME when app becomes active (true/false) |
 | `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
 | `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
+
+#### [shaders]
+| Key | Description |
+|-----|-------------|
+| `enabled` | Enable user-supplied custom GLSL post-process shaders (true/false) |
+| `post_process` | Where the chain runs: `"after_bloom"` (only implemented mode); `"before_bloom"` / `"replace_bloom"` are accepted but warn + fall back to `after_bloom` |
+| `paths` | Array of GLSL file paths. **Absolute paths only** — entries are opened verbatim, so launches from Finder / Explorer break with relative paths. Multiple entries form a chain: each pass's output feeds the next; the final pass writes to the swapchain. Drop-in compatible with Shadertoy / Ghostty shader source. |
+
+Supported uniforms (Shadertoy + Ghostty 1.1+):
+`iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iSampleRate`,
+`iDate`, `iWindowOffset`, `iWindowSize` (drop-in for ext windows),
+`iCurrentCursor`, `iPreviousCursor`, `iCurrentCursorColor`,
+`iPreviousCursorColor`, `iTimeCursorChange`. `iMouse` is reserved but
+currently unimplemented (always zero).
+
+`iChannel0` aliases the terminal contents (back buffer) so existing
+Ghostty / Shadertoy shaders that sample `texture(iChannel0, uv)`
+work without modification.
 
 ## Neovim Integration
 
