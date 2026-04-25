@@ -2089,6 +2089,21 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         screen_w = main_r.width;
                         screen_h = main_r.height;
                     }
+                    // Mirror cursor uniforms + iTime origin from main
+                    // so cursor shaders work in cmdline / popupmenu /
+                    // float windows. Without this, ext renderers see
+                    // (0, 0, 0, 0) for iCurrentCursor and a separate
+                    // iTime origin, so iTime - iTimeCursorChange ends
+                    // up nonsense for shaders rendered through the ext
+                    // renderer's shader pass.
+                    if (main_r.custom_shader_start_qpc != 0) {
+                        g_sh.custom_shader_start_qpc = main_r.custom_shader_start_qpc;
+                    }
+                    g_sh.shader_cursor_current = main_r.shader_cursor_current;
+                    g_sh.shader_cursor_previous = main_r.shader_cursor_previous;
+                    g_sh.shader_cursor_current_color = main_r.shader_cursor_current_color;
+                    g_sh.shader_cursor_previous_color = main_r.shader_cursor_previous_color;
+                    g_sh.shader_cursor_change_time = main_r.shader_cursor_change_time;
                 }
                 // Use each HWND's client-area origin rather than
                 // GetWindowRect. GetWindowRect includes any window
