@@ -380,10 +380,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // pipeline via `setFragmentBytes(_:length:index:)`, so each MTKView
     // (main window, external grids, cmdline, popupmenu) gets its own
     // independent copy with no shared-buffer write race.
-    private var customShaderFrameIndex: Int32 = 0
-    private var customShaderStartTimeSec: CFTimeInterval = 0
-    private var customShaderLastTimeSec: CFTimeInterval = 0
-    private var customShaderEmaFrameRate: Float = 60.0
+    /// Per-view shader timing state. Owned by each MTKView (main +
+    /// each ExternalGridView), so iFrame / iTimeDelta / iFrameRate
+    /// don't ping-pong with draw order across views that share the
+    /// renderer. Cursor state stays on the renderer because it
+    /// reflects "the cursor", which is global across views.
+    public final class ShaderViewTimingState {
+        public var frameIndex: Int32 = 0
+        public var startTimeSec: CFTimeInterval = 0
+        public var lastTimeSec: CFTimeInterval = 0
+        public var emaFrameRate: Float = 60.0
+        public init() {}
+    }
+    /// Main window's timing state (used by MetalTerminalView's draw).
+    /// External views own their own ShaderViewTimingState instance and
+    /// pass it to makeCustomShaderUniforms.
+    public let mainShaderTiming = ShaderViewTimingState()
     /// Ping-pong render targets for multi-pass shader chains. Allocated
     /// only when pipelines.count > 1. Size matches backBufferSize.
     private var customShaderPong: [MTLTexture?] = [nil, nil]
@@ -2347,19 +2359,30 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func makeCustomShaderUniforms(
         screenResolution: CGSize,
         windowOffset: CGPoint,
-        windowSize: CGSize
+        windowSize: CGSize,
+        timing: ShaderViewTimingState? = nil
     ) -> zonvie_shader_uniforms {
+        let state = timing ?? mainShaderTiming
         let now = CACurrentMediaTime()
-        if customShaderStartTimeSec == 0 {
-            customShaderStartTimeSec = now
-            customShaderLastTimeSec = now
+        if state.startTimeSec == 0 {
+            // External views (timing != mainShaderTiming) inherit the
+            // main view's iTime origin once main has started so iTime
+            // and iTimeCursorChange (which the main path computes
+            // against mainShaderTiming.startTimeSec) stay in the same
+            // time base across the whole app.
+            if state !== mainShaderTiming, mainShaderTiming.startTimeSec != 0 {
+                state.startTimeSec = mainShaderTiming.startTimeSec
+            } else {
+                state.startTimeSec = now
+            }
+            state.lastTimeSec = now
         }
-        let iTime = Float(now - customShaderStartTimeSec)
-        let dt = Float(max(0, now - customShaderLastTimeSec))
-        customShaderLastTimeSec = now
+        let iTime = Float(now - state.startTimeSec)
+        let dt = Float(max(0, now - state.lastTimeSec))
+        state.lastTimeSec = now
         if dt > 0 {
             let instant = 1.0 / dt
-            customShaderEmaFrameRate = customShaderEmaFrameRate * 0.9 + instant * 0.1
+            state.emaFrameRate = state.emaFrameRate * 0.9 + instant * 0.1
         }
 
         var uniforms = zonvie_shader_uniforms()
@@ -2368,9 +2391,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iResolution.2 = 1.0
         uniforms.iTime = iTime
         uniforms.iTimeDelta = dt
-        uniforms.iFrame = customShaderFrameIndex
+        uniforms.iFrame = state.frameIndex
         uniforms.iSampleRate = 44100.0
-        uniforms.iFrameRate = customShaderEmaFrameRate
+        uniforms.iFrameRate = state.emaFrameRate
         uniforms.iWindowOffset.0 = Float(windowOffset.x)
         uniforms.iWindowOffset.1 = Float(windowOffset.y)
         uniforms.iWindowSize.0 = Float(windowSize.width)
@@ -2402,7 +2425,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iDate.3 = secsInDay
         // iMouse unimplemented on macOS — stays zero.
 
-        customShaderFrameIndex &+= 1
+        state.frameIndex &+= 1
         return uniforms
     }
 
@@ -2428,8 +2451,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         shaderCursorPreviousColor = shaderCursorCurrentColor
         shaderCursorCurrent = rect
         shaderCursorCurrentColor = color
-        if customShaderStartTimeSec != 0 {
-            shaderCursorChangeTime = Float(CACurrentMediaTime() - customShaderStartTimeSec)
+        // The cursor change timestamp is reported in the same time
+        // base as the main view's iTime (mainShaderTiming.startTimeSec).
+        // External views use the same base because they share the
+        // shared start when they read iTime (see makeCustomShaderUniforms).
+        if mainShaderTiming.startTimeSec != 0 {
+            shaderCursorChangeTime = Float(CACurrentMediaTime() - mainShaderTiming.startTimeSec)
         } else {
             shaderCursorChangeTime = 0
         }

@@ -147,6 +147,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Persistent back buffer for partial redraw and GPU scroll copy
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
+    /// Per-view shader timing state. Owning this here (instead of the
+    /// shared MetalTerminalRenderer) keeps iFrame / iTimeDelta /
+    /// iFrameRate independent of draw order across views.
+    private let shaderTiming = MetalTerminalRenderer.ShaderViewTimingState()
     /// Ping-pong render targets for multi-pass custom shader chains.
     /// Allocated lazily inside draw() when pipelines.count > 1.
     private var customShaderPong: [MTLTexture?] = [nil, nil]
@@ -1481,7 +1485,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let uniforms = renderer.makeCustomShaderUniforms(
                     screenResolution: screenRes,
                     windowOffset: windowOffset,
-                    windowSize: view.drawableSize
+                    windowSize: view.drawableSize,
+                    timing: shaderTiming
                 )
                 let pipelines = renderer.customShaderPipelines
                 if pipelines.count > 1 {
