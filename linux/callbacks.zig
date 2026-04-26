@@ -877,6 +877,15 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) 
 
     // Load font synchronously (CRITICAL: must complete before vertex generation resumes)
     if (ft_renderer.loadFont(app.alloc, app, font_name, font_pt, app.dpi_scale)) {
+        // The previous flush's vertex data was generated against the old
+        // cell metrics, so its NDC coordinates no longer line up with the
+        // newly sized cells. We need to force a full redraw and invalidate
+        // the GPU-side row VBO upload cache, but gl_needs_resize is
+        // GTK-thread-owned and pending_paint_full must be written under
+        // rotation_mu. Hop to the GTK main thread via an idle source so the
+        // combined update happens on the right thread with the right lock.
+        _ = gtk_mod.g_idle_add(&idleInvalidateForLayoutChange, @ptrCast(app));
+
         // Notify core of updated cell dimensions (cell height includes linespace)
         const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
         if (app.corep != null and app.drawable_w_px > 0 and app.drawable_h_px > 0) {
@@ -896,11 +905,50 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) 
 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     const app = getApp(ctx) orelse return;
-    app.linespace_px = @intCast(@max(0, linespace_px));
+    const new_linespace: u32 = @intCast(@max(0, linespace_px));
+    if (new_linespace == app.linespace_px) {
+        // No change — skip the vertex / VBO invalidation work below.
+        if (applog.isEnabled()) applog.appLog("[linux] onLineSpace: {d}px (unchanged)\n", .{linespace_px});
+        return;
+    }
+
+    app.linespace_px = new_linespace;
 
     if (applog.isEnabled()) {
         applog.appLog("[linux] onLineSpace: {d}px\n", .{linespace_px});
     }
+
+    // Same rationale as onGuiFont: cell height changed, so committed vertex
+    // data no longer matches the layout. Defer the invalidate flag writes
+    // to GTK main thread to avoid a cross-thread race against the render
+    // path that reads them.
+    _ = gtk_mod.g_idle_add(&idleInvalidateForLayoutChange, @ptrCast(app));
+
+    const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    if (app.corep != null and app.drawable_w_px > 0 and app.drawable_h_px > 0 and app.cell_w_px > 0) {
+        app_mod.zonvie_core_update_layout_px(
+            app.corep,
+            app.drawable_w_px,
+            app.drawable_h_px,
+            app.cell_w_px,
+            ch,
+        );
+        _ = gtk_mod.g_idle_add(&idleUpdateScreenCols, @ptrCast(app));
+    }
+}
+
+/// GTK main-thread idle source: raise the "invalidate everything" flags after
+/// a layout-affecting change (font / linespace). Routed through the TBS API
+/// so pending_paint_full is updated under rotation_mu (matching commitFlush /
+/// acquireForPaint), and runs on the same GTK thread that owns gl_needs_resize.
+fn idleInvalidateForLayoutChange(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    app.tbs.requestFullRepaint();
+    app.gl_needs_resize = true;
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    return 0; // G_SOURCE_REMOVE
 }
 
 // =========================================================================
@@ -1157,6 +1205,21 @@ fn signalClipboardDone(app: *App, result: c_int, len: usize) void {
     app.clipboard_cond.signal();
 }
 
+/// Heap-allocated payload for the GTK idle source created by onClipboardSet.
+/// Owns its own NUL-terminated text buffer so the idle never has to read from
+/// the shared app.clipboard_buf concurrently with another onClipboardSet call.
+/// Also carries the operation seq so the idle can detect that its caller has
+/// already timed out (or been superseded) and skip both the GDK write and
+/// the waiter signal.
+const ClipboardSetTask = struct {
+    app: *App,
+    seq: u64,
+    /// Owned heap buffer of [text..., 0]. `text_len` is the byte length
+    /// excluding the terminator. Freed in idleClipboardSet.
+    buf: []u8,
+    text_len: usize,
+};
+
 pub fn onClipboardSet(
     ctx: ?*anyopaque,
     register: [*]const u8,
@@ -1169,63 +1232,116 @@ pub fn onClipboardSet(
     if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: called len={d}\n", .{len});
     if (len == 0) return 1;
 
-    // Reset state, store data pointer for GTK thread
-    app.clipboard_mu.lock();
-    app.clipboard_ready = false;
-    app.clipboard_set_data = data;
-    app.clipboard_set_len = len;
-    app.clipboard_result = 0;
-    app.clipboard_mu.unlock();
+    // Allocate a per-call buffer up front and copy the caller's payload into
+    // it while data[] is still known to be alive. The idle will read from
+    // this owned buffer, not from app.clipboard_buf — that way a subsequent
+    // onClipboardSet on the core thread cannot stomp on a buffer GDK is
+    // currently reading on the GTK thread.
+    const max_text_bytes: usize = 64 * 1024;
+    const copy_len = @min(len, max_text_bytes);
+    const buf = app.alloc.alloc(u8, copy_len + 1) catch {
+        if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: alloc(buf) failed\n", .{});
+        return 0;
+    };
+    @memcpy(buf[0..copy_len], data[0..copy_len]);
+    buf[copy_len] = 0;
 
-    _ = gtk_mod.g_idle_add(&idleClipboardSet, @ptrCast(app));
+    // Bump the operation seq under the mu so any idle queued by a previous
+    // (timed-out / superseded) call sees a mismatch on entry. Also reset the
+    // ready/result fields the waiter is about to read.
+    var my_seq: u64 = 0;
+    {
+        app.clipboard_mu.lock();
+        defer app.clipboard_mu.unlock();
+        app.clipboard_ready = false;
+        app.clipboard_set_seq +%= 1;
+        my_seq = app.clipboard_set_seq;
+        app.clipboard_result = 0;
+    }
+
+    const task = app.alloc.create(ClipboardSetTask) catch {
+        app.alloc.free(buf);
+        if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: alloc(task) failed\n", .{});
+        return 0;
+    };
+    task.* = .{ .app = app, .seq = my_seq, .buf = buf, .text_len = copy_len };
+    _ = gtk_mod.g_idle_add(&idleClipboardSet, @ptrCast(task));
 
     // Wait for GTK main thread to complete
-    app.clipboard_mu.lock();
-    defer app.clipboard_mu.unlock();
-    if (!app.clipboard_ready) {
-        app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
-    }
+    {
+        app.clipboard_mu.lock();
+        defer app.clipboard_mu.unlock();
+        if (!app.clipboard_ready) {
+            app.clipboard_cond.timedWait(&app.clipboard_mu, 5_000_000_000) catch {};
+        }
 
-    if (!app.clipboard_ready) {
-        // Invalidate data pointer to prevent GTK callback from reading stale memory
-        app.clipboard_set_data = null;
-        app.clipboard_set_len = 0;
-        if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: timeout\n", .{});
-        return 0;
-    }
+        if (!app.clipboard_ready) {
+            // Invalidate any in-flight idle by bumping seq. The idle will
+            // see the mismatch on entry and skip both the GDK write and the
+            // signal, so the next clipboard_set caller is not woken by us.
+            app.clipboard_set_seq +%= 1;
+            if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: timeout\n", .{});
+            return 0;
+        }
 
-    if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: result={d}\n", .{app.clipboard_result});
-    return app.clipboard_result;
+        if (applog.isEnabled()) applog.appLog("[linux] clipboard_set: result={d}\n", .{app.clipboard_result});
+        return app.clipboard_result;
+    }
 }
 
 fn idleClipboardSet(user_data: ?*anyopaque) callconv(.c) c_int {
-    const app = getApp(user_data) orelse return 0;
+    const task: *ClipboardSetTask = @ptrCast(@alignCast(user_data orelse return 0));
+    const app = task.app;
+    const my_seq = task.seq;
+    defer {
+        app.alloc.free(task.buf);
+        app.alloc.destroy(task);
+    }
+
+    // Verify our seq is still current. If not, the original caller has
+    // either timed out or been superseded by a newer clipboard_set; do not
+    // touch the system clipboard and do not signal the waiter (which now
+    // belongs to a different operation).
+    {
+        app.clipboard_mu.lock();
+        defer app.clipboard_mu.unlock();
+        if (app.clipboard_set_seq != my_seq) {
+            if (applog.isEnabled()) applog.appLog("[linux] clipboard_set idle: stale (mine={d} cur={d}) — skipped\n", .{ my_seq, app.clipboard_set_seq });
+            return 0;
+        }
+    }
+
     const display = gdk_display_get_default() orelse {
-        signalClipboardDone(app, 0, 0);
+        signalClipboardDoneIfCurrent(app, my_seq, 0, 0);
         return 0;
     };
     const clipboard = gdk_display_get_clipboard(display) orelse {
-        signalClipboardDone(app, 0, 0);
+        signalClipboardDoneIfCurrent(app, my_seq, 0, 0);
         return 0;
     };
 
-    app.clipboard_mu.lock();
-    const data = app.clipboard_set_data;
-    const len = app.clipboard_set_len;
-    app.clipboard_mu.unlock();
-
-    if (data) |d| {
-        // Copy to a NUL-terminated buffer for gdk_clipboard_set_text
-        const copy_len = @min(len, app.clipboard_buf.len - 1);
-        @memcpy(app.clipboard_buf[0..copy_len], d[0..copy_len]);
-        app.clipboard_buf[copy_len] = 0;
-        gdk_clipboard_set_text(clipboard, @ptrCast(&app.clipboard_buf));
-        signalClipboardDone(app, 1, copy_len);
+    // task.buf is owned exclusively by this idle; no other thread touches it.
+    if (task.text_len > 0) {
+        gdk_clipboard_set_text(clipboard, @ptrCast(task.buf.ptr));
+        signalClipboardDoneIfCurrent(app, my_seq, 1, task.text_len);
     } else {
-        signalClipboardDone(app, 0, 0);
+        signalClipboardDoneIfCurrent(app, my_seq, 0, 0);
     }
 
     return 0; // G_SOURCE_REMOVE
+}
+
+/// Variant of signalClipboardDone that only signals if the operation seq still
+/// matches. Prevents an out-of-band signal from waking a *different* caller
+/// after the original has timed out.
+fn signalClipboardDoneIfCurrent(app: *App, seq: u64, result: c_int, len: usize) void {
+    app.clipboard_mu.lock();
+    defer app.clipboard_mu.unlock();
+    if (app.clipboard_set_seq != seq) return;
+    app.clipboard_result = result;
+    app.clipboard_len = len;
+    app.clipboard_ready = true;
+    app.clipboard_cond.signal();
 }
 
 // GDK clipboard extern declarations
@@ -1379,7 +1495,10 @@ pub fn onCmdlinePos(ctx: ?*anyopaque, _: u32, _: u32) callconv(.c) void {
 
 pub fn onCmdlineSpecialChar(ctx: ?*anyopaque, _: [*]const u8, _: usize, _: bool, _: u32) callconv(.c) void {
     _ = ctx;
-    // Special character display handled by core grid
+    // No frontend-side work needed: src/core/grid.zig setCmdlineSpecialChar
+    // marks cmdline_dirty, src/core/flush.zig writes the special char into the
+    // cmdline grid at the cursor position, and the resulting flush queues an
+    // overlay redraw via the standard onVerticesRow → idleQueueRedraw path.
 }
 
 pub fn onCmdlineBlockShow(ctx: ?*anyopaque, _: [*]const core.CmdlineBlockLine, _: usize) callconv(.c) void {
@@ -1401,7 +1520,7 @@ pub fn onCmdlineBlockHide(ctx: ?*anyopaque) callconv(.c) void {
 
 pub fn onPopupmenuShow(
     ctx: ?*anyopaque,
-    _: ?*const anyopaque, // items
+    _: ?*const anyopaque, // items — rendered through POPUPMENU_GRID_ID by core
     _: usize, // item_count
     _: i32, // selected
     row: i32,
@@ -1417,6 +1536,15 @@ pub fn onPopupmenuShow(
     app.popupmenu_anchor_col = col;
     app.popupmenu_anchor_grid = grid_id;
     app.mu.unlock();
+
+    // Refresh the popup border color from the Pmenu / PmenuSel highlights
+    // so it matches the colorscheme. Must be deferred — core holds grid_mu
+    // here and zonvie_core_get_hl_by_name re-enters the same lock.
+    _ = gtk_mod.g_idle_add(&idleUpdatePopupmenuColors, @ptrCast(app));
+    // Schedule a redraw so the overlay paints on the same tick as the show.
+    // Core's vertex callbacks fire later; without an explicit queue here the
+    // first frame after open can drop the popup until the next event.
+    _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
 }
 
 pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
@@ -1431,8 +1559,51 @@ pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPopupmenuSelect(ctx: ?*anyopaque, _: i32) callconv(.c) void {
-    _ = ctx;
-    // Selection change is handled by core vertex generation
+    const app = getApp(ctx) orelse return;
+    // Selection rendering is produced by core's vertex stream, but the GLArea
+    // does not necessarily get a queue_draw on its own. Force one so the
+    // highlighted row updates without waiting for the next unrelated event.
+    _ = gtk_mod.g_idle_add(&idleQueueRedraw, @ptrCast(app));
+}
+
+/// Pull the Pmenu* highlights from core and apply them to the cached popup
+/// border / icon colors used by the overlay renderer. Runs on GTK main
+/// thread (idle source) so it can safely re-enter zonvie_core_get_hl_by_name.
+fn idleUpdatePopupmenuColors(user_data: ?*anyopaque) callconv(.c) c_int {
+    const app = getApp(user_data) orelse return 0;
+    const corep = app.corep orelse return 0;
+
+    var fg_rgb: u32 = 0;
+    var bg_rgb: u32 = 0;
+
+    var border_r: f32 = app.cmdline_border_color[0];
+    var border_g: f32 = app.cmdline_border_color[1];
+    var border_b: f32 = app.cmdline_border_color[2];
+
+    // PmenuSel background = the colorscheme's "selected entry" color, which
+    // is the most visually distinctive choice for the surrounding border.
+    // Use the function's return value (1 = found, 0 = not found) instead of
+    // comparing bg_rgb against 0, since black (#000000) is a perfectly valid
+    // colour and is in fact the default for many dark colorschemes.
+    if (app_mod.zonvie_core_get_hl_by_name(corep, "PmenuSel", &fg_rgb, &bg_rgb) != 0) {
+        border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
+        border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
+        border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
+    } else if (app_mod.zonvie_core_get_hl_by_name(corep, "Pmenu", &fg_rgb, &bg_rgb) != 0) {
+        // Fall back to plain Pmenu bg if no PmenuSel was defined.
+        border_r = @as(f32, @floatFromInt((bg_rgb >> 16) & 0xFF)) / 255.0;
+        border_g = @as(f32, @floatFromInt((bg_rgb >> 8) & 0xFF)) / 255.0;
+        border_b = @as(f32, @floatFromInt(bg_rgb & 0xFF)) / 255.0;
+    }
+
+    app.mu.lock();
+    app.popupmenu_border_color = .{ border_r, border_g, border_b };
+    app.mu.unlock();
+
+    if (app.gl_area) |area| {
+        main_mod.gtk_externs.widget_queue_draw(area);
+    }
+    return 0; // G_SOURCE_REMOVE
 }
 
 // =========================================================================

@@ -188,8 +188,19 @@ fn onRealize(widget: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     // Get initial DPI scale
     app.dpi_scale = @floatFromInt(@max(1, gtk_widget_get_scale_factor(gl_area)));
 
+    // Capture the initial GLArea geometry now so startCore can size nvim to
+    // the real window. Without this, drawable_*_px is still 0 (onResize hasn't
+    // fired yet) and core would launch at the 120x40 fallback, then
+    // grid_resize would arrive a moment later and cause a visible double-draw.
+    const w = gtk_widget_get_width(gl_area);
+    const h = gtk_widget_get_height(gl_area);
+    if (w > 0) app.drawable_w_px = @intCast(w);
+    if (h > 0) app.drawable_h_px = @intCast(h);
+
     if (applog.isEnabled()) {
-        applog.appLog("[linux] GLArea realized, dpi_scale={d:.2}\n", .{app.dpi_scale});
+        applog.appLog("[linux] GLArea realized, dpi_scale={d:.2}, geom={d}x{d}\n", .{
+            app.dpi_scale, app.drawable_w_px, app.drawable_h_px,
+        });
     }
 
     // Start core after renderer is ready
@@ -250,8 +261,11 @@ fn onResize(area: ?*anyopaque, width: c_int, height: c_int, user_data: ?*anyopaq
     // Mark that GL resources need rebuild on next render (GL context not current here)
     app.gl_needs_resize = true;
 
-    // Force full repaint
-    app.tbs.pending_paint_full = true;
+    // Force full repaint. Routed through the TBS API so pending_paint_full is
+    // written under rotation_mu, matching commitFlush / acquireForPaint and
+    // avoiding a race with the core thread that may be in commitFlush right
+    // now.
+    app.tbs.requestFullRepaint();
     if (app.gl_area) |gl_area| {
         gtk_externs.widget_queue_draw(gl_area);
     }
@@ -505,13 +519,32 @@ fn startCore(app: *App) void {
     else
         "nvim";
 
-    // Initial grid size estimate
-    const init_rows: u32 = if (app.drawable_h_px > 0 and app.cell_h_px > 0)
-        app.drawable_h_px / app.cell_h_px
+    // Pre-load the font using the config family/size so cell_w_px / cell_h_px
+    // reflect real glyph metrics before ui_attach. Without this, nvim launches
+    // sized by the placeholder 9x18 metrics and a second resize lands as soon
+    // as guifont is reported, producing a visible double-draw at startup.
+    if (app.ft_hb_font == null) {
+        const default_family = "monospace";
+        const default_size_pt: f32 = 14.0;
+        const family = if (app.config.font.family.len > 0) app.config.font.family else default_family;
+        const size_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else default_size_pt;
+        const dpi_scale: f32 = if (app.dpi_scale > 0.0) app.dpi_scale else 1.0;
+        if (!ft_renderer.loadFont(app.alloc, app, family, size_pt, dpi_scale)) {
+            applog.appLog("[linux] WARN: font preload failed, falling back to default cell metrics\n", .{});
+        }
+        if (app.config.font.linespace > 0) {
+            app.linespace_px = @intCast(app.config.font.linespace);
+        }
+    }
+
+    // Initial grid size estimate, derived from real drawable size + cell size.
+    const cell_h_total: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const init_rows: u32 = if (app.drawable_h_px > 0)
+        @max(1, app.drawable_h_px / cell_h_total)
     else
         40;
     const init_cols: u32 = if (app.drawable_w_px > 0 and app.cell_w_px > 0)
-        app.drawable_w_px / app.cell_w_px
+        @max(1, app.drawable_w_px / app.cell_w_px)
     else
         120;
 

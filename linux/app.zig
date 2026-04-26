@@ -416,6 +416,16 @@ pub const TripleBufferedSurface = struct {
         return false;
     }
 
+    /// Mark the next paint as a full repaint. Must be used in place of a bare
+    /// `pending_paint_full = true` from any thread that does not already hold
+    /// rotation_mu — commitFlush / acquireForPaint manipulate this field
+    /// under that lock, so cross-thread bare writes would race with them.
+    pub fn requestFullRepaint(self: *TripleBufferedSurface) void {
+        self.rotation_mu.lock();
+        defer self.rotation_mu.unlock();
+        self.pending_paint_full = true;
+    }
+
     pub fn beginFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) bool {
         var picked: ?u8 = null;
         var ci: u8 = undefined;
@@ -781,6 +791,10 @@ pub const App = struct {
     popupmenu_anchor_row: i32 = 0,
     popupmenu_anchor_col: i32 = 0,
     popupmenu_anchor_grid: i64 = 1,
+    // Border color for the popupmenu overlay. Pulled from PmenuSel (or Pmenu)
+    // highlight on each show; falls back to the cmdline border color so the
+    // overlay never paints with an uninitialised colour on first appearance.
+    popupmenu_border_color: [3]f32 = .{ 1.0, 1.0, 0.0 },
 
     // UI extensions
     ext_cmdline_enabled: bool = false,
@@ -892,8 +906,13 @@ pub const App = struct {
     clipboard_len: usize = 0,
     clipboard_result: c_int = 0,
     clipboard_ready: bool = false,
-    clipboard_set_data: ?[*]const u8 = null,
-    clipboard_set_len: usize = 0,
+    /// Monotonic sequence number for clipboard_set operations. Bumped on
+    /// every onClipboardSet call and again on timeout. A queued GTK idle
+    /// carries the seq it was scheduled with; a mismatch on entry means the
+    /// caller has already moved on (timed out or been superseded) and the
+    /// idle must skip the GDK write to avoid sending stale data and to
+    /// avoid signaling the wrong waiter.
+    clipboard_set_seq: u64 = 0,
 
     /// Scale a logical pixel value by DPI scale factor
     pub fn scalePx(self: *const App, v: u32) i32 {
