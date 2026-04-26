@@ -546,11 +546,18 @@ fn renderCmdlineOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     // Calculate total window dimensions including padding and icon
     const icon_total_w: f32 = @floatFromInt(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
     const padding: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
-    const total_w_px: f32 = @min(content_w_px + icon_total_w + padding * 2.0, vp_w);
+    const decoration_w: f32 = icon_total_w + padding * 2.0;
+    // Aesthetic minimum: at least 40 cells of content area or half the viewport,
+    // whichever is smaller. Prevents the overlay from collapsing into a sliver
+    // when the cmdline is empty or holds only `:` / `/`.
+    const min_content_w_px: f32 = @min(@as(f32, @floatFromInt(40 * cell_w)), vp_w * 0.5);
+    const desired_content_w: f32 = @max(content_w_px, min_content_w_px);
+    const total_w_px: f32 = @min(desired_content_w + decoration_w, vp_w);
     const total_h_px: f32 = content_h_px + padding * 2.0;
 
-    // Center horizontally, position at 1/3 from top
-    const box_x_px: f32 = (vp_w - total_w_px) / 2.0;
+    // Center horizontally, position at 1/3 from top, but never let the box go
+    // negative if the viewport ends up narrower than the overlay.
+    const box_x_px: f32 = @max(0.0, (vp_w - total_w_px) / 2.0);
     const box_y_px: f32 = vp_h / 3.0;
 
     // Convert box position to NDC
@@ -748,7 +755,7 @@ fn renderPopupmenuOverlay(app: *App, viewport_w: u32, viewport_h: u32) void {
     const cell_h = app.cell_h_px + app.linespace_px;
     const anchor_row = app.popupmenu_anchor_row;
     const anchor_col = app.popupmenu_anchor_col;
-    const border_color = app.cmdline_border_color;
+    const border_color = app.popupmenu_border_color;
     app.mu.unlock();
 
     if (content_rows == 0 or content_cols == 0) {
