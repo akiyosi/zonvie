@@ -544,7 +544,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if prepResult.needsGpuBlit {
             // GPU blit required — create command buffer now
             if let cmd = queue.makeCommandBuffer() {
-                atlas.encodeBackTextureBlit(commandBuffer: cmd)
+                let blitEncoded = atlas.encodeBackTextureBlit(commandBuffer: cmd)
                 let tAtlasCommitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 cmd.commit()
                 if perfEnabled {
@@ -555,15 +555,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 if perfEnabled {
                     atlasWaitUs = (CFAbsoluteTimeGetCurrent() - tAtlasWaitStart) * 1_000_000
                 }
-                if cmd.status == .completed {
+                if cmd.status == .completed && blitEncoded {
                     atlasDidBlit = true
                     atlas.markBackSynced()
                 } else {
                     isInFlush = false
-                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit command buffer failed (status=\(cmd.status.rawValue)), dropping flush")
+                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit command buffer failed (status=\(cmd.status.rawValue) encoded=\(blitEncoded)), dropping flush")
                     return .dropped
                 }
             } else {
+                atlas.cancelPendingBackTextureBlit()
                 isInFlush = false
                 ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
                 return .dropped
@@ -1382,7 +1383,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
-                // defer handles: semaphore.signal() + gpuInFlight decrement
+                // Encoder creation failed (rare). Commit the empty cmd anyway so
+                // the IOAccelerator region attached to it is reclaimed; otherwise
+                // an uncommitted MTLCommandBuffer leaks GPU memory permanently.
+                hasPresentedOnce = false
+                let sem = inflightSemaphore
+                let lk = lock
+                cmd.addCompletedHandler { [weak self] _ in
+                    lk.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    lk.unlock()
+                    sem.signal()
+                }
+                cmd.commit()
+                gpuSubmitted = true
+                (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
 

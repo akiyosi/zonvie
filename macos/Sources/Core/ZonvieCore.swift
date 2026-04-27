@@ -101,18 +101,20 @@ final class ZonvieCore {
 
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
-        // Prefix with elapsed milliseconds since process start for startup
-        // latency diagnostics. Sub-millisecond resolution on Apple Silicon.
-        let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let elapsedMs = Double(nowNs &- appLogStartNs) / 1_000_000.0
-        let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, message())
+        autoreleasepool {
+            // Prefix with elapsed milliseconds since process start for startup
+            // latency diagnostics. Sub-millisecond resolution on Apple Silicon.
+            let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let elapsedMs = Double(nowNs &- appLogStartNs) / 1_000_000.0
+            let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, message())
 
-        if let handle = logFileHandle {
-            if let data = line.data(using: .utf8) {
-                handle.write(data)
+            if let handle = logFileHandle {
+                if let data = line.data(using: .utf8) {
+                    handle.write(data)
+                }
+            } else {
+                fputs(line, stderr)
             }
-        } else {
-            fputs(line, stderr)
         }
     }
 
@@ -2209,9 +2211,11 @@ final class ZonvieCore {
     private func onLog(bytes: UnsafePointer<UInt8>, len: Int) {
         // Skip Data allocation if logging is disabled
         guard ZonvieCore.appLogEnabled else { return }
-        let data = Data(bytes: bytes, count: max(0, len))
-        if let s = String(data: data, encoding: .utf8) {
-            ZonvieCore.appLog(s)
+        autoreleasepool {
+            let data = Data(bytes: bytes, count: max(0, len))
+            if let s = String(data: data, encoding: .utf8) {
+                ZonvieCore.appLog(s)
+            }
         }
     }
 

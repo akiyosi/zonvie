@@ -10,7 +10,7 @@ private let ZONVIE_STYLE_ITALIC: UInt32 = 1 << 1
 final class GlyphAtlas {
     // Use os_unfair_lock instead of NSLock for better performance
     // os_unfair_lock is a low-level spin lock that's faster for short critical sections
-    private var mu = os_unfair_lock()  
+    private var mu = os_unfair_lock()
 
     struct Entry {
         let uvMin: SIMD2<Float>
@@ -1901,9 +1901,19 @@ final class GlyphAtlas {
 
     /// Phase 2: Encode GPU blit into the given command buffer.
     /// Only call this when prepareBackTexture() returned needsGpuBlit=true.
-    func encodeBackTextureBlit(commandBuffer: MTLCommandBuffer) {
-        guard let front = pendingBlitFront, let back = pendingBlitBack else { return }
-        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+    func cancelPendingBackTextureBlit() {
+        pendingBlitFront = nil
+        pendingBlitBack = nil
+        pendingBlitRect = nil
+        pendingBlitWasRecreate = false
+    }
+
+    func encodeBackTextureBlit(commandBuffer: MTLCommandBuffer) -> Bool {
+        guard let front = pendingBlitFront, let back = pendingBlitBack else { return false }
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else {
+            cancelPendingBackTextureBlit()
+            return false
+        }
 
         let sourceOrigin: MTLOrigin
         let sourceSize: MTLSize
@@ -1925,9 +1935,8 @@ final class GlyphAtlas {
                   destinationOrigin: destinationOrigin)
         blit.endEncoding()
 
-        pendingBlitFront = nil
-        pendingBlitBack = nil
-        pendingBlitRect = nil
+        cancelPendingBackTextureBlit()
+        return true
     }
 
     /// Called after blit command buffer completes successfully.

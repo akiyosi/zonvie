@@ -1010,7 +1010,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
             guard let backTex = backBuffer else { return }
 
-            guard let cmd = queue.makeCommandBuffer() else { return }
+            guard let cmd = queue.makeCommandBuffer() else {
+                return
+            }
 
             // --- GPU scroll blit (shift pixels in back buffer) ---
             // dirtyRows is only populated when GPU scroll copy is active.
@@ -1066,7 +1068,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             )
             rpd.colorAttachments[0].clearColor = gridClearColor
 
-            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+                // Encoder creation failed (rare). Commit the empty cmd anyway so
+                // the IOAccelerator region attached to it is reclaimed; otherwise
+                // an uncommitted MTLCommandBuffer leaks GPU memory permanently.
+                hasPresentedOnce = false
+                let sem = inflightSemaphore
+                let tbLock = tripleBufferLock
+                cmd.addCompletedHandler { [weak self] _ in
+                    tbLock.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    tbLock.unlock()
+                    sem.signal()
+                }
+                cmd.commit()
+                gpuSubmitted = true
+                return
+            }
             viewportMetrics.applyViewport(to: enc)
             enc.setRenderPipelineState(pipeline)
 
