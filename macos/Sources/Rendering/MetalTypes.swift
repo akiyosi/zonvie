@@ -3,7 +3,6 @@ import Foundation
 import Metal
 import simd
 
-
 struct Vertex {
     var position: simd_float2
     var texCoord: simd_float2
@@ -289,6 +288,33 @@ final class SurfaceBufferSet {
     var detachPoolCursorBuffer: MTLBuffer? = nil
     var detachPoolCursorCap: Int = 0
 
+    // Private per-row buffer pool, owned exclusively by this set.
+    //
+    // Two slots per row to handle the COW shallow-copy chain. Single slot is
+    // unsafe: after rotation, src.rowState[R] may alias this set's only private
+    // buffer (via shallow-copy chain through 3 sets), so writing to private
+    // would corrupt the in-flight committed frame. Two slots guarantee at
+    // least one is not aliased after warm-up.
+    //
+    // Used as the safe write target when detach pool cannot be reused —
+    // specifically when sharesSource && gpuInFlight && pool buffer aliases src.
+    //
+    // Without this, ensureSurfaceRowBuffer would call device.makeBuffer() in
+    // that alias-fallback path. Each fresh MTLBuffer creates a new IOAccelerator
+    // region; macOS Metal allocator pools released regions internally rather
+    // than returning them to the kernel, causing phys_footprint to grow
+    // monotonically across scroll bursts.
+    //
+    // After warm-up, no new MTLBuffer allocations are needed for this path.
+    // Total bound: 3 sets x N rows x 2 slots x peak cap.
+    var privateRowBuffers0: [MTLBuffer?] = []
+    var privateRowCapacities0: [Int] = []
+    var privateRowBuffers1: [MTLBuffer?] = []
+    var privateRowCapacities1: [Int] = []
+    /// 0 or 1: which slot to try first on next detach for this row.
+    /// Toggles after each successful reuse so slots alternate naturally.
+    var privateRowNextSlot: [Int] = []
+
 }
 
 /// Pick a free buffer set index for writing during a flush.
@@ -441,7 +467,7 @@ func ensureSurfaceRowBuffer(
             // (gpuInFlight == false), alias with the committed buffer is safe because
             // nobody is reading the buffer contents.  When a draw IS in flight, the
             // committed buffer may be referenced by the GPU encoder on another thread,
-            // so we must not write into it — fall through to device.makeBuffer().
+            // so we must not write into it — fall through to private-buffer ring below.
             bufferSet.rowState.buffers[row] = poolBuf
             bufferSet.rowState.capacities[row] = bufferSet.detachPoolRowCapacities[row]
             bufferSet.detachPoolRowBuffers[row] = nil  // consumed
@@ -449,11 +475,65 @@ func ensureSurfaceRowBuffer(
         }
 
         if !reused {
-            bufferSet.rowState.capacities[row] = nextCap
-            bufferSet.rowState.buffers[row] = device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if bufferSet.rowState.buffers[row] == nil {
-                bufferSet.rowState.capacities[row] = 0
-                return nil
+            // Use this set's per-row private slots (2-deep ring) instead of
+            // device.makeBuffer() — fresh MTLBuffer allocations here create
+            // IOAccelerator regions that the macOS Metal allocator pools
+            // internally rather than returning to the kernel, causing
+            // phys_footprint to grow under scroll bursts.
+            //
+            // Why 2 slots: the COW shallow-copy chain spreads a buffer across
+            // all 3 sets within 2 rotations. With only 1 private slot, after
+            // those rotations src would alias this set's single private slot
+            // (since src inherited it via COW). 2 slots break the cycle.
+            while bufferSet.privateRowBuffers0.count <= row {
+                bufferSet.privateRowBuffers0.append(nil)
+                bufferSet.privateRowCapacities0.append(0)
+                bufferSet.privateRowBuffers1.append(nil)
+                bufferSet.privateRowCapacities1.append(0)
+                bufferSet.privateRowNextSlot.append(0)
+            }
+
+            // Try slots in order [nextSlot, otherSlot]. Use the first slot
+            // whose buffer satisfies cap AND is not aliased with src (to
+            // preserve the in-flight committed frame).
+            let primarySlot = bufferSet.privateRowNextSlot[row]
+            var pickedSlotIdx: Int = -1
+            for tryIdx in 0..<2 {
+                let slot = (primarySlot + tryIdx) % 2
+                let buf = (slot == 0) ? bufferSet.privateRowBuffers0[row] : bufferSet.privateRowBuffers1[row]
+                let cap = (slot == 0) ? bufferSet.privateRowCapacities0[row] : bufferSet.privateRowCapacities1[row]
+                if let priv = buf, cap >= nextCap, priv !== srcRowBuffer {
+                    pickedSlotIdx = slot
+                    bufferSet.rowState.buffers[row] = priv
+                    bufferSet.rowState.capacities[row] = cap
+                    break
+                }
+            }
+
+            if pickedSlotIdx >= 0 {
+                // Reuse: toggle nextSlot so future detaches alternate naturally.
+                bufferSet.privateRowNextSlot[row] = 1 - pickedSlotIdx
+            } else {
+                // Both private slots are unusable (nil, too small, or aliased).
+                // Allocate a fresh buffer into the primary slot. Old contents
+                // (if any) are dropped from this set; ARC will eventually
+                // release once other sets drop their COW references.
+                let newBuf = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                if newBuf == nil {
+                    bufferSet.rowState.capacities[row] = 0
+                    bufferSet.rowState.buffers[row] = nil
+                    return nil
+                }
+                if primarySlot == 0 {
+                    bufferSet.privateRowBuffers0[row] = newBuf
+                    bufferSet.privateRowCapacities0[row] = nextCap
+                } else {
+                    bufferSet.privateRowBuffers1[row] = newBuf
+                    bufferSet.privateRowCapacities1[row] = nextCap
+                }
+                bufferSet.rowState.buffers[row] = newBuf
+                bufferSet.rowState.capacities[row] = nextCap
+                bufferSet.privateRowNextSlot[row] = 1 - primarySlot
             }
         }
     }
