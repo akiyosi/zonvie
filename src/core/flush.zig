@@ -1407,7 +1407,9 @@ pub fn generateRowVertices(
                     // Dump shaping results for ligature debugging.
                     // Log when shaping was used (not ASCII fast path) — covers both
                     // calt (glyph count == scalar count, IDs differ) and liga (count differs).
-                    if (log_enabled and final_glyph_count > 0 and !used_ascii_fast_path) {
+                    // Hot-path: gated by core.log.verbose to avoid Foundation alloc churn
+                    // (~thousands of calls/sec dominates RSS noise during steady editing).
+                    if (log_enabled and core.log.verbose and final_glyph_count > 0 and !used_ascii_fast_path) {
                         core.log.write("[shape_dump] scalars={d} glyphs={d} run=[{d}..{d}) style={d}\n", .{ scalar_count, final_glyph_count, run_start, end, c_style });
                         for (0..@min(final_glyph_count, 16)) |dgi| {
                             core.log.write("[shape_dump]   g[{d}] gid={d} cluster={d} x_adv={d} x_off={d}\n", .{
@@ -1724,7 +1726,8 @@ pub fn generateRowVertices(
                                 }
                             }
 
-                            if (log_enabled and !used_ascii_fast_path) {
+                            // Hot-path: gated by core.log.verbose (per-glyph debug).
+                            if (log_enabled and core.log.verbose and !used_ascii_fast_path) {
                                 core.log.write("[glyph_quad] gi={d} gid={d} penX={d:.1} gx0={d:.1} gx1={d:.1} bbox_w={d:.1} bbox_ox={d:.1} x_off={d:.1} cellW={d:.1}\n", .{
                                     gi, gid, penX, gx0, gx1, ge.bbox_size_px[0], ge.bbox_origin_px[0], x_off_px, cellW,
                                 });
