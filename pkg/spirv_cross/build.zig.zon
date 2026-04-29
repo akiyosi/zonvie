@@ -1,0 +1,22 @@
+.{
+    .name = .spirv_cross,
+    .version = "1.4.341",
+
+    .fingerprint = 0x7ea1d833a33143f,
+
+    .minimum_zig_version = "0.15.2",
+
+    .dependencies = .{
+        // Upstream KhronosGroup/SPIRV-Cross pinned to a vulkan-sdk tag.
+        // Fetched and cached by the Zig package manager; no git submodule.
+        .upstream = .{
+            .url = "git+https://github.com/KhronosGroup/SPIRV-Cross#a0fba56c34a6700f1724bf9b751da5b488a3775c",
+            .hash = "N-V-__8AAHmjuACJQQj6LAdUGiH_9UXgzBdEV3OZYRBHlemv",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

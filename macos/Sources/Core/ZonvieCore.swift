@@ -4369,6 +4369,14 @@ final class ZonvieCore {
 
         gridView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
         containerView.addSubview(gridView)
+        // Re-stack the cmdline firstc icon above the MTKView so it is not
+        // obscured when the drawable becomes opaque (e.g. user-supplied
+        // post-process shaders fill alpha=1 across the whole drawable,
+        // collapsing the alpha=0 padding that normally lets the icon
+        // composite through from underneath).
+        if kind == .cmdline, let iconView = self.cmdlineIconView {
+            containerView.addSubview(iconView, positioned: .above, relativeTo: gridView)
+        }
         window.contentView = containerView
         window.backgroundColor = .clear
         window.isOpaque = false

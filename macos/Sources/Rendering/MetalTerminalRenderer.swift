@@ -362,6 +362,51 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     let glowTextures = SurfaceGlowTextures()
     private(set) var bilinearSampler: MTLSamplerState?
 
+    // --- User-supplied custom post-process shaders ---
+    // Loaded once from config paths during bloom-pipeline construction.
+    // Empty array when `[shaders].enabled = false` or no paths are listed.
+    private(set) var customShaderPipelines: [CustomShaderPipeline] = []
+    /// Where the custom shader chain inserts relative to bloom. Mirrored from
+    /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
+    /// path does not need to re-read config each frame.
+    private(set) var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
+    /// True when any loaded custom shader references a time-varying
+    /// Shadertoy uniform. Used by `MetalTerminalView` to keep the vsync
+    /// draw loop active instead of falling back to flush-driven rendering.
+    private(set) var anyCustomShaderNeedsAnimation: Bool = false
+
+    // Shadertoy-style uniforms block (64 bytes, std140). Populated per
+    // draw into a local `zonvie_shader_uniforms` value and handed to the
+    // pipeline via `setFragmentBytes(_:length:index:)`, so each MTKView
+    // (main window, external grids, cmdline, popupmenu) gets its own
+    // independent copy with no shared-buffer write race.
+    /// Per-view shader timing state. Owned by each MTKView (main +
+    /// each ExternalGridView), so iFrame / iTimeDelta / iFrameRate
+    /// don't ping-pong with draw order across views that share the
+    /// renderer. Cursor state stays on the renderer because it
+    /// reflects "the cursor", which is global across views.
+    public final class ShaderViewTimingState {
+        public var frameIndex: Int32 = 0
+        public var startTimeSec: CFTimeInterval = 0
+        public var lastTimeSec: CFTimeInterval = 0
+        public var emaFrameRate: Float = 60.0
+        public init() {}
+    }
+    /// Main window's timing state (used by MetalTerminalView's draw).
+    /// External views own their own ShaderViewTimingState instance and
+    /// pass it to makeCustomShaderUniforms.
+    public let mainShaderTiming = ShaderViewTimingState()
+    /// Ping-pong render targets for multi-pass shader chains. Allocated
+    /// only when pipelines.count > 1. Size matches backBufferSize.
+    private var customShaderPong: [MTLTexture?] = [nil, nil]
+    private var customShaderPongSize: CGSize = .zero
+    // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
+    private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorChangeTime: Float = 0
+
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
 
@@ -388,6 +433,30 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
+    }
+
+    /// Allocate the two ping-pong textures used by multi-pass custom
+    /// shader chains. Size/format must match the drawable so the final
+    /// pass can write the same pixel format the drawable expects.
+    private func ensureCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
+        if customShaderPong[0] != nil,
+           customShaderPong[1] != nil,
+           customShaderPongSize == size {
+            return
+        }
+        let w = max(1, Int(size.width))
+        let h = max(1, Int(size.height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: w,
+            height: h,
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        customShaderPong[0] = device.makeTexture(descriptor: desc)
+        customShaderPong[1] = device.makeTexture(descriptor: desc)
+        customShaderPongSize = size
     }
 
     private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
@@ -782,6 +851,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             } else {
                 bufferSets[s].cursorVertexCount = 0
             }
+            updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
         } else {
             bufferSets[s].cursorVertexCount = 0
         }
@@ -823,10 +893,48 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else {
                     bufferSets[s].cursorVertexCount = 0
                 }
+                updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
             } else {
                 bufferSets[s].cursorVertexCount = 0
             }
         }
+    }
+
+    /// Compute the cursor bounding rectangle and color from its raw
+    /// vertex data (NDC coords + straight RGBA) and forward the
+    /// result into the Ghostty cursor uniform state. Cheap — scans at
+    /// most ~12 vertices. Called from the vertex-submit path so the
+    /// next shader draw picks up the new iCurrentCursor /
+    /// iTimeCursorChange immediately.
+    private func updateCursorShaderStateFromVerts(cursorPtr: UnsafeRawPointer, cursorCount: Int) {
+        guard cursorCount > 0 else { return }
+        let verts = cursorPtr.bindMemory(to: Vertex.self, capacity: cursorCount)
+        var minX: Float = verts[0].position.x
+        var maxX: Float = minX
+        var minY: Float = verts[0].position.y
+        var maxY: Float = minY
+        for i in 0..<cursorCount {
+            let p = verts[i].position
+            if p.x < minX { minX = p.x }
+            if p.x > maxX { maxX = p.x }
+            if p.y < minY { minY = p.y }
+            if p.y > maxY { maxY = p.y }
+        }
+        // NDC -> main window drawable px. NDC top is y = +1.
+        let w = Float(backBufferSize.width)
+        let h = Float(backBufferSize.height)
+        let xPx = (minX + 1.0) * 0.5 * w
+        let rightPx = (maxX + 1.0) * 0.5 * w
+        let topPx = (1.0 - maxY) * 0.5 * h
+        let botPx = (1.0 - minY) * 0.5 * h
+        // Ghostty's cursor shaders treat iCurrentCursor.y as the BOTTOM
+        // edge of the cursor rect (center = y - h/2, rect = y-h..y).
+        // Pass bottom-edge so the SDF renders over the actual cursor.
+        let c0 = verts[0].color
+        setCursorShaderState(
+            rect: (xPx, botPx, rightPx - xPx, botPx - topPx),
+            color: (c0.x, c0.y, c0.z, c0.w)
+        )
     }
 
     func setLineSpace(px: Int32) {
@@ -943,6 +1051,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let window = view.window, window.isMiniaturized {
             (view as? MetalTerminalView)?.didDrawFrame()
             return
+        }
+
+        // Keep the vsync draw loop alive while any custom shader references
+        // animation-driving uniforms (iTime etc.). activateDrawLoop resets
+        // the idle counter and unpauses the MTKView; without this the
+        // shader would be frozen between Neovim flush events.
+        if anyCustomShaderNeedsAnimation {
+            (view as? MetalTerminalView)?.activateDrawLoop()
         }
 
         // Process pending scroll clears before rendering
@@ -1109,13 +1225,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
+            //
+            // Exception: when a loaded custom shader references time-varying
+            // uniforms (iTime etc.), we MUST proceed every frame so the
+            // shader pass sees an advancing clock. Otherwise the shader only
+            // runs on Neovim flushes and the animation appears frozen
+            // between keystrokes.
             if hasPresentedOnce,
                !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
                !smoothScrolling,
                !blinkStateChanged,
-               !drawableSizeChanged {
+               !drawableSizeChanged,
+               !anyCustomShaderNeedsAnimation {
                 // Still reset redrawPending so future redraws are not blocked.
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -1126,7 +1249,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Also skip when a new commit arrived but carried no visual changes
             // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
             // destroys the backbuffer between GPU-blit scroll frames.
-            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce {
+            // Same animation exception as above.
+            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce && !anyCustomShaderNeedsAnimation {
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -1760,7 +1884,49 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // - Blit shaders cannot be cached in MTLBinaryArchive
             // - After fork(), XPC compiler service is unavailable
             // - Render pipelines can be cached and work without XPC
-            if let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
+
+            // User-supplied custom post-process shaders take over the
+            // backTex -> drawable step when configured in `.afterBloom`
+            // mode. See ExternalGridView.draw for the external-grid path.
+            // Multi-pass chains ping-pong between customShaderPong[0/1];
+            // the final pass writes straight into the drawable.
+            var customShaderHandled = false
+            if !customShaderPipelines.isEmpty,
+               customShaderPostProcess == .afterBloom,
+               let copyVB = copyVertexBuffer,
+               let bilinSamp = bilinearSampler
+            {
+                let uniforms = makeCustomShaderUniforms(
+                    screenResolution: view.drawableSize,
+                    windowOffset: .zero,
+                    windowSize: view.drawableSize
+                )
+                let pipelines = customShaderPipelines
+                if pipelines.count > 1 {
+                    ensureCustomShaderPong(size: view.drawableSize, pixelFormat: drawable.texture.pixelFormat)
+                }
+                let pongsReady =
+                    pipelines.count <= 1
+                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
+                if pongsReady {
+                    for (i, pipeline) in pipelines.enumerated() {
+                        let isLast = (i == pipelines.count - 1)
+                        let inputTex: MTLTexture = (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
+                        let outputTex: MTLTexture = isLast ? drawable.texture : customShaderPong[i % 2]!
+                        pipeline.encode(
+                            cmd: cmd,
+                            input: inputTex,
+                            output: outputTex,
+                            copyVertexBuffer: copyVB,
+                            sampler: bilinSamp,
+                            uniforms: uniforms
+                        )
+                    }
+                    customShaderHandled = true
+                }
+            }
+
+            if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
                 let copyRPD = MTLRenderPassDescriptor()
                 copyRPD.colorAttachments[0].texture = drawable.texture
                 copyRPD.colorAttachments[0].loadAction = .dontCare
@@ -1774,13 +1940,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     copyEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
                     copyEnc.endEncoding()
                 }
+            }
 
-                // === PERF LOG: Copy終了 ===
-                if ZonvieCore.appLogEnabled {
-                    let t_copy_end = CFAbsoluteTimeGetCurrent()
-                    let copy_us = (t_copy_end - t_copy_start) * 1_000_000
-                    ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
-                }
+            // === PERF LOG: Copy終了 ===
+            if ZonvieCore.appLogEnabled {
+                let t_copy_end = CFAbsoluteTimeGetCurrent()
+                let copy_us = (t_copy_end - t_copy_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
             }
 
             // Cursor is composited only on the final drawable.
@@ -1953,6 +2119,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             // Build bloom pipelines for neon glow
             buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+            buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
             // Build copy vertex buffer
             buildCopyVertexBuffer()
             return
@@ -2020,6 +2187,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // Build bloom pipelines for neon glow (always, glow check is at draw time)
         buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
+        buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
 
         // Cache all pipelines to binary archive for future use
         cacheToArchive(mainDesc: desc, bgDesc: bgDesc, glyphDesc: glyphDesc, copyDesc: copyDesc)
@@ -2174,6 +2342,162 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
+    }
+
+    /// Build a `zonvie_shader_uniforms` value for the current frame.
+    ///
+    /// `screenResolution` is always the MAIN window's drawable size, so
+    /// every view shares one coordinate space — stars and other effects
+    /// line up seamlessly across ext-cmdline / ext-popupmenu / extra OS
+    /// windows. `windowOffset` is the current view's top-left corner in
+    /// the main window's drawable pixels (top-left origin); `windowSize`
+    /// is the current view's own drawable size.
+    ///
+    /// Each caller passes the result inline via `setFragmentBytes`, so
+    /// multiple MTKViews animating at 60fps never race on a shared
+    /// buffer.
+    func makeCustomShaderUniforms(
+        screenResolution: CGSize,
+        windowOffset: CGPoint,
+        windowSize: CGSize,
+        timing: ShaderViewTimingState? = nil
+    ) -> zonvie_shader_uniforms {
+        let state = timing ?? mainShaderTiming
+        let now = CACurrentMediaTime()
+        if state.startTimeSec == 0 {
+            // External views (timing != mainShaderTiming) inherit the
+            // main view's iTime origin once main has started so iTime
+            // and iTimeCursorChange (which the main path computes
+            // against mainShaderTiming.startTimeSec) stay in the same
+            // time base across the whole app.
+            if state !== mainShaderTiming, mainShaderTiming.startTimeSec != 0 {
+                state.startTimeSec = mainShaderTiming.startTimeSec
+            } else {
+                state.startTimeSec = now
+            }
+            state.lastTimeSec = now
+        }
+        let iTime = Float(now - state.startTimeSec)
+        let dt = Float(max(0, now - state.lastTimeSec))
+        state.lastTimeSec = now
+        if dt > 0 {
+            let instant = 1.0 / dt
+            state.emaFrameRate = state.emaFrameRate * 0.9 + instant * 0.1
+        }
+
+        var uniforms = zonvie_shader_uniforms()
+        uniforms.iResolution.0 = Float(screenResolution.width)
+        uniforms.iResolution.1 = Float(screenResolution.height)
+        uniforms.iResolution.2 = 1.0
+        uniforms.iTime = iTime
+        uniforms.iTimeDelta = dt
+        uniforms.iFrame = state.frameIndex
+        uniforms.iSampleRate = 44100.0
+        uniforms.iFrameRate = state.emaFrameRate
+        uniforms.iWindowOffset.0 = Float(windowOffset.x)
+        uniforms.iWindowOffset.1 = Float(windowOffset.y)
+        uniforms.iWindowSize.0 = Float(windowSize.width)
+        uniforms.iWindowSize.1 = Float(windowSize.height)
+        // Ghostty 1.1+ cursor uniforms.
+        uniforms.iCurrentCursor = shaderCursorCurrent
+        uniforms.iPreviousCursor = shaderCursorPrevious
+        uniforms.iCurrentCursorColor = shaderCursorCurrentColor
+        uniforms.iPreviousCursorColor = shaderCursorPreviousColor
+        uniforms.iTimeCursorChange = shaderCursorChangeTime
+        // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
+        // Shadertoy's howto lists the fields as "Year, month, day,
+        // time in seconds" without specifying month indexing. Forward
+        // Calendar's .month component verbatim (already 1..12), which
+        // matches the most common interpretation.
+        let cal = Calendar(identifier: .gregorian)
+        let comp = cal.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second, .nanosecond],
+            from: Date()
+        )
+        let secsInDay: Float =
+            Float(comp.hour ?? 0) * 3600.0 +
+            Float(comp.minute ?? 0) * 60.0 +
+            Float(comp.second ?? 0) +
+            Float(comp.nanosecond ?? 0) / 1_000_000_000.0
+        uniforms.iDate.0 = Float(comp.year ?? 0)
+        uniforms.iDate.1 = Float(comp.month ?? 1)
+        uniforms.iDate.2 = Float(comp.day ?? 0)
+        uniforms.iDate.3 = secsInDay
+        // iMouse unimplemented on macOS — stays zero.
+
+        state.frameIndex &+= 1
+        return uniforms
+    }
+
+    /// Ghostty 1.1+ cursor uniform update. rect is (x, y, w, h) in
+    /// drawable pixels within the shader "screen" universe (main
+    /// window's drawable). color is straight RGBA in [0, 1]. No-op
+    /// when incoming state matches the current state, so shaders keep
+    /// seeing the last real change's iTimeCursorChange.
+    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float)) {
+        let sameRect =
+            rect.0 == shaderCursorCurrent.0 &&
+            rect.1 == shaderCursorCurrent.1 &&
+            rect.2 == shaderCursorCurrent.2 &&
+            rect.3 == shaderCursorCurrent.3
+        let sameColor =
+            color.0 == shaderCursorCurrentColor.0 &&
+            color.1 == shaderCursorCurrentColor.1 &&
+            color.2 == shaderCursorCurrentColor.2 &&
+            color.3 == shaderCursorCurrentColor.3
+        if sameRect && sameColor { return }
+
+        shaderCursorPrevious = shaderCursorCurrent
+        shaderCursorPreviousColor = shaderCursorCurrentColor
+        shaderCursorCurrent = rect
+        shaderCursorCurrentColor = color
+        // The cursor change timestamp is reported in the same time
+        // base as the main view's iTime (mainShaderTiming.startTimeSec).
+        // External views use the same base because they share the
+        // shared start when they read iTime (see makeCustomShaderUniforms).
+        if mainShaderTiming.startTimeSec != 0 {
+            shaderCursorChangeTime = Float(CACurrentMediaTime() - mainShaderTiming.startTimeSec)
+        } else {
+            shaderCursorChangeTime = 0
+        }
+    }
+
+    /// Load user-supplied custom post-process shaders listed in config.toml's
+    /// `[shaders].paths`, cross-compile them to MSL, and create one pipeline
+    /// state per entry. Called once alongside the bloom-pipeline construction.
+    private func buildCustomShaderPipelines(
+        lib: MTLLibrary,
+        copyVertexDesc: MTLVertexDescriptor,
+        pixelFormat: MTLPixelFormat
+    ) {
+        let config = ZonvieConfig.shared.shaders
+        customShaderPostProcess = config.postProcess
+        customShaderPipelines.removeAll()
+        anyCustomShaderNeedsAnimation = false
+        if !config.enabled || config.paths.isEmpty {
+            return
+        }
+        guard let vsCustomPost = lib.makeFunction(name: "vs_custom_post") else {
+            ZonvieCore.appLog("[Renderer] WARNING: Missing vs_custom_post shader (custom shaders disabled)")
+            return
+        }
+        for path in config.paths {
+            let expanded = (path as NSString).expandingTildeInPath
+            if let pipeline = CustomShaderPipeline.load(
+                device: device,
+                library: lib,
+                vsCustomPost: vsCustomPost,
+                copyVertexDescriptor: copyVertexDesc,
+                sourcePath: expanded,
+                pixelFormat: pixelFormat
+            ) {
+                customShaderPipelines.append(pipeline)
+                if pipeline.needsAnimation {
+                    anyCustomShaderNeedsAnimation = true
+                }
+            }
+        }
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders, anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
     }
 
     /// Try to load pipeline from binary archive

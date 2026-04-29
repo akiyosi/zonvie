@@ -864,11 +864,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     _ = c.ShowWindow(hwnd, 8);
 
     // Initialize D3D11 renderer for external window (with transparency if enabled)
-    const renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
+    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
         _ = c.DestroyWindow(hwnd);
         return;
     };
+    // Load the same custom post-process shaders the main window uses,
+    // so cmdline/popupmenu/msg/etc. overlay get the same shader effect
+    // applied through their own back_tex.
+    renderer.loadCustomShaderPipelines(&app.config);
 
     // Collect SetWindowPos info while holding the lock, then call SetWindowPos after releasing
     // to avoid deadlock (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
@@ -2068,6 +2072,112 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
+
+    // Update custom-shader screen-space override so this HWND samples
+    // the main window's shader universe at its own offset/size. Without
+    // this, each ext window would get its own compressed shader space
+    // (a star field squeezed into the cmdline bar, etc.).
+    if (gpu_ptr) |g_sh| {
+        if (g_sh.custom_shader_pipelines.items.len > 0) {
+            var screen_w: u32 = g_sh.width;
+            var screen_h: u32 = g_sh.height;
+            var off_x: f32 = 0;
+            var off_y: f32 = 0;
+            if (app.hwnd) |main_hwnd| {
+                if (app.renderer) |*main_r| {
+                    if (main_r.width != 0 and main_r.height != 0) {
+                        screen_w = main_r.width;
+                        screen_h = main_r.height;
+                    }
+                }
+                // Use each HWND's client-area origin rather than
+                // GetWindowRect. GetWindowRect includes any window
+                // frame / title bar (WS_OVERLAPPEDWINDOW on regular
+                // external windows), so subtracting it pushes the
+                // shader offset into the decoration strip — the
+                // rendered shader pixels in the client area end up
+                // shifted by the frame thickness. Shader pixels live
+                // in client coords, so use client origins on both
+                // sides.
+                var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+                if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
+                    off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
+                    off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
+                }
+                // If this ext surface holds the active cursor (cmdline
+                // / popupmenu / float window currently has focus),
+                // forward its rect into the main renderer's shader
+                // cursor state so cursor shaders track the visible
+                // cursor instead of the main grid's stale cursor. The
+                // ext verts are in this view's local NDC; translate
+                // to main-window drawable px using the offset above.
+                const ext_cursor_verts = ext_win.surface.cursor_verts.items;
+                if (ext_cursor_verts.len != 0) {
+                    if (app.renderer) |*main_r2| {
+                        var minx_c: f32 = ext_cursor_verts[0].position[0];
+                        var maxx_c: f32 = minx_c;
+                        var miny_c: f32 = ext_cursor_verts[0].position[1];
+                        var maxy_c: f32 = miny_c;
+                        for (ext_cursor_verts) |v| {
+                            if (v.position[0] < minx_c) minx_c = v.position[0];
+                            if (v.position[0] > maxx_c) maxx_c = v.position[0];
+                            if (v.position[1] < miny_c) miny_c = v.position[1];
+                            if (v.position[1] > maxy_c) maxy_c = v.position[1];
+                        }
+                        const ext_w_f: f32 = @floatFromInt(g_sh.width);
+                        const ext_h_f: f32 = @floatFromInt(g_sh.height);
+                        // Position the cursor at the NDC center, but
+                        // size it using main grid's cell metrics. ext
+                        // cmdline / popupmenu drawables are often
+                        // taller than a single cell (multi-row
+                        // prompt / padding) and cursor verts span the
+                        // full NDC y = -1..+1, so translating that
+                        // across the full ext drawable height makes
+                        // the cursor SDF render at the drawable's
+                        // height instead of the actual cell height.
+                        const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
+                        const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
+                        const cell_w: f32 = @floatFromInt(app.cell_w_px);
+                        const cell_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
+                        const left_main = center_x - cell_w * 0.5;
+                        const right_main = center_x + cell_w * 0.5;
+                        const top_main = center_y - cell_h * 0.5;
+                        const bot_main = center_y + cell_h * 0.5;
+                        // Ghostty's cursor shaders treat iCurrentCursor.y
+                        // as the BOTTOM edge of the cursor rect.
+                        const cv0 = ext_cursor_verts[0];
+                        main_r2.setCursorShaderState(
+                            .{ left_main, bot_main, right_main - left_main, bot_main - top_main },
+                            cv0.color,
+                        );
+                    }
+                }
+
+                if (app.renderer) |*main_r3| {
+                    // Mirror cursor uniforms + iTime origin from main
+                    // so cursor shaders work in cmdline / popupmenu /
+                    // float windows. Without this, ext renderers see
+                    // (0, 0, 0, 0) for iCurrentCursor and a separate
+                    // iTime origin, so iTime - iTimeCursorChange ends
+                    // up nonsense for shaders rendered through the ext
+                    // renderer's shader pass.
+                    if (main_r3.custom_shader_start_qpc != 0) {
+                        g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
+                    }
+                    g_sh.shader_cursor_current = main_r3.shader_cursor_current;
+                    g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
+                    g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
+                    g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
+                    g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+                }
+            }
+            g_sh.shader_screen_w = screen_w;
+            g_sh.shader_screen_h = screen_h;
+            g_sh.shader_window_offset_x = off_x;
+            g_sh.shader_window_offset_y = off_y;
+        }
+    }
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;

@@ -1401,8 +1401,11 @@ final class MetalTerminalView: MTKView {
             )
 
             if event.hasPreciseScrollingDeltas {
-                ZonvieCore.appLog("[scroll] stored offset=\(newOffset) updating shader...")
-                updateScrollShaderOffset()
+                // Shader uniforms are propagated in onPreDraw (which always
+                // runs updateScrollShaderOffset before draw); calling it
+                // here too would just re-do the same work and fire
+                // markAllRowsDirty twice per scroll input.
+                ZonvieCore.appLog("[scroll] stored offset=\(newOffset) requesting redraw")
                 requestRedraw()
             }
         }

@@ -3,6 +3,42 @@ import Metal
 import MetalKit
 import simd
 
+/// Compute the screen-space parameters (custom shader uniforms) for an
+/// external MTKView relative to the main terminal view. `screenResolution`
+/// is the main MTKView's drawable size in pixels; `windowOffset` is the
+/// external view's top-left corner in that drawable-pixel coordinate space
+/// (top-left origin). Falls back to the external view's own drawable when
+/// the main window is unavailable, so shaders still render sensibly
+/// during early startup.
+fileprivate func screenSpaceParameters(
+    mainView: MetalTerminalView?,
+    selfView: MTKView
+) -> (screenResolution: CGSize, windowOffset: CGPoint) {
+    let selfDrawable = selfView.drawableSize
+    guard let mainView = mainView,
+          let mainWin = mainView.window,
+          let selfWin = selfView.window else {
+        return (selfDrawable, .zero)
+    }
+    let scale = selfWin.backingScaleFactor
+    // Convert each MTKView's local bounds -> screen coords (bottom-left
+    // origin, in points).
+    let selfInWindow = selfView.convert(selfView.bounds, to: nil)
+    let mainInWindow = mainView.convert(mainView.bounds, to: nil)
+    let selfOnScreen = selfWin.convertToScreen(selfInWindow)
+    let mainOnScreen = mainWin.convertToScreen(mainInWindow)
+    // NSWindow uses bottom-left screen origin. The TOP of each MTKView is
+    // origin.y + height in those coords. Y in drawable pixels uses a
+    // top-left origin, so we subtract to get the external view's top-left
+    // offset from the main view's top-left in top-left coords.
+    let mainTopY = mainOnScreen.origin.y + mainOnScreen.height
+    let selfTopY = selfOnScreen.origin.y + selfOnScreen.height
+    let dxPts = selfOnScreen.origin.x - mainOnScreen.origin.x
+    let dyPts = mainTopY - selfTopY
+    let offsetPx = CGPoint(x: dxPts * scale, y: dyPts * scale)
+    return (mainView.drawableSize, offsetPx)
+}
+
 /// A Metal view for rendering external Neovim grids (from win_external_pos).
 /// Shares the glyph atlas with the main renderer for consistent text rendering.
 /// Forwards key events to the main terminal view so keyboard input still works.
@@ -111,6 +147,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Persistent back buffer for partial redraw and GPU scroll copy
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
+    /// Per-view shader timing state. Owning this here (instead of the
+    /// shared MetalTerminalRenderer) keeps iFrame / iTimeDelta /
+    /// iFrameRate independent of draw order across views.
+    private let shaderTiming = MetalTerminalRenderer.ShaderViewTimingState()
+    /// Ping-pong render targets for multi-pass custom shader chains.
+    /// Allocated lazily inside draw() when pipelines.count > 1.
+    private var customShaderPong: [MTLTexture?] = [nil, nil]
+    private var customShaderPongSize: CGSize = .zero
     private var scrollScratchTexture: MTLTexture? = nil
     private var scrollScratchSize: CGSize = .zero
 
@@ -568,6 +612,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     memcpy(buf.contents(), validPtr, byteCount)
                     cursorVertexCount = count
                 }
+                // Forward the cursor rect into the main renderer's
+                // shader cursor state so cursor shaders running through
+                // any HWND see the active (cmdline / popupmenu / float)
+                // cursor instead of the main grid's stale cursor. Verts
+                // arrive in this view's local NDC; translate to main
+                // window drawable px using the same screen-space
+                // parameters the shader uniforms use.
+                forwardExternalCursorToMainShader(ptr: validPtr, count: count)
             } else {
                 cursorVertexCount = 0
             }
@@ -641,7 +693,92 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         desc.storageMode = .private
         backBuffer = mtlDevice.makeTexture(descriptor: desc)
         backBufferSize = drawableSize
+        // Drop ping-pong too — it must match the drawable.
+        customShaderPong[0] = nil
+        customShaderPong[1] = nil
+        customShaderPongSize = .zero
         hasPresentedOnce = false
+    }
+
+    /// Translate this view's cursor verts (NDC, view-local) into the
+    /// main window's drawable px and forward to the main renderer's
+    /// shader cursor state. Without this, cursor shaders see the main
+    /// grid's stale cursor while the user is editing the cmdline /
+    /// popupmenu / a float window.
+    private func forwardExternalCursorToMainShader(ptr: UnsafePointer<zonvie_vertex>, count: Int) {
+        guard count > 0 else { return }
+        guard let mainView = mainTerminalView,
+              let renderer = mainView.renderer else { return }
+        // Same screen-space parameters the shader uniforms use, so the
+        // cursor rect lands in the same coordinate system the shader
+        // resolves against.
+        let (screenRes, windowOffset) = screenSpaceParameters(
+            mainView: mainView,
+            selfView: self
+        )
+        // Convert NDC bounding box to main drawable pixels.
+        var minX: Float = ptr[0].position.0
+        var maxX: Float = minX
+        var minY: Float = ptr[0].position.1
+        var maxY: Float = minY
+        for i in 0..<count {
+            let p = ptr[i].position
+            if p.0 < minX { minX = p.0 }
+            if p.0 > maxX { maxX = p.0 }
+            if p.1 < minY { minY = p.1 }
+            if p.1 > maxY { maxY = p.1 }
+        }
+        let extW = Float(self.drawableSize.width)
+        let extH = Float(self.drawableSize.height)
+        let offX = Float(windowOffset.x)
+        let offY = Float(windowOffset.y)
+        // Position the cursor at the NDC center, but size it using the
+        // main grid's cell metrics. ext-cmdline / popupmenu drawables
+        // are often taller than a single cell (multi-row prompt /
+        // padding), and cursor verts always span NDC y = -1..+1
+        // regardless. Translating that NDC range across the full
+        // drawable height makes the cursor SDF render at the
+        // ext drawable's height (e.g., 88 px) instead of the actual
+        // cell height (~40 px), so cursor_blaze and friends look
+        // vertically stretched on those surfaces.
+        let centerPxX = offX + (minX + maxX + 2.0) * 0.25 * extW
+        let centerPxY = offY + (2.0 - minY - maxY) * 0.25 * extH
+        let cellW = renderer.cellWidthPx
+        let cellH = renderer.cellHeightPx
+        let leftPx = centerPxX - cellW * 0.5
+        let rightPx = centerPxX + cellW * 0.5
+        let topPx = centerPxY - cellH * 0.5
+        let botPx = centerPxY + cellH * 0.5
+        // Ghostty's cursor shaders treat iCurrentCursor.y as the
+        // BOTTOM edge of the cursor rect (rect spans y-h..y).
+        let c0 = ptr[0].color
+        renderer.setCursorShaderState(
+            rect: (leftPx, botPx, rightPx - leftPx, botPx - topPx),
+            color: (c0.0, c0.1, c0.2, c0.3)
+        )
+    }
+
+    /// Allocate the two ping-pong textures used by multi-pass custom
+    /// shader chains applied to this external view's backTex.
+    private func ensureExternalCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
+        if customShaderPong[0] != nil,
+           customShaderPong[1] != nil,
+           customShaderPongSize == size {
+            return
+        }
+        let w = max(1, Int(size.width))
+        let h = max(1, Int(size.height))
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: w,
+            height: h,
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        customShaderPong[0] = mtlDevice.makeTexture(descriptor: desc)
+        customShaderPong[1] = mtlDevice.makeTexture(descriptor: desc)
+        customShaderPongSize = size
     }
 
     private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
@@ -907,7 +1044,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let hasCursorUpdate = cursorDirty
             if hasCursorUpdate { cursorDirty = false }
 
-            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling {
+            // Animation exception mirrors MetalTerminalRenderer: when a
+            // loaded custom shader references iTime / iFrame / etc., we
+            // must proceed every frame and keep this view's draw loop
+            // active, even with no Neovim-side changes. Without this,
+            // popupmenu / messages / cmdline / ext-window background stays
+            // frozen while the main window animates.
+            let shaderAnimates = mainTerminalView?.renderer.anyCustomShaderNeedsAnimation ?? false
+            if shaderAnimates {
+                activateDrawLoop()
+            }
+
+            if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling && !shaderAnimates {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // If a visual commit occurred recently, a timing race likely caused
                 // this idle frame. Don't count toward deactivation.
@@ -1378,7 +1526,66 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 redrawScheduler.didDrawFrame()
                 return
             }
-            if let blitEnc = cmd.makeBlitCommandEncoder() {
+            // User-supplied custom post-process shaders take over the
+            // backTex -> drawable copy when configured in `.afterBloom`
+            // mode. The shader samples backTex (which already contains
+            // main render + optional bloom) and writes directly to the
+            // drawable, replacing the normal blit. Phase 2 applies a
+            // single shader; multi-pass chaining is Phase 5's scope.
+            var customShaderHandled = false
+            if let renderer = mainTerminalView?.renderer,
+               !renderer.customShaderPipelines.isEmpty,
+               renderer.customShaderPostProcess == .afterBloom,
+               let copyVB = renderer.copyVertexBuffer,
+               let bilinSamp = renderer.bilinearSampler
+            {
+                // Screen-space unification: use the MAIN window's
+                // drawable as the shader's iResolution, and tell the
+                // shader where this external view sits inside that
+                // coordinate space so effects (stars, gradients,
+                // spotlights) line up across all windows.
+                let (screenRes, windowOffset) = screenSpaceParameters(
+                    mainView: mainTerminalView,
+                    selfView: self
+                )
+                let uniforms = renderer.makeCustomShaderUniforms(
+                    screenResolution: screenRes,
+                    windowOffset: windowOffset,
+                    windowSize: view.drawableSize,
+                    timing: shaderTiming
+                )
+                let pipelines = renderer.customShaderPipelines
+                if pipelines.count > 1 {
+                    ensureExternalCustomShaderPong(
+                        size: view.drawableSize,
+                        pixelFormat: drawable.texture.pixelFormat
+                    )
+                }
+                let pongsReady =
+                    pipelines.count <= 1
+                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
+                if pongsReady {
+                    for (i, pipeline) in pipelines.enumerated() {
+                        let isLast = (i == pipelines.count - 1)
+                        let inputTex: MTLTexture =
+                            (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
+                        let outputTex: MTLTexture =
+                            isLast ? drawable.texture : customShaderPong[i % 2]!
+                        pipeline.encode(
+                            cmd: cmd,
+                            input: inputTex,
+                            output: outputTex,
+                            copyVertexBuffer: copyVB,
+                            sampler: bilinSamp,
+                            uniforms: uniforms
+                        )
+                    }
+                    customShaderHandled = true
+                }
+            } else {
+                ZonvieCore.appLog("[CustomShader.ext] SKIP gridId=\(gridId) decorated=\(isDecoratedSurface) mainRenderer=\(mainTerminalView?.renderer != nil) pipelines=\(mainTerminalView?.renderer.customShaderPipelines.count ?? -1) copyVB=\(mainTerminalView?.renderer.copyVertexBuffer != nil) sampler=\(mainTerminalView?.renderer.bilinearSampler != nil)")
+            }
+            if !customShaderHandled, let blitEnc = cmd.makeBlitCommandEncoder() {
                 let w = min(backTex.width, drawable.texture.width)
                 let h = min(backTex.height, drawable.texture.height)
                 blitEnc.copy(

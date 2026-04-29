@@ -1009,6 +1009,60 @@ pub export fn WndProc(
                             break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
                         } else null;
 
+                        // Feed cursor state into the custom shader
+                        // uniforms (Ghostty 1.1+ iCurrentCursor /
+                        // iPreviousCursor / iTimeCursorChange etc.). No-op
+                        // when the rect + color match the last call.
+                        // Recompute the rect in floating point to avoid
+                        // the 1-pixel inflation that cursor_rc_opt picks
+                        // up from its floor/ceil integer rounding (the
+                        // dirty-rect consumer needs that, the shader
+                        // doesn't).
+                        if (cursor_verts_snapshot.len != 0) {
+                            if (app.renderer) |*r_sh| {
+                                var minx_sh: f32 = cursor_verts_snapshot[0].position[0];
+                                var maxx_sh: f32 = minx_sh;
+                                var miny_sh: f32 = cursor_verts_snapshot[0].position[1];
+                                var maxy_sh: f32 = miny_sh;
+                                for (cursor_verts_snapshot) |v| {
+                                    if (v.position[0] < minx_sh) minx_sh = v.position[0];
+                                    if (v.position[0] > maxx_sh) maxx_sh = v.position[0];
+                                    if (v.position[1] < miny_sh) miny_sh = v.position[1];
+                                    if (v.position[1] > maxy_sh) maxy_sh = v.position[1];
+                                }
+                                const vp_x_sh: u32 = content_x_offset orelse 0;
+                                const vp_y_sh: u32 = content_y_offset orelse 0;
+                                const base_w_sh: u32 = content_width orelse @intCast(@max(1, client.right));
+                                const sidebar_w_sh: u32 = sidebar_right_width orelse 0;
+                                const vp_w_sh: u32 =
+                                    if (base_w_sh > vp_x_sh + sidebar_w_sh)
+                                        base_w_sh - vp_x_sh - sidebar_w_sh
+                                    else
+                                        1;
+                                const vp_h_sh: u32 = content_height;
+                                const wf_sh: f32 = @floatFromInt(vp_w_sh);
+                                const hf_sh: f32 = @floatFromInt(vp_h_sh);
+                                const xo_sh: f32 = @floatFromInt(vp_x_sh);
+                                const yo_sh: f32 = @floatFromInt(vp_y_sh);
+                                const left_sh = xo_sh + (minx_sh + 1.0) * 0.5 * wf_sh;
+                                const right_sh = xo_sh + (maxx_sh + 1.0) * 0.5 * wf_sh;
+                                const top_sh = yo_sh + (1.0 - maxy_sh) * 0.5 * hf_sh;
+                                const bottom_sh = yo_sh + (1.0 - miny_sh) * 0.5 * hf_sh;
+                                // Ghostty's cursor shaders interpret the y
+                                // component as the BOTTOM edge of the
+                                // cursor rect (center is computed as
+                                // `y - h/2`, rect spans `y-h..y`). Pass
+                                // the bottom-edge so the shader renders
+                                // over the actual cursor, not one row
+                                // above it.
+                                const v0 = cursor_verts_snapshot[0];
+                                r_sh.setCursorShaderState(
+                                    .{ left_sh, bottom_sh, right_sh - left_sh, bottom_sh - top_sh },
+                                    v0.color,
+                                );
+                            }
+                        }
+
                         const fallback_row_h: u32 = app.cell_h_px + app.linespace_px;
                         const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
                         const row_h_px_u32 = if (rows_mismatch)
@@ -2317,6 +2371,51 @@ pub export fn WndProc(
                 if (getApp(hwnd)) |app| {
                     input.handleCursorBlinkTimer(hwnd, app);
                 }
+            } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
+                // Continuous-redraw tick for animated custom shaders.
+                // Runs a minimal shader-only present on the UI thread
+                // (no row VB draws, no overlays). Using InvalidateRect +
+                // full WM_PAINT here stalls input at 60 Hz because each
+                // tick re-runs the full row-mode paint path.
+                if (getApp(hwnd)) |app| {
+                    if (app.renderer) |*r| {
+                        r.presentShaderAnimationFrame();
+                    }
+                    // Iterating external_windows under app.mu while
+                    // calling Present on each renderer would self-
+                    // deadlock if DXGI's Present pumps a message whose
+                    // handler also locks app.mu (close, resize,
+                    // repaint, etc.). Snapshot the renderers under
+                    // the lock and bump paint_ref_count so concurrent
+                    // close handlers wait, then drop the lock for the
+                    // actual presents. finishExternalWindowPaint
+                    // releases the ref + drives any deferred close.
+                    const MaxExt: usize = 32;
+                    var ext_grids: [MaxExt]i64 = undefined;
+                    var ext_renderers: [MaxExt]*d3d11.Renderer = undefined;
+                    var ext_count: usize = 0;
+                    app.mu.lock();
+                    var it = app.external_windows.iterator();
+                    while (it.next()) |entry| {
+                        if (ext_count >= MaxExt) break;
+                        const ew = entry.value_ptr;
+                        if (ew.is_pending_close) continue;
+                        ew.paint_ref_count += 1;
+                        ext_grids[ext_count] = entry.key_ptr.*;
+                        ext_renderers[ext_count] = &ew.renderer;
+                        ext_count += 1;
+                    }
+                    app.mu.unlock();
+
+                    var i: usize = 0;
+                    while (i < ext_count) : (i += 1) {
+                        ext_renderers[i].presentShaderAnimationFrame();
+                    }
+                    var j: usize = 0;
+                    while (j < ext_count) : (j += 1) {
+                        external_windows.finishExternalWindowPaint(app, ext_grids[j]);
+                    }
+                }
             } else if (wParam == TIMER_DEVCONTAINER_POLL) {
                 // Poll for devcontainer up completion
                 if (dialogs.g_devcontainer_up_done.load(.seq_cst)) {
@@ -2708,6 +2807,29 @@ pub export fn WndProc(
                 app.mu.unlock();
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
+
+                // Load user-supplied custom post-process shaders. Disabled
+                // by default; fails soft and logs on broken config. Must
+                // run after the renderer is installed into `app.renderer`
+                // because compilation + pixel-shader creation need the
+                // live D3D11 device.
+                if (app.renderer) |*r| {
+                    r.loadCustomShaderPipelines(&app.config);
+                    if (r.any_custom_shader_needs_animation) {
+                        // Kick continuous-redraw ticker. Runs ~60Hz until
+                        // the renderer (or a future config reload) tells
+                        // us no animated shader is loaded anymore.
+                        const tr = c.SetTimer(
+                            hwnd,
+                            app_mod.TIMER_CUSTOM_SHADER_ANIM,
+                            app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS,
+                            null,
+                        );
+                        if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM SetTimer hwnd={*} interval={d}ms -> {d}\n", .{ hwnd, app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS, tr });
+                    } else {
+                        if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM not started (no animated shader)\n", .{});
+                    }
+                }
 
                 // Process pending glyphs
                 {

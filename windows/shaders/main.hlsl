@@ -248,6 +248,26 @@ FSQuadVSOut VSFullscreen(uint id : SV_VertexID) {
     return o;
 }
 
+// Separate vertex shader for the user's custom post-process shader.
+// SPIRV-Cross emits the PS input struct with a field named `vUV`. D3D11
+// matches stage-in by semantic, but some drivers/runtimes (observed with
+// the `negative.glsl` scratch-copy path on Windows) leave the PS's `vUV`
+// initialized to (0,0) when the VS output field is named `uv`. That made
+// every fragment sample `iChannel0` at (0,0) → single-color output. Using
+// a matching `vUV` field name sidesteps that case.
+struct CustomPostVSOut {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+
+CustomPostVSOut VSCustomPost(uint id : SV_VertexID) {
+    CustomPostVSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.vUV = uv;
+    return o;
+}
+
 // Glow extract: render only DECO_GLOW glyphs with original foreground color.
 // Non-glow vertices and non-glyph vertices are discarded.
 // Output is premultiplied alpha.

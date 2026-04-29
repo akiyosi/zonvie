@@ -11,6 +11,20 @@
             .url = "git+https://github.com/sam701/zig-toml#zig-0.15",
             .hash = "toml-0.3.0-bV14BfV7AQD8DkuQI7skP8ekQTaBYKTO0MY_35Cw_EXo",
         },
+        // Games-by-Mason's Zig-0.15-compatible port of glslang.
+        // Pulls upstream KhronosGroup/glslang + SPIRV-Tools + SPIRV-Headers
+        // as transitive deps and compiles them via Zig's build system.
+        .glslang = .{
+            .url = "git+https://github.com/Games-by-Mason/glslang-zig#734f1971036ad8364ba8f6ef10cfdcb589e04be9",
+            .hash = "glslang-1.4.309-eMn68KLGCQDAuHVUzugaYOOEhbkyHmN526R7mHIq9YUs",
+        },
+        // Local thin build wrapper around KhronosGroup/SPIRV-Cross.
+        // No public Zig-0.15-compatible port exists, so we vendor our own
+        // (under pkg/spirv_cross/). It fetches the upstream sources via
+        // Zig's package manager, so there is no git submodule to manage.
+        .spirv_cross = .{
+            .path = "pkg/spirv_cross",
+        },
     },
 
     .paths = .{""},

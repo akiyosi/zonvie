@@ -134,6 +134,20 @@ pub const atlas_size_min: u32 = 1024;
 pub const atlas_size_max: u32 = 4096;
 pub const atlas_size_default: u32 = 2048;
 
+/// Post-process insertion point for user-supplied custom shaders.
+pub const ShaderPostProcess = enum(u8) {
+    after_bloom = 0, // custom shader runs after bloom composite (default)
+    before_bloom = 1, // custom shader runs before bloom
+    replace_bloom = 2, // skip bloom entirely, only run custom shader
+
+    pub fn fromString(s: []const u8) ?ShaderPostProcess {
+        if (std.mem.eql(u8, s, "after_bloom")) return .after_bloom;
+        if (std.mem.eql(u8, s, "before_bloom")) return .before_bloom;
+        if (std.mem.eql(u8, s, "replace_bloom")) return .replace_bloom;
+        return null;
+    }
+};
+
 /// Zonvie configuration (nested structure for compatibility with existing code)
 pub const Config = struct {
     neovim: NeovimConfig = .{},
@@ -148,10 +162,12 @@ pub const Config = struct {
     log: LogConfig = .{},
     performance: PerformanceConfig = .{},
     ime: IMEConfig = .{},
+    shaders: ShaderConfig = .{},
 
     // Internal state
     alloc: ?std.mem.Allocator = null,
     routes_allocated: bool = false,
+    shader_paths_allocated: bool = false,
     parse_error: ?[]const u8 = null,
 
     pub const NeovimConfig = struct {
@@ -259,6 +275,16 @@ pub const Config = struct {
         disable_on_activate: bool = false,
         disable_on_modechange: bool = false,
         option_as_meta: OptionAsMeta = .both,
+    };
+
+    pub const ShaderConfig = struct {
+        /// Enable custom post-process shader chain.
+        enabled: bool = false,
+        /// Ordered list of GLSL shader file paths (Shadertoy / Ghostty compatible).
+        /// Each pass receives the previous pass output as iChannel0.
+        paths: []const []const u8 = &.{},
+        /// Where the custom shader chain inserts relative to bloom.
+        post_process: ShaderPostProcess = .after_bloom,
     };
 
     const Self = @This();
@@ -476,6 +502,47 @@ pub const Config = struct {
                 else if (std.mem.eql(u8, v, "only_right")) { self.ime.option_as_meta = .only_right; }
             }
         }
+
+        if (cfg.shaders) |s| {
+            if (s.enabled) |e| self.shaders.enabled = e;
+            if (s.post_process) |pp| {
+                if (ShaderPostProcess.fromString(pp)) |v| {
+                    // Only `after_bloom` is currently wired up in the
+                    // renderers. Accept the ABI-visible `before_bloom` /
+                    // `replace_bloom` values but log a warning and fall
+                    // back to `after_bloom` so shaders still run instead
+                    // of silently disabling.
+                    if (v != .after_bloom) {
+                        std.debug.print(
+                            "[config] [shaders] post_process = \"{s}\" is not implemented yet; falling back to \"after_bloom\"\n",
+                            .{pp},
+                        );
+                        self.shaders.post_process = .after_bloom;
+                    } else {
+                        self.shaders.post_process = v;
+                    }
+                }
+            }
+            if (s.paths) |paths_in| {
+                var list: std.ArrayList([]const u8) = .{};
+                for (paths_in) |p| {
+                    const duped = alloc.dupe(u8, p) catch continue;
+                    list.append(alloc, duped) catch {
+                        alloc.free(duped);
+                        continue;
+                    };
+                }
+                if (list.items.len > 0) {
+                    if (list.toOwnedSlice(alloc)) |slice| {
+                        self.shaders.paths = slice;
+                        self.shader_paths_allocated = true;
+                    } else |_| {
+                        for (list.items) |ps| alloc.free(ps);
+                        list.deinit(alloc);
+                    }
+                }
+            }
+        }
     }
 
     /// Route a message to the appropriate view
@@ -570,6 +637,12 @@ pub const Config = struct {
             }
             alloc.free(self.messages.routes);
         }
+
+        // Free allocated shader paths
+        if (self.shader_paths_allocated) {
+            for (self.shaders.paths) |p| alloc.free(p);
+            alloc.free(self.shaders.paths);
+        }
     }
 };
 
@@ -587,6 +660,7 @@ const TomlConfig = struct {
     log: ?TomlLog = null,
     performance: ?TomlPerformance = null,
     ime: ?TomlIME = null,
+    shaders: ?TomlShaders = null,
 };
 
 const TomlNeovim = struct {
@@ -674,4 +748,10 @@ const TomlIME = struct {
     disable_on_activate: ?bool = null,
     disable_on_modechange: ?bool = null,
     option_as_meta: ?[]const u8 = null,
+};
+
+const TomlShaders = struct {
+    enabled: ?bool = null,
+    paths: ?[]const []const u8 = null,
+    post_process: ?[]const u8 = null,
 };
