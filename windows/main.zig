@@ -631,7 +631,7 @@ pub fn main() u8 {
         @ptrCast(title.ptr),
         window_style,
         c.CW_USEDEFAULT, c.CW_USEDEFAULT,
-        1000, 700,
+        c.CW_USEDEFAULT, c.CW_USEDEFAULT,
         null, null,
         wc.hInstance,
         app, // lpParam -> WM_NCCREATE
