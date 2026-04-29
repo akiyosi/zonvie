@@ -2573,7 +2573,15 @@ final class ZonvieCore {
         // NSApp.terminate() would call exit(0) internally, losing the code.
         // Darwin.exit() directly would skip AppKit teardown and crash when
         // DispatchSemaphore is disposed mid-wait (MTKView inflightSemaphore).
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            // Force-flush the main window's frame to UserDefaults before the
+            // run loop stops. setFrameAutosaveName auto-saves on resize but
+            // those writes are in-memory; the main.swift Darwin.exit path
+            // bypasses AppKit's natural shutdown flush, so an explicit save
+            // here is needed to persist the most recent geometry.
+            if let win = self?.terminalView?.window, !win.frameAutosaveName.isEmpty {
+                win.saveFrame(usingName: win.frameAutosaveName)
+            }
             NSApp.stop(nil)
             // NSApp.stop requires a pending event to actually break the loop
             let event = NSEvent.otherEvent(
