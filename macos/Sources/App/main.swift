@@ -471,5 +471,9 @@ app.run()
 // Exit with Neovim's exit code (only meaningful in --nofork mode)
 // In fork mode, the parent process already exited with 0, so child's exit code
 // is not visible to the terminal.
+// Force any pending UserDefaults writes (e.g. NSWindow frame autosave) to
+// disk before Darwin.exit kills the process — the C exit() path skips
+// cfprefsd's natural drain that NSApp.terminate() would otherwise allow.
+UserDefaults.standard.synchronize()
 Darwin.exit(ZonvieCore.getExitCode())
 

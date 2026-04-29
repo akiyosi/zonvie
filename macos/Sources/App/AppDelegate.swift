@@ -171,19 +171,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         win.contentMinSize = NSSize(width: minWidth, height: 300)
 
+        // Assign the content view controller BEFORE restoring the frame.
+        // NSWindow.contentViewController setter resizes the window to match
+        // the view controller's view contentSize (~400x300 default), which
+        // would otherwise overwrite a restored autosave frame.
+        let vc = ViewController()
+        win.contentViewController = vc
+
         // Persist/restore window geometry (AppKit feature).
         win.setFrameAutosaveName(windowFrameAutosaveName)
 
         // If there is a saved frame from the last session, use it.
         // Otherwise keep the computed default rect (centered 800x600-ish).
-        if win.setFrameUsingName(windowFrameAutosaveName) {
-            // Restored from the last session; do not recenter.
-        } else {
+        if !win.setFrameUsingName(windowFrameAutosaveName) {
             win.center()
         }
-
-        let vc = ViewController()
-        win.contentViewController = vc
 
         self.window = win
         win.delegate = self  // Handle window close with unsaved buffer check
