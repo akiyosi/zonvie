@@ -498,6 +498,17 @@ pub const Callbacks = extern struct {
         total_rows: u32,
         total_cols: u32,
     ) callconv(.c) void = null,
+
+    // Restart UI event observer (informational; core handles reconnect).
+    // Appended at the end of the struct to preserve ABI for older callers
+    // that pass a smaller callbacks_size to zonvie_core_create.
+    on_restart: ?*const fn (ctx: ?*anyopaque, listen_addr: [*]const u8, listen_addr_len: usize) callconv(.c) void = null,
+
+    // Connect UI event observer (informational; core handles reconnect).
+    // Appended after on_restart for the same ABI-compat reason. Old callers
+    // that don't fill this field get a null callback and lose the
+    // notification — the reconnect itself still happens transparently.
+    on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
 };
 
 
@@ -561,6 +572,8 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         .on_exit = box.cb.on_exit,
         .on_set_title = box.cb.on_set_title,
+        .on_restart = box.cb.on_restart,
+        .on_connect = box.cb.on_connect,
 
         .on_external_window = box.cb.on_external_window,
         .on_external_window_close = box.cb.on_external_window_close,
@@ -660,6 +673,27 @@ pub export fn zonvie_core_start(p: ?*zonvie_core, nvim_path_c: ?[*:0]const u8, r
     const box = asBox(p.?);
     const nvim_path = if (nvim_path_c) |s| std.mem.span(s) else "nvim";
     box.core.start(nvim_path, rows, cols) catch return -2;
+    return 0;
+}
+
+/// Start in connect mode: attach to a running Neovim server at
+/// listen_addr instead of spawning a child. Address forms supported:
+///   - "host:port"        TCP
+///   - "/abs/path"        Unix domain socket
+/// Windows named pipes are not yet supported; on Windows the connect
+/// returns an error and the run loop exits without firing on_exit.
+pub export fn zonvie_core_start_connect(
+    p: ?*zonvie_core,
+    listen_addr: ?[*]const u8,
+    listen_addr_len: usize,
+    rows: u32,
+    cols: u32,
+) callconv(.c) i32 {
+    if (p == null) return -1;
+    const box = asBox(p.?);
+    const addr = if (listen_addr) |s| s[0..listen_addr_len] else return -3;
+    if (addr.len == 0) return -3;
+    box.core.startConnect(addr, rows, cols) catch return -2;
     return 0;
 }
 

@@ -14,6 +14,7 @@ const flush = @import("flush.zig");
 const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
+const rpc_transport = @import("rpc_transport.zig");
 
 pub const PipeReader = struct {
     file: std.fs.File,
@@ -780,6 +781,8 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             flush.FlushCtx.onLinespace,
             flush.FlushCtx.onSetTitle,
             flush.FlushCtx.onDefaultColors,
+            flush.FlushCtx.onRestart,
+            flush.FlushCtx.onConnect,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
         };
@@ -1122,6 +1125,15 @@ pub fn runLoop(self: *Core) void {
         contains_ssh_exe or
         (is_cmd and std.mem.indexOf(u8, nvim_path, "ssh") != null);
 
+    // Remote modes wrap nvim in an indirection (ssh / devcontainer / wsl /
+    // shell / cmd). The listen_addr returned by a `:restart` event lives
+    // inside that indirection and is not reachable from the host, so a
+    // restart in remote mode falls back to re-spawn instead of socket
+    // connect. Pure native sessions (and any future "connect to running
+    // nvim" entry point) get the proper transparent reconnect.
+    const is_remote_for_restart = is_wsl or is_ssh or is_ssh_askpass or
+        is_cmd or is_shell or is_devcontainer;
+
     // Buffer for parsed arguments
     var argv_buf: [16][]const u8 = undefined;
     var argc: usize = 0;
@@ -1254,314 +1266,433 @@ pub fn runLoop(self: *Core) void {
     logEnvHints(self);
     self.log.write("[MARKER] after logEnvHints\n", .{});
 
-    var child = std.process.Child.init(argv_buf[0..argc], self.alloc);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.create_no_window = true;
+    // === Session loop ===
+    //
+    // First iteration spawns nvim (or, in the future, opens an initial
+    // socket connection — currently not yet a separate entry point).
+    // Subsequent iterations are entered only when a `:restart` event
+    // queued `restart_pending_addr`. In that case:
+    //   - Native mode:   open a socket to listen_addr (transparent reconnect).
+    //   - Remote mode:   re-spawn the same argv (listen_addr unreachable).
+    //   - Connect failure: same as remote — fall back to re-spawn.
+    //
+    // Persistent state (grid, hl, atlas, ext UI, layout dimensions) carries
+    // across iterations untouched, so the user sees no flicker on `:restart`.
+    var ui_attached_overall: bool = false;
+    var last_term: ?std.process.Child.Term = null;
 
-    var cwd_owner: CwdOwner = .{};
-    defer cwd_owner.close();
-    if (!self.inherit_cwd) {
-        cwd_owner.openPreferred(self.alloc, &self.log);
-        cwd_owner.applyToChild(&child);
-    } else {
-        self.log.write("inherit_cwd=true; child inherits parent cwd\n", .{});
-    }
-
-    // Check for path separators - both '/' (Unix) and '\' (Windows)
-    const has_slash = (std.mem.indexOfScalar(u8, nvim_path, '/') != null) or
-        (std.mem.indexOfScalar(u8, nvim_path, '\\') != null);
-    if (@hasField(@TypeOf(child), "expand_arg0")) {
-        child.expand_arg0 = if (has_slash) .no_expand else .expand;
-    }
-    self.log.write("expand_arg0: has_slash={}, mode={s}\n", .{ has_slash, if (has_slash) "no_expand" else "expand" });
-
-    self.log.write("about to spawn...\n", .{});
-    // Direct callback log before spawn
-    if (self.cb.on_log) |logfn| {
-        const msg1 = "[DIRECT] calling child.spawn() now\n";
-        logfn(self.ctx, msg1.ptr, msg1.len);
-    }
-    const spawn_start_ns = std.time.nanoTimestamp();
-    child.spawn() catch |e| {
-        self.log.write("spawn failed: {any}\n", .{e});
-        if (self.cb.on_log) |logfn| {
-            const msg_err = "[DIRECT] spawn error occurred\n";
-            logfn(self.ctx, msg_err.ptr, msg_err.len);
+    session: while (true) {
+        var session_addr: ?[]u8 = null;
+        var use_connect: bool = false;
+        if (self.restart_pending_addr) |a| {
+            self.restart_pending_addr = null;
+            if (is_remote_for_restart) {
+                self.log.write("restart: remote mode, re-spawning instead of connecting (addr={s})\n", .{a});
+                self.alloc.free(a);
+            } else {
+                session_addr = a;
+                use_connect = true;
+            }
         }
-        return;
-    };
-    const spawn_end_ns = std.time.nanoTimestamp();
-    const spawn_ms = @divTrunc(spawn_end_ns - spawn_start_ns, 1_000_000);
-    // Direct callback log after spawn
-    if (self.cb.on_log) |logfn| {
-        const msg2 = "[DIRECT] child.spawn() returned successfully\n";
-        logfn(self.ctx, msg2.ptr, msg2.len);
-    }
-    self.log.write("[TIMING] nvim spawn: {d}ms\n", .{spawn_ms});
-    self.log.write("spawn returned ok, pid={any}\n", .{child.id});
+        defer if (session_addr) |a| self.alloc.free(a);
 
-    // Note: Don't try to read stderr here - it blocks if no data available
+        // === Set up transport ===
+        var have_child: bool = false;
+        var child: std.process.Child = undefined;
+        var cwd_owner: CwdOwner = .{};
+        defer cwd_owner.close();
 
-    self.child_handle = child.id;
-    self.stdin_file = child.stdin;
-    self.stdout_file = child.stdout;
-    self.stderr_file = child.stderr;
+        if (use_connect) {
+            const conn_opt: ?rpc_transport.Connection = rpc_transport.connectListenAddr(self.alloc, session_addr.?) catch |e| blk: {
+                self.log.write("connect to {s} failed: {any}; falling back to re-spawn\n", .{ session_addr.?, e });
+                break :blk null;
+            };
+            if (conn_opt) |conn| {
+                self.transport_kind = .socket;
+                self.stdin_file = conn.file;
+                self.stdout_file = conn.file; // alias of the same fd
+                self.stderr_file = null;
+                self.log.write("connect: established socket session to {s}\n", .{session_addr.?});
+            } else if (nvim_path.len == 0) {
+                // Connect-only mode (started via zonvie_core_start_connect): no
+                // argv to fall back to. Exit cleanly without spawning a
+                // surprise local nvim.
+                self.log.write("connect: no spawn fallback (connect-only mode); exiting run loop\n", .{});
+                break :session;
+            } else {
+                use_connect = false; // fall through to spawn
+            }
+        }
 
-    // OWNERSHIP TRANSFER:
-    // We keep the pipe handles in Core, so prevent std.process.Child from closing them.
-    child.stdin = null;
-    child.stdout = null;
-    child.stderr = null;
+        if (!use_connect) {
+            child = std.process.Child.init(argv_buf[0..argc], self.alloc);
+            child.stdin_behavior = .Pipe;
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Pipe;
+            child.create_no_window = true;
 
-    if (self.stderr_file) |ef| {
-        self.stderr_thread = std.Thread.spawn(.{}, pumpStderr, .{ self, ef }) catch null;
-    }
-
-    // Start writer thread for non-blocking stdin writes.
-    // SSH mode defers this until after authentication completes (see below).
-    if (!self.is_ssh_mode) {
-        self.startWriterThread();
-    }
-
-    // SSH mode: prompt for password immediately after process start
-    // With -tt option, password prompt goes to TTY (not visible via pipes)
-    // So we show dialog immediately and wait for user to enter password
-    if (self.is_ssh_mode) {
-        self.log.write("SSH mode: prompting for password immediately...\n", .{});
-
-        // Set pending flag to block other stdin writes (RPC sends)
-        self.ssh_auth_pending.store(true, .seq_cst);
-
-        // Small delay to let SSH start
-        std.Thread.sleep(200 * std.time.ns_per_ms);
-
-        // Call callback to show password dialog
-        if (self.cb.on_ssh_auth_prompt) |cb| {
-            cb(self.ctx, "SSH Password:", 13);
-
-            // Wait for password to be sent (ssh_auth_done flag)
-            self.log.write("SSH mode: waiting for user to enter password...\n", .{});
-            var waited_ms: u32 = 0;
-            const timeout_ms: u32 = 60000; // 60 seconds
-            const poll_ms: u32 = 100;
-
-            while (waited_ms < timeout_ms and !self.stop_flag.load(.seq_cst)) {
-                if (self.ssh_auth_done.load(.seq_cst)) {
-                    self.log.write("SSH mode: password sent, waiting for connection...\n", .{});
-                    // Give SSH time to authenticate
-                    std.Thread.sleep(2000 * std.time.ns_per_ms);
-                    break;
-                }
-                std.Thread.sleep(poll_ms * std.time.ns_per_ms);
-                waited_ms += poll_ms;
+            if (!self.inherit_cwd) {
+                cwd_owner.openPreferred(self.alloc, &self.log);
+                cwd_owner.applyToChild(&child);
+            } else {
+                self.log.write("inherit_cwd=true; child inherits parent cwd\n", .{});
             }
 
-            if (waited_ms >= timeout_ms) {
-                self.log.write("SSH mode: authentication timeout\n", .{});
+            const has_slash = (std.mem.indexOfScalar(u8, nvim_path, '/') != null) or
+                (std.mem.indexOfScalar(u8, nvim_path, '\\') != null);
+            if (@hasField(@TypeOf(child), "expand_arg0")) {
+                child.expand_arg0 = if (has_slash) .no_expand else .expand;
+            }
+            self.log.write("expand_arg0: has_slash={}, mode={s}\n", .{ has_slash, if (has_slash) "no_expand" else "expand" });
+
+            self.log.write("about to spawn...\n", .{});
+            if (self.cb.on_log) |logfn| {
+                const msg1 = "[DIRECT] calling child.spawn() now\n";
+                logfn(self.ctx, msg1.ptr, msg1.len);
+            }
+            const spawn_start_ns = std.time.nanoTimestamp();
+            child.spawn() catch |e| {
+                self.log.write("spawn failed: {any}\n", .{e});
+                if (self.cb.on_log) |logfn| {
+                    const msg_err = "[DIRECT] spawn error occurred\n";
+                    logfn(self.ctx, msg_err.ptr, msg_err.len);
+                }
+                break :session;
+            };
+            const spawn_end_ns = std.time.nanoTimestamp();
+            const spawn_ms = @divTrunc(spawn_end_ns - spawn_start_ns, 1_000_000);
+            if (self.cb.on_log) |logfn| {
+                const msg2 = "[DIRECT] child.spawn() returned successfully\n";
+                logfn(self.ctx, msg2.ptr, msg2.len);
+            }
+            self.log.write("[TIMING] nvim spawn: {d}ms\n", .{spawn_ms});
+            self.log.write("spawn returned ok, pid={any}\n", .{child.id});
+
+            self.transport_kind = .pipes;
+            self.child_handle = child.id;
+            self.stdin_file = child.stdin;
+            self.stdout_file = child.stdout;
+            self.stderr_file = child.stderr;
+
+            // OWNERSHIP TRANSFER: keep handles in Core; prevent Child from closing them.
+            child.stdin = null;
+            child.stdout = null;
+            child.stderr = null;
+
+            have_child = true;
+
+            if (self.stderr_file) |ef| {
+                self.stderr_thread = std.Thread.spawn(.{}, pumpStderr, .{ self, ef }) catch null;
+            }
+
+            // SSH mode defers writer thread until after authentication completes.
+            if (!self.is_ssh_mode) {
+                self.startWriterThread();
+            }
+
+            if (self.is_ssh_mode) {
+                self.log.write("SSH mode: prompting for password immediately...\n", .{});
+                self.ssh_auth_pending.store(true, .seq_cst);
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+
+                if (self.cb.on_ssh_auth_prompt) |cb| {
+                    cb(self.ctx, "SSH Password:", 13);
+                    self.log.write("SSH mode: waiting for user to enter password...\n", .{});
+                    var waited_ms: u32 = 0;
+                    const timeout_ms: u32 = 60000;
+                    const poll_ms: u32 = 100;
+
+                    while (waited_ms < timeout_ms and !self.stop_flag.load(.seq_cst)) {
+                        if (self.ssh_auth_done.load(.seq_cst)) {
+                            self.log.write("SSH mode: password sent, waiting for connection...\n", .{});
+                            std.Thread.sleep(2000 * std.time.ns_per_ms);
+                            break;
+                        }
+                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                        waited_ms += poll_ms;
+                    }
+
+                    if (waited_ms >= timeout_ms) {
+                        self.log.write("SSH mode: authentication timeout\n", .{});
+                    }
+                } else {
+                    self.log.write("SSH mode: no callback registered\n", .{});
+                }
+
+                self.ssh_auth_pending.store(false, .seq_cst);
+                self.startWriterThread();
+
+                if (self.stop_flag.load(.seq_cst)) {
+                    self.log.write("SSH mode: stopped by user\n", .{});
+                    teardownSpawnSession(self, &child, have_child);
+                    break :session;
+                }
             }
         } else {
-            self.log.write("SSH mode: no callback registered\n", .{});
+            // Connect mode has no child process; the writer thread can
+            // start immediately (no SSH auth in this path).
+            self.startWriterThread();
         }
 
-        // Clear pending flag and start writer thread now that auth is done
-        self.ssh_auth_pending.store(false, .seq_cst);
-        self.startWriterThread();
+        var ui_attached: bool = false;
+
+        // Block until layout is ready (set by notifyLayoutReady on first
+        // start). For restart iterations ui_attach_ready is already true,
+        // so this falls through immediately.
+        {
+            self.ui_attach_mutex.lock();
+            defer self.ui_attach_mutex.unlock();
+            while (!self.ui_attach_ready) {
+                if (self.stop_flag.load(.seq_cst)) break;
+                self.ui_attach_cond.wait(&self.ui_attach_mutex);
+            }
+        }
 
         if (self.stop_flag.load(.seq_cst)) {
-            self.log.write("SSH mode: stopped by user\n", .{});
-            return;
+            teardownSpawnSession(self, &child, have_child);
+            break :session;
         }
-    }
 
-    var ui_attached = false;
+        self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
+        self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
 
-    // Block until layout is ready (ui_attach_cond signaled by notifyLayoutReady)
-    {
-        self.ui_attach_mutex.lock();
-        defer self.ui_attach_mutex.unlock();
-        while (!self.ui_attach_ready) {
-            if (self.stop_flag.load(.seq_cst)) break;
-            self.ui_attach_cond.wait(&self.ui_attach_mutex);
-        }
-    }
-
-    if (self.stop_flag.load(.seq_cst)) {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    }
-
-    self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
-    self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
-
-    // If config.toml [font] family is set, push it to nvim's `guifont` BEFORE
-    // ui_attach. Sending it after ui_attach would arrive mid-redraw: nvim
-    // would emit an option_set during its initial paint, then re-emit after
-    // processing our set. The second paint round-trip caused the statusline
-    // to briefly drop its text on Windows at startup.
-    if (self.msg_config.font.family_explicit) {
-        var guifont_buf: [256]u8 = undefined;
-        const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
-            self.msg_config.font.family,
-            self.msg_config.font.size,
-        }) catch null;
-        if (guifont_str) |val| {
-            self.requestSetOptionValue("guifont", val) catch |e|
-                self.log.write("pre-attach set guifont failed: {any}\n", .{e});
-        }
-    }
-
-    self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
-        self.log.write("ui_attach send failed: {any}\n", .{e});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    };
-    ui_attached = true;
-    self.ui_attached.store(true, .seq_cst);
-    self.flushPendingFocus();
-
-    // Setup clipboard immediately after ui_attach (no get_api_info
-    // round-trip). The Lua code discovers our channel_id via
-    // nvim_list_chans() + client.name match.
-    setupClipboard(self);
-
-    // Glow config is requested via glow_startup_retries during flush processing.
-
-    if (self.pending_resize_valid) {
-        const pr2 = self.pending_resize_rows;
-        const pc2 = self.pending_resize_cols;
-        if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
-            self.pending_resize_valid = false;
-            self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
-        } else {
-            self.requestTryResize(pr2, pc2) catch |e| {
-                self.log.write("pending resize send failed: {any}\n", .{e});
-            };
-            self.pending_resize_valid = false;
-            self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
-        }
-    }
-
-    if (self.stdout_file == null) {
-        self.log.write("stdout pipe is null\n", .{});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    }
-
-    // Contiguous buffered reader. Replaces the byte-at-a-time PipeReader so
-    // the MessagePack decoder sees a `[]const u8` slice it can advance through.
-    // The buffer grows on demand when a single RPC frame exceeds the current
-    // capacity (e.g., a wide-grid `grid_line` carrying thousands of cells).
-    var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
-        self.log.write("FrameReader init failed: {any}\n", .{e});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    };
-    defer fr.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-    defer arena_state.deinit();
-
-    outer: while (!self.stop_flag.load(.seq_cst)) {
-        // Refill-on-EOF retry loop. The arena is reset between retries so
-        // that partial allocations from a failed decode don't accumulate.
-        //
-        // Note: an earlier iteration of this loop included a streaming
-        // fast path (probe + skipAny + `decodeFromStream`) for redraw
-        // notifications. Microbenchmarks (`zig build bench`) showed it
-        // was 1.24x–1.94x slower on the decode path alone — as long as
-        // handlers keep consuming `Value` trees, the streaming decoder
-        // loses both to the second scan pass and to the extra
-        // `ValueHead` dispatch layer. The fast path was removed; the
-        // streaming decoder (`src/core/mpack_stream.zig`) and its bridge
-        // helper (`msgpack.decodeFromStream`) are retained as reference
-        // implementations for any future rewrite that streams through
-        // the handlers directly (i.e., drops the intermediate `Value`
-        // tree on the `grid_line` hot path).
-        var root: mp.Value = undefined;
-        while (true) {
-            _ = arena_state.reset(.retain_capacity);
-            const arena_once = arena_state.allocator();
-
-            var sr = FrameSliceReader{ .data = fr.view() };
-            if (mp.decode(arena_once, &sr)) |v| {
-                fr.consume(sr.i);
-                root = v;
-                break;
-            } else |e| {
-                if (e == error.EndOfStream) {
-                    const n = fr.fill() catch |fe| {
-                        self.log.write("pipe read err: {any}\n", .{fe});
-                        break :outer;
-                    };
-                    if (n == 0) {
-                        self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
-                        break :outer;
-                    }
-                    continue;
-                }
-                self.log.write("decode err: {any}\n", .{e});
-                break :outer;
+        // If config.toml [font] family is set, push it to nvim's `guifont`
+        // BEFORE ui_attach (avoids a second paint round-trip; see original
+        // statusline-on-Windows note for context).
+        if (self.msg_config.font.family_explicit) {
+            var guifont_buf: [256]u8 = undefined;
+            const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
+                self.msg_config.font.family,
+                self.msg_config.font.size,
+            }) catch null;
+            if (guifont_str) |val| {
+                self.requestSetOptionValue("guifont", val) catch |e|
+                    self.log.write("pre-attach set guifont failed: {any}\n", .{e});
             }
         }
 
-        const arena = arena_state.allocator();
-        if (root != .arr or root.arr.len < 1) continue;
-        const top = root.arr;
-        if (top[0] != .int) continue;
+        self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
+            self.log.write("ui_attach send failed: {any}\n", .{e});
+            teardownSpawnSession(self, &child, have_child);
+            break :session;
+        };
+        ui_attached = true;
+        ui_attached_overall = true;
+        self.ui_attached.store(true, .seq_cst);
+        self.flushPendingFocus();
 
-        const t = top[0].int;
-        if (t == 0) {
-            // RPC request from Neovim (e.g., clipboard operations)
-            handleRpcRequest(self, arena, top);
-            continue;
+        // Discover our channel_id via vim.api.nvim_list_chans() and install
+        // the clipboard provider hooks.
+        setupClipboard(self);
+
+        if (self.pending_resize_valid) {
+            const pr2 = self.pending_resize_rows;
+            const pc2 = self.pending_resize_cols;
+            if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
+                self.pending_resize_valid = false;
+                self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
+            } else {
+                self.requestTryResize(pr2, pc2) catch |e| {
+                    self.log.write("pending resize send failed: {any}\n", .{e});
+                };
+                self.pending_resize_valid = false;
+                self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
+            }
         }
-        if (t == 1) {
-            // RPC response (e.g., quit request result)
-            handleRpcResponse(self, top);
-            continue;
+
+        if (self.stdout_file == null) {
+            self.log.write("read transport is null\n", .{});
+            teardownSpawnSession(self, &child, have_child);
+            break :session;
         }
-        if (t == 2) {
-            handleRpcNotification(self, arena, top);
-            continue;
+
+        var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
+            self.log.write("FrameReader init failed: {any}\n", .{e});
+            teardownSpawnSession(self, &child, have_child);
+            break :session;
+        };
+        defer fr.deinit();
+
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+
+        // Inner reader loop — same for both transports. Earlier iterations
+        // experimented with a streaming fast path here; microbenchmarks
+        // showed the Value-tree path was 1.24x–1.94x faster, so the
+        // streaming machinery (mpack_stream / decodeFromStream) is kept
+        // only as a reference implementation.
+        outer: while (!self.stop_flag.load(.seq_cst)) {
+            var root: mp.Value = undefined;
+            while (true) {
+                _ = arena_state.reset(.retain_capacity);
+                const arena_once = arena_state.allocator();
+
+                var sr = FrameSliceReader{ .data = fr.view() };
+                if (mp.decode(arena_once, &sr)) |v| {
+                    fr.consume(sr.i);
+                    root = v;
+                    break;
+                } else |e| {
+                    if (e == error.EndOfStream) {
+                        const n = fr.fill() catch |fe| {
+                            self.log.write("pipe read err: {any}\n", .{fe});
+                            break :outer;
+                        };
+                        if (n == 0) {
+                            self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
+                            break :outer;
+                        }
+                        continue;
+                    }
+                    self.log.write("decode err: {any}\n", .{e});
+                    break :outer;
+                }
+            }
+
+            const arena = arena_state.allocator();
+            if (root != .arr or root.arr.len < 1) continue;
+            const top = root.arr;
+            if (top[0] != .int) continue;
+
+            const t = top[0].int;
+            if (t == 0) {
+                handleRpcRequest(self, arena, top);
+                continue;
+            }
+            if (t == 1) {
+                handleRpcResponse(self, top);
+                continue;
+            }
+            if (t == 2) {
+                handleRpcNotification(self, arena, top);
+                continue;
+            }
         }
+
+        // === Session cleanup ===
+        // Stop the writer thread before closing the transport so its
+        // in-flight writeAll() doesn't observe a torn-down handle.
+        var wt: ?std.Thread = null;
+        {
+            self.write_queue_mu.lock();
+            self.write_queue_closed = true;
+            wt = self.writer_thread;
+            self.writer_thread = null;
+            self.write_queue_cond.signal();
+            self.write_queue_mu.unlock();
+        }
+        // `:connect` hot-swap: the old nvim is still alive headless on
+        // its own listen socket and would block child.wait() forever
+        // (the process never exits). Don't kill, don't wait — just drop
+        // the handle. The orphan continues running until the user kills
+        // it manually. We still close OUR end of the pipes (just FDs in
+        // our process; doesn't affect the running nvim).
+        const orphan_child = self.connect_keeps_child_alive;
+
+        if (self.stdin_file) |f| {
+            f.close();
+            self.stdin_file = null;
+            // Socket transport aliases stdin and stdout on the same fd —
+            // closing once fully tears down the connection. Null both
+            // pointers so downstream cleanup does not double-close.
+            if (self.transport_kind == .socket) {
+                self.stdout_file = null;
+            }
+        }
+        if (wt) |t| t.join();
+
+        // Wait for the child (spawn mode only) and capture exit term.
+        var session_term: ?std.process.Child.Term = null;
+        if (have_child) {
+            if (orphan_child) {
+                self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
+                self.child_handle = null;
+            } else {
+                if (self.stop_flag.load(.seq_cst)) {
+                    _ = child.kill() catch {};
+                }
+                session_term = child.wait() catch |e| blk: {
+                    self.log.write("wait err: {any}\n", .{e});
+                    break :blk null;
+                };
+                if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
+                self.child_handle = null;
+            }
+        }
+        if (session_term) |t| last_term = t;
+
+        // Close any remaining transport handles.
+        if (self.stdout_file) |f| {
+            f.close();
+            self.stdout_file = null;
+        }
+        if (self.stderr_file) |f| {
+            f.close();
+            self.stderr_file = null;
+        }
+
+        // Join the stderr pump (if any). Closing stderr_file above causes
+        // its read() to return 0, exiting the thread cleanly.
+        if (self.stderr_thread) |t| {
+            t.join();
+            self.stderr_thread = null;
+        }
+
+        // === Decide next iteration ===
+        if (self.stop_flag.load(.seq_cst)) {
+            // App-side stop() observed; do not fire on_exit, do not loop.
+            return;
+        }
+
+        if (self.restart_pending_addr != null) {
+            // Restart/connect was queued during this session. Reset
+            // session-scoped state and loop back; the next iteration uses
+            // the connect path (or re-spawn fallback for remote modes).
+            // Consume the connect-keeps-alive flag now that the orphan
+            // (if any) has been dropped — the next session must not
+            // inherit it.
+            self.connect_keeps_child_alive = false;
+            self.resetSessionState();
+            if (self.stop_flag.load(.seq_cst)) return;
+            continue :session;
+        }
+
+        // Natural exit: nvim closed the channel without queueing a restart.
+        break :session;
     }
 
-    if (self.stop_flag.load(.seq_cst)) {
-        _ = child.kill() catch {};
-    }
-
-    const term = child.wait() catch |e| {
-        self.log.write("wait err: {any}\n", .{e});
-        return;
-    };
-    self.log.write("nvim terminated: {any}\n", .{term});
-    self.child_handle = null;
-
-
-    self.log.write("nvim terminated: {any}\n", .{term});
-    self.child_handle = null;
-
-    // If nvim exited by itself (e.g. :q), notify the frontend.
-    // When stop() is requested by the app side, stop_flag is set and we should not trigger on_exit.
-    if (!self.stop_flag.load(.seq_cst) and ui_attached) {
+    // === After-loop: fire on_exit ===
+    // Suppressed only when stop() was already invoked (user-driven shutdown:
+    // window close, app quit). For all other paths — including pre-attach
+    // failures like connect-only socket-not-found, spawn failure, ui_attach
+    // send failure, FrameReader init failure — we still fire on_exit so the
+    // frontend can tear down its window instead of leaving a blank shell.
+    if (!self.stop_flag.load(.seq_cst)) {
         if (self.cb.on_exit) |f| {
             // Convert Term to exit code:
-            // - Exited: use exit code directly
-            // - Signal: 128 + signal number (Unix convention)
-            // - Stopped/Unknown: return 1 (generic error)
-            const exit_code: i32 = switch (term) {
+            //   - Exited: use exit code directly
+            //   - Signal: 128 + signal number (Unix convention)
+            //   - Stopped/Unknown: return 1 (generic error)
+            //   - Natural exit in connect mode (no Term, ui attached): 0
+            //   - Pre-attach failure (no Term, never attached): 1
+            const exit_code: i32 = if (last_term) |t| switch (t) {
                 .Exited => |code| @intCast(code),
                 .Signal => |sig| 128 + @as(i32, @intCast(sig)),
                 .Stopped, .Unknown => 1,
-            };
+            } else if (ui_attached_overall) 0 else 1;
             self.log.write("calling on_exit with code: {d}\n", .{exit_code});
             f(self.ctx, exit_code);
         }
+    }
+}
+
+/// Tear down a partially-set-up spawn session without firing on_exit.
+/// Called from early-exit paths inside runLoop (ui_attach failure, stop
+/// during ssh-auth wait, etc.). Safe to call when have_child is false.
+fn teardownSpawnSession(self: *Core, child: *std.process.Child, have_child: bool) void {
+    if (have_child) {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        self.child_handle = null;
     }
 }

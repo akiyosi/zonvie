@@ -19,6 +19,7 @@ let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") ||
 //   --nofork, --nvim <path>, --log <path>, --extcmdline, --extpopup, --extpopupmenu,
 //   --extmessages, --exttabline, --extwindows, --ssh=*, --ssh-identity=*,
 //   --devcontainer=*, --devcontainer-config=*, --devcontainer-rebuild,
+//   --connect-nvim=*, --remote-ui=* (alias),
 //   --help, -h
 // After "--", all remaining arguments are passed to nvim
 var cliNvimPath: String? = nil
@@ -63,11 +64,13 @@ do {
             // Skip --log and its value
             i += 2
         } else if arg == "--ssh" || arg == "--ssh-identity" ||
-                  arg == "--devcontainer" || arg == "--devcontainer-config" {
+                  arg == "--devcontainer" || arg == "--devcontainer-config" ||
+                  arg == "--connect-nvim" || arg == "--remote-ui" {
             // Skip space-separated value arguments (--ssh host, --devcontainer path, etc.)
             i += 2
         } else if arg.hasPrefix("--ssh=") || arg.hasPrefix("--ssh-identity=") ||
-                  arg.hasPrefix("--devcontainer=") || arg.hasPrefix("--devcontainer-config=") {
+                  arg.hasPrefix("--devcontainer=") || arg.hasPrefix("--devcontainer-config=") ||
+                  arg.hasPrefix("--connect-nvim=") || arg.hasPrefix("--remote-ui=") {
             // Skip =value style arguments
             i += 1
         } else {
@@ -144,6 +147,10 @@ if args.contains("--help") || args.contains("-h") {
             --devcontainer=<workspace>    Run inside a devcontainer
             --devcontainer-config=<path>  Path to devcontainer.json
             --devcontainer-rebuild        Rebuild devcontainer before starting
+            --connect-nvim=<addr>         Attach to a running Neovim server.
+                                            Address: TCP "host:port" or Unix socket path.
+                                            Mutually exclusive with --ssh / --devcontainer.
+            --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
             --install                     Create default config file and exit
             --help, -h                    Show this help message and exit
             --                            Pass all remaining arguments to nvim

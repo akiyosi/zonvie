@@ -153,6 +153,8 @@ fn makeCoreCbs() core.Callbacks {
         .on_exit = callbacks.onExit,
         .on_default_colors_set = callbacks.onDefaultColorsSet,
         .on_set_title = callbacks.onSetTitle,
+        .on_restart = callbacks.onRestart,
+        .on_connect = callbacks.onConnect,
         .on_external_window = external_windows.onExternalWindow,
         .on_external_window_close = external_windows.onExternalWindowClose,
         .on_cursor_grid_changed = external_windows.onCursorGridChanged,
@@ -291,15 +293,21 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     // 5. Compute rows/cols from actual cell metrics
     updateRowsColsFromClientForce(hwnd, app);
 
-    // 6. Spawn nvim (native mode only)
-    var nvim_cmd_buf: [1024]u8 = undefined;
-    const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
-    const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
-    defer if (nvim_path_z) |p| app.alloc.free(p);
-    const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
+    // 6. Start session: connect mode if --connect-nvim/--remote-ui was set,
+    //    otherwise spawn nvim (native mode).
+    if (app.connect_addr) |addr| {
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: connect mode addr={s} rows={d} cols={d}\n", .{ addr, app.surface.rows, app.surface.cols });
+        _ = core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surface.rows, app.surface.cols);
+    } else {
+        var nvim_cmd_buf: [1024]u8 = undefined;
+        const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
+        const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
+        defer if (nvim_path_z) |p| app.alloc.free(p);
+        const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
 
-    if (log_enabled) applog.appLog("[win] doEarlyCoreInit: starting nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
-    _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: spawning nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+    }
     app.nvim_spawned = true;
     app.early_core_init_done = true;
 

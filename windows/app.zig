@@ -27,6 +27,7 @@ pub const zonvie_callbacks = core.zonvie_callbacks;
 pub const zonvie_core_create = core.zonvie_core_create;
 pub const zonvie_core_destroy = core.zonvie_core_destroy;
 pub const zonvie_core_start = core.zonvie_core_start;
+pub const zonvie_core_start_connect = core.zonvie_core_start_connect;
 pub const zonvie_core_stop = core.zonvie_core_stop;
 pub const zonvie_core_notify_layout_ready = core.zonvie_core_notify_layout_ready;
 pub const zonvie_core_send_input = core.zonvie_core_send_input;
@@ -2748,6 +2749,12 @@ pub const App = struct {
     devcontainer_rebuild: bool = false,
     devcontainer_up_pending: bool = false, // Waiting for devcontainer up to complete
     devcontainer_nvim_started: bool = false, // Nvim started in devcontainer mode
+
+    // Connect mode (--connect-nvim=<addr> or --remote-ui=<addr>): attach to a
+    // running Neovim server instead of spawning. When set, doEarlyCoreInit
+    // calls zonvie_core_start_connect with this address. Mutually exclusive
+    // with wsl/ssh/devcontainer modes (CLI parsing rejects mixed use).
+    connect_addr: ?[]const u8 = null,
 
     // Extra arguments to pass to nvim (not recognized as zonvie arguments)
     nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .{},

@@ -209,6 +209,17 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(mpack_stream_tests).step);
 
+    // RPC transport address-parser tests (inline tests in src/core/rpc_transport.zig).
+    const rpc_transport_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/rpc_transport.zig"),
+    });
+    const rpc_transport_tests = b.addTest(.{
+        .root_module = rpc_transport_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(rpc_transport_tests).step);
+
     // Shader cross-compile tests (inline tests in src/core/shader_compiler.zig).
     // Requires glslang + SPIRV-Cross linked.
     const shader_test_mod = b.createModule(.{

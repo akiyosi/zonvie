@@ -4161,6 +4161,14 @@ pub const FlushCtx = struct {
     pub fn onDefaultColors(ctx: *FlushCtx, fg: u32, bg: u32) !void {
         ctx.core.emitDefaultColors(fg, bg);
     }
+
+    pub fn onRestart(ctx: *FlushCtx, listen_addr: []const u8) !void {
+        try ctx.core.handleRestartEvent(listen_addr);
+    }
+
+    pub fn onConnect(ctx: *FlushCtx, server_addr: []const u8) !void {
+        try ctx.core.handleConnectEvent(server_addr);
+    }
 };
 
 pub fn notifyExternalWindowChanges(self: *Core) bool {

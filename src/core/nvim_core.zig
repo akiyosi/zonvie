@@ -20,6 +20,15 @@ const vertexgen = @import("vertexgen.zig");
 /// on_external_window so the frontend can update window position.
 pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
 
+/// Backing transport for the current RPC session.
+pub const TransportKind = enum {
+    /// Spawned nvim child process; stdin/stdout/stderr are 3 separate pipes.
+    pipes,
+    /// Connected to a running nvim server over TCP or unix socket.
+    /// stdin_file and stdout_file alias the same fd; stderr_file is null.
+    socket,
+};
+
 pub const Callbacks = struct {
     on_vertices_partial: ?*const fn (
         ctx: ?*anyopaque,
@@ -59,6 +68,18 @@ pub const Callbacks = struct {
 
     /// Called when Neovim sets the window title (set_title UI event).
     on_set_title: ?*const fn (ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.c) void = null,
+
+    /// Called when Neovim sends the `restart` UI event (`:restart` command).
+    /// listen_addr is the new server address that the core will attach to.
+    /// Informational only — the core handles the actual reconnect; the
+    /// frontend must NOT tear down its window or treat this as `on_exit`.
+    on_restart: ?*const fn (ctx: ?*anyopaque, listen_addr: [*]const u8, listen_addr_len: usize) callconv(.c) void = null,
+
+    /// Called when Neovim sends the `connect` UI event (`:connect <addr>`).
+    /// server_addr is the server the UI is being hot-swapped to. Same
+    /// reconnect machinery as `on_restart`; the only difference is that
+    /// the previous server keeps running headless (it is not dying).
+    on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
 
     /// Called when a grid should be displayed in an external window.
     on_external_window: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void = null,
@@ -439,6 +460,26 @@ pub const Core = struct {
     stderr_file: ?std.fs.File = null,
     stderr_thread: ?std.Thread = null,
 
+    /// Transport mode of the current session.
+    /// .pipes: spawned child + 3 pipes (stdin/stdout/stderr separate handles).
+    /// .socket: connected to a running nvim via TCP/Unix socket. In this mode
+    /// stdin_file and stdout_file alias the same fd; close() must run only
+    /// once and stderr_file is null.
+    transport_kind: TransportKind = .pipes,
+
+    /// Set by handleRestartEvent to the new server's listen address (owned).
+    /// Observed by the RPC run loop after the current session terminates;
+    /// when non-null, the loop reconnects to this address instead of firing
+    /// on_exit. Cleared once the next session is established.
+    restart_pending_addr: ?[]u8 = null,
+
+    /// Set by handleConnectEvent. When true, the run loop's cleanup must
+    /// NOT wait on or kill the spawned child — `:connect` is a hot-swap
+    /// where the old nvim stays alive headless and would otherwise make
+    /// child.wait() block forever. The handle is dropped (orphaned).
+    /// Consumed (reset to false) by the run loop before the next iteration.
+    connect_keeps_child_alive: bool = false,
+
     drawable_w_px: u32 = 1,
     drawable_h_px: u32 = 1,
     cell_w_px: u32 = 1,
@@ -715,6 +756,81 @@ pub const Core = struct {
         self.started = true;
     }
 
+    /// Start in connect mode: attach to a Neovim server already listening
+    /// at `listen_addr` (TCP `host:port` or Unix socket path) instead of
+    /// spawning a child. Used by both the future "connect to running
+    /// nvim" CLI flag and as the initial entry that the runLoop already
+    /// supports via the `:restart` machinery.
+    ///
+    /// nvim_path_owned is left empty so the connect-failure fall-through
+    /// inside runLoop does NOT silently spawn a local nvim — that would
+    /// surprise a caller who explicitly opted into connect mode.
+    pub fn startConnect(self: *Core, listen_addr: []const u8, rows: u32, cols: u32) !void {
+        self.init_rows = rows;
+        self.init_cols = cols;
+        self.nvim_path_owned = self.alloc.dupe(u8, "") catch null;
+        // Pre-populate restart_pending_addr so the run loop's first
+        // iteration takes the connect path. Same machinery as `:restart`.
+        self.restart_pending_addr = try self.alloc.dupe(u8, listen_addr);
+        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.started = true;
+    }
+
+    /// Reset session-scoped state between RPC sessions (called by the run
+    /// loop when transitioning to the next session for `:restart`). Clears
+    /// transient flags and in-flight RPC msgids so the new session starts
+    /// from a clean slate. Persistent state (grid, hl, atlas, ext UI,
+    /// layout dimensions) is intentionally NOT touched — those carry over
+    /// to the new server unchanged so the user sees no flicker.
+    ///
+    /// MUST be called only from the RPC thread, after the previous
+    /// session's writer thread has been joined and pipes/sockets closed.
+    pub fn resetSessionState(self: *Core) void {
+        // UI attachment must be re-issued after reconnect.
+        self.ui_attached.store(false, .seq_cst);
+
+        // Channel-bound state.
+        self.clipboard_setup_done = false;
+
+        // In-flight RPC IDs from the dead channel — drop tracking so any
+        // stale response from the new server (very unlikely; new msgid
+        // counter starts fresh on the nvim side) does not match.
+        self.get_api_info_msgid = null;
+        self.quit_request_msgid.store(0, .release);
+        self.glow_request_msgid.store(0, .release);
+
+        // Re-arm the glow startup probe so it queries vim.g.zonvie_glow on
+        // the new server (the user's init.lua may set it again, identically
+        // or differently).
+        self.glow_startup_retries = 30;
+
+        // Pending focus state from before the reconnect should not leak —
+        // the new server has its own initial focus state.
+        self.pending_focus.store(0, .seq_cst);
+
+        // SSH auth flags only apply to spawn-mode SSH sessions; reset so a
+        // future spawn-mode session (re-spawn fallback) starts unauthenticated.
+        self.ssh_auth_pending.store(false, .seq_cst);
+        self.ssh_auth_done.store(false, .seq_cst);
+
+        // Transport handles are cleaned up by the caller (closed and nulled);
+        // here we only flip the kind tag for clarity until the next session
+        // re-assigns it.
+        self.transport_kind = .pipes;
+
+        // Re-arm the writer queue: the previous session's cleanup set
+        // write_queue_closed=true so the writer thread would drain and exit.
+        // Clearing it now allows startWriterThread() to succeed for the
+        // next session.
+        self.write_queue_mu.lock();
+        self.write_queue_closed = false;
+        self.writer_failed = false;
+        self.write_queue.clearRetainingCapacity();
+        self.write_queue_mu.unlock();
+
+        self.log.write("resetSessionState: cleared session-scoped state\n", .{});
+    }
+
     /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
     /// can be sent with the correct dimensions. Must be called from the UI
     /// thread after the renderer is initialized and actual rows/cols are computed.
@@ -810,6 +926,13 @@ pub const Core = struct {
         if (self.nvim_path_owned) |p| {
             self.alloc.free(p);
             self.nvim_path_owned = null;
+        }
+
+        // Free any pending restart address (queued but never consumed because
+        // stop() raced ahead of the run loop's restart handling).
+        if (self.restart_pending_addr) |a| {
+            self.alloc.free(a);
+            self.restart_pending_addr = null;
         }
 
         // Free shaping buffers (Phase B)
@@ -1993,6 +2116,74 @@ pub const Core = struct {
         if (self.cb.on_default_colors_set) |f| {
             f(self.ctx, fg, bg);
         }
+    }
+
+    pub fn emitOnRestart(self: *Core, listen_addr: []const u8) void {
+        if (self.cb.on_restart) |f| {
+            f(self.ctx, listen_addr.ptr, listen_addr.len);
+        }
+    }
+
+    pub fn emitOnConnect(self: *Core, server_addr: []const u8) void {
+        if (self.cb.on_connect) |f| {
+            f(self.ctx, server_addr.ptr, server_addr.len);
+        }
+    }
+
+    /// Handle the `restart` UI event from Neovim. Records the new server's
+    /// listen address and signals the current session to shut down. The RPC
+    /// run loop observes restart_pending_addr and reconnects on the next
+    /// session iteration instead of firing on_exit.
+    ///
+    /// Called from the redraw thread (grid_mu held).
+    pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
+        // Drop any previously queued restart (only the latest matters).
+        if (self.restart_pending_addr) |old| {
+            self.alloc.free(old);
+            self.restart_pending_addr = null;
+        }
+
+        const owned = self.alloc.dupe(u8, listen_addr) catch |e| {
+            self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
+            return e;
+        };
+        self.restart_pending_addr = owned;
+
+        self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
+
+        // Notify frontend (informational; frontend MUST NOT close window).
+        self.emitOnRestart(listen_addr);
+
+        // The RPC run loop will observe restart_pending_addr after the
+        // current session terminates (nvim closes the channel). We do NOT
+        // proactively close stdin here because nvim is in the middle of
+        // sending its final batch (the `restart` event itself is part of
+        // that batch). Letting the read side EOF naturally is cleaner.
+    }
+
+    /// Handle the `connect` UI event from Neovim (`:connect <addr>`). The
+    /// reconnect machinery is identical to `restart` — we record the new
+    /// server's address in restart_pending_addr and let the run loop
+    /// observe it after the channel closes — but the frontend gets a
+    /// distinct `on_connect` callback so it can distinguish a hot-swap
+    /// (`:connect`, old server stays alive headless) from a server
+    /// replacement (`:restart`, old server dies).
+    pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
+        if (self.restart_pending_addr) |old| {
+            self.alloc.free(old);
+            self.restart_pending_addr = null;
+        }
+
+        const owned = self.alloc.dupe(u8, server_addr) catch |e| {
+            self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
+            return e;
+        };
+        self.restart_pending_addr = owned;
+        self.connect_keeps_child_alive = true;
+
+        self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});
+
+        self.emitOnConnect(server_addr);
     }
 
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.

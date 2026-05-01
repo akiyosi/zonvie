@@ -263,6 +263,11 @@ pub fn main() u8 {
     var devcontainer_workspace: ?[]const u8 = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild: bool = false;
+
+    // Connect mode (--connect-nvim=<addr> / --remote-ui=<addr>): attach to a
+    // running Neovim server instead of spawning. Mutually exclusive with
+    // wsl/ssh/devcontainer modes; if combined, connect mode wins.
+    var connect_addr: ?[]const u8 = null;
     const args = std.process.argsAlloc(alloc) catch return 1;
     defer std.process.argsFree(alloc, args);
 
@@ -295,6 +300,10 @@ pub fn main() u8 {
                     \\    --devcontainer=<workspace>    Run inside a devcontainer
                     \\    --devcontainer-config=<path>  Path to devcontainer.json
                     \\    --devcontainer-rebuild        Rebuild devcontainer before starting
+                    \\    --connect-nvim=<addr>         Attach to a running Neovim server.
+                    \\                                    Address: TCP "host:port" or Unix socket path.
+                    \\                                    Mutually exclusive with --ssh / --devcontainer / --wsl.
+                    \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
                     \\    --install                     First-launch setup (icon + default config) and exit
                     \\    --help, -h                    Show this help message and exit
                     \\    --                            Pass all remaining arguments to nvim
@@ -515,6 +524,24 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
             devcontainer_rebuild = true;
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-rebuild flag detected\n", .{});
+        } else if (std.mem.startsWith(u8, arg, "--connect-nvim=")) {
+            connect_addr = arg["--connect-nvim=".len..];
+            if (applog.isEnabled()) applog.appLog("[win] --connect-nvim={s} flag detected\n", .{connect_addr.?});
+        } else if (std.mem.eql(u8, arg, "--connect-nvim")) {
+            if (i + 1 < args.len) {
+                connect_addr = args[i + 1];
+                i += 1;
+                if (applog.isEnabled()) applog.appLog("[win] --connect-nvim {s} flag detected\n", .{connect_addr.?});
+            }
+        } else if (std.mem.startsWith(u8, arg, "--remote-ui=")) {
+            connect_addr = arg["--remote-ui=".len..];
+            if (applog.isEnabled()) applog.appLog("[win] --remote-ui={s} flag detected (alias of --connect-nvim)\n", .{connect_addr.?});
+        } else if (std.mem.eql(u8, arg, "--remote-ui")) {
+            if (i + 1 < args.len) {
+                connect_addr = args[i + 1];
+                i += 1;
+                if (applog.isEnabled()) applog.appLog("[win] --remote-ui {s} flag detected (alias of --connect-nvim)\n", .{connect_addr.?});
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             // Already handled above, skip
         } else {
@@ -607,6 +634,7 @@ pub fn main() u8 {
         .devcontainer_workspace = devcontainer_workspace,
         .devcontainer_config = devcontainer_config,
         .devcontainer_rebuild = devcontainer_rebuild,
+        .connect_addr = connect_addr,
         .nvim_extra_args = nvim_extra_args,
         .cli_nvim_path = cli_nvim_path,
     };
