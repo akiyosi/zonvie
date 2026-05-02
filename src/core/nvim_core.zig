@@ -12,8 +12,13 @@ const Logger = @import("log.zig").Logger;
 const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
+const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
+
+/// Re-exported here so callers in this file can spell `Stream` without
+/// reaching into `rpc_transport`.
+pub const Stream = rpc_transport.Stream;
 
 /// Position/size snapshot for a known external grid. Used to detect
 /// changes in anchor position (e.g. popupmenu re-show) and re-fire
@@ -455,9 +460,9 @@ pub const Core = struct {
     thread: ?std.Thread = null,
 
     child_handle: ?std.process.Child.Id = null,
-    stdin_file: ?std.fs.File = null,
-    stdout_file: ?std.fs.File = null,
-    stderr_file: ?std.fs.File = null,
+    stdin_file: ?Stream = null,
+    stdout_file: ?Stream = null,
+    stderr_file: ?Stream = null,
     stderr_thread: ?std.Thread = null,
 
     /// Transport mode of the current session.
@@ -1422,7 +1427,7 @@ pub const Core = struct {
     /// Signals ssh_auth_done after writing.
     pub fn sendStdinData(self: *Core, data: []const u8) void {
         if (self.stdin_file) |f| {
-            _ = f.write(data) catch |e| {
+            f.writeAll(data) catch |e| {
                 self.log.write("sendStdinData write err: {any}\n", .{e});
                 return;
             };
@@ -2187,8 +2192,8 @@ pub const Core = struct {
     }
 
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
-    /// Receives the file handle by value to avoid racing with stop().
-    fn writerThreadFn(self: *Core, file: std.fs.File) void {
+    /// Receives the stream by value to avoid racing with stop().
+    fn writerThreadFn(self: *Core, file: Stream) void {
         var drain: std.ArrayListUnmanaged(u8) = .{};
         defer drain.deinit(self.alloc);
 
@@ -3030,7 +3035,7 @@ pub const Core = struct {
 
     // --- Forwarding stubs for rpc_session.zig ---
 
-    pub fn pumpStderr(self: *Core, f: std.fs.File) void {
+    pub fn pumpStderr(self: *Core, f: Stream) void {
         rpc_session.pumpStderr(self, f);
     }
 

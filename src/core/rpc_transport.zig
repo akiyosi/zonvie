@@ -6,24 +6,25 @@
 //   - Socket: a TCP, Unix-domain-socket, or Windows named-pipe connection
 //     to an already-running nvim server. Used for `:restart` and the
 //     "connect to running nvim" feature. The connected fd/HANDLE serves
-//     both read and write, and is wrapped in a `std.fs.File` so the
-//     existing `FrameReader` and `writerThreadFn` (which both operate on
-//     `std.fs.File`) can be reused unchanged.
+//     both read and write.
 //
-// Platform notes:
-//   - POSIX: TCP and Unix-domain sockets work via std.net (same posix.fd_t
-//     as a regular file, so the alias trick is transparent).
-//   - Windows: NEITHER TCP NOR named-pipe connect is supported yet.
-//     - TCP: winsock SOCKET is not interchangeable with a HANDLE for
-//       ReadFile/WriteFile.
-//     - Named pipe: synchronous-mode HANDLEs serialize ReadFile/WriteFile
-//       at the kernel level, so when FrameReader is blocked in ReadFile
-//       waiting for nvim output, the writer thread's WriteFile deadlocks
-//       indefinitely. Real fix requires opening the pipe with
-//       FILE_FLAG_OVERLAPPED and rewriting the I/O paths around OVERLAPPED
-//       structures (libuv's approach). Tracked as TODO; the parser still
-//       recognizes pipe paths so the future implementation has a clean
-//       hook point. Until then, callers fall back to re-spawning nvim.
+// All callers operate on a `Stream` wrapper so the read/write paths look
+// identical regardless of backend:
+//   - On POSIX, `Stream.file` is a `std.fs.File` aliasing the socket fd
+//     (or the child pipe). `read`/`writeAll`/`close` go straight through.
+//   - On Windows for spawn-mode child pipes, `Stream.file` works the same
+//     way (separate handles for stdin/stdout/stderr; each I/O path uses
+//     its own handle, so the kernel's per-handle synchronization never
+//     contends).
+//   - On Windows for named-pipe connect, the pipe is opened with
+//     FILE_FLAG_OVERLAPPED and wrapped as a `*WindowsOverlappedPipe`.
+//     Sync-mode HANDLEs would serialize ReadFile/WriteFile at the kernel
+//     level — when FrameReader is blocked in ReadFile waiting for nvim
+//     output, the writer thread's WriteFile would deadlock — so the
+//     overlapped path uses `OVERLAPPED` + `GetOverlappedResult` to let
+//     read and write proceed independently. The wrapper exposes
+//     synchronous-blocking semantics so the existing FrameReader and
+//     writerThreadFn don't need to know about overlapped I/O.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,21 +34,201 @@ pub const ConnectError = error{
     UnsupportedOnWindows,
     UnsupportedOnPosix,
     ConnectionRefused,
+    PipeBusy,
+    PipeOpenFailed,
+    EventCreateFailed,
 } || std.net.TcpConnectToHostError ||
     std.net.TcpConnectToAddressError ||
     std.posix.SocketError ||
     std.posix.ConnectError ||
     std.mem.Allocator.Error;
 
-/// A connected RPC transport. The `file` field aliases the socket fd
-/// (POSIX) or pipe HANDLE (Windows); reading and writing both operate
-/// on the same handle, so closing the file once is sufficient — never
-/// close it twice.
-pub const Connection = struct {
+/// Synchronous-blocking I/O abstraction over either a regular file/socket
+/// (`std.fs.File`) or a Windows overlapped named pipe. The abstraction
+/// hides overlapped-I/O bookkeeping so FrameReader / writerThreadFn / the
+/// stderr pump can treat any backend uniformly.
+pub const Stream = union(enum) {
     file: std.fs.File,
+    win_pipe: *WindowsOverlappedPipe,
 
-    pub fn close(self: *Connection) void {
-        self.file.close();
+    pub fn read(self: Stream, buf: []u8) !usize {
+        return switch (self) {
+            .file => |f| f.read(buf),
+            .win_pipe => |p| p.read(buf),
+        };
+    }
+
+    pub fn writeAll(self: Stream, bytes: []const u8) !void {
+        return switch (self) {
+            .file => |f| f.writeAll(bytes),
+            .win_pipe => |p| p.writeAll(bytes),
+        };
+    }
+
+    pub fn close(self: Stream) void {
+        switch (self) {
+            .file => |f| f.close(),
+            .win_pipe => |p| p.deinit(),
+        }
+    }
+
+    pub fn fromFile(f: std.fs.File) Stream {
+        return .{ .file = f };
+    }
+};
+
+/// Opaque-on-POSIX struct with a stub interface that panics if the
+/// non-Windows code paths somehow hit it. On Windows it's a full wrapper
+/// around an overlapped HANDLE plus per-direction completion events.
+pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+
+    handle: windows.HANDLE,
+    read_event: windows.HANDLE,
+    write_event: windows.HANDLE,
+    alloc: std.mem.Allocator,
+
+    /// Open a Windows named pipe with FILE_FLAG_OVERLAPPED and set up
+    /// auto-reset completion events for read and write. Returns a heap-
+    /// allocated wrapper; the caller is responsible for calling
+    /// `deinit()` exactly once at session teardown.
+    pub fn open(alloc: std.mem.Allocator, addr: []const u8) ConnectError!*WindowsOverlappedPipe {
+        const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, addr) catch return error.OutOfMemory;
+        defer alloc.free(path_w);
+
+        const handle = windows.kernel32.CreateFileW(
+            path_w.ptr,
+            windows.GENERIC_READ | windows.GENERIC_WRITE,
+            0, // no sharing
+            null, // default security
+            windows.OPEN_EXISTING,
+            windows.FILE_FLAG_OVERLAPPED,
+            null,
+        );
+
+        if (handle == windows.INVALID_HANDLE_VALUE) {
+            return switch (windows.kernel32.GetLastError()) {
+                .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.ConnectionRefused,
+                .PIPE_BUSY => error.PipeBusy,
+                else => error.PipeOpenFailed,
+            };
+        }
+        errdefer windows.CloseHandle(handle);
+
+        // Auto-reset events (dwFlags=0): GetOverlappedResult resets the
+        // event when it returns successfully, so consecutive I/O calls
+        // that reuse the same OVERLAPPED+event don't need ResetEvent.
+        const read_event = windows.kernel32.CreateEventExW(null, null, 0, windows.EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
+        errdefer windows.CloseHandle(read_event);
+
+        const write_event = windows.kernel32.CreateEventExW(null, null, 0, windows.EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
+        errdefer windows.CloseHandle(write_event);
+
+        const self = try alloc.create(WindowsOverlappedPipe);
+        self.* = .{
+            .handle = handle,
+            .read_event = read_event,
+            .write_event = write_event,
+            .alloc = alloc,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *WindowsOverlappedPipe) void {
+        windows.CloseHandle(self.handle);
+        windows.CloseHandle(self.read_event);
+        windows.CloseHandle(self.write_event);
+        self.alloc.destroy(self);
+    }
+
+    /// Wait for an overlapped I/O to complete. Returns the byte count on
+    /// success; returns null on broken-pipe / EOF (i.e. read EOF, write
+    /// to closed pipe). Other errors propagate.
+    fn waitOverlapped(self: *WindowsOverlappedPipe, overlapped: *windows.OVERLAPPED) !?windows.DWORD {
+        var bytes: windows.DWORD = 0;
+        if (windows.kernel32.GetOverlappedResult(self.handle, overlapped, &bytes, @intFromBool(true)) == 0) {
+            return switch (windows.kernel32.GetLastError()) {
+                .BROKEN_PIPE, .HANDLE_EOF => null,
+                .OPERATION_ABORTED => error.OperationAborted,
+                .NETNAME_DELETED => error.ConnectionResetByPeer,
+                else => error.Unexpected,
+            };
+        }
+        return bytes;
+    }
+
+    /// Blocking read. Returns 0 on EOF (broken pipe). Uses overlapped
+    /// I/O so a concurrent writeAll() on the same handle doesn't block.
+    pub fn read(self: *WindowsOverlappedPipe, buf: []u8) !usize {
+        if (buf.len == 0) return 0;
+
+        var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
+        overlapped.hEvent = self.read_event;
+
+        const want: windows.DWORD = @intCast(@min(buf.len, std.math.maxInt(windows.DWORD)));
+        var bytes_read: windows.DWORD = 0;
+
+        const ok = windows.kernel32.ReadFile(self.handle, buf.ptr, want, &bytes_read, &overlapped);
+        if (ok == 0) {
+            switch (windows.kernel32.GetLastError()) {
+                .IO_PENDING => {}, // proceed to GetOverlappedResult below
+                .BROKEN_PIPE, .HANDLE_EOF => return 0,
+                .OPERATION_ABORTED => return error.OperationAborted,
+                .NETNAME_DELETED => return error.ConnectionResetByPeer,
+                else => return error.Unexpected,
+            }
+
+            const maybe_got = try self.waitOverlapped(&overlapped);
+            const got = maybe_got orelse return 0; // EOF
+            return @intCast(got);
+        }
+        return @intCast(bytes_read);
+    }
+
+    /// Blocking writeAll. Loops on partial writes (rare for pipes but
+    /// possible for very large buffers).
+    pub fn writeAll(self: *WindowsOverlappedPipe, bytes: []const u8) !void {
+        var idx: usize = 0;
+        while (idx < bytes.len) {
+            var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
+            overlapped.hEvent = self.write_event;
+
+            const want: windows.DWORD = @intCast(@min(bytes.len - idx, std.math.maxInt(windows.DWORD)));
+            var bytes_written: windows.DWORD = 0;
+
+            const ok = windows.kernel32.WriteFile(self.handle, bytes.ptr + idx, want, &bytes_written, &overlapped);
+            if (ok == 0) {
+                switch (windows.kernel32.GetLastError()) {
+                    .IO_PENDING => {}, // proceed to GetOverlappedResult below
+                    .BROKEN_PIPE => return error.BrokenPipe,
+                    .OPERATION_ABORTED => return error.OperationAborted,
+                    .NETNAME_DELETED => return error.ConnectionResetByPeer,
+                    else => return error.Unexpected,
+                }
+
+                const maybe_got = try self.waitOverlapped(&overlapped);
+                bytes_written = maybe_got orelse return error.BrokenPipe;
+            }
+
+            if (bytes_written == 0) return error.BrokenPipe;
+            idx += @as(usize, bytes_written);
+        }
+    }
+} else struct {
+    // POSIX stub: never instantiated. Methods are unreachable so the
+    // Stream switch arms type-check on POSIX even though .win_pipe is
+    // never constructed there.
+    pub fn open(_: std.mem.Allocator, _: []const u8) ConnectError!*@This() {
+        unreachable;
+    }
+    pub fn deinit(_: *@This()) void {
+        unreachable;
+    }
+    pub fn read(_: *@This(), _: []u8) !usize {
+        unreachable;
+    }
+    pub fn writeAll(_: *@This(), _: []const u8) !void {
+        unreachable;
     }
 };
 
@@ -73,7 +254,6 @@ fn isPipePath(addr: []const u8) bool {
     if (addr[3] != '\\') return false;
     const tail = addr[4..];
     if (tail.len < 5) return false;
-    // Match "pipe\" case-insensitively.
     if (std.ascii.toLower(tail[0]) != 'p') return false;
     if (std.ascii.toLower(tail[1]) != 'i') return false;
     if (std.ascii.toLower(tail[2]) != 'p') return false;
@@ -121,23 +301,26 @@ pub fn parseListenAddr(addr: []const u8) ?Parsed {
     return .{ .tcp = .{ .host = host, .port = port } };
 }
 
-/// Connect to a Neovim listen address and return a `Connection`. The
-/// connection's underlying fd is used for both read and write, and is
-/// closed exactly once at session teardown.
-///
-/// Windows: returns `error.UnsupportedOnWindows` for all forms today (see
-/// file header for the named-pipe deadlock rationale). The caller's
-/// re-spawn fallback handles `:restart` in degraded mode.
-pub fn connectListenAddr(alloc: std.mem.Allocator, addr: []const u8) ConnectError!Connection {
-    if (builtin.os.tag == .windows) return error.UnsupportedOnWindows;
-
+/// Connect to a Neovim listen address and return a `Stream`. The
+/// connection's underlying fd/HANDLE is used for both read and write,
+/// and is closed exactly once at session teardown via `Stream.close()`.
+pub fn connectListenAddr(alloc: std.mem.Allocator, addr: []const u8) ConnectError!Stream {
     const parsed = parseListenAddr(addr) orelse return error.InvalidAddress;
+
+    if (builtin.os.tag == .windows) {
+        return switch (parsed) {
+            .pipe => |p| .{ .win_pipe = try WindowsOverlappedPipe.open(alloc, p) },
+            // TCP on Windows would require a winsock SOCKET-as-HANDLE
+            // shim that the existing FrameReader/writer don't expose.
+            .tcp => error.UnsupportedOnWindows,
+            .unix => error.UnsupportedOnWindows,
+        };
+    }
 
     const stream = switch (parsed) {
         .tcp => |t| try std.net.tcpConnectToHost(alloc, t.host, t.port),
         .unix => |p| try std.net.connectUnixSocket(p),
-        // Pipe paths are Windows-only; the early return above already
-        // handled them for that platform.
+        // Pipe paths are Windows-only; the early return above handled it.
         .pipe => return error.UnsupportedOnPosix,
     };
 

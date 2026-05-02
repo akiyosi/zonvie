@@ -17,7 +17,7 @@ const Callbacks = nvim_core.Callbacks;
 const rpc_transport = @import("rpc_transport.zig");
 
 pub const PipeReader = struct {
-    file: std.fs.File,
+    file: rpc_transport.Stream,
     buf: [8192]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
@@ -78,7 +78,7 @@ pub const PipeReader = struct {
 /// The buffer grows on demand up to `max_capacity` when a single frame
 /// exceeds the current capacity with no consumable tail to compact.
 pub const FrameReader = struct {
-    file: std.fs.File,
+    file: rpc_transport.Stream,
     alloc: std.mem.Allocator,
     buf: []u8,
     pos: usize = 0,
@@ -86,7 +86,7 @@ pub const FrameReader = struct {
 
     pub const initial_capacity: usize = 64 * 1024;
 
-    pub fn init(alloc: std.mem.Allocator, file: std.fs.File) !FrameReader {
+    pub fn init(alloc: std.mem.Allocator, file: rpc_transport.Stream) !FrameReader {
         const buf = try alloc.alloc(u8, initial_capacity);
         return .{ .file = file, .alloc = alloc, .buf = buf };
     }
@@ -238,7 +238,7 @@ pub const CwdOwner = struct {
     }
 };
 
-pub fn pumpStderr(self: *Core, f: std.fs.File) void {
+pub fn pumpStderr(self: *Core, f: rpc_transport.Stream) void {
     var buf: [4096]u8 = undefined;
     while (!self.stop_flag.load(.seq_cst)) {
         const n = f.read(&buf) catch break;
@@ -1303,14 +1303,14 @@ pub fn runLoop(self: *Core) void {
         defer cwd_owner.close();
 
         if (use_connect) {
-            const conn_opt: ?rpc_transport.Connection = rpc_transport.connectListenAddr(self.alloc, session_addr.?) catch |e| blk: {
+            const conn_opt: ?rpc_transport.Stream = rpc_transport.connectListenAddr(self.alloc, session_addr.?) catch |e| blk: {
                 self.log.write("connect to {s} failed: {any}; falling back to re-spawn\n", .{ session_addr.?, e });
                 break :blk null;
             };
             if (conn_opt) |conn| {
                 self.transport_kind = .socket;
-                self.stdin_file = conn.file;
-                self.stdout_file = conn.file; // alias of the same fd
+                self.stdin_file = conn;
+                self.stdout_file = conn; // alias of the same fd / pipe wrapper
                 self.stderr_file = null;
                 self.log.write("connect: established socket session to {s}\n", .{session_addr.?});
             } else if (nvim_path.len == 0) {
@@ -1370,9 +1370,9 @@ pub fn runLoop(self: *Core) void {
 
             self.transport_kind = .pipes;
             self.child_handle = child.id;
-            self.stdin_file = child.stdin;
-            self.stdout_file = child.stdout;
-            self.stderr_file = child.stderr;
+            self.stdin_file = if (child.stdin) |f| rpc_transport.Stream.fromFile(f) else null;
+            self.stdout_file = if (child.stdout) |f| rpc_transport.Stream.fromFile(f) else null;
+            self.stderr_file = if (child.stderr) |f| rpc_transport.Stream.fromFile(f) else null;
 
             // OWNERSHIP TRANSFER: keep handles in Core; prevent Child from closing them.
             child.stdin = null;
@@ -1565,6 +1565,19 @@ pub fn runLoop(self: *Core) void {
             }
             if (t == 2) {
                 handleRpcNotification(self, arena, top);
+                // If the notification queued a restart/connect, exit the
+                // inner loop now so cleanup can run and the next session
+                // iteration can pick up restart_pending_addr. For local
+                // spawn this isn't strictly necessary (the channel
+                // closes naturally when nvim exits), but for SSH /
+                // devcontainer / WSL the new nvim inherits stdio from
+                // the old one and the SSH/wrapper stdio never EOFs —
+                // so we'd be stuck in this loop forever waiting for a
+                // close that never comes.
+                if (self.restart_pending_addr != null) {
+                    self.log.write("inner loop: restart/connect queued; breaking to trigger cleanup\n", .{});
+                    break :outer;
+                }
                 continue;
             }
         }
@@ -1608,7 +1621,14 @@ pub fn runLoop(self: *Core) void {
                 self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
                 self.child_handle = null;
             } else {
-                if (self.stop_flag.load(.seq_cst)) {
+                // User stop OR restart/connect queued via the inner-loop
+                // early break: kill the child to ensure it terminates
+                // promptly. For local spawn the child is usually already
+                // dead (nvim self-exits on :restart); kill is then a
+                // no-op. For SSH / devcontainer / WSL the wrapper
+                // process is still alive holding stdio open, and would
+                // make child.wait() block indefinitely without this kill.
+                if (self.stop_flag.load(.seq_cst) or self.restart_pending_addr != null) {
                     _ = child.kill() catch {};
                 }
                 session_term = child.wait() catch |e| blk: {
