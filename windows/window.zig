@@ -2999,23 +2999,31 @@ pub export fn WndProc(
                 // This prevents double-input of Enter, Backspace, Tab, Escape.
                 // 0x08 = Backspace, 0x09 = Tab, 0x0D = Enter (CR), 0x1B = Escape
                 if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
+                    app.pending_high_surrogate_char = 0;
                     return 0;
                 }
 
-                // WM_CHAR gives UTF-16 code unit; handle surrogate pair minimally:
-                // If high surrogate, wait for next WM_CHAR is complex; for now ignore high surrogate.
-                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
-                    return 0;
-                }
-                if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
-                    return 0;
-                }
-
+                // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high
+                // surrogate first, then low surrogate. Buffer the high one and
+                // combine it with the next low one before sending to core.
                 var out: [8]u8 = undefined;
-                const s = input.utf16UnitsToUtf8(&out, ch0, null) orelse return 0;
+                var s: ?[]const u8 = null;
+                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
+                    app.pending_high_surrogate_char = ch0;
+                    return 0;
+                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
+                    const hi = app.pending_high_surrogate_char;
+                    app.pending_high_surrogate_char = 0;
+                    if (hi == 0) return 0; // stray low surrogate
+                    s = input.utf16UnitsToUtf8(&out, hi, ch0);
+                } else {
+                    app.pending_high_surrogate_char = 0;
+                    s = input.utf16UnitsToUtf8(&out, ch0, null);
+                }
 
+                const text = s orelse return 0;
                 // keycode=0 means "text input" (Zig will take chars path).
-                input.sendKeyEventToCore(app, 0, mods, s, s);
+                input.sendKeyEventToCore(app, 0, mods, text, text);
                 return 0;
             }
         },
@@ -3170,19 +3178,28 @@ pub export fn WndProc(
         },
 
         c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim
+            // IME committed character - send to Neovim. Non-BMP commits arrive
+            // as two consecutive WM_IME_CHAR messages (high then low surrogate).
             if (getApp(hwnd)) |app| {
                 const ch: u16 = @intCast(wParam);
 
-                // Skip surrogate pairs for now (complex handling)
-                if (ch >= 0xD800 and ch <= 0xDFFF) {
+                var out: [8]u8 = undefined;
+                var s: ?[]const u8 = null;
+                if (ch >= 0xD800 and ch <= 0xDBFF) {
+                    app.pending_high_surrogate_ime = ch;
                     return 0;
+                } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
+                    const hi = app.pending_high_surrogate_ime;
+                    app.pending_high_surrogate_ime = 0;
+                    if (hi == 0) return 0;
+                    s = input.utf16UnitsToUtf8(&out, hi, ch);
+                } else {
+                    app.pending_high_surrogate_ime = 0;
+                    s = input.utf16UnitsToUtf8(&out, ch, null);
                 }
 
-                var out: [8]u8 = undefined;
-                const s = input.utf16UnitsToUtf8(&out, ch, null) orelse return 0;
-
-                input.sendKeyEventToCore(app, 0, 0, s, s);
+                const text = s orelse return 0;
+                input.sendKeyEventToCore(app, 0, 0, text, text);
                 return 0;
             }
         },

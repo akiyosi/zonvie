@@ -2598,6 +2598,15 @@ pub const App = struct {
     ime_target_end: u32 = 0, // end of target clause
     ime_overlay_hwnd: ?c.HWND = null, // Layered window for preedit overlay
 
+    // Pending UTF-16 high surrogate from a previous WM_CHAR / WM_IME_CHAR.
+    // Windows delivers a non-BMP character (e.g. emoji) as two consecutive
+    // messages: high surrogate first, then low surrogate. We buffer the high
+    // surrogate here and combine it with the next low surrogate to form one
+    // UTF-8 sequence to send to core. Stored separately for WM_CHAR vs.
+    // WM_IME_CHAR because they can interleave around composition. 0 = none.
+    pending_high_surrogate_char: u16 = 0,
+    pending_high_surrogate_ime: u16 = 0,
+
     // When row-mode starts (or after resize), we must seed the persistent back buffer once.
     // Otherwise the first present may clear to black and only the dirty row gets drawn.
     need_full_seed: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
