@@ -1392,17 +1392,28 @@ pub export fn ExternalWndProc(
 
                 // Skip control characters handled by WM_KEYDOWN
                 if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
+                    app.pending_high_surrogate_char = 0;
                     return 0;
                 }
 
-                // Skip surrogates for now
-                if (ch0 >= 0xD800 and ch0 <= 0xDFFF) {
-                    return 0;
-                }
-
+                // Pair surrogate halves for non-BMP characters (emoji etc).
                 var tmp: [8]u8 = undefined;
-                if (input.utf16UnitsToUtf8(&tmp, ch0, null)) |s| {
-                    input.sendKeyEventToCore(app, 0, mods, s, null);
+                var s: ?[]const u8 = null;
+                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
+                    app.pending_high_surrogate_char = ch0;
+                    return 0;
+                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
+                    const hi = app.pending_high_surrogate_char;
+                    app.pending_high_surrogate_char = 0;
+                    if (hi == 0) return 0;
+                    s = input.utf16UnitsToUtf8(&tmp, hi, ch0);
+                } else {
+                    app.pending_high_surrogate_char = 0;
+                    s = input.utf16UnitsToUtf8(&tmp, ch0, null);
+                }
+
+                if (s) |text| {
+                    input.sendKeyEventToCore(app, 0, mods, text, null);
                 }
                 return 0;
             }
@@ -1813,20 +1824,29 @@ pub export fn ExternalWndProc(
         },
 
         c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim
+            // IME committed character - send to Neovim. Non-BMP commits arrive
+            // as two consecutive WM_IME_CHAR messages (high then low surrogate).
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_CHAR wParam=0x{x}\n", .{wParam});
             if (app_mod.getApp(hwnd)) |app| {
                 const ch: u16 = @intCast(wParam);
 
-                // Skip surrogate pairs for now
-                if (ch >= 0xD800 and ch <= 0xDFFF) {
+                var out: [8]u8 = undefined;
+                var s: ?[]const u8 = null;
+                if (ch >= 0xD800 and ch <= 0xDBFF) {
+                    app.pending_high_surrogate_ime = ch;
                     return 0;
+                } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
+                    const hi = app.pending_high_surrogate_ime;
+                    app.pending_high_surrogate_ime = 0;
+                    if (hi == 0) return 0;
+                    s = input.utf16UnitsToUtf8(&out, hi, ch);
+                } else {
+                    app.pending_high_surrogate_ime = 0;
+                    s = input.utf16UnitsToUtf8(&out, ch, null);
                 }
 
-                var out: [8]u8 = undefined;
-                const s = input.utf16UnitsToUtf8(&out, ch, null) orelse return 0;
-
-                input.sendKeyEventToCore(app, 0, 0, s, s);
+                const text = s orelse return 0;
+                input.sendKeyEventToCore(app, 0, 0, text, text);
                 return 0;
             }
         },
