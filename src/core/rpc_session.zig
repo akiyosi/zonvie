@@ -1472,7 +1472,7 @@ pub fn runLoop(self: *Core) void {
 
                 if (self.stop_flag.load(.seq_cst)) {
                     self.log.write("SSH mode: stopped by user\n", .{});
-                    _ = cleanupSession(self, &child, have_child, false);
+                    _ = cleanupSession(self, &child, have_child, false, false);
                     break :session;
                 }
             }
@@ -1497,7 +1497,7 @@ pub fn runLoop(self: *Core) void {
         }
 
         if (self.stop_flag.load(.seq_cst)) {
-            _ = cleanupSession(self, &child, have_child, false);
+            _ = cleanupSession(self, &child, have_child, false, false);
             break :session;
         }
 
@@ -1521,7 +1521,7 @@ pub fn runLoop(self: *Core) void {
 
         self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
             self.log.write("ui_attach send failed: {any}\n", .{e});
-            _ = cleanupSession(self, &child, have_child, true);
+            _ = cleanupSession(self, &child, have_child, true, false);
             break :session;
         };
         ui_attached = true;
@@ -1550,19 +1550,27 @@ pub fn runLoop(self: *Core) void {
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
-            _ = cleanupSession(self, &child, have_child, true);
+            _ = cleanupSession(self, &child, have_child, true, false);
             break :session;
         }
 
         var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
             self.log.write("FrameReader init failed: {any}\n", .{e});
-            _ = cleanupSession(self, &child, have_child, true);
+            _ = cleanupSession(self, &child, have_child, true, false);
             break :session;
         };
         defer fr.deinit();
 
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
+
+        // Tracks how the inner loop exited:
+        //   false = natural EOF / read error / stop_flag (local restart
+        //           takes this path — nvim is exiting on its own)
+        //   true  = early break because a remote-mode restart/connect
+        //           is queued and the wrapper stdio will never EOF
+        // Passed to cleanupSession as `kill_on_restart_pending`.
+        var remote_restart_break: bool = false;
 
         // Inner reader loop — same for both transports. Earlier iterations
         // experimented with a streaming fast path here; microbenchmarks
@@ -1613,29 +1621,47 @@ pub fn runLoop(self: *Core) void {
             }
             if (t == 2) {
                 handleRpcNotification(self, arena, top);
-                // If the notification queued a restart/connect, exit the
-                // inner loop now so cleanup can run and the next session
-                // iteration can pick up restart_pending_addr. For local
-                // spawn this isn't strictly necessary (the channel
-                // closes naturally when nvim exits), but for SSH /
-                // devcontainer / WSL the new nvim inherits stdio from
-                // the old one and the SSH/wrapper stdio never EOFs —
-                // so we'd be stuck in this loop forever waiting for a
-                // close that never comes.
+                // If the notification queued a restart/connect, decide
+                // whether to break the inner loop NOW or wait for the
+                // natural channel close.
+                //
+                // Remote modes (SSH / WSL / devcontainer / cmd / shell):
+                // the new nvim inherits stdio from the wrapper which
+                // never EOFs, so we MUST break here — otherwise we'd be
+                // stuck reading forever. cleanupSession will then kill
+                // the wrapper to unblock wait().
+                //
+                // Local spawn: nvim is in the middle of its own clean
+                // shutdown (channel close + process exit). Breaking
+                // here would force cleanupSession to kill nvim mid-
+                // shutdown, racing with shada/viminfo flush, swap file
+                // deletion, etc. Instead, fall through and let the
+                // inner loop see the natural EOF (decode err path
+                // above), which breaks out cleanly. The kill in
+                // cleanupSession is then a true no-op on the already-
+                // exited child.
                 if (self.restart_pending_addr != null) {
-                    self.log.write("inner loop: restart/connect queued; breaking to trigger cleanup\n", .{});
-                    break :outer;
+                    if (is_remote_for_restart) {
+                        self.log.write("inner loop: restart/connect queued (remote); breaking immediately\n", .{});
+                        remote_restart_break = true;
+                        break :outer;
+                    }
+                    self.log.write("inner loop: restart/connect queued (local); waiting for natural EOF\n", .{});
                 }
                 continue;
             }
         }
 
         // === Session cleanup ===
-        // Natural inner-loop exit: kill conditions inside cleanupSession
-        // already cover stop_flag and restart_pending_addr, so no need to
-        // force-kill here. Propagate the term so on_exit can compute the
-        // right exit code from how nvim ended this session.
-        if (cleanupSession(self, &child, have_child, false)) |t| last_term = t;
+        // Natural inner-loop exit. cleanupSession's kill conditions cover
+        // stop_flag (user stop) automatically, so we don't force-kill
+        // here. `kill_on_restart_pending = remote_restart_break` lets
+        // remote-mode restarts kill the wrapper (whose stdio never EOFs)
+        // while local-mode restarts skip the kill so nvim can finish
+        // its own clean shutdown — channel close (EOF) is just one of
+        // the last steps in nvim's exit, not the end. Propagate the
+        // term so on_exit can compute the right exit code.
+        if (cleanupSession(self, &child, have_child, false, remote_restart_break)) |t| last_term = t;
 
         // === Decide next iteration ===
         if (self.stop_flag.load(.seq_cst)) {
@@ -1685,6 +1711,19 @@ pub fn runLoop(self: *Core) void {
     }
 }
 
+/// POSIX background reaper for `:connect` orphans. Without this, the
+/// orphaned headless nvim becomes a zombie when it eventually exits
+/// (e.g., `:connect!` from another UI, system shutdown), holding a
+/// kernel process-table entry until our process exits. The thread
+/// blocks in waitpid() until the orphan terminates, then naturally
+/// returns and self-cleans-up. Receives the Child by value so the
+/// owning runLoop frame can drop its local `child` without affecting
+/// the reaper.
+fn reapOrphanThread(orphan: std.process.Child) void {
+    var c = orphan;
+    _ = c.wait() catch {};
+}
+
 /// Tear down the current RPC session: stop the writer thread, close the
 /// transport (with socket-alias handling), reap the child (if any), and
 /// join the stderr pump. Safe to call from any session-exit path — both
@@ -1698,6 +1737,18 @@ pub fn runLoop(self: *Core) void {
 /// so wait() does not block (notably SSH / devcontainer / WSL where the
 /// wrapper holds stdio open until killed).
 ///
+/// `kill_on_restart_pending`: when true, kill the child if a restart /
+/// connect is queued. True for the remote-mode inner-loop early-break
+/// path (SSH / WSL / devcontainer / cmd / shell), where the wrapper
+/// holds stdio open and child.wait() would block forever without an
+/// explicit kill. False for the local-spawn natural-EOF path, where
+/// nvim closed its channel while in the middle of its own clean
+/// shutdown — child.wait() will reap shortly on its own. Killing in
+/// the local case truncates nvim's shutdown work (shada / viminfo
+/// flush, swap file deletion, etc.) and violates the Neovim restart
+/// UI event contract: the UI must wait for channel close + natural
+/// process exit, not force-terminate the old server.
+///
 /// Returns the child's exit term, or null if not available (no child,
 /// orphaned for a `:connect` hot-swap, or wait() failed). The caller
 /// decides whether to propagate the term to `last_term` for on_exit's
@@ -1707,6 +1758,7 @@ fn cleanupSession(
     child: *std.process.Child,
     have_child: bool,
     force_kill_child: bool,
+    kill_on_restart_pending: bool,
 ) ?std.process.Child.Term {
     // Stop the writer thread before closing the transport so its
     // in-flight writeAll() does not observe a torn-down handle.
@@ -1746,28 +1798,52 @@ fn cleanupSession(
             // On Windows std.process.Child.Id is a HANDLE and there is
             // also a thread_handle for the main thread. Normally
             // child.wait() closes both, but the orphan path skips
-            // wait() (the headless nvim never exits, so wait would
-            // block forever). Close them explicitly so repeated
-            // :connect hot-swaps don't leak HANDLEs. POSIX has no
-            // resources to free here — id is a pid_t, thread_handle
-            // is zero-sized void — so the block is Windows-only.
+            // wait() (the headless nvim never exits in the foreground
+            // case, so wait would block). Close them explicitly so
+            // repeated :connect hot-swaps don't leak HANDLEs. The
+            // process keeps running because HANDLEs are merely kernel-
+            // object references, not the process itself.
+            //
+            // On POSIX the orphan is reaped by a detached background
+            // thread. id is a pid_t (just an integer, no kernel HANDLE
+            // to close), but if we never waitpid() the orphan, it
+            // becomes a zombie when it eventually exits. The thread
+            // blocks in child.wait() and reaps the zombie when the
+            // orphan terminates. child.stdin/stdout/stderr were nulled
+            // on spawn (lines 1426-1428) so wait()'s cleanupStreams is
+            // a no-op — no double-close races with our own pipe
+            // teardown above.
             if (builtin.os.tag == .windows) {
                 std.os.windows.CloseHandle(child.id);
                 std.os.windows.CloseHandle(child.thread_handle);
+            } else {
+                if (std.Thread.spawn(.{}, reapOrphanThread, .{child.*})) |t| {
+                    t.detach();
+                } else |e| {
+                    self.log.write("orphan reaper spawn failed: {any}; pid {any} may zombie on exit\n", .{ e, child.id });
+                }
             }
             self.child_handle = null;
         } else {
             // Kill conditions:
-            //   - User stop OR restart/connect queued via inner-loop early
-            //     break: terminate promptly. For local spawn the child is
-            //     usually already dead (nvim self-exits on :restart); kill
-            //     is then a no-op. For SSH / devcontainer / WSL the wrapper
-            //     process is still alive holding stdio open, and would make
-            //     child.wait() block indefinitely without this kill.
+            //   - User stop (stop_flag): terminate promptly so we don't
+            //     block on wait().
             //   - force_kill_child: early-exit failure paths haven't set
             //     stop_flag, but still need the child reaped without
             //     blocking on wait().
-            if (force_kill_child or self.stop_flag.load(.seq_cst) or self.restart_pending_addr != null) {
+            //   - restart/connect pending AND kill_on_restart_pending:
+            //     remote modes (SSH / WSL / devcontainer / cmd / shell)
+            //     where the wrapper holds stdio open after nvim exits.
+            //     Without an explicit kill, wait() blocks forever on
+            //     the wrapper. The local-spawn natural-EOF path passes
+            //     kill_on_restart_pending=false so we let nvim finish
+            //     its shutdown (shada / viminfo / swap file cleanup)
+            //     and reap via wait() — EOF is channel close, not
+            //     process exit, so racing a kill against the still-in-
+            //     progress teardown would truncate nvim's work.
+            if (force_kill_child or self.stop_flag.load(.seq_cst) or
+                (kill_on_restart_pending and self.restart_pending_addr != null))
+            {
                 _ = child.kill() catch {};
             }
             session_term = child.wait() catch |e| blk: {
