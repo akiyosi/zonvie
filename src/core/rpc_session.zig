@@ -2,6 +2,7 @@
 // Extracted from nvim_core.zig. Free functions take *Core as first parameter.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
 const highlight = @import("highlight.zig");
@@ -1742,6 +1743,18 @@ fn cleanupSession(
     if (have_child) {
         if (orphan_child) {
             self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
+            // On Windows std.process.Child.Id is a HANDLE and there is
+            // also a thread_handle for the main thread. Normally
+            // child.wait() closes both, but the orphan path skips
+            // wait() (the headless nvim never exits, so wait would
+            // block forever). Close them explicitly so repeated
+            // :connect hot-swaps don't leak HANDLEs. POSIX has no
+            // resources to free here — id is a pid_t, thread_handle
+            // is zero-sized void — so the block is Windows-only.
+            if (builtin.os.tag == .windows) {
+                std.os.windows.CloseHandle(child.id);
+                std.os.windows.CloseHandle(child.thread_handle);
+            }
             self.child_handle = null;
         } else {
             // Kill conditions:
