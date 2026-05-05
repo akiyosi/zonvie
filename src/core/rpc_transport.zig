@@ -85,6 +85,53 @@ pub const Stream = union(enum) {
         }
     }
 
+    /// Wake any blocked read/writeAll on this stream so the holding
+    /// thread can return promptly. Must be called BEFORE close().
+    /// Used at session teardown when the reader/writer threads sit on
+    /// a socket fd that another thread is about to close.
+    ///
+    /// Why this is needed (POSIX socket only):
+    ///   For connect-mode (.socket transport) stdin and stdout alias
+    ///   the same fd. Closing it from another thread does NOT
+    ///   reliably wake threads already blocked in read()/write() on
+    ///   the same fd — the kernel keeps an in-flight reference for
+    ///   each blocked syscall, and only completes them when the peer
+    ///   shuts down its side. shutdown(SHUT_RDWR) makes the kernel
+    ///   immediately deliver EOF to readers and EPIPE to writers on
+    ///   our side, regardless of peer state.
+    ///
+    /// Pipe transport (.file with pipe fds): not needed. stdin and
+    /// stdout are separate fds, and closing stdin causes nvim to
+    /// exit, which closes stdout from its side → reader gets EOF
+    /// naturally.
+    ///
+    /// Windows .win_pipe: not needed. closeHandles() already fires
+    /// CancelIoEx on the pipe HANDLE, which releases blocked
+    /// GetOverlappedResult calls.
+    ///
+    /// `is_socket` MUST be accurate: posix.shutdown panics on a
+    /// non-socket fd (NOTSOCK is `unreachable` in the Zig wrapper).
+    /// Errors are swallowed — at teardown we only care that the
+    /// blocked thread is woken; a SocketNotConnected or
+    /// ConnectionResetByPeer is acceptable noise.
+    pub fn shutdownIfSocket(self: Stream, is_socket: bool) void {
+        if (!is_socket) return;
+        // Windows `.file` is only used for spawn-mode pipe transport in
+        // this codebase — connect-mode socket equivalent is `.win_pipe`
+        // (named pipe), whose closeHandles() already fires CancelIoEx
+        // to release blocked GetOverlappedResult calls. Skip the
+        // POSIX shutdown branch on Windows: std.fs.File.handle is
+        // windows.HANDLE while std.posix.shutdown expects
+        // ws2_32.SOCKET, so the call would not even compile.
+        if (builtin.os.tag == .windows) return;
+        switch (self) {
+            .file => |f| {
+                std.posix.shutdown(f.handle, .both) catch {};
+            },
+            .win_pipe => {},
+        }
+    }
+
     pub fn fromFile(f: std.fs.File) Stream {
         return .{ .file = f };
     }

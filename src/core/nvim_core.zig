@@ -823,6 +823,16 @@ pub const Core = struct {
     /// layout dimensions) is intentionally NOT touched — those carry over
     /// to the new server unchanged so the user sees no flicker.
     ///
+    /// EXCEPTION: external windows (multigrid windows mapped to OS-level
+    /// windows by the frontend) ARE channel-bound. The new server uses a
+    /// fresh grid_id space, so old grid_ids in known_external_grids /
+    /// grid.external_grids would never receive grid_resize from the new
+    /// server and never appear in the closed-detection diff at
+    /// flush.notifyExternalWindowChanges. Without explicit teardown, the
+    /// stale OS windows remain visible holding dead grid state. Fire
+    /// on_external_window_close for each known grid_id and clear both
+    /// maps before the next session.
+    ///
     /// MUST be called only from the RPC thread, after the previous
     /// session's writer thread has been joined and pipes/sockets closed.
     pub fn resetSessionState(self: *Core) void {
@@ -867,6 +877,25 @@ pub const Core = struct {
         self.writer_failed = false;
         self.write_queue.clearRetainingCapacity();
         self.write_queue_mu.unlock();
+
+        // Tear down channel-bound external windows. See doc comment above
+        // for the rationale (new server's grid_id space is fresh, so the
+        // diff at notifyExternalWindowChanges never fires on stale ids).
+        // Fire close callbacks first so the frontend can dismiss its OS
+        // windows; then clear both maps so the new session starts with an
+        // empty external-grid registry.
+        if (self.known_external_grids.count() > 0) {
+            const closed_count = self.known_external_grids.count();
+            if (self.cb.on_external_window_close) |cb| {
+                var it = self.known_external_grids.keyIterator();
+                while (it.next()) |grid_id_ptr| {
+                    cb(self.ctx, grid_id_ptr.*);
+                }
+            }
+            self.known_external_grids.clearRetainingCapacity();
+            self.log.write("resetSessionState: closed {d} external windows from previous session\n", .{closed_count});
+        }
+        self.grid.external_grids.clearRetainingCapacity();
 
         self.log.write("resetSessionState: cleared session-scoped state\n", .{});
     }
@@ -928,6 +957,13 @@ pub const Core = struct {
         // The same alias guard lives in cleanupSession() (rpc_session.zig)
         // — keep both sides in sync.
         if (self.stdin_file) |f| {
+            // For POSIX .socket transport (connect mode, where stdin/
+            // stdout alias the same fd) close() alone does not wake
+            // the reader/writer thread blocked on the fd. Issue
+            // shutdown(SHUT_RDWR) first so those threads return EOF /
+            // EPIPE and can be join()ed below; otherwise stop() would
+            // hang waiting on self.thread / writer thread join.
+            f.shutdownIfSocket(self.transport_kind == .socket);
             f.close();
             self.stdin_file = null;
             if (self.transport_kind == .socket) {

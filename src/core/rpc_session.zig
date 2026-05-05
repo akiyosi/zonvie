@@ -1780,6 +1780,14 @@ fn cleanupSession(
     const orphan_child = self.connect_keeps_child_alive;
 
     if (self.stdin_file) |f| {
+        // POSIX socket transport aliases stdin/stdout on the same fd.
+        // Issue shutdown(SHUT_RDWR) before close() so the writer
+        // thread (blocked in writeAll on the socket) returns EPIPE
+        // and exits — close() alone leaves it stuck, and the
+        // wt.join() below would hang. The reader does not run here
+        // (we are on the runLoop thread, post inner-loop exit), so
+        // it is naturally not affected.
+        f.shutdownIfSocket(self.transport_kind == .socket);
         f.close();
         self.stdin_file = null;
         // Socket transport aliases stdin and stdout on the same fd —
