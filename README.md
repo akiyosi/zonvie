@@ -71,7 +71,7 @@ zonvie [OPTIONS] [--] [NVIM_ARGS...]
 | `--devcontainer=<workspace>` | Run inside a devcontainer |
 | `--devcontainer-config=<path>` | Path to devcontainer.json |
 | `--devcontainer-rebuild` | Rebuild devcontainer before starting |
-| `--connect-nvim=<addr>` | Attach to a running Neovim server (TCP `host:port` or Unix socket path). Mutually exclusive with `--ssh` / `--devcontainer` / `--wsl`. |
+| `--connect-nvim=<addr>` | Attach to a running Neovim server. Address: POSIX (macOS/Linux) — TCP `host:port` or Unix socket path; Windows — named pipe path (e.g. `\\.\pipe\nvim.31920.0`). Mutually exclusive with `--ssh` / `--devcontainer` / `--wsl`. |
 | `--remote-ui=<addr>` | Alias of `--connect-nvim`, mirrors `nvim --remote-ui` |
 | `--install` | Create default config file and exit |
 | `--` | Pass all remaining arguments to nvim |
@@ -94,8 +94,9 @@ zonvie --devcontainer=/path/to/project
 
 # Attach to a Neovim server already running (e.g. started elsewhere with
 # `nvim --headless --listen /tmp/nvim.sock` or `:detach`'d from another UI)
-zonvie --connect-nvim=/tmp/nvim.sock
-zonvie --connect-nvim=127.0.0.1:6789
+zonvie --connect-nvim=/tmp/nvim.sock          # POSIX: Unix socket
+zonvie --connect-nvim=127.0.0.1:6789          # POSIX: TCP
+zonvie --connect-nvim=\\.\pipe\nvim.31920.0  # Windows: named pipe
 ```
 
 ## Configuration

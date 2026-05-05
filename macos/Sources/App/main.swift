@@ -8,11 +8,23 @@ signal(SIGPIPE, SIG_IGN)
 
 // Check for --nofork and --help early (before any other processing)
 let args = CommandLine.arguments
-let noforkMode = args.contains("--nofork")
+
+// `zonvieArgs` is the argv slice up to (but not including) the first `--`.
+// Anything after `--` is forwarded verbatim to nvim and must NOT be parsed
+// as a zonvie option, otherwise `zonvie -- --ssh=...` would erroneously
+// flip on SSH mode (and similar for --connect-nvim, --devcontainer, etc.).
+let zonvieArgs: [String] = {
+    if let sep = args.firstIndex(of: "--") {
+        return Array(args[..<sep])
+    }
+    return args
+}()
+
+let noforkMode = zonvieArgs.contains("--nofork")
 
 // Check if SSH or devcontainer mode (window should be hidden until auth completes)
-let sshModeEnabled = args.contains { $0.hasPrefix("--ssh=") || $0 == "--ssh" }
-let devcontainerModeEnabled = args.contains { $0.hasPrefix("--devcontainer=") || $0 == "--devcontainer" }
+let sshModeEnabled = zonvieArgs.contains { $0.hasPrefix("--ssh=") || $0 == "--ssh" }
+let devcontainerModeEnabled = zonvieArgs.contains { $0.hasPrefix("--devcontainer=") || $0 == "--devcontainer" }
 
 // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
 // zonvie-specific arguments:
@@ -125,8 +137,10 @@ func loadShellEnvironment() {
     }
 }
 
-// Handle --help before fork (so output goes to terminal)
-if args.contains("--help") || args.contains("-h") {
+// Handle --help before fork (so output goes to terminal).
+// Use zonvieArgs so `zonvie -- --help` forwards `--help` to nvim
+// instead of printing zonvie's own help text and exiting.
+if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
     let help = """
         zonvie - A high-performance Neovim GUI
 
@@ -209,8 +223,11 @@ if args.contains("--help") || args.contains("-h") {
     exit(0)
 }
 
-// Handle --install: create default config.toml and exit
-if args.contains("--install") {
+// Handle --install: create default config.toml and exit.
+// Use zonvieArgs so `zonvie -- --install` forwards `--install` to nvim
+// (nvim has no such option but the user's intent is clear: don't run
+// zonvie's installer just because the token appears post `--`).
+if zonvieArgs.contains("--install") {
     let configURL = ZonvieConfig.configFilePath
     let configPath = configURL.path
     let fm = FileManager.default
@@ -253,6 +270,107 @@ if args.contains("--install") {
         }
     }
     exit(0)
+}
+
+// Validate flag exclusivity BEFORE the posix_spawnp fork branch below.
+// The fork makes the parent exit(0) once the child is spawned, which
+// hides any error printed afterwards from the terminal — both because
+// the parent has already returned success to the shell, and because
+// the child's stdio is redirected to /dev/null. By running the check
+// here, a CLI invocation like `zonvie --connect-nvim=... --ssh=...`
+// fails synchronously in the foreground process with a visible stderr
+// message instead of silently no-op'ing.
+//
+// `--connect-nvim` attaches to an already-running Neovim server;
+// `--ssh` / `--devcontainer` (and their config.toml equivalents
+// `[neovim].ssh` / `.wsl`) all SPAWN a wrapper-hosted nvim. The two
+// modes are mutually exclusive — silently letting connect mode
+// override (the previous behavior) would pick the user's wrapper
+// config out from under them. Refuse to start so the user can fix the
+// invocation explicitly.
+// Detect connect-mode usage AND capture its address in a single pass so
+// we can fail fast on bad invocations. Three classes of mistake we catch:
+//   1. Conflict with --ssh / --devcontainer (or their config.toml twins)
+//   2. Bare --connect-nvim / --remote-ui with no following value, which
+//      previously fell through silently to a regular nvim spawn
+//   3. --connect-nvim= or --remote-ui= with an empty value, which
+//      previously entered connect mode with addr=="" and surfaced as
+//      a confusing "Invalid core handle" alert from ZonvieCore.start.
+var connectModeEnabled = false
+var connectAddrCaptured: String? = nil
+do {
+    var i = 0
+    while i < zonvieArgs.count {
+        let arg = zonvieArgs[i]
+        if arg.hasPrefix("--connect-nvim=") {
+            connectModeEnabled = true
+            connectAddrCaptured = String(arg.dropFirst("--connect-nvim=".count))
+        } else if arg == "--connect-nvim" {
+            connectModeEnabled = true
+            if i + 1 < zonvieArgs.count {
+                connectAddrCaptured = zonvieArgs[i + 1]
+                i += 1
+            } else {
+                connectAddrCaptured = nil
+            }
+        } else if arg.hasPrefix("--remote-ui=") {
+            connectModeEnabled = true
+            connectAddrCaptured = String(arg.dropFirst("--remote-ui=".count))
+        } else if arg == "--remote-ui" {
+            connectModeEnabled = true
+            if i + 1 < zonvieArgs.count {
+                connectAddrCaptured = zonvieArgs[i + 1]
+                i += 1
+            } else {
+                connectAddrCaptured = nil
+            }
+        }
+        i += 1
+    }
+}
+if connectModeEnabled {
+    // (1) value missing or empty
+    if connectAddrCaptured == nil || connectAddrCaptured!.isEmpty {
+        let stderrMsg = "zonvie: --connect-nvim / --remote-ui requires a non-empty address (e.g. /tmp/nvim.sock or 127.0.0.1:6789).\n"
+        fputs(stderrMsg, stderr)
+        if launchedFromFinder {
+            _ = NSApplication.shared
+            let alert = NSAlert()
+            alert.messageText = "zonvie: invalid options"
+            alert.informativeText = "--connect-nvim / --remote-ui requires a non-empty address such as /tmp/nvim.sock or 127.0.0.1:6789."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            _ = alert.runModal()
+        }
+        Darwin.exit(1)
+    }
+    // (2) wrapper-mode conflict
+    var conflictParts: [String] = []
+    if sshModeEnabled || ZonvieConfig.shared.neovim.ssh {
+        conflictParts.append("--ssh / [neovim].ssh")
+    }
+    if devcontainerModeEnabled {
+        conflictParts.append("--devcontainer")
+    }
+    if !conflictParts.isEmpty {
+        let conflictDesc = conflictParts.joined(separator: " and ")
+        let stderrMsg = "zonvie: --connect-nvim is mutually exclusive with \(conflictDesc).\nRemove the conflicting option(s) and retry.\n"
+        fputs(stderrMsg, stderr)
+        // Finder launches have no parent terminal to read stderr — pop a
+        // modal dialog so the error is visible. Terminal launches see the
+        // stderr message above and don't need (and shouldn't get) an
+        // alert that would flash on screen and then disappear.
+        if launchedFromFinder {
+            _ = NSApplication.shared
+            let alert = NSAlert()
+            alert.messageText = "zonvie: invalid options"
+            alert.informativeText = "--connect-nvim is mutually exclusive with \(conflictDesc) (or the corresponding config.toml entry). Remove the conflicting option(s) and retry."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            _ = alert.runModal()
+        }
+        Darwin.exit(1)
+    }
 }
 
 if !noforkMode && !launchedFromFinder {
@@ -438,12 +556,13 @@ if !noforkMode && !launchedFromFinder {
 }
 // --nofork mode or no cache: keep current directory, stay attached to terminal
 
-// Configure logging before anything else
-// CLI --log takes precedence over config file
+// Configure logging before anything else.
+// CLI --log takes precedence over config file. Iterate zonvieArgs so
+// a post-`--` `--log` token (meant for nvim) is not consumed by zonvie.
 var cliLogPath: String? = nil
-for i in 0..<args.count {
-    if args[i] == "--log" && i + 1 < args.count {
-        cliLogPath = args[i + 1]
+for i in 0..<zonvieArgs.count {
+    if zonvieArgs[i] == "--log" && i + 1 < zonvieArgs.count {
+        cliLogPath = zonvieArgs[i + 1]
         break
     }
 }

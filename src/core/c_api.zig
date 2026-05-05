@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
 const shader_compiler = @import("shader_compiler.zig");
+const rpc_transport = @import("rpc_transport.zig");
 
 // Re-exports for test access
 pub const nvim_core = core;
@@ -678,10 +679,14 @@ pub export fn zonvie_core_start(p: ?*zonvie_core, nvim_path_c: ?[*:0]const u8, r
 
 /// Start in connect mode: attach to a running Neovim server at
 /// listen_addr instead of spawning a child. Address forms supported:
-///   - "host:port"        TCP
-///   - "/abs/path"        Unix domain socket
-/// Windows named pipes are not yet supported; on Windows the connect
-/// returns an error and the run loop exits without firing on_exit.
+///   POSIX (macOS, Linux): "host:port" (TCP) or "/abs/path" (Unix socket)
+///   Windows:              "\\.\pipe\..." (named pipe); TCP and Unix
+///                         sockets are not yet supported.
+///
+/// Address validity (parse errors and platform-unsupported forms) is
+/// checked synchronously and returned as -3 before the run-loop thread
+/// is spawned, so callers can react immediately instead of waiting for
+/// an async on_exit.
 pub export fn zonvie_core_start_connect(
     p: ?*zonvie_core,
     listen_addr: ?[*]const u8,
@@ -691,9 +696,20 @@ pub export fn zonvie_core_start_connect(
 ) callconv(.c) i32 {
     if (p == null) return -1;
     const box = asBox(p.?);
-    const addr = if (listen_addr) |s| s[0..listen_addr_len] else return -3;
-    if (addr.len == 0) return -3;
+    const addr = if (listen_addr) |s| s[0..listen_addr_len] else {
+        box.core.log.write("[c_api] start_connect: listen_addr=null -> -3\n", .{});
+        return -3;
+    };
+    box.core.log.write("[c_api] start_connect: enter addr_len={d} addr=\"{s}\"\n", .{ addr.len, addr });
+    if (addr.len == 0) {
+        box.core.log.write("[c_api] start_connect: empty addr -> -3\n", .{});
+        return -3;
+    }
+    const supported = rpc_transport.isAddrSupported(addr);
+    box.core.log.write("[c_api] start_connect: isAddrSupported(\"{s}\") = {}\n", .{ addr, supported });
+    if (!supported) return -3;
     box.core.startConnect(addr, rows, cols) catch return -2;
+    box.core.log.write("[c_api] start_connect: thread spawned, returning 0\n", .{});
     return 0;
 }
 

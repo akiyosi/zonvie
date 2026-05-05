@@ -1284,9 +1284,30 @@ pub fn runLoop(self: *Core) void {
     session: while (true) {
         var session_addr: ?[]u8 = null;
         var use_connect: bool = false;
+        // Snapshot whether the pending session was queued by `:connect`
+        // (hot-swap, old nvim orphaned) vs `:restart` (old nvim dead).
+        // Consumed below so a subsequent fall-through to spawn doesn't
+        // see stale state.
+        var was_connect_hotswap: bool = false;
         if (self.restart_pending_addr) |a| {
             self.restart_pending_addr = null;
+            was_connect_hotswap = self.restart_pending_is_connect_hotswap;
+            self.restart_pending_is_connect_hotswap = false;
             if (is_remote_for_restart) {
+                if (was_connect_hotswap) {
+                    // Remote-mode `:connect` hot-swap: the new server's
+                    // listen socket lives inside the SSH / WSL /
+                    // devcontainer / shell wrapper and is not reachable
+                    // from the host, so we can't attach. The old nvim has
+                    // already been orphaned by cleanup, so falling through
+                    // to spawn the original argv would launch a wholly new
+                    // remote session unrelated to the user's editing state
+                    // in the orphan. Surface the failure via on_exit
+                    // instead.
+                    self.log.write("connect: remote-mode :connect cannot reach new server's listen socket and old nvim is orphaned; not spawning surprise replacement; exiting run loop (addr={s})\n", .{a});
+                    self.alloc.free(a);
+                    break :session;
+                }
                 self.log.write("restart: remote mode, re-spawning instead of connecting (addr={s})\n", .{a});
                 self.alloc.free(a);
             } else {
@@ -1312,12 +1333,38 @@ pub fn runLoop(self: *Core) void {
                 self.stdin_file = conn;
                 self.stdout_file = conn; // alias of the same fd / pipe wrapper
                 self.stderr_file = null;
+                // For Windows named pipes the Stream wraps a heap-allocated
+                // *WindowsOverlappedPipe. Save the owning pointer so we can
+                // destroy() the wrapper *after* the writer/stderr threads
+                // have been joined — Stream.close() only fires CancelIoEx
+                // on the pipe HANDLE (no HANDLE close yet) so blocked
+                // GetOverlappedResult calls return without their HANDLE
+                // references being closed mid-wait. The pipe HANDLE, the
+                // event HANDLEs, and the wrapper memory are all released
+                // together by destroy(). Without this separate ownership
+                // pointer, the alias-null in stop()/cleanupSession would
+                // drop our only reference and the wrapper would leak.
+                self.session_pipe = switch (conn) {
+                    .win_pipe => |p| p,
+                    .file => null,
+                };
                 self.log.write("connect: established socket session to {s}\n", .{session_addr.?});
             } else if (nvim_path.len == 0) {
                 // Connect-only mode (started via zonvie_core_start_connect): no
                 // argv to fall back to. Exit cleanly without spawning a
                 // surprise local nvim.
                 self.log.write("connect: no spawn fallback (connect-only mode); exiting run loop\n", .{});
+                break :session;
+            } else if (was_connect_hotswap) {
+                // `:connect` hot-swap: the old nvim is already orphaned
+                // (kept alive headless on its own listen socket — the user
+                // can still reach it manually). Falling through to spawn
+                // the original argv would open a brand-new local nvim
+                // session that is unrelated to the user's editing state in
+                // the orphan, leaving them with TWO disconnected sessions.
+                // Exit cleanly so the frontend (via on_exit) can surface
+                // the failure instead.
+                self.log.write("connect: :connect hot-swap connect failed and old nvim is orphaned; not spawning surprise local fallback; exiting run loop\n", .{});
                 break :session;
             } else {
                 use_connect = false; // fall through to spawn
@@ -1424,7 +1471,7 @@ pub fn runLoop(self: *Core) void {
 
                 if (self.stop_flag.load(.seq_cst)) {
                     self.log.write("SSH mode: stopped by user\n", .{});
-                    teardownSpawnSession(self, &child, have_child);
+                    _ = cleanupSession(self, &child, have_child, false);
                     break :session;
                 }
             }
@@ -1449,7 +1496,7 @@ pub fn runLoop(self: *Core) void {
         }
 
         if (self.stop_flag.load(.seq_cst)) {
-            teardownSpawnSession(self, &child, have_child);
+            _ = cleanupSession(self, &child, have_child, false);
             break :session;
         }
 
@@ -1473,7 +1520,7 @@ pub fn runLoop(self: *Core) void {
 
         self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
             self.log.write("ui_attach send failed: {any}\n", .{e});
-            teardownSpawnSession(self, &child, have_child);
+            _ = cleanupSession(self, &child, have_child, true);
             break :session;
         };
         ui_attached = true;
@@ -1502,13 +1549,13 @@ pub fn runLoop(self: *Core) void {
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
-            teardownSpawnSession(self, &child, have_child);
+            _ = cleanupSession(self, &child, have_child, true);
             break :session;
         }
 
         var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
             self.log.write("FrameReader init failed: {any}\n", .{e});
-            teardownSpawnSession(self, &child, have_child);
+            _ = cleanupSession(self, &child, have_child, true);
             break :session;
         };
         defer fr.deinit();
@@ -1583,80 +1630,11 @@ pub fn runLoop(self: *Core) void {
         }
 
         // === Session cleanup ===
-        // Stop the writer thread before closing the transport so its
-        // in-flight writeAll() doesn't observe a torn-down handle.
-        var wt: ?std.Thread = null;
-        {
-            self.write_queue_mu.lock();
-            self.write_queue_closed = true;
-            wt = self.writer_thread;
-            self.writer_thread = null;
-            self.write_queue_cond.signal();
-            self.write_queue_mu.unlock();
-        }
-        // `:connect` hot-swap: the old nvim is still alive headless on
-        // its own listen socket and would block child.wait() forever
-        // (the process never exits). Don't kill, don't wait — just drop
-        // the handle. The orphan continues running until the user kills
-        // it manually. We still close OUR end of the pipes (just FDs in
-        // our process; doesn't affect the running nvim).
-        const orphan_child = self.connect_keeps_child_alive;
-
-        if (self.stdin_file) |f| {
-            f.close();
-            self.stdin_file = null;
-            // Socket transport aliases stdin and stdout on the same fd —
-            // closing once fully tears down the connection. Null both
-            // pointers so downstream cleanup does not double-close.
-            if (self.transport_kind == .socket) {
-                self.stdout_file = null;
-            }
-        }
-        if (wt) |t| t.join();
-
-        // Wait for the child (spawn mode only) and capture exit term.
-        var session_term: ?std.process.Child.Term = null;
-        if (have_child) {
-            if (orphan_child) {
-                self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
-                self.child_handle = null;
-            } else {
-                // User stop OR restart/connect queued via the inner-loop
-                // early break: kill the child to ensure it terminates
-                // promptly. For local spawn the child is usually already
-                // dead (nvim self-exits on :restart); kill is then a
-                // no-op. For SSH / devcontainer / WSL the wrapper
-                // process is still alive holding stdio open, and would
-                // make child.wait() block indefinitely without this kill.
-                if (self.stop_flag.load(.seq_cst) or self.restart_pending_addr != null) {
-                    _ = child.kill() catch {};
-                }
-                session_term = child.wait() catch |e| blk: {
-                    self.log.write("wait err: {any}\n", .{e});
-                    break :blk null;
-                };
-                if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
-                self.child_handle = null;
-            }
-        }
-        if (session_term) |t| last_term = t;
-
-        // Close any remaining transport handles.
-        if (self.stdout_file) |f| {
-            f.close();
-            self.stdout_file = null;
-        }
-        if (self.stderr_file) |f| {
-            f.close();
-            self.stderr_file = null;
-        }
-
-        // Join the stderr pump (if any). Closing stderr_file above causes
-        // its read() to return 0, exiting the thread cleanly.
-        if (self.stderr_thread) |t| {
-            t.join();
-            self.stderr_thread = null;
-        }
+        // Natural inner-loop exit: kill conditions inside cleanupSession
+        // already cover stop_flag and restart_pending_addr, so no need to
+        // force-kill here. Propagate the term so on_exit can compute the
+        // right exit code from how nvim ended this session.
+        if (cleanupSession(self, &child, have_child, false)) |t| last_term = t;
 
         // === Decide next iteration ===
         if (self.stop_flag.load(.seq_cst)) {
@@ -1706,13 +1684,118 @@ pub fn runLoop(self: *Core) void {
     }
 }
 
-/// Tear down a partially-set-up spawn session without firing on_exit.
-/// Called from early-exit paths inside runLoop (ui_attach failure, stop
-/// during ssh-auth wait, etc.). Safe to call when have_child is false.
-fn teardownSpawnSession(self: *Core, child: *std.process.Child, have_child: bool) void {
-    if (have_child) {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        self.child_handle = null;
+/// Tear down the current RPC session: stop the writer thread, close the
+/// transport (with socket-alias handling), reap the child (if any), and
+/// join the stderr pump. Safe to call from any session-exit path — both
+/// the natural inner-loop exit and the early-exit failure paths
+/// (ui_attach failure, FrameReader init failure, stop during ssh-auth,
+/// etc.). Safe to call when have_child is false.
+///
+/// `force_kill_child`: when true, unconditionally kill the child before
+/// wait(). Used by early-exit failure paths that do not set stop_flag /
+/// restart_pending_addr but still need the child to terminate promptly
+/// so wait() does not block (notably SSH / devcontainer / WSL where the
+/// wrapper holds stdio open until killed).
+///
+/// Returns the child's exit term, or null if not available (no child,
+/// orphaned for a `:connect` hot-swap, or wait() failed). The caller
+/// decides whether to propagate the term to `last_term` for on_exit's
+/// exit-code computation.
+fn cleanupSession(
+    self: *Core,
+    child: *std.process.Child,
+    have_child: bool,
+    force_kill_child: bool,
+) ?std.process.Child.Term {
+    // Stop the writer thread before closing the transport so its
+    // in-flight writeAll() does not observe a torn-down handle.
+    var wt: ?std.Thread = null;
+    {
+        self.write_queue_mu.lock();
+        self.write_queue_closed = true;
+        wt = self.writer_thread;
+        self.writer_thread = null;
+        self.write_queue_cond.signal();
+        self.write_queue_mu.unlock();
     }
+    // `:connect` hot-swap: the old nvim is still alive headless on
+    // its own listen socket and would block child.wait() forever
+    // (the process never exits). Don't kill, don't wait — just drop
+    // the handle. The orphan continues running until the user kills
+    // it manually. We still close OUR end of the pipes (just FDs in
+    // our process; doesn't affect the running nvim).
+    const orphan_child = self.connect_keeps_child_alive;
+
+    if (self.stdin_file) |f| {
+        f.close();
+        self.stdin_file = null;
+        // Socket transport aliases stdin and stdout on the same fd —
+        // closing once fully tears down the connection. Null both
+        // pointers so downstream cleanup does not double-close.
+        if (self.transport_kind == .socket) {
+            self.stdout_file = null;
+        }
+    }
+    if (wt) |t| t.join();
+
+    var session_term: ?std.process.Child.Term = null;
+    if (have_child) {
+        if (orphan_child) {
+            self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
+            self.child_handle = null;
+        } else {
+            // Kill conditions:
+            //   - User stop OR restart/connect queued via inner-loop early
+            //     break: terminate promptly. For local spawn the child is
+            //     usually already dead (nvim self-exits on :restart); kill
+            //     is then a no-op. For SSH / devcontainer / WSL the wrapper
+            //     process is still alive holding stdio open, and would make
+            //     child.wait() block indefinitely without this kill.
+            //   - force_kill_child: early-exit failure paths haven't set
+            //     stop_flag, but still need the child reaped without
+            //     blocking on wait().
+            if (force_kill_child or self.stop_flag.load(.seq_cst) or self.restart_pending_addr != null) {
+                _ = child.kill() catch {};
+            }
+            session_term = child.wait() catch |e| blk: {
+                self.log.write("wait err: {any}\n", .{e});
+                break :blk null;
+            };
+            if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
+            self.child_handle = null;
+        }
+    }
+
+    // Close any remaining transport handles.
+    if (self.stdout_file) |f| {
+        f.close();
+        self.stdout_file = null;
+    }
+    if (self.stderr_file) |f| {
+        f.close();
+        self.stderr_file = null;
+    }
+
+    // Join the stderr pump (if any). Closing stderr_file above causes
+    // its read() to return 0, exiting the thread cleanly.
+    if (self.stderr_thread) |t| {
+        t.join();
+        self.stderr_thread = null;
+    }
+
+    // All threads that could dereference the Windows named-pipe wrapper
+    // (writer thread, stderr pump, the run-loop reader inlined above)
+    // have now been joined — safe to release the kernel HANDLEs and
+    // free the heap allocation. Stream.close() above only canceled
+    // pending I/O via CancelIoEx; the pipe HANDLE and the event
+    // HANDLEs stayed alive until now so that threads sleeping in
+    // GetOverlappedResult could wake up and exit cleanly without
+    // their HANDLE references being yanked from under them. destroy()
+    // closes those HANDLEs and frees the wrapper struct.
+    if (self.session_pipe) |p| {
+        p.destroy();
+        self.session_pipe = null;
+    }
+
+    return session_term;
 }

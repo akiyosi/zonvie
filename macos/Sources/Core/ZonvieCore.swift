@@ -1032,6 +1032,13 @@ final class ZonvieCore {
         var argIdx = 0
         while argIdx < args.count {
             let arg = args[argIdx]
+            // Stop parsing zonvie-side options at `--`; everything after the
+            // separator is forwarded verbatim to nvim. Without this guard,
+            // `zonvie -- --ssh=...` (where `--ssh=...` is meant for nvim)
+            // would erroneously trip zonvie's SSH/connect/devcontainer paths.
+            if arg == "--" {
+                break
+            }
             if arg.hasPrefix("--connect-nvim=") {
                 connectAddr = String(arg.dropFirst("--connect-nvim=".count))
             } else if arg == "--connect-nvim" && argIdx + 1 < args.count {
@@ -1099,6 +1106,17 @@ final class ZonvieCore {
         // Mutually exclusive with SSH / devcontainer; if both are passed, the
         // connect address wins and the user is warned.
         if let addr = connectAddr {
+            // main.swift filters this earlier, but treat empty addresses
+            // as invalid here too: ZonvieCore.start can be invoked with
+            // arbitrary CommandLine.arguments, and an empty Swift string
+            // makes Array("".utf8).withUnsafeBufferPointer hand back a
+            // nil baseAddress, which previously masked the real failure
+            // (invalid address) as a generic "Invalid core handle" (-1).
+            // Reject up front so the frontend reports -3 (invalid addr).
+            if addr.isEmpty {
+                ZonvieCore.appLog("[start] connect mode: empty listen_addr -> -3")
+                return -3
+            }
             if sshHost != nil || devcontainerWorkspace != nil {
                 ZonvieCore.appLog("[start] WARN: --connect-nvim/--remote-ui overrides --ssh / --devcontainer")
             }

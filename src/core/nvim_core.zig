@@ -472,11 +472,46 @@ pub const Core = struct {
     /// once and stderr_file is null.
     transport_kind: TransportKind = .pipes,
 
-    /// Set by handleRestartEvent to the new server's listen address (owned).
-    /// Observed by the RPC run loop after the current session terminates;
-    /// when non-null, the loop reconnects to this address instead of firing
-    /// on_exit. Cleared once the next session is established.
+    /// Owning pointer to the Windows named-pipe wrapper for the current
+    /// session, when transport_kind == .socket and the platform is Windows.
+    /// stdin_file / stdout_file's `Stream.close()` calls
+    /// `WindowsOverlappedPipe.closeHandles()` which only fires
+    /// `CancelIoEx` to abort pending overlapped I/O — neither the pipe
+    /// HANDLE nor the event HANDLEs are closed there, because closing
+    /// a HANDLE another thread is still using as the file argument to
+    /// `GetOverlappedResult` (or as the wait HANDLE for an overlapped
+    /// completion event) is undefined behavior per MSDN. The pipe
+    /// HANDLE, the event HANDLEs, and the heap-allocated wrapper are
+    /// all released exactly once via `session_pipe.destroy()` from
+    /// cleanupSession, AFTER the writer / stderr threads have been
+    /// joined. Without this separation, stop()/cleanupSession would
+    /// close those HANDLEs and `alloc.destroy(self)` while the writer
+    /// thread was still mid-writeAll(), corrupting kernel state and
+    /// heap memory. Null on POSIX and on spawn-mode sessions.
+    session_pipe: ?*rpc_transport.WindowsOverlappedPipe = null,
+
+    /// Set by handleRestartEvent / handleConnectEvent to the next session's
+    /// listen address (owned). Observed by the RPC run loop after the
+    /// current session terminates; when non-null, the loop reconnects to
+    /// this address instead of firing on_exit. Cleared once the next
+    /// session is established.
     restart_pending_addr: ?[]u8 = null,
+
+    /// Distinguishes how `restart_pending_addr` was queued:
+    ///   - false (default): set by handleRestartEvent. The old nvim died
+    ///     and a new instance came up at this address; if connecting back
+    ///     fails, falling through to spawn the original argv is the
+    ///     correct recovery (the user lost their session anyway).
+    ///   - true: set by handleConnectEvent. `:connect` is a hot-swap that
+    ///     orphans the old nvim (still alive headless on its own listen
+    ///     socket); if connecting to the NEW server fails, spawning a
+    ///     fresh local nvim would orphan the user's editing session in
+    ///     the old nvim while opening a wholly different blank session.
+    ///     Exit the run loop instead so the frontend can surface the
+    ///     failure.
+    /// Consumed (reset to false) by the run loop alongside
+    /// restart_pending_addr.
+    restart_pending_is_connect_hotswap: bool = false,
 
     /// Set by handleConnectEvent. When true, the run loop's cleanup must
     /// NOT wait on or kill the spawned child — `:connect` is a hot-swap
@@ -876,13 +911,34 @@ pub const Core = struct {
             self.write_queue_mu.unlock();
         }
 
-        // Close stdin to unblock writer thread's writeAll() if it's blocked on pipe I/O
+        // Unblock writer thread's writeAll() if blocked on transport I/O.
+        // Transport-specific semantics of Stream.close():
+        //   - POSIX (.file): closes the fd outright. For socket transport
+        //     (connect mode) stdin_file and stdout_file alias the same fd;
+        //     a second close would close an unrelated fd that the kernel
+        //     may have already recycled, so we null the alias to skip
+        //     cleanupSession's stdout close.
+        //   - Windows named pipe (.win_pipe): calls closeHandles() which
+        //     only fires CancelIoEx — the pipe HANDLE itself stays alive
+        //     until session_pipe.destroy() runs in cleanupSession (after
+        //     all threads holding a Stream value have been joined). We
+        //     still null the stdout alias to keep the cleanupSession path
+        //     symmetric: closeHandles is idempotent under its swap()
+        //     guard, but skipping the duplicate call is clearer.
+        // The same alias guard lives in cleanupSession() (rpc_session.zig)
+        // — keep both sides in sync.
         if (self.stdin_file) |f| {
             f.close();
             self.stdin_file = null;
+            if (self.transport_kind == .socket) {
+                self.stdout_file = null;
+            }
         }
 
-        // Join writer thread (exits due to closed flag or I/O error from stdin close)
+        // Join writer thread. It exits via:
+        //   - clean shutdown: write_queue_closed observed with empty queue
+        //   - I/O error: POSIX broken-pipe from the stdin close above, or
+        //     OperationAborted from CancelIoEx on the Windows pipe HANDLE
         if (wt) |t| t.join();
 
         if (self.child_handle) |_| {
@@ -934,11 +990,13 @@ pub const Core = struct {
         }
 
         // Free any pending restart address (queued but never consumed because
-        // stop() raced ahead of the run loop's restart handling).
+        // stop() raced ahead of the run loop's restart handling). Reset the
+        // companion hot-swap flag too — the run loop reads them as a pair.
         if (self.restart_pending_addr) |a| {
             self.alloc.free(a);
             self.restart_pending_addr = null;
         }
+        self.restart_pending_is_connect_hotswap = false;
 
         // Free shaping buffers (Phase B)
         self.shaping_bufs.deinit(self.alloc);
@@ -2153,6 +2211,10 @@ pub const Core = struct {
             return e;
         };
         self.restart_pending_addr = owned;
+        // Explicit reset in case a prior :connect queued (then aborted) left
+        // the hot-swap flag set; :restart is NOT a hot-swap (the old nvim
+        // dies), so spawn fallback on connect failure is the desired recovery.
+        self.restart_pending_is_connect_hotswap = false;
 
         self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
 
@@ -2184,6 +2246,7 @@ pub const Core = struct {
             return e;
         };
         self.restart_pending_addr = owned;
+        self.restart_pending_is_connect_hotswap = true;
         self.connect_keeps_child_alive = true;
 
         self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});

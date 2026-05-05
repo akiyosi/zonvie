@@ -65,10 +65,23 @@ pub const Stream = union(enum) {
         };
     }
 
+    /// Cancel pending I/O on the underlying transport so any blocked
+    /// read/write returns. Semantics differ by backend:
+    ///   - `.file`: closes the fd/HANDLE outright. Self-contained.
+    ///   - `.win_pipe`: calls `WindowsOverlappedPipe.closeHandles()`
+    ///     which fires `CancelIoEx` only — neither the pipe HANDLE
+    ///     nor the event HANDLEs are closed here, because other
+    ///     threads holding a Stream value may still be sleeping in
+    ///     `GetOverlappedResult(self.handle, ovl, ..., TRUE)` and
+    ///     closing those HANDLEs mid-wait is undefined behavior.
+    ///     Both the HANDLEs and the wrapper memory are released
+    ///     later via `WindowsOverlappedPipe.destroy()`, which the
+    ///     owner must call exactly once after every such thread has
+    ///     been joined.
     pub fn close(self: Stream) void {
         switch (self) {
             .file => |f| f.close(),
-            .win_pipe => |p| p.deinit(),
+            .win_pipe => |p| p.closeHandles(),
         }
     }
 
@@ -86,12 +99,44 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
     handle: windows.HANDLE,
     read_event: windows.HANDLE,
     write_event: windows.HANDLE,
+    /// Atomic shutdown flag observed by read()/writeAll() at the top
+    /// of every loop iteration AND re-checked after a WriteFile/
+    /// ReadFile returns IO_PENDING. Set exactly once via swap() in
+    /// closeHandles(). Atomic (not plain bool) because closeHandles()
+    /// runs on the UI / RPC thread while read()/writeAll() run on the
+    /// reader / writer thread; without acquire-release synchronization
+    /// the writer could miss the cancellation, issue a fresh WriteFile
+    /// after CancelIoEx fired (which only catches I/O outstanding at
+    /// the time of the call), and then hang in GetOverlappedResult.
+    handles_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     alloc: std.mem.Allocator,
 
     /// Open a Windows named pipe with FILE_FLAG_OVERLAPPED and set up
     /// auto-reset completion events for read and write. Returns a heap-
-    /// allocated wrapper; the caller is responsible for calling
-    /// `deinit()` exactly once at session teardown.
+    /// allocated wrapper.
+    ///
+    /// Lifetime contract: the wrapper has TWO teardown phases the
+    /// owner must run in order:
+    ///   1. `closeHandles()` (idempotent) — calls `CancelIoEx` on the
+    ///      pipe HANDLE, which marks all currently-pending overlapped
+    ///      I/O on that handle as aborted; the kernel writes
+    ///      STATUS_CANCELLED into OVERLAPPED.Internal and signals
+    ///      OVERLAPPED.hEvent. Any thread sleeping in
+    ///      `GetOverlappedResult(self.handle, ovl, ..., TRUE)` wakes
+    ///      up and returns FALSE with ERROR_OPERATION_ABORTED. We do
+    ///      NOT call `CloseHandle(self.handle)` here, because closing
+    ///      the file HANDLE while another thread still holds it as
+    ///      the first argument to GetOverlappedResult is undefined
+    ///      behavior per MSDN. Event HANDLEs are also left alive for
+    ///      the same reason. Do NOT free the wrapper here.
+    ///   2. `destroy()` — closes the pipe HANDLE, the event HANDLEs,
+    ///      and frees the wrapper struct. MUST be called exactly once,
+    ///      AFTER every thread that received a copy of the Stream
+    ///      value (writer, reader, stderr pump) has been joined;
+    ///      otherwise the close races with their in-flight use of
+    ///      self.handle / read_event / write_event.
+    /// Skipping phase 1 is safe (destroy() closes the handle anyway)
+    /// but loses the ability to unblock blocked I/O before joining.
     pub fn open(alloc: std.mem.Allocator, addr: []const u8) ConnectError!*WindowsOverlappedPipe {
         const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, addr) catch return error.OutOfMemory;
         defer alloc.free(path_w);
@@ -134,7 +179,52 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         return self;
     }
 
-    pub fn deinit(self: *WindowsOverlappedPipe) void {
+    /// Phase 1 of teardown: cancel pending overlapped I/O without
+    /// closing any HANDLE. `CancelIoEx(self.handle, NULL)` marks every
+    /// outstanding I/O on the pipe as aborted; the kernel updates
+    /// OVERLAPPED.Internal to STATUS_CANCELLED and signals the
+    /// associated event. A thread blocked in
+    /// `GetOverlappedResult(self.handle, ovl, ..., TRUE)` wakes up
+    /// and returns FALSE with ERROR_OPERATION_ABORTED, which `read()`
+    /// / `writeAll()` translate to EOF / OperationAborted.
+    ///
+    /// IMPORTANT: self.handle, read_event, and write_event are all
+    /// left alive here. MSDN's contract is that closing a HANDLE while
+    /// another thread is still using it (as the file handle for
+    /// GetOverlappedResult, or as the wait HANDLE for an overlapped
+    /// completion event) is undefined behavior. They are closed in
+    /// destroy() after the caller has joined every thread that could
+    /// hold a reference. Idempotent — safe to call multiple times
+    /// (e.g. from the alias close in socket mode).
+    ///
+    /// Race coverage: CancelIoEx only cancels I/O outstanding at the
+    /// time of the call. To stop the writer from issuing a *fresh*
+    /// WriteFile after CancelIoEx fires (which would then hang in
+    /// GetOverlappedResult), the atomic flag is set BEFORE CancelIoEx
+    /// runs (release ordering pairs with the acquire load at the top
+    /// of writeAll/read iterations); writeAll/read also re-check the
+    /// flag after a successful WriteFile/ReadFile returns IO_PENDING
+    /// and call CancelIoEx targeted at the specific OVERLAPPED so
+    /// that fresh I/O is also canceled. See read()/writeAll().
+    pub fn closeHandles(self: *WindowsOverlappedPipe) void {
+        // swap returns the previous value; if it was already true,
+        // closeHandles already ran (e.g. via the alias close in socket
+        // mode) and CancelIoEx has nothing new to do.
+        if (self.handles_closed.swap(true, .acq_rel)) return;
+        _ = windows.kernel32.CancelIoEx(self.handle, null);
+    }
+
+    /// Phase 2 of teardown: close the pipe HANDLE, the completion
+    /// events, and free the heap allocation. MUST be called exactly
+    /// once and only after every thread that holds a
+    /// `*WindowsOverlappedPipe` (writer thread, reader, stderr pump,
+    /// etc.) has been joined — otherwise closing self.handle /
+    /// read_event / write_event mid-use is undefined behavior, and
+    /// the alloc.destroy() races with the threads' dereferences.
+    /// Calls closeHandles() first as a safety net (no-op if already
+    /// canceled by Stream.close()).
+    pub fn destroy(self: *WindowsOverlappedPipe) void {
+        self.closeHandles();
         windows.CloseHandle(self.handle);
         windows.CloseHandle(self.read_event);
         windows.CloseHandle(self.write_event);
@@ -157,10 +247,16 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         return bytes;
     }
 
-    /// Blocking read. Returns 0 on EOF (broken pipe). Uses overlapped
-    /// I/O so a concurrent writeAll() on the same handle doesn't block.
+    /// Blocking read. Returns 0 on EOF (broken pipe or shutdown
+    /// observed). Uses overlapped I/O so a concurrent writeAll() on
+    /// the same handle doesn't block.
     pub fn read(self: *WindowsOverlappedPipe, buf: []u8) !usize {
         if (buf.len == 0) return 0;
+        // Pre-check shutdown (acquire pairs with the release in
+        // closeHandles' swap). If shutdown was observed, return EOF
+        // without issuing a fresh ReadFile that the prior CancelIoEx
+        // would not catch.
+        if (self.handles_closed.load(.acquire)) return 0;
 
         var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
         overlapped.hEvent = self.read_event;
@@ -171,7 +267,18 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         const ok = windows.kernel32.ReadFile(self.handle, buf.ptr, want, &bytes_read, &overlapped);
         if (ok == 0) {
             switch (windows.kernel32.GetLastError()) {
-                .IO_PENDING => {}, // proceed to GetOverlappedResult below
+                .IO_PENDING => {
+                    // Race recovery: closeHandles may have fired between
+                    // our pre-check and ReadFile. The prior CancelIoEx
+                    // (with NULL OVERLAPPED) only catches I/O outstanding
+                    // at its call instant, so this fresh ReadFile would
+                    // otherwise hang in GetOverlappedResult. Re-check the
+                    // flag and cancel this specific OVERLAPPED if so;
+                    // GetOverlappedResult will then return ABORTED quickly.
+                    if (self.handles_closed.load(.acquire)) {
+                        _ = windows.kernel32.CancelIoEx(self.handle, &overlapped);
+                    }
+                },
                 .BROKEN_PIPE, .HANDLE_EOF => return 0,
                 .OPERATION_ABORTED => return error.OperationAborted,
                 .NETNAME_DELETED => return error.ConnectionResetByPeer,
@@ -186,10 +293,18 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
     }
 
     /// Blocking writeAll. Loops on partial writes (rare for pipes but
-    /// possible for very large buffers).
+    /// possible for very large buffers). Per-iteration shutdown check
+    /// + post-IO_PENDING re-check + targeted CancelIoEx eliminate the
+    /// race where stop() fires CancelIoEx between writer's queue-pop
+    /// and WriteFile call (the prior CancelIoEx wouldn't catch the
+    /// fresh I/O, leaving the writer hung in GetOverlappedResult).
     pub fn writeAll(self: *WindowsOverlappedPipe, bytes: []const u8) !void {
         var idx: usize = 0;
         while (idx < bytes.len) {
+            // Per-iteration pre-check (acquire pairs with the release
+            // in closeHandles' swap).
+            if (self.handles_closed.load(.acquire)) return error.OperationAborted;
+
             var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
             overlapped.hEvent = self.write_event;
 
@@ -199,7 +314,19 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
             const ok = windows.kernel32.WriteFile(self.handle, bytes.ptr + idx, want, &bytes_written, &overlapped);
             if (ok == 0) {
                 switch (windows.kernel32.GetLastError()) {
-                    .IO_PENDING => {}, // proceed to GetOverlappedResult below
+                    .IO_PENDING => {
+                        // Race recovery: closeHandles may have fired
+                        // between our pre-check and WriteFile. The prior
+                        // CancelIoEx (NULL OVERLAPPED) only catches I/O
+                        // outstanding at the call instant, so this fresh
+                        // WriteFile would otherwise hang in
+                        // GetOverlappedResult. Cancel this specific
+                        // OVERLAPPED so GetOverlappedResult returns
+                        // ABORTED quickly.
+                        if (self.handles_closed.load(.acquire)) {
+                            _ = windows.kernel32.CancelIoEx(self.handle, &overlapped);
+                        }
+                    },
                     .BROKEN_PIPE => return error.BrokenPipe,
                     .OPERATION_ABORTED => return error.OperationAborted,
                     .NETNAME_DELETED => return error.ConnectionResetByPeer,
@@ -221,7 +348,10 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
     pub fn open(_: std.mem.Allocator, _: []const u8) ConnectError!*@This() {
         unreachable;
     }
-    pub fn deinit(_: *@This()) void {
+    pub fn closeHandles(_: *@This()) void {
+        unreachable;
+    }
+    pub fn destroy(_: *@This()) void {
         unreachable;
     }
     pub fn read(_: *@This(), _: []u8) !usize {
@@ -238,7 +368,10 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
 ///   - "host:port"        (TCP) — first character is digit, '[' (IPv6
 ///                                bracket), or alphanumeric followed by
 ///                                ':' and digits.
-///   - "/abs/path"        (Unix domain socket) — starts with '/' or '~'.
+///   - "/abs/path"        (Unix domain socket) — absolute path starting
+///                                with '/'. No '~' expansion is performed,
+///                                so home-relative paths must be expanded
+///                                by the caller before being passed in.
 ///   - "\\.\pipe\..."     (Windows named pipe) — also accepts "\\?\pipe\".
 pub const Parsed = union(enum) {
     tcp: struct { host: []const u8, port: u16 },
@@ -270,8 +403,12 @@ pub fn parseListenAddr(addr: []const u8) ?Parsed {
         return .{ .pipe = addr };
     }
 
-    // Unix domain socket: absolute path or home-relative.
-    if (addr[0] == '/' or addr[0] == '~') {
+    // Unix domain socket: absolute path only. `~` home-relative paths are
+    // intentionally rejected — the C ABI promises `fail fast` on invalid
+    // addresses, but nothing on the connect path expands `~` (it would be
+    // passed verbatim to connectUnixSocket and fail at runtime). Users
+    // should pass an absolute path, e.g. `/Users/me/.cache/nvim/nvim.sock`.
+    if (addr[0] == '/') {
         return .{ .unix = addr };
     }
 
@@ -299,6 +436,23 @@ pub fn parseListenAddr(addr: []const u8) ?Parsed {
     const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
     if (host.len == 0) return null;
     return .{ .tcp = .{ .host = host, .port = port } };
+}
+
+/// Returns true if `addr` is a well-formed listen address that
+/// `connectListenAddr` would accept on the current platform. Used by
+/// the C ABI (`zonvie_core_start_connect`) to fail fast with a parse
+/// error before spawning the run-loop thread, instead of letting the
+/// failure surface asynchronously through `on_exit`.
+///
+/// Platform support matrix:
+///     POSIX (macOS, Linux): TCP, Unix socket
+///     Windows:              named pipe
+pub fn isAddrSupported(addr: []const u8) bool {
+    const parsed = parseListenAddr(addr) orelse return false;
+    return switch (parsed) {
+        .tcp, .unix => builtin.os.tag != .windows,
+        .pipe => builtin.os.tag == .windows,
+    };
 }
 
 /// Connect to a Neovim listen address and return a `Stream`. The
@@ -388,4 +542,35 @@ test "parseListenAddr: rejects unbracketed ipv6" {
 
 test "parseListenAddr: rejects non-pipe UNC path" {
     try std.testing.expect(parseListenAddr("\\\\server\\share") == null);
+}
+
+test "parseListenAddr: rejects ~ home-relative path (no expansion)" {
+    // The connect path passes the address verbatim to connectUnixSocket,
+    // which does not expand `~`. Accepting it here would let
+    // zonvie_core_start_connect return 0 and fail asynchronously, breaking
+    // the `fail fast` ABI contract. Force absolute paths instead.
+    try std.testing.expect(parseListenAddr("~/nvim.sock") == null);
+    try std.testing.expect(parseListenAddr("~root/nvim.sock") == null);
+}
+
+test "isAddrSupported: rejects malformed input on every platform" {
+    try std.testing.expect(!isAddrSupported(""));
+    try std.testing.expect(!isAddrSupported("localhost"));
+    try std.testing.expect(!isAddrSupported(":1234"));
+    try std.testing.expect(!isAddrSupported("\\\\server\\share"));
+}
+
+test "isAddrSupported: platform-specific acceptance matrix" {
+    if (builtin.os.tag == .windows) {
+        // Windows: only named pipes are supported today.
+        try std.testing.expect(isAddrSupported("\\\\.\\pipe\\nvim.31920.0"));
+        try std.testing.expect(!isAddrSupported("127.0.0.1:6789"));
+        try std.testing.expect(!isAddrSupported("/tmp/nvim.42.0"));
+    } else {
+        // POSIX: TCP and Unix sockets supported; pipes are not.
+        try std.testing.expect(isAddrSupported("127.0.0.1:6789"));
+        try std.testing.expect(isAddrSupported("[::1]:6789"));
+        try std.testing.expect(isAddrSupported("/tmp/nvim.42.0"));
+        try std.testing.expect(!isAddrSupported("\\\\.\\pipe\\nvim.31920.0"));
+    }
 }

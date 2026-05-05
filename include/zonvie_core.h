@@ -832,12 +832,20 @@ void zonvie_core_destroy(zonvie_core *core);
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);
 
 /* Start in connect mode: attach to a running Neovim server at
-   `listen_addr` (TCP "host:port" or Unix socket path) instead of
-   spawning a child. Same lifecycle and callbacks as `zonvie_core_start`;
-   the only difference is the initial transport.
+   `listen_addr` instead of spawning a child. Same lifecycle and
+   callbacks as `zonvie_core_start`; the only difference is the
+   initial transport.
+
+   Address formats by platform:
+       POSIX (macOS, Linux): TCP "host:port" or Unix socket path
+       Windows:              named pipe path, e.g. "\\\\.\\pipe\\nvim.31920.0"
+                             (TCP and Unix sockets are not yet supported)
+
    Returns 0 on success, negative on error:
        -1 invalid handle, -2 thread spawn failed, -3 invalid address.
-   Windows named pipes are not yet supported. */
+   Address validity is checked synchronously: parse failures and
+   platform-unsupported forms (e.g. TCP on Windows) return -3 before
+   the run loop is started. */
 int  zonvie_core_start_connect(
     zonvie_core *core,
     const uint8_t *listen_addr, size_t listen_addr_len,

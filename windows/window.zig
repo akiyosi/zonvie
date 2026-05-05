@@ -294,11 +294,16 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     updateRowsColsFromClientForce(hwnd, app);
 
     // 6. Start session: connect mode if --connect-nvim/--remote-ui was set,
-    //    otherwise spawn nvim (native mode).
-    if (app.connect_addr) |addr| {
+    //    otherwise spawn nvim (native mode). Capture the int return: a
+    //    negative value means the core thread was NOT started (-1 invalid
+    //    handle, -2 thread spawn failed, -3 invalid/unsupported listen
+    //    address). on_exit will not fire in that case, so we must abort
+    //    startup ourselves instead of leaving a zombie window with no
+    //    backing nvim.
+    const start_rc: i32 = if (app.connect_addr) |addr| blk: {
         if (log_enabled) applog.appLog("[win] doEarlyCoreInit: connect mode addr={s} rows={d} cols={d}\n", .{ addr, app.surface.rows, app.surface.cols });
-        _ = core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surface.rows, app.surface.cols);
-    } else {
+        break :blk core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surface.rows, app.surface.cols);
+    } else blk: {
         var nvim_cmd_buf: [1024]u8 = undefined;
         const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
         const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
@@ -306,7 +311,21 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
 
         if (log_enabled) applog.appLog("[win] doEarlyCoreInit: spawning nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
-        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+        break :blk core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+    };
+
+    if (start_rc != 0) {
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: core start failed rc={d}; aborting startup\n", .{start_rc});
+        // Mark the session as already exited so the WM_CLOSE handler
+        // takes the fast path (no quit dialog, no waiting on the core).
+        app.neovim_exited.store(true, .release);
+        // Set the global exit code so wWinMain returns 1 to the shell
+        // (mirrors macOS Darwin.exit(1)). main.zig pulls this value
+        // out of g_exit_code after the message loop exits — the
+        // wParam passed to PostQuitMessage is intentionally ignored.
+        app_mod.g_exit_code.store(1, .seq_cst);
+        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        return;
     }
     app.nvim_spawned = true;
     app.early_core_init_done = true;
@@ -2704,7 +2723,14 @@ pub export fn WndProc(
                         const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                         defer if (nvim_path_z) |p| app.alloc.free(p);
                         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        const start_rc = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        if (start_rc != 0) {
+                            if (applog.isEnabled()) applog.appLog("[win] devcontainer-up: core start failed rc={d}; aborting\n", .{start_rc});
+                            app.neovim_exited.store(true, .release);
+                            app_mod.g_exit_code.store(1, .seq_cst);
+                            _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+                            return 0;
+                        }
                         app.nvim_spawned = true;
                         if (app.devcontainer_mode and !app.devcontainer_rebuild) {
                             dialogs.hideDevcontainerProgressDialog();
@@ -4022,7 +4048,9 @@ pub export fn WndProc(
                     tray.remove();
                 }
             }
-            // Nvy style: PostQuitMessage(0), exit code returned from main()
+            // Nvy style: PostQuitMessage(0). The actual exit code is
+            // pulled from app_mod.g_exit_code by wWinMain after the
+            // message loop exits, so the wParam here is irrelevant.
             if (applog.isEnabled()) applog.appLog("[win] WM_DESTROY: calling PostQuitMessage(0)\n", .{});
             c.PostQuitMessage(0);
             return 0;
