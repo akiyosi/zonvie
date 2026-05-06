@@ -878,12 +878,16 @@ pub const Core = struct {
         self.write_queue.clearRetainingCapacity();
         self.write_queue_mu.unlock();
 
-        // Tear down channel-bound external windows. See doc comment above
-        // for the rationale (new server's grid_id space is fresh, so the
-        // diff at notifyExternalWindowChanges never fires on stale ids).
+        // Tear down channel-bound external-window state. See doc comment
+        // above for the rationale (new server's grid_id space is fresh,
+        // so any stale grid_id left in these maps can later be matched
+        // against an unrelated win_pos / grid_resize from the new server
+        // and silently re-promote a normal window to "external", or feed
+        // a stale target size into the next win_external_pos diff).
+        //
         // Fire close callbacks first so the frontend can dismiss its OS
-        // windows; then clear both maps so the new session starts with an
-        // empty external-grid registry.
+        // windows; then clear every channel-bound map so the new session
+        // starts with an empty external-grid registry.
         if (self.known_external_grids.count() > 0) {
             const closed_count = self.known_external_grids.count();
             if (self.cb.on_external_window_close) |cb| {
@@ -896,6 +900,23 @@ pub const Core = struct {
             self.log.write("resetSessionState: closed {d} external windows from previous session\n", .{closed_count});
         }
         self.grid.external_grids.clearRetainingCapacity();
+        // ext_windows_grids: grid_id -> win_id mapping. Without clearing,
+        // a fresh win_pos for the same grid_id on the new server hits
+        // the redraw_handler.zig stale-detection path that re-promotes
+        // it to external (redraw_handler.zig:~1171).
+        self.grid.ext_windows_grids.clearRetainingCapacity();
+        // external_grid_target_sizes: dimensions used to match resize
+        // events to known external grids (redraw_handler.zig:~960).
+        // Stale entries would feed the wrong size into the new session.
+        self.grid.external_grid_target_sizes.clearRetainingCapacity();
+        // pending_ext_window_grids: grids waiting for their first
+        // grid_resize before the frontend window is created.
+        self.grid.pending_ext_window_grids.clearRetainingCapacity();
+        // pending_grid_resizes / pending_win_ops: queued ops referring
+        // to old-session grid_ids; carrying them across would apply to
+        // unrelated grids in the new session.
+        self.grid.pending_grid_resizes.clearRetainingCapacity();
+        self.grid.pending_win_ops.clearRetainingCapacity();
 
         self.log.write("resetSessionState: cleared session-scoped state\n", .{});
     }

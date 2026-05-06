@@ -250,6 +250,16 @@ pub const PendingExternalWindow = struct {
     cols: u32,
     start_row: i32, // -1 if no position info (cmdline, etc.)
     start_col: i32,
+    /// Monotonic identifier assigned by onExternalWindow at enqueue.
+    /// The corresponding WM_APP_CREATE_EXTERNAL_WINDOW message carries
+    /// this value in lParam so the UI-thread handler can dequeue the
+    /// exact request the message was posted for. Without this, an old-
+    /// session WM_APP_CREATE message could pick up a same-grid_id new-
+    /// session request that landed in the queue after a session reset.
+    /// Coalescing same-grid_id requests in onExternalWindow preserves
+    /// the existing entry's seq so the original posted message still
+    /// matches.
+    seq: u64,
 };
 
 /// CPU-side surface state shared between external windows and pending
@@ -2499,6 +2509,14 @@ pub const App = struct {
 
     // Pending external window creation requests (for UI thread processing)
     pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
+
+    // Monotonically increasing identifier assigned to each
+    // PendingExternalWindow at enqueue. Used to bind WM_APP_CREATE_
+    // EXTERNAL_WINDOW messages 1:1 to their request: a stale message
+    // (e.g., posted by a previous session whose request was removed
+    // by onExternalWindowClose) won't dequeue an unrelated new-session
+    // request whose seq doesn't match the message's lParam.
+    pending_external_seq_counter: u64 = 0,
 
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,

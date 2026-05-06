@@ -3342,6 +3342,14 @@ final class ZonvieCore {
             self.pendingExternalVertices.removeValue(forKey: gridId)
             self.pendingExternalGridConfig.removeValue(forKey: gridId)
 
+            // Drop any queued window-creation request for this gridId.
+            // resetSessionState fires close callbacks for every external
+            // grid at session boundary; if a request was queued (window
+            // not yet created when the request landed in the queue),
+            // a later processPendingExternalWindows() would otherwise
+            // resurrect the stale gridId from the previous session.
+            self.pendingExternalWindowRequests.removeAll { $0.gridId == gridId }
+
             if let window = self.externalWindows.removeValue(forKey: gridId) {
                 // Save window position for restoration on tab switch back.
                 // Evict the entry with the lowest gridId to bound growth
