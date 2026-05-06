@@ -404,6 +404,22 @@ if !noforkMode && !launchedFromFinder {
         print("Warning: Cannot determine HOME directory, running without fork")
     }
 
+    // --connect-nvim / --remote-ui: never fork. The fork pattern below has
+    // the parent exit(0) immediately after a successful posix_spawnp,
+    // before the child has had a chance to run zonvie_core_start_connect
+    // (which can fail synchronously with rc=-3) or fire on_exit(1) from
+    // a hot-swap connect failure. With fork, those failures resolve
+    // entirely inside a child whose stdio is /dev/null and whose exit
+    // code never reaches the parent shell — a script wrapping
+    // `zonvie --connect-nvim=...` would see exit 0 even on failure.
+    // Foregrounding restores the contract that ViewController.swift
+    // handleCoreStartFailure already assumes ("the shell sees a non-
+    // zero exit code"). For the common case (terminal launch with no
+    // connect mode) the fork still applies.
+    if connectModeEnabled {
+        shouldFork = false
+    }
+
     if shouldFork {
         // Use posix_spawnp instead of fork to avoid macOS GUI/IME issues after fork.
         // fork() breaks WindowServer/HIToolbox connections needed for IME candidate windows.

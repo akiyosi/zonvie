@@ -1281,6 +1281,15 @@ pub fn runLoop(self: *Core) void {
     // across iterations untouched, so the user sees no flicker on `:restart`.
     var ui_attached_overall: bool = false;
     var last_term: ?std.process.Child.Term = null;
+    // Set true on any session-fatal failure path that breaks :session
+    // without producing a usable last_term. Covers connect failures
+    // (remote :connect, connect-only mode, hot-swap fallback skip),
+    // spawn failure, ui_attach send failure, transport init failure.
+    // The on_exit code path below uses this to override the
+    // ui_attached_overall=true → exit 0 default — once a session has
+    // attached at least once, a later attach/connect failure would
+    // otherwise look like a clean exit to scripts wrapping zonvie.
+    var session_failed: bool = false;
 
     session: while (true) {
         var session_addr: ?[]u8 = null;
@@ -1307,6 +1316,7 @@ pub fn runLoop(self: *Core) void {
                     // instead.
                     self.log.write("connect: remote-mode :connect cannot reach new server's listen socket and old nvim is orphaned; not spawning surprise replacement; exiting run loop (addr={s})\n", .{a});
                     self.alloc.free(a);
+                    session_failed = true;
                     break :session;
                 }
                 self.log.write("restart: remote mode, re-spawning instead of connecting (addr={s})\n", .{a});
@@ -1355,6 +1365,7 @@ pub fn runLoop(self: *Core) void {
                 // argv to fall back to. Exit cleanly without spawning a
                 // surprise local nvim.
                 self.log.write("connect: no spawn fallback (connect-only mode); exiting run loop\n", .{});
+                session_failed = true;
                 break :session;
             } else if (was_connect_hotswap) {
                 // `:connect` hot-swap: the old nvim is already orphaned
@@ -1366,6 +1377,7 @@ pub fn runLoop(self: *Core) void {
                 // Exit cleanly so the frontend (via on_exit) can surface
                 // the failure instead.
                 self.log.write("connect: :connect hot-swap connect failed and old nvim is orphaned; not spawning surprise local fallback; exiting run loop\n", .{});
+                session_failed = true;
                 break :session;
             } else {
                 use_connect = false; // fall through to spawn
@@ -1405,6 +1417,7 @@ pub fn runLoop(self: *Core) void {
                     const msg_err = "[DIRECT] spawn error occurred\n";
                     logfn(self.ctx, msg_err.ptr, msg_err.len);
                 }
+                session_failed = true;
                 break :session;
             };
             const spawn_end_ns = std.time.nanoTimestamp();
@@ -1522,6 +1535,7 @@ pub fn runLoop(self: *Core) void {
         self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
             self.log.write("ui_attach send failed: {any}\n", .{e});
             _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
             break :session;
         };
         ui_attached = true;
@@ -1551,12 +1565,14 @@ pub fn runLoop(self: *Core) void {
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
             _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
             break :session;
         }
 
         var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
             self.log.write("FrameReader init failed: {any}\n", .{e});
             _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
             break :session;
         };
         defer fr.deinit();
@@ -1695,12 +1711,19 @@ pub fn runLoop(self: *Core) void {
     if (!self.stop_flag.load(.seq_cst)) {
         if (self.cb.on_exit) |f| {
             // Convert Term to exit code:
+            //   - session_failed (any session-fatal break path that is
+            //     NOT a clean child exit): 1. Checked first so a hot-
+            //     swap connect failure on an already-attached session
+            //     does not look like a clean exit just because
+            //     ui_attached_overall is true.
             //   - Exited: use exit code directly
             //   - Signal: 128 + signal number (Unix convention)
             //   - Stopped/Unknown: return 1 (generic error)
             //   - Natural exit in connect mode (no Term, ui attached): 0
             //   - Pre-attach failure (no Term, never attached): 1
-            const exit_code: i32 = if (last_term) |t| switch (t) {
+            const exit_code: i32 = if (session_failed)
+                1
+            else if (last_term) |t| switch (t) {
                 .Exited => |code| @intCast(code),
                 .Signal => |sig| 128 + @as(i32, @intCast(sig)),
                 .Stopped, .Unknown => 1,
