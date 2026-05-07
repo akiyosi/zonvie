@@ -1806,11 +1806,14 @@ pub fn runLoop(self: *Core) void {
         // its own clean shutdown — channel close (EOF) is just one of
         // the last steps in nvim's exit, not the end. Propagate the
         // term so on_exit can compute the right exit code.
+        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any})\n", .{remote_restart_break});
         if (cleanupSession(self, &child, have_child, false, remote_restart_break)) |t| last_term = t;
+        self.log.write("session loop: cleanupSession returned\n", .{});
 
         // === Decide next iteration ===
         if (self.stop_flag.load(.seq_cst)) {
             // App-side stop() observed; do not fire on_exit, do not loop.
+            self.log.write("session loop: stop_flag set after cleanup; returning\n", .{});
             return;
         }
 
@@ -1821,13 +1824,17 @@ pub fn runLoop(self: *Core) void {
             // Consume the connect-keeps-alive flag now that the orphan
             // (if any) has been dropped — the next session must not
             // inherit it.
+            self.log.write("session loop: restart_pending; entering resetSessionState\n", .{});
             self.connect_keeps_child_alive = false;
             self.resetSessionState();
+            self.log.write("session loop: resetSessionState returned\n", .{});
             if (self.stop_flag.load(.seq_cst)) return;
+            self.log.write("session loop: continuing to next iteration\n", .{});
             continue :session;
         }
 
         // Natural exit: nvim closed the channel without queueing a restart.
+        self.log.write("session loop: no restart pending; breaking out\n", .{});
         break :session;
     }
 
@@ -1912,6 +1919,13 @@ fn cleanupSession(
     force_kill_child: bool,
     kill_on_restart_pending: bool,
 ) ?std.process.Child.Term {
+    self.log.write("cleanupSession: enter (have_child={any} force_kill={any} kill_on_restart_pending={any} restart_pending={any} connect_keeps_child_alive={any})\n", .{
+        have_child,
+        force_kill_child,
+        kill_on_restart_pending,
+        self.restart_pending_addr != null,
+        self.connect_keeps_child_alive,
+    });
     // Stop the writer thread before closing the transport so its
     // in-flight writeAll() does not observe a torn-down handle.
     var wt: ?std.Thread = null;
@@ -1923,6 +1937,7 @@ fn cleanupSession(
         self.write_queue_cond.signal();
         self.write_queue_mu.unlock();
     }
+    self.log.write("cleanupSession: writer queue closed (wt_present={any})\n", .{wt != null});
     // `:connect` hot-swap: the old nvim is still alive headless on
     // its own listen socket and would block child.wait() forever
     // (the process never exits). Don't kill, don't wait — just drop
@@ -1939,6 +1954,7 @@ fn cleanupSession(
         // wt.join() below would hang. The reader does not run here
         // (we are on the runLoop thread, post inner-loop exit), so
         // it is naturally not affected.
+        self.log.write("cleanupSession: closing stdin (transport={any})\n", .{self.transport_kind});
         f.shutdownIfSocket(self.transport_kind == .socket);
         f.close();
         self.stdin_file = null;
@@ -1948,8 +1964,13 @@ fn cleanupSession(
         if (self.transport_kind == .socket) {
             self.stdout_file = null;
         }
+        self.log.write("cleanupSession: stdin closed\n", .{});
     }
-    if (wt) |t| t.join();
+    if (wt) |t| {
+        self.log.write("cleanupSession: joining writer thread\n", .{});
+        t.join();
+        self.log.write("cleanupSession: writer thread joined\n", .{});
+    }
 
     var session_term: ?std.process.Child.Term = null;
     if (have_child) {
@@ -2001,11 +2022,13 @@ fn cleanupSession(
             //     and reap via wait() — EOF is channel close, not
             //     process exit, so racing a kill against the still-in-
             //     progress teardown would truncate nvim's work.
-            if (force_kill_child or self.stop_flag.load(.seq_cst) or
-                (kill_on_restart_pending and self.restart_pending_addr != null))
-            {
+            const want_kill = force_kill_child or self.stop_flag.load(.seq_cst) or
+                (kill_on_restart_pending and self.restart_pending_addr != null);
+            if (want_kill) {
+                self.log.write("cleanupSession: killing child (pid={any})\n", .{child.id});
                 _ = child.kill() catch {};
             }
+            self.log.write("cleanupSession: waiting for child (pid={any} want_kill={any})\n", .{ child.id, want_kill });
             session_term = child.wait() catch |e| blk: {
                 self.log.write("wait err: {any}\n", .{e});
                 break :blk null;
@@ -2021,40 +2044,55 @@ fn cleanupSession(
     // blocked read syscall hasn't yet observed EOF and the fd number is
     // recycled by the next open() in our process. Just null the alias.
     if (self.stdout_file) |f| {
+        self.log.write("cleanupSession: closing stdout\n", .{});
         f.close();
         self.stdout_file = null;
+        self.log.write("cleanupSession: stdout closed\n", .{});
     }
     self.stderr_file = null;
 
     // Reap the stderr pump.
-    //   - Normal path: child died, its stderr writer closed, our pump
-    //     read returned 0, the pump thread is exiting (or already
-    //     exited). join() completes promptly.
+    //   - Final-shutdown path (no restart pending, no orphan): child
+    //     died, its stderr writer closed, our pump read returned 0,
+    //     the pump thread is exiting (or already exited). join()
+    //     completes promptly.
     //   - Orphan path (`:connect` hot-swap): the old nvim is still
     //     running and holds the stderr writer open, so the pump is
     //     stuck in a blocking read that close() on the read end does
     //     NOT wake on POSIX. Joining would hang the run loop and
-    //     prevent attaching to the new server. Detach instead — the
-    //     pump exits naturally when the orphan eventually closes its
-    //     stderr (process exit, :connect! from another UI, etc.) and
-    //     the defer in StderrPump.run releases the fd and frees the
-    //     pump struct.
+    //     prevent attaching to the new server. Detach instead.
+    //   - Restart-pending path (`:restart`): even though the old
+    //     nvim has exited, the headless successor it spawned to host
+    //     the new session may have inherited a stray write reference
+    //     to our stderr pipe across the libuv fork (uv_spawn with
+    //     UV_IGNORE on stderr replaces the child's fd 2 with
+    //     /dev/null but does NOT close OTHER inherited fds without
+    //     CLOEXEC; if old nvim's libuv held a dup of fd 2 elsewhere,
+    //     the successor keeps our pipe writer open). The successor
+    //     outlives the run-loop here by design — we are about to
+    //     attach to it — so its inherited fd never closes during
+    //     this cleanup, and the pump's POSIX read() never sees EOF.
+    //     Joining would hang forever. Detach as in the orphan case;
+    //     the pump exits naturally when the successor eventually
+    //     closes its inherited fd (or zonvie exits first).
     //
-    // For the orphan path we must call detachFromCore() BEFORE the
+    // For both detach paths we must call detachFromCore() BEFORE the
     // pump might dereference Core, since Core may be torn down while
     // the pump is still running. detachFromCore() takes the pump's
-    // own mutex, waiting for any in-flight Core access to finish, then
-    // nulls the pump's back-pointer to Core. Subsequent iterations
-    // see core==null and skip every Core dereference.
-    if (orphan_child) {
-        // Orphan path: the pump thread keeps running until the
-        // orphan eventually closes its stderr writer (or never, if
-        // zonvie exits first). Drop our ref so the pump destroys
-        // itself when its thread releases its ref. detachFromCore
-        // first under the pump's mutex so the running pump stops
-        // dereferencing Core; then release() drops Core's ref.
-        // Both calls require a live ref, which we hold until the
-        // matched release().
+    // own mutex, waiting for any in-flight Core access to finish,
+    // then nulls the pump's back-pointer to Core. Subsequent
+    // iterations see core==null and skip every Core dereference.
+    const detach_pump = orphan_child or self.restart_pending_addr != null;
+    if (detach_pump) {
+        // Drop our ref so the pump destroys itself when its thread
+        // releases its ref. detachFromCore first under the pump's
+        // mutex so the running pump stops dereferencing Core; then
+        // release() drops Core's ref. Both calls require a live ref,
+        // which we hold until the matched release().
+        self.log.write("cleanupSession: stderr pump path=detach (orphan={any} restart_pending={any})\n", .{
+            orphan_child,
+            self.restart_pending_addr != null,
+        });
         if (self.stderr_pump) |p| {
             p.detachFromCore();
             p.release();
@@ -2064,18 +2102,25 @@ fn cleanupSession(
             t.detach();
             self.stderr_thread = null;
         }
+        self.log.write("cleanupSession: stderr pump detached\n", .{});
     } else {
-        // Normal path: child died, stderr writer closed, pump
-        // thread observed EOF and exited (releasing its ref).
+        // Final-shutdown path: child died, stderr writer closed,
+        // pump thread observed EOF and exited (releasing its ref).
         // join() guarantees the thread has finished its release;
         // we then drop Core's ref to free the struct.
+        self.log.write("cleanupSession: stderr pump path=join (thread_present={any} pump_present={any})\n", .{
+            self.stderr_thread != null,
+            self.stderr_pump != null,
+        });
         if (self.stderr_thread) |t| {
             t.join();
             self.stderr_thread = null;
+            self.log.write("cleanupSession: stderr thread joined\n", .{});
         }
         if (self.stderr_pump) |p| {
             p.release();
             self.stderr_pump = null;
+            self.log.write("cleanupSession: stderr pump released\n", .{});
         }
     }
 
@@ -2089,9 +2134,11 @@ fn cleanupSession(
     // their HANDLE references being yanked from under them. destroy()
     // closes those HANDLEs and frees the wrapper struct.
     if (self.session_pipe) |p| {
+        self.log.write("cleanupSession: destroying session_pipe (Windows named pipe wrapper)\n", .{});
         p.destroy();
         self.session_pipe = null;
     }
 
+    self.log.write("cleanupSession: returning (term_present={any})\n", .{session_term != null});
     return session_term;
 }
