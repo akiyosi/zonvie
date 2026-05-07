@@ -824,11 +824,48 @@ pub const Core = struct {
     }
 
     /// Reset session-scoped state between RPC sessions (called by the run
-    /// loop when transitioning to the next session for `:restart`). Clears
-    /// transient flags and in-flight RPC msgids so the new session starts
-    /// from a clean slate. Persistent state (grid, hl, atlas, ext UI,
-    /// layout dimensions) is intentionally NOT touched — those carry over
-    /// to the new server unchanged so the user sees no flicker.
+    /// loop when transitioning to the next session for `:restart` /
+    /// `:connect`). Clears transient flags, in-flight RPC msgids, and
+    /// every piece of state tied to the previous server's grid_id space
+    /// or UI overlays so the new session starts from a clean slate.
+    ///
+    /// Channel-bound state (cleared here):
+    ///   - external windows + their grid registry (existing, see below)
+    ///   - composited grid layout: sub_grids / win_pos / grid_win_ids /
+    ///     win_layer / viewport(_margins) / cell_overflow / grid_metrics.
+    ///     The new server never sends grid_destroy for grid_ids it does
+    ///     not know about, so leftover entries would be rendered as
+    ///     stale floats (flush.zig:rebuildMain) and reported as visible
+    ///     by getVisibleGridsLocked (hit-testing).
+    ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
+    ///     tabline_state / message_state / msg_history_state. The new
+    ///     server does not send hide events for overlays it never
+    ///     created.
+    ///   - cursor state: cursor_grid may point at a now-deleted sub_grid.
+    ///   - Core-side flush bookkeeping: last_sent_*_rev, msg throttle
+    ///     state, last_cmd snapshot, popupmenu Lua-mirror handles,
+    ///     pre_cmdline cursor snapshot, prev_subgrid_snapshots.
+    ///
+    /// Frontend overlay teardown:
+    ///   - external_grids cleanup below already fires on_external_window_close
+    ///     for cmdline / popupmenu / message / msg_history overlays
+    ///     (those use external grid_ids -100..-103).
+    ///   - tabline lives outside that path, so on_tabline_hide is fired
+    ///     explicitly. on_popupmenu_hide / on_msg_clear are also fired
+    ///     defensively in case the frontend tracks overlay state outside
+    ///     the external-grid path.
+    ///
+    /// Preserved intentionally:
+    ///   - global grid (id=1) cells/dimensions: the new server overwrites
+    ///     them via grid_resize + grid_line right after attach. The
+    ///     frontend's last committed frame keeps the screen visually
+    ///     stable in the gap (no flush runs between sessions).
+    ///   - hl table: hl_ids are redefined by hl_attr_define on attach.
+    ///   - atlas / glyph caches / shape cache: keyed by content + style
+    ///     + font_generation; valid as long as font is unchanged.
+    ///   - mode info / cursor shape / cursor_visible: replaced by the
+    ///     new session's mode_info_set + mode_change.
+    ///   - layout dimensions (last_layout_rows/cols, init_rows/cols).
     ///
     /// EXCEPTION: external windows (multigrid windows mapped to OS-level
     /// windows by the frontend) ARE channel-bound. The new server uses a
@@ -885,6 +922,26 @@ pub const Core = struct {
         self.write_queue.clearRetainingCapacity();
         self.write_queue_mu.unlock();
 
+        // === Grid-protected critical section ===
+        //
+        // Everything below mutates state that the frontend reads under
+        // grid_mu via the public C API (`zonvie_core_get_visible_grids`,
+        // viewport / cursor lookups, message tick, etc.). Without this
+        // lock, a frontend reader holding grid_mu could race with us
+        // clear/deinit'ing AutoHashMap nodes or sub_grid cell buffers.
+        //
+        // Locking contract (matches handleRedraw at rpc_session.zig:849):
+        // frontend callbacks (on_external_window_close, on_tabline_hide,
+        // on_popupmenu_hide, on_msg_clear) execute while grid_mu is held.
+        // Callbacks MUST NOT call zonvie_core_get_* or any other API that
+        // re-acquires grid_mu, otherwise this thread will deadlock against
+        // its own lock.
+        //
+        // The `defer unlock` covers every early return path here (none
+        // exist today, but future edits stay safe).
+        self.grid_mu.lock();
+        defer self.grid_mu.unlock();
+
         // Tear down channel-bound external-window state. See doc comment
         // above for the rationale (new server's grid_id space is fresh,
         // so any stale grid_id left in these maps can later be matched
@@ -924,6 +981,65 @@ pub const Core = struct {
         // unrelated grids in the new session.
         self.grid.pending_grid_resizes.clearRetainingCapacity();
         self.grid.pending_win_ops.clearRetainingCapacity();
+
+        // Composited / multigrid layout, ext UI overlays, cursor state.
+        // See doc comment on this function for the full rationale.
+        self.grid.resetForNewSession();
+
+        // Frontend overlay teardown for paths not covered by the external
+        // window cleanup above. The cmdline / popupmenu / message external
+        // grids are torn down via on_external_window_close (fired by the
+        // known_external_grids loop above), but:
+        //   - tabline is rendered without an external grid; without an
+        //     explicit hide the frontend keeps the old tabs on screen
+        //     until the new session sends tabline_update.
+        //   - on_popupmenu_hide / on_msg_clear are fired defensively in
+        //     case the frontend tracks overlay state outside the
+        //     external-grid path (e.g. an in-window popup overlay).
+        if (self.cb.on_tabline_hide) |cb| cb(self.ctx);
+        if (self.cb.on_popupmenu_hide) |cb| cb(self.ctx);
+        if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+
+        // Core-side flush bookkeeping. Without resetting these, the next
+        // flush could short-circuit on rev equality or use stale
+        // window-handle references from the previous channel.
+        // These fields are consulted from the flush path which already
+        // runs under grid_mu (see handleRedraw); resetting them inside
+        // this critical section keeps the flush invariants consistent.
+        self.last_sent_content_rev = 0;
+        self.last_sent_cursor_rev = 0;
+        self.last_ext_cursor_grid = 1;
+        self.last_ext_cursor_rev = 0;
+        self.pre_cmdline_cursor_grid = 1;
+        self.pre_cmdline_cursor_row = 0;
+        self.pre_cmdline_cursor_col = 0;
+        self.popupmenu_win_id = null;
+        self.popupmenu_buf_id = null;
+
+        // ext_messages timing / scroll state was tied to the old session's
+        // msg_show events; carrying it across would auto-hide the new
+        // session's first message at the old deadline.
+        self.msg_show_pending_since = null;
+        self.msg_show_auto_hide_at = null;
+        self.msg_history_auto_hide_at = null;
+        self.msg_scroll_offset = 0;
+        self.msg_total_lines = 0;
+        self.msg_cached_max_width = 0;
+        self.msg_scroll_pending = false;
+        self.msg_scroll_last_send = 0;
+        self.msg_cache_valid = false;
+        // MsgCachedLine has only fixed-size buffers (no heap-owned strings).
+        self.msg_line_cache.clearRetainingCapacity();
+
+        // Last command tracking for the split-view label was a snapshot
+        // of the old session's :commands.
+        self.last_cmd_len = 0;
+        self.last_cmd_firstc = 0;
+        self.last_cmd_start_time = null;
+
+        // Subgrid layout snapshot for scroll fast path: stale entries
+        // would reference grid_ids the new session has not (yet) created.
+        self.prev_subgrid_snapshot_count = 0;
 
         self.log.write("resetSessionState: cleared session-scoped state\n", .{});
     }

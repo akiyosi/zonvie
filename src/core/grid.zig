@@ -1025,6 +1025,99 @@ pub const Grid = struct {
         self.cell_overflow.deinit(self.alloc);
     }
 
+    /// Reset all channel-bound state for a new RPC session (`:restart`,
+    /// `:connect`, hot-swap connect, etc.).
+    ///
+    /// The new server uses a fresh grid_id space and never sends
+    /// `grid_destroy` / `cmdline_hide` / `popupmenu_hide` / `tabline_hide`
+    /// / `msg_clear` for the previous session's UI overlays. Without an
+    /// explicit teardown, any leftover entry in `sub_grids` / `win_pos` /
+    /// `win_layer` is rendered as a stale composited float by
+    /// flush.zig:rebuildMain and reported as a visible grid by
+    /// nvim_core.zig:getVisibleGridsLocked (hit-testing). The same logic
+    /// applies to ext UI state that survives across the channel close.
+    ///
+    /// Preserves intentionally:
+    ///   - global grid (id=1) cells / dimensions: the new session's
+    ///     `grid_resize 1` + `grid_line` overwrite progressively, and the
+    ///     frontend's last committed frame keeps the screen stable
+    ///     between sessions (no flush runs in the gap).
+    ///   - `hl` highlight table: caller's responsibility (lives outside
+    ///     this struct); the new session redefines hl_ids via hl_attr_define.
+    ///   - mode info / cursor shape: redefined by the new session's
+    ///     `mode_info_set` + `mode_change`.
+    ///   - dirty bitmap state: `markAllDirty()` is invoked so the first
+    ///     post-attach flush of the new session unconditionally rebuilds.
+    ///
+    /// Capacity-retaining clears are used so the next session does not
+    /// pay reallocation cost for typical workloads.
+    pub fn resetForNewSession(self: *Grid) void {
+        // Composited / multigrid layout: stale entries here would be
+        // emitted as floats by flush.zig:rebuildMain (iterating win_pos)
+        // and counted as visible by getVisibleGridsLocked.
+        var sg_it = self.sub_grids.iterator();
+        while (sg_it.next()) |e| {
+            e.value_ptr.deinit(self.alloc);
+        }
+        self.sub_grids.clearRetainingCapacity();
+        self.win_pos.clearRetainingCapacity();
+        self.grid_win_ids.clearRetainingCapacity();
+        self.win_layer.clearRetainingCapacity();
+        self.viewport.clearRetainingCapacity();
+        self.viewport_margins.clearRetainingCapacity();
+        self.grid_metrics.clearRetainingCapacity();
+        self.cell_overflow.clearRetainingCapacity();
+        self.layer_order_counter = 0;
+        self.composited_win_closed = false;
+
+        // Cursor: a stale `cursor_grid` pointing at a now-deleted sub_grid
+        // would briefly drive cursor rendering at a stale offset before
+        // the new session's first grid_cursor_goto arrives.
+        self.cursor_grid = 1;
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.cursor_valid = false;
+        self.prev_cursor_row = null;
+        self.prev_cursor_grid = null;
+
+        // ext_cmdline: the new server has no notion of these levels.
+        // Mark dirty so the next flush re-emits hide based on absence
+        // of any visible level.
+        var cm_it = self.cmdline_states.iterator();
+        while (cm_it.next()) |e| {
+            e.value_ptr.deinit(self.alloc);
+        }
+        self.cmdline_states.clearRetainingCapacity();
+        self.cmdline_block.clear(self.alloc);
+        self.cmdline_dirty = true;
+
+        // ext_popupmenu / ext_tabline / ext_messages.
+        self.popupmenu.clear(self.alloc);
+        self.tabline_state.clear(self.alloc);
+        self.message_state.clear(self.alloc);
+        self.msg_history_state.clear(self.alloc);
+
+        // Scroll bookkeeping: a pending op refers to the old session's
+        // grid_id and would apply to an unrelated grid in the new
+        // session if grid_ids overlap.
+        self.pending_scroll = null;
+        self.scroll_fast_path_blocked = false;
+        self.scrolled_grid_count = 0;
+        self.scroll_touched_count = 0;
+
+        // Bump revs so any rev-equality short-circuit (e.g. last_sent_*
+        // tracking on the Core side) cannot match the new session's
+        // first frame against the old session's last frame.
+        self.content_rev +%= 1;
+        self.cursor_rev +%= 1;
+
+        // Force the first flush of the new session to redraw grid 1.
+        // grid_resize will markAllDirty too, but this is the no-op-resize
+        // case (same dimensions) where redraw_handler doesn't reach
+        // resizeGrid.
+        self.dirty_all = true;
+    }
+
     // ── Cell overflow helpers ────────────────────────────────────────
 
     /// Store extra codepoints for a multi-codepoint cell.
