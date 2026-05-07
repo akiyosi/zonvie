@@ -18,21 +18,18 @@ jobs:
         include:
           - arch: arm64
             runner: macos-15
-            zig_host: aarch64-macos
           - arch: x86_64
             runner: macos-15-intel
-            zig_host: x86_64-macos
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies (Homebrew)
         run: brew install freetype harfbuzz
 
-      - name: Download and Setup Zig
-        run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_host }}-${ZIG_VERSION}.tar.xz"
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-${{ matrix.zig_host }}-${ZIG_VERSION}" >> $GITHUB_PATH
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Build Zig Core (macOS)
         run: zig build
@@ -46,11 +43,16 @@ jobs:
             -destination "platform=macOS,arch=${{ matrix.arch }}" \
             build
 
+      - name: Stage .app for upload
+        run: |
+          mkdir -p artifact-staging
+          mv macos/.derived/Build/Products/Debug/zonvie.app artifact-staging/
+
       - name: Upload macOS Build
         uses: actions/upload-artifact@v4
         with:
           name: zonvie-macos-${{ matrix.arch }}-debug
-          path: macos/.derived/Build/Products/Debug/zonvie.app
+          path: artifact-staging
 
   build-windows:
     name: Build Windows (${{ matrix.arch }})
@@ -65,11 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and Setup Zig
-        run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Check shader bytecode freshness
         run: python3 windows/shaders/check_shader_hash.py
@@ -89,11 +90,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and Setup Zig
-        run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> $GITHUB_PATH
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Run Zig Tests
         run: zig build test || echo "No tests defined"
