@@ -1041,14 +1041,29 @@ final class ZonvieCore {
             }
             if arg.hasPrefix("--connect-nvim=") {
                 connectAddr = String(arg.dropFirst("--connect-nvim=".count))
-            } else if arg == "--connect-nvim" && argIdx + 1 < args.count {
-                connectAddr = args[argIdx + 1]
-                argIdx += 1
+            } else if arg == "--connect-nvim" {
+                // Defense-in-depth: main.swift already exits 1 for a bare
+                // --connect-nvim, but ZonvieCore.start can be invoked
+                // with arbitrary CommandLine.arguments. Set an empty
+                // address so the addr.isEmpty branch below returns -3
+                // instead of falling through to a regular nvim spawn.
+                if argIdx + 1 < args.count {
+                    connectAddr = args[argIdx + 1]
+                    argIdx += 1
+                } else {
+                    connectAddr = ""
+                }
             } else if arg.hasPrefix("--remote-ui=") {
                 connectAddr = String(arg.dropFirst("--remote-ui=".count))
-            } else if arg == "--remote-ui" && argIdx + 1 < args.count {
-                connectAddr = args[argIdx + 1]
-                argIdx += 1
+            } else if arg == "--remote-ui" {
+                // Mirror --connect-nvim: bare flag with no value yields
+                // an empty address that gets rejected synchronously.
+                if argIdx + 1 < args.count {
+                    connectAddr = args[argIdx + 1]
+                    argIdx += 1
+                } else {
+                    connectAddr = ""
+                }
             } else if arg.hasPrefix("--ssh=") {
                 let value = String(arg.dropFirst("--ssh=".count))
                 // Parse user@host:port format (port is after last colon, but only if it's numeric)
@@ -1103,8 +1118,11 @@ final class ZonvieCore {
 
         // === Connect mode (--connect-nvim / --remote-ui) ===
         // Attach to a running Neovim server at <addr>; skip spawn entirely.
-        // Mutually exclusive with SSH / devcontainer; if both are passed, the
-        // connect address wins and the user is warned.
+        // Mutually exclusive with SSH / devcontainer (and their config.toml
+        // twins). The combination is rejected up front in main.swift's
+        // pre-fork validation; this function double-checks and returns -3
+        // if a wrapper-mode flag still slipped through (matches Windows
+        // main.zig's reject behavior).
         if let addr = connectAddr {
             // main.swift filters this earlier, but treat empty addresses
             // as invalid here too: ZonvieCore.start can be invoked with
@@ -1117,8 +1135,17 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[start] connect mode: empty listen_addr -> -3")
                 return -3
             }
+            // CLI contract: --connect-nvim is mutually exclusive with
+            // --ssh / --devcontainer (and their config.toml twins
+            // [neovim].ssh / .wsl). main.swift's pre-fork validation
+            // already exits 1 in that case before reaching here, and
+            // Windows main.zig does the same. Keep this defensive
+            // reject so ZonvieCore.start cannot accidentally pick
+            // connect over a wrapper config — silently dropping the
+            // user's --ssh would be a worse failure than -3.
             if sshHost != nil || devcontainerWorkspace != nil {
-                ZonvieCore.appLog("[start] WARN: --connect-nvim/--remote-ui overrides --ssh / --devcontainer")
+                ZonvieCore.appLog("[start] connect mode rejected: mutually exclusive with --ssh / --devcontainer / [neovim].ssh / [neovim].wsl -> -3")
+                return -3
             }
             ZonvieCore.appLog("[start] connect mode: attaching to listen_addr=\(addr)")
 

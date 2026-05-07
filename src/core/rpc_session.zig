@@ -239,29 +239,110 @@ pub const CwdOwner = struct {
     }
 };
 
-pub fn pumpStderr(self: *Core, f: rpc_transport.Stream) void {
-    var buf: [4096]u8 = undefined;
-    while (!self.stop_flag.load(.seq_cst)) {
-        const n = f.read(&buf) catch break;
-        if (n == 0) break;
+/// Heap-allocated stderr pump state, refcount-managed so Core and the
+/// pump thread can release their references independently. This
+/// matters for the `:connect` orphan path: the old nvim keeps its
+/// stderr writer open after we hot-swap, our blocked POSIX read does
+/// not wake when we close our copy of the fd from cleanupSession, so
+/// the pump must run detached until the orphan eventually closes
+/// stderr — which can outlive Core itself if zonvie quits before the
+/// orphan does. At the same time, the pump can exit at ANY moment
+/// (orphan dies before cleanupSession reaches detachFromCore), so a
+/// raw self-destroy in run()'s defer would race Core's pointer use.
+///
+/// Lifetime contract:
+///   - At spawn, refcount = 2: one ref for Core (held via
+///     Core.stderr_pump), one ref for the pump thread.
+///   - Each holder calls release() exactly once when done. The last
+///     release closes f and frees the struct.
+///   - Core MUST keep its ref live across any access to the struct
+///     (detachFromCore, etc.) and call release() afterwards. Orphan
+///     path: detachFromCore + release; non-orphan: thread.join (which
+///     drops the thread's ref) then Core's release.
+///
+/// Core access (the `core` pointer) is gated by `mu`.
+/// cleanupSession's orphan path calls detachFromCore() (which holds
+/// mu while nulling the back-pointer) before letting Core go away;
+/// subsequent pump iterations see core==null inside the lock and skip
+/// every dereference. The mutex being inside the heap struct (not in
+/// Core) is what makes this safe — it outlives Core for the duration
+/// of the detached pump.
+///
+/// `alloc` MUST outlive every release(). Callers pass
+/// std.heap.c_allocator (process-lifetime) instead of CoreBox's GPA
+/// so a detached pump's eventual destroy still targets a valid
+/// allocator after zonvie_core_destroy has done box.gpa.deinit().
+pub const StderrPump = struct {
+    alloc: std.mem.Allocator,
+    f: rpc_transport.Stream,
+    mu: std.Thread.Mutex,
+    core: ?*Core,
+    refcount: std.atomic.Value(u32),
 
-        // Log stderr output
-        if (self.cb.on_log) |logfn| logfn(self.ctx, buf[0..n].ptr, n);
+    /// Drop one reference. When the count drops to zero, close the
+    /// fd and free the struct. Safe to call from any thread.
+    pub fn release(self: *StderrPump) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.f.close();
+            self.alloc.destroy(self);
+        }
+    }
 
-        // SSH mode: detect password prompt in stderr
-        if (self.is_ssh_mode and !self.ssh_auth_done.load(.seq_cst)) {
-            const data = buf[0..n];
-            // Check for common password prompts (case-insensitive check for "password")
-            if (containsPasswordPrompt(data)) {
-                self.log.write("SSH: detected password prompt in stderr\n", .{});
-                if (self.cb.on_ssh_auth_prompt) |cb| {
-                    self.ssh_auth_pending.store(true, .seq_cst);
-                    cb(self.ctx, "SSH Password:", 13);
+    /// Run the pump until EOF / read error. Called from the pump
+    /// thread; never directly. Drops the thread's ref on exit.
+    pub fn run(self: *StderrPump) void {
+        defer self.release();
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            // Stop check: Core may have flagged termination.
+            {
+                self.mu.lock();
+                defer self.mu.unlock();
+                if (self.core) |c| {
+                    if (c.stop_flag.load(.seq_cst)) break;
+                }
+            }
+
+            const n = self.f.read(&buf) catch break;
+            if (n == 0) break;
+
+            // Logging + SSH detection. Both touch Core, so guarded
+            // by the same mutex. After detachFromCore() this branch
+            // is a no-op — orphaned pumps simply discard the data.
+            // (We could keep logging via a captured on_log function
+            // pointer + ctx — both App-owned, safe across Core
+            // teardown — but that adds another snapshot field for
+            // a feature the orphan path does not need.)
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.core) |c| {
+                if (c.cb.on_log) |logfn| logfn(c.ctx, buf[0..n].ptr, n);
+
+                if (c.is_ssh_mode and !c.ssh_auth_done.load(.seq_cst)) {
+                    if (containsPasswordPrompt(buf[0..n])) {
+                        c.log.write("SSH: detected password prompt in stderr\n", .{});
+                        if (c.cb.on_ssh_auth_prompt) |prompt_cb| {
+                            c.ssh_auth_pending.store(true, .seq_cst);
+                            prompt_cb(c.ctx, "SSH Password:", 13);
+                        }
+                    }
                 }
             }
         }
     }
-}
+
+    /// Sever the pump's back-reference to Core under the pump's own
+    /// mutex. After this returns, the pump will not dereference Core
+    /// in any subsequent iteration, and the caller is free to deinit
+    /// Core. Safe to call from any thread; caller MUST hold a ref to
+    /// the pump for the duration of this call.
+    pub fn detachFromCore(self: *StderrPump) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.core = null;
+    }
+};
 
 /// Check if data contains a password prompt (case-insensitive)
 pub fn containsPasswordPrompt(data: []const u8) bool {
@@ -1443,7 +1524,55 @@ pub fn runLoop(self: *Core) void {
             have_child = true;
 
             if (self.stderr_file) |ef| {
-                self.stderr_thread = std.Thread.spawn(.{}, pumpStderr, .{ self, ef }) catch null;
+                // Allocate the pump state on the heap so it can outlive
+                // Core (orphan path). Pump thread frees it on exit.
+                //
+                // Use std.heap.c_allocator instead of self.alloc here:
+                // an orphan-detached pump can still be running when
+                // zonvie_core_destroy calls box.gpa.deinit(), at which
+                // point self.alloc would be a dead allocator interface.
+                // c_allocator is process-lifetime, so the pump's later
+                // self.alloc.destroy(self) is always safe.
+                const pump_alloc = std.heap.c_allocator;
+                const pump = pump_alloc.create(StderrPump) catch null;
+                if (pump) |p| {
+                    p.* = .{
+                        .alloc = pump_alloc,
+                        .f = ef,
+                        .mu = .{},
+                        .core = self,
+                        // refcount = 2 from the start: one for Core
+                        // (kept via self.stderr_pump until cleanup
+                        // calls release), one for the pump thread
+                        // (released by run()'s defer). Pre-set so the
+                        // thread can't observe a stale 0.
+                        .refcount = std.atomic.Value(u32).init(2),
+                    };
+                    self.stderr_pump = p;
+                    self.stderr_thread = std.Thread.spawn(.{}, StderrPump.run, .{p}) catch blk: {
+                        // Spawn failed: thread never started so it
+                        // never took its ref. We are the only holder;
+                        // free the struct and close the fd directly,
+                        // no need to go through release().
+                        p.f.close();
+                        pump_alloc.destroy(p);
+                        self.stderr_pump = null;
+                        break :blk null;
+                    };
+                } else {
+                    // Allocation failed: nothing else owns this fd
+                    // (child.stderr is already null after the ownership
+                    // transfer above), so close it here. cleanupSession
+                    // assumes the pump owns the fd and would only null
+                    // self.stderr_file without closing.
+                    ef.close();
+                }
+                // Ownership of stderr_file has been transferred:
+                //   - alloc + spawn ok: pump owns; freed by run()'s defer.
+                //   - spawn failed: catch above closed and freed pump.
+                //   - alloc failed: closed in the else branch above.
+                // In all cases Core no longer holds the fd.
+                self.stderr_file = null;
             }
 
             // SSH mode defers writer thread until after authentication completes.
@@ -1886,21 +2015,68 @@ fn cleanupSession(
         }
     }
 
-    // Close any remaining transport handles.
+    // Close any remaining transport handles. stderr_file is intentionally
+    // NOT closed here — its fd is owned by pumpStderr (which defer-closes
+    // on exit), so closing from this thread risks fd reuse if the pump's
+    // blocked read syscall hasn't yet observed EOF and the fd number is
+    // recycled by the next open() in our process. Just null the alias.
     if (self.stdout_file) |f| {
         f.close();
         self.stdout_file = null;
     }
-    if (self.stderr_file) |f| {
-        f.close();
-        self.stderr_file = null;
-    }
+    self.stderr_file = null;
 
-    // Join the stderr pump (if any). Closing stderr_file above causes
-    // its read() to return 0, exiting the thread cleanly.
-    if (self.stderr_thread) |t| {
-        t.join();
-        self.stderr_thread = null;
+    // Reap the stderr pump.
+    //   - Normal path: child died, its stderr writer closed, our pump
+    //     read returned 0, the pump thread is exiting (or already
+    //     exited). join() completes promptly.
+    //   - Orphan path (`:connect` hot-swap): the old nvim is still
+    //     running and holds the stderr writer open, so the pump is
+    //     stuck in a blocking read that close() on the read end does
+    //     NOT wake on POSIX. Joining would hang the run loop and
+    //     prevent attaching to the new server. Detach instead — the
+    //     pump exits naturally when the orphan eventually closes its
+    //     stderr (process exit, :connect! from another UI, etc.) and
+    //     the defer in StderrPump.run releases the fd and frees the
+    //     pump struct.
+    //
+    // For the orphan path we must call detachFromCore() BEFORE the
+    // pump might dereference Core, since Core may be torn down while
+    // the pump is still running. detachFromCore() takes the pump's
+    // own mutex, waiting for any in-flight Core access to finish, then
+    // nulls the pump's back-pointer to Core. Subsequent iterations
+    // see core==null and skip every Core dereference.
+    if (orphan_child) {
+        // Orphan path: the pump thread keeps running until the
+        // orphan eventually closes its stderr writer (or never, if
+        // zonvie exits first). Drop our ref so the pump destroys
+        // itself when its thread releases its ref. detachFromCore
+        // first under the pump's mutex so the running pump stops
+        // dereferencing Core; then release() drops Core's ref.
+        // Both calls require a live ref, which we hold until the
+        // matched release().
+        if (self.stderr_pump) |p| {
+            p.detachFromCore();
+            p.release();
+            self.stderr_pump = null;
+        }
+        if (self.stderr_thread) |t| {
+            t.detach();
+            self.stderr_thread = null;
+        }
+    } else {
+        // Normal path: child died, stderr writer closed, pump
+        // thread observed EOF and exited (releasing its ref).
+        // join() guarantees the thread has finished its release;
+        // we then drop Core's ref to free the struct.
+        if (self.stderr_thread) |t| {
+            t.join();
+            self.stderr_thread = null;
+        }
+        if (self.stderr_pump) |p| {
+            p.release();
+            self.stderr_pump = null;
+        }
     }
 
     // All threads that could dereference the Windows named-pipe wrapper

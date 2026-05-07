@@ -464,6 +464,13 @@ pub const Core = struct {
     stdout_file: ?Stream = null,
     stderr_file: ?Stream = null,
     stderr_thread: ?std.Thread = null,
+    /// Heap-allocated state shared with the stderr pump thread.
+    /// Lifetime: created at session spawn, freed by the pump thread's
+    /// run() defer block on exit. This back-pointer in Core is just a
+    /// handle for cleanupSession to call detachFromCore() before the
+    /// pump might outlive Core (`:connect` orphan path). Always null
+    /// it after detach / join — the pump destroys the struct itself.
+    stderr_pump: ?*rpc_session.StderrPump = null,
 
     /// Transport mode of the current session.
     /// .pipes: spawned child + 3 pipes (stdin/stdout/stderr separate handles).
@@ -1012,6 +1019,17 @@ pub const Core = struct {
         if (self.thread) |t| t.join();
         self.thread = null;
 
+        // Defensive: if a stderr pump is still pointing at Core (e.g., a
+        // failure path bypassed cleanupSession), detach it now so its
+        // run() loop stops dereferencing Core before we free Core's
+        // storage below, then release Core's ref so the struct can be
+        // freed when the pump thread releases its own. Normal flows
+        // have cleanupSession already null both fields by this point.
+        if (self.stderr_pump) |p| {
+            p.detachFromCore();
+            p.release();
+            self.stderr_pump = null;
+        }
         if (self.stderr_thread) |t2| t2.join();
         self.stderr_thread = null;
 
@@ -3154,10 +3172,6 @@ pub const Core = struct {
 
 
     // --- Forwarding stubs for rpc_session.zig ---
-
-    pub fn pumpStderr(self: *Core, f: Stream) void {
-        rpc_session.pumpStderr(self, f);
-    }
 
     pub fn containsPasswordPrompt(data: []const u8) bool {
         return rpc_session.containsPasswordPrompt(data);
