@@ -2334,7 +2334,9 @@ final class ZonvieCore {
     }
 
     /// Check whether a named font family is available on the system.
-    private static func isFontAvailable(_ name: String) -> Bool {
+    /// Used by both the guifont fallback path and the renderer's
+    /// initial-font selection from config's candidate list.
+    static func isFontAvailable(_ name: String) -> Bool {
         let desc = CTFontDescriptorCreateWithAttributes(
             [kCTFontFamilyNameAttribute: name] as CFDictionary
         )
@@ -2378,6 +2380,7 @@ final class ZonvieCore {
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
         let familyExplicit = ZonvieConfig.shared.font.familyExplicit
         let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit
+        let configCandidates = ZonvieConfig.shared.font.candidates
 
         // The payload may contain multiple newline-separated candidates
         // (guifont fallback list).  Try each in order; use the first
@@ -2389,10 +2392,18 @@ final class ZonvieCore {
         var features: String = ""
         var found = false
 
-        // If the user explicitly set font.family in config.toml, skip guifont
-        // candidates entirely and go straight to the config fallback below.
+        // If the user explicitly set font.family in config.toml, skip the
+        // nvim payload and walk the config's candidate list with the same
+        // availability-based fallback rules instead.
         if familyExplicit {
-            Self.appLog("[onGuiFont] family_explicit set, ignoring nvim guifont payload")
+            Self.appLog("[onGuiFont] family_explicit set, walking config candidate list")
+            if let picked = ZonvieConfig.pickFirstAvailable(from: configCandidates, skipLogPrefix: "[onGuiFont] config candidate") {
+                name = picked.name
+                size = sizeExplicit ? configSize : picked.size
+                features = picked.features
+                found = true
+                Self.appLog("[onGuiFont] selected from config '\(name)' size=\(size) features='\(features)'")
+            }
         } else {
             for candidate in candidates {
                 guard let parsed = Self.parseGuiFontEntry(String(candidate), configSize: configSize, sizeExplicit: sizeExplicit) else {
@@ -2423,7 +2434,7 @@ final class ZonvieCore {
         }
 
         if !found {
-            Self.appLog("[onGuiFont] no loadable font in list, using config font '\(configFont)' size=\(configSize)")
+            Self.appLog("[onGuiFont] no loadable font, using config font '\(configFont)' size=\(configSize)")
         }
 
         Self.appLog("[onGuiFont] name='\(name)' size=\(size) features='\(features)'")

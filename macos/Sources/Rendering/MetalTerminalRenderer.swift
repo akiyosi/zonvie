@@ -485,10 +485,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         self.queue = q
 
-        // Font priority: config.font.family > OS default (Menlo)
-        let initialFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
-        let initialSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
-        ZonvieCore.appLog("[Renderer] init: initial font='\(initialFont)' size=\(initialSize)")
+        // Initial font: walk the config's candidate list (parsed from
+        // [font] family using guifont syntax) and pick the first family
+        // available on the system. Falls back to Menlo if nothing in
+        // the list resolves. The actual `setFont` we run here only
+        // primes the atlas; if nvim later sends a `guifont` payload,
+        // onGuiFont takes over with its own fallback walk.
+        let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
+        let configCandidates = ZonvieConfig.shared.font.candidates
+        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit
+        var pickedName: String
+        var pickedSize: Double
+        if let picked = ZonvieConfig.pickFirstAvailable(from: configCandidates, skipLogPrefix: "[Renderer] init:") {
+            pickedName = picked.name
+            pickedSize = sizeExplicit ? configSize : picked.size
+        } else {
+            // Reached only when the core formatter failed (OOM) and the
+            // candidate list is empty, OR none of the listed families
+            // are installed. Fall back to whatever single name the
+            // back-compat `family` field still carries (Menlo by
+            // default), at the configured size.
+            pickedName = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
+            pickedSize = configSize
+        }
+        let initialFont = pickedName
+        let initialSize = pickedSize
+        ZonvieCore.appLog("[Renderer] init: initial font='\(initialFont)' size=\(initialSize) (from \(configCandidates.count) candidate(s))")
 
         // Pull configured atlas size up-front so the GlyphAtlas allocates its
         // texture at the correct dimensions immediately, avoiding a wasteful

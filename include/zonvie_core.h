@@ -1198,6 +1198,15 @@ typedef struct zonvie_config zonvie_config;
 
 typedef struct zonvie_config_values {
     // font
+    /* Newline-separated candidate list in the same form the
+       `on_guifont` callback delivers:
+           "<name>\t<size>[\t<features>]\n<name>\t<size>...".
+       Built from [font] family with the same parsing rules as nvim's
+       `guifont` (comma-separated, backslash escapes, per-entry `:hN`
+       for size, `+ss01`/`-liga`/`cv02=3` for OpenType features).
+       Entries without `:hN` inherit `font_size`. The frontend should
+       try each candidate in order and pick the first one that loads
+       on the system. */
     const char* font_family;
     float font_size;
     int32_t font_linespace;

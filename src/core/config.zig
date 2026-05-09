@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const toml = @import("toml");
+const redraw_handler = @import("redraw_handler.zig");
 
 /// Message event types for routing
 pub const MsgEvent = enum {
@@ -181,7 +182,17 @@ pub const Config = struct {
     };
 
     pub const FontConfig = struct {
-        family: []const u8 = if (builtin.os.tag == .macos) "Menlo" else "Consolas",
+        // Default mirrors nvim's DFLT_GFN (src/nvim/option_vars.h) so that
+        // when [font] family is unset, the GUI's logical default matches
+        // nvim v0.12+'s built-in `guifont` default. The string is a
+        // comma-separated fallback list using guifont syntax (escape
+        // commas with `\\`, per-entry size with `:hN`).
+        family: []const u8 = switch (builtin.os.tag) {
+            .macos => "SF Mono,Menlo,Monaco,Courier New,monospace",
+            .windows => "Cascadia Code,Cascadia Mono,Consolas,Courier New,monospace",
+            .linux => "Source Code Pro,DejaVu Sans Mono,Courier New,monospace",
+            else => "DejaVu Sans Mono,Courier New,monospace",
+        },
         size: f32 = if (builtin.os.tag == .macos) 14.0 else 18.0,
         linespace: i32 = 0,
         // Whether the user explicitly set the value in config.toml. When true,
@@ -645,6 +656,78 @@ pub const Config = struct {
         }
     }
 };
+
+/// Split a comma-separated [font] family string into trimmed candidate
+/// substrings. Empty fragments (e.g. ",,") are skipped.
+///
+/// Unlike vim's `guifont` parser this does NOT handle backslash escapes:
+/// real-world monospace font names contain no commas, and TOML's own
+/// backslash escape rules conflict with vim-style `\,`. Keeping the two
+/// sets of escapes separate avoids user confusion.
+pub fn splitFontFamilyList(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len == 0) continue;
+        try out.append(arena, trimmed);
+    }
+    return out.items;
+}
+
+/// Format a comma-separated font.family string into the newline-separated
+/// candidate list form used by the GUI frontends:
+///   "<name>\t<size>[\t<features>]\n<name>\t<size>[\t<features>]\n..."
+///
+/// `raw` is split on `,` with whitespace trimmed around each entry (no
+/// backslash escapes; see `splitFontFamilyList`). Each candidate may
+/// still carry its own `:hN` size and OpenType feature tokens (`+ss01`,
+/// `-liga`, `cv02=3`); entries without `:hN` inherit `default_size_pt`.
+///
+/// On parse failure or empty `raw`, emits a single fallback entry
+/// formatted from `fallback_name` and `default_size_pt`.
+///
+/// `arena` MUST be an arena allocator. The internal calls to
+/// `parseGuiFontCandidate` / `formatResolvedGuiFont` produce many small
+/// intermediate allocations that this function does not free
+/// individually; passing a non-arena allocator will leak them. The
+/// returned slice lives as long as the arena.
+pub fn formatFontFamilyAsCandidateList(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    default_size_pt: f64,
+    fallback_name: []const u8,
+) ![]const u8 {
+    var combined: std.ArrayListUnmanaged(u8) = .{};
+
+    if (raw.len != 0) {
+        const cands = try splitFontFamilyList(arena, raw);
+        for (cands, 0..) |cand, idx| {
+            var resolved = try redraw_handler.parseGuiFontCandidate(arena, cand);
+            // parseGuiFontCandidate defaults to 14.0 when no `:hN` is
+            // present. Override that with the config's [font] size so
+            // bare `family = "Foo,Bar"` inherits `size`.
+            if (!std.mem.containsAtLeast(u8, cand, 1, ":h") and
+                !std.mem.containsAtLeast(u8, cand, 1, ":p"))
+            {
+                resolved.point_size = default_size_pt;
+            }
+            const msg = try redraw_handler.formatResolvedGuiFont(arena, resolved);
+            if (idx > 0) try combined.append(arena, '\n');
+            try combined.appendSlice(arena, msg);
+        }
+    }
+
+    if (combined.items.len == 0) {
+        const msg = try std.fmt.allocPrint(arena, "{s}\t{d}", .{ fallback_name, default_size_pt });
+        try combined.appendSlice(arena, msg);
+    }
+
+    return combined.items;
+}
 
 // TOML parsing structures (match config.toml format)
 const TomlConfig = struct {

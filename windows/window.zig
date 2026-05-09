@@ -273,12 +273,19 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     );
     core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
 
-    // 4. DWrite metrics init (font metrics calculation) -> store in early_atlas
-    const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+    // 4. DWrite metrics init (font metrics calculation) -> store in early_atlas.
+    // Pass the raw config family string; initMetrics walks the
+    // guifont-style candidate list and picks the first loadable font.
     const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
 
     if (log_enabled) _ = c.QueryPerformanceCounter(&t1);
-    var atlas_val = try dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt);
+    var atlas_val = try dwrite_d2d.Renderer.initMetrics(
+        app.alloc,
+        hwnd,
+        app.config.font.family,
+        initial_pt,
+        app.config.font.size_explicit,
+    );
     if (log_enabled) {
         _ = c.QueryPerformanceCounter(&t2);
         const ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, app_mod.g_startup_freq.QuadPart);
@@ -2622,12 +2629,18 @@ pub export fn WndProc(
                     );
                     core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
 
-                    // DWrite metrics init
-                    const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+                    // DWrite metrics init: walk the guifont-style candidate
+                    // list from config and pick the first loadable font.
                     const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
 
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                    atlas = dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
+                    atlas = dwrite_d2d.Renderer.initMetrics(
+                        app.alloc,
+                        hwnd,
+                        app.config.font.family,
+                        initial_pt,
+                        app.config.font.size_explicit,
+                    ) catch |e| {
                         if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initMetrics failed: {any}\n", .{e});
                         return 0;
                     };

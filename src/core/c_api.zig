@@ -1470,9 +1470,36 @@ fn msgPosToInt(pos: config.MsgPosition) i32 {
 }
 
 fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie_config_values {
+    // Format the user-supplied (or default) family string into a
+    // newline-separated `<name>\t<size>[\t<features>]` list so the
+    // frontend can reuse the same parser as for nvim's `guifont`
+    // payload. See `config.formatFontFamilyAsCandidateList`.
+    //
+    // On formatter / dupe failure (only OOM in practice) we emit a
+    // well-formed minimal single entry instead of falling back to the
+    // raw comma-separated `cfg.font.family`: the frontend expects a
+    // newline-separated candidate list, so handing it the unformatted
+    // string would make it treat the whole list as one font name.
+    const default_size_pt: f64 = if (cfg.font.size > 0) cfg.font.size else 14.0;
+    const fallback_name: []const u8 = if (@import("builtin").os.tag == .macos) "Menlo" else "Consolas";
+    const family_list_z: [*:0]const u8 = blk: {
+        if (config.formatFontFamilyAsCandidateList(
+            alloc,
+            cfg.font.family,
+            default_size_pt,
+            fallback_name,
+        )) |formatted| {
+            if (alloc.dupeZ(u8, formatted)) |z| break :blk z.ptr else |_| {}
+        } else |_| {}
+        if (std.fmt.allocPrint(alloc, "{s}\t{d}", .{ fallback_name, default_size_pt })) |fb| {
+            if (alloc.dupeZ(u8, fb)) |z| break :blk z.ptr else |_| {}
+        } else |_| {}
+        break :blk dupeZForC(alloc, "", "Menlo");
+    };
+
     return .{
         // font
-        .font_family = dupeZForC(alloc, cfg.font.family, "Menlo"),
+        .font_family = family_list_z,
         .font_size = cfg.font.size,
         .font_linespace = cfg.font.linespace,
         .font_family_explicit = cfg.font.family_explicit,

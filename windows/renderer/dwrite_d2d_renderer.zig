@@ -156,7 +156,21 @@ pub const Renderer = struct {
     /// Phase 1 of two-phase init: creates D2D/DWrite factories, sets font, and
     /// computes cellW/cellH. Does NOT create the D2D render target (~30ms).
     /// Call initRenderTarget() to complete initialization before rendering.
-    pub fn initMetrics(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
+    ///
+    /// `family_raw` is the user-supplied (or default) [font] family from
+    /// config.toml in guifont syntax: a comma-separated fallback list with
+    /// optional per-entry `:hN` size and OpenType feature tokens. This
+    /// function walks each candidate and uses the first that DWrite can
+    /// load. If all fail, it falls back to "Consolas" 14pt.
+    /// `default_pt` is [font] size and is used for entries without `:hN`.
+    /// When `size_explicit` is true, `default_pt` overrides per-entry sizes.
+    pub fn initMetrics(
+        alloc: std.mem.Allocator,
+        hwnd: c.HWND,
+        family_raw: []const u8,
+        default_pt: f32,
+        size_explicit: bool,
+    ) !Renderer {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
@@ -221,12 +235,38 @@ pub const Renderer = struct {
         self.dpi = if (window_dpi > 0) window_dpi else 96;
         if (applog.isEnabled()) applog.appLog("[d2d] window DPI: {d}\n", .{self.dpi});
 
-        // Initial font → cell metrics become valid
+        // Initial font → cell metrics become valid.
+        // Walk the [font] family candidate list (guifont syntax) and
+        // pick the first that loads. Same fallback rule as the runtime
+        // `on_guifont` path so config and nvim's payload behave alike.
         if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
-        self.setFontUtf8(initial_font, initial_pt) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[d2d] initial font '{s}' failed: {any}, trying Consolas\n", .{ initial_font, e });
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var loaded = false;
+        if (family_raw.len > 0) {
+            const cands = core.config.splitFontFamilyList(aa, family_raw) catch &.{};
+            for (cands) |cand_str| {
+                const resolved = core.redraw_handler.parseGuiFontCandidate(aa, cand_str) catch continue;
+                if (resolved.name.len == 0) continue;
+                const parsed_pt: f32 = @floatCast(resolved.point_size);
+                const cand_pt: f32 = if (size_explicit or parsed_pt <= 0) default_pt else parsed_pt;
+                self.setFontUtf8WithFeatures(resolved.name, cand_pt, "") catch |e| {
+                    if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ resolved.name, cand_pt, e });
+                    continue;
+                };
+                if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: selected '{s}' pt={d}\n", .{ resolved.name, cand_pt });
+                loaded = true;
+                break;
+            }
+        }
+        if (!loaded) {
+            if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: no candidate loaded, falling back to Consolas\n", .{});
             try self.setFontUtf8("Consolas", 14.0);
-        };
+        }
+
         if (applog.isEnabled()) {
             _ = c.QueryPerformanceCounter(&t1);
             applog.appLog("[d2d] [TIMING] setFontUtf8: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});

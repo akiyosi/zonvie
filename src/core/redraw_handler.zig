@@ -392,7 +392,7 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
     };
 }
 
-fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
+pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]const u8 {
     // "<name>\t<size>" or "<name>\t<size>\t<features>"
     if (r.features.len == 0) {
         return try std.fmt.allocPrint(arena, "{s}\t{d}", .{ r.name, r.point_size });

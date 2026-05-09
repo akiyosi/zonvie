@@ -38,10 +38,26 @@ struct ZonvieConfig {
         var sshIdentity: String? = nil  // 秘密鍵パス
     }
 
+    /// One parsed entry from [font] family. Mirrors the `<name>\t<size>[\t<features>]`
+    /// format the core emits via zonvie_config_values.font_family.
+    struct FontCandidate {
+        var name: String
+        var size: Double
+        var features: String
+    }
+
     struct FontConfig {
+        /// Primary font name. Convenience for logging and code that just
+        /// wants a single string. Always equals `candidates.first?.name`
+        /// when the candidate list is non-empty.
         var family: String = "Menlo"
         var size: Double = 14.0
         var linespace: Int = 0
+        /// Parsed fallback list, in priority order. The frontend should
+        /// try each in turn and pick the first one available on the
+        /// system. Empty only when the core failed to format the list,
+        /// in which case `family` still carries a sane fallback.
+        var candidates: [FontCandidate] = []
         /// True when the user explicitly set [font] family / size in config.toml.
         /// When true, onGuiFont prefers config over nvim's default guifont list.
         var familyExplicit: Bool = false
@@ -192,8 +208,16 @@ struct ZonvieConfig {
 
         let v = zonvie_config_get_values(handle)
 
-        // Font
-        if let s = v.font_family { config.font.family = String(cString: s) }
+        // Font: font_family is newline-separated `<name>\t<size>[\t<features>]`
+        // entries (see zonvie_core.h). Parse into FontCandidate list and
+        // also keep `family` = first-entry name for back-compat / logging.
+        if let s = v.font_family {
+            let raw = String(cString: s)
+            config.font.candidates = ZonvieConfig.parseFontFamilyList(raw)
+            if let first = config.font.candidates.first {
+                config.font.family = first.name
+            }
+        }
         config.font.size = Double(v.font_size)
         config.font.linespace = Int(v.font_linespace)
         config.font.familyExplicit = v.font_family_explicit
@@ -261,6 +285,43 @@ struct ZonvieConfig {
         zonvie_config_destroy(handle)
 
         return config
+    }
+
+    /// Parse the newline-separated font candidate list emitted by the
+    /// core (zonvie_config_values.font_family). Each line is
+    /// `<name>\t<size>[\t<features>]`; missing or zero size falls back
+    /// to 14.0. Empty / malformed lines are skipped.
+    static func parseFontFamilyList(_ raw: String) -> [FontCandidate] {
+        var out: [FontCandidate] = []
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard parts.count >= 2 else { continue }
+            let name = String(parts[0])
+            if name.isEmpty { continue }
+            let parsedSize = Double(parts[1]) ?? 0
+            let size = parsedSize > 0 ? parsedSize : 14.0
+            let features = parts.count >= 3 ? String(parts[2]) : ""
+            out.append(FontCandidate(name: name, size: size, features: features))
+        }
+        return out
+    }
+
+    /// Walk `candidates` in priority order and return the first family
+    /// that CoreText reports as available on the system. Each candidate
+    /// that fails the availability check is logged with `skipLogPrefix`.
+    /// Returns nil if no candidate resolves; the caller decides on its
+    /// own ultimate fallback (e.g. "Menlo").
+    static func pickFirstAvailable(
+        from candidates: [FontCandidate],
+        skipLogPrefix: String
+    ) -> FontCandidate? {
+        for cand in candidates {
+            if ZonvieCore.isFontAvailable(cand.name) {
+                return cand
+            }
+            ZonvieCore.appLog("\(skipLogPrefix) skipped unavailable '\(cand.name)'")
+        }
+        return nil
     }
 
 }

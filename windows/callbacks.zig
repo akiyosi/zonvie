@@ -2001,9 +2001,39 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         var applied_pt: f32 = config_pt;
         var font_set = false;
 
-        // If the user explicitly set font.family in config.toml, skip guifont
-        // candidates entirely and go straight to the config fallback below.
+        // If the user explicitly set font.family in config.toml, skip
+        // nvim's guifont payload and walk the config's own candidate
+        // list (parsed from the raw guifont-syntax string in
+        // app.config.font.family). Same fallback rule as the nvim
+        // payload path below.
         const skip_guifont = family_explicit;
+        if (skip_guifont) {
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer arena.deinit();
+            const aa = arena.allocator();
+
+            const cands = core.config.splitFontFamilyList(aa, app.config.font.family) catch &.{};
+            for (cands) |cand_str| {
+                const resolved = core.redraw_handler.parseGuiFontCandidate(aa, cand_str) catch continue;
+                if (resolved.name.len == 0) continue;
+                const parsed_pt: f32 = @floatCast(resolved.point_size);
+                const cand_pt: f32 = if (size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
+
+                const try_result = a.setFontUtf8WithFeatures(resolved.name, cand_pt, "");
+                if (try_result) |_| {
+                    applied_name = resolved.name;
+                    applied_pt = cand_pt;
+                    name = resolved.name;
+                    pt = cand_pt;
+                    features_str = "";
+                    font_set = true;
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: selected from config '{s}' pt={d}", .{ resolved.name, cand_pt });
+                    break;
+                } else |e| {
+                    if (applog.isEnabled()) applog.appLog("onGuiFont: skipped config '{s}' pt={d}: {any}", .{ resolved.name, cand_pt, e });
+                }
+            }
+        }
 
         if (!skip_guifont and bytes != null and len != 0) {
             const s = bytes.?[0..len];
