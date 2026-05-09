@@ -153,6 +153,8 @@ fn makeCoreCbs() core.Callbacks {
         .on_exit = callbacks.onExit,
         .on_default_colors_set = callbacks.onDefaultColorsSet,
         .on_set_title = callbacks.onSetTitle,
+        .on_restart = callbacks.onRestart,
+        .on_connect = callbacks.onConnect,
         .on_external_window = external_windows.onExternalWindow,
         .on_external_window_close = external_windows.onExternalWindowClose,
         .on_cursor_grid_changed = external_windows.onCursorGridChanged,
@@ -291,15 +293,40 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     // 5. Compute rows/cols from actual cell metrics
     updateRowsColsFromClientForce(hwnd, app);
 
-    // 6. Spawn nvim (native mode only)
-    var nvim_cmd_buf: [1024]u8 = undefined;
-    const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
-    const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
-    defer if (nvim_path_z) |p| app.alloc.free(p);
-    const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
+    // 6. Start session: connect mode if --connect-nvim/--remote-ui was set,
+    //    otherwise spawn nvim (native mode). Capture the int return: a
+    //    negative value means the core thread was NOT started (-1 invalid
+    //    handle, -2 thread spawn failed, -3 invalid/unsupported listen
+    //    address). on_exit will not fire in that case, so we must abort
+    //    startup ourselves instead of leaving a zombie window with no
+    //    backing nvim.
+    const start_rc: i32 = if (app.connect_addr) |addr| blk: {
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: connect mode addr={s} rows={d} cols={d}\n", .{ addr, app.surface.rows, app.surface.cols });
+        break :blk core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surface.rows, app.surface.cols);
+    } else blk: {
+        var nvim_cmd_buf: [1024]u8 = undefined;
+        const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
+        const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
+        defer if (nvim_path_z) |p| app.alloc.free(p);
+        const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
 
-    if (log_enabled) applog.appLog("[win] doEarlyCoreInit: starting nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
-    _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: spawning nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+        break :blk core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+    };
+
+    if (start_rc != 0) {
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: core start failed rc={d}; aborting startup\n", .{start_rc});
+        // Mark the session as already exited so the WM_CLOSE handler
+        // takes the fast path (no quit dialog, no waiting on the core).
+        app.neovim_exited.store(true, .release);
+        // Set the global exit code so wWinMain returns 1 to the shell
+        // (mirrors macOS Darwin.exit(1)). main.zig pulls this value
+        // out of g_exit_code after the message loop exits — the
+        // wParam passed to PostQuitMessage is intentionally ignored.
+        app_mod.g_exit_code.store(1, .seq_cst);
+        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        return;
+    }
     app.nvim_spawned = true;
     app.early_core_init_done = true;
 
@@ -1898,18 +1925,49 @@ pub export fn WndProc(
                 // This ensures colors are available for popupmenu even if cmdline wasn't shown
                 external_windows.updateExternalWindowColors(app);
 
-                // Process all pending external window requests
+                // Dequeue the single pending request whose seq matches the
+                // one posted in lParam. Each onExternalWindow enqueue posts
+                // one message tagged with the request's seq, so messages
+                // bind 1:1 to specific requests — even if the request was
+                // later coalesced (same grid_id, fields replaced, seq kept)
+                // or removed (e.g., dropped from a previous session by
+                // onExternalWindowClose), the lookup remains unambiguous.
+                //
+                // Skip if the matching entry's grid_id is currently held
+                // by an is_pending_close entry in external_windows (close
+                // received but deferred because paint was in progress).
+                // Creating now would put() over the old entry while paint
+                // still references it, leaking the old HWND. Leave the
+                // request in the queue; closeExternalWindowOnUIThread re-
+                // posts WM_APP_CREATE with the same seq after the destroy
+                // completes, and the next pass will find the slot free.
+                const msg_seq: u64 = @bitCast(lParam);
                 app.mu.lock();
-                const pending = app.pending_external_windows.toOwnedSlice(app.alloc) catch {
+                var dequeue_idx: ?usize = null;
+                for (app.pending_external_windows.items, 0..) |item, i| {
+                    if (item.seq != msg_seq) continue;
+                    const blocked = if (app.external_windows.get(item.grid_id)) |e| e.is_pending_close else false;
+                    if (blocked) {
+                        // Matching entry exists but is blocked — leave
+                        // it; the deferred close will re-post a wake.
+                        app.mu.unlock();
+                        return 0;
+                    }
+                    dequeue_idx = i;
+                    break;
+                }
+                if (dequeue_idx == null) {
+                    // No matching pending entry. Either the request was
+                    // removed by onExternalWindowClose (old session) or
+                    // it was already dequeued by an earlier same-seq
+                    // wake message. Either way, this is a no-op.
                     app.mu.unlock();
                     return 0;
-                };
+                }
+                const req = app.pending_external_windows.orderedRemove(dequeue_idx.?);
                 app.mu.unlock();
 
-                for (pending) |req| {
-                    external_windows.createExternalWindowOnUIThread(app, req);
-                }
-                app.alloc.free(pending);
+                external_windows.createExternalWindowOnUIThread(app, req);
             }
             return 0;
         },
@@ -2696,7 +2754,14 @@ pub export fn WndProc(
                         const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                         defer if (nvim_path_z) |p| app.alloc.free(p);
                         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                        _ = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        const start_rc = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        if (start_rc != 0) {
+                            if (applog.isEnabled()) applog.appLog("[win] devcontainer-up: core start failed rc={d}; aborting\n", .{start_rc});
+                            app.neovim_exited.store(true, .release);
+                            app_mod.g_exit_code.store(1, .seq_cst);
+                            _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+                            return 0;
+                        }
                         app.nvim_spawned = true;
                         if (app.devcontainer_mode and !app.devcontainer_rebuild) {
                             dialogs.hideDevcontainerProgressDialog();
@@ -4014,7 +4079,9 @@ pub export fn WndProc(
                     tray.remove();
                 }
             }
-            // Nvy style: PostQuitMessage(0), exit code returned from main()
+            // Nvy style: PostQuitMessage(0). The actual exit code is
+            // pulled from app_mod.g_exit_code by wWinMain after the
+            // message loop exits, so the wParam here is irrelevant.
             if (applog.isEnabled()) applog.appLog("[win] WM_DESTROY: calling PostQuitMessage(0)\n", .{});
             c.PostQuitMessage(0);
             return 0;

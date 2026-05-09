@@ -2263,6 +2263,30 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 // Exit / IME / quit / title callbacks
 // =========================================================================
 
+pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
+    _ = ctx;
+    if (!applog.isEnabled()) return;
+    if (addr_ptr) |p| {
+        applog.appLog("[win] on_restart: reconnecting to listen_addr={s}\n", .{p[0..addr_len]});
+    } else {
+        applog.appLog("[win] on_restart: (no listen_addr)\n", .{});
+    }
+}
+
+/// Receive the `connect` UI event (`:connect <addr>`). Same flicker-free
+/// reconnect as restart; the only difference is that the previous server
+/// keeps running headless instead of dying. The core handles the actual
+/// hot-swap; this callback is informational only.
+pub fn onConnect(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
+    _ = ctx;
+    if (!applog.isEnabled()) return;
+    if (addr_ptr) |p| {
+        applog.appLog("[win] on_connect: hot-swap to server_addr={s}\n", .{p[0..addr_len]});
+    } else {
+        applog.appLog("[win] on_connect: (no server_addr)\n", .{});
+    }
+}
+
 pub fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_exit: code={d}\n", .{exit_code});

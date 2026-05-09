@@ -536,13 +536,56 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
     app.mu.lock();
     defer app.mu.unlock();
 
-    // Check if already exists
-    if (app.external_windows.get(grid_id) != null) {
-        if (applog.isEnabled()) applog.appLog("[win] external window already exists for grid_id={d}\n", .{grid_id});
-        return;
+    // Check if already exists. If the existing entry is is_pending_close
+    // (queued for destruction by an earlier on_external_window_close —
+    // typically from resetSessionState clearing channel-bound state at a
+    // :restart / :connect boundary), we must NOT short-circuit: the new
+    // session can legitimately reuse the same grid_id, and rejecting it
+    // here would leave the new server's window unattached. The pending
+    // close message is already in the UI thread queue ahead of the
+    // create message we are about to post, so FIFO ordering guarantees
+    // the old window is destroyed before the new one is created.
+    if (app.external_windows.get(grid_id)) |existing| {
+        if (!existing.is_pending_close) {
+            if (applog.isEnabled()) applog.appLog("[win] external window already exists for grid_id={d}\n", .{grid_id});
+            return;
+        }
+        if (applog.isEnabled()) applog.appLog("[win] external window for grid_id={d} is pending close; queueing new request behind it\n", .{grid_id});
     }
 
-    // Queue the request for UI thread processing
+    // Coalesce: if the queue already has a request for this grid_id (UI
+    // thread hasn't dequeued it yet, or all pending entries for this
+    // grid_id are blocked by an is_pending_close existing window),
+    // replace its mutable fields in place but PRESERVE the existing
+    // entry's seq. The original WM_APP_CREATE_EXTERNAL_WINDOW message
+    // already in the UI queue carries that seq in lParam, and the
+    // handler will dequeue exactly the entry whose seq matches —
+    // guaranteeing the (replaced) data, not stale fields, gets used.
+    //
+    // Without coalesce, multiple enqueues for the same grid_id would
+    // each spawn a createExternalWindowOnUIThread; the second put()
+    // would overwrite the first window's HWND in external_windows —
+    // leaking the first and confusing the close handler.
+    for (app.pending_external_windows.items, 0..) |item, i| {
+        if (item.grid_id == grid_id) {
+            app.pending_external_windows.items[i] = .{
+                .grid_id = grid_id,
+                .win = win,
+                .rows = rows,
+                .cols = cols,
+                .start_row = start_row,
+                .start_col = start_col,
+                .seq = item.seq, // preserve so existing in-flight message still matches
+            };
+            if (applog.isEnabled()) applog.appLog("[win] coalesced pending external window request for grid_id={d} (seq={d})\n", .{ grid_id, item.seq });
+            return;
+        }
+    }
+
+    // No existing pending entry: take a fresh seq, append, post.
+    const seq = app.pending_external_seq_counter;
+    app.pending_external_seq_counter += 1;
+
     app.pending_external_windows.append(app.alloc, .{
         .grid_id = grid_id,
         .win = win,
@@ -550,14 +593,13 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
         .cols = cols,
         .start_row = start_row,
         .start_col = start_col,
+        .seq = seq,
     }) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to queue external window request: {any}\n", .{e});
         return;
     };
-
-    // Post message to UI thread to create the window
     if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_CREATE_EXTERNAL_WINDOW, 0, 0);
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_CREATE_EXTERNAL_WINDOW, 0, @bitCast(seq));
     }
 }
 
@@ -892,6 +934,36 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     app.mu.lock();
 
+    // Defense-in-depth: refuse to overwrite a live external_windows entry
+    // (i.e., one that is NOT is_pending_close). The main caller flow
+    // already coalesces same-grid_id requests in pending_external_windows
+    // and the WM_APP_CREATE_EXTERNAL_WINDOW handler skips items blocked
+    // by an is_pending_close entry, so reaching this branch implies a
+    // bug elsewhere — but if we did put() over a live entry, the old
+    // HWND would leak and the close handler would later destroy whichever
+    // entry is currently in the map (the new one). Tear down our just-
+    // created HWND/renderer instead.
+    if (app.external_windows.get(req.grid_id)) |existing| {
+        if (!existing.is_pending_close) {
+            app.mu.unlock();
+            if (applog.isEnabled()) applog.appLog("[win] createExternalWindowOnUIThread: live entry for grid_id={d} would be overwritten; aborting (probable upstream coalesce miss)\n", .{req.grid_id});
+            var tmp_renderer = renderer;
+            tmp_renderer.deinit();
+            _ = c.DestroyWindow(hwnd);
+            return;
+        }
+        // is_pending_close: should have been filtered by the
+        // WM_APP_CREATE_EXTERNAL_WINDOW blocked-skip path. Reaching
+        // here means we got dequeued before close ran — also a bug.
+        // Same teardown response.
+        app.mu.unlock();
+        if (applog.isEnabled()) applog.appLog("[win] createExternalWindowOnUIThread: pending-close entry for grid_id={d} still in map; aborting (close not yet completed)\n", .{req.grid_id});
+        var tmp_renderer = renderer;
+        tmp_renderer.deinit();
+        _ = c.DestroyWindow(hwnd);
+        return;
+    }
+
     // Store external window
     const ext_window = app_mod.ExternalWindow{
         .hwnd = hwnd.?,
@@ -1067,13 +1139,35 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     if (applog.isEnabled()) applog.appLog("[win] on_external_window_close: grid_id={d}\n", .{grid_id});
 
     // Mark the window as pending close (don't remove from HashMap yet to avoid use-after-free)
-    // The actual removal and cleanup will happen on the UI thread in closeExternalWindowOnUIThread
+    // The actual removal and cleanup will happen on the UI thread in closeExternalWindowOnUIThread.
+    //
+    // Drop any pending_external_windows entries for this grid_id. They
+    // belong to the OLD session (resetSessionState fires this callback
+    // before the new session can enqueue anything for this grid_id),
+    // so removing them here prevents an old in-flight WM_APP_CREATE
+    // message from later picking up an unrelated new-session entry.
+    // The seq tag on each entry is unique so the old WM_APP_CREATE
+    // message — which carries the removed entry's seq in lParam —
+    // will find no match and be a no-op when the UI thread processes it.
     app.mu.lock();
     const main_hwnd = app.hwnd;
     if (app.external_windows.getPtr(grid_id)) |ext_win| {
         ext_win.is_pending_close = true;
     }
+    var i: usize = 0;
+    var removed: usize = 0;
+    while (i < app.pending_external_windows.items.len) {
+        if (app.pending_external_windows.items[i].grid_id == grid_id) {
+            _ = app.pending_external_windows.orderedRemove(i);
+            removed += 1;
+        } else {
+            i += 1;
+        }
+    }
     app.mu.unlock();
+    if (removed > 0 and applog.isEnabled()) {
+        applog.appLog("[win] on_external_window_close: dropped {d} stale pending request(s) for grid_id={d}\n", .{ removed, grid_id });
+    }
 
     // Post message to UI thread to do the actual close
     // (DestroyWindow must be called from the thread that created the window)
@@ -1156,6 +1250,41 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     // Note: We intentionally do NOT remove pending_external_verts here because
     // the pending verts might belong to a new window with the same grid_id that
     // was created after the close event was queued but before this handler ran.
+    //
+    // Likewise we do NOT remove pending_external_windows entries by grid_id.
+    // The new session can legitimately enqueue a same-grid_id create after
+    // we posted WM_APP_CLOSE_EXTERNAL_WINDOW, and we cannot tell those
+    // apart from old-session entries by grid_id alone.
+    //
+    // Wake any pending creates that were blocked by our is_pending_close
+    // entry. The WM_APP_CREATE_EXTERNAL_WINDOW handler skips queue items
+    // whose grid_id is held by an is_pending_close entry (to avoid
+    // racing with paint that still holds a pointer into ext_win); now
+    // that we have removed the old entry from external_windows, those
+    // items are safe to dequeue. Re-post one create message per matching
+    // pending entry, carrying the entry's seq so the handler picks up
+    // the right one. (Coalesce in onExternalWindow keeps the pending
+    // count <=1 per grid_id, but iterate the full set defensively.)
+    if (entry != null) {
+        app.mu.lock();
+        var seqs_buf: [8]u64 = undefined;
+        var seq_count: usize = 0;
+        for (app.pending_external_windows.items) |item| {
+            if (item.grid_id == grid_id and seq_count < seqs_buf.len) {
+                seqs_buf[seq_count] = item.seq;
+                seq_count += 1;
+            }
+        }
+        app.mu.unlock();
+        if (seq_count > 0) {
+            if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: waking {d} pending create(s) for grid_id={d}\n", .{ seq_count, grid_id });
+            if (app.hwnd) |main_hwnd| {
+                for (seqs_buf[0..seq_count]) |seq| {
+                    _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_CREATE_EXTERNAL_WINDOW, 0, @bitCast(seq));
+                }
+            }
+        }
+    }
 }
 
 pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {

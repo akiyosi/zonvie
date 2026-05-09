@@ -851,6 +851,28 @@ final class ZonvieCore {
                     rowsDelta: Int(rowsDelta),
                     totalRows: Int(totalRows), totalCols: Int(totalCols)
                 )
+            },
+            on_restart: { ctx, addrPtr, addrLen in
+                guard let ctx else { return }
+                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                let addr: String
+                if let p = addrPtr, addrLen > 0 {
+                    addr = String(decoding: UnsafeBufferPointer(start: p, count: addrLen), as: UTF8.self)
+                } else {
+                    addr = ""
+                }
+                core.handleRestartEvent(listenAddr: addr)
+            },
+            on_connect: { ctx, addrPtr, addrLen in
+                guard let ctx else { return }
+                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                let addr: String
+                if let p = addrPtr, addrLen > 0 {
+                    addr = String(decoding: UnsafeBufferPointer(start: p, count: addrLen), as: UTF8.self)
+                } else {
+                    addr = ""
+                }
+                core.handleConnectEvent(serverAddr: addr)
             }
         )
 
@@ -1002,10 +1024,47 @@ final class ZonvieCore {
         var devcontainerConfig: String? = nil
         var devcontainerRebuild: Bool = false
 
+        // Parse connect-mode arguments: --connect-nvim=<addr> or --remote-ui=<addr> (alias).
+        // When set, Zonvie skips spawning nvim and attaches to the running server
+        // at <addr> instead. Mutually exclusive with SSH / devcontainer modes.
+        var connectAddr: String? = nil
+
         var argIdx = 0
         while argIdx < args.count {
             let arg = args[argIdx]
-            if arg.hasPrefix("--ssh=") {
+            // Stop parsing zonvie-side options at `--`; everything after the
+            // separator is forwarded verbatim to nvim. Without this guard,
+            // `zonvie -- --ssh=...` (where `--ssh=...` is meant for nvim)
+            // would erroneously trip zonvie's SSH/connect/devcontainer paths.
+            if arg == "--" {
+                break
+            }
+            if arg.hasPrefix("--connect-nvim=") {
+                connectAddr = String(arg.dropFirst("--connect-nvim=".count))
+            } else if arg == "--connect-nvim" {
+                // Defense-in-depth: main.swift already exits 1 for a bare
+                // --connect-nvim, but ZonvieCore.start can be invoked
+                // with arbitrary CommandLine.arguments. Set an empty
+                // address so the addr.isEmpty branch below returns -3
+                // instead of falling through to a regular nvim spawn.
+                if argIdx + 1 < args.count {
+                    connectAddr = args[argIdx + 1]
+                    argIdx += 1
+                } else {
+                    connectAddr = ""
+                }
+            } else if arg.hasPrefix("--remote-ui=") {
+                connectAddr = String(arg.dropFirst("--remote-ui=".count))
+            } else if arg == "--remote-ui" {
+                // Mirror --connect-nvim: bare flag with no value yields
+                // an empty address that gets rejected synchronously.
+                if argIdx + 1 < args.count {
+                    connectAddr = args[argIdx + 1]
+                    argIdx += 1
+                } else {
+                    connectAddr = ""
+                }
+            } else if arg.hasPrefix("--ssh=") {
                 let value = String(arg.dropFirst("--ssh=".count))
                 // Parse user@host:port format (port is after last colon, but only if it's numeric)
                 if let lastColon = value.lastIndex(of: ":"),
@@ -1056,6 +1115,61 @@ final class ZonvieCore {
         }
 
         ZonvieCore.appLog("[start] SSH config: host=\(sshHost ?? "nil"), port=\(sshPort ?? -1), identity=\(sshIdentity ?? "nil")")
+
+        // === Connect mode (--connect-nvim / --remote-ui) ===
+        // Attach to a running Neovim server at <addr>; skip spawn entirely.
+        // Mutually exclusive with SSH / devcontainer (and their config.toml
+        // twins). The combination is rejected up front in main.swift's
+        // pre-fork validation; this function double-checks and returns -3
+        // if a wrapper-mode flag still slipped through (matches Windows
+        // main.zig's reject behavior).
+        if let addr = connectAddr {
+            // main.swift filters this earlier, but treat empty addresses
+            // as invalid here too: ZonvieCore.start can be invoked with
+            // arbitrary CommandLine.arguments, and an empty Swift string
+            // makes Array("".utf8).withUnsafeBufferPointer hand back a
+            // nil baseAddress, which previously masked the real failure
+            // (invalid address) as a generic "Invalid core handle" (-1).
+            // Reject up front so the frontend reports -3 (invalid addr).
+            if addr.isEmpty {
+                ZonvieCore.appLog("[start] connect mode: empty listen_addr -> -3")
+                return -3
+            }
+            // CLI contract: --connect-nvim is mutually exclusive with
+            // --ssh / --devcontainer (and their config.toml twins
+            // [neovim].ssh / .wsl). main.swift's pre-fork validation
+            // already exits 1 in that case before reaching here, and
+            // Windows main.zig does the same. Keep this defensive
+            // reject so ZonvieCore.start cannot accidentally pick
+            // connect over a wrapper config — silently dropping the
+            // user's --ssh would be a worse failure than -3.
+            if sshHost != nil || devcontainerWorkspace != nil {
+                ZonvieCore.appLog("[start] connect mode rejected: mutually exclusive with --ssh / --devcontainer / [neovim].ssh / [neovim].wsl -> -3")
+                return -3
+            }
+            ZonvieCore.appLog("[start] connect mode: attaching to listen_addr=\(addr)")
+
+            // Performance / IME / blur knobs identical to spawn path; the
+            // core only needs them set before the run-thread starts.
+            setBlurEnabled(true)
+            setInheritCwd(noforkMode)
+            let perfConfig = config.performance
+            zonvie_core_set_glyph_cache_size(
+                core,
+                UInt32(perfConfig.glyphCacheAsciiSize),
+                UInt32(perfConfig.glyphCacheNonAsciiSize)
+            )
+            zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
+            zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
+
+            let utf8 = Array(addr.utf8)
+            let result = utf8.withUnsafeBufferPointer { buf -> Int32 in
+                guard let base = buf.baseAddress else { return -1 }
+                return zonvie_core_start_connect(core, base, buf.count, rows, cols)
+            }
+            zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
+            return result
+        }
 
         // Build final command path (quote if path contains spaces for Zig parser)
         var finalPath: String
@@ -2555,6 +2669,22 @@ final class ZonvieCore {
         }
     }
 
+    /// Receive the `restart` UI event from the core. Informational only —
+    /// the core handles the actual reconnect (TCP / Unix-socket connect to
+    /// listen_addr) transparently while the GUI continues running. The
+    /// matching `on_exit` is suppressed inside the core, so this is the
+    /// only signal a frontend gets that nvim swapped underneath.
+    fileprivate func handleRestartEvent(listenAddr: String) {
+        ZonvieCore.appLog("restart: reconnecting to listen_addr=\(listenAddr)")
+    }
+
+    /// Receive the `connect` UI event (`:connect <addr>`). Same flicker-free
+    /// reconnect as restart; the only difference is that the previous
+    /// server keeps running headless instead of dying.
+    fileprivate func handleConnectEvent(serverAddr: String) {
+        ZonvieCore.appLog("connect: hot-swap to server_addr=\(serverAddr)")
+    }
+
 
 
     // Exit code from Neovim (for propagation to main.swift)
@@ -3238,6 +3368,14 @@ final class ZonvieCore {
             // would leak indefinitely when the grid is closed.
             self.pendingExternalVertices.removeValue(forKey: gridId)
             self.pendingExternalGridConfig.removeValue(forKey: gridId)
+
+            // Drop any queued window-creation request for this gridId.
+            // resetSessionState fires close callbacks for every external
+            // grid at session boundary; if a request was queued (window
+            // not yet created when the request landed in the queue),
+            // a later processPendingExternalWindows() would otherwise
+            // resurrect the stale gridId from the previous session.
+            self.pendingExternalWindowRequests.removeAll { $0.gridId == gridId }
 
             if let window = self.externalWindows.removeValue(forKey: gridId) {
                 // Save window position for restoration on tab switch back.

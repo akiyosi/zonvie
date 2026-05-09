@@ -118,13 +118,51 @@ final class ViewController: NSViewController {
         if sshEnabled || devcontainerModeEnabled {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "ssh/devcontainer") }
             }
         } else {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
-                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "native") }
             }
+        }
+    }
+
+    /// Surface a synchronous start() / start_connect() failure to the user
+    /// and terminate. The C ABI returns 0 on success, -1 invalid handle,
+    /// -2 thread spawn failed, -3 invalid/unsupported listen address. In
+    /// every failure case the core thread did NOT start and on_exit will
+    /// not fire, so without explicit handling the window would remain
+    /// open with no backing nvim — the user sees an empty zombie window.
+    private func handleCoreStartFailure(rc: Int32, context: String) {
+        ZonvieCore.appLog("[start] core start failed rc=\(rc) context=\(context); terminating")
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Zonvie failed to start"
+            let reason: String
+            switch rc {
+            case -1: reason = "Invalid core handle (rc=-1)."
+            case -2: reason = "Could not spawn the RPC run-loop thread (rc=-2)."
+            case -3: reason = "Invalid or unsupported listen address (rc=-3). For --connect-nvim, use a TCP \"host:port\" or absolute Unix-socket path on macOS."
+            default: reason = "Unknown error (rc=\(rc))."
+            }
+            alert.informativeText = "\(reason)\nContext: \(context)."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            _ = alert.runModal()
+            // Use Darwin.exit(1) instead of NSApp.terminate(nil) so the
+            // shell sees a non-zero exit code for fatal startup failures.
+            // NSApp.terminate(nil) runs the normal AppKit teardown and
+            // returns 0, which would mask the failure for callers
+            // scripting around `zonvie --connect-nvim=...`. The specific
+            // failure reason (rc value, context) is surfaced via the
+            // NSAlert text above, not via the exit code — exit codes are
+            // a binary success/failure signal, matching the rest of
+            // zonvie's CLI validation paths.
+            ZonvieCore.appLog("[start] handleCoreStartFailure: exit(1)")
+            Darwin.exit(1)
         }
     }
 

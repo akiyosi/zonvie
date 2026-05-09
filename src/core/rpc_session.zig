@@ -2,6 +2,7 @@
 // Extracted from nvim_core.zig. Free functions take *Core as first parameter.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
 const highlight = @import("highlight.zig");
@@ -14,9 +15,10 @@ const flush = @import("flush.zig");
 const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
+const rpc_transport = @import("rpc_transport.zig");
 
 pub const PipeReader = struct {
-    file: std.fs.File,
+    file: rpc_transport.Stream,
     buf: [8192]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
@@ -77,7 +79,7 @@ pub const PipeReader = struct {
 /// The buffer grows on demand up to `max_capacity` when a single frame
 /// exceeds the current capacity with no consumable tail to compact.
 pub const FrameReader = struct {
-    file: std.fs.File,
+    file: rpc_transport.Stream,
     alloc: std.mem.Allocator,
     buf: []u8,
     pos: usize = 0,
@@ -85,7 +87,7 @@ pub const FrameReader = struct {
 
     pub const initial_capacity: usize = 64 * 1024;
 
-    pub fn init(alloc: std.mem.Allocator, file: std.fs.File) !FrameReader {
+    pub fn init(alloc: std.mem.Allocator, file: rpc_transport.Stream) !FrameReader {
         const buf = try alloc.alloc(u8, initial_capacity);
         return .{ .file = file, .alloc = alloc, .buf = buf };
     }
@@ -237,29 +239,110 @@ pub const CwdOwner = struct {
     }
 };
 
-pub fn pumpStderr(self: *Core, f: std.fs.File) void {
-    var buf: [4096]u8 = undefined;
-    while (!self.stop_flag.load(.seq_cst)) {
-        const n = f.read(&buf) catch break;
-        if (n == 0) break;
+/// Heap-allocated stderr pump state, refcount-managed so Core and the
+/// pump thread can release their references independently. This
+/// matters for the `:connect` orphan path: the old nvim keeps its
+/// stderr writer open after we hot-swap, our blocked POSIX read does
+/// not wake when we close our copy of the fd from cleanupSession, so
+/// the pump must run detached until the orphan eventually closes
+/// stderr — which can outlive Core itself if zonvie quits before the
+/// orphan does. At the same time, the pump can exit at ANY moment
+/// (orphan dies before cleanupSession reaches detachFromCore), so a
+/// raw self-destroy in run()'s defer would race Core's pointer use.
+///
+/// Lifetime contract:
+///   - At spawn, refcount = 2: one ref for Core (held via
+///     Core.stderr_pump), one ref for the pump thread.
+///   - Each holder calls release() exactly once when done. The last
+///     release closes f and frees the struct.
+///   - Core MUST keep its ref live across any access to the struct
+///     (detachFromCore, etc.) and call release() afterwards. Orphan
+///     path: detachFromCore + release; non-orphan: thread.join (which
+///     drops the thread's ref) then Core's release.
+///
+/// Core access (the `core` pointer) is gated by `mu`.
+/// cleanupSession's orphan path calls detachFromCore() (which holds
+/// mu while nulling the back-pointer) before letting Core go away;
+/// subsequent pump iterations see core==null inside the lock and skip
+/// every dereference. The mutex being inside the heap struct (not in
+/// Core) is what makes this safe — it outlives Core for the duration
+/// of the detached pump.
+///
+/// `alloc` MUST outlive every release(). Callers pass
+/// std.heap.c_allocator (process-lifetime) instead of CoreBox's GPA
+/// so a detached pump's eventual destroy still targets a valid
+/// allocator after zonvie_core_destroy has done box.gpa.deinit().
+pub const StderrPump = struct {
+    alloc: std.mem.Allocator,
+    f: rpc_transport.Stream,
+    mu: std.Thread.Mutex,
+    core: ?*Core,
+    refcount: std.atomic.Value(u32),
 
-        // Log stderr output
-        if (self.cb.on_log) |logfn| logfn(self.ctx, buf[0..n].ptr, n);
+    /// Drop one reference. When the count drops to zero, close the
+    /// fd and free the struct. Safe to call from any thread.
+    pub fn release(self: *StderrPump) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.f.close();
+            self.alloc.destroy(self);
+        }
+    }
 
-        // SSH mode: detect password prompt in stderr
-        if (self.is_ssh_mode and !self.ssh_auth_done.load(.seq_cst)) {
-            const data = buf[0..n];
-            // Check for common password prompts (case-insensitive check for "password")
-            if (containsPasswordPrompt(data)) {
-                self.log.write("SSH: detected password prompt in stderr\n", .{});
-                if (self.cb.on_ssh_auth_prompt) |cb| {
-                    self.ssh_auth_pending.store(true, .seq_cst);
-                    cb(self.ctx, "SSH Password:", 13);
+    /// Run the pump until EOF / read error. Called from the pump
+    /// thread; never directly. Drops the thread's ref on exit.
+    pub fn run(self: *StderrPump) void {
+        defer self.release();
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            // Stop check: Core may have flagged termination.
+            {
+                self.mu.lock();
+                defer self.mu.unlock();
+                if (self.core) |c| {
+                    if (c.stop_flag.load(.seq_cst)) break;
+                }
+            }
+
+            const n = self.f.read(&buf) catch break;
+            if (n == 0) break;
+
+            // Logging + SSH detection. Both touch Core, so guarded
+            // by the same mutex. After detachFromCore() this branch
+            // is a no-op — orphaned pumps simply discard the data.
+            // (We could keep logging via a captured on_log function
+            // pointer + ctx — both App-owned, safe across Core
+            // teardown — but that adds another snapshot field for
+            // a feature the orphan path does not need.)
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.core) |c| {
+                if (c.cb.on_log) |logfn| logfn(c.ctx, buf[0..n].ptr, n);
+
+                if (c.is_ssh_mode and !c.ssh_auth_done.load(.seq_cst)) {
+                    if (containsPasswordPrompt(buf[0..n])) {
+                        c.log.write("SSH: detected password prompt in stderr\n", .{});
+                        if (c.cb.on_ssh_auth_prompt) |prompt_cb| {
+                            c.ssh_auth_pending.store(true, .seq_cst);
+                            prompt_cb(c.ctx, "SSH Password:", 13);
+                        }
+                    }
                 }
             }
         }
     }
-}
+
+    /// Sever the pump's back-reference to Core under the pump's own
+    /// mutex. After this returns, the pump will not dereference Core
+    /// in any subsequent iteration, and the caller is free to deinit
+    /// Core. Safe to call from any thread; caller MUST hold a ref to
+    /// the pump for the duration of this call.
+    pub fn detachFromCore(self: *StderrPump) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.core = null;
+    }
+};
 
 /// Check if data contains a password prompt (case-insensitive)
 pub fn containsPasswordPrompt(data: []const u8) bool {
@@ -780,6 +863,8 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             flush.FlushCtx.onLinespace,
             flush.FlushCtx.onSetTitle,
             flush.FlushCtx.onDefaultColors,
+            flush.FlushCtx.onRestart,
+            flush.FlushCtx.onConnect,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
         };
@@ -1122,6 +1207,15 @@ pub fn runLoop(self: *Core) void {
         contains_ssh_exe or
         (is_cmd and std.mem.indexOf(u8, nvim_path, "ssh") != null);
 
+    // Remote modes wrap nvim in an indirection (ssh / devcontainer / wsl /
+    // shell / cmd). The listen_addr returned by a `:restart` event lives
+    // inside that indirection and is not reachable from the host, so a
+    // restart in remote mode falls back to re-spawn instead of socket
+    // connect. Pure native sessions (and any future "connect to running
+    // nvim" entry point) get the proper transparent reconnect.
+    const is_remote_for_restart = is_wsl or is_ssh or is_ssh_askpass or
+        is_cmd or is_shell or is_devcontainer;
+
     // Buffer for parsed arguments
     var argv_buf: [16][]const u8 = undefined;
     var argc: usize = 0;
@@ -1254,314 +1348,797 @@ pub fn runLoop(self: *Core) void {
     logEnvHints(self);
     self.log.write("[MARKER] after logEnvHints\n", .{});
 
-    var child = std.process.Child.init(argv_buf[0..argc], self.alloc);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.create_no_window = true;
+    // === Session loop ===
+    //
+    // First iteration spawns nvim (or, in the future, opens an initial
+    // socket connection — currently not yet a separate entry point).
+    // Subsequent iterations are entered only when a `:restart` event
+    // queued `restart_pending_addr`. In that case:
+    //   - Native mode:   open a socket to listen_addr (transparent reconnect).
+    //   - Remote mode:   re-spawn the same argv (listen_addr unreachable).
+    //   - Connect failure: same as remote — fall back to re-spawn.
+    //
+    // Persistent state (grid, hl, atlas, ext UI, layout dimensions) carries
+    // across iterations untouched, so the user sees no flicker on `:restart`.
+    var ui_attached_overall: bool = false;
+    var last_term: ?std.process.Child.Term = null;
+    // Set true on any session-fatal failure path that breaks :session
+    // without producing a usable last_term. Covers connect failures
+    // (remote :connect, connect-only mode, hot-swap fallback skip),
+    // spawn failure, ui_attach send failure, transport init failure.
+    // The on_exit code path below uses this to override the
+    // ui_attached_overall=true → exit 0 default — once a session has
+    // attached at least once, a later attach/connect failure would
+    // otherwise look like a clean exit to scripts wrapping zonvie.
+    var session_failed: bool = false;
 
-    var cwd_owner: CwdOwner = .{};
-    defer cwd_owner.close();
-    if (!self.inherit_cwd) {
-        cwd_owner.openPreferred(self.alloc, &self.log);
-        cwd_owner.applyToChild(&child);
-    } else {
-        self.log.write("inherit_cwd=true; child inherits parent cwd\n", .{});
-    }
-
-    // Check for path separators - both '/' (Unix) and '\' (Windows)
-    const has_slash = (std.mem.indexOfScalar(u8, nvim_path, '/') != null) or
-        (std.mem.indexOfScalar(u8, nvim_path, '\\') != null);
-    if (@hasField(@TypeOf(child), "expand_arg0")) {
-        child.expand_arg0 = if (has_slash) .no_expand else .expand;
-    }
-    self.log.write("expand_arg0: has_slash={}, mode={s}\n", .{ has_slash, if (has_slash) "no_expand" else "expand" });
-
-    self.log.write("about to spawn...\n", .{});
-    // Direct callback log before spawn
-    if (self.cb.on_log) |logfn| {
-        const msg1 = "[DIRECT] calling child.spawn() now\n";
-        logfn(self.ctx, msg1.ptr, msg1.len);
-    }
-    const spawn_start_ns = std.time.nanoTimestamp();
-    child.spawn() catch |e| {
-        self.log.write("spawn failed: {any}\n", .{e});
-        if (self.cb.on_log) |logfn| {
-            const msg_err = "[DIRECT] spawn error occurred\n";
-            logfn(self.ctx, msg_err.ptr, msg_err.len);
-        }
-        return;
-    };
-    const spawn_end_ns = std.time.nanoTimestamp();
-    const spawn_ms = @divTrunc(spawn_end_ns - spawn_start_ns, 1_000_000);
-    // Direct callback log after spawn
-    if (self.cb.on_log) |logfn| {
-        const msg2 = "[DIRECT] child.spawn() returned successfully\n";
-        logfn(self.ctx, msg2.ptr, msg2.len);
-    }
-    self.log.write("[TIMING] nvim spawn: {d}ms\n", .{spawn_ms});
-    self.log.write("spawn returned ok, pid={any}\n", .{child.id});
-
-    // Note: Don't try to read stderr here - it blocks if no data available
-
-    self.child_handle = child.id;
-    self.stdin_file = child.stdin;
-    self.stdout_file = child.stdout;
-    self.stderr_file = child.stderr;
-
-    // OWNERSHIP TRANSFER:
-    // We keep the pipe handles in Core, so prevent std.process.Child from closing them.
-    child.stdin = null;
-    child.stdout = null;
-    child.stderr = null;
-
-    if (self.stderr_file) |ef| {
-        self.stderr_thread = std.Thread.spawn(.{}, pumpStderr, .{ self, ef }) catch null;
-    }
-
-    // Start writer thread for non-blocking stdin writes.
-    // SSH mode defers this until after authentication completes (see below).
-    if (!self.is_ssh_mode) {
-        self.startWriterThread();
-    }
-
-    // SSH mode: prompt for password immediately after process start
-    // With -tt option, password prompt goes to TTY (not visible via pipes)
-    // So we show dialog immediately and wait for user to enter password
-    if (self.is_ssh_mode) {
-        self.log.write("SSH mode: prompting for password immediately...\n", .{});
-
-        // Set pending flag to block other stdin writes (RPC sends)
-        self.ssh_auth_pending.store(true, .seq_cst);
-
-        // Small delay to let SSH start
-        std.Thread.sleep(200 * std.time.ns_per_ms);
-
-        // Call callback to show password dialog
-        if (self.cb.on_ssh_auth_prompt) |cb| {
-            cb(self.ctx, "SSH Password:", 13);
-
-            // Wait for password to be sent (ssh_auth_done flag)
-            self.log.write("SSH mode: waiting for user to enter password...\n", .{});
-            var waited_ms: u32 = 0;
-            const timeout_ms: u32 = 60000; // 60 seconds
-            const poll_ms: u32 = 100;
-
-            while (waited_ms < timeout_ms and !self.stop_flag.load(.seq_cst)) {
-                if (self.ssh_auth_done.load(.seq_cst)) {
-                    self.log.write("SSH mode: password sent, waiting for connection...\n", .{});
-                    // Give SSH time to authenticate
-                    std.Thread.sleep(2000 * std.time.ns_per_ms);
-                    break;
+    session: while (true) {
+        var session_addr: ?[]u8 = null;
+        var use_connect: bool = false;
+        // Snapshot whether the pending session was queued by `:connect`
+        // (hot-swap, old nvim orphaned) vs `:restart` (old nvim dead).
+        // Consumed below so a subsequent fall-through to spawn doesn't
+        // see stale state.
+        var was_connect_hotswap: bool = false;
+        if (self.restart_pending_addr) |a| {
+            self.restart_pending_addr = null;
+            was_connect_hotswap = self.restart_pending_is_connect_hotswap;
+            self.restart_pending_is_connect_hotswap = false;
+            if (is_remote_for_restart) {
+                if (was_connect_hotswap) {
+                    // Remote-mode `:connect` hot-swap: the new server's
+                    // listen socket lives inside the SSH / WSL /
+                    // devcontainer / shell wrapper and is not reachable
+                    // from the host, so we can't attach. The old nvim has
+                    // already been orphaned by cleanup, so falling through
+                    // to spawn the original argv would launch a wholly new
+                    // remote session unrelated to the user's editing state
+                    // in the orphan. Surface the failure via on_exit
+                    // instead.
+                    self.log.write("connect: remote-mode :connect cannot reach new server's listen socket and old nvim is orphaned; not spawning surprise replacement; exiting run loop (addr={s})\n", .{a});
+                    self.alloc.free(a);
+                    session_failed = true;
+                    break :session;
                 }
-                std.Thread.sleep(poll_ms * std.time.ns_per_ms);
-                waited_ms += poll_ms;
+                self.log.write("restart: remote mode, re-spawning instead of connecting (addr={s})\n", .{a});
+                self.alloc.free(a);
+            } else {
+                session_addr = a;
+                use_connect = true;
+            }
+        }
+        defer if (session_addr) |a| self.alloc.free(a);
+
+        // === Set up transport ===
+        var have_child: bool = false;
+        var child: std.process.Child = undefined;
+        var cwd_owner: CwdOwner = .{};
+        defer cwd_owner.close();
+
+        if (use_connect) {
+            const conn_opt: ?rpc_transport.Stream = rpc_transport.connectListenAddr(self.alloc, session_addr.?) catch |e| blk: {
+                self.log.write("connect to {s} failed: {any}; falling back to re-spawn\n", .{ session_addr.?, e });
+                break :blk null;
+            };
+            if (conn_opt) |conn| {
+                self.transport_kind = .socket;
+                self.stdin_file = conn;
+                self.stdout_file = conn; // alias of the same fd / pipe wrapper
+                self.stderr_file = null;
+                // For Windows named pipes the Stream wraps a heap-allocated
+                // *WindowsOverlappedPipe. Save the owning pointer so we can
+                // destroy() the wrapper *after* the writer/stderr threads
+                // have been joined — Stream.close() only fires CancelIoEx
+                // on the pipe HANDLE (no HANDLE close yet) so blocked
+                // GetOverlappedResult calls return without their HANDLE
+                // references being closed mid-wait. The pipe HANDLE, the
+                // event HANDLEs, and the wrapper memory are all released
+                // together by destroy(). Without this separate ownership
+                // pointer, the alias-null in stop()/cleanupSession would
+                // drop our only reference and the wrapper would leak.
+                self.session_pipe = switch (conn) {
+                    .win_pipe => |p| p,
+                    .file => null,
+                };
+                self.log.write("connect: established socket session to {s}\n", .{session_addr.?});
+            } else if (nvim_path.len == 0) {
+                // Connect-only mode (started via zonvie_core_start_connect): no
+                // argv to fall back to. Exit cleanly without spawning a
+                // surprise local nvim.
+                self.log.write("connect: no spawn fallback (connect-only mode); exiting run loop\n", .{});
+                session_failed = true;
+                break :session;
+            } else if (was_connect_hotswap) {
+                // `:connect` hot-swap: the old nvim is already orphaned
+                // (kept alive headless on its own listen socket — the user
+                // can still reach it manually). Falling through to spawn
+                // the original argv would open a brand-new local nvim
+                // session that is unrelated to the user's editing state in
+                // the orphan, leaving them with TWO disconnected sessions.
+                // Exit cleanly so the frontend (via on_exit) can surface
+                // the failure instead.
+                self.log.write("connect: :connect hot-swap connect failed and old nvim is orphaned; not spawning surprise local fallback; exiting run loop\n", .{});
+                session_failed = true;
+                break :session;
+            } else {
+                use_connect = false; // fall through to spawn
+            }
+        }
+
+        if (!use_connect) {
+            child = std.process.Child.init(argv_buf[0..argc], self.alloc);
+            child.stdin_behavior = .Pipe;
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Pipe;
+            child.create_no_window = true;
+
+            if (!self.inherit_cwd) {
+                cwd_owner.openPreferred(self.alloc, &self.log);
+                cwd_owner.applyToChild(&child);
+            } else {
+                self.log.write("inherit_cwd=true; child inherits parent cwd\n", .{});
             }
 
-            if (waited_ms >= timeout_ms) {
-                self.log.write("SSH mode: authentication timeout\n", .{});
+            const has_slash = (std.mem.indexOfScalar(u8, nvim_path, '/') != null) or
+                (std.mem.indexOfScalar(u8, nvim_path, '\\') != null);
+            if (@hasField(@TypeOf(child), "expand_arg0")) {
+                child.expand_arg0 = if (has_slash) .no_expand else .expand;
+            }
+            self.log.write("expand_arg0: has_slash={}, mode={s}\n", .{ has_slash, if (has_slash) "no_expand" else "expand" });
+
+            self.log.write("about to spawn...\n", .{});
+            if (self.cb.on_log) |logfn| {
+                const msg1 = "[DIRECT] calling child.spawn() now\n";
+                logfn(self.ctx, msg1.ptr, msg1.len);
+            }
+            const spawn_start_ns = std.time.nanoTimestamp();
+            child.spawn() catch |e| {
+                self.log.write("spawn failed: {any}\n", .{e});
+                if (self.cb.on_log) |logfn| {
+                    const msg_err = "[DIRECT] spawn error occurred\n";
+                    logfn(self.ctx, msg_err.ptr, msg_err.len);
+                }
+                session_failed = true;
+                break :session;
+            };
+            const spawn_end_ns = std.time.nanoTimestamp();
+            const spawn_ms = @divTrunc(spawn_end_ns - spawn_start_ns, 1_000_000);
+            if (self.cb.on_log) |logfn| {
+                const msg2 = "[DIRECT] child.spawn() returned successfully\n";
+                logfn(self.ctx, msg2.ptr, msg2.len);
+            }
+            self.log.write("[TIMING] nvim spawn: {d}ms\n", .{spawn_ms});
+            self.log.write("spawn returned ok, pid={any}\n", .{child.id});
+
+            self.transport_kind = .pipes;
+            self.child_handle = child.id;
+            self.stdin_file = if (child.stdin) |f| rpc_transport.Stream.fromFile(f) else null;
+            self.stdout_file = if (child.stdout) |f| rpc_transport.Stream.fromFile(f) else null;
+            self.stderr_file = if (child.stderr) |f| rpc_transport.Stream.fromFile(f) else null;
+
+            // OWNERSHIP TRANSFER: keep handles in Core; prevent Child from closing them.
+            child.stdin = null;
+            child.stdout = null;
+            child.stderr = null;
+
+            have_child = true;
+
+            if (self.stderr_file) |ef| {
+                // Allocate the pump state on the heap so it can outlive
+                // Core (orphan path). Pump thread frees it on exit.
+                //
+                // Use std.heap.c_allocator instead of self.alloc here:
+                // an orphan-detached pump can still be running when
+                // zonvie_core_destroy calls box.gpa.deinit(), at which
+                // point self.alloc would be a dead allocator interface.
+                // c_allocator is process-lifetime, so the pump's later
+                // self.alloc.destroy(self) is always safe.
+                const pump_alloc = std.heap.c_allocator;
+                const pump = pump_alloc.create(StderrPump) catch null;
+                if (pump) |p| {
+                    p.* = .{
+                        .alloc = pump_alloc,
+                        .f = ef,
+                        .mu = .{},
+                        .core = self,
+                        // refcount = 2 from the start: one for Core
+                        // (kept via self.stderr_pump until cleanup
+                        // calls release), one for the pump thread
+                        // (released by run()'s defer). Pre-set so the
+                        // thread can't observe a stale 0.
+                        .refcount = std.atomic.Value(u32).init(2),
+                    };
+                    self.stderr_pump = p;
+                    self.stderr_thread = std.Thread.spawn(.{}, StderrPump.run, .{p}) catch blk: {
+                        // Spawn failed: thread never started so it
+                        // never took its ref. We are the only holder;
+                        // free the struct and close the fd directly,
+                        // no need to go through release().
+                        p.f.close();
+                        pump_alloc.destroy(p);
+                        self.stderr_pump = null;
+                        break :blk null;
+                    };
+                } else {
+                    // Allocation failed: nothing else owns this fd
+                    // (child.stderr is already null after the ownership
+                    // transfer above), so close it here. cleanupSession
+                    // assumes the pump owns the fd and would only null
+                    // self.stderr_file without closing.
+                    ef.close();
+                }
+                // Ownership of stderr_file has been transferred:
+                //   - alloc + spawn ok: pump owns; freed by run()'s defer.
+                //   - spawn failed: catch above closed and freed pump.
+                //   - alloc failed: closed in the else branch above.
+                // In all cases Core no longer holds the fd.
+                self.stderr_file = null;
+            }
+
+            // SSH mode defers writer thread until after authentication completes.
+            if (!self.is_ssh_mode) {
+                self.startWriterThread();
+            }
+
+            if (self.is_ssh_mode) {
+                self.log.write("SSH mode: prompting for password immediately...\n", .{});
+                self.ssh_auth_pending.store(true, .seq_cst);
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+
+                if (self.cb.on_ssh_auth_prompt) |cb| {
+                    cb(self.ctx, "SSH Password:", 13);
+                    self.log.write("SSH mode: waiting for user to enter password...\n", .{});
+                    var waited_ms: u32 = 0;
+                    const timeout_ms: u32 = 60000;
+                    const poll_ms: u32 = 100;
+
+                    while (waited_ms < timeout_ms and !self.stop_flag.load(.seq_cst)) {
+                        if (self.ssh_auth_done.load(.seq_cst)) {
+                            self.log.write("SSH mode: password sent, waiting for connection...\n", .{});
+                            std.Thread.sleep(2000 * std.time.ns_per_ms);
+                            break;
+                        }
+                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                        waited_ms += poll_ms;
+                    }
+
+                    if (waited_ms >= timeout_ms) {
+                        self.log.write("SSH mode: authentication timeout\n", .{});
+                    }
+                } else {
+                    self.log.write("SSH mode: no callback registered\n", .{});
+                }
+
+                self.ssh_auth_pending.store(false, .seq_cst);
+                self.startWriterThread();
+
+                if (self.stop_flag.load(.seq_cst)) {
+                    self.log.write("SSH mode: stopped by user\n", .{});
+                    _ = cleanupSession(self, &child, have_child, false, false);
+                    break :session;
+                }
             }
         } else {
-            self.log.write("SSH mode: no callback registered\n", .{});
+            // Connect mode has no child process; the writer thread can
+            // start immediately (no SSH auth in this path).
+            self.startWriterThread();
         }
 
-        // Clear pending flag and start writer thread now that auth is done
-        self.ssh_auth_pending.store(false, .seq_cst);
-        self.startWriterThread();
+        var ui_attached: bool = false;
+
+        // Block until layout is ready (set by notifyLayoutReady on first
+        // start). For restart iterations ui_attach_ready is already true,
+        // so this falls through immediately.
+        {
+            self.ui_attach_mutex.lock();
+            defer self.ui_attach_mutex.unlock();
+            while (!self.ui_attach_ready) {
+                if (self.stop_flag.load(.seq_cst)) break;
+                self.ui_attach_cond.wait(&self.ui_attach_mutex);
+            }
+        }
 
         if (self.stop_flag.load(.seq_cst)) {
-            self.log.write("SSH mode: stopped by user\n", .{});
-            return;
+            _ = cleanupSession(self, &child, have_child, false, false);
+            break :session;
         }
-    }
 
-    var ui_attached = false;
+        self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
+        self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
 
-    // Block until layout is ready (ui_attach_cond signaled by notifyLayoutReady)
-    {
-        self.ui_attach_mutex.lock();
-        defer self.ui_attach_mutex.unlock();
-        while (!self.ui_attach_ready) {
-            if (self.stop_flag.load(.seq_cst)) break;
-            self.ui_attach_cond.wait(&self.ui_attach_mutex);
-        }
-    }
-
-    if (self.stop_flag.load(.seq_cst)) {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    }
-
-    self.log.write("[rpc] layout ready: rows={d} cols={d}, sending ui_attach\n", .{ self.ui_attach_rows, self.ui_attach_cols });
-    self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
-
-    // If config.toml [font] family is set, push it to nvim's `guifont` BEFORE
-    // ui_attach. Sending it after ui_attach would arrive mid-redraw: nvim
-    // would emit an option_set during its initial paint, then re-emit after
-    // processing our set. The second paint round-trip caused the statusline
-    // to briefly drop its text on Windows at startup.
-    if (self.msg_config.font.family_explicit) {
-        var guifont_buf: [256]u8 = undefined;
-        const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
-            self.msg_config.font.family,
-            self.msg_config.font.size,
-        }) catch null;
-        if (guifont_str) |val| {
-            self.requestSetOptionValue("guifont", val) catch |e|
-                self.log.write("pre-attach set guifont failed: {any}\n", .{e});
-        }
-    }
-
-    self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
-        self.log.write("ui_attach send failed: {any}\n", .{e});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    };
-    ui_attached = true;
-    self.ui_attached.store(true, .seq_cst);
-    self.flushPendingFocus();
-
-    // Setup clipboard immediately after ui_attach (no get_api_info
-    // round-trip). The Lua code discovers our channel_id via
-    // nvim_list_chans() + client.name match.
-    setupClipboard(self);
-
-    // Glow config is requested via glow_startup_retries during flush processing.
-
-    if (self.pending_resize_valid) {
-        const pr2 = self.pending_resize_rows;
-        const pc2 = self.pending_resize_cols;
-        if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
-            self.pending_resize_valid = false;
-            self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
-        } else {
-            self.requestTryResize(pr2, pc2) catch |e| {
-                self.log.write("pending resize send failed: {any}\n", .{e});
-            };
-            self.pending_resize_valid = false;
-            self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
-        }
-    }
-
-    if (self.stdout_file == null) {
-        self.log.write("stdout pipe is null\n", .{});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    }
-
-    // Contiguous buffered reader. Replaces the byte-at-a-time PipeReader so
-    // the MessagePack decoder sees a `[]const u8` slice it can advance through.
-    // The buffer grows on demand when a single RPC frame exceeds the current
-    // capacity (e.g., a wide-grid `grid_line` carrying thousands of cells).
-    var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
-        self.log.write("FrameReader init failed: {any}\n", .{e});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    };
-    defer fr.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-    defer arena_state.deinit();
-
-    outer: while (!self.stop_flag.load(.seq_cst)) {
-        // Refill-on-EOF retry loop. The arena is reset between retries so
-        // that partial allocations from a failed decode don't accumulate.
-        //
-        // Note: an earlier iteration of this loop included a streaming
-        // fast path (probe + skipAny + `decodeFromStream`) for redraw
-        // notifications. Microbenchmarks (`zig build bench`) showed it
-        // was 1.24x–1.94x slower on the decode path alone — as long as
-        // handlers keep consuming `Value` trees, the streaming decoder
-        // loses both to the second scan pass and to the extra
-        // `ValueHead` dispatch layer. The fast path was removed; the
-        // streaming decoder (`src/core/mpack_stream.zig`) and its bridge
-        // helper (`msgpack.decodeFromStream`) are retained as reference
-        // implementations for any future rewrite that streams through
-        // the handlers directly (i.e., drops the intermediate `Value`
-        // tree on the `grid_line` hot path).
-        var root: mp.Value = undefined;
-        while (true) {
-            _ = arena_state.reset(.retain_capacity);
-            const arena_once = arena_state.allocator();
-
-            var sr = FrameSliceReader{ .data = fr.view() };
-            if (mp.decode(arena_once, &sr)) |v| {
-                fr.consume(sr.i);
-                root = v;
-                break;
-            } else |e| {
-                if (e == error.EndOfStream) {
-                    const n = fr.fill() catch |fe| {
-                        self.log.write("pipe read err: {any}\n", .{fe});
-                        break :outer;
-                    };
-                    if (n == 0) {
-                        self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
-                        break :outer;
-                    }
-                    continue;
-                }
-                self.log.write("decode err: {any}\n", .{e});
-                break :outer;
+        // If config.toml [font] family is set, push it to nvim's `guifont`
+        // BEFORE ui_attach (avoids a second paint round-trip; see original
+        // statusline-on-Windows note for context).
+        if (self.msg_config.font.family_explicit) {
+            var guifont_buf: [256]u8 = undefined;
+            const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
+                self.msg_config.font.family,
+                self.msg_config.font.size,
+            }) catch null;
+            if (guifont_str) |val| {
+                self.requestSetOptionValue("guifont", val) catch |e|
+                    self.log.write("pre-attach set guifont failed: {any}\n", .{e});
             }
         }
 
-        const arena = arena_state.allocator();
-        if (root != .arr or root.arr.len < 1) continue;
-        const top = root.arr;
-        if (top[0] != .int) continue;
+        self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
+            self.log.write("ui_attach send failed: {any}\n", .{e});
+            _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
+            break :session;
+        };
+        ui_attached = true;
+        ui_attached_overall = true;
+        self.ui_attached.store(true, .seq_cst);
+        self.flushPendingFocus();
 
-        const t = top[0].int;
-        if (t == 0) {
-            // RPC request from Neovim (e.g., clipboard operations)
-            handleRpcRequest(self, arena, top);
-            continue;
+        // Discover our channel_id via vim.api.nvim_list_chans() and install
+        // the clipboard provider hooks.
+        setupClipboard(self);
+
+        if (self.pending_resize_valid) {
+            const pr2 = self.pending_resize_rows;
+            const pc2 = self.pending_resize_cols;
+            if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
+                self.pending_resize_valid = false;
+                self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
+            } else {
+                self.requestTryResize(pr2, pc2) catch |e| {
+                    self.log.write("pending resize send failed: {any}\n", .{e});
+                };
+                self.pending_resize_valid = false;
+                self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
+            }
         }
-        if (t == 1) {
-            // RPC response (e.g., quit request result)
-            handleRpcResponse(self, top);
-            continue;
+
+        if (self.stdout_file == null) {
+            self.log.write("read transport is null\n", .{});
+            _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
+            break :session;
         }
-        if (t == 2) {
-            handleRpcNotification(self, arena, top);
-            continue;
+
+        var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
+            self.log.write("FrameReader init failed: {any}\n", .{e});
+            _ = cleanupSession(self, &child, have_child, true, false);
+            session_failed = true;
+            break :session;
+        };
+        defer fr.deinit();
+
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+
+        // Tracks how the inner loop exited:
+        //   false = natural EOF / read error / stop_flag (local restart
+        //           takes this path — nvim is exiting on its own)
+        //   true  = early break because a remote-mode restart/connect
+        //           is queued and the wrapper stdio will never EOF
+        // Passed to cleanupSession as `kill_on_restart_pending`.
+        var remote_restart_break: bool = false;
+
+        // Inner reader loop — same for both transports. Earlier iterations
+        // experimented with a streaming fast path here; microbenchmarks
+        // showed the Value-tree path was 1.24x–1.94x faster, so the
+        // streaming machinery (mpack_stream / decodeFromStream) is kept
+        // only as a reference implementation.
+        outer: while (!self.stop_flag.load(.seq_cst)) {
+            var root: mp.Value = undefined;
+            while (true) {
+                _ = arena_state.reset(.retain_capacity);
+                const arena_once = arena_state.allocator();
+
+                var sr = FrameSliceReader{ .data = fr.view() };
+                if (mp.decode(arena_once, &sr)) |v| {
+                    fr.consume(sr.i);
+                    root = v;
+                    break;
+                } else |e| {
+                    if (e == error.EndOfStream) {
+                        const n = fr.fill() catch |fe| {
+                            self.log.write("pipe read err: {any}\n", .{fe});
+                            break :outer;
+                        };
+                        if (n == 0) {
+                            self.log.write("decode err: EndOfStream (nvim stdout closed)\n", .{});
+                            break :outer;
+                        }
+                        continue;
+                    }
+                    self.log.write("decode err: {any}\n", .{e});
+                    break :outer;
+                }
+            }
+
+            const arena = arena_state.allocator();
+            if (root != .arr or root.arr.len < 1) continue;
+            const top = root.arr;
+            if (top[0] != .int) continue;
+
+            const t = top[0].int;
+            if (t == 0) {
+                handleRpcRequest(self, arena, top);
+                continue;
+            }
+            if (t == 1) {
+                handleRpcResponse(self, top);
+                continue;
+            }
+            if (t == 2) {
+                handleRpcNotification(self, arena, top);
+                // If the notification queued a restart/connect, decide
+                // whether to break the inner loop NOW or wait for the
+                // natural channel close.
+                //
+                // Remote modes (SSH / WSL / devcontainer / cmd / shell):
+                // the new nvim inherits stdio from the wrapper which
+                // never EOFs, so we MUST break here — otherwise we'd be
+                // stuck reading forever. cleanupSession will then kill
+                // the wrapper to unblock wait().
+                //
+                // Local spawn: nvim is in the middle of its own clean
+                // shutdown (channel close + process exit). Breaking
+                // here would force cleanupSession to kill nvim mid-
+                // shutdown, racing with shada/viminfo flush, swap file
+                // deletion, etc. Instead, fall through and let the
+                // inner loop see the natural EOF (decode err path
+                // above), which breaks out cleanly. The kill in
+                // cleanupSession is then a true no-op on the already-
+                // exited child.
+                if (self.restart_pending_addr != null) {
+                    if (is_remote_for_restart) {
+                        self.log.write("inner loop: restart/connect queued (remote); breaking immediately\n", .{});
+                        remote_restart_break = true;
+                        break :outer;
+                    }
+                    self.log.write("inner loop: restart/connect queued (local); waiting for natural EOF\n", .{});
+                }
+                continue;
+            }
         }
+
+        // === Session cleanup ===
+        // Natural inner-loop exit. cleanupSession's kill conditions cover
+        // stop_flag (user stop) automatically, so we don't force-kill
+        // here. `kill_on_restart_pending = remote_restart_break` lets
+        // remote-mode restarts kill the wrapper (whose stdio never EOFs)
+        // while local-mode restarts skip the kill so nvim can finish
+        // its own clean shutdown — channel close (EOF) is just one of
+        // the last steps in nvim's exit, not the end. Propagate the
+        // term so on_exit can compute the right exit code.
+        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any})\n", .{remote_restart_break});
+        if (cleanupSession(self, &child, have_child, false, remote_restart_break)) |t| last_term = t;
+        self.log.write("session loop: cleanupSession returned\n", .{});
+
+        // === Decide next iteration ===
+        if (self.stop_flag.load(.seq_cst)) {
+            // App-side stop() observed; do not fire on_exit, do not loop.
+            self.log.write("session loop: stop_flag set after cleanup; returning\n", .{});
+            return;
+        }
+
+        if (self.restart_pending_addr != null) {
+            // Restart/connect was queued during this session. Reset
+            // session-scoped state and loop back; the next iteration uses
+            // the connect path (or re-spawn fallback for remote modes).
+            // Consume the connect-keeps-alive flag now that the orphan
+            // (if any) has been dropped — the next session must not
+            // inherit it.
+            self.log.write("session loop: restart_pending; entering resetSessionState\n", .{});
+            self.connect_keeps_child_alive = false;
+            self.resetSessionState();
+            self.log.write("session loop: resetSessionState returned\n", .{});
+            if (self.stop_flag.load(.seq_cst)) return;
+            self.log.write("session loop: continuing to next iteration\n", .{});
+            continue :session;
+        }
+
+        // Natural exit: nvim closed the channel without queueing a restart.
+        self.log.write("session loop: no restart pending; breaking out\n", .{});
+        break :session;
     }
 
-    if (self.stop_flag.load(.seq_cst)) {
-        _ = child.kill() catch {};
-    }
-
-    const term = child.wait() catch |e| {
-        self.log.write("wait err: {any}\n", .{e});
-        return;
-    };
-    self.log.write("nvim terminated: {any}\n", .{term});
-    self.child_handle = null;
-
-
-    self.log.write("nvim terminated: {any}\n", .{term});
-    self.child_handle = null;
-
-    // If nvim exited by itself (e.g. :q), notify the frontend.
-    // When stop() is requested by the app side, stop_flag is set and we should not trigger on_exit.
-    if (!self.stop_flag.load(.seq_cst) and ui_attached) {
+    // === After-loop: fire on_exit ===
+    // Suppressed only when stop() was already invoked (user-driven shutdown:
+    // window close, app quit). For all other paths — including pre-attach
+    // failures like connect-only socket-not-found, spawn failure, ui_attach
+    // send failure, FrameReader init failure — we still fire on_exit so the
+    // frontend can tear down its window instead of leaving a blank shell.
+    if (!self.stop_flag.load(.seq_cst)) {
         if (self.cb.on_exit) |f| {
             // Convert Term to exit code:
-            // - Exited: use exit code directly
-            // - Signal: 128 + signal number (Unix convention)
-            // - Stopped/Unknown: return 1 (generic error)
-            const exit_code: i32 = switch (term) {
+            //   - session_failed (any session-fatal break path that is
+            //     NOT a clean child exit): 1. Checked first so a hot-
+            //     swap connect failure on an already-attached session
+            //     does not look like a clean exit just because
+            //     ui_attached_overall is true.
+            //   - Exited: use exit code directly
+            //   - Signal: 128 + signal number (Unix convention)
+            //   - Stopped/Unknown: return 1 (generic error)
+            //   - Natural exit in connect mode (no Term, ui attached): 0
+            //   - Pre-attach failure (no Term, never attached): 1
+            const exit_code: i32 = if (session_failed)
+                1
+            else if (last_term) |t| switch (t) {
                 .Exited => |code| @intCast(code),
                 .Signal => |sig| 128 + @as(i32, @intCast(sig)),
                 .Stopped, .Unknown => 1,
-            };
+            } else if (ui_attached_overall) 0 else 1;
             self.log.write("calling on_exit with code: {d}\n", .{exit_code});
             f(self.ctx, exit_code);
         }
     }
+}
+
+/// POSIX background reaper for `:connect` orphans. Without this, the
+/// orphaned headless nvim becomes a zombie when it eventually exits
+/// (e.g., `:connect!` from another UI, system shutdown), holding a
+/// kernel process-table entry until our process exits. The thread
+/// blocks in waitpid() until the orphan terminates, then naturally
+/// returns and self-cleans-up. Receives the Child by value so the
+/// owning runLoop frame can drop its local `child` without affecting
+/// the reaper.
+fn reapOrphanThread(orphan: std.process.Child) void {
+    var c = orphan;
+    _ = c.wait() catch {};
+}
+
+/// Tear down the current RPC session: stop the writer thread, close the
+/// transport (with socket-alias handling), reap the child (if any), and
+/// join the stderr pump. Safe to call from any session-exit path — both
+/// the natural inner-loop exit and the early-exit failure paths
+/// (ui_attach failure, FrameReader init failure, stop during ssh-auth,
+/// etc.). Safe to call when have_child is false.
+///
+/// `force_kill_child`: when true, unconditionally kill the child before
+/// wait(). Used by early-exit failure paths that do not set stop_flag /
+/// restart_pending_addr but still need the child to terminate promptly
+/// so wait() does not block (notably SSH / devcontainer / WSL where the
+/// wrapper holds stdio open until killed).
+///
+/// `kill_on_restart_pending`: when true, kill the child if a restart /
+/// connect is queued. True for the remote-mode inner-loop early-break
+/// path (SSH / WSL / devcontainer / cmd / shell), where the wrapper
+/// holds stdio open and child.wait() would block forever without an
+/// explicit kill. False for the local-spawn natural-EOF path, where
+/// nvim closed its channel while in the middle of its own clean
+/// shutdown — child.wait() will reap shortly on its own. Killing in
+/// the local case truncates nvim's shutdown work (shada / viminfo
+/// flush, swap file deletion, etc.) and violates the Neovim restart
+/// UI event contract: the UI must wait for channel close + natural
+/// process exit, not force-terminate the old server.
+///
+/// Returns the child's exit term, or null if not available (no child,
+/// orphaned for a `:connect` hot-swap, or wait() failed). The caller
+/// decides whether to propagate the term to `last_term` for on_exit's
+/// exit-code computation.
+fn cleanupSession(
+    self: *Core,
+    child: *std.process.Child,
+    have_child: bool,
+    force_kill_child: bool,
+    kill_on_restart_pending: bool,
+) ?std.process.Child.Term {
+    self.log.write("cleanupSession: enter (have_child={any} force_kill={any} kill_on_restart_pending={any} restart_pending={any} connect_keeps_child_alive={any})\n", .{
+        have_child,
+        force_kill_child,
+        kill_on_restart_pending,
+        self.restart_pending_addr != null,
+        self.connect_keeps_child_alive,
+    });
+    // Stop the writer thread before closing the transport so its
+    // in-flight writeAll() does not observe a torn-down handle.
+    var wt: ?std.Thread = null;
+    {
+        self.write_queue_mu.lock();
+        self.write_queue_closed = true;
+        wt = self.writer_thread;
+        self.writer_thread = null;
+        self.write_queue_cond.signal();
+        self.write_queue_mu.unlock();
+    }
+    self.log.write("cleanupSession: writer queue closed (wt_present={any})\n", .{wt != null});
+    // `:connect` hot-swap: the old nvim is still alive headless on
+    // its own listen socket and would block child.wait() forever
+    // (the process never exits). Don't kill, don't wait — just drop
+    // the handle. The orphan continues running until the user kills
+    // it manually. We still close OUR end of the pipes (just FDs in
+    // our process; doesn't affect the running nvim).
+    const orphan_child = self.connect_keeps_child_alive;
+
+    if (self.stdin_file) |f| {
+        // POSIX socket transport aliases stdin/stdout on the same fd.
+        // Issue shutdown(SHUT_RDWR) before close() so the writer
+        // thread (blocked in writeAll on the socket) returns EPIPE
+        // and exits — close() alone leaves it stuck, and the
+        // wt.join() below would hang. The reader does not run here
+        // (we are on the runLoop thread, post inner-loop exit), so
+        // it is naturally not affected.
+        self.log.write("cleanupSession: closing stdin (transport={any})\n", .{self.transport_kind});
+        f.shutdownIfSocket(self.transport_kind == .socket);
+        f.close();
+        self.stdin_file = null;
+        // Socket transport aliases stdin and stdout on the same fd —
+        // closing once fully tears down the connection. Null both
+        // pointers so downstream cleanup does not double-close.
+        if (self.transport_kind == .socket) {
+            self.stdout_file = null;
+        }
+        self.log.write("cleanupSession: stdin closed\n", .{});
+    }
+    if (wt) |t| {
+        self.log.write("cleanupSession: joining writer thread\n", .{});
+        t.join();
+        self.log.write("cleanupSession: writer thread joined\n", .{});
+    }
+
+    var session_term: ?std.process.Child.Term = null;
+    if (have_child) {
+        if (orphan_child) {
+            self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
+            // On Windows std.process.Child.Id is a HANDLE and there is
+            // also a thread_handle for the main thread. Normally
+            // child.wait() closes both, but the orphan path skips
+            // wait() (the headless nvim never exits in the foreground
+            // case, so wait would block). Close them explicitly so
+            // repeated :connect hot-swaps don't leak HANDLEs. The
+            // process keeps running because HANDLEs are merely kernel-
+            // object references, not the process itself.
+            //
+            // On POSIX the orphan is reaped by a detached background
+            // thread. id is a pid_t (just an integer, no kernel HANDLE
+            // to close), but if we never waitpid() the orphan, it
+            // becomes a zombie when it eventually exits. The thread
+            // blocks in child.wait() and reaps the zombie when the
+            // orphan terminates. child.stdin/stdout/stderr were nulled
+            // on spawn (lines 1426-1428) so wait()'s cleanupStreams is
+            // a no-op — no double-close races with our own pipe
+            // teardown above.
+            if (builtin.os.tag == .windows) {
+                std.os.windows.CloseHandle(child.id);
+                std.os.windows.CloseHandle(child.thread_handle);
+            } else {
+                if (std.Thread.spawn(.{}, reapOrphanThread, .{child.*})) |t| {
+                    t.detach();
+                } else |e| {
+                    self.log.write("orphan reaper spawn failed: {any}; pid {any} may zombie on exit\n", .{ e, child.id });
+                }
+            }
+            self.child_handle = null;
+        } else {
+            // Kill conditions:
+            //   - User stop (stop_flag): terminate promptly so we don't
+            //     block on wait().
+            //   - force_kill_child: early-exit failure paths haven't set
+            //     stop_flag, but still need the child reaped without
+            //     blocking on wait().
+            //   - restart/connect pending AND kill_on_restart_pending:
+            //     remote modes (SSH / WSL / devcontainer / cmd / shell)
+            //     where the wrapper holds stdio open after nvim exits.
+            //     Without an explicit kill, wait() blocks forever on
+            //     the wrapper. The local-spawn natural-EOF path passes
+            //     kill_on_restart_pending=false so we let nvim finish
+            //     its shutdown (shada / viminfo / swap file cleanup)
+            //     and reap via wait() — EOF is channel close, not
+            //     process exit, so racing a kill against the still-in-
+            //     progress teardown would truncate nvim's work.
+            const want_kill = force_kill_child or self.stop_flag.load(.seq_cst) or
+                (kill_on_restart_pending and self.restart_pending_addr != null);
+            if (want_kill) {
+                self.log.write("cleanupSession: killing child (pid={any})\n", .{child.id});
+                _ = child.kill() catch {};
+            }
+            self.log.write("cleanupSession: waiting for child (pid={any} want_kill={any})\n", .{ child.id, want_kill });
+            session_term = child.wait() catch |e| blk: {
+                self.log.write("wait err: {any}\n", .{e});
+                break :blk null;
+            };
+            if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
+            self.child_handle = null;
+        }
+    }
+
+    // Close any remaining transport handles. stderr_file is intentionally
+    // NOT closed here — its fd is owned by pumpStderr (which defer-closes
+    // on exit), so closing from this thread risks fd reuse if the pump's
+    // blocked read syscall hasn't yet observed EOF and the fd number is
+    // recycled by the next open() in our process. Just null the alias.
+    if (self.stdout_file) |f| {
+        self.log.write("cleanupSession: closing stdout\n", .{});
+        f.close();
+        self.stdout_file = null;
+        self.log.write("cleanupSession: stdout closed\n", .{});
+    }
+    self.stderr_file = null;
+
+    // Reap the stderr pump.
+    //   - Final-shutdown path (no restart pending, no orphan): child
+    //     died, its stderr writer closed, our pump read returned 0,
+    //     the pump thread is exiting (or already exited). join()
+    //     completes promptly.
+    //   - Orphan path (`:connect` hot-swap): the old nvim is still
+    //     running and holds the stderr writer open, so the pump is
+    //     stuck in a blocking read that close() on the read end does
+    //     NOT wake on POSIX. Joining would hang the run loop and
+    //     prevent attaching to the new server. Detach instead.
+    //   - Restart-pending path (`:restart`): even though the old
+    //     nvim has exited, the headless successor it spawned to host
+    //     the new session may have inherited a stray write reference
+    //     to our stderr pipe across the libuv fork (uv_spawn with
+    //     UV_IGNORE on stderr replaces the child's fd 2 with
+    //     /dev/null but does NOT close OTHER inherited fds without
+    //     CLOEXEC; if old nvim's libuv held a dup of fd 2 elsewhere,
+    //     the successor keeps our pipe writer open). The successor
+    //     outlives the run-loop here by design — we are about to
+    //     attach to it — so its inherited fd never closes during
+    //     this cleanup, and the pump's POSIX read() never sees EOF.
+    //     Joining would hang forever. Detach as in the orphan case;
+    //     the pump exits naturally when the successor eventually
+    //     closes its inherited fd (or zonvie exits first).
+    //
+    // For both detach paths we must call detachFromCore() BEFORE the
+    // pump might dereference Core, since Core may be torn down while
+    // the pump is still running. detachFromCore() takes the pump's
+    // own mutex, waiting for any in-flight Core access to finish,
+    // then nulls the pump's back-pointer to Core. Subsequent
+    // iterations see core==null and skip every Core dereference.
+    const detach_pump = orphan_child or self.restart_pending_addr != null;
+    if (detach_pump) {
+        // Drop our ref so the pump destroys itself when its thread
+        // releases its ref. detachFromCore first under the pump's
+        // mutex so the running pump stops dereferencing Core; then
+        // release() drops Core's ref. Both calls require a live ref,
+        // which we hold until the matched release().
+        self.log.write("cleanupSession: stderr pump path=detach (orphan={any} restart_pending={any})\n", .{
+            orphan_child,
+            self.restart_pending_addr != null,
+        });
+        if (self.stderr_pump) |p| {
+            p.detachFromCore();
+            p.release();
+            self.stderr_pump = null;
+        }
+        if (self.stderr_thread) |t| {
+            t.detach();
+            self.stderr_thread = null;
+        }
+        self.log.write("cleanupSession: stderr pump detached\n", .{});
+    } else {
+        // Final-shutdown path: child died, stderr writer closed,
+        // pump thread observed EOF and exited (releasing its ref).
+        // join() guarantees the thread has finished its release;
+        // we then drop Core's ref to free the struct.
+        self.log.write("cleanupSession: stderr pump path=join (thread_present={any} pump_present={any})\n", .{
+            self.stderr_thread != null,
+            self.stderr_pump != null,
+        });
+        if (self.stderr_thread) |t| {
+            t.join();
+            self.stderr_thread = null;
+            self.log.write("cleanupSession: stderr thread joined\n", .{});
+        }
+        if (self.stderr_pump) |p| {
+            p.release();
+            self.stderr_pump = null;
+            self.log.write("cleanupSession: stderr pump released\n", .{});
+        }
+    }
+
+    // All threads that could dereference the Windows named-pipe wrapper
+    // (writer thread, stderr pump, the run-loop reader inlined above)
+    // have now been joined — safe to release the kernel HANDLEs and
+    // free the heap allocation. Stream.close() above only canceled
+    // pending I/O via CancelIoEx; the pipe HANDLE and the event
+    // HANDLEs stayed alive until now so that threads sleeping in
+    // GetOverlappedResult could wake up and exit cleanly without
+    // their HANDLE references being yanked from under them. destroy()
+    // closes those HANDLEs and frees the wrapper struct.
+    if (self.session_pipe) |p| {
+        self.log.write("cleanupSession: destroying session_pipe (Windows named pipe wrapper)\n", .{});
+        p.destroy();
+        self.session_pipe = null;
+    }
+
+    self.log.write("cleanupSession: returning (term_present={any})\n", .{session_term != null});
+    return session_term;
 }

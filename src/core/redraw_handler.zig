@@ -65,6 +65,8 @@ pub const RedrawEvent = enum {
     msg_history_show,
     msg_history_clear,
     set_title,
+    restart,
+    connect,
     flush,
 };
 
@@ -808,6 +810,8 @@ pub fn handleRedrawStream(
     linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
     set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
+    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
+    connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
     var ei: u32 = 0;
     while (ei < n_events) : (ei += 1) {
@@ -880,6 +884,8 @@ pub fn handleRedrawStream(
             linespace_fn,
             set_title_fn,
             default_colors_fn,
+            restart_fn,
+            connect_fn,
         ) catch |re| {
             log.write("redraw dispatch err: {any}\n", .{re});
             const remaining = n_events - ei - 1;
@@ -891,7 +897,7 @@ pub fn handleRedrawStream(
 
 /// Supported redraw events:
 /// grid_resize, grid_line, grid_clear, grid_cursor_goto, hl_attr_define,
-/// default_colors_set, option_set, set_title, flush
+/// default_colors_set, option_set, set_title, restart, connect, flush
 pub fn handleRedraw(
     grid: *Grid,
     hl: *Highlights,
@@ -906,6 +912,8 @@ pub fn handleRedraw(
     linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
     set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
+    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
+    connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
 
     for (params) |ev| {
@@ -2375,6 +2383,45 @@ pub fn handleRedraw(
                     const title = t[0].str;
                     if (log.cb != null) log.write("set_title: {s}\n", .{title});
                     try fn_ptr(opt_ctx, title);
+                }
+            }
+
+        }, .restart => {
+            // restart: [listen_addr]
+            // Nvim invoked :restart and started a new server. The current
+            // channel is about to close; the UI should attach to the new
+            // server at listen_addr after the close is observed.
+            if (restart_fn) |fn_ptr| {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1 or t[0] != .str) continue;
+
+                    const listen_addr = t[0].str;
+                    if (log.cb != null) log.write("restart: listen_addr={s}\n", .{listen_addr});
+                    try fn_ptr(opt_ctx, listen_addr);
+                }
+            }
+
+        }, .connect => {
+            // connect: [server_addr]
+            // Nvim invoked :connect and detached the current UI. Unlike
+            // restart, the old server keeps running headless; the UI
+            // should immediately attach to the new server at server_addr.
+            // The core's reconnect machinery is identical for both events
+            // (only the old-server fate differs, and the UI sees the same
+            // channel-close handshake), but the dispatcher routes through
+            // a distinct callback so the frontend can tell them apart for
+            // logging / UI-hint purposes.
+            if (connect_fn) |fn_ptr| {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1 or t[0] != .str) continue;
+
+                    const server_addr = t[0].str;
+                    if (log.cb != null) log.write("connect: server_addr={s}\n", .{server_addr});
+                    try fn_ptr(opt_ctx, server_addr);
                 }
             }
 

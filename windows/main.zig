@@ -263,11 +263,22 @@ pub fn main() u8 {
     var devcontainer_workspace: ?[]const u8 = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild: bool = false;
+
+    // Connect mode (--connect-nvim=<addr> / --remote-ui=<addr>): attach to
+    // a running Neovim server instead of spawning. Mutually exclusive with
+    // --wsl / --ssh / --devcontainer (and their config.toml equivalents
+    // [neovim].wsl / .ssh). The combination is rejected up-front below,
+    // before the App is constructed; see the validation block right after
+    // argv parsing.
+    var connect_addr: ?[]const u8 = null;
     const args = std.process.argsAlloc(alloc) catch return 1;
     defer std.process.argsFree(alloc, args);
 
-    // Check for --help / -h first
+    // Check for --help / -h first. Stop at `--` so `zonvie -- --help` /
+    // `zonvie -- --install` forward those tokens to nvim instead of
+    // triggering zonvie's own help / installer.
     for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             // Attach to parent console for stdout output
             _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
@@ -295,6 +306,12 @@ pub fn main() u8 {
                     \\    --devcontainer=<workspace>    Run inside a devcontainer
                     \\    --devcontainer-config=<path>  Path to devcontainer.json
                     \\    --devcontainer-rebuild        Rebuild devcontainer before starting
+                    \\    --connect-nvim=<addr>         Attach to a running Neovim server.
+                    \\                                    Address: Windows named pipe path,
+                    \\                                    e.g. "\\\\.\\pipe\\nvim.31920.0".
+                    \\                                    (TCP / Unix sockets: not yet supported on Windows.)
+                    \\                                    Mutually exclusive with --ssh / --devcontainer / --wsl.
+                    \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
                     \\    --install                     First-launch setup (icon + default config) and exit
                     \\    --help, -h                    Show this help message and exit
                     \\    --                            Pass all remaining arguments to nvim
@@ -515,6 +532,34 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, arg, "--devcontainer-rebuild")) {
             devcontainer_rebuild = true;
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-rebuild flag detected\n", .{});
+        } else if (std.mem.startsWith(u8, arg, "--connect-nvim=")) {
+            connect_addr = arg["--connect-nvim=".len..];
+            if (applog.isEnabled()) applog.appLog("[win] --connect-nvim={s} flag detected\n", .{connect_addr.?});
+        } else if (std.mem.eql(u8, arg, "--connect-nvim")) {
+            if (i + 1 < args.len) {
+                connect_addr = args[i + 1];
+                i += 1;
+                if (applog.isEnabled()) applog.appLog("[win] --connect-nvim {s} flag detected\n", .{connect_addr.?});
+            } else {
+                // Mark connect mode requested but value missing. The empty
+                // slice flows into the validation block below where we
+                // refuse to start instead of silently falling through to
+                // a regular nvim spawn.
+                connect_addr = "";
+                if (applog.isEnabled()) applog.appLog("[win] --connect-nvim flag detected without value\n", .{});
+            }
+        } else if (std.mem.startsWith(u8, arg, "--remote-ui=")) {
+            connect_addr = arg["--remote-ui=".len..];
+            if (applog.isEnabled()) applog.appLog("[win] --remote-ui={s} flag detected (alias of --connect-nvim)\n", .{connect_addr.?});
+        } else if (std.mem.eql(u8, arg, "--remote-ui")) {
+            if (i + 1 < args.len) {
+                connect_addr = args[i + 1];
+                i += 1;
+                if (applog.isEnabled()) applog.appLog("[win] --remote-ui {s} flag detected (alias of --connect-nvim)\n", .{connect_addr.?});
+            } else {
+                connect_addr = "";
+                if (applog.isEnabled()) applog.appLog("[win] --remote-ui flag detected without value\n", .{});
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             // Already handled above, skip
         } else {
@@ -583,6 +628,91 @@ pub fn main() u8 {
     if (c.RegisterClassExW(&wc) == 0) return 1;
 
 
+    // Reject empty / missing connect address. Catches both
+    // `zonvie --connect-nvim` (bare flag, no value) and
+    // `zonvie --connect-nvim=` (`=` with nothing after). Without this
+    // check the previous behavior was: bare flag silently fell through
+    // to a regular nvim spawn (surprising), and empty-after-`=` flowed
+    // into the core which returned -3 anyway but only after the run-
+    // thread spin-up. Rejecting here keeps the failure synchronous and
+    // gives the user a clear message.
+    if (connect_addr) |ca| {
+        if (ca.len == 0) {
+            _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
+            const stderr = c.GetStdHandle(c.STD_ERROR_HANDLE);
+            if (stderr != c.INVALID_HANDLE_VALUE) {
+                var written: c.DWORD = 0;
+                const m = "zonvie: --connect-nvim / --remote-ui requires a non-empty address (e.g. \\\\.\\pipe\\nvim.31920.0). On Windows only named pipes are supported.\r\n";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            const wide_title = comptime blk: {
+                const t = "zonvie: invalid options";
+                var buf: [t.len + 1]u16 = undefined;
+                for (t, 0..) |ch, idx| buf[idx] = ch;
+                buf[t.len] = 0;
+                break :blk buf;
+            };
+            const wide_msg = comptime blk: {
+                const m = "--connect-nvim / --remote-ui requires a non-empty address such as \\\\.\\pipe\\nvim.31920.0. On Windows only named pipes are supported.";
+                var buf: [m.len + 1]u16 = undefined;
+                for (m, 0..) |ch, idx| buf[idx] = ch;
+                buf[m.len] = 0;
+                break :blk buf;
+            };
+            _ = c.MessageBoxW(null, &wide_msg, &wide_title, c.MB_OK | c.MB_ICONERROR);
+            return 1;
+        }
+    }
+
+    // Validate flag exclusivity: --connect-nvim attaches to an already-
+    // running Neovim server, while --wsl / --ssh / --devcontainer (and
+    // their config-file equivalents [neovim].wsl / .ssh) all SPAWN a
+    // wrapper-hosted nvim. The two are mutually exclusive — silently
+    // letting connect mode override (the previous behavior) would pick
+    // the user's wrapper config out from under them. Refuse to start so
+    // the user can fix the invocation explicitly.
+    if (connect_addr != null and (wsl_mode or ssh_mode or devcontainer_mode)) {
+        _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
+        const stderr = c.GetStdHandle(c.STD_ERROR_HANDLE);
+        if (stderr != c.INVALID_HANDLE_VALUE) {
+            var written: c.DWORD = 0;
+            const m1 = "zonvie: --connect-nvim is mutually exclusive with";
+            _ = c.WriteFile(stderr, m1.ptr, @intCast(m1.len), &written, null);
+            if (wsl_mode) {
+                const m = " --wsl";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            if (ssh_mode) {
+                const m = " --ssh";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            if (devcontainer_mode) {
+                const m = " --devcontainer";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            const m2 = " (or [neovim].wsl/[neovim].ssh in config.toml).\r\nRemove the conflicting option(s) and retry.\r\n";
+            _ = c.WriteFile(stderr, m2.ptr, @intCast(m2.len), &written, null);
+        }
+        // Also surface via MessageBox for Explorer / shortcut launches
+        // where there is no parent console.
+        const wide_title = comptime blk: {
+            const t = "zonvie: invalid options";
+            var buf: [t.len + 1]u16 = undefined;
+            for (t, 0..) |ch, idx| buf[idx] = ch;
+            buf[t.len] = 0;
+            break :blk buf;
+        };
+        const wide_msg = comptime blk: {
+            const m = "--connect-nvim is mutually exclusive with --wsl / --ssh / --devcontainer (or their config.toml equivalents). Remove the conflicting option(s) and retry.";
+            var buf: [m.len + 1]u16 = undefined;
+            for (m, 0..) |ch, idx| buf[idx] = ch;
+            buf[m.len] = 0;
+            break :blk buf;
+        };
+        _ = c.MessageBoxW(null, &wide_msg, &wide_title, c.MB_OK | c.MB_ICONERROR);
+        return 1;
+    }
+
     const app = alloc.create(App) catch return 1;
     // errdefer alloc.destroy(app); // ← Remove this (causes double-free)
 
@@ -607,6 +737,7 @@ pub fn main() u8 {
         .devcontainer_workspace = devcontainer_workspace,
         .devcontainer_config = devcontainer_config,
         .devcontainer_rebuild = devcontainer_rebuild,
+        .connect_addr = connect_addr,
         .nvim_extra_args = nvim_extra_args,
         .cli_nvim_path = cli_nvim_path,
     };

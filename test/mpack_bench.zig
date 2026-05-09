@@ -325,6 +325,8 @@ fn noopGuifont(_: *NoopCtx, _: []const u8) anyerror!void {}
 fn noopLinespace(_: *NoopCtx, _: i32) anyerror!void {}
 fn noopSetTitle(_: *NoopCtx, _: []const u8) anyerror!void {}
 fn noopDefaultColors(_: *NoopCtx, _: u32, _: u32) anyerror!void {}
+fn noopRestart(_: *NoopCtx, _: []const u8) anyerror!void {}
+fn noopConnect(_: *NoopCtx, _: []const u8) anyerror!void {}
 
 fn runOldFull(
     arena: std.mem.Allocator,
@@ -355,6 +357,8 @@ fn runOldFull(
         noopLinespace,
         noopSetTitle,
         noopDefaultColors,
+        noopRestart,
+        noopConnect,
     );
 }
 
@@ -391,6 +395,8 @@ fn runNewFull(
         noopLinespace,
         noopSetTitle,
         noopDefaultColors,
+        noopRestart,
+        noopConnect,
     );
 }
 

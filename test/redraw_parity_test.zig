@@ -49,6 +49,8 @@ const Stub = struct {
     last_linespace_px: i32 = 0,
     set_title_calls: u32 = 0,
     default_colors_calls: u32 = 0,
+    restart_calls: u32 = 0,
+    connect_calls: u32 = 0,
 
     fn onFlush(ctx: *Stub, rows: u32, cols: u32) anyerror!void {
         ctx.flush_calls += 1;
@@ -67,6 +69,12 @@ const Stub = struct {
     }
     fn onDefaultColors(ctx: *Stub, _: u32, _: u32) anyerror!void {
         ctx.default_colors_calls += 1;
+    }
+    fn onRestart(ctx: *Stub, _: []const u8) anyerror!void {
+        ctx.restart_calls += 1;
+    }
+    fn onConnect(ctx: *Stub, _: []const u8) anyerror!void {
+        ctx.connect_calls += 1;
     }
 };
 
@@ -142,6 +150,8 @@ fn runValueTreePath(frame_bytes: []const u8, w: *World) !void {
         Stub.onLinespace,
         Stub.onSetTitle,
         Stub.onDefaultColors,
+        Stub.onRestart,
+        Stub.onConnect,
     );
 }
 
@@ -169,6 +179,8 @@ fn runStreamingPath(frame_bytes: []const u8, w: *World) !void {
         Stub.onLinespace,
         Stub.onSetTitle,
         Stub.onDefaultColors,
+        Stub.onRestart,
+        Stub.onConnect,
     );
 }
 

@@ -27,6 +27,7 @@ pub const zonvie_callbacks = core.zonvie_callbacks;
 pub const zonvie_core_create = core.zonvie_core_create;
 pub const zonvie_core_destroy = core.zonvie_core_destroy;
 pub const zonvie_core_start = core.zonvie_core_start;
+pub const zonvie_core_start_connect = core.zonvie_core_start_connect;
 pub const zonvie_core_stop = core.zonvie_core_stop;
 pub const zonvie_core_notify_layout_ready = core.zonvie_core_notify_layout_ready;
 pub const zonvie_core_send_input = core.zonvie_core_send_input;
@@ -249,6 +250,16 @@ pub const PendingExternalWindow = struct {
     cols: u32,
     start_row: i32, // -1 if no position info (cmdline, etc.)
     start_col: i32,
+    /// Monotonic identifier assigned by onExternalWindow at enqueue.
+    /// The corresponding WM_APP_CREATE_EXTERNAL_WINDOW message carries
+    /// this value in lParam so the UI-thread handler can dequeue the
+    /// exact request the message was posted for. Without this, an old-
+    /// session WM_APP_CREATE message could pick up a same-grid_id new-
+    /// session request that landed in the queue after a session reset.
+    /// Coalescing same-grid_id requests in onExternalWindow preserves
+    /// the existing entry's seq so the original posted message still
+    /// matches.
+    seq: u64,
 };
 
 /// CPU-side surface state shared between external windows and pending
@@ -2499,6 +2510,14 @@ pub const App = struct {
     // Pending external window creation requests (for UI thread processing)
     pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
 
+    // Monotonically increasing identifier assigned to each
+    // PendingExternalWindow at enqueue. Used to bind WM_APP_CREATE_
+    // EXTERNAL_WINDOW messages 1:1 to their request: a stale message
+    // (e.g., posted by a previous session whose request was removed
+    // by onExternalWindowClose) won't dequeue an unrelated new-session
+    // request whose seq doesn't match the message's lParam.
+    pending_external_seq_counter: u64 = 0,
+
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
     pending_external_window_position_time: i64 = 0, // Timestamp when position was set (for timeout)
@@ -2748,6 +2767,12 @@ pub const App = struct {
     devcontainer_rebuild: bool = false,
     devcontainer_up_pending: bool = false, // Waiting for devcontainer up to complete
     devcontainer_nvim_started: bool = false, // Nvim started in devcontainer mode
+
+    // Connect mode (--connect-nvim=<addr> or --remote-ui=<addr>): attach to a
+    // running Neovim server instead of spawning. When set, doEarlyCoreInit
+    // calls zonvie_core_start_connect with this address. Mutually exclusive
+    // with wsl/ssh/devcontainer modes (CLI parsing rejects mixed use).
+    connect_addr: ?[]const u8 = null,
 
     // Extra arguments to pass to nvim (not recognized as zonvie arguments)
     nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .{},

@@ -12,13 +12,27 @@ const Logger = @import("log.zig").Logger;
 const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
+const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
+
+/// Re-exported here so callers in this file can spell `Stream` without
+/// reaching into `rpc_transport`.
+pub const Stream = rpc_transport.Stream;
 
 /// Position/size snapshot for a known external grid. Used to detect
 /// changes in anchor position (e.g. popupmenu re-show) and re-fire
 /// on_external_window so the frontend can update window position.
 pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
+
+/// Backing transport for the current RPC session.
+pub const TransportKind = enum {
+    /// Spawned nvim child process; stdin/stdout/stderr are 3 separate pipes.
+    pipes,
+    /// Connected to a running nvim server over TCP or unix socket.
+    /// stdin_file and stdout_file alias the same fd; stderr_file is null.
+    socket,
+};
 
 pub const Callbacks = struct {
     on_vertices_partial: ?*const fn (
@@ -59,6 +73,18 @@ pub const Callbacks = struct {
 
     /// Called when Neovim sets the window title (set_title UI event).
     on_set_title: ?*const fn (ctx: ?*anyopaque, title: [*]const u8, title_len: usize) callconv(.c) void = null,
+
+    /// Called when Neovim sends the `restart` UI event (`:restart` command).
+    /// listen_addr is the new server address that the core will attach to.
+    /// Informational only — the core handles the actual reconnect; the
+    /// frontend must NOT tear down its window or treat this as `on_exit`.
+    on_restart: ?*const fn (ctx: ?*anyopaque, listen_addr: [*]const u8, listen_addr_len: usize) callconv(.c) void = null,
+
+    /// Called when Neovim sends the `connect` UI event (`:connect <addr>`).
+    /// server_addr is the server the UI is being hot-swapped to. Same
+    /// reconnect machinery as `on_restart`; the only difference is that
+    /// the previous server keeps running headless (it is not dying).
+    on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
 
     /// Called when a grid should be displayed in an external window.
     on_external_window: ?*const fn (ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void = null,
@@ -434,10 +460,72 @@ pub const Core = struct {
     thread: ?std.Thread = null,
 
     child_handle: ?std.process.Child.Id = null,
-    stdin_file: ?std.fs.File = null,
-    stdout_file: ?std.fs.File = null,
-    stderr_file: ?std.fs.File = null,
+    stdin_file: ?Stream = null,
+    stdout_file: ?Stream = null,
+    stderr_file: ?Stream = null,
     stderr_thread: ?std.Thread = null,
+    /// Heap-allocated state shared with the stderr pump thread.
+    /// Lifetime: created at session spawn, freed by the pump thread's
+    /// run() defer block on exit. This back-pointer in Core is just a
+    /// handle for cleanupSession to call detachFromCore() before the
+    /// pump might outlive Core (`:connect` orphan path). Always null
+    /// it after detach / join — the pump destroys the struct itself.
+    stderr_pump: ?*rpc_session.StderrPump = null,
+
+    /// Transport mode of the current session.
+    /// .pipes: spawned child + 3 pipes (stdin/stdout/stderr separate handles).
+    /// .socket: connected to a running nvim via TCP/Unix socket. In this mode
+    /// stdin_file and stdout_file alias the same fd; close() must run only
+    /// once and stderr_file is null.
+    transport_kind: TransportKind = .pipes,
+
+    /// Owning pointer to the Windows named-pipe wrapper for the current
+    /// session, when transport_kind == .socket and the platform is Windows.
+    /// stdin_file / stdout_file's `Stream.close()` calls
+    /// `WindowsOverlappedPipe.closeHandles()` which only fires
+    /// `CancelIoEx` to abort pending overlapped I/O — neither the pipe
+    /// HANDLE nor the event HANDLEs are closed there, because closing
+    /// a HANDLE another thread is still using as the file argument to
+    /// `GetOverlappedResult` (or as the wait HANDLE for an overlapped
+    /// completion event) is undefined behavior per MSDN. The pipe
+    /// HANDLE, the event HANDLEs, and the heap-allocated wrapper are
+    /// all released exactly once via `session_pipe.destroy()` from
+    /// cleanupSession, AFTER the writer / stderr threads have been
+    /// joined. Without this separation, stop()/cleanupSession would
+    /// close those HANDLEs and `alloc.destroy(self)` while the writer
+    /// thread was still mid-writeAll(), corrupting kernel state and
+    /// heap memory. Null on POSIX and on spawn-mode sessions.
+    session_pipe: ?*rpc_transport.WindowsOverlappedPipe = null,
+
+    /// Set by handleRestartEvent / handleConnectEvent to the next session's
+    /// listen address (owned). Observed by the RPC run loop after the
+    /// current session terminates; when non-null, the loop reconnects to
+    /// this address instead of firing on_exit. Cleared once the next
+    /// session is established.
+    restart_pending_addr: ?[]u8 = null,
+
+    /// Distinguishes how `restart_pending_addr` was queued:
+    ///   - false (default): set by handleRestartEvent. The old nvim died
+    ///     and a new instance came up at this address; if connecting back
+    ///     fails, falling through to spawn the original argv is the
+    ///     correct recovery (the user lost their session anyway).
+    ///   - true: set by handleConnectEvent. `:connect` is a hot-swap that
+    ///     orphans the old nvim (still alive headless on its own listen
+    ///     socket); if connecting to the NEW server fails, spawning a
+    ///     fresh local nvim would orphan the user's editing session in
+    ///     the old nvim while opening a wholly different blank session.
+    ///     Exit the run loop instead so the frontend can surface the
+    ///     failure.
+    /// Consumed (reset to false) by the run loop alongside
+    /// restart_pending_addr.
+    restart_pending_is_connect_hotswap: bool = false,
+
+    /// Set by handleConnectEvent. When true, the run loop's cleanup must
+    /// NOT wait on or kill the spawned child — `:connect` is a hot-swap
+    /// where the old nvim stays alive headless and would otherwise make
+    /// child.wait() block forever. The handle is dropped (orphaned).
+    /// Consumed (reset to false) by the run loop before the next iteration.
+    connect_keeps_child_alive: bool = false,
 
     drawable_w_px: u32 = 1,
     drawable_h_px: u32 = 1,
@@ -715,6 +803,247 @@ pub const Core = struct {
         self.started = true;
     }
 
+    /// Start in connect mode: attach to a Neovim server already listening
+    /// at `listen_addr` (TCP `host:port` or Unix socket path) instead of
+    /// spawning a child. Used by both the future "connect to running
+    /// nvim" CLI flag and as the initial entry that the runLoop already
+    /// supports via the `:restart` machinery.
+    ///
+    /// nvim_path_owned is left empty so the connect-failure fall-through
+    /// inside runLoop does NOT silently spawn a local nvim — that would
+    /// surprise a caller who explicitly opted into connect mode.
+    pub fn startConnect(self: *Core, listen_addr: []const u8, rows: u32, cols: u32) !void {
+        self.init_rows = rows;
+        self.init_cols = cols;
+        self.nvim_path_owned = self.alloc.dupe(u8, "") catch null;
+        // Pre-populate restart_pending_addr so the run loop's first
+        // iteration takes the connect path. Same machinery as `:restart`.
+        self.restart_pending_addr = try self.alloc.dupe(u8, listen_addr);
+        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.started = true;
+    }
+
+    /// Reset session-scoped state between RPC sessions (called by the run
+    /// loop when transitioning to the next session for `:restart` /
+    /// `:connect`). Clears transient flags, in-flight RPC msgids, and
+    /// every piece of state tied to the previous server's grid_id space
+    /// or UI overlays so the new session starts from a clean slate.
+    ///
+    /// Channel-bound state (cleared here):
+    ///   - external windows + their grid registry (existing, see below)
+    ///   - composited grid layout: sub_grids / win_pos / grid_win_ids /
+    ///     win_layer / viewport(_margins) / cell_overflow / grid_metrics.
+    ///     The new server never sends grid_destroy for grid_ids it does
+    ///     not know about, so leftover entries would be rendered as
+    ///     stale floats (flush.zig:rebuildMain) and reported as visible
+    ///     by getVisibleGridsLocked (hit-testing).
+    ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
+    ///     tabline_state / message_state / msg_history_state. The new
+    ///     server does not send hide events for overlays it never
+    ///     created.
+    ///   - cursor state: cursor_grid may point at a now-deleted sub_grid.
+    ///   - Core-side flush bookkeeping: last_sent_*_rev, msg throttle
+    ///     state, last_cmd snapshot, popupmenu Lua-mirror handles,
+    ///     pre_cmdline cursor snapshot, prev_subgrid_snapshots.
+    ///
+    /// Frontend overlay teardown:
+    ///   - external_grids cleanup below already fires on_external_window_close
+    ///     for cmdline / popupmenu / message / msg_history overlays
+    ///     (those use external grid_ids -100..-103).
+    ///   - tabline lives outside that path, so on_tabline_hide is fired
+    ///     explicitly. on_popupmenu_hide / on_msg_clear are also fired
+    ///     defensively in case the frontend tracks overlay state outside
+    ///     the external-grid path.
+    ///
+    /// Preserved intentionally:
+    ///   - global grid (id=1) cells/dimensions: the new server overwrites
+    ///     them via grid_resize + grid_line right after attach. The
+    ///     frontend's last committed frame keeps the screen visually
+    ///     stable in the gap (no flush runs between sessions).
+    ///   - hl table: hl_ids are redefined by hl_attr_define on attach.
+    ///   - atlas / glyph caches / shape cache: keyed by content + style
+    ///     + font_generation; valid as long as font is unchanged.
+    ///   - mode info / cursor shape / cursor_visible: replaced by the
+    ///     new session's mode_info_set + mode_change.
+    ///   - layout dimensions (last_layout_rows/cols, init_rows/cols).
+    ///
+    /// EXCEPTION: external windows (multigrid windows mapped to OS-level
+    /// windows by the frontend) ARE channel-bound. The new server uses a
+    /// fresh grid_id space, so old grid_ids in known_external_grids /
+    /// grid.external_grids would never receive grid_resize from the new
+    /// server and never appear in the closed-detection diff at
+    /// flush.notifyExternalWindowChanges. Without explicit teardown, the
+    /// stale OS windows remain visible holding dead grid state. Fire
+    /// on_external_window_close for each known grid_id and clear both
+    /// maps before the next session.
+    ///
+    /// MUST be called only from the RPC thread, after the previous
+    /// session's writer thread has been joined and pipes/sockets closed.
+    pub fn resetSessionState(self: *Core) void {
+        // UI attachment must be re-issued after reconnect.
+        self.ui_attached.store(false, .seq_cst);
+
+        // Channel-bound state.
+        self.clipboard_setup_done = false;
+
+        // In-flight RPC IDs from the dead channel — drop tracking so any
+        // stale response from the new server (very unlikely; new msgid
+        // counter starts fresh on the nvim side) does not match.
+        self.get_api_info_msgid = null;
+        self.quit_request_msgid.store(0, .release);
+        self.glow_request_msgid.store(0, .release);
+
+        // Re-arm the glow startup probe so it queries vim.g.zonvie_glow on
+        // the new server (the user's init.lua may set it again, identically
+        // or differently).
+        self.glow_startup_retries = 30;
+
+        // Pending focus state from before the reconnect should not leak —
+        // the new server has its own initial focus state.
+        self.pending_focus.store(0, .seq_cst);
+
+        // SSH auth flags only apply to spawn-mode SSH sessions; reset so a
+        // future spawn-mode session (re-spawn fallback) starts unauthenticated.
+        self.ssh_auth_pending.store(false, .seq_cst);
+        self.ssh_auth_done.store(false, .seq_cst);
+
+        // Transport handles are cleaned up by the caller (closed and nulled);
+        // here we only flip the kind tag for clarity until the next session
+        // re-assigns it.
+        self.transport_kind = .pipes;
+
+        // Re-arm the writer queue: the previous session's cleanup set
+        // write_queue_closed=true so the writer thread would drain and exit.
+        // Clearing it now allows startWriterThread() to succeed for the
+        // next session.
+        self.write_queue_mu.lock();
+        self.write_queue_closed = false;
+        self.writer_failed = false;
+        self.write_queue.clearRetainingCapacity();
+        self.write_queue_mu.unlock();
+
+        // === Grid-protected critical section ===
+        //
+        // Everything below mutates state that the frontend reads under
+        // grid_mu via the public C API (`zonvie_core_get_visible_grids`,
+        // viewport / cursor lookups, message tick, etc.). Without this
+        // lock, a frontend reader holding grid_mu could race with us
+        // clear/deinit'ing AutoHashMap nodes or sub_grid cell buffers.
+        //
+        // Locking contract (matches handleRedraw at rpc_session.zig:849):
+        // frontend callbacks (on_external_window_close, on_tabline_hide,
+        // on_popupmenu_hide, on_msg_clear) execute while grid_mu is held.
+        // Callbacks MUST NOT call zonvie_core_get_* or any other API that
+        // re-acquires grid_mu, otherwise this thread will deadlock against
+        // its own lock.
+        //
+        // The `defer unlock` covers every early return path here (none
+        // exist today, but future edits stay safe).
+        self.grid_mu.lock();
+        defer self.grid_mu.unlock();
+
+        // Tear down channel-bound external-window state. See doc comment
+        // above for the rationale (new server's grid_id space is fresh,
+        // so any stale grid_id left in these maps can later be matched
+        // against an unrelated win_pos / grid_resize from the new server
+        // and silently re-promote a normal window to "external", or feed
+        // a stale target size into the next win_external_pos diff).
+        //
+        // Fire close callbacks first so the frontend can dismiss its OS
+        // windows; then clear every channel-bound map so the new session
+        // starts with an empty external-grid registry.
+        if (self.known_external_grids.count() > 0) {
+            const closed_count = self.known_external_grids.count();
+            if (self.cb.on_external_window_close) |cb| {
+                var it = self.known_external_grids.keyIterator();
+                while (it.next()) |grid_id_ptr| {
+                    cb(self.ctx, grid_id_ptr.*);
+                }
+            }
+            self.known_external_grids.clearRetainingCapacity();
+            self.log.write("resetSessionState: closed {d} external windows from previous session\n", .{closed_count});
+        }
+        self.grid.external_grids.clearRetainingCapacity();
+        // ext_windows_grids: grid_id -> win_id mapping. Without clearing,
+        // a fresh win_pos for the same grid_id on the new server hits
+        // the redraw_handler.zig stale-detection path that re-promotes
+        // it to external (redraw_handler.zig:~1171).
+        self.grid.ext_windows_grids.clearRetainingCapacity();
+        // external_grid_target_sizes: dimensions used to match resize
+        // events to known external grids (redraw_handler.zig:~960).
+        // Stale entries would feed the wrong size into the new session.
+        self.grid.external_grid_target_sizes.clearRetainingCapacity();
+        // pending_ext_window_grids: grids waiting for their first
+        // grid_resize before the frontend window is created.
+        self.grid.pending_ext_window_grids.clearRetainingCapacity();
+        // pending_grid_resizes / pending_win_ops: queued ops referring
+        // to old-session grid_ids; carrying them across would apply to
+        // unrelated grids in the new session.
+        self.grid.pending_grid_resizes.clearRetainingCapacity();
+        self.grid.pending_win_ops.clearRetainingCapacity();
+
+        // Composited / multigrid layout, ext UI overlays, cursor state.
+        // See doc comment on this function for the full rationale.
+        self.grid.resetForNewSession();
+
+        // Frontend overlay teardown for paths not covered by the external
+        // window cleanup above. The cmdline / popupmenu / message external
+        // grids are torn down via on_external_window_close (fired by the
+        // known_external_grids loop above), but:
+        //   - tabline is rendered without an external grid; without an
+        //     explicit hide the frontend keeps the old tabs on screen
+        //     until the new session sends tabline_update.
+        //   - on_popupmenu_hide / on_msg_clear are fired defensively in
+        //     case the frontend tracks overlay state outside the
+        //     external-grid path (e.g. an in-window popup overlay).
+        if (self.cb.on_tabline_hide) |cb| cb(self.ctx);
+        if (self.cb.on_popupmenu_hide) |cb| cb(self.ctx);
+        if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+
+        // Core-side flush bookkeeping. Without resetting these, the next
+        // flush could short-circuit on rev equality or use stale
+        // window-handle references from the previous channel.
+        // These fields are consulted from the flush path which already
+        // runs under grid_mu (see handleRedraw); resetting them inside
+        // this critical section keeps the flush invariants consistent.
+        self.last_sent_content_rev = 0;
+        self.last_sent_cursor_rev = 0;
+        self.last_ext_cursor_grid = 1;
+        self.last_ext_cursor_rev = 0;
+        self.pre_cmdline_cursor_grid = 1;
+        self.pre_cmdline_cursor_row = 0;
+        self.pre_cmdline_cursor_col = 0;
+        self.popupmenu_win_id = null;
+        self.popupmenu_buf_id = null;
+
+        // ext_messages timing / scroll state was tied to the old session's
+        // msg_show events; carrying it across would auto-hide the new
+        // session's first message at the old deadline.
+        self.msg_show_pending_since = null;
+        self.msg_show_auto_hide_at = null;
+        self.msg_history_auto_hide_at = null;
+        self.msg_scroll_offset = 0;
+        self.msg_total_lines = 0;
+        self.msg_cached_max_width = 0;
+        self.msg_scroll_pending = false;
+        self.msg_scroll_last_send = 0;
+        self.msg_cache_valid = false;
+        // MsgCachedLine has only fixed-size buffers (no heap-owned strings).
+        self.msg_line_cache.clearRetainingCapacity();
+
+        // Last command tracking for the split-view label was a snapshot
+        // of the old session's :commands.
+        self.last_cmd_len = 0;
+        self.last_cmd_firstc = 0;
+        self.last_cmd_start_time = null;
+
+        // Subgrid layout snapshot for scroll fast path: stale entries
+        // would reference grid_ids the new session has not (yet) created.
+        self.prev_subgrid_snapshot_count = 0;
+
+        self.log.write("resetSessionState: cleared session-scoped state\n", .{});
+    }
+
     /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
     /// can be sent with the correct dimensions. Must be called from the UI
     /// thread after the renderer is initialized and actual rows/cols are computed.
@@ -755,13 +1084,41 @@ pub const Core = struct {
             self.write_queue_mu.unlock();
         }
 
-        // Close stdin to unblock writer thread's writeAll() if it's blocked on pipe I/O
+        // Unblock writer thread's writeAll() if blocked on transport I/O.
+        // Transport-specific semantics of Stream.close():
+        //   - POSIX (.file): closes the fd outright. For socket transport
+        //     (connect mode) stdin_file and stdout_file alias the same fd;
+        //     a second close would close an unrelated fd that the kernel
+        //     may have already recycled, so we null the alias to skip
+        //     cleanupSession's stdout close.
+        //   - Windows named pipe (.win_pipe): calls closeHandles() which
+        //     only fires CancelIoEx — the pipe HANDLE itself stays alive
+        //     until session_pipe.destroy() runs in cleanupSession (after
+        //     all threads holding a Stream value have been joined). We
+        //     still null the stdout alias to keep the cleanupSession path
+        //     symmetric: closeHandles is idempotent under its swap()
+        //     guard, but skipping the duplicate call is clearer.
+        // The same alias guard lives in cleanupSession() (rpc_session.zig)
+        // — keep both sides in sync.
         if (self.stdin_file) |f| {
+            // For POSIX .socket transport (connect mode, where stdin/
+            // stdout alias the same fd) close() alone does not wake
+            // the reader/writer thread blocked on the fd. Issue
+            // shutdown(SHUT_RDWR) first so those threads return EOF /
+            // EPIPE and can be join()ed below; otherwise stop() would
+            // hang waiting on self.thread / writer thread join.
+            f.shutdownIfSocket(self.transport_kind == .socket);
             f.close();
             self.stdin_file = null;
+            if (self.transport_kind == .socket) {
+                self.stdout_file = null;
+            }
         }
 
-        // Join writer thread (exits due to closed flag or I/O error from stdin close)
+        // Join writer thread. It exits via:
+        //   - clean shutdown: write_queue_closed observed with empty queue
+        //   - I/O error: POSIX broken-pipe from the stdin close above, or
+        //     OperationAborted from CancelIoEx on the Windows pipe HANDLE
         if (wt) |t| t.join();
 
         if (self.child_handle) |_| {
@@ -778,6 +1135,17 @@ pub const Core = struct {
         if (self.thread) |t| t.join();
         self.thread = null;
 
+        // Defensive: if a stderr pump is still pointing at Core (e.g., a
+        // failure path bypassed cleanupSession), detach it now so its
+        // run() loop stops dereferencing Core before we free Core's
+        // storage below, then release Core's ref so the struct can be
+        // freed when the pump thread releases its own. Normal flows
+        // have cleanupSession already null both fields by this point.
+        if (self.stderr_pump) |p| {
+            p.detachFromCore();
+            p.release();
+            self.stderr_pump = null;
+        }
         if (self.stderr_thread) |t2| t2.join();
         self.stderr_thread = null;
 
@@ -811,6 +1179,15 @@ pub const Core = struct {
             self.alloc.free(p);
             self.nvim_path_owned = null;
         }
+
+        // Free any pending restart address (queued but never consumed because
+        // stop() raced ahead of the run loop's restart handling). Reset the
+        // companion hot-swap flag too — the run loop reads them as a pair.
+        if (self.restart_pending_addr) |a| {
+            self.alloc.free(a);
+            self.restart_pending_addr = null;
+        }
+        self.restart_pending_is_connect_hotswap = false;
 
         // Free shaping buffers (Phase B)
         self.shaping_bufs.deinit(self.alloc);
@@ -1299,7 +1676,7 @@ pub const Core = struct {
     /// Signals ssh_auth_done after writing.
     pub fn sendStdinData(self: *Core, data: []const u8) void {
         if (self.stdin_file) |f| {
-            _ = f.write(data) catch |e| {
+            f.writeAll(data) catch |e| {
                 self.log.write("sendStdinData write err: {any}\n", .{e});
                 return;
             };
@@ -1995,9 +2372,82 @@ pub const Core = struct {
         }
     }
 
+    pub fn emitOnRestart(self: *Core, listen_addr: []const u8) void {
+        if (self.cb.on_restart) |f| {
+            f(self.ctx, listen_addr.ptr, listen_addr.len);
+        }
+    }
+
+    pub fn emitOnConnect(self: *Core, server_addr: []const u8) void {
+        if (self.cb.on_connect) |f| {
+            f(self.ctx, server_addr.ptr, server_addr.len);
+        }
+    }
+
+    /// Handle the `restart` UI event from Neovim. Records the new server's
+    /// listen address and signals the current session to shut down. The RPC
+    /// run loop observes restart_pending_addr and reconnects on the next
+    /// session iteration instead of firing on_exit.
+    ///
+    /// Called from the redraw thread (grid_mu held).
+    pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
+        // Drop any previously queued restart (only the latest matters).
+        if (self.restart_pending_addr) |old| {
+            self.alloc.free(old);
+            self.restart_pending_addr = null;
+        }
+
+        const owned = self.alloc.dupe(u8, listen_addr) catch |e| {
+            self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
+            return e;
+        };
+        self.restart_pending_addr = owned;
+        // Explicit reset in case a prior :connect queued (then aborted) left
+        // the hot-swap flag set; :restart is NOT a hot-swap (the old nvim
+        // dies), so spawn fallback on connect failure is the desired recovery.
+        self.restart_pending_is_connect_hotswap = false;
+
+        self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
+
+        // Notify frontend (informational; frontend MUST NOT close window).
+        self.emitOnRestart(listen_addr);
+
+        // The RPC run loop will observe restart_pending_addr after the
+        // current session terminates (nvim closes the channel). We do NOT
+        // proactively close stdin here because nvim is in the middle of
+        // sending its final batch (the `restart` event itself is part of
+        // that batch). Letting the read side EOF naturally is cleaner.
+    }
+
+    /// Handle the `connect` UI event from Neovim (`:connect <addr>`). The
+    /// reconnect machinery is identical to `restart` — we record the new
+    /// server's address in restart_pending_addr and let the run loop
+    /// observe it after the channel closes — but the frontend gets a
+    /// distinct `on_connect` callback so it can distinguish a hot-swap
+    /// (`:connect`, old server stays alive headless) from a server
+    /// replacement (`:restart`, old server dies).
+    pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
+        if (self.restart_pending_addr) |old| {
+            self.alloc.free(old);
+            self.restart_pending_addr = null;
+        }
+
+        const owned = self.alloc.dupe(u8, server_addr) catch |e| {
+            self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
+            return e;
+        };
+        self.restart_pending_addr = owned;
+        self.restart_pending_is_connect_hotswap = true;
+        self.connect_keeps_child_alive = true;
+
+        self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});
+
+        self.emitOnConnect(server_addr);
+    }
+
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
-    /// Receives the file handle by value to avoid racing with stop().
-    fn writerThreadFn(self: *Core, file: std.fs.File) void {
+    /// Receives the stream by value to avoid racing with stop().
+    fn writerThreadFn(self: *Core, file: Stream) void {
         var drain: std.ArrayListUnmanaged(u8) = .{};
         defer drain.deinit(self.alloc);
 
@@ -2838,10 +3288,6 @@ pub const Core = struct {
 
 
     // --- Forwarding stubs for rpc_session.zig ---
-
-    pub fn pumpStderr(self: *Core, f: std.fs.File) void {
-        rpc_session.pumpStderr(self, f);
-    }
 
     pub fn containsPasswordPrompt(data: []const u8) bool {
         return rpc_session.containsPasswordPrompt(data);

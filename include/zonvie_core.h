@@ -283,6 +283,27 @@ typedef void (*zonvie_on_set_title_fn)(
     const uint8_t* title, size_t title_len
 );
 
+/* Called when Neovim sends the `restart` UI event (`:restart` command).
+   listen_addr is the new server's listen address (TCP host:port or
+   Unix socket path). Informational only — the core handles the actual
+   reconnect; the frontend MUST NOT close its window or treat this as
+   `on_exit`. The matching `on_exit` will not fire for this transition. */
+typedef void (*zonvie_on_restart_fn)(
+    void* ctx,
+    const uint8_t* listen_addr, size_t listen_addr_len
+);
+
+/* Called when Neovim sends the `connect` UI event (`:connect <addr>`).
+   server_addr is the address the UI is being hot-swapped to. Same
+   reconnect semantics as `on_restart`; the only difference is that the
+   previous server keeps running headless instead of dying. The frontend
+   may use this to distinguish hot-swap (`:connect`) from server
+   replacement (`:restart`) for logging or status display. */
+typedef void (*zonvie_on_connect_fn)(
+    void* ctx,
+    const uint8_t* server_addr, size_t server_addr_len
+);
+
 /* Called when a grid should be displayed in an external window.
    grid_id: the grid to display externally
    win: Neovim window handle (for reference)
@@ -738,6 +759,15 @@ typedef struct zonvie_callbacks {
        Suppressed when multiple scrolls occur in the same batch.
        Consumer must validate eligibility before applying optimizations. */
     zonvie_on_grid_row_scroll_fn on_grid_row_scroll;
+
+    /* Restart UI event observer (informational; core handles reconnect).
+       Appended at the end of the struct to preserve ABI for older callers
+       that pass a smaller callbacks_size to zonvie_core_create. */
+    zonvie_on_restart_fn on_restart;
+
+    /* Connect UI event observer (informational; core handles reconnect).
+       Appended after on_restart for the same ABI-compat reason. */
+    zonvie_on_connect_fn on_connect;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -800,6 +830,27 @@ zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, voi
 void zonvie_core_destroy(zonvie_core *core);
 
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);
+
+/* Start in connect mode: attach to a running Neovim server at
+   `listen_addr` instead of spawning a child. Same lifecycle and
+   callbacks as `zonvie_core_start`; the only difference is the
+   initial transport.
+
+   Address formats by platform:
+       POSIX (macOS, Linux): TCP "host:port" or Unix socket path
+       Windows:              named pipe path, e.g. "\\\\.\\pipe\\nvim.31920.0"
+                             (TCP and Unix sockets are not yet supported)
+
+   Returns 0 on success, negative on error:
+       -1 invalid handle, -2 thread spawn failed, -3 invalid address.
+   Address validity is checked synchronously: parse failures and
+   platform-unsupported forms (e.g. TCP on Windows) return -3 before
+   the run loop is started. */
+int  zonvie_core_start_connect(
+    zonvie_core *core,
+    const uint8_t *listen_addr, size_t listen_addr_len,
+    unsigned rows, unsigned cols);
+
 void zonvie_core_stop(zonvie_core *core);
 
 /* Notify the core that actual layout dimensions are ready.
