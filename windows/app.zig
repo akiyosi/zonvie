@@ -2641,6 +2641,18 @@ pub const App = struct {
     row_valid_count: u32 = 0,
     row_layout_gen: u64 = 0,
 
+    // True when back_tex holds a fully-painted frame at the current dimensions
+    // and metrics, so subsequent paints may preserve it (preserve_back=true) and
+    // overwrite only dirty rows. Decoupled from seed_pending so that a partial
+    // seed (e.g. WM_SIZE on minimize/restore where row data is still current,
+    // followed by a scroll that propagates zero validity bits via
+    // swapAndShiftRows) does not force a back_tex clear on every frame.
+    // Reset by paths that invalidate back_tex content: swapchain resize (real
+    // dimension change), font/linespace/DPI changes that shift cell metrics
+    // without necessarily resizing the swapchain. macOS analogue:
+    // hasPresentedOnce on MetalTerminalRenderer.
+    back_tex_valid: bool = false,
+
     linespace_px: u32 = 0,
 
     // DPI scaling factor (e.g. 1.0 at 96 DPI, 2.0 at 192 DPI)
