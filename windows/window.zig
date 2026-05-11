@@ -553,6 +553,16 @@ pub export fn WndProc(
                 _ = c.BeginPaint(hwnd, &ps);
                 defer _ = c.EndPaint(hwnd, &ps);
 
+                // While minimized, GetClientRect returns the iconic size
+                // (e.g. 160x28); letting drawEx → resize run would shrink
+                // swapchain/back_tex to that size and discard their contents,
+                // so the next restore would Present an empty surface as a
+                // gray rectangle. BeginPaint/EndPaint above still consumes
+                // the paint region so Windows stops re-issuing WM_PAINT.
+                if (c.IsIconic(hwnd) != 0) {
+                    return 0;
+                }
+
                 // Log first paint with content timing (startup performance)
                 if (!app.first_paint_logged and app.renderer != null) {
                     if (log_enabled) {
