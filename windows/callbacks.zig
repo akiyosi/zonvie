@@ -2001,6 +2001,12 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         var applied_pt: f32 = config_pt;
         var font_set = false;
 
+        // Arena must outlive applied_name: the skip_guifont branch assigns
+        // resolved.name (arena-backed) into applied_name, which is read by
+        // appLog at the end of this block.
+        var arena = std.heap.ArenaAllocator.init(app.alloc);
+        defer arena.deinit();
+
         // If the user explicitly set font.family in config.toml, skip
         // nvim's guifont payload and walk the config's own candidate
         // list (parsed from the raw guifont-syntax string in
@@ -2008,10 +2014,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         // payload path below.
         const skip_guifont = family_explicit;
         if (skip_guifont) {
-            var arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer arena.deinit();
             const aa = arena.allocator();
-
             const cands = core.config.splitFontFamilyList(aa, app.config.font.family) catch &.{};
             for (cands) |cand_str| {
                 const resolved = core.redraw_handler.parseGuiFontCandidate(aa, cand_str) catch continue;
