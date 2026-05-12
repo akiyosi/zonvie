@@ -2105,6 +2105,18 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
         app.cell_w_px = a.cellW();
         app.cell_h_px = a.cellH();
+        // Co-set invalidation flags atomically with the cell metrics update.
+        // The font_generation branch below temporarily releases app.mu to call
+        // into core (zonvie_core_invalidate_glyph_cache), and a WM_PAINT racing
+        // that window must not observe new metrics together with stale
+        // back_tex_valid=true. Setting these here keeps the snapshot consistent
+        // regardless of which app.mu boundary the UI thread crosses.
+        app.surface.paint_full = true;
+        app.paint_rects.clearRetainingCapacity();
+        app.need_full_seed.store(true, .seq_cst);
+        app.seed_pending = true;
+        app.seed_clear_pending = true;
+        app.back_tex_valid = false;
         if (applog.isEnabled()) applog.appLog("onGuiFont: applied name='{s}' pt={d} cell=({d},{d})", .{ applied_name, applied_pt, app.cell_w_px, app.cell_h_px });
 
         if (a.font_generation != prev_font_generation) {
@@ -2176,20 +2188,24 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         }
     }
 
+    // Invalidation flags must be co-set with the cell metrics update above (still
+    // under app.mu): font change shifted cell_w_px/cell_h_px, so any WM_PAINT that
+    // observes the new metrics must also see back_tex_valid=false and the seed
+    // flags. Setting them only after InvalidateRect — as the previous code did —
+    // left a window in which the UI thread could snapshot new metrics together
+    // with stale back_tex_valid=true and preserve a geometrically wrong back_tex.
+    app.surface.paint_full = true;
+    app.paint_rects.clearRetainingCapacity();
+    app.need_full_seed.store(true, .seq_cst);
+    app.seed_pending = true;
+    app.seed_clear_pending = true;
+    app.back_tex_valid = false;
+
     app.mu.unlock();
 
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);
         _ = c.InvalidateRect(h, null, 0);
-        app.mu.lock();
-        app.surface.paint_full = true;
-        app.paint_rects.clearRetainingCapacity();
-        // Trigger full seed to clear back buffer and sync all swapchain buffers.
-        // This ensures gutter areas (outside the new grid) are properly cleared.
-        app.need_full_seed.store(true, .seq_cst);
-        app.seed_pending = true;
-        app.seed_clear_pending = true;
-        app.mu.unlock();
 
         // Snap the main window's client rect to a multiple of the new
         // cell size. Without this, drawable_px % cell_px leaves a strip
@@ -2271,20 +2287,22 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
         }
     }
 
+    // Co-set invalidation flags with the linespace update above (still under
+    // app.mu) for the same race-avoidance reason as onGuiFont: a WM_PAINT that
+    // observes the new linespace must also see back_tex_valid=false and seed
+    // flags, never an interleaved snapshot of new metrics + stale validity.
+    app.surface.paint_full = true;
+    app.paint_rects.clearRetainingCapacity();
+    app.need_full_seed.store(true, .seq_cst);
+    app.seed_pending = true;
+    app.seed_clear_pending = true;
+    app.back_tex_valid = false;
+
     app.mu.unlock();
 
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);
         _ = c.InvalidateRect(h, null, 0);
-        app.mu.lock();
-        app.surface.paint_full = true;
-        app.paint_rects.clearRetainingCapacity();
-        // Trigger full seed to clear back buffer and sync all swapchain buffers.
-        // This ensures gutter areas (outside the new grid) are properly cleared.
-        app.need_full_seed.store(true, .seq_cst);
-        app.seed_pending = true;
-        app.seed_clear_pending = true;
-        app.mu.unlock();
 
         // Same client-rect snap as onGuiFont — linespace changes the row
         // height, so the same drawable_h % cell_h remainder problem applies.

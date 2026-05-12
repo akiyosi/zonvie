@@ -553,6 +553,16 @@ pub export fn WndProc(
                 _ = c.BeginPaint(hwnd, &ps);
                 defer _ = c.EndPaint(hwnd, &ps);
 
+                // While minimized, GetClientRect returns the iconic size
+                // (e.g. 160x28); letting drawEx → resize run would shrink
+                // swapchain/back_tex to that size and discard their contents,
+                // so the next restore would Present an empty surface as a
+                // gray rectangle. BeginPaint/EndPaint above still consumes
+                // the paint region so Windows stops re-issuing WM_PAINT.
+                if (c.IsIconic(hwnd) != 0) {
+                    return 0;
+                }
+
                 // Log first paint with content timing (startup performance)
                 if (!app.first_paint_logged and app.renderer != null) {
                     if (log_enabled) {
@@ -666,6 +676,8 @@ pub export fn WndProc(
 
                 // Read UI metadata under app.mu.
                 const seed_pending_snapshot = app.seed_pending;
+                const seed_clear_pending_snapshot = app.seed_clear_pending;
+                const back_tex_valid_snapshot = app.back_tex_valid;
                 const row_valid_count_snapshot = app.row_valid_count;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
@@ -906,6 +918,30 @@ pub export fn WndProc(
                         if (non_row_draw) {
                             if (g.drawEx(local_main.items, local_cursor.items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
+                                // Non-row-mode equivalent of row-mode's
+                                // (back_tex_valid_snapshot AND preserve_back) OR rendered_complete.
+                                //
+                                // draw_preserved: drawEx actually preserved back_tex this paint.
+                                //   d3d11_renderer.zig:821 clears whenever
+                                //     !has_presented_once OR dirty == null OR opacity < 1.0,
+                                //   so all three conditions must hold for the previous validity
+                                //   to carry forward. (has_presented_once is true after a
+                                //   successful drawEx so is not re-checked here.)
+                                //
+                                // rendered_complete: drawEx just did a full redraw of complete
+                                //   flat_verts. dirty == null is the "full redraw" indicator
+                                //   for non-row-mode (no scissor restriction). !seed_pending
+                                //   is the proxy for "flat_verts covers the whole grid".
+                                //   Without dirty == null, a transparent partial-dirty paint
+                                //   would clear and only draw within the scissor — bv would
+                                //   then be claimed on an incomplete back_tex.
+                                const draw_preserved =
+                                    back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
+                                const rendered_complete =
+                                    !seed_pending_snapshot and dirty == null;
+                                app.mu.lock();
+                                app.back_tex_valid = draw_preserved or rendered_complete;
+                                app.mu.unlock();
                             } else |e| {
                                 if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
                             }
@@ -925,8 +961,32 @@ pub export fn WndProc(
                         // preserve_back=false clears back_tex entirely in drawEx, so if only
                         // dirty rows are drawn the unchanged rows disappear.  Matches
                         // drawNormalExtRowMode's force_full_rows logic for external windows.
+                        //
+                        // seed_pending alone no longer forces a full redraw: when
+                        // back_tex_valid_snapshot is true the previous frame is preserved on
+                        // back_tex, so incremental dirty/scroll updates suffice. Limiting the
+                        // seed_pending reason to !back_tex_valid_snapshot keeps the
+                        // fresh-from-scratch seed path (initial attach, real resize) doing
+                        // full redraws while restoring partial-redraw / DXGI scroll fast paths
+                        // when the seed has stuck for unrelated reasons (e.g. zero validity
+                        // bits propagated through swapAndShiftRows after WM_SIZE no-op).
+                        //
+                        // seed_clear_pending_snapshot is the tight coupling: whenever the
+                        // back_tex is going to be cleared this frame (preserve_back=false via
+                        // the seed_clear branch), every row must be redrawn. Not every
+                        // seed_clear_pending setter co-sets paint_full / need_full_seed (e.g.
+                        // the on_vertices_row dimension-change path at callbacks.zig:1067), so
+                        // relying on those flags alone leaves a window where back_tex is
+                        // cleared but only dirty rows are drawn — non-dirty rows show the
+                        // clear color until Neovim re-sends grid_line.
                         const force_full_rows =
-                            did_need_seed or (dirty == null) or paint_full_snapshot or seed_pending_snapshot or glow_enabled or (g.opacity < 1.0);
+                            did_need_seed or
+                            (dirty == null) or
+                            paint_full_snapshot or
+                            seed_clear_pending_snapshot or
+                            (seed_pending_snapshot and !back_tex_valid_snapshot) or
+                            glow_enabled or
+                            (g.opacity < 1.0);
 
                         const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                         const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
@@ -1328,9 +1388,20 @@ pub export fn WndProc(
                         // With TBS, committed set is read-only — only clear row_valid under app.mu.
                         app.mu.lock();
 
-                        const seed_clear = did_need_seed or app.seed_clear_pending;
+                        // Use the snapshot rather than a live re-read so seed_clear matches the
+                        // value force_full_rows above was computed from. If an RPC callback
+                        // (e.g. on_vertices_row dimension change) sets app.seed_clear_pending
+                        // between the snapshot and this point, the new request is handled by
+                        // the next WM_PAINT — never in a frame where force_full_rows was false.
+                        const seed_clear = did_need_seed or seed_clear_pending_snapshot;
                         if (seed_clear) {
-                            app.seed_clear_pending = false;
+                            // Only consume the pending flag when no RPC dimension change has
+                            // landed since the snapshot. A bumped row_layout_gen means the new
+                            // committed set will need its own clear at the new dimensions;
+                            // leaving seed_clear_pending=true defers that to the next paint.
+                            if (app.row_layout_gen == row_layout_gen_snapshot) {
+                                app.seed_clear_pending = false;
+                            }
                             // Only unset validity for rows beyond current grid
                             const current_rows = committed.rows;
                             var clear_idx: usize = current_rows;
@@ -1345,14 +1416,18 @@ pub export fn WndProc(
                         }
                         app.mu.unlock();
 
-                        // During seed mode (seed_pending), always clear the back buffer to ensure
-                        // all swapchain buffers are properly cleared as they rotate. This prevents
-                        // ghost artifacts in the gutter area when grid shrinks.
-                        // Transparency mode (opacity<1.0) must also force clear: premultiplied alpha
-                        // blending accumulates on retained back_tex, producing faint ghost text on
-                        // rows that are drawn over without an intervening clear (matches external
-                        // window logic in drawNormalExtRowMode).
-                        const preserve_back = !seed_clear and !seed_pending_snapshot and !glow_enabled and g.opacity >= 1.0;
+                        // Gate preservation on back_tex_valid (mirror of macOS hasPresentedOnce
+                        // plus explicit invalidation on font/linespace/DPI changes) rather than
+                        // on !seed_pending. seed_pending alone gets stuck in a dead state when
+                        // a scroll arrives before Neovim finishes re-sending grid_line for all
+                        // rows: swapAndShiftRows propagates zero validity bits through every
+                        // shifted slot, row_valid_count never reaches total_rows, and the old
+                        // gating cleared back_tex on every frame.
+                        // Transparency mode (opacity<1.0) must still force clear: premultiplied
+                        // alpha blending accumulates on retained back_tex, producing faint ghost
+                        // text on rows that are drawn over without an intervening clear (matches
+                        // external window logic in drawNormalExtRowMode).
+                        const preserve_back = !seed_clear and back_tex_valid_snapshot and !glow_enabled and g.opacity >= 1.0;
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{
@@ -1370,7 +1445,11 @@ pub export fn WndProc(
                             .y_offset = content_y_offset_i32,
                             .content_right = content_right_i32,
                             .preserve_back = preserve_back,
-                            .use_row_scissor = !seed_pending_snapshot,
+                            // Per-row scissor when we're either past seed mode or
+                            // preserving a valid back_tex (incremental updates on top of
+                            // a previously-painted frame). Only the fresh-from-scratch
+                            // seed path (back_tex_valid=false) keeps the full-area scissor.
+                            .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
                             .glow_enabled = glow_enabled,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
@@ -1564,11 +1643,31 @@ pub export fn WndProc(
                             if (effective_rows == 0) break :blk false;
 
                             if (seed_pending_snapshot) {
+                                // back_tex_valid_snapshot is the source-of-truth gate
+                                // (same flag preserve_back uses). When it is true,
+                                // back_tex already holds a fully-painted frame at the
+                                // current dimensions/metrics, so an incomplete row_valid
+                                // bitset does not block presenting scroll/dirty updates
+                                // — the rows we have not yet re-validated stay sourced
+                                // from the preserved back_tex content. Without this,
+                                // a WM_SIZE on minimize/restore that resets row_valid,
+                                // combined with grid_scroll propagating zero validity
+                                // bits via swapAndShiftRows, would freeze present while
+                                // preserve_back=true masked the gray-rectangle symptom.
+                                if (back_tex_valid_snapshot) {
+                                    if (rows_mismatch) {
+                                        if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
+                                        break :blk false;
+                                    }
+                                    break :blk true;
+                                }
+
                                 if (rows_mismatch) {
                                     if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
                                     break :blk false;
                                 }
-                                // Require a complete seed: all rows must have been received.
+                                // No back_tex yet: require a complete seed so the first
+                                // present covers every row.
                                 if (effective_row_valid_count == effective_rows) {
                                     if (skipped_empty != 0) break :blk false;
                                     if (rows_to_draw.items.len != effective_rows) break :blk false;
@@ -1604,7 +1703,13 @@ pub export fn WndProc(
                             // otherwise areas not covered by partial present rects may show stale content.
                             // Also force full present when scrollbar is visible to avoid knob ghosting.
                             const scrollbar_needs_full = app.scrollbar_alpha > 0.001;
-                            const force_full_present = force_full_rows or (seed_pending_snapshot and !rows_mismatch) or seed_clear or scrollbar_needs_full;
+                            // seed_pending alone no longer forces a full present: when
+                            // back_tex_valid_snapshot is true the swapchain has already been
+                            // synced to a complete frame, and partial present rects keep
+                            // DXGI from copying unchanged regions every paint.
+                            const force_full_present = force_full_rows or
+                                (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
+                                seed_clear or scrollbar_needs_full;
                             const present_rects_slice: []const c.RECT =
                                 if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
@@ -1623,6 +1728,42 @@ pub export fn WndProc(
                                 null,
                             )) {
                                 render_ok = true;
+                                // Assign back_tex_valid directly so it can also transition
+                                // true → false in the same paint. Two paths to true:
+                                //
+                                //   1. preserve_back was true AND back_tex_valid_snapshot was
+                                //      true. The previous paint left back_tex in a valid state
+                                //      and this paint only overlaid dirty rows on top of it —
+                                //      back_tex is still valid even if this paint didn't render
+                                //      every row.
+                                //
+                                //   2. We just rendered a complete frame regardless of prior
+                                //      state. "Complete" here is render-side completeness
+                                //      (skipped_empty == 0 and rows_to_draw covers every row),
+                                //      not Neovim-side validation (row_valid_count). The
+                                //      distinction matters for minimize/restore, where
+                                //      row_valid is unsetAll'd by WM_SIZE but row_verts still
+                                //      holds full pre-minimize data — a seed_clear paint
+                                //      redraws every row from that data and back_tex becomes
+                                //      complete even with row_valid_count == 0.
+                                //
+                                // Both conditions fail (preserve_back=false AND incomplete
+                                // render) → back_tex_valid falls to false. This is the
+                                // critical case for the on_vertices_row dimension-change path:
+                                // seed_clear bypasses the row_valid completeness check at
+                                // allow_present and presents anyway, so without an explicit
+                                // false-assignment a stale snapshot value would survive a
+                                // paint that wiped back_tex.
+                                const rendered_complete_frame =
+                                    effective_rows != 0 and
+                                    skipped_empty == 0 and
+                                    rows_to_draw.items.len == effective_rows;
+                                const new_back_tex_valid =
+                                    (back_tex_valid_snapshot and preserve_back) or
+                                    rendered_complete_frame;
+                                app.mu.lock();
+                                app.back_tex_valid = new_back_tex_valid;
+                                app.mu.unlock();
                                 // last_painted_cursor_row is tracked by drawCursorOverlay above.
                             } else |e| {
                                 if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
@@ -1753,6 +1894,9 @@ pub export fn WndProc(
                 if (app.row_valid.bit_length != 0) {
                     app.row_valid.unsetAll();
                 }
+                // DPI change shifts cell metrics; back_tex content is no longer
+                // geometrically valid even if pixel dimensions happen to match.
+                app.back_tex_valid = false;
                 app.mu.unlock();
 
                 // Resize window to the suggested rect from WM_DPICHANGED
@@ -1867,6 +2011,16 @@ pub export fn WndProc(
 
                     if (gpu_ptr) |g| {
                         g.resize() catch {};
+                        // renderer.resize() short-circuits when client size is unchanged
+                        // (e.g. minimize/restore), leaving has_presented_once true; only
+                        // an actual dimension change resets it. Mirror that decision into
+                        // back_tex_valid so preserve_back keeps the buffer across no-op
+                        // resizes but forces a clear when the swapchain was rebuilt.
+                        if (!g.has_presented_once) {
+                            app.mu.lock();
+                            app.back_tex_valid = false;
+                            app.mu.unlock();
+                        }
                     }
                 }
                 {
