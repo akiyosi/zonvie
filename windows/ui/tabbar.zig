@@ -6,6 +6,7 @@ const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
+const window_mod = @import("../window.zig");
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 
@@ -1032,13 +1033,17 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                 var rect: c.RECT = undefined;
                 _ = c.GetClientRect(hwnd, &rect);
 
-                // Fill with light background
-                const bg_brush = c.CreateSolidBrush(c.RGB(240, 240, 240));
+                // Match the active OS theme so the drag preview blends with
+                // the titlebar palette regardless of light/dark mode.
+                const preview_pal = currentTitlebarPalette();
+
+                // Fill with theme background
+                const bg_brush = c.CreateSolidBrush(preview_pal.bar_bg);
                 _ = c.FillRect(hdc, &rect, bg_brush);
                 _ = c.DeleteObject(bg_brush);
 
-                // Draw border
-                const border_brush = c.CreateSolidBrush(c.RGB(180, 180, 180));
+                // Draw border using the muted glyph pen color
+                const border_brush = c.CreateSolidBrush(preview_pal.glyph_pen);
                 _ = c.FrameRect(hdc, &rect, border_brush);
                 _ = c.DeleteObject(border_brush);
 
@@ -1080,7 +1085,7 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                                 text_rect.left += text_pad;
                                 text_rect.right -= text_pad;
                                 _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                                _ = c.SetTextColor(hdc, c.RGB(0, 0, 0));
+                                _ = c.SetTextColor(hdc, preview_pal.text_selected);
 
                                 // Convert UTF-8 to UTF-16
                                 var wide_buf: [128]u16 = undefined;
@@ -1095,7 +1100,7 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                                 text_rect.left += text_pad;
                                 text_rect.right -= text_pad;
                                 _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                                _ = c.SetTextColor(hdc, c.RGB(128, 128, 128));
+                                _ = c.SetTextColor(hdc, preview_pal.text_normal);
                                 _ = c.DrawTextW(hdc, &no_name, 9, &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER);
                             }
                         }
@@ -1168,6 +1173,72 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
 }
 
 /// Draw tabline content (called from offscreen DC or child window WM_PAINT)
+/// Color palette for the custom titlebar / tabline rendering. All values
+/// are picked from the OS app-theme preference (Settings → Personalization
+/// → Colors) so the titlebar tracks the system light/dark mode regardless
+/// of the active Neovim colorscheme. Approximates the Windows 11 native
+/// titlebar palette.
+const TitlebarPalette = struct {
+    bar_bg: c.COLORREF,
+    tab_selected: c.COLORREF,
+    tab_hover: c.COLORREF,
+    tab_normal: c.COLORREF,
+    tab_placeholder: c.COLORREF,
+    tab_dragging: c.COLORREF,
+    text_selected: c.COLORREF,
+    text_normal: c.COLORREF,
+    glyph_pen: c.COLORREF, // close X, + icon, plus pen
+    glyph_hover_bg: c.COLORREF, // close hover bg, plus hover bg
+    wbtn_icon: c.COLORREF,
+    wbtn_hover_bg: c.COLORREF,
+    wbtn_close_hover_bg: c.COLORREF, // red, same in both themes
+    wbtn_close_hover_icon: c.COLORREF, // white on red bg, same in both themes
+    accent: c.COLORREF, // drop indicator / float-tab border
+};
+
+fn currentTitlebarPalette() TitlebarPalette {
+    // Read the cached dark-mode flag (UI-thread only). The cache is
+    // refreshed by window.applyOsTitlebarTheme() / handleThemeReread() on
+    // initial bring-up and on theme-change notifications, so no registry
+    // syscall enters the WM_PAINT hot path.
+    if (window_mod.g_os_dark_theme_cached) {
+        return .{
+            .bar_bg = c.RGB(32, 32, 32),
+            .tab_selected = c.RGB(48, 48, 48),
+            .tab_hover = c.RGB(58, 58, 58),
+            .tab_normal = c.RGB(40, 40, 40),
+            .tab_placeholder = c.RGB(50, 50, 50),
+            .tab_dragging = c.RGB(40, 60, 90),
+            .text_selected = c.RGB(255, 255, 255),
+            .text_normal = c.RGB(180, 180, 180),
+            .glyph_pen = c.RGB(200, 200, 200),
+            .glyph_hover_bg = c.RGB(80, 80, 80),
+            .wbtn_icon = c.RGB(220, 220, 220),
+            .wbtn_hover_bg = c.RGB(60, 60, 60),
+            .wbtn_close_hover_bg = c.RGB(232, 17, 35),
+            .wbtn_close_hover_icon = c.RGB(255, 255, 255),
+            .accent = c.RGB(0, 120, 215),
+        };
+    }
+    return .{
+        .bar_bg = c.RGB(240, 240, 240),
+        .tab_selected = c.RGB(255, 255, 255),
+        .tab_hover = c.RGB(230, 230, 230),
+        .tab_normal = c.RGB(220, 220, 220),
+        .tab_placeholder = c.RGB(200, 200, 200),
+        .tab_dragging = c.RGB(200, 220, 255),
+        .text_selected = c.RGB(0, 0, 0),
+        .text_normal = c.RGB(80, 80, 80),
+        .glyph_pen = c.RGB(100, 100, 100),
+        .glyph_hover_bg = c.RGB(200, 200, 200),
+        .wbtn_icon = c.RGB(50, 50, 50),
+        .wbtn_hover_bg = c.RGB(230, 230, 230),
+        .wbtn_close_hover_bg = c.RGB(232, 17, 35),
+        .wbtn_close_hover_icon = c.RGB(255, 255, 255),
+        .accent = c.RGB(0, 120, 215),
+    };
+}
+
 pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     if (app.tabline_state.tab_count == 0) {
         return;
@@ -1190,8 +1261,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const plus_icon_inset = app.scalePx(5);
     const is_dragging = app.tabline_state.dragging_tab != null;
 
+    const pal = currentTitlebarPalette();
+
     // Background
-    const bg_brush = c.CreateSolidBrush(c.RGB(240, 240, 240));
+    const bg_brush = c.CreateSolidBrush(pal.bar_bg);
     defer _ = c.DeleteObject(bg_brush);
     var bar_rect = c.RECT{
         .left = 0,
@@ -1208,10 +1281,10 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
 
     // Brushes
-    const selected_brush = c.CreateSolidBrush(c.RGB(255, 255, 255));
-    const hover_brush = c.CreateSolidBrush(c.RGB(230, 230, 230));
-    const normal_brush = c.CreateSolidBrush(c.RGB(220, 220, 220));
-    const dragging_brush = c.CreateSolidBrush(c.RGB(200, 220, 255));  // Light blue for dragging tab
+    const selected_brush = c.CreateSolidBrush(pal.tab_selected);
+    const hover_brush = c.CreateSolidBrush(pal.tab_hover);
+    const normal_brush = c.CreateSolidBrush(pal.tab_normal);
+    const dragging_brush = c.CreateSolidBrush(pal.tab_dragging);
     defer {
         _ = c.DeleteObject(selected_brush);
         _ = c.DeleteObject(hover_brush);
@@ -1259,7 +1332,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // If this tab is being dragged (moved beyond threshold), draw a placeholder (dimmed)
         if (is_being_dragged) {
             // Draw dimmed placeholder
-            const placeholder_brush = c.CreateSolidBrush(c.RGB(200, 200, 200));
+            const placeholder_brush = c.CreateSolidBrush(pal.tab_placeholder);
             _ = c.FillRect(hdc, &tab_rect, placeholder_brush);
             _ = c.DeleteObject(placeholder_brush);
             x += tab_width + 1;
@@ -1271,7 +1344,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         _ = c.FillRect(hdc, &tab_rect, brush);
 
         // Tab name
-        _ = c.SetTextColor(hdc, if (is_selected) c.RGB(0, 0, 0) else c.RGB(80, 80, 80));
+        _ = c.SetTextColor(hdc, if (is_selected) pal.text_selected else pal.text_normal);
 
         var text_rect = c.RECT{
             .left = x + tab_padding,
@@ -1297,7 +1370,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
             // Highlight if close button hovered
             if (app.tabline_state.hovered_close == i) {
-                const highlight_brush = c.CreateSolidBrush(c.RGB(200, 200, 200));
+                const highlight_brush = c.CreateSolidBrush(pal.glyph_hover_bg);
                 var close_rect = c.RECT{
                     .left = close_x,
                     .top = close_y,
@@ -1309,7 +1382,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             }
 
             // Draw X
-            const pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(100, 100, 100));
+            const pen = c.CreatePen(c.PS_SOLID, 1, pal.glyph_pen);
             const old_pen = c.SelectObject(hdc, pen);
             _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
             _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
@@ -1328,7 +1401,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     {
         // Draw hover background (circular) if hovered
         if (app.tabline_state.hovered_new_tab_btn) {
-            const plus_hover_brush = c.CreateSolidBrush(c.RGB(200, 200, 200));
+            const plus_hover_brush = c.CreateSolidBrush(pal.glyph_hover_bg);
             _ = c.SelectObject(hdc, plus_hover_brush);
             const null_pen = c.GetStockObject(c.NULL_PEN);
             const old_pen_hover = c.SelectObject(hdc, null_pen);
@@ -1338,7 +1411,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         }
 
         // Draw + icon
-        const pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(100, 100, 100));
+        const pen = c.CreatePen(c.PS_SOLID, 2, pal.glyph_pen);
         const old_pen = c.SelectObject(hdc, pen);
         _ = c.MoveToEx(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_icon_inset, null);
         _ = c.LineTo(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_btn_size - plus_icon_inset);
@@ -1366,13 +1439,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Hover highlight
         if (hovered_btn == 0) {
-            const min_hover_brush = c.CreateSolidBrush(c.RGB(230, 230, 230));
+            const min_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
             _ = c.FillRect(hdc, &btn_rect, min_hover_brush);
             _ = c.DeleteObject(min_hover_brush);
         }
 
         // Draw minimize icon (horizontal line)
-        const min_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, c.RGB(50, 50, 50));
+        const min_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
         const old_min_icon_pen = c.SelectObject(hdc, min_icon_pen);
         const icon_y = @divTrunc(bar_height, 2);
         _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, icon_y, null);
@@ -1388,13 +1461,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Hover highlight
         if (hovered_btn == 1) {
-            const max_hover_brush = c.CreateSolidBrush(c.RGB(230, 230, 230));
+            const max_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
             _ = c.FillRect(hdc, &btn_rect, max_hover_brush);
             _ = c.DeleteObject(max_hover_brush);
         }
 
         // Draw maximize icon (rectangle)
-        const max_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, c.RGB(50, 50, 50));
+        const max_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
         const old_max_icon_pen = c.SelectObject(hdc, max_icon_pen);
         const max_null_brush = c.GetStockObject(c.NULL_BRUSH);
         const old_max_brush = c.SelectObject(hdc, max_null_brush);
@@ -1412,13 +1485,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Red hover highlight for close button
         if (hovered_btn == 2) {
-            const close_hover_brush = c.CreateSolidBrush(c.RGB(232, 17, 35));  // Red
+            const close_hover_brush = c.CreateSolidBrush(pal.wbtn_close_hover_bg);
             _ = c.FillRect(hdc, &btn_rect, close_hover_brush);
             _ = c.DeleteObject(close_hover_brush);
         }
 
         // Draw X icon
-        const close_icon_color = if (hovered_btn == 2) c.RGB(255, 255, 255) else c.RGB(50, 50, 50);
+        const close_icon_color = if (hovered_btn == 2) pal.wbtn_close_hover_icon else pal.wbtn_icon;
         const close_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, close_icon_color);
         const old_close_icon_pen = c.SelectObject(hdc, close_icon_pen);
         const close_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
@@ -1437,7 +1510,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Only show indicator if target is different from current position
             if (target_idx != drag_idx and target_idx != drag_idx + 1) {
                 const indicator_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(target_idx)) * (tab_width + 1);
-                const indicator_pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(0, 120, 215));  // Blue indicator
+                const indicator_pen = c.CreatePen(c.PS_SOLID, 2, pal.accent);
                 const old_indicator_pen = c.SelectObject(hdc, indicator_pen);
                 _ = c.MoveToEx(hdc, indicator_x, 2, null);
                 _ = c.LineTo(hdc, indicator_x, bar_height - 2);
@@ -1459,13 +1532,14 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
                 .bottom = bar_height,
             };
 
-            // Draw floating tab with blue tint (semi-transparent effect via color)
-            const float_brush = c.CreateSolidBrush(c.RGB(200, 220, 255));  // Light blue
+            // Draw floating tab tinted with the accent color (no transparency
+            // in GDI; use the dragging-tab palette entry for a consistent feel).
+            const float_brush = c.CreateSolidBrush(pal.tab_dragging);
             _ = c.FillRect(hdc, &float_rect, float_brush);
             _ = c.DeleteObject(float_brush);
 
             // Draw border for floating tab
-            const border_pen = c.CreatePen(c.PS_SOLID, 1, c.RGB(0, 120, 215));
+            const border_pen = c.CreatePen(c.PS_SOLID, 1, pal.accent);
             const old_border_pen = c.SelectObject(hdc, border_pen);
             const float_null_brush = c.GetStockObject(c.NULL_BRUSH);
             const old_float_brush = c.SelectObject(hdc, float_null_brush);
@@ -1475,7 +1549,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             _ = c.DeleteObject(border_pen);
 
             // Draw tab name on floating tab
-            _ = c.SetTextColor(hdc, c.RGB(0, 0, 0));
+            _ = c.SetTextColor(hdc, pal.text_selected);
             var float_text_rect = c.RECT{
                 .left = float_x + tab_padding,
                 .top = top_padding,
@@ -1547,156 +1621,6 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
     if (app.tabline_state.hwnd) |tabline_hwnd| {
         _ = c.ShowWindow(tabline_hwnd, c.SW_HIDE);
     }
-}
-
-/// Draw tabline bar using GDI
-pub fn drawTabline(app: *App, hdc: c.HDC, client_width: c_int) void {
-    if (!app.ext_tabline_enabled or !app.tabline_state.visible) return;
-    if (app.tabline_state.tab_count == 0) return;
-
-    if (applog.isEnabled()) {
-        applog.appLog("[win] drawTabline: tab_count={d} current_tab={d} width={d}\n", .{
-            app.tabline_state.tab_count,
-            app.tabline_state.current_tab,
-            client_width,
-        });
-    }
-
-    // DPI-scaled constants
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
-    const tab_padding = app.scalePx(TablineState.TAB_PADDING);
-    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const plus_space = app.scalePx(40);
-    const close_margin = app.scalePx(6);
-    const close_inset = app.scalePx(3);
-    const top_padding = app.scalePx(4);
-    const plus_offset = app.scalePx(8);
-
-    // Background
-    const bg_brush = c.CreateSolidBrush(c.RGB(240, 240, 240));
-    defer _ = c.DeleteObject(bg_brush);
-    var bar_rect = c.RECT{
-        .left = 0,
-        .top = 0,
-        .right = client_width,
-        .bottom = bar_height,
-    };
-    _ = c.FillRect(hdc, &bar_rect, bg_brush);
-
-    // Calculate tab width
-    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;  // plus_space for new tab button
-    const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-    const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
-
-    // Brushes
-    const selected_brush = c.CreateSolidBrush(c.RGB(255, 255, 255));
-    const hover_brush = c.CreateSolidBrush(c.RGB(230, 230, 230));
-    const normal_brush = c.CreateSolidBrush(c.RGB(220, 220, 220));
-    defer {
-        _ = c.DeleteObject(selected_brush);
-        _ = c.DeleteObject(hover_brush);
-        _ = c.DeleteObject(normal_brush);
-    }
-
-    // Font
-    const font = c.CreateFontW(
-        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
-        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
-        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
-    );
-    defer _ = c.DeleteObject(font);
-    const old_font = c.SelectObject(hdc, font);
-    defer _ = c.SelectObject(hdc, old_font);
-
-    _ = c.SetBkMode(hdc, c.TRANSPARENT);
-
-    var x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-
-    for (0..app.tabline_state.tab_count) |i| {
-        const tab = &app.tabline_state.tabs[i];
-        const is_selected = tab.handle == app.tabline_state.current_tab;
-        const is_hovered = app.tabline_state.hovered_tab == i;
-
-        var tab_rect = c.RECT{
-            .left = x + 1,
-            .top = top_padding,
-            .right = x + tab_width - 1,
-            .bottom = bar_height,
-        };
-
-        // Background
-        const brush = if (is_selected) selected_brush else if (is_hovered) hover_brush else normal_brush;
-        _ = c.FillRect(hdc, &tab_rect, brush);
-
-        // Tab name
-        _ = c.SetTextColor(hdc, if (is_selected) c.RGB(0, 0, 0) else c.RGB(80, 80, 80));
-
-        var text_rect = c.RECT{
-            .left = x + tab_padding,
-            .top = top_padding,
-            .right = x + tab_width - tab_padding - close_size - top_padding,
-            .bottom = bar_height,
-        };
-
-        // Convert name to display
-        var display_name: [256]u8 = undefined;
-        const display_len = extractTabDisplayName(tab, &display_name);
-
-        // Convert to wide string
-        var wide_buf: [256]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
-
-        _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
-
-        // Close button (X) - show on selected or hovered tabs
-        if (is_selected or is_hovered) {
-            const close_x = x + tab_width - close_size - close_margin;
-            const close_y = @divTrunc(bar_height - close_size, 2);
-            const is_close_hovered = app.tabline_state.hovered_close == i;
-
-            if (is_close_hovered) {
-                const close_bg = c.CreateSolidBrush(c.RGB(200, 200, 200));
-                var close_rect = c.RECT{
-                    .left = close_x,
-                    .top = close_y,
-                    .right = close_x + close_size,
-                    .bottom = close_y + close_size,
-                };
-                _ = c.FillRect(hdc, &close_rect, close_bg);
-                _ = c.DeleteObject(close_bg);
-            }
-
-            // Draw X
-            const pen = c.CreatePen(c.PS_SOLID, 1, if (is_close_hovered) c.RGB(0, 0, 0) else c.RGB(100, 100, 100));
-            const old_pen = c.SelectObject(hdc, pen);
-            _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
-            _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
-            _ = c.SelectObject(hdc, old_pen);
-            _ = c.DeleteObject(pen);
-        }
-
-        x += tab_width + 1;
-    }
-
-    // Draw + button
-    const plus_btn_size = app.scalePx(16);
-    const plus_x = x + plus_offset;
-    const plus_y = @divTrunc(bar_height - plus_btn_size, 2);
-    const plus_pen = c.CreatePen(c.PS_SOLID, 2, c.RGB(100, 100, 100));
-    const old_pen = c.SelectObject(hdc, plus_pen);
-    const plus_half = @divTrunc(plus_btn_size, 2);
-    _ = c.MoveToEx(hdc, plus_x + plus_half, plus_y, null);
-    _ = c.LineTo(hdc, plus_x + plus_half, plus_y + plus_btn_size);
-    _ = c.MoveToEx(hdc, plus_x, plus_y + plus_half, null);
-    _ = c.LineTo(hdc, plus_x + plus_btn_size, plus_y + plus_half);
-    _ = c.SelectObject(hdc, old_pen);
-    _ = c.DeleteObject(plus_pen);
 }
 
 /// Handle tabline mouse click

@@ -64,7 +64,7 @@ const RegGetValueW_usizeFn = *const fn (
 // value on every supported Windows build, so the failure path here is
 // effectively unreachable on a sane system; we still default to "light"
 // to match the value's own missing-state semantics.
-fn osAppThemeIsDark() bool {
+pub fn osAppThemeIsDark() bool {
     var apps_use_light_theme: c.DWORD = 1; // default light if read fails
     var data_size: c.DWORD = @sizeOf(c.DWORD);
     const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
@@ -88,15 +88,26 @@ fn osAppThemeIsDark() bool {
     return apps_use_light_theme == 0;
 }
 
-// Apply the user's OS light/dark theme preference to the DWM titlebar.
-// Called from WM_CREATE (initial frame) and from WM_SETTINGCHANGE when
-// the user toggles the system theme. Works regardless of ext-tabline state:
-// the custom tabline (when ext-tabline=titlebar) covers the caption area
-// itself, but the system min/max/close buttons, resize border, and
-// alt-tab / window-switch chrome still come from DWM and follow this bit.
-// HRESULT is ignored — pre-19041 Windows 10 builds simply no-op.
+// UI-thread cached copy of `osAppThemeIsDark()`. The custom titlebar / tabline
+// renderer (drawTablineContent) reads this on every WM_PAINT to pick its
+// palette, so we MUST NOT call osAppThemeIsDark() (a registry syscall) from
+// the paint hot path. The cache is refreshed by applyOsTitlebarTheme() and
+// handleThemeReread(), which run only at initial bring-up, on theme-change
+// notifications, and from the registry watcher.
+//
+// Only the UI thread reads/writes this; no synchronisation needed.
+pub var g_os_dark_theme_cached: bool = false;
+
+// Apply the user's OS light/dark theme preference to the DWM titlebar and
+// refresh the cached dark-mode flag in the same call. Called from WM_CREATE
+// (initial frame) and from theme-change handlers. Works regardless of
+// ext-tabline state: the custom tabline (when ext-tabline=titlebar) covers
+// the caption area itself, but the system min/max/close buttons, resize
+// border, and alt-tab / window-switch chrome still come from DWM and follow
+// this bit. HRESULT is ignored — pre-19041 Windows 10 builds simply no-op.
 pub fn applyOsTitlebarTheme(hwnd: c.HWND) void {
-    var dark_mode: c.BOOL = if (osAppThemeIsDark()) 1 else 0;
+    g_os_dark_theme_cached = osAppThemeIsDark();
+    var dark_mode: c.BOOL = if (g_os_dark_theme_cached) 1 else 0;
     _ = c.DwmSetWindowAttribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -136,6 +147,11 @@ pub fn handleImmersiveColorSet(hwnd: c.HWND, lParam: c.LPARAM) bool {
     const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
     if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) == 0) return false;
     applyOsTitlebarTheme(hwnd);
+    // ext-tabline=titlebar paints its own custom titlebar inside the client
+    // area whose palette is picked from g_os_dark_theme_cached at paint
+    // time. Force a repaint so the tabline texture is regenerated with the
+    // new palette even if the registry-watcher path is unavailable.
+    _ = c.InvalidateRect(hwnd, null, 0);
     return true;
 }
 
@@ -283,6 +299,12 @@ fn enumApplyThemeProc(hwnd: c.HWND, _: c.LPARAM) callconv(.winapi) c.BOOL {
     const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
     if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) != 0) {
         applyOsTitlebarTheme(hwnd);
+        // The ext-tabline=titlebar mode replaces the system caption with a
+        // GDI/D3D-drawn custom titlebar whose palette is picked at paint
+        // time from currentTitlebarPalette(). DWM attributes alone don't
+        // refresh that surface, so force a repaint to redraw the tabline
+        // (and any other client-area UI) under the new theme.
+        _ = c.InvalidateRect(hwnd, null, 0);
     }
     return 1;
 }
@@ -292,6 +314,10 @@ fn enumApplyThemeProc(hwnd: c.HWND, _: c.LPARAM) callconv(.winapi) c.BOOL {
 // current (UI) thread — main window, all external windows, and any open
 // dialogs are covered in one pass.
 fn handleThemeReread() void {
+    // Refresh the cache once up-front so even the no-window case (or a
+    // future caller that bypasses EnumThreadWindows) leaves the UI-thread
+    // dark-mode flag consistent with the OS state.
+    g_os_dark_theme_cached = osAppThemeIsDark();
     _ = c.EnumThreadWindows(c.GetCurrentThreadId(), enumApplyThemeProc, 0);
 }
 
@@ -311,6 +337,9 @@ pub fn handleThemeChanged(hwnd: c.HWND) bool {
     const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
     if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) == 0) return false;
     applyOsTitlebarTheme(hwnd);
+    // Force a repaint so the custom tabline texture is regenerated with the
+    // refreshed palette (same reasoning as in handleImmersiveColorSet).
+    _ = c.InvalidateRect(hwnd, null, 0);
     return true;
 }
 
@@ -1139,9 +1168,16 @@ pub export fn WndProc(
                     else
                         null;
 
-                    // Tabbar background color (dark gray) - fallback if tabline texture not available
+                    // Tabbar background color - fallback strip shown if the
+                    // tabline texture is not yet generated (initial frame or
+                    // update failure). Track the OS light/dark theme cache so
+                    // the fallback matches currentTitlebarPalette().bar_bg
+                    // (RGB(32,32,32) dark / RGB(240,240,240) light).
                     const tabbar_bg_color: ?[4]f32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                        .{ 0.12, 0.12, 0.12, 1.0 }
+                        (if (g_os_dark_theme_cached)
+                            [4]f32{ 32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0 }
+                        else
+                            [4]f32{ 240.0 / 255.0, 240.0 / 255.0, 240.0 / 255.0, 1.0 })
                     else
                         null;
                     const content_x_offset_i32: i32 = if (content_x_offset) |off| @intCast(off) else 0;
