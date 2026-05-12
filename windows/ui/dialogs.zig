@@ -3,6 +3,7 @@ const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
+const window_mod = @import("../window.zig");
 
 // --- SSH Password Dialog state ---
 var ssh_dlg_password: [256]u8 = undefined;
@@ -321,6 +322,9 @@ pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16)
 
     if (hwnd == null) return false;
 
+    // Match OS light/dark titlebar theme — same as the main window.
+    window_mod.applyOsTitlebarTheme(hwnd);
+
     // Create prompt label
     _ = c.CreateWindowExW(
         0,
@@ -449,6 +453,18 @@ fn passwordDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
             c.PostQuitMessage(0);
             return 0;
         },
+        c.WM_SETTINGCHANGE => {
+            // Only consume the color-mode broadcast; let other
+            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
+            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
+            // Fall through to the default dispatch path below.
+        },
+        c.WM_THEMECHANGED => {
+            // Best-effort titlebar refresh, then fall through so the OS
+            // can run its standard handling for any non-caption surface.
+            _ = window_mod.handleThemeChanged(hwnd);
+            // Fall through to the default dispatch path below.
+        },
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -492,6 +508,9 @@ pub fn showDevcontainerProgressDialog(label_text: [*:0]const u16) void {
 
     if (hwnd == null) return;
     g_devcontainer_dialog_hwnd = hwnd;
+
+    // Match OS light/dark titlebar theme — same as the main window.
+    window_mod.applyOsTitlebarTheme(hwnd);
 
     // Create label
     g_devcontainer_label_hwnd = c.CreateWindowExW(
@@ -537,6 +556,18 @@ fn devcontainerDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
             g_devcontainer_dialog_hwnd = null;
             g_devcontainer_label_hwnd = null;
             return 0;
+        },
+        c.WM_SETTINGCHANGE => {
+            // Only consume the color-mode broadcast; let other
+            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
+            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
+            // Fall through to the default dispatch path below.
+        },
+        c.WM_THEMECHANGED => {
+            // Best-effort titlebar refresh, then fall through so the OS
+            // can run its standard handling for any non-caption surface.
+            _ = window_mod.handleThemeChanged(hwnd);
+            // Fall through to the default dispatch path below.
         },
         else => {},
     }

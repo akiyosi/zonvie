@@ -25,6 +25,295 @@ fn loadSystemCursor(id: usize) c.HCURSOR {
     return @ptrCast(@alignCast(load_fn(null, id)));
 }
 
+// DWM titlebar immersive-dark-mode attribute. Defined locally so the code
+// compiles against older mingw-w64 headers that may predate this constant.
+//
+// Officially documented as Windows 11 22000+ only (see DWMWINDOWATTRIBUTE).
+// Works empirically on Windows 10 19041+ as well, which is what most
+// Win32 dark-mode-aware apps rely on. On systems where the attribute is
+// not supported, DwmSetWindowAttribute returns E_INVALIDARG and the
+// titlebar simply stays at its default color — that failure is intentional
+// and the HRESULT is discarded at every call site.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: c.DWORD = 20;
+
+// HKEY_CURRENT_USER cannot be expressed as a Zig pointer constant: zig's
+// comptime alignment check rejects the magic 0x80000001 sentinel because
+// the underlying HKEY type is align(4). Bind RegGetValueW through @extern
+// with a usize-typed hkey parameter — the Win64 ABI passes the pointer as
+// an integer-sized register anyway.
+const RegGetValueW_usizeFn = *const fn (
+    hkey: usize,
+    lpSubKey: ?[*:0]const u16,
+    lpValue: ?[*:0]const u16,
+    dwFlags: c.DWORD,
+    pdwType: ?*c.DWORD,
+    pvData: ?*anyopaque,
+    pcbData: ?*c.DWORD,
+) callconv(.winapi) c.LONG;
+
+// Read the user's OS-wide app theme preference (Settings → Personalization
+// → Colors → "Choose your mode"). Returns true if dark mode is selected,
+// false otherwise (including when the registry value cannot be read).
+//
+// Microsoft's officially-recommended path is
+// `Windows.UI.ViewManagement.UISettings.GetColorValue(UIColorType.Foreground)`
+// through WinRT, but every Win32 dark-mode-aware app (Windows Terminal,
+// VSCode's electron shell, Chromium) ends up reading this registry key
+// directly because pulling in a WinRT activation for a one-bit query is
+// disproportionate. `Personalize\AppsUseLightTheme` is a stable user-mode
+// value on every supported Windows build, so the failure path here is
+// effectively unreachable on a sane system; we still default to "light"
+// to match the value's own missing-state semantics.
+fn osAppThemeIsDark() bool {
+    var apps_use_light_theme: c.DWORD = 1; // default light if read fails
+    var data_size: c.DWORD = @sizeOf(c.DWORD);
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    const value = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    const HKEY_CURRENT_USER: usize = 0x80000001;
+    const reg_get_value_w: RegGetValueW_usizeFn = @extern(
+        RegGetValueW_usizeFn,
+        .{ .name = "RegGetValueW" },
+    );
+    _ = reg_get_value_w(
+        HKEY_CURRENT_USER,
+        subkey,
+        value,
+        c.RRF_RT_REG_DWORD,
+        null,
+        &apps_use_light_theme,
+        &data_size,
+    );
+    return apps_use_light_theme == 0;
+}
+
+// Apply the user's OS light/dark theme preference to the DWM titlebar.
+// Called from WM_CREATE (initial frame) and from WM_SETTINGCHANGE when
+// the user toggles the system theme. Works regardless of ext-tabline state:
+// the custom tabline (when ext-tabline=titlebar) covers the caption area
+// itself, but the system min/max/close buttons, resize border, and
+// alt-tab / window-switch chrome still come from DWM and follow this bit.
+// HRESULT is ignored — pre-19041 Windows 10 builds simply no-op.
+pub fn applyOsTitlebarTheme(hwnd: c.HWND) void {
+    var dark_mode: c.BOOL = if (osAppThemeIsDark()) 1 else 0;
+    _ = c.DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark_mode,
+        @sizeOf(c.BOOL),
+    );
+}
+
+// WM_SETTINGCHANGE dispatch helper for any top-level window that wants its
+// DWM titlebar to follow the OS app theme. Returns true if the message was
+// the "ImmersiveColorSet" broadcast and the theme was re-applied.
+//
+// "ImmersiveColorSet" is a de-facto broadcast string the Windows shell
+// sends when the user toggles light/dark mode. It is NOT in the public
+// WM_SETTINGCHANGE documentation — the officially-supported live-tracking
+// path is `Windows.UI.ViewManagement.UISettings.ColorValuesChanged` through
+// WinRT. We listen for it here because every Win32 dark-mode app does
+// (Windows Terminal, Chromium, VSCode), and pair it with WM_THEMECHANGED
+// (a documented Win32 message) via handleThemeChanged() so theme tracking
+// still works if a future Windows build stops broadcasting the string.
+//
+// Performs a NUL-terminated wide-string compare so shorter lParam values
+// like "intl" / "Policy" / "Environment" do not read past their NUL into
+// adjacent memory. Skips windows without WS_CAPTION (caption-less popups
+// such as ext-cmdline / popupmenu / msg overlays) since DwmSetWindowAttribute
+// has nothing to colour for them.
+pub fn handleImmersiveColorSet(hwnd: c.HWND, lParam: c.LPARAM) bool {
+    if (lParam == 0) return false;
+    const param_ptr: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lParam)));
+    const expected = [_:0]u16{ 'I', 'm', 'm', 'e', 'r', 's', 'i', 'v', 'e', 'C', 'o', 'l', 'o', 'r', 'S', 'e', 't' };
+    var i: usize = 0;
+    while (i < expected.len) : (i += 1) {
+        const got = param_ptr[i];
+        if (got == 0 or got != expected[i]) return false;
+    }
+    if (param_ptr[expected.len] != 0) return false;
+    const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
+    if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) == 0) return false;
+    applyOsTitlebarTheme(hwnd);
+    return true;
+}
+
+// =========================================================================
+// OS theme live-tracking (RegNotifyChangeKeyValue worker)
+// =========================================================================
+//
+// Microsoft's officially-supported channel for color-mode change events is
+// `UISettings.ColorValuesChanged` (WinRT). Adopting it would pull in COM
+// activation and a runtimeobject link, which is heavy for a one-bit query.
+// Instead we watch the underlying registry key the OS updates whenever the
+// user toggles light/dark mode (`HKCU\Software\Microsoft\Windows\
+// CurrentVersion\Themes\Personalize`) with `RegNotifyChangeKeyValue` — a
+// stable, documented Win32 API. A single worker thread arms the
+// notification with an async event, waits on (change_event, stop_event)
+// via WaitForMultipleObjects, and posts WM_APP_THEME_REREAD to the main
+// HWND on change. The UI-thread handler then re-applies the theme to every
+// caption-bearing top-level window.
+//
+// Synchronisation contract: the worker only touches its own kernel handles
+// and posts a Win32 message; it never enters rendering or input code. The
+// UI thread owns DwmSetWindowAttribute calls.
+
+var g_theme_watch_thread: ?c.HANDLE = null;
+var g_theme_watch_stop_event: ?c.HANDLE = null;
+var g_theme_watch_main_hwnd: c.HWND = null;
+
+// HKEY-using extern bindings re-typed to usize for the same reason
+// osAppThemeIsDark() needs: HKEY's align(4) trips zig's comptime check
+// when we'd otherwise pass a sentinel pointer literal.
+const RegOpenKeyExW_usizeFn = *const fn (
+    hkey: usize,
+    lpSubKey: ?[*:0]const u16,
+    ulOptions: c.DWORD,
+    samDesired: c.REGSAM,
+    phkResult: *c.HKEY,
+) callconv(.winapi) c.LONG;
+
+fn themeWatchThread(_: ?*anyopaque) callconv(.winapi) c.DWORD {
+    const main_hwnd = g_theme_watch_main_hwnd;
+    if (main_hwnd == null) return 1;
+
+    const HKEY_CURRENT_USER: usize = 0x80000001;
+    const reg_open: RegOpenKeyExW_usizeFn = @extern(
+        RegOpenKeyExW_usizeFn,
+        .{ .name = "RegOpenKeyExW" },
+    );
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    var hkey: c.HKEY = undefined;
+    if (reg_open(HKEY_CURRENT_USER, subkey, 0, c.KEY_NOTIFY, &hkey) != c.ERROR_SUCCESS) {
+        return 1;
+    }
+    defer _ = c.RegCloseKey(hkey);
+
+    const change_event = c.CreateEventW(null, 1, 0, null);
+    if (change_event == null) return 1;
+    defer _ = c.CloseHandle(change_event);
+
+    while (true) {
+        _ = c.ResetEvent(change_event);
+        const r = c.RegNotifyChangeKeyValue(
+            hkey,
+            0, // bWatchSubtree = FALSE
+            c.REG_NOTIFY_CHANGE_LAST_SET,
+            change_event,
+            1, // fAsynchronous = TRUE
+        );
+        if (r != c.ERROR_SUCCESS) break;
+
+        const stop_event = g_theme_watch_stop_event orelse break;
+        var handles = [_]c.HANDLE{ change_event.?, stop_event };
+        const wait_r = c.WaitForMultipleObjects(2, &handles, 0, c.INFINITE);
+        if (wait_r == c.WAIT_OBJECT_0) {
+            // Registry changed — ask the UI thread to re-apply. Do not call
+            // DwmSetWindowAttribute from this thread; PostMessageW is the
+            // only synchronisation point.
+            _ = c.PostMessageW(main_hwnd, WM_APP_THEME_REREAD, 0, 0);
+            continue;
+        }
+        // Stop signalled (WAIT_OBJECT_0 + 1) or wait failed — exit.
+        break;
+    }
+    return 0;
+}
+
+pub fn startThemeWatcher(main_hwnd: c.HWND) void {
+    if (g_theme_watch_thread != null) return; // already running
+    g_theme_watch_main_hwnd = main_hwnd;
+    g_theme_watch_stop_event = c.CreateEventW(null, 1, 0, null);
+    if (g_theme_watch_stop_event == null) return;
+    var tid: c.DWORD = 0;
+    g_theme_watch_thread = c.CreateThread(
+        null,
+        0,
+        themeWatchThread,
+        null,
+        0,
+        &tid,
+    );
+    if (g_theme_watch_thread == null) {
+        _ = c.CloseHandle(g_theme_watch_stop_event.?);
+        g_theme_watch_stop_event = null;
+    }
+}
+
+pub fn stopThemeWatcher() void {
+    if (g_theme_watch_stop_event) |ev| {
+        _ = c.SetEvent(ev);
+    }
+    if (g_theme_watch_thread) |th| {
+        // Bounded wait — the worker only blocks in WaitForMultipleObjects,
+        // which is woken by SetEvent above. Only close the kernel handles
+        // once we have confirmed the worker has exited; closing a handle
+        // that another thread is still waiting on is documented as
+        // undefined behaviour, so on timeout/error we intentionally leak
+        // the thread and event handles (the process is shutting down and
+        // the kernel will reclaim them at exit).
+        const wait_r = c.WaitForSingleObject(th, 2000);
+        if (wait_r == c.WAIT_OBJECT_0) {
+            _ = c.CloseHandle(th);
+            g_theme_watch_thread = null;
+            if (g_theme_watch_stop_event) |ev| {
+                _ = c.CloseHandle(ev);
+                g_theme_watch_stop_event = null;
+            }
+        } else {
+            if (applog.isEnabled()) applog.appLog(
+                "[win] stopThemeWatcher: worker did not exit within 2s (wait_r=0x{x}); leaking handles\n",
+                .{wait_r},
+            );
+        }
+    } else {
+        // Thread never started (worker creation failed) — safe to drop
+        // the standalone event handle here.
+        if (g_theme_watch_stop_event) |ev| {
+            _ = c.CloseHandle(ev);
+            g_theme_watch_stop_event = null;
+        }
+    }
+}
+
+fn enumApplyThemeProc(hwnd: c.HWND, _: c.LPARAM) callconv(.winapi) c.BOOL {
+    const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
+    if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) != 0) {
+        applyOsTitlebarTheme(hwnd);
+    }
+    return 1;
+}
+
+// UI-thread handler for WM_APP_THEME_REREAD. Re-applies the OS-theme
+// titlebar setting to every caption-bearing top-level window owned by the
+// current (UI) thread — main window, all external windows, and any open
+// dialogs are covered in one pass.
+fn handleThemeReread() void {
+    _ = c.EnumThreadWindows(c.GetCurrentThreadId(), enumApplyThemeProc, 0);
+}
+
+// WM_THEMECHANGED dispatch helper. WM_THEMECHANGED is a documented Win32
+// message, but the documentation only covers theme enable/disable and
+// classic-vs-themed transitions — it does NOT contract to fire on a pure
+// light↔dark color-mode toggle. The officially-supported live-tracking
+// channel for color-mode changes is `UISettings.ColorValuesChanged` via
+// WinRT. Until/unless we adopt WinRT, color-mode tracking effectively
+// depends on the de-facto "ImmersiveColorSet" broadcast handled in
+// handleImmersiveColorSet(). This helper is best-effort: if the OS happens
+// to send WM_THEMECHANGED on color-mode toggle (some shell builds do),
+// we'll pick it up; otherwise we rely on the WM_SETTINGCHANGE path.
+//
+// Skips caption-less windows for the same reason as handleImmersiveColorSet().
+pub fn handleThemeChanged(hwnd: c.HWND) bool {
+    const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
+    if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) == 0) return false;
+    applyOsTitlebarTheme(hwnd);
+    return true;
+}
+
 // Type aliases from app_mod (to minimize changes in WndProc)
 const ExternalWindow = app_mod.ExternalWindow;
 const RowVerts = app_mod.RowVerts;
@@ -75,6 +364,7 @@ const WM_APP_SHOW_WINDOW = app_mod.WM_APP_SHOW_WINDOW;
 const WM_APP_SWP_FRAMECHANGED = app_mod.WM_APP_SWP_FRAMECHANGED;
 const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
 const WM_APP_SNAP_MAIN_WINDOW = app_mod.WM_APP_SNAP_MAIN_WINDOW;
+const WM_APP_THEME_REREAD = app_mod.WM_APP_THEME_REREAD;
 
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
@@ -527,6 +817,15 @@ pub export fn WndProc(
 
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
+
+                // Apply the OS app-theme preference to the DWM titlebar so the
+                // very first frame matches the user's light/dark choice.
+                // Re-applied on WM_SETTINGCHANGE / ImmersiveColorSet and
+                // WM_APP_THEME_REREAD (RegNotifyChangeKeyValue worker).
+                applyOsTitlebarTheme(hwnd);
+                // Start the registry-watcher worker so light/dark toggles
+                // taken while Zonvie is running are picked up live.
+                startThemeWatcher(hwnd);
 
                 // Native mode: perform early core init (before deferred init)
                 // WSL/SSH/devcontainer modes use the traditional WM_APP_DEFERRED_INIT path
@@ -1856,6 +2155,33 @@ pub export fn WndProc(
                 // Tabline is now rendered via D3D11 texture (see renderTablineToD3D call before gpu rendering)
             }
 
+            return 0;
+        },
+
+        c.WM_SETTINGCHANGE => {
+            // Only consume the message if it was the color-mode broadcast we
+            // care about. Other WM_SETTINGCHANGE flavours ("intl", "Policy",
+            // "Environment", ...) need to reach DefWindowProcW so the OS can
+            // do its standard handling.
+            if (handleImmersiveColorSet(hwnd, lParam)) return 0;
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        c.WM_THEMECHANGED => {
+            // WM_THEMECHANGED covers all visual-style transitions, not just
+            // light/dark color-mode. Re-apply the OS titlebar attribute as
+            // a best-effort addition, then fall through to DefWindowProcW
+            // so the standard uxtheme client-side refresh still runs. This
+            // also means caption-less popups (where handleThemeChanged()
+            // returns false) get their default handling instead of being
+            // silently swallowed.
+            _ = handleThemeChanged(hwnd);
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        WM_APP_THEME_REREAD => {
+            // Posted by the registry-watcher worker thread when
+            // AppsUseLightTheme changes. Re-apply to every caption-bearing
+            // top-level window on this thread in one pass.
+            handleThemeReread();
             return 0;
         },
 
@@ -4240,6 +4566,9 @@ pub export fn WndProc(
         },
 
         c.WM_DESTROY => {
+            // Stop the theme-watcher worker before the HWND goes away so the
+            // last PostMessageW target is still valid up to this point.
+            stopThemeWatcher();
             // Remove tray icon before quitting
             if (getApp(hwnd)) |app| {
                 if (app.tray_icon) |*tray| {

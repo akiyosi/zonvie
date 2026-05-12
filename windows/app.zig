@@ -124,6 +124,12 @@ pub const WM_APP_POST_SHOW_INIT: c.UINT = c.WM_APP + 27;
 /// so it never receives any draw and shows whatever the renderer last
 /// cleared it to (historically hardcoded black).
 pub const WM_APP_SNAP_MAIN_WINDOW: c.UINT = c.WM_APP + 28;
+/// Posted from the theme-watcher worker thread when the
+/// `HKCU\...\Personalize` registry key changes (i.e. the user toggled the
+/// OS light/dark mode). The UI thread's handler re-applies the OS-theme
+/// titlebar setting to every caption-bearing top-level window via
+/// EnumThreadWindows.
+pub const WM_APP_THEME_REREAD: c.UINT = c.WM_APP + 29;
 
 // =========================================================================
 // Timer IDs and timing constants

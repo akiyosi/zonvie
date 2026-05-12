@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const scrollbar = @import("scrollbar.zig");
 const input = @import("../input.zig");
 const messages = @import("messages.zig");
+const window_mod = @import("../window.zig");
 const core = @import("zonvie_core");
 
 const ExternalSurfaceKind = enum {
@@ -897,6 +898,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         null,
     );
 
+    if (hwnd != null and !is_special_window) {
+        // Mirror the main HWND's OS-theme titlebar handling. WS_POPUP
+        // children (cmdline/popupmenu/msg_show/msg_history) have no caption
+        // so we skip them.
+        window_mod.applyOsTitlebarTheme(hwnd);
+    }
+
     if (hwnd == null) {
         if (applog.isEnabled()) applog.appLog("[win] CreateWindowExW failed for external grid\n", .{});
         return;
@@ -1458,6 +1466,21 @@ pub export fn ExternalWndProc(
             // Don't destroy - just hide or let the core handle it
             _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
+        },
+        c.WM_SETTINGCHANGE => {
+            // OS theme toggle — defer to the shared helper, which also
+            // filters out caption-less popups via WS_CAPTION. Non-color
+            // settings broadcasts fall through to DefWindowProcW so the OS
+            // can do its standard handling.
+            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+        c.WM_THEMECHANGED => {
+            // Best-effort titlebar refresh, then fall through to the OS so
+            // the standard uxtheme handling still runs (and caption-less
+            // popups are not silently swallowed).
+            _ = window_mod.handleThemeChanged(hwnd);
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
         c.WM_DESTROY => {
             // Clear userdata
