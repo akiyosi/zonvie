@@ -916,6 +916,57 @@ pub fn handleRedraw(
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
 
+    // Per-handleRedraw aggregate. Each "redraw" notification batches many
+    // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
+    // grid_line / flush_start lines already mark dispatch latency; this gives
+    // a single batch-level [perf] line so a profiler can see total wall time
+    // and event count without scraping per-event lines.
+    const log_on_batch = log.cb != null;
+    const t_batch_start: i128 = if (log_on_batch) std.time.nanoTimestamp() else 0;
+    var ev_count: u32 = 0;
+    var tuple_count: u32 = 0;
+    // grid_line cell-write counter (after repeat expansion). Quantifies the
+    // "type B" terminal-buffer scroll cost: tig/less/lazygit produce no
+    // grid_scroll, but rewrite affected rows via grid_line — so a single
+    // PageDown can write rows*cols cells per batch. Compare against
+    // grid_scroll batches where dirty rows are minimal.
+    var grid_line_cells_total: u64 = 0;
+    var grid_line_tuple_total: u32 = 0;
+
+    // Per-event-tag dispatch time (ns) and call count, indexed by
+    // @intFromEnum(RedrawEvent). Stack-allocated, zero-init. Dumped once at
+    // batch end as a single [perf] redraw_events line, sorted client-side.
+    @setEvalBranchQuota(4000);
+    const N_EVENTS = @typeInfo(RedrawEvent).@"enum".fields.len;
+    var per_event_ns: [N_EVENTS]u64 = .{0} ** N_EVENTS;
+    var per_event_cnt: [N_EVENTS]u32 = .{0} ** N_EVENTS;
+
+    defer {
+        if (log_on_batch) {
+            const batch_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_batch_start), 1000));
+            log.write(
+                "[perf] redraw_batch events={d} tuples={d} us={d}\n",
+                .{ ev_count, tuple_count, batch_us },
+            );
+            // Always emit even when zero, so a downstream analyzer can pair
+            // it 1:1 with redraw_batch and detect zero-grid_line batches.
+            log.write(
+                "[perf] grid_line_stats tuples={d} cells={d}\n",
+                .{ grid_line_tuple_total, grid_line_cells_total },
+            );
+            // One [perf] redraw_event line per nonzero tag. Skips silent tags
+            // so a typical "grid_line + flush" batch produces only 2 lines.
+            inline for (@typeInfo(RedrawEvent).@"enum".fields, 0..) |f, i| {
+                if (per_event_cnt[i] != 0) {
+                    log.write(
+                        "[perf] redraw_event name={s} count={d} ns={d}\n",
+                        .{ f.name, per_event_cnt[i], per_event_ns[i] },
+                    );
+                }
+            }
+        }
+    }
+
     for (params) |ev| {
         if (ev != .arr) continue;
         const a = ev.arr;
@@ -923,6 +974,10 @@ pub fn handleRedraw(
 
         const name = a[0].str;
         const tuples = tupleIter(a);
+        if (log_on_batch) {
+            ev_count +%= 1;
+            tuple_count +%= @intCast(tuples.len);
+        }
 
         // Only run log processing if logging is enabled (avoid overhead when disabled)
         if (log.cb != null) {
@@ -937,6 +992,16 @@ pub fn handleRedraw(
         }
 
         const ev_tag = std.meta.stringToEnum(RedrawEvent, name) orelse continue;
+        // Per-event timing. defer fires at end of each loop iteration even
+        // when the switch case path uses `try` to surface an error, since
+        // defer runs on scope exit including through error returns.
+        const t_ev_start: i128 = if (log_on_batch) std.time.nanoTimestamp() else 0;
+        defer if (log_on_batch) {
+            const dt_ns: i128 = std.time.nanoTimestamp() - t_ev_start;
+            const idx = @intFromEnum(ev_tag);
+            per_event_ns[idx] +|= @as(u64, @intCast(@max(@as(i128, 0), dt_ns)));
+            per_event_cnt[idx] +|= 1;
+        };
         switch (ev_tag) { .grid_resize => {
             for (tuples) |tv| {
                 if (tv != .arr) continue;
@@ -1583,6 +1648,17 @@ pub fn handleRedraw(
                 if (t[0] != .str) continue;
 
                 const opt_name = t[0].str;
+                // Per-option timing. option_set fires rarely (startup + :set)
+                // so per-call logging is acceptable. The aggregate redraw_event
+                // line shows option_set as a 57ms outlier; this breakdown
+                // points at the specific option doing the heavy lifting
+                // (typically guifont triggers atlas reset + font rebuild).
+                const log_on_opt = log.cb != null;
+                const t_opt_start: i128 = if (log_on_opt) std.time.nanoTimestamp() else 0;
+                defer if (log_on_opt) {
+                    const dt_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_opt_start), 1000));
+                    log.write("[perf] option_set name={s} us={d}\n", .{ opt_name, dt_us });
+                };
 
                 // switch (t[1]) {
                 //     .str => {
@@ -1816,6 +1892,7 @@ pub fn handleRedraw(
             grid.cursor_rev +%= 1;
 
         }, .grid_line => {
+            if (log_on_batch) grid_line_tuple_total +%= @intCast(tuples.len);
             for (tuples) |tv| {
                 if (tv != .arr) continue;
                 const t = tv.arr;
@@ -1882,6 +1959,7 @@ pub fn handleRedraw(
                         repeat = @as(u32, @intCast(r64));
                     }
 
+                    if (log_on_batch) grid_line_cells_total +%= repeat;
                     var i: u32 = 0;
                     while (i < repeat) : (i += 1) {
                         var hl_to_use: u32 = 0;

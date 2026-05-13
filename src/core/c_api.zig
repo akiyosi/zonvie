@@ -869,6 +869,17 @@ pub export fn zonvie_core_set_log_enabled(p: ?*zonvie_core, enabled: i32) callco
     box.core.log.cb = if (on) box.cb.on_log else null;
 }
 
+/// When enabled is non-zero, only [perf...] log lines are emitted; all other
+/// debug logs ([scroll_debug], [cmdline], [msg], etc.) are dropped at the
+/// Logger.write boundary. Independent of zonvie_core_set_log_enabled — caller
+/// must still enable logging for any output to appear. Intended for low-noise
+/// hot-path profiling.
+pub export fn zonvie_core_set_log_perf_only(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.log.perf_only = (enabled != 0);
+}
+
 /// Enable ext_cmdline UI extension. Must be called before zonvie_core_start().
 /// When enabled, cmdline is rendered as a separate external window.
 pub export fn zonvie_core_set_ext_cmdline(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -1426,6 +1437,7 @@ pub const zonvie_config_values = extern struct {
     // log
     log_enabled: bool = false,
     log_path: ?[*:0]const u8 = null,
+    log_perf_only: bool = false,
     // performance
     perf_glyph_cache_ascii: i32 = 512,
     perf_glyph_cache_non_ascii: i32 = 256,
@@ -1533,6 +1545,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         // log
         .log_enabled = cfg.log.enabled,
         .log_path = dupeZForCOpt(alloc, cfg.log.path),
+        .log_perf_only = cfg.log.perf_only,
         // performance
         .perf_glyph_cache_ascii = @intCast(cfg.performance.glyph_cache_ascii_size),
         .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),

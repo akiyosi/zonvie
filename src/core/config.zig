@@ -269,6 +269,9 @@ pub const Config = struct {
     pub const LogConfig = struct {
         enabled: bool = false,
         path: ?[]const u8 = null,
+        // When true, only [perf...] tagged lines reach the on_log callback.
+        // Lets users profile hot paths without the noise of debug logs.
+        perf_only: bool = false,
     };
 
     pub const PerformanceConfig = struct {
@@ -493,6 +496,7 @@ pub const Config = struct {
         if (cfg.log) |l| {
             if (l.enabled) |e| self.log.enabled = e;
             if (l.path) |p| self.log.path = alloc.dupe(u8, p) catch null;
+            if (l.perf_only) |po| self.log.perf_only = po;
         }
 
         if (cfg.performance) |p| {
@@ -817,6 +821,7 @@ const TomlWindows = struct {
 const TomlLog = struct {
     enabled: ?bool = null,
     path: ?[]const u8 = null,
+    perf_only: ?bool = null,
 };
 
 const TomlPerformance = struct {

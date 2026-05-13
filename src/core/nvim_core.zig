@@ -559,6 +559,24 @@ pub const Core = struct {
     pending_resize_valid: bool = false,
     missing_glyph_log_count: u32 = 0,
 
+    // Per-flush atlas/callback aggregation (reset at flush start, dumped at flush end).
+    // Per-glyph log lines would dominate the trace; aggregating here gives one
+    // [perf] atlas line per flush with rasterize / upload / pack totals.
+    perf_rasterize_ns_total: u64 = 0,
+    perf_upload_ns_total: u64 = 0,
+    perf_pack_ns_total: u64 = 0,
+    perf_rasterize_calls: u32 = 0,
+    perf_upload_calls: u32 = 0,
+    perf_atlas_create_calls: u32 = 0,
+    perf_atlas_create_ns_total: u64 = 0,
+    // ensureGlyphPhase2 / ensureGlyphByID wall time, including dispatch
+    // overhead, cache check, and the rasterize/upload/pack subset already
+    // accounted for above. (atlas_total_ns - rasterize_ns - upload_ns -
+    // pack_ns) reveals pure dispatch overhead — i.e. how much glyph_pass
+    // time the atlas-resolve path consumes outside of GPU work.
+    perf_atlas_total_ns_total: u64 = 0,
+    perf_atlas_total_calls: u32 = 0,
+
     // Thread ID of the thread currently inside handleRedraw (grid_mu is already held).
     // When updateLayoutPx is called from the SAME thread, it skips locking since
     // that thread already holds grid_mu. Using thread ID instead of a bool prevents
@@ -1479,8 +1497,11 @@ pub const Core = struct {
             return null;
         }
 
+        const log_on = self.log.cb != null;
+
         // Try to pack
         var packer = &(self.atlas_packer.?);
+        const t_pack: i128 = if (log_on) std.time.nanoTimestamp() else 0;
         var rect = packer.alloc(bm.width, bm.height);
 
         // Atlas full → reset and retry once.
@@ -1491,12 +1512,22 @@ pub const Core = struct {
             rect = packer.alloc(bm.width, bm.height);
             if (rect == null) return null;
         }
+        if (log_on) {
+            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_pack));
+            self.perf_pack_ns_total +%= dt;
+        }
 
         const r = rect.?;
 
         // Upload glyph bitmap
         if (self.cb.on_atlas_upload) |f| {
+            const t_up: i128 = if (log_on) std.time.nanoTimestamp() else 0;
             f(self.ctx, r.x + packer.padding, r.y + packer.padding, bm.width, bm.height, bm);
+            if (log_on) {
+                const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_up));
+                self.perf_upload_ns_total +%= dt;
+                self.perf_upload_calls +%= 1;
+            }
         }
 
         // Compute UVs (excluding padding)
@@ -1525,7 +1556,16 @@ pub const Core = struct {
     fn ensureAtlasInit(self: *Core) void {
         if (!self.atlas_initialized) {
             self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
-            if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
+            if (self.cb.on_atlas_create) |f| {
+                const log_on = self.log.cb != null;
+                const t: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+                f(self.ctx, self.atlas_w, self.atlas_h);
+                if (log_on) {
+                    const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t));
+                    self.perf_atlas_create_ns_total +%= dt;
+                    self.perf_atlas_create_calls +%= 1;
+                }
+            }
             self.atlas_initialized = true;
         }
     }
@@ -1584,11 +1624,25 @@ pub const Core = struct {
     /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
     /// Returns null on unrecoverable failure (rasterize callback returned 0).
     pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+        const log_on = self.log.cb != null;
+        const t_total: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        defer if (log_on) {
+            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_total));
+            self.perf_atlas_total_ns_total +%= dt;
+            self.perf_atlas_total_calls +%= 1;
+        };
+
         self.ensureAtlasInit();
 
         // Ask frontend to rasterize (no packing / UV)
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const t_r: i128 = if (log_on) std.time.nanoTimestamp() else 0;
         const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
+        if (log_on) {
+            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_r));
+            self.perf_rasterize_ns_total +%= dt;
+            self.perf_rasterize_calls +%= 1;
+        }
         if (ok == 0) return null;
 
         return self.packAndUploadBitmap(&bm);
@@ -1597,10 +1651,24 @@ pub const Core = struct {
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
     /// Similar to ensureGlyphPhase2 but uses on_rasterize_glyph_by_id callback.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
+        const log_on = self.log.cb != null;
+        const t_total: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        defer if (log_on) {
+            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_total));
+            self.perf_atlas_total_ns_total +%= dt;
+            self.perf_atlas_total_calls +%= 1;
+        };
+
         self.ensureAtlasInit();
 
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const t_r: i128 = if (log_on) std.time.nanoTimestamp() else 0;
         const ok = self.cb.on_rasterize_glyph_by_id.?(self.ctx, glyph_id, style_flags, &bm);
+        if (log_on) {
+            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_r));
+            self.perf_rasterize_ns_total +%= dt;
+            self.perf_rasterize_calls +%= 1;
+        }
         if (ok == 0) return null;
 
         return self.packAndUploadBitmap(&bm);
@@ -1617,7 +1685,16 @@ pub const Core = struct {
         }
         self.resetGlyphCacheFlags();
         self.atlas_initialized = true;
-        if (self.cb.on_atlas_create) |f| f(self.ctx, self.atlas_w, self.atlas_h);
+        if (self.cb.on_atlas_create) |f| {
+            const log_on = self.log.cb != null;
+            const t: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+            f(self.ctx, self.atlas_w, self.atlas_h);
+            if (log_on) {
+                const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t));
+                self.perf_atlas_create_ns_total +%= dt;
+                self.perf_atlas_create_calls +%= 1;
+            }
+        }
     }
 
     /// Set glyph cache sizes (must be called before start or during stop)

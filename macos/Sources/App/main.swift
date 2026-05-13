@@ -585,11 +585,11 @@ for i in 0..<zonvieArgs.count {
 
 let config = ZonvieConfig.shared
 if let logPath = cliLogPath {
-    ZonvieCore.configureLogging(enabled: true, filePath: logPath)
+    ZonvieCore.configureLogging(enabled: true, filePath: logPath, perfOnly: config.log.perfOnly)
 } else if config.log.enabled {
-    ZonvieCore.configureLogging(enabled: true, filePath: config.log.path)
+    ZonvieCore.configureLogging(enabled: true, filePath: config.log.path, perfOnly: config.log.perfOnly)
 } else {
-    ZonvieCore.configureLogging(enabled: false, filePath: nil)
+    ZonvieCore.configureLogging(enabled: false, filePath: nil, perfOnly: config.log.perfOnly)
 }
 
 // Validate --nvim path (reject quote characters that break shell/Zig parser quoting)

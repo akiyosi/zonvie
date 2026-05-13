@@ -190,6 +190,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var flushSourceSetIndex: Int = 0 // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
+    // Per-flush row submit accumulators. Reset in beginFlush, summed in
+    // submitVerticesRowRaw, dumped in commitFlush as [perf] row_submit. Surfaces
+    // the Swift-side cost inside Zig-measured row_cb_us (memcpy + slot remap).
+    private var perfRowSubmitNs: Int64 = 0    // Core thread only
+    private var perfRowSubmitCalls: Int = 0   // Core thread only
+    private var perfRowSubmitVerts: Int = 0   // Core thread only
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
@@ -575,6 +581,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         isInFlush = true
+        perfRowSubmitNs = 0
+        perfRowSubmitCalls = 0
+        perfRowSubmitVerts = 0
         let perfEnabled = ZonvieCore.appLogEnabled
         let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         var atlasPrepareUs: Double = 0
@@ -792,6 +801,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 totalVerts += bs.rowState.counts[i]
             }
             ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
+            // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
+            ZonvieCore.appLog("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
     }
 
@@ -1576,6 +1587,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
 
+            // === PERF LOG: encode_setup → encode_rows boundary ===
+            let t_encode_rows_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let encode_setup_us: Double = ZonvieCore.appLogEnabled ? (t_encode_rows_start - t_encode_start) * 1_000_000 : 0
+
             // use2Pass and safeRowCount are pre-computed in Step 2 above.
 
             if rowMode {
@@ -1799,6 +1814,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 )
             }
 
+            // === PERF LOG: encode_rows → encode_finalize boundary ===
+            let t_encode_finalize_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let encode_rows_us: Double = ZonvieCore.appLogEnabled ? (t_encode_finalize_start - t_encode_rows_start) * 1_000_000 : 0
+
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
             // canBlinkFastPath also sets a scissor that must be reset.
@@ -1816,7 +1835,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 let t_encode_end = CFAbsoluteTimeGetCurrent()
                 let encode_us = (t_encode_end - t_encode_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us))")
+                let encode_finalize_us = (t_encode_end - t_encode_finalize_start) * 1_000_000
+                let dirtyRowCount = dirtyRows.count
+                ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us)) setup_us=\(String(format: "%.1f", encode_setup_us)) rows_us=\(String(format: "%.1f", encode_rows_us)) finalize_us=\(String(format: "%.1f", encode_finalize_us)) dirtyRows=\(dirtyRowCount)")
             }
 
             // --- Post-process bloom (neon glow) ---
@@ -3116,6 +3137,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // We currently assume Zig calls with rowCount == 1 (contract in Zig onFlush).
         guard rowCount > 0 else { return }
 
+        let perfEnabled = ZonvieCore.appLogEnabled
+        let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
         submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
             sourceSet: bufferSets[flushSourceSetIndex],
@@ -3127,6 +3150,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             totalRows: totalRows,
             gpuInFlight: isAnyGpuInFlight()
         )
+        if perfEnabled {
+            let dt = zonvie_core_perf_now_ns() - t0
+            perfRowSubmitNs &+= dt
+            perfRowSubmitCalls &+= 1
+            perfRowSubmitVerts &+= count
+        }
     }
 
     // --- Dirty marking ---
