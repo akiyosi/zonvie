@@ -1570,6 +1570,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return true
             }()
 
+            // Skip the main render pass entirely for blink-only frames. The
+            // cursor lives on the drawable (not in backTex; see "Cursor is
+            // composited only on the final drawable" further below), so blink
+            // toggling never changes backTex contents — copy+cursor passes
+            // alone reproduce the right pixel. Avoids the ~5.7ms .clear cost
+            // (alpha=0.8 backgrounds disable Apple's fast-clear path) and the
+            // legacy canBlinkFastPath cursor-row redraw, which was redundant
+            // for the same reason. Glow is excluded because bloom samples
+            // backTex via its own intermediate pass.
+            let skipMainPass = isBlinkOnlyFrame && !glowEnabled && hasPresentedOnce
+
             // We always need a drawable to present.
             var t_drawable_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -1704,6 +1715,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
 
+            if skipMainPass {
+                ZonvieCore.appLog("[draw] skipMainPass=true (blink-only frame; backTex preserved, copy+cursor only)")
+            }
+            if !skipMainPass {
             attachGpuPerfSamples(to: rpd, label: "main")
             attachGpuStatsSamples(to: rpd, label: "main")
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
@@ -2020,6 +2035,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let dirtyRowCount = dirtyRows.count
                 ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us)) setup_us=\(String(format: "%.1f", encode_setup_us)) rows_us=\(String(format: "%.1f", encode_rows_us)) finalize_us=\(String(format: "%.1f", encode_finalize_us)) dirtyRows=\(dirtyRowCount)")
             }
+            }  // end of `if !skipMainPass`
 
             // --- Post-process bloom (neon glow) ---
             if glowEnabled,
