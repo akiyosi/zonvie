@@ -2039,12 +2039,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // if the renderer is deallocated before the GPU finishes.
             let sem = inflightSemaphore
             let lk = lock
-            cmd.addCompletedHandler { [weak self, weak view] _ in
+            // Wall-time clock at submission, used to compute gpu_wall_us
+            // (queue + GPU + present scheduling latency) inside the completion
+            // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
+            let t_gpu_submit: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
                 self?.gpuInFlightCount[csi] -= 1
                 lk.unlock()
                 sem.signal()
+
+                if ZonvieCore.appLogEnabled {
+                    let gpu_wall_us = (CFAbsoluteTimeGetCurrent() - t_gpu_submit) * 1_000_000
+                    let gpu_exec_us = (completed.gpuEndTime - completed.gpuStartTime) * 1_000_000
+                    ZonvieCore.appLog("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
+                }
 
                 guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
