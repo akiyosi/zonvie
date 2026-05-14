@@ -196,6 +196,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var perfRowSubmitNs: Int64 = 0    // Core thread only
     private var perfRowSubmitCalls: Int = 0   // Core thread only
     private var perfRowSubmitVerts: Int = 0   // Core thread only
+
+    // Per-pass GPU timing via MTLCounterSampleBuffer (stage-boundary timestamps).
+    // One sample buffer is reused across frames; safe because inflightSemaphore
+    // bounds in-flight frames to 1, so the previous frame's completion handler
+    // resolves the buffer before the next draw assigns slots.
+    private struct GpuPerfSlot { let label: String; let startIdx: Int; let endIdx: Int }
+    private var gpuPerfSampleBuffer: MTLCounterSampleBuffer?
+    private var gpuPerfSamplingEnabled: Bool = false
+    private var gpuTimestampPeriodNs: Double = 1.0
+    private var gpuPerfSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
@@ -553,6 +564,77 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             var visible: UInt32 = 1
             memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
         }
+
+        setupGpuPerfSampling()
+    }
+
+    // Probe device support for stage-boundary timestamp counters and allocate
+    // a reusable sample buffer. On unsupported devices the gate stays false and
+    // the per-pass GPU log is silently skipped (gpu_execution still emits).
+    private func setupGpuPerfSampling() {
+        guard device.supportsCounterSampling(.atStageBoundary) else {
+            ZonvieCore.appLog("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
+            return
+        }
+        let timestampSet = device.counterSets?.first { cs in
+            // MTLCommonCounterSet is a RawRepresentable wrapper around String;
+            // MTLCounterSet.name returns a Swift String, so compare via rawValue.
+            cs.name == MTLCommonCounterSet.timestamp.rawValue
+        }
+        guard let cs = timestampSet else {
+            ZonvieCore.appLog("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
+            return
+        }
+        let desc = MTLCounterSampleBufferDescriptor()
+        desc.counterSet = cs
+        desc.label = "ZonvieGpuPerfTimestamps"
+        desc.storageMode = .shared
+        // Capacity 16 = up to 8 passes per frame (start+end each). Today we attach
+        // 3 (main, copy, cursor); headroom for future custom-shader chain entries.
+        desc.sampleCount = 16
+        do {
+            gpuPerfSampleBuffer = try device.makeCounterSampleBuffer(descriptor: desc)
+        } catch {
+            ZonvieCore.appLog("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
+            return
+        }
+        // Calibrate GPU tick → ns. On Apple Silicon timestamps already arrive in
+        // nanoseconds, but compute the ratio so other backends (Intel discrete
+        // GPUs, future hw) report correctly. Newer SDKs expose this as a
+        // tuple-returning method instead of inout pointers.
+        let (cpu0, gpu0) = device.sampleTimestamps()
+        Thread.sleep(forTimeInterval: 0.002)
+        let (cpu1, gpu1) = device.sampleTimestamps()
+        let cpuDelta = Double(cpu1 &- cpu0)
+        let gpuDelta = Double(gpu1 &- gpu0)
+        if cpuDelta > 0, gpuDelta > 0 {
+            // sampleTimestamps' cpuTimestamp is in nanoseconds (mach_absolute_time
+            // converted via timebase, per Apple docs); gpuTimestamp is in GPU ticks.
+            gpuTimestampPeriodNs = cpuDelta / gpuDelta
+        }
+        gpuPerfSamplingEnabled = true
+        ZonvieCore.appLog("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
+    }
+
+    // Attach stage-boundary timestamp samples to a render pass descriptor so the
+    // GPU records start-of-vertex / end-of-fragment timestamps. The whole-pass
+    // duration is end-start in ticks, scaled by gpuTimestampPeriodNs in the
+    // completion handler. No-op when perf logging is off or the device lacks
+    // counter sampling. Must be called BEFORE makeRenderCommandEncoder(rpd).
+    private func attachGpuPerfSamples(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuPerfSampleBuffer
+        else { return }
+        let startIdx = gpuPerfSlots.count * 2
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = startIdx
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = MTLCounterDontSample
+        attach.endOfFragmentSampleIndex = endIdx
+        gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
     }
 
     // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
@@ -1436,6 +1518,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             guard let cmd = queue.makeCommandBuffer() else {
                 return
             }
+            // Per-pass GPU timing: reset slot list at frame start; attach calls
+            // below append entries that the completion handler resolves into a
+            // single [perf] gpu_passes line. No-op when perf logging is off.
+            gpuPerfSlots.removeAll(keepingCapacity: true)
             // GPU scroll blit: shift back texture pixels and expand dirty rows.
             // Windows equivalent: applyScrollShift (windows/app.zig) which calls
             // scrollBackTex + shiftRowVBs + gap row expansion.
@@ -1539,6 +1625,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
 
+            attachGpuPerfSamples(to: rpd, label: "main")
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
@@ -1975,6 +2062,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 copyRPD.colorAttachments[0].loadAction = .dontCare
                 copyRPD.colorAttachments[0].storeAction = .store
 
+                attachGpuPerfSamples(to: copyRPD, label: "copy")
                 if let copyEnc = cmd.makeRenderCommandEncoder(descriptor: copyRPD) {
                     copyEnc.setRenderPipelineState(copyPipe)
                     copyEnc.setVertexBuffer(copyVB, offset: 0, index: 0)
@@ -2002,6 +2090,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cursorRPD.colorAttachments[0].loadAction = .load
                 cursorRPD.colorAttachments[0].storeAction = .store
 
+                attachGpuPerfSamples(to: cursorRPD, label: "cursor")
                 if let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) {
                     viewportMetrics.applyViewport(to: cursorEnc)
                     cursorEnc.setRenderPipelineState(pipeline!)
@@ -2043,6 +2132,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // (queue + GPU + present scheduling latency) inside the completion
             // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
             let t_gpu_submit: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            // Snapshot per-pass slots + sample buffer + tick scale for the
+            // completion handler. The renderer reuses gpuPerfSlots next frame, so
+            // a value-typed copy keeps this frame's data alive until resolve.
+            let frameSlots = gpuPerfSlots
+            let frameSampleBuf = gpuPerfSampleBuffer
+            let frameTickNs = gpuTimestampPeriodNs
             cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
@@ -2054,6 +2149,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let gpu_wall_us = (CFAbsoluteTimeGetCurrent() - t_gpu_submit) * 1_000_000
                     let gpu_exec_us = (completed.gpuEndTime - completed.gpuStartTime) * 1_000_000
                     ZonvieCore.appLog("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
+
+                    // Per-pass GPU breakdown via stage-boundary timestamps.
+                    // Pairs with gpu_execution: per-pass durations should sum to
+                    // ≤ exec_us (the gap is tile-binning / submit overhead).
+                    if let buf = frameSampleBuf, !frameSlots.isEmpty {
+                        let total = frameSlots.count * 2
+                        if let data = try? buf.resolveCounterRange(0..<total) {
+                            data.withUnsafeBytes { raw in
+                                let ts = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+                                guard ts.count >= total else { return }
+                                var msg = "[perf] gpu_passes"
+                                for slot in frameSlots {
+                                    let s = ts[slot.startIdx].timestamp
+                                    let e = ts[slot.endIdx].timestamp
+                                    let ticks = (e >= s) ? Double(e &- s) : 0
+                                    let us = ticks * frameTickNs / 1000.0
+                                    msg += " \(slot.label)_us=\(String(format: "%.1f", us))"
+                                }
+                                ZonvieCore.appLog(msg)
+                            }
+                        }
+                    }
                 }
 
                 guard let self = self else { return }
