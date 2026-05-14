@@ -1493,6 +1493,111 @@ pub fn generateRowVertices(
                     };
                     var penX: f32 = baseX;
 
+                    // ── ASCII fast emit path ───────────────────────────────────
+                    // When the shaping fast path was taken, the run is guaranteed
+                    // to be pure ASCII (0x20..0x7E) with no ligature triggers.
+                    // That eliminates entire categories of work from the regular
+                    // emit loop:
+                    //   • cluster grouping (1 cluster == 1 scalar == 1 glyph)
+                    //   • emoji detection (no ASCII codepoints are emoji)
+                    //   • wide-char handling (ASCII is always single-width)
+                    //   • retroactive suppression (no calt → no overhanging glyphs)
+                    //   • x_off/y_off math (always zero for fast path)
+                    // and lets us use the direct-indexed glyph_cache_ascii (keyed
+                    // by scalar*4+style_index) instead of the hashed
+                    // glyph_cache_id (keyed by hash(gid, style)).
+                    //
+                    // Requires: glyph_cache_ascii sized >= 512 (default 512 covers
+                    // 128 codepoints × 4 styles). For smaller caches we fall back
+                    // to the existing emit loop, which preserves correctness.
+                    if (used_ascii_fast_path
+                        and glyph_cache_ascii != null and glyph_valid_ascii != null
+                        and GLYPH_CACHE_ASCII_SIZE >= 512)
+                    {
+                        const ge_cache = glyph_cache_ascii.?;
+                        const ge_valid = glyph_valid_ascii.?;
+                        var gi: u32 = 0;
+                        while (gi < final_glyph_count) : (gi += 1) {
+                            const cluster_idx: u32 = @intCast(bufs.clusters.items[gi]);
+                            const scalar: u32 = core.shaping_scalars.items[cluster_idx];
+                            // Cell-based pen advance. Raw HarfBuzz x_adv would be
+                            // the font's actual advance (e.g. 7.6 px for Menlo at
+                            // size 14) which the renderer ceils to cellW (8 px) in
+                            // its grid layout. Accumulating raw advance over many
+                            // glyphs would drift content off the cell grid by
+                            // ~0.5 px / glyph and shift later cells onto wrong
+                            // columns. shaping_col_widths is set to 1 for every
+                            // ASCII scalar by the fast-path setup, so a single
+                            // cellW step per glyph is exactly correct.
+                            const cell_advance: f32 = cellW;
+
+                            // Skip space (very hot in tig — most cells are space)
+                            if (scalar == 0x20) {
+                                penX += cell_advance;
+                                continue;
+                            }
+
+                            // Direct index lookup; bounds-safe because guarded
+                            // by GLYPH_CACHE_ASCII_SIZE >= 512 above (max key
+                            // for ASCII printable + style_index <= 127*4+3 = 511).
+                            const cache_key: usize = @as(usize, scalar) * 4 + @as(usize, style_index);
+                            var ge: c_api.GlyphEntry = undefined;
+                            if (ge_valid[cache_key]) {
+                                ge = ge_cache[cache_key];
+                            } else {
+                                const t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const ge_opt = core.ensureGlyphPhase2(scalar, c_style);
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_ens));
+                                if (ge_opt) |entry| {
+                                    ge = entry;
+                                    ge_cache[cache_key] = entry;
+                                    ge_valid[cache_key] = true;
+                                } else {
+                                    stats.had_glyph_miss = true;
+                                    if (core.missing_glyph_log_count < 16) {
+                                        core.log.write(
+                                            "glyph_missing(ascii_fast) row={d} scalar=0x{x}\n",
+                                            .{ r, scalar },
+                                        );
+                                        core.missing_glyph_log_count += 1;
+                                    }
+                                    penX += cell_advance;
+                                    continue;
+                                }
+                            }
+
+                            // Emit quad. x_off/y_off are 0 for ASCII fast path,
+                            // so positioning collapses to bbox-relative only.
+                            if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
+                                const baselineY: f32 = baseY + ge.ascent_px;
+                                const gx0: f32 = penX + ge.bbox_origin_px[0];
+                                const gx1: f32 = gx0 + ge.bbox_size_px[0];
+                                const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                                const gy1: f32 = gy0 + ge.bbox_size_px[1];
+                                const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
+                                const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
+                                const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
+                                const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
+                                // ASCII is never emoji and the fast path is never
+                                // entered for color emoji bitmaps, so DECO_COLOR_EMOJI
+                                // is unconditionally off.
+                                const deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
+                                const t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, deco);
+                                if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_emit));
+                            }
+
+                            penX += cell_advance;
+                        }
+
+                        // Atlas reset can happen inside ensureGlyphPhase2 above; the
+                        // outer retry loop relies on atlas_reset_during_flush which
+                        // we did not touch. Advance the column cursor manually since
+                        // we are bypassing the rest of the has_shaping emit body.
+                        c = end;
+                        continue;
+                    }
+
                     // Dump shaping results for ligature debugging.
                     // Log when shaping was used (not ASCII fast path) — covers both
                     // calt (glyph count == scalar count, IDs differ) and liga (count differs).
