@@ -581,7 +581,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // a reusable sample buffer. On unsupported devices the gate stays false and
     // the per-pass GPU log is silently skipped (gpu_execution still emits).
     private func setupGpuPerfSampling() {
-        guard device.supportsCounterSampling(.atStageBoundary) else {
+        // Diagnostic dump of what the device actually exposes. M-series Macs
+        // typically only show "timestamp" via runtime API; statistic and
+        // stageutilization are restricted to Xcode GPU Capture on macOS.
+        let exposedSets = (device.counterSets ?? []).map { $0.name }.joined(separator: ",")
+        let supportsStage = device.supportsCounterSampling(.atStageBoundary)
+        let supportsDraw = device.supportsCounterSampling(.atDrawBoundary)
+        let supportsBlit = device.supportsCounterSampling(.atBlitBoundary)
+        ZonvieCore.appLog("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
+
+        guard supportsStage else {
             ZonvieCore.appLog("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
             return
         }
