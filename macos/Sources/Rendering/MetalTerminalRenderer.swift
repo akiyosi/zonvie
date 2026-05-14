@@ -25,6 +25,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // Glyph pipeline uses standard alpha blending for correct antialiasing
     private var backgroundPipeline: MTLRenderPipelineState?
     private var glyphPipeline: MTLRenderPipelineState?
+    // Single-pass replacement for the (backgroundPipeline + glyphPipeline) 2-pass.
+    // Uses ps_unified_blur which reads tile memory via raster_order_group and
+    // composites bg + glyph + decorations in a single fragment shader. Halves
+    // fragment-shader invocations vs the 2-pass discard pattern when enabled.
+    // nil → fall back to 2-pass for safety.
+    private var unifiedBlurPipeline: MTLRenderPipelineState?
 
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
@@ -1757,7 +1763,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if rowMode {
                 if use2Pass {
                     if canBlinkFastPath {
-                        // FAST PATH: blink-only — redraw only cursor row (2-pass)
+                        // FAST PATH: blink-only — redraw only cursor row.
+                        // Single-pass via unified blur pipeline when available;
+                        // 2-pass fallback otherwise (matches the global rule
+                        // for use2Pass branches).
                         let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
                         let vc = resolved.vc
                         let vb = resolved.vb
@@ -1768,20 +1777,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
                         }
 
-                        // Pass 1: Background (overwrite blending — erases old cursor)
-                        enc.setRenderPipelineState(backgroundPipeline!)
                         var rowTranslation = resolved.translationY
-                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        if let unified = unifiedBlurPipeline {
+                            enc.setRenderPipelineState(unified)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        } else {
+                            // Pass 1: Background (overwrite blending — erases old cursor)
+                            enc.setRenderPipelineState(backgroundPipeline!)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
 
-                        // Pass 2: Glyph (alpha blending — redraws text/decorations)
-                        enc.setRenderPipelineState(glyphPipeline!)
-                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                            // Pass 2: Glyph (alpha blending — redraws text/decorations)
+                            enc.setRenderPipelineState(glyphPipeline!)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
 
-                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc)")
+                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc) unified=\(unifiedBlurPipeline != nil)")
                     } else if useGpuScrollCopy {
                         // Switch to backgroundPipeline (overwrite blend: one, zero)
                         // for ALL clear operations in the scroll path.  With blur
@@ -1830,7 +1846,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     } else if canDirtyOnlyWithBlur {
                         // Partial redraw with .load for blur: only dirty rows are
@@ -1874,7 +1891,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     } else {
                         // 2-Pass rendering for blur: draw backgrounds first, then glyphs
@@ -1886,7 +1904,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     }
                 } else if smoothScrolling {
@@ -1971,7 +1990,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     backgroundPipeline: backgroundPipeline,
                     glyphPipeline: glyphPipeline,
                     useTwoPass: use2Pass,
-                    scissorRect: dirtyScissor
+                    scissorRect: dirtyScissor,
+                    unifiedBlurPipeline: unifiedBlurPipeline
                 )
             }
 
@@ -2562,11 +2582,35 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             backgroundPipeline = try device.makeRenderPipelineState(descriptor: bgDesc)
             glyphPipeline = try device.makeRenderPipelineState(descriptor: glyphDesc)
             ZonvieCore.appLog("[Renderer] 2-pass pipelines created for blur support")
-            return (bgDesc, glyphDesc)
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
             return (nil, nil)
         }
+
+        // Unified single-pass pipeline that supersedes 2-pass when available.
+        // Pipeline blend disabled — ps_unified_blur reads tile via
+        // raster_order_group and writes the final composited pixel directly.
+        if let fsUnified = lib.makeFunction(name: "ps_unified_blur") {
+            let uDesc = MTLRenderPipelineDescriptor()
+            uDesc.vertexFunction = vs
+            uDesc.fragmentFunction = fsUnified
+            uDesc.vertexDescriptor = vertexDesc
+            uDesc.colorAttachments[0].pixelFormat = pixelFormat
+            if let a = uDesc.colorAttachments[0] {
+                a.isBlendingEnabled = false  // shader does manual alpha blend via tile read
+            }
+            do {
+                unifiedBlurPipeline = try device.makeRenderPipelineState(descriptor: uDesc)
+                ZonvieCore.appLog("[Renderer] unified blur pipeline created (1-pass programmable blending)")
+            } catch {
+                ZonvieCore.appLog("[Renderer] WARNING: unified blur pipeline build failed; 2-pass fallback in use: \(error)")
+                unifiedBlurPipeline = nil
+            }
+        } else {
+            ZonvieCore.appLog("[Renderer] WARNING: ps_unified_blur shader not found; 2-pass fallback in use")
+        }
+
+        return (bgDesc, glyphDesc)
     }
 
     /// Build bloom pipelines for post-process neon glow.

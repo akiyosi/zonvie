@@ -228,7 +228,8 @@ func encodeSurfaceRowDraws(
     pipeline: MTLRenderPipelineState,
     backgroundPipeline: MTLRenderPipelineState?,
     glyphPipeline: MTLRenderPipelineState?,
-    useTwoPass: Bool
+    useTwoPass: Bool,
+    unifiedBlurPipeline: MTLRenderPipelineState? = nil
 ) -> Int {
     var drawnRows = 0
 
@@ -249,7 +250,12 @@ func encodeSurfaceRowDraws(
         }
     }
 
-    if useTwoPass, let backgroundPipeline, let glyphPipeline {
+    // Single-pass via programmable blending supersedes the 2-pass discard
+    // pattern when the unified pipeline is available — same visual output,
+    // half the fragment-shader invocations.
+    if useTwoPass, let unified = unifiedBlurPipeline {
+        encodePass(with: unified, countDrawnRows: true)
+    } else if useTwoPass, let backgroundPipeline, let glyphPipeline {
         encodePass(with: backgroundPipeline, countDrawnRows: true)
         encodePass(with: glyphPipeline, countDrawnRows: false)
     } else {
@@ -771,14 +777,23 @@ func encodeSurfaceNonRowContent(
     backgroundPipeline: MTLRenderPipelineState?,
     glyphPipeline: MTLRenderPipelineState?,
     useTwoPass: Bool,
-    scissorRect: MTLScissorRect? = nil
+    scissorRect: MTLScissorRect? = nil,
+    unifiedBlurPipeline: MTLRenderPipelineState? = nil
 ) {
     guard vertexCount > 0, let vb = vertexBuffer else { return }
 
     var zeroTranslation: Float = 0
     encoder.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
 
-    if useTwoPass, let bgPipe = backgroundPipeline, let glyphPipe = glyphPipeline {
+    // Single-pass via programmable blending supersedes 2-pass when available.
+    if useTwoPass, let unified = unifiedBlurPipeline {
+        encoder.setRenderPipelineState(unified)
+        if let sr = scissorRect {
+            encoder.setScissorRect(sr)
+        }
+        encoder.setVertexBuffer(vb, offset: 0, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
+    } else if useTwoPass, let bgPipe = backgroundPipeline, let glyphPipe = glyphPipeline {
         encoder.setRenderPipelineState(bgPipe)
         encoder.setVertexBuffer(vb, offset: 0, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
