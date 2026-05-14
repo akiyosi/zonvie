@@ -2088,6 +2088,60 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let t_copy_end = CFAbsoluteTimeGetCurrent()
                 let copy_us = (t_copy_end - t_copy_start) * 1_000_000
                 ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
+
+                // Copy-pass dirty-region opportunity: characterizes how much of the
+                // drawable actually changed this frame so we can quantify Option B
+                // (skip / partial copy). Pairs 1:1 with [perf] gpu_passes copy_us.
+                //   dirty_rows=N    : rows the main pass actually rewrote
+                //   dirty_h_px=H    : bbox height in pixels (not row-count * cellH;
+                //                     accounts for non-contiguous dirty)
+                //   drawable_h_px=DH: full drawable height
+                //   dirty_pct=P     : H / DH × 100 (how much of vertical extent
+                //                     could be omitted from the copy)
+                //   category        : full | partial | scroll | blink | shader |
+                //                     noop  (what the frame actually was)
+                //   noop_eligible   : true when nothing main-touched and no blink,
+                //                     i.e. copy is structurally avoidable if we
+                //                     had drawable preservation
+                let cellHpx = max(1, Int(cellHi))
+                let drawableHpx = max(1, Int(drawableHi))
+                var minRow = Int.max
+                var maxRow = Int.min
+                for r in dirtyRows {
+                    if r < minRow { minRow = r }
+                    if r > maxRow { maxRow = r }
+                }
+                let dirtyHpx: Int
+                if dirtyRows.isEmpty {
+                    dirtyHpx = 0
+                } else {
+                    dirtyHpx = max(0, maxRow - minRow + 1) * cellHpx
+                }
+                let dirtyPct = Double(dirtyHpx) * 100.0 / Double(drawableHpx)
+                let category: String
+                if customShaderHandled {
+                    category = "shader"
+                } else if smoothScrolling || useGpuScrollCopy {
+                    category = "scroll"
+                } else if isBlinkOnlyFrame {
+                    category = "blink"
+                } else if !rowMode {
+                    category = "full"
+                } else if dirtyRows.isEmpty {
+                    category = "noop"
+                } else if dirtyPct >= 95.0 {
+                    category = "full"
+                } else {
+                    category = "partial"
+                }
+                let noopEligible = dirtyRows.isEmpty
+                    && !smoothScrolling
+                    && !useGpuScrollCopy
+                    && !drawableSizeChanged
+                    && !blinkStateChanged
+                    && hasPresentedOnce
+                    && !customShaderHandled
+                ZonvieCore.appLog("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
             }
 
             // Cursor is composited only on the final drawable.
