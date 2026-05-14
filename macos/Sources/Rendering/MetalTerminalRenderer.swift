@@ -616,11 +616,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         ZonvieCore.appLog("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
     }
 
-    // Attach stage-boundary timestamp samples to a render pass descriptor so the
-    // GPU records start-of-vertex / end-of-fragment timestamps. The whole-pass
-    // duration is end-start in ticks, scaled by gpuTimestampPeriodNs in the
-    // completion handler. No-op when perf logging is off or the device lacks
-    // counter sampling. Must be called BEFORE makeRenderCommandEncoder(rpd).
+    // Attach fragment-stage timestamp samples to a render pass descriptor so the
+    // GPU records start-of-fragment / end-of-fragment timestamps. The duration
+    // (end - start) is scaled by gpuTimestampPeriodNs in the completion handler.
+    //
+    // Why fragment-stage only (not start_v..end_f): on Apple Silicon TBDR, the
+    // vertex stage of pass N+1 runs in parallel with the fragment stage of pass
+    // N, so start_v..end_f intervals overlap heavily and don't yield meaningful
+    // per-pass cost (sum was ~1.6x exec_us when measured that way). Adjacent
+    // passes that share textures are serialized at the fragment boundary
+    // (read-after-write), so fragment-only sampling produces costs that roughly
+    // sum to gpu_exec_us. Vertex cost is small for text rendering and acceptable
+    // to elide.
+    //
+    // No-op when perf logging is off or the device lacks counter sampling.
+    // Must be called BEFORE makeRenderCommandEncoder(rpd).
     private func attachGpuPerfSamples(to rpd: MTLRenderPassDescriptor, label: String) {
         guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
               let buf = gpuPerfSampleBuffer
@@ -630,9 +640,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard endIdx < buf.sampleCount else { return }
         let attach = rpd.sampleBufferAttachments[0]!
         attach.sampleBuffer = buf
-        attach.startOfVertexSampleIndex = startIdx
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
         attach.endOfVertexSampleIndex = MTLCounterDontSample
-        attach.startOfFragmentSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
         attach.endOfFragmentSampleIndex = endIdx
         gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
     }
