@@ -293,6 +293,76 @@ pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usiz
     return i;
 }
 
+/// Fused run-end scan over up to 5 SoA attribute arrays in a single pass.
+/// Returns the first index in [start, limit) where ANY of the enabled arrays
+/// differs from its target. Equivalent to:
+///     min(
+///       simdFindRunEndU32(fg, ..., fg_t),
+///       simdFindRunEndU32(bg, ..., bg_t),
+///       simdFindRunEndI64(grid, ..., grid_t),
+///       has_style ? findStyleMaskEnd(style, ..., style_mask, style_val) : limit,
+///       has_glow  ? simdFindRunEndU8(glow, ..., glow_t)                  : limit,
+///     )
+/// but reads each cache line once instead of 3–5 separate passes.
+///
+/// Stride is 8 cells per outer iteration. `inline fn` lets the compiler
+/// constant-propagate `has_style` and `has_glow` at the call site, eliminating
+/// the disabled branches from the hot loop.
+pub inline fn simdFindRunEndMulti(
+    start: usize,
+    limit: usize,
+    fg: []const u32, fg_t: u32,
+    bg: []const u32, bg_t: u32,
+    grid: []const i64, grid_t: i64,
+    style: []const u8, style_mask: u8, style_val: u8, has_style: bool,
+    glow: []const u8, glow_t: u8, has_glow: bool,
+) usize {
+    const N = 8;
+    var i = start;
+    const fg_tv: @Vector(N, u32) = @splat(fg_t);
+    const bg_tv: @Vector(N, u32) = @splat(bg_t);
+    const grid_tv: @Vector(N, i64) = @splat(grid_t);
+    const style_mv: @Vector(N, u8) = @splat(style_mask);
+    const style_vv: @Vector(N, u8) = @splat(style_val);
+    const glow_tv: @Vector(N, u8) = @splat(glow_t);
+
+    while (i + N <= limit) {
+        const fg_c: @Vector(N, u32) = fg[i..][0..N].*;
+        const bg_c: @Vector(N, u32) = bg[i..][0..N].*;
+        const grid_c: @Vector(N, i64) = grid[i..][0..N].*;
+        var match: @Vector(N, bool) = (fg_c == fg_tv);
+        match = @select(bool, match, bg_c == bg_tv, match);
+        match = @select(bool, match, grid_c == grid_tv, match);
+        if (has_style) {
+            const s_c: @Vector(N, u8) = style[i..][0..N].*;
+            match = @select(bool, match, (s_c & style_mv) == style_vv, match);
+        }
+        if (has_glow) {
+            const g_c: @Vector(N, u8) = glow[i..][0..N].*;
+            match = @select(bool, match, g_c == glow_tv, match);
+        }
+        if (@reduce(.And, match)) {
+            i += N;
+        } else {
+            // Scalar scan within this chunk to find the exact mismatch index.
+            inline for (0..N) |k| {
+                if (!match[k]) return i + k;
+            }
+            unreachable;
+        }
+    }
+
+    // Scalar tail.
+    while (i < limit) : (i += 1) {
+        if (fg[i] != fg_t) return i;
+        if (bg[i] != bg_t) return i;
+        if (grid[i] != grid_t) return i;
+        if (has_style and (style[i] & style_mask) != style_val) return i;
+        if (has_glow and glow[i] != glow_t) return i;
+    }
+    return i;
+}
+
 /// Check if any u32 in [start..end) is non-space (not 0 and not 32).
 /// Returns true if there is "ink" content to render.
 pub inline fn simdHasInkInRange(scalars: []const u32, start: usize, end: usize) bool {
@@ -1165,26 +1235,20 @@ pub fn generateRowVertices(
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
             const run_start = c;
 
-            const base_end_attr = @min(
-                simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c), @intCast(cols), run_fg),
-                @min(
-                    simdFindRunEndU32(rc.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
-                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
-                ),
-            );
-            // When shaping is active, also split by bold/italic style so each
-            // sub-run selects the correct font variant for HarfBuzz shaping.
+            // Fused run-end: single SIMD pass over fg/bg/grid + optional
+            // style-mask (when shaping splits by bold/italic) + optional glow.
+            // Replaces 3–5 separate simdFindRunEnd*+findStyleMaskEnd calls.
             const shaping_style_mask: u8 = STYLE_BOLD | STYLE_ITALIC;
             const run_style_bi: u8 = rc.style_flags_arr.items[@intCast(c)] & shaping_style_mask;
-            const base_end: usize = if (has_shaping)
-                @min(base_end_attr, findStyleMaskEnd(rc.style_flags_arr.items, @intCast(c), base_end_attr, shaping_style_mask, run_style_bi))
-            else
-                base_end_attr;
             const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
-            const end: u32 = @intCast(if (p.glow_enabled)
-                @min(base_end, simdFindRunEndU8(rc.glow_arr.items, @intCast(c), @intCast(cols), run_glow))
-            else
-                base_end);
+            const end: u32 = @intCast(simdFindRunEndMulti(
+                @intCast(c), @intCast(cols),
+                rc.fg_rgbs.items, run_fg,
+                rc.bg_rgbs.items, run_bg,
+                rc.grid_ids.items, run_grid_id,
+                rc.style_flags_arr.items, shaping_style_mask, run_style_bi, has_shaping,
+                rc.glow_arr.items, run_glow, p.glow_enabled,
+            ));
             const has_ink = simdHasInkInRange(rc.scalars.items, @intCast(c), @intCast(end));
 
             if (has_ink) {
