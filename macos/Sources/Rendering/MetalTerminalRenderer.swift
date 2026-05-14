@@ -207,6 +207,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var gpuTimestampPeriodNs: Double = 1.0
     private var gpuPerfSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
 
+    // Per-pass overdraw measurement via MTLCommonCounterSetStatistic.
+    // Captures fragmentInvocations at pass start/end; ratio against the actual
+    // visible pixel area (drawable_w × dirty_h_px) is true overdraw. Confirms
+    // whether the 2-pass blur path actually doubles fragment work, which our
+    // hypothesis says is the dominant ~5ms in main pass.
+    private var gpuStatsSampleBuffer: MTLCounterSampleBuffer?
+    private var gpuStatsSamplingEnabled: Bool = false
+    private var gpuStatsSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
@@ -614,6 +623,29 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         gpuPerfSamplingEnabled = true
         ZonvieCore.appLog("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
+
+        // ── Statistic counter set: fragment invocations for overdraw measurement.
+        // Independent enable gate so a partial-support device can still benefit
+        // from gpu_passes timing even if statistic isn't available.
+        let statisticSet = device.counterSets?.first { cs in
+            cs.name == MTLCommonCounterSet.statistic.rawValue
+        }
+        guard let stCs = statisticSet else {
+            ZonvieCore.appLog("[perf] gpu_overdraw: no statistic counter set; skipping")
+            return
+        }
+        let stDesc = MTLCounterSampleBufferDescriptor()
+        stDesc.counterSet = stCs
+        stDesc.label = "ZonvieGpuStatsBuffer"
+        stDesc.storageMode = .shared
+        stDesc.sampleCount = 16
+        do {
+            gpuStatsSampleBuffer = try device.makeCounterSampleBuffer(descriptor: stDesc)
+            gpuStatsSamplingEnabled = true
+            ZonvieCore.appLog("[perf] gpu_overdraw: enabled")
+        } catch {
+            ZonvieCore.appLog("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
+        }
     }
 
     // Attach fragment-stage timestamp samples to a render pass descriptor so the
@@ -645,6 +677,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         attach.startOfFragmentSampleIndex = startIdx
         attach.endOfFragmentSampleIndex = endIdx
         gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
+    }
+
+    // Attach fragment-invocation counter samples on attachment slot 1 (slot 0 is
+    // taken by timestamps). Uses the same fragment-stage boundaries so the
+    // invocation count covers the same work the timestamp duration does.
+    // Resolved in the completion handler as fragmentInvocations(end - start);
+    // overdraw ratio is computed against actual visible pixel area.
+    private func attachGpuStatsSamples(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuStatsSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuStatsSampleBuffer
+        else { return }
+        let startIdx = gpuStatsSlots.count * 2
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        let attach = rpd.sampleBufferAttachments[1]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
+        attach.endOfFragmentSampleIndex = endIdx
+        gpuStatsSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
     }
 
     // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
@@ -1532,6 +1585,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // below append entries that the completion handler resolves into a
             // single [perf] gpu_passes line. No-op when perf logging is off.
             gpuPerfSlots.removeAll(keepingCapacity: true)
+            gpuStatsSlots.removeAll(keepingCapacity: true)
             // GPU scroll blit: shift back texture pixels and expand dirty rows.
             // Windows equivalent: applyScrollShift (windows/app.zig) which calls
             // scrollBackTex + shiftRowVBs + gap row expansion.
@@ -1636,6 +1690,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             attachGpuPerfSamples(to: rpd, label: "main")
+            attachGpuStatsSamples(to: rpd, label: "main")
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
@@ -2073,6 +2128,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 copyRPD.colorAttachments[0].storeAction = .store
 
                 attachGpuPerfSamples(to: copyRPD, label: "copy")
+                attachGpuStatsSamples(to: copyRPD, label: "copy")
                 if let copyEnc = cmd.makeRenderCommandEncoder(descriptor: copyRPD) {
                     copyEnc.setRenderPipelineState(copyPipe)
                     copyEnc.setVertexBuffer(copyVB, offset: 0, index: 0)
@@ -2155,6 +2211,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cursorRPD.colorAttachments[0].storeAction = .store
 
                 attachGpuPerfSamples(to: cursorRPD, label: "cursor")
+                attachGpuStatsSamples(to: cursorRPD, label: "cursor")
                 if let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) {
                     viewportMetrics.applyViewport(to: cursorEnc)
                     cursorEnc.setRenderPipelineState(pipeline!)
@@ -2202,6 +2259,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let frameSlots = gpuPerfSlots
             let frameSampleBuf = gpuPerfSampleBuffer
             let frameTickNs = gpuTimestampPeriodNs
+            let frameStatsSlots = gpuStatsSlots
+            let frameStatsBuf = gpuStatsSampleBuffer
             cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
@@ -2230,6 +2289,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     let ticks = (e >= s) ? Double(e &- s) : 0
                                     let us = ticks * frameTickNs / 1000.0
                                     msg += " \(slot.label)_us=\(String(format: "%.1f", us))"
+                                }
+                                ZonvieCore.appLog(msg)
+                            }
+                        }
+                    }
+
+                    // Per-pass fragment invocations (overdraw numerator). Pairs
+                    // with copy_opportunity dirty_h_px / drawable info to
+                    // compute true overdraw per pass. Validates whether the
+                    // 2-pass-for-blur path actually doubles fragment work.
+                    if let buf = frameStatsBuf, !frameStatsSlots.isEmpty {
+                        let total = frameStatsSlots.count * 2
+                        if let data = try? buf.resolveCounterRange(0..<total) {
+                            data.withUnsafeBytes { raw in
+                                let st = raw.bindMemory(to: MTLCounterResultStatistic.self)
+                                guard st.count >= total else { return }
+                                var msg = "[perf] gpu_overdraw"
+                                for slot in frameStatsSlots {
+                                    let s = st[slot.startIdx].fragmentInvocations
+                                    let e = st[slot.endIdx].fragmentInvocations
+                                    let inv = (e >= s) ? (e &- s) : 0
+                                    msg += " \(slot.label)_frags=\(inv)"
                                 }
                                 ZonvieCore.appLog(msg)
                             }
