@@ -1259,7 +1259,13 @@ pub fn generateRowVertices(
                         const is_ascii_safe = ascii_chk: {
                             const scalars = core.shaping_scalars.items[0..scalar_count];
                             if (!simdAllAsciiPrintable(scalars, scalar_count)) break :ascii_chk false;
-                            if (scalar_count == 1) break :ascii_chk true;
+                            // ascii_lig_triggers now covers single-glyph
+                            // substitution features (zero / ssXX / cvXX / locl /
+                            // ccmp / smcp etc.) in addition to multi-glyph
+                            // ligatures. A scalar_count==1 run can still be
+                            // affected by zero=1 swapping '0' with slashed-zero,
+                            // for example. The trigger table must be consulted
+                            // for every run regardless of length.
                             const trigs = &core.ascii_lig_triggers[style_index];
                             for (scalars) |s| {
                                 if (trigs[@intCast(s)] != 0) break :ascii_chk false;
