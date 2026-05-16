@@ -1468,6 +1468,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // otherwise macOS stretches the old frame to the new window size.
             let drawableSizeChanged = view.drawableSize != lastDrawnDrawableSize
 
+            // "Blink-only frame" = blinkStateChanged is the ONLY change this draw.
+            // Used both for skipMainPass later AND for the cursor==0 skipFrame
+            // early-return below — defined here so both can share the predicate
+            // safely (the early-return must NOT trigger when there are dirty
+            // rows / dirtyRectPxOpt / new commits / scroll, otherwise we drop
+            // updates already consumed under the lock).
+            let isBlinkOnlyFrame = blinkStateChanged
+                && !hasNewCommit
+                && dirtyRows.isEmpty
+                && dirtyRectPxOpt == nil
+                && !smoothScrolling
+                && !drawableSizeChanged
+                && hasPresentedOnce
+
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             //
@@ -1496,6 +1510,35 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // destroys the backbuffer between GPU-blit scroll frames.
             // Same animation exception as above.
             if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce && !anyCustomShaderNeedsAnimation {
+                (view as? MetalTerminalView)?.notifyDrawIdle()
+                (view as? MetalTerminalView)?.didDrawFrame()
+                return
+            }
+
+            // Blink toggled but there is no cursor to draw this frame
+            // (currentCursorCount == 0). The toggle is visually invisible
+            // because cursor isn't rendered in either state, so the entire
+            // draw cycle is wasted work: drawable acquire (~30us, p99 ~500us),
+            // copy pass (~2.9ms wall time including vfgap), present, plus
+            // wakes on the next vsync. Skip and acknowledge the toggle so
+            // blinkStateChanged stops firing for this state.
+            //
+            // Common when cursor is hidden (some terminal modes, t_vi,
+            // long-running commands that hide cursor). Zero effect when
+            // cursor is normally visible.
+            //
+            // isBlinkOnlyFrame already covers !hasNewCommit, dirtyRows.isEmpty,
+            // dirtyRectPxOpt == nil, !smoothScrolling, !drawableSizeChanged,
+            // hasPresentedOnce — critical because pendingDirtyRectPx was
+            // consumed under the lock above; skipping without checking it
+            // would lose the update.
+            if rowMode
+                && isBlinkOnlyFrame
+                && pendingScroll == nil
+                && currentCursorCount == 0
+                && !anyCustomShaderNeedsAnimation {
+                lastRenderedBlinkState = cursorBlinkState
+                ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -1537,14 +1580,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
 
-            // --- Step 1: Detect blink-only frame condition ---
-            let isBlinkOnlyFrame = blinkStateChanged
-                && !hasNewCommit
-                && dirtyRows.isEmpty
-                && dirtyRectPxOpt == nil
-                && !smoothScrolling
-                && !drawableSizeChanged
-                && hasPresentedOnce
+            // isBlinkOnlyFrame is computed earlier (right after drawableSizeChanged)
+            // so the skipFrame early-return above can share the same predicate.
 
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
             let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
