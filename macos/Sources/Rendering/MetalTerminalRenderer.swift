@@ -1960,15 +1960,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 )
                             }
                         }
-                        let drawItems = buildSurfaceRowDrawItems(
-                            rows: dirtyRows,
-                            resolve: resolvedRowState
-                        ) { row in
-                            makeRowScissorRect(row: row, cellHeight_px: scrollCellHiI, drawableWidth_px: drawableW)
-                        }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: dirtyRows,
+                            resolve: resolvedRowState,
+                            scissor: { row in
+                                makeRowScissorRect(row: row, cellHeight_px: scrollCellHiI, drawableWidth_px: drawableW)
+                            },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
@@ -1982,7 +1980,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // alpha accumulation in the redrawn rows.
                         //
                         // Rows with vc==0 (cleared by core) are dropped by
-                        // resolvedRowState → buildSurfaceRowDrawItems.  Since
+                        // resolvedRowState → encodeSurfaceRowDraws.  Since
                         // loadAction=.load, the old backbuffer pixels would persist.
                         // Draw a background-color quad for these empty rows using
                         // backgroundPipeline (overwrite blend) to fully replace old content.
@@ -2005,15 +2003,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 }
                             }
                         }
-                        let drawItems = buildSurfaceRowDrawItems(
-                            rows: dirtyRows,
-                            resolve: resolvedRowState
-                        ) { row in
-                            makeRowScissorRect(row: row, cellHeight_px: cellHiI, drawableWidth_px: drawableW)
-                        }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: dirtyRows,
+                            resolve: resolvedRowState,
+                            scissor: { row in
+                                makeRowScissorRect(row: row, cellHeight_px: cellHiI, drawableWidth_px: drawableW)
+                            },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
@@ -2023,10 +2019,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     } else {
                         // 2-Pass rendering for blur: draw backgrounds first, then glyphs
                         // This prevents ghosting with semi-transparent backgrounds
-                        let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: 0..<safeRowCount,
+                            resolve: resolvedRowState,
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
@@ -2036,10 +2032,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
                 } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -2055,15 +2051,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             bgRGB: snappedBgRGB
                         )
                     }
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -2072,15 +2066,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else if !glowEnabled && !dirtyRows.isEmpty {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
                     // Skipped when glow is enabled — full redraw needed for correct bloom composite.
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -2088,10 +2080,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     )
                 } else {
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,

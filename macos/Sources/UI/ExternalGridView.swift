@@ -1324,15 +1324,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                                 bgRGB: bgRGB
                             )
                         }
-                        let drawItems = buildSurfaceRowDrawItems(
-                            rows: dirtyRows,
-                            resolve: resolvedRowState
-                        ) { row in
-                            makeRowScissorRect(row: row, cellHeight_px: Int(cellHi), drawableWidth_px: drawableW)
-                        }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: dirtyRows,
+                            resolve: resolvedRowState,
+                            scissor: { row in
+                                makeRowScissorRect(row: row, cellHeight_px: Int(cellHi), drawableWidth_px: drawableW)
+                            },
                             pipeline: pipeline,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
@@ -1340,10 +1338,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         )
                     } else {
                         // 2-pass full redraw (same as MetalTerminalRenderer)
-                        let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: 0..<safeRowCount,
+                            resolve: resolvedRowState,
                             pipeline: pipeline,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
@@ -1352,10 +1350,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     }
                 } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1372,15 +1370,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             bgRGB: bgRGB
                         )
                     }
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1388,15 +1384,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     )
                 } else if !glowEnabled && !dirtyRows.isEmpty {
                     // Normal mode: scissor per dirty row (match MetalTerminalRenderer)
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1404,10 +1398,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     )
                 } else {
                     // Full redraw fallback
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,

@@ -112,13 +112,6 @@ final class SurfaceRedrawScheduler {
     }
 }
 
-struct SurfaceRowDrawItem {
-    var vertexBuffer: MTLBuffer
-    var vertexCount: Int
-    var translationY: Float = 0
-    var scissorRect: MTLScissorRect? = nil
-}
-
 struct SurfaceViewportMetrics {
     let viewportWidth: Double
     let viewportHeight: Double
@@ -221,29 +214,37 @@ func resolveSurfaceColorLoadAction(
     return .clear
 }
 
+/// Encode row draws for a collection of row indices. Resolution and scissor
+/// are produced via closures so the caller does not have to materialize an
+/// intermediate per-frame draw-item array (zero allocation on the hot path).
+///
+/// `rows` accepts any `Collection<Int>` — typically `Range<Int>` for the
+/// full-grid path or `[Int]` for dirty-row paths.
 @discardableResult
-func encodeSurfaceRowDraws(
+func encodeSurfaceRowDraws<C: Collection>(
     encoder: MTLRenderCommandEncoder,
-    items: [SurfaceRowDrawItem],
+    rows: C,
+    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?,
+    scissor: ((Int) -> MTLScissorRect?)? = nil,
     pipeline: MTLRenderPipelineState,
     backgroundPipeline: MTLRenderPipelineState?,
     glyphPipeline: MTLRenderPipelineState?,
     useTwoPass: Bool,
     unifiedBlurPipeline: MTLRenderPipelineState? = nil
-) -> Int {
+) -> Int where C.Element == Int {
     var drawnRows = 0
 
     func encodePass(with pipelineState: MTLRenderPipelineState, countDrawnRows: Bool) {
         encoder.setRenderPipelineState(pipelineState)
-        for item in items {
-            guard item.vertexCount > 0 else { continue }
-            if let scissor = item.scissorRect {
-                encoder.setScissorRect(scissor)
+        for row in rows {
+            guard let resolved = resolve(row), resolved.vc > 0 else { continue }
+            if let scissorFn = scissor, let sr = scissorFn(row) {
+                encoder.setScissorRect(sr)
             }
-            var translation = item.translationY
+            var translation = resolved.translationY
             encoder.setVertexBytes(&translation, length: MemoryLayout<Float>.size, index: 3)
-            encoder.setVertexBuffer(item.vertexBuffer, offset: 0, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: item.vertexCount)
+            encoder.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
             if countDrawnRows {
                 drawnRows += 1
             }
@@ -682,36 +683,6 @@ func makeRowScissorRect(
     let y = max(0, row * cellHeight_px)
     guard drawableWidth_px > 0, cellHeight_px > 0 else { return nil }
     return MTLScissorRect(x: 0, y: y, width: drawableWidth_px, height: cellHeight_px)
-}
-
-func buildSurfaceRowDrawItems(
-    safeRowCount: Int,
-    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?
-) -> [SurfaceRowDrawItem] {
-    return (0..<safeRowCount).compactMap { row in
-        guard let resolved = resolve(row) else { return nil }
-        return SurfaceRowDrawItem(
-            vertexBuffer: resolved.vb,
-            vertexCount: resolved.vc,
-            translationY: resolved.translationY
-        )
-    }
-}
-
-func buildSurfaceRowDrawItems(
-    rows: [Int],
-    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?,
-    scissor: (Int) -> MTLScissorRect?
-) -> [SurfaceRowDrawItem] {
-    return rows.compactMap { row in
-        guard let resolved = resolve(row) else { return nil }
-        return SurfaceRowDrawItem(
-            vertexBuffer: resolved.vb,
-            vertexCount: resolved.vc,
-            translationY: resolved.translationY,
-            scissorRect: scissor(row)
-        )
-    }
 }
 
 // MARK: - Surface Encoder Binding Helpers
