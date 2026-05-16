@@ -1570,16 +1570,30 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return true
             }()
 
-            // Skip the main render pass entirely for blink-only frames. The
-            // cursor lives on the drawable (not in backTex; see "Cursor is
-            // composited only on the final drawable" further below), so blink
-            // toggling never changes backTex contents — copy+cursor passes
-            // alone reproduce the right pixel. Avoids the ~5.7ms .clear cost
-            // (alpha=0.8 backgrounds disable Apple's fast-clear path) and the
-            // legacy canBlinkFastPath cursor-row redraw, which was redundant
-            // for the same reason. Glow is excluded because bloom samples
-            // backTex via its own intermediate pass.
-            let skipMainPass = isBlinkOnlyFrame && !glowEnabled && hasPresentedOnce
+            // Skip the main render pass entirely for any frame that produces
+            // no backTex change:
+            //   - blink-only frames (cursor toggle, content unchanged)
+            //   - noop frames (nothing dirty, draw() triggered spuriously e.g.
+            //     by an upstream redraw request that ended up touching no rows)
+            // The cursor lives on the drawable, not backTex (see "Cursor is
+            // composited only on the final drawable" further below), so the
+            // copy + cursor passes alone reproduce the right pixel.
+            //
+            // Avoids the ~5.7ms .clear cost (alpha=0.8 backgrounds disable
+            // Apple's fast-clear path) which the noop+.clear and blink+.clear
+            // paths were eating per logs. Glow is excluded because bloom
+            // samples backTex via its own intermediate pass.
+            //
+            // Note: isBlinkOnlyFrame already implies these conditions; noop
+            // expansion just drops the blinkStateChanged predicate so any
+            // dirty-empty frame qualifies.
+            let noMainWorkFrame = !hasNewCommit
+                && dirtyRows.isEmpty
+                && dirtyRectPxOpt == nil
+                && !smoothScrolling
+                && !drawableSizeChanged
+                && hasPresentedOnce
+            let skipMainPass = noMainWorkFrame && !glowEnabled
 
             // We always need a drawable to present.
             var t_drawable_start: CFAbsoluteTime = 0
@@ -1716,7 +1730,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             if skipMainPass {
-                ZonvieCore.appLog("[draw] skipMainPass=true (blink-only frame; backTex preserved, copy+cursor only)")
+                let reason = isBlinkOnlyFrame ? "blink-only" : "noop"
+                ZonvieCore.appLog("[draw] skipMainPass=true (\(reason); backTex preserved, copy+cursor only)")
             }
             if !skipMainPass {
             attachGpuPerfSamples(to: rpd, label: "main")
