@@ -208,10 +208,24 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // bounds in-flight frames to 1, so the previous frame's completion handler
     // resolves the buffer before the next draw assigns slots.
     private struct GpuPerfSlot { let label: String; let startIdx: Int; let endIdx: Int }
+    // Full 4-stage sampling for one pass (vertex start/end + fragment start/end).
+    // Used to investigate why the copy pass measures ~2.9ms even though it's a
+    // single 6-vert blit (~0.7ms theoretical bandwidth limit) — the fragment-
+    // only number doesn't show vertex stage cost or the gap waiting for the
+    // previous pass's tile store.
+    private struct GpuPerfSlotFull {
+        let label: String
+        let startVIdx: Int
+        let endVIdx: Int
+        let startFIdx: Int
+        let endFIdx: Int
+    }
     private var gpuPerfSampleBuffer: MTLCounterSampleBuffer?
     private var gpuPerfSamplingEnabled: Bool = false
     private var gpuTimestampPeriodNs: Double = 1.0
     private var gpuPerfSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+    private var gpuPerfFullSlots: [GpuPerfSlotFull] = []  // ditto, full-stage sampling
+    private var gpuPerfNextIdx: Int = 0  // shared sample-buffer cursor; reset per draw
 
     // Per-pass overdraw measurement via MTLCommonCounterSetStatistic.
     // Captures fragmentInvocations at pass start/end; ratio against the actual
@@ -682,9 +696,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
               let buf = gpuPerfSampleBuffer
         else { return }
-        let startIdx = gpuPerfSlots.count * 2
+        let startIdx = gpuPerfNextIdx
         let endIdx = startIdx + 1
         guard endIdx < buf.sampleCount else { return }
+        gpuPerfNextIdx += 2
         let attach = rpd.sampleBufferAttachments[0]!
         attach.sampleBuffer = buf
         attach.startOfVertexSampleIndex = MTLCounterDontSample
@@ -692,6 +707,41 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         attach.startOfFragmentSampleIndex = startIdx
         attach.endOfFragmentSampleIndex = endIdx
         gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
+    }
+
+    // Same as attachGpuPerfSamples but also samples the vertex-stage boundary
+    // so we get start_v / end_v / start_f / end_f for one pass. Lets us split:
+    //   vertex_us  = end_v - start_v   (vertex shader + binning)
+    //   vfgap_us   = start_f - end_v   (idle waiting for tile binning to settle
+    //                                   or for previous pass's tile store)
+    //   fragment_us = end_f - start_f  (= existing copy_us field)
+    //   total_us   = end_f - start_v   (whole pass wall time)
+    //
+    // Used only for the copy pass today, where the 2.9ms p50 measurement is
+    // 4x the bandwidth-limited theoretical minimum and we need the breakdown
+    // to know whether the cost is in vertex/binning, in cross-pass scheduling,
+    // or actually in fragment shading.
+    private func attachGpuPerfSamplesFull(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuPerfSampleBuffer
+        else { return }
+        let baseIdx = gpuPerfNextIdx
+        let endFIdx = baseIdx + 3
+        guard endFIdx < buf.sampleCount else { return }
+        gpuPerfNextIdx += 4
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = baseIdx
+        attach.endOfVertexSampleIndex = baseIdx + 1
+        attach.startOfFragmentSampleIndex = baseIdx + 2
+        attach.endOfFragmentSampleIndex = baseIdx + 3
+        gpuPerfFullSlots.append(GpuPerfSlotFull(
+            label: label,
+            startVIdx: baseIdx,
+            endVIdx: baseIdx + 1,
+            startFIdx: baseIdx + 2,
+            endFIdx: baseIdx + 3
+        ))
     }
 
     // Attach fragment-invocation counter samples on attachment slot 1 (slot 0 is
@@ -741,10 +791,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         isInFlush = true
-        perfRowSubmitNs = 0
-        perfRowSubmitCalls = 0
-        perfRowSubmitVerts = 0
         let perfEnabled = ZonvieCore.appLogEnabled
+        if perfEnabled {
+            perfRowSubmitNs = 0
+            perfRowSubmitCalls = 0
+            perfRowSubmitVerts = 0
+        }
         let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         var atlasPrepareUs: Double = 0
         var atlasCommitUs: Double = 0
@@ -1623,9 +1675,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             // Per-pass GPU timing: reset slot list at frame start; attach calls
             // below append entries that the completion handler resolves into a
-            // single [perf] gpu_passes line. No-op when perf logging is off.
-            gpuPerfSlots.removeAll(keepingCapacity: true)
-            gpuStatsSlots.removeAll(keepingCapacity: true)
+            // single [perf] gpu_passes line. Gated so the hot path pays zero
+            // cost when perf logging is off (the attach helpers also bail out
+            // internally, but the removeAll calls themselves would otherwise
+            // run unconditionally).
+            if ZonvieCore.appLogEnabled {
+                gpuPerfSlots.removeAll(keepingCapacity: true)
+                gpuPerfFullSlots.removeAll(keepingCapacity: true)
+                gpuPerfNextIdx = 0
+                gpuStatsSlots.removeAll(keepingCapacity: true)
+            }
             // GPU scroll blit: shift back texture pixels and expand dirty rows.
             // Windows equivalent: applyScrollShift (windows/app.zig) which calls
             // scrollBackTex + shiftRowVBs + gap row expansion.
@@ -2187,7 +2246,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 copyRPD.colorAttachments[0].loadAction = .dontCare
                 copyRPD.colorAttachments[0].storeAction = .store
 
-                attachGpuPerfSamples(to: copyRPD, label: "copy")
+                // Full 4-stage sampling (vertex + fragment) on the copy pass
+                // to investigate why it measures ~2.9ms vs ~0.7ms theoretical.
+                attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
                 attachGpuStatsSamples(to: copyRPD, label: "copy")
                 if let copyEnc = cmd.makeRenderCommandEncoder(descriptor: copyRPD) {
                     copyEnc.setRenderPipelineState(copyPipe)
@@ -2314,13 +2375,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
             let t_gpu_submit: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
             // Snapshot per-pass slots + sample buffer + tick scale for the
-            // completion handler. The renderer reuses gpuPerfSlots next frame, so
-            // a value-typed copy keeps this frame's data alive until resolve.
-            let frameSlots = gpuPerfSlots
-            let frameSampleBuf = gpuPerfSampleBuffer
+            // completion handler. The renderer reuses gpuPerfSlots next frame,
+            // so a value-typed copy keeps this frame's data alive until resolve.
+            // Gated on appLogEnabled so when logging is off the captures are
+            // cheap constants instead of array struct copies / ref bumps.
+            let logEnabledForCompletion = ZonvieCore.appLogEnabled
+            let frameSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuPerfSlots : []
+            let frameFullSlots: [GpuPerfSlotFull] = logEnabledForCompletion ? gpuPerfFullSlots : []
+            let frameSampleCount: Int = logEnabledForCompletion ? gpuPerfNextIdx : 0
+            let frameSampleBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuPerfSampleBuffer : nil
             let frameTickNs = gpuTimestampPeriodNs
-            let frameStatsSlots = gpuStatsSlots
-            let frameStatsBuf = gpuStatsSampleBuffer
+            let frameStatsSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuStatsSlots : []
+            let frameStatsBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuStatsSampleBuffer : nil
             cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
@@ -2336,12 +2402,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // Per-pass GPU breakdown via stage-boundary timestamps.
                     // Pairs with gpu_execution: per-pass durations should sum to
                     // ≤ exec_us (the gap is tile-binning / submit overhead).
-                    if let buf = frameSampleBuf, !frameSlots.isEmpty {
-                        let total = frameSlots.count * 2
-                        if let data = try? buf.resolveCounterRange(0..<total) {
+                    // frameSampleCount covers both fragment-only slots and full
+                    // (vertex+fragment) slots, allocated contiguously in the
+                    // shared sample buffer via gpuPerfNextIdx.
+                    if let buf = frameSampleBuf, frameSampleCount > 0,
+                       (!frameSlots.isEmpty || !frameFullSlots.isEmpty)
+                    {
+                        if let data = try? buf.resolveCounterRange(0..<frameSampleCount) {
                             data.withUnsafeBytes { raw in
                                 let ts = raw.bindMemory(to: MTLCounterResultTimestamp.self)
-                                guard ts.count >= total else { return }
+                                guard ts.count >= frameSampleCount else { return }
                                 var msg = "[perf] gpu_passes"
                                 for slot in frameSlots {
                                     let s = ts[slot.startIdx].timestamp
@@ -2350,7 +2420,47 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     let us = ticks * frameTickNs / 1000.0
                                     msg += " \(slot.label)_us=\(String(format: "%.1f", us))"
                                 }
+                                // Full-stage slots: report fragment_us under
+                                // the same `<label>_us=` field so the existing
+                                // analyzer keeps working, then emit a separate
+                                // [perf] gpu_pass_detail line with the full
+                                // vertex/gap/fragment/total breakdown.
+                                for slot in frameFullSlots {
+                                    let sV = ts[slot.startVIdx].timestamp
+                                    let eV = ts[slot.endVIdx].timestamp
+                                    let sF = ts[slot.startFIdx].timestamp
+                                    let eF = ts[slot.endFIdx].timestamp
+                                    let fragTicks = (eF >= sF) ? Double(eF &- sF) : 0
+                                    let fragUs = fragTicks * frameTickNs / 1000.0
+                                    msg += " \(slot.label)_us=\(String(format: "%.1f", fragUs))"
+                                }
                                 ZonvieCore.appLog(msg)
+
+                                // Detail for full-stage slots: vertex / vfgap /
+                                // fragment / total. vfgap is start_f - end_v —
+                                // idle between stages, often dominated by
+                                // waiting for the previous pass's tile store.
+                                for slot in frameFullSlots {
+                                    let sV = ts[slot.startVIdx].timestamp
+                                    let eV = ts[slot.endVIdx].timestamp
+                                    let sF = ts[slot.startFIdx].timestamp
+                                    let eF = ts[slot.endFIdx].timestamp
+                                    func usOf(_ a: UInt64, _ b: UInt64) -> Double {
+                                        let t = (b >= a) ? Double(b &- a) : 0
+                                        return t * frameTickNs / 1000.0
+                                    }
+                                    let vUs = usOf(sV, eV)
+                                    let gapUs = usOf(eV, sF)
+                                    let fUs = usOf(sF, eF)
+                                    let totalUs = usOf(sV, eF)
+                                    ZonvieCore.appLog(
+                                        "[perf] gpu_pass_detail \(slot.label) " +
+                                        "vertex_us=\(String(format: "%.1f", vUs)) " +
+                                        "vfgap_us=\(String(format: "%.1f", gapUs)) " +
+                                        "fragment_us=\(String(format: "%.1f", fUs)) " +
+                                        "total_us=\(String(format: "%.1f", totalUs))"
+                                    )
+                                }
                             }
                         }
                     }
