@@ -118,6 +118,8 @@ struct ZonvieConfig {
     struct LogConfig {
         var enabled: Bool = false
         var path: String? = nil  // If nil, logs to stderr
+        // When true, only [perf...] tagged lines reach the on_log callback.
+        var perfOnly: Bool = false
     }
 
     struct PerformanceConfig {
@@ -256,6 +258,7 @@ struct ZonvieConfig {
         // Log
         config.log.enabled = v.log_enabled
         if let s = v.log_path { config.log.path = String(cString: s) }
+        config.log.perfOnly = v.log_perf_only
 
         // Performance
         config.performance.glyphCacheAsciiSize = Int(v.perf_glyph_cache_ascii)

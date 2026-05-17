@@ -25,6 +25,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // Glyph pipeline uses standard alpha blending for correct antialiasing
     private var backgroundPipeline: MTLRenderPipelineState?
     private var glyphPipeline: MTLRenderPipelineState?
+    // Single-pass replacement for the (backgroundPipeline + glyphPipeline) 2-pass.
+    // Uses ps_unified_blur which reads tile memory via raster_order_group and
+    // composites bg + glyph + decorations in a single fragment shader. Halves
+    // fragment-shader invocations vs the 2-pass discard pattern when enabled.
+    // nil → fall back to 2-pass for safety.
+    private var unifiedBlurPipeline: MTLRenderPipelineState?
 
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
@@ -190,6 +196,46 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var flushSourceSetIndex: Int = 0 // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
+    // Per-flush row submit accumulators. Reset in beginFlush, summed in
+    // submitVerticesRowRaw, dumped in commitFlush as [perf] row_submit. Surfaces
+    // the Swift-side cost inside Zig-measured row_cb_us (memcpy + slot remap).
+    private var perfRowSubmitNs: Int64 = 0    // Core thread only
+    private var perfRowSubmitCalls: Int = 0   // Core thread only
+    private var perfRowSubmitVerts: Int = 0   // Core thread only
+
+    // Per-pass GPU timing via MTLCounterSampleBuffer (stage-boundary timestamps).
+    // One sample buffer is reused across frames; safe because inflightSemaphore
+    // bounds in-flight frames to 1, so the previous frame's completion handler
+    // resolves the buffer before the next draw assigns slots.
+    private struct GpuPerfSlot { let label: String; let startIdx: Int; let endIdx: Int }
+    // Full 4-stage sampling for one pass (vertex start/end + fragment start/end).
+    // Used to investigate why the copy pass measures ~2.9ms even though it's a
+    // single 6-vert blit (~0.7ms theoretical bandwidth limit) — the fragment-
+    // only number doesn't show vertex stage cost or the gap waiting for the
+    // previous pass's tile store.
+    private struct GpuPerfSlotFull {
+        let label: String
+        let startVIdx: Int
+        let endVIdx: Int
+        let startFIdx: Int
+        let endFIdx: Int
+    }
+    private var gpuPerfSampleBuffer: MTLCounterSampleBuffer?
+    private var gpuPerfSamplingEnabled: Bool = false
+    private var gpuTimestampPeriodNs: Double = 1.0
+    private var gpuPerfSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+    private var gpuPerfFullSlots: [GpuPerfSlotFull] = []  // ditto, full-stage sampling
+    private var gpuPerfNextIdx: Int = 0  // shared sample-buffer cursor; reset per draw
+
+    // Per-pass overdraw measurement via MTLCommonCounterSetStatistic.
+    // Captures fragmentInvocations at pass start/end; ratio against the actual
+    // visible pixel area (drawable_w × dirty_h_px) is true overdraw. Confirms
+    // whether the 2-pass blur path actually doubles fragment work, which our
+    // hypothesis says is the dominant ~5ms in main pass.
+    private var gpuStatsSampleBuffer: MTLCounterSampleBuffer?
+    private var gpuStatsSamplingEnabled: Bool = false
+    private var gpuStatsSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
@@ -547,6 +593,176 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             var visible: UInt32 = 1
             memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
         }
+
+        setupGpuPerfSampling()
+    }
+
+    // Probe device support for stage-boundary timestamp counters and allocate
+    // a reusable sample buffer. On unsupported devices the gate stays false and
+    // the per-pass GPU log is silently skipped (gpu_execution still emits).
+    private func setupGpuPerfSampling() {
+        // Diagnostic dump of what the device actually exposes. M-series Macs
+        // typically only show "timestamp" via runtime API; statistic and
+        // stageutilization are restricted to Xcode GPU Capture on macOS.
+        let exposedSets = (device.counterSets ?? []).map { $0.name }.joined(separator: ",")
+        let supportsStage = device.supportsCounterSampling(.atStageBoundary)
+        let supportsDraw = device.supportsCounterSampling(.atDrawBoundary)
+        let supportsBlit = device.supportsCounterSampling(.atBlitBoundary)
+        ZonvieCore.appLog("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
+
+        guard supportsStage else {
+            ZonvieCore.appLog("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
+            return
+        }
+        let timestampSet = device.counterSets?.first { cs in
+            // MTLCommonCounterSet is a RawRepresentable wrapper around String;
+            // MTLCounterSet.name returns a Swift String, so compare via rawValue.
+            cs.name == MTLCommonCounterSet.timestamp.rawValue
+        }
+        guard let cs = timestampSet else {
+            ZonvieCore.appLog("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
+            return
+        }
+        let desc = MTLCounterSampleBufferDescriptor()
+        desc.counterSet = cs
+        desc.label = "ZonvieGpuPerfTimestamps"
+        desc.storageMode = .shared
+        // Capacity 16 = up to 8 passes per frame (start+end each). Today we attach
+        // 3 (main, copy, cursor); headroom for future custom-shader chain entries.
+        desc.sampleCount = 16
+        do {
+            gpuPerfSampleBuffer = try device.makeCounterSampleBuffer(descriptor: desc)
+        } catch {
+            ZonvieCore.appLog("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
+            return
+        }
+        // Calibrate GPU tick → ns. On Apple Silicon timestamps already arrive in
+        // nanoseconds, but compute the ratio so other backends (Intel discrete
+        // GPUs, future hw) report correctly. Newer SDKs expose this as a
+        // tuple-returning method instead of inout pointers.
+        let (cpu0, gpu0) = device.sampleTimestamps()
+        Thread.sleep(forTimeInterval: 0.002)
+        let (cpu1, gpu1) = device.sampleTimestamps()
+        let cpuDelta = Double(cpu1 &- cpu0)
+        let gpuDelta = Double(gpu1 &- gpu0)
+        if cpuDelta > 0, gpuDelta > 0 {
+            // sampleTimestamps' cpuTimestamp is in nanoseconds (mach_absolute_time
+            // converted via timebase, per Apple docs); gpuTimestamp is in GPU ticks.
+            gpuTimestampPeriodNs = cpuDelta / gpuDelta
+        }
+        gpuPerfSamplingEnabled = true
+        ZonvieCore.appLog("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
+
+        // ── Statistic counter set: fragment invocations for overdraw measurement.
+        // Independent enable gate so a partial-support device can still benefit
+        // from gpu_passes timing even if statistic isn't available.
+        let statisticSet = device.counterSets?.first { cs in
+            cs.name == MTLCommonCounterSet.statistic.rawValue
+        }
+        guard let stCs = statisticSet else {
+            ZonvieCore.appLog("[perf] gpu_overdraw: no statistic counter set; skipping")
+            return
+        }
+        let stDesc = MTLCounterSampleBufferDescriptor()
+        stDesc.counterSet = stCs
+        stDesc.label = "ZonvieGpuStatsBuffer"
+        stDesc.storageMode = .shared
+        stDesc.sampleCount = 16
+        do {
+            gpuStatsSampleBuffer = try device.makeCounterSampleBuffer(descriptor: stDesc)
+            gpuStatsSamplingEnabled = true
+            ZonvieCore.appLog("[perf] gpu_overdraw: enabled")
+        } catch {
+            ZonvieCore.appLog("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
+        }
+    }
+
+    // Attach fragment-stage timestamp samples to a render pass descriptor so the
+    // GPU records start-of-fragment / end-of-fragment timestamps. The duration
+    // (end - start) is scaled by gpuTimestampPeriodNs in the completion handler.
+    //
+    // Why fragment-stage only (not start_v..end_f): on Apple Silicon TBDR, the
+    // vertex stage of pass N+1 runs in parallel with the fragment stage of pass
+    // N, so start_v..end_f intervals overlap heavily and don't yield meaningful
+    // per-pass cost (sum was ~1.6x exec_us when measured that way). Adjacent
+    // passes that share textures are serialized at the fragment boundary
+    // (read-after-write), so fragment-only sampling produces costs that roughly
+    // sum to gpu_exec_us. Vertex cost is small for text rendering and acceptable
+    // to elide.
+    //
+    // No-op when perf logging is off or the device lacks counter sampling.
+    // Must be called BEFORE makeRenderCommandEncoder(rpd).
+    private func attachGpuPerfSamples(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuPerfSampleBuffer
+        else { return }
+        let startIdx = gpuPerfNextIdx
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        gpuPerfNextIdx += 2
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
+        attach.endOfFragmentSampleIndex = endIdx
+        gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
+    }
+
+    // Same as attachGpuPerfSamples but also samples the vertex-stage boundary
+    // so we get start_v / end_v / start_f / end_f for one pass. Lets us split:
+    //   vertex_us  = end_v - start_v   (vertex shader + binning)
+    //   vfgap_us   = start_f - end_v   (idle waiting for tile binning to settle
+    //                                   or for previous pass's tile store)
+    //   fragment_us = end_f - start_f  (= existing copy_us field)
+    //   total_us   = end_f - start_v   (whole pass wall time)
+    //
+    // Used only for the copy pass today, where the 2.9ms p50 measurement is
+    // 4x the bandwidth-limited theoretical minimum and we need the breakdown
+    // to know whether the cost is in vertex/binning, in cross-pass scheduling,
+    // or actually in fragment shading.
+    private func attachGpuPerfSamplesFull(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuPerfSampleBuffer
+        else { return }
+        let baseIdx = gpuPerfNextIdx
+        let endFIdx = baseIdx + 3
+        guard endFIdx < buf.sampleCount else { return }
+        gpuPerfNextIdx += 4
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = baseIdx
+        attach.endOfVertexSampleIndex = baseIdx + 1
+        attach.startOfFragmentSampleIndex = baseIdx + 2
+        attach.endOfFragmentSampleIndex = baseIdx + 3
+        gpuPerfFullSlots.append(GpuPerfSlotFull(
+            label: label,
+            startVIdx: baseIdx,
+            endVIdx: baseIdx + 1,
+            startFIdx: baseIdx + 2,
+            endFIdx: baseIdx + 3
+        ))
+    }
+
+    // Attach fragment-invocation counter samples on attachment slot 1 (slot 0 is
+    // taken by timestamps). Uses the same fragment-stage boundaries so the
+    // invocation count covers the same work the timestamp duration does.
+    // Resolved in the completion handler as fragmentInvocations(end - start);
+    // overdraw ratio is computed against actual visible pixel area.
+    private func attachGpuStatsSamples(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard gpuStatsSamplingEnabled, ZonvieCore.appLogEnabled,
+              let buf = gpuStatsSampleBuffer
+        else { return }
+        let startIdx = gpuStatsSlots.count * 2
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        let attach = rpd.sampleBufferAttachments[1]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
+        attach.endOfFragmentSampleIndex = endIdx
+        gpuStatsSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
     }
 
     // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
@@ -576,6 +792,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func beginFlush() -> BeginFlushResult {
         isInFlush = true
         let perfEnabled = ZonvieCore.appLogEnabled
+        if perfEnabled {
+            perfRowSubmitNs = 0
+            perfRowSubmitCalls = 0
+            perfRowSubmitVerts = 0
+        }
         let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         var atlasPrepareUs: Double = 0
         var atlasCommitUs: Double = 0
@@ -792,6 +1013,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 totalVerts += bs.rowState.counts[i]
             }
             ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
+            // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
+            ZonvieCore.appLog("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
     }
 
@@ -1245,6 +1468,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // otherwise macOS stretches the old frame to the new window size.
             let drawableSizeChanged = view.drawableSize != lastDrawnDrawableSize
 
+            // "Blink-only frame" = blinkStateChanged is the ONLY change this draw.
+            // Used both for skipMainPass later AND for the cursor==0 skipFrame
+            // early-return below — defined here so both can share the predicate
+            // safely (the early-return must NOT trigger when there are dirty
+            // rows / dirtyRectPxOpt / new commits / scroll, otherwise we drop
+            // updates already consumed under the lock).
+            let isBlinkOnlyFrame = blinkStateChanged
+                && !hasNewCommit
+                && dirtyRows.isEmpty
+                && dirtyRectPxOpt == nil
+                && !smoothScrolling
+                && !drawableSizeChanged
+                && hasPresentedOnce
+
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             //
@@ -1273,6 +1510,35 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // destroys the backbuffer between GPU-blit scroll frames.
             // Same animation exception as above.
             if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce && !anyCustomShaderNeedsAnimation {
+                (view as? MetalTerminalView)?.notifyDrawIdle()
+                (view as? MetalTerminalView)?.didDrawFrame()
+                return
+            }
+
+            // Blink toggled but there is no cursor to draw this frame
+            // (currentCursorCount == 0). The toggle is visually invisible
+            // because cursor isn't rendered in either state, so the entire
+            // draw cycle is wasted work: drawable acquire (~30us, p99 ~500us),
+            // copy pass (~2.9ms wall time including vfgap), present, plus
+            // wakes on the next vsync. Skip and acknowledge the toggle so
+            // blinkStateChanged stops firing for this state.
+            //
+            // Common when cursor is hidden (some terminal modes, t_vi,
+            // long-running commands that hide cursor). Zero effect when
+            // cursor is normally visible.
+            //
+            // isBlinkOnlyFrame already covers !hasNewCommit, dirtyRows.isEmpty,
+            // dirtyRectPxOpt == nil, !smoothScrolling, !drawableSizeChanged,
+            // hasPresentedOnce — critical because pendingDirtyRectPx was
+            // consumed under the lock above; skipping without checking it
+            // would lose the update.
+            if rowMode
+                && isBlinkOnlyFrame
+                && pendingScroll == nil
+                && currentCursorCount == 0
+                && !anyCustomShaderNeedsAnimation {
+                lastRenderedBlinkState = cursorBlinkState
+                ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -1314,14 +1580,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
 
-            // --- Step 1: Detect blink-only frame condition ---
-            let isBlinkOnlyFrame = blinkStateChanged
-                && !hasNewCommit
-                && dirtyRows.isEmpty
-                && dirtyRectPxOpt == nil
-                && !smoothScrolling
-                && !drawableSizeChanged
-                && hasPresentedOnce
+            // isBlinkOnlyFrame is computed earlier (right after drawableSizeChanged)
+            // so the skipFrame early-return above can share the same predicate.
 
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
             let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
@@ -1399,6 +1659,31 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return true
             }()
 
+            // Skip the main render pass entirely for any frame that produces
+            // no backTex change:
+            //   - blink-only frames (cursor toggle, content unchanged)
+            //   - noop frames (nothing dirty, draw() triggered spuriously e.g.
+            //     by an upstream redraw request that ended up touching no rows)
+            // The cursor lives on the drawable, not backTex (see "Cursor is
+            // composited only on the final drawable" further below), so the
+            // copy + cursor passes alone reproduce the right pixel.
+            //
+            // Avoids the ~5.7ms .clear cost (alpha=0.8 backgrounds disable
+            // Apple's fast-clear path) which the noop+.clear and blink+.clear
+            // paths were eating per logs. Glow is excluded because bloom
+            // samples backTex via its own intermediate pass.
+            //
+            // Note: isBlinkOnlyFrame already implies these conditions; noop
+            // expansion just drops the blinkStateChanged predicate so any
+            // dirty-empty frame qualifies.
+            let noMainWorkFrame = !hasNewCommit
+                && dirtyRows.isEmpty
+                && dirtyRectPxOpt == nil
+                && !smoothScrolling
+                && !drawableSizeChanged
+                && hasPresentedOnce
+            let skipMainPass = noMainWorkFrame && !glowEnabled
+
             // We always need a drawable to present.
             var t_drawable_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -1424,6 +1709,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             guard let cmd = queue.makeCommandBuffer() else {
                 return
+            }
+            // Per-pass GPU timing: reset slot list at frame start; attach calls
+            // below append entries that the completion handler resolves into a
+            // single [perf] gpu_passes line. Gated so the hot path pays zero
+            // cost when perf logging is off (the attach helpers also bail out
+            // internally, but the removeAll calls themselves would otherwise
+            // run unconditionally).
+            if ZonvieCore.appLogEnabled {
+                gpuPerfSlots.removeAll(keepingCapacity: true)
+                gpuPerfFullSlots.removeAll(keepingCapacity: true)
+                gpuPerfNextIdx = 0
+                gpuStatsSlots.removeAll(keepingCapacity: true)
             }
             // GPU scroll blit: shift back texture pixels and expand dirty rows.
             // Windows equivalent: applyScrollShift (windows/app.zig) which calls
@@ -1528,6 +1825,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_encode_start = CFAbsoluteTimeGetCurrent()
             }
 
+            if skipMainPass {
+                let reason = isBlinkOnlyFrame ? "blink-only" : "noop"
+                ZonvieCore.appLog("[draw] skipMainPass=true (\(reason); backTex preserved, copy+cursor only)")
+            }
+            if !skipMainPass {
+            attachGpuPerfSamples(to: rpd, label: "main")
+            attachGpuStatsSamples(to: rpd, label: "main")
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
@@ -1576,12 +1880,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
 
+            // === PERF LOG: encode_setup → encode_rows boundary ===
+            let t_encode_rows_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let encode_setup_us: Double = ZonvieCore.appLogEnabled ? (t_encode_rows_start - t_encode_start) * 1_000_000 : 0
+
             // use2Pass and safeRowCount are pre-computed in Step 2 above.
 
             if rowMode {
                 if use2Pass {
                     if canBlinkFastPath {
-                        // FAST PATH: blink-only — redraw only cursor row (2-pass)
+                        // FAST PATH: blink-only — redraw only cursor row.
+                        // Single-pass via unified blur pipeline when available;
+                        // 2-pass fallback otherwise (matches the global rule
+                        // for use2Pass branches).
                         let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
                         let vc = resolved.vc
                         let vb = resolved.vb
@@ -1592,20 +1903,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
                         }
 
-                        // Pass 1: Background (overwrite blending — erases old cursor)
-                        enc.setRenderPipelineState(backgroundPipeline!)
                         var rowTranslation = resolved.translationY
-                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        if let unified = unifiedBlurPipeline {
+                            enc.setRenderPipelineState(unified)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        } else {
+                            // Pass 1: Background (overwrite blending — erases old cursor)
+                            enc.setRenderPipelineState(backgroundPipeline!)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
 
-                        // Pass 2: Glyph (alpha blending — redraws text/decorations)
-                        enc.setRenderPipelineState(glyphPipeline!)
-                        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                            // Pass 2: Glyph (alpha blending — redraws text/decorations)
+                            enc.setRenderPipelineState(glyphPipeline!)
+                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                            enc.setVertexBuffer(vb, offset: 0, index: 0)
+                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                        }
 
-                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc)")
+                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc) unified=\(unifiedBlurPipeline != nil)")
                     } else if useGpuScrollCopy {
                         // Switch to backgroundPipeline (overwrite blend: one, zero)
                         // for ALL clear operations in the scroll path.  With blur
@@ -1642,19 +1960,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 )
                             }
                         }
-                        let drawItems = buildSurfaceRowDrawItems(
-                            rows: dirtyRows,
-                            resolve: resolvedRowState
-                        ) { row in
-                            makeRowScissorRect(row: row, cellHeight_px: scrollCellHiI, drawableWidth_px: drawableW)
-                        }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: dirtyRows,
+                            resolve: resolvedRowState,
+                            scissor: { row in
+                                makeRowScissorRect(row: row, cellHeight_px: scrollCellHiI, drawableWidth_px: drawableW)
+                            },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     } else if canDirtyOnlyWithBlur {
                         // Partial redraw with .load for blur: only dirty rows are
@@ -1663,7 +1980,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // alpha accumulation in the redrawn rows.
                         //
                         // Rows with vc==0 (cleared by core) are dropped by
-                        // resolvedRowState → buildSurfaceRowDrawItems.  Since
+                        // resolvedRowState → encodeSurfaceRowDraws.  Since
                         // loadAction=.load, the old backbuffer pixels would persist.
                         // Draw a background-color quad for these empty rows using
                         // backgroundPipeline (overwrite blend) to fully replace old content.
@@ -1686,39 +2003,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 }
                             }
                         }
-                        let drawItems = buildSurfaceRowDrawItems(
-                            rows: dirtyRows,
-                            resolve: resolvedRowState
-                        ) { row in
-                            makeRowScissorRect(row: row, cellHeight_px: cellHiI, drawableWidth_px: drawableW)
-                        }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: dirtyRows,
+                            resolve: resolvedRowState,
+                            scissor: { row in
+                                makeRowScissorRect(row: row, cellHeight_px: cellHiI, drawableWidth_px: drawableW)
+                            },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     } else {
                         // 2-Pass rendering for blur: draw backgrounds first, then glyphs
                         // This prevents ghosting with semi-transparent backgrounds
-                        let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
-                            items: drawItems,
+                            rows: 0..<safeRowCount,
+                            resolve: resolvedRowState,
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     }
                 } else if smoothScrolling {
                     // Smooth scroll without blur: draw all rows without scissor
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1734,15 +2051,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             bgRGB: snappedBgRGB
                         )
                     }
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1751,15 +2066,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else if !glowEnabled && !dirtyRows.isEmpty {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
                     // Skipped when glow is enabled — full redraw needed for correct bloom composite.
-                    let drawItems = buildSurfaceRowDrawItems(
-                        rows: dirtyRows,
-                        resolve: resolvedRowState
-                    ) { row in
-                        makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
-                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                        },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1767,10 +2080,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     )
                 } else {
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
-                    let drawItems = buildSurfaceRowDrawItems(safeRowCount: safeRowCount, resolve: resolvedRowState)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        items: drawItems,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
@@ -1795,9 +2108,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     backgroundPipeline: backgroundPipeline,
                     glyphPipeline: glyphPipeline,
                     useTwoPass: use2Pass,
-                    scissorRect: dirtyScissor
+                    scissorRect: dirtyScissor,
+                    unifiedBlurPipeline: unifiedBlurPipeline
                 )
             }
+
+            // === PERF LOG: encode_rows → encode_finalize boundary ===
+            let t_encode_finalize_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let encode_rows_us: Double = ZonvieCore.appLogEnabled ? (t_encode_finalize_start - t_encode_rows_start) * 1_000_000 : 0
 
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
@@ -1816,8 +2134,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 let t_encode_end = CFAbsoluteTimeGetCurrent()
                 let encode_us = (t_encode_end - t_encode_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us))")
+                let encode_finalize_us = (t_encode_end - t_encode_finalize_start) * 1_000_000
+                let dirtyRowCount = dirtyRows.count
+                ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us)) setup_us=\(String(format: "%.1f", encode_setup_us)) rows_us=\(String(format: "%.1f", encode_rows_us)) finalize_us=\(String(format: "%.1f", encode_finalize_us)) dirtyRows=\(dirtyRowCount)")
             }
+            }  // end of `if !skipMainPass`
 
             // --- Post-process bloom (neon glow) ---
             if glowEnabled,
@@ -1954,6 +2275,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 copyRPD.colorAttachments[0].loadAction = .dontCare
                 copyRPD.colorAttachments[0].storeAction = .store
 
+                // Full 4-stage sampling (vertex + fragment) on the copy pass
+                // to investigate why it measures ~2.9ms vs ~0.7ms theoretical.
+                attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
+                attachGpuStatsSamples(to: copyRPD, label: "copy")
                 if let copyEnc = cmd.makeRenderCommandEncoder(descriptor: copyRPD) {
                     copyEnc.setRenderPipelineState(copyPipe)
                     copyEnc.setVertexBuffer(copyVB, offset: 0, index: 0)
@@ -1969,6 +2294,60 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let t_copy_end = CFAbsoluteTimeGetCurrent()
                 let copy_us = (t_copy_end - t_copy_start) * 1_000_000
                 ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
+
+                // Copy-pass dirty-region opportunity: characterizes how much of the
+                // drawable actually changed this frame so we can quantify Option B
+                // (skip / partial copy). Pairs 1:1 with [perf] gpu_passes copy_us.
+                //   dirty_rows=N    : rows the main pass actually rewrote
+                //   dirty_h_px=H    : bbox height in pixels (not row-count * cellH;
+                //                     accounts for non-contiguous dirty)
+                //   drawable_h_px=DH: full drawable height
+                //   dirty_pct=P     : H / DH × 100 (how much of vertical extent
+                //                     could be omitted from the copy)
+                //   category        : full | partial | scroll | blink | shader |
+                //                     noop  (what the frame actually was)
+                //   noop_eligible   : true when nothing main-touched and no blink,
+                //                     i.e. copy is structurally avoidable if we
+                //                     had drawable preservation
+                let cellHpx = max(1, Int(cellHi))
+                let drawableHpx = max(1, Int(drawableHi))
+                var minRow = Int.max
+                var maxRow = Int.min
+                for r in dirtyRows {
+                    if r < minRow { minRow = r }
+                    if r > maxRow { maxRow = r }
+                }
+                let dirtyHpx: Int
+                if dirtyRows.isEmpty {
+                    dirtyHpx = 0
+                } else {
+                    dirtyHpx = max(0, maxRow - minRow + 1) * cellHpx
+                }
+                let dirtyPct = Double(dirtyHpx) * 100.0 / Double(drawableHpx)
+                let category: String
+                if customShaderHandled {
+                    category = "shader"
+                } else if smoothScrolling || useGpuScrollCopy {
+                    category = "scroll"
+                } else if isBlinkOnlyFrame {
+                    category = "blink"
+                } else if !rowMode {
+                    category = "full"
+                } else if dirtyRows.isEmpty {
+                    category = "noop"
+                } else if dirtyPct >= 95.0 {
+                    category = "full"
+                } else {
+                    category = "partial"
+                }
+                let noopEligible = dirtyRows.isEmpty
+                    && !smoothScrolling
+                    && !useGpuScrollCopy
+                    && !drawableSizeChanged
+                    && !blinkStateChanged
+                    && hasPresentedOnce
+                    && !customShaderHandled
+                ZonvieCore.appLog("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
             }
 
             // Cursor is composited only on the final drawable.
@@ -1981,6 +2360,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cursorRPD.colorAttachments[0].loadAction = .load
                 cursorRPD.colorAttachments[0].storeAction = .store
 
+                attachGpuPerfSamples(to: cursorRPD, label: "cursor")
+                attachGpuStatsSamples(to: cursorRPD, label: "cursor")
                 if let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) {
                     viewportMetrics.applyViewport(to: cursorEnc)
                     cursorEnc.setRenderPipelineState(pipeline!)
@@ -2018,12 +2399,123 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // if the renderer is deallocated before the GPU finishes.
             let sem = inflightSemaphore
             let lk = lock
-            cmd.addCompletedHandler { [weak self, weak view] _ in
+            // Wall-time clock at submission, used to compute gpu_wall_us
+            // (queue + GPU + present scheduling latency) inside the completion
+            // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
+            let t_gpu_submit: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            // Snapshot per-pass slots + sample buffer + tick scale for the
+            // completion handler. The renderer reuses gpuPerfSlots next frame,
+            // so a value-typed copy keeps this frame's data alive until resolve.
+            // Gated on appLogEnabled so when logging is off the captures are
+            // cheap constants instead of array struct copies / ref bumps.
+            let logEnabledForCompletion = ZonvieCore.appLogEnabled
+            let frameSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuPerfSlots : []
+            let frameFullSlots: [GpuPerfSlotFull] = logEnabledForCompletion ? gpuPerfFullSlots : []
+            let frameSampleCount: Int = logEnabledForCompletion ? gpuPerfNextIdx : 0
+            let frameSampleBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuPerfSampleBuffer : nil
+            let frameTickNs = gpuTimestampPeriodNs
+            let frameStatsSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuStatsSlots : []
+            let frameStatsBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuStatsSampleBuffer : nil
+            cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
                 self?.gpuInFlightCount[csi] -= 1
                 lk.unlock()
                 sem.signal()
+
+                if ZonvieCore.appLogEnabled {
+                    let gpu_wall_us = (CFAbsoluteTimeGetCurrent() - t_gpu_submit) * 1_000_000
+                    let gpu_exec_us = (completed.gpuEndTime - completed.gpuStartTime) * 1_000_000
+                    ZonvieCore.appLog("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
+
+                    // Per-pass GPU breakdown via stage-boundary timestamps.
+                    // Pairs with gpu_execution: per-pass durations should sum to
+                    // ≤ exec_us (the gap is tile-binning / submit overhead).
+                    // frameSampleCount covers both fragment-only slots and full
+                    // (vertex+fragment) slots, allocated contiguously in the
+                    // shared sample buffer via gpuPerfNextIdx.
+                    if let buf = frameSampleBuf, frameSampleCount > 0,
+                       (!frameSlots.isEmpty || !frameFullSlots.isEmpty)
+                    {
+                        if let data = try? buf.resolveCounterRange(0..<frameSampleCount) {
+                            data.withUnsafeBytes { raw in
+                                let ts = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+                                guard ts.count >= frameSampleCount else { return }
+                                var msg = "[perf] gpu_passes"
+                                for slot in frameSlots {
+                                    let s = ts[slot.startIdx].timestamp
+                                    let e = ts[slot.endIdx].timestamp
+                                    let ticks = (e >= s) ? Double(e &- s) : 0
+                                    let us = ticks * frameTickNs / 1000.0
+                                    msg += " \(slot.label)_us=\(String(format: "%.1f", us))"
+                                }
+                                // Full-stage slots: report fragment_us under
+                                // the same `<label>_us=` field so the existing
+                                // analyzer keeps working, then emit a separate
+                                // [perf] gpu_pass_detail line with the full
+                                // vertex/gap/fragment/total breakdown.
+                                for slot in frameFullSlots {
+                                    let sV = ts[slot.startVIdx].timestamp
+                                    let eV = ts[slot.endVIdx].timestamp
+                                    let sF = ts[slot.startFIdx].timestamp
+                                    let eF = ts[slot.endFIdx].timestamp
+                                    let fragTicks = (eF >= sF) ? Double(eF &- sF) : 0
+                                    let fragUs = fragTicks * frameTickNs / 1000.0
+                                    msg += " \(slot.label)_us=\(String(format: "%.1f", fragUs))"
+                                }
+                                ZonvieCore.appLog(msg)
+
+                                // Detail for full-stage slots: vertex / vfgap /
+                                // fragment / total. vfgap is start_f - end_v —
+                                // idle between stages, often dominated by
+                                // waiting for the previous pass's tile store.
+                                for slot in frameFullSlots {
+                                    let sV = ts[slot.startVIdx].timestamp
+                                    let eV = ts[slot.endVIdx].timestamp
+                                    let sF = ts[slot.startFIdx].timestamp
+                                    let eF = ts[slot.endFIdx].timestamp
+                                    func usOf(_ a: UInt64, _ b: UInt64) -> Double {
+                                        let t = (b >= a) ? Double(b &- a) : 0
+                                        return t * frameTickNs / 1000.0
+                                    }
+                                    let vUs = usOf(sV, eV)
+                                    let gapUs = usOf(eV, sF)
+                                    let fUs = usOf(sF, eF)
+                                    let totalUs = usOf(sV, eF)
+                                    ZonvieCore.appLog(
+                                        "[perf] gpu_pass_detail \(slot.label) " +
+                                        "vertex_us=\(String(format: "%.1f", vUs)) " +
+                                        "vfgap_us=\(String(format: "%.1f", gapUs)) " +
+                                        "fragment_us=\(String(format: "%.1f", fUs)) " +
+                                        "total_us=\(String(format: "%.1f", totalUs))"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Per-pass fragment invocations (overdraw numerator). Pairs
+                    // with copy_opportunity dirty_h_px / drawable info to
+                    // compute true overdraw per pass. Validates whether the
+                    // 2-pass-for-blur path actually doubles fragment work.
+                    if let buf = frameStatsBuf, !frameStatsSlots.isEmpty {
+                        let total = frameStatsSlots.count * 2
+                        if let data = try? buf.resolveCounterRange(0..<total) {
+                            data.withUnsafeBytes { raw in
+                                let st = raw.bindMemory(to: MTLCounterResultStatistic.self)
+                                guard st.count >= total else { return }
+                                var msg = "[perf] gpu_overdraw"
+                                for slot in frameStatsSlots {
+                                    let s = st[slot.startIdx].fragmentInvocations
+                                    let e = st[slot.endIdx].fragmentInvocations
+                                    let inv = (e >= s) ? (e &- s) : 0
+                                    msg += " \(slot.label)_frags=\(inv)"
+                                }
+                                ZonvieCore.appLog(msg)
+                            }
+                        }
+                    }
+                }
 
                 guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
@@ -2260,11 +2752,35 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             backgroundPipeline = try device.makeRenderPipelineState(descriptor: bgDesc)
             glyphPipeline = try device.makeRenderPipelineState(descriptor: glyphDesc)
             ZonvieCore.appLog("[Renderer] 2-pass pipelines created for blur support")
-            return (bgDesc, glyphDesc)
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
             return (nil, nil)
         }
+
+        // Unified single-pass pipeline that supersedes 2-pass when available.
+        // Pipeline blend disabled — ps_unified_blur reads tile via
+        // raster_order_group and writes the final composited pixel directly.
+        if let fsUnified = lib.makeFunction(name: "ps_unified_blur") {
+            let uDesc = MTLRenderPipelineDescriptor()
+            uDesc.vertexFunction = vs
+            uDesc.fragmentFunction = fsUnified
+            uDesc.vertexDescriptor = vertexDesc
+            uDesc.colorAttachments[0].pixelFormat = pixelFormat
+            if let a = uDesc.colorAttachments[0] {
+                a.isBlendingEnabled = false  // shader does manual alpha blend via tile read
+            }
+            do {
+                unifiedBlurPipeline = try device.makeRenderPipelineState(descriptor: uDesc)
+                ZonvieCore.appLog("[Renderer] unified blur pipeline created (1-pass programmable blending)")
+            } catch {
+                ZonvieCore.appLog("[Renderer] WARNING: unified blur pipeline build failed; 2-pass fallback in use: \(error)")
+                unifiedBlurPipeline = nil
+            }
+        } else {
+            ZonvieCore.appLog("[Renderer] WARNING: ps_unified_blur shader not found; 2-pass fallback in use")
+        }
+
+        return (bgDesc, glyphDesc)
     }
 
     /// Build bloom pipelines for post-process neon glow.
@@ -3116,6 +3632,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // We currently assume Zig calls with rowCount == 1 (contract in Zig onFlush).
         guard rowCount > 0 else { return }
 
+        let perfEnabled = ZonvieCore.appLogEnabled
+        let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
         submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
             sourceSet: bufferSets[flushSourceSetIndex],
@@ -3127,6 +3645,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             totalRows: totalRows,
             gpuInFlight: isAnyGpuInFlight()
         )
+        if perfEnabled {
+            let dt = zonvie_core_perf_now_ns() - t0
+            perfRowSubmitNs &+= dt
+            perfRowSubmitCalls &+= 1
+            perfRowSubmitVerts &+= count
+        }
     }
 
     // --- Dirty marking ---

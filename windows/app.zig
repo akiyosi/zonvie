@@ -51,6 +51,7 @@ pub const zonvie_core_update_layout_px = core.zonvie_core_update_layout_px;
 pub const zonvie_core_set_screen_cols = core.zonvie_core_set_screen_cols;
 pub const zonvie_core_get_hl_by_name = core.zonvie_core_get_hl_by_name;
 pub const zonvie_core_set_log_enabled = core.zonvie_core_set_log_enabled;
+pub const zonvie_core_set_log_perf_only = core.zonvie_core_set_log_perf_only;
 pub const zonvie_core_set_ext_cmdline = core.zonvie_core_set_ext_cmdline;
 pub const zonvie_core_set_ext_popupmenu = core.zonvie_core_set_ext_popupmenu;
 pub const zonvie_core_set_ext_messages = core.zonvie_core_set_ext_messages;

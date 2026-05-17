@@ -60,19 +60,26 @@ static void build_ascii_tables(zonvie_ft_hb_font* f) {
   hb_face_t* face = hb_font_get_face(f->hb_font);
   if (!face) { f->ascii_tables_valid = 1; return; }
 
-  // Feature tags that can produce ligature/contextual substitutions
+  // Feature tags that may substitute an ASCII codepoint with a different glyph.
+  // First list: features HarfBuzz activates by default (mirrors hb_shape() behavior).
+  // We must mark their input glyphs as triggers so the ASCII fast path falls
+  // back to HarfBuzz when those features fire — otherwise the precomputed
+  // ascii_glyph_ids[] (built without features) and the shaped output diverge.
   const hb_tag_t lig_features[] = {
     HB_TAG('l','i','g','a'),  // Standard ligatures (default on)
     HB_TAG('c','a','l','t'),  // Contextual alternates (default on)
     HB_TAG('r','l','i','g'),  // Required ligatures (always on)
     HB_TAG('c','l','i','g'),  // Contextual ligatures (default off)
     HB_TAG('d','l','i','g'),  // Discretionary ligatures (default off)
+    HB_TAG('l','o','c','l'),  // Localized forms (default on per HarfBuzz)
+    HB_TAG('c','c','m','p'),  // Composition/decomposition (default on per HarfBuzz)
   };
-  const int num_features = 5;
-  // Default activation: liga=on, calt=on, rlig=on, clig=off, dlig=off
-  int feature_active[] = { 1, 1, 1, 0, 0 };
+  const int num_features = 7;
+  // Default activation matches HarfBuzz defaults; clig/dlig default off.
+  int feature_active[] = { 1, 1, 1, 0, 0, 1, 1 };
 
-  // Override defaults based on user-set features
+  // Override defaults based on user-set features (e.g. user passes liga=0 to
+  // disable standard ligatures, or clig=1 to opt into contextual ligatures).
   for (size_t fi = 0; fi < f->feature_count; fi++) {
     for (int li = 0; li < num_features; li++) {
       if (f->features[fi].tag == lig_features[li]) {
@@ -81,11 +88,29 @@ static void build_ascii_tables(zonvie_ft_hb_font* f) {
     }
   }
 
-  // Collect GSUB lookup indices for all active ligature features
+  // Collect GSUB lookup indices for all active ligature/substitution features.
   hb_set_t* lookups = hb_set_create();
   for (int li = 0; li < num_features; li++) {
     if (!feature_active[li]) continue;
     const hb_tag_t tags[] = { lig_features[li], HB_TAG_NONE };
+    hb_ot_layout_collect_lookups(face, HB_OT_TAG_GSUB, NULL, NULL, tags, lookups);
+  }
+
+  // Additionally collect lookups for any user-enabled feature not already
+  // covered above. This catches arbitrary stylistic / character variant /
+  // numeric features (ss01..ss20, cv01..cv99, zero, frac, smcp, c2sc, onum,
+  // lnum, tnum, pnum, case, etc.) that can substitute ASCII glyphs and would
+  // otherwise produce divergent rendering between the ASCII fast path and
+  // hb_shape() output. Features with value==0 are explicit disables and
+  // already handled by the defaults-override loop above.
+  for (size_t fi = 0; fi < f->feature_count; fi++) {
+    if (f->features[fi].value == 0) continue;
+    int is_default = 0;
+    for (int li = 0; li < num_features; li++) {
+      if (f->features[fi].tag == lig_features[li]) { is_default = 1; break; }
+    }
+    if (is_default) continue;  // already collected above
+    const hb_tag_t tags[] = { f->features[fi].tag, HB_TAG_NONE };
     hb_ot_layout_collect_lookups(face, HB_OT_TAG_GSUB, NULL, NULL, tags, lookups);
   }
 

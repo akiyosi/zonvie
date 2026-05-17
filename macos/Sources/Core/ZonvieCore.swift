@@ -36,6 +36,9 @@ final class ZonvieCore {
     }
 
     static var appLogEnabled = false
+    /// When true, only [perf...] tagged lines reach the on_log callback at the
+    /// core boundary. Set from config.log.perfOnly during configureLogging.
+    static var appLogPerfOnly = false
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
     /// Process start time captured at first appLog reference; used to prefix
@@ -119,8 +122,9 @@ final class ZonvieCore {
     }
 
     /// Configure logging with file path (called from AppDelegate)
-    static func configureLogging(enabled: Bool, filePath: String?) {
+    static func configureLogging(enabled: Bool, filePath: String?, perfOnly: Bool = false) {
         appLogEnabled = enabled
+        appLogPerfOnly = perfOnly
         appLogFilePath = filePath
 
         // Close existing handle if any
@@ -1168,6 +1172,7 @@ final class ZonvieCore {
                 return zonvie_core_start_connect(core, base, buf.count, rows, cols)
             }
             zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
+            zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
             return result
         }
 
@@ -1910,6 +1915,17 @@ final class ZonvieCore {
         guard let core else { return }
         zonvie_core_set_log_enabled(core, enabled ? 1 : 0)
         ZonvieCore.appLogEnabled = enabled
+        // Re-apply perf_only on each enable toggle so a runtime toggle of the
+        // log flag never resets perf_only to its core default (off).
+        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+    }
+
+    /// Drop all non-[perf...] log lines at the core boundary. Independent of
+    /// setLogEnabledViaCore — caller must still enable logging for any output.
+    func setLogPerfOnlyViaCore(_ enabled: Bool) {
+        guard let core else { return }
+        zonvie_core_set_log_perf_only(core, enabled ? 1 : 0)
+        ZonvieCore.appLogPerfOnly = enabled
     }
 
     // MARK: - Smooth Scrolling Support

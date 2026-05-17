@@ -339,7 +339,12 @@ final class MetalTerminalView: MTKView {
         // On-demand draw. Render only when new data arrives.
         autoResizeDrawable = false
         colorPixelFormat = .bgra8Unorm
-        framebufferOnly = false
+        // Drawable is render-target-only across the renderer: copy / cursor /
+        // custom-shader passes use it as colorAttachment, never as a sampled
+        // texture or blit source. Keeping this true lets Apple Silicon apply
+        // lossless framebuffer compression, reducing GPU memory bandwidth and
+        // easing contention with WindowServer's blur compositor.
+        framebufferOnly = true
 
         enableSetNeedsDisplay = true
         isPaused = true

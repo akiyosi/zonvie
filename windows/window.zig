@@ -451,6 +451,9 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
     // 1) core-side switch
     if (app.corep != null) {
         core.zonvie_core_set_log_enabled(app.corep, if (enabled) 1 else 0);
+        // Re-apply perf_only on every enable toggle so a runtime toggle of
+        // the log flag doesn't reset perf_only to its core default (off).
+        core.zonvie_core_set_log_perf_only(app.corep, if (app.config.log.perf_only) 1 else 0);
     }
 
     // 2) app-root switch (Windows side)

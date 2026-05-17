@@ -869,12 +869,28 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             self.log.write("redraw err: {any}\n", .{re});
         };
 
+        // Per-redraw post-processing notifications. Each one is a thin wrapper
+        // over UI-extension state diffing, but they fire callbacks that may run
+        // arbitrary frontend code, so individual timing helps explain
+        // redraw_batch tail latency.
+        const log_on_notify = self.log.cb != null;
+
         // Update cmdline grid BEFORE checking external windows
         // (cmdline is rendered as an external grid)
+        const t_notify_cmdline: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
         self.notifyCmdlineChanges();
+        if (log_on_notify) {
+            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_cmdline), 1000));
+            self.log.write("[perf] notify_cmdline us={d}\n", .{dt});
+        }
 
         // Handle message changes (ext_messages)
+        const t_notify_msg: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
         self.notifyMessageChanges();
+        if (log_on_notify) {
+            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_msg), 1000));
+            self.log.write("[perf] notify_message us={d}\n", .{dt});
+        }
 
         // Send config parse error on first redraw (Neovim is ready at this point)
         if (!self.config_error_sent) {
@@ -886,7 +902,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
 
         // Handle tabline changes (ext_tabline)
+        const t_notify_tabline: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
         self.notifyTablineChanges();
+        if (log_on_notify) {
+            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_tabline), 1000));
+            self.log.write("[perf] notify_tabline us={d}\n", .{dt});
+        }
 
         // Process pending ext_windows grid resizes (from win_resize events).
         // win_resize is Neovim's request to the UI. The UI decides the actual
@@ -1120,7 +1141,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // here — it runs after commitFlush/atlas-swap, so rasterized glyphs
         // would go to the new back texture while the front (used for drawing)
         // would have empty texels, causing non-ASCII text to be invisible.
+        const t_notify_extwin: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
         _ = self.notifyExternalWindowChanges();
+        if (log_on_notify) {
+            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_extwin), 1000));
+            self.log.write("[perf] notify_extwin us={d}\n", .{dt});
+        }
 
         // Check IME off request (from mode_change event)
         if (self.grid.ime_off_requested) {
@@ -1724,18 +1750,32 @@ pub fn runLoop(self: *Core) void {
         // only as a reference implementation.
         outer: while (!self.stop_flag.load(.seq_cst)) {
             var root: mp.Value = undefined;
+            const log_on_msg = self.log.cb != null;
+            // Separate accounting: decode_ns counts CPU time inside mp.decode
+            // (across all attempts that returned EndOfStream); io_wait_ns
+            // counts wall time blocked on fr.fill() waiting for nvim. Earlier
+            // implementation wall-timed the whole loop and reported it as
+            // "decode" — that was misleading because most of it was I/O wait.
+            var decode_ns: i128 = 0;
+            var io_wait_ns: i128 = 0;
             while (true) {
                 _ = arena_state.reset(.retain_capacity);
                 const arena_once = arena_state.allocator();
 
                 var sr = FrameSliceReader{ .data = fr.view() };
-                if (mp.decode(arena_once, &sr)) |v| {
+                const t_dec: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
+                const dec_res = mp.decode(arena_once, &sr);
+                if (log_on_msg) decode_ns += std.time.nanoTimestamp() - t_dec;
+                if (dec_res) |v| {
                     fr.consume(sr.i);
                     root = v;
                     break;
                 } else |e| {
                     if (e == error.EndOfStream) {
-                        const n = fr.fill() catch |fe| {
+                        const t_io: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
+                        const fill_res = fr.fill();
+                        if (log_on_msg) io_wait_ns += std.time.nanoTimestamp() - t_io;
+                        const n = fill_res catch |fe| {
                             self.log.write("pipe read err: {any}\n", .{fe});
                             break :outer;
                         };
@@ -1765,7 +1805,21 @@ pub fn runLoop(self: *Core) void {
                 continue;
             }
             if (t == 2) {
+                const t_dispatch_start: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
                 handleRpcNotification(self, arena, top);
+                if (log_on_msg) {
+                    const dispatch_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_dispatch_start), 1000));
+                    const decode_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), decode_ns), 1000));
+                    const io_wait_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), io_wait_ns), 1000));
+                    // Only the method string is interesting here; pull it from
+                    // top[1] (already validated as .str inside the dispatcher
+                    // for the redraw path, but we re-check defensively).
+                    const method_for_log: []const u8 = if (top.len >= 2 and top[1] == .str) top[1].str else "?";
+                    self.log.write(
+                        "[perf] rpc_msg method={s} decode_us={d} io_wait_us={d} dispatch_us={d}\n",
+                        .{ method_for_log, decode_us, io_wait_us, dispatch_us },
+                    );
+                }
                 // If the notification queued a restart/connect, decide
                 // whether to break the inner loop NOW or wait for the
                 // natural channel close.

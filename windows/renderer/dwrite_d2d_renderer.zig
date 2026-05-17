@@ -3772,12 +3772,18 @@ fn detectLigTriggersFromGSUB(
     const feature_count = readU16BE(tbl, fl_abs) orelse return;
 
     // Determine which features are active.
-    // Default-on features: liga, calt, rlig (matching macOS HBFTBridge.c behavior)
+    // Default-on features: liga, calt, rlig, locl, ccmp (mirrors HarfBuzz defaults
+    // and macOS HBFTBridge.c). locl and ccmp can substitute ASCII glyphs in some
+    // fonts (e.g. locale-specific bracket forms) so we must mark their input
+    // glyphs as triggers to avoid divergent rendering between the ASCII fast
+    // path and HarfBuzz output.
     // Default-off features: clig, dlig, ss01-ss20, cv01-cv99, etc.
     // User features can override defaults (enable or disable).
     const ot_liga: u32 = 0x6C696761; // 'liga' big-endian
     const ot_calt: u32 = 0x63616C74; // 'calt' big-endian
     const ot_rlig: u32 = 0x726C6967; // 'rlig' big-endian
+    const ot_locl: u32 = 0x6C6F636C; // 'locl' big-endian
+    const ot_ccmp: u32 = 0x63636D70; // 'ccmp' big-endian
     // Collect lookup indices from active features
     // We use a bitset for lookup indices (max 65536 lookups, but typically <500)
     // Use a fixed-size array as a simple bitset (supports up to 4096 lookups)
@@ -3793,7 +3799,8 @@ fn detectLigTriggersFromGSUB(
         var active = false;
 
         // Check default-on features
-        if (tag_be == ot_liga or tag_be == ot_calt or tag_be == ot_rlig) {
+        if (tag_be == ot_liga or tag_be == ot_calt or tag_be == ot_rlig or
+            tag_be == ot_locl or tag_be == ot_ccmp) {
             active = true; // default on
         }
 

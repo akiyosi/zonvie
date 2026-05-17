@@ -393,6 +393,123 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
 }
 
 // ============================================================================
+// Unified single-pass shader for blur backgrounds via programmable blending
+// ============================================================================
+// Replaces the ps_background + ps_glyph 2-pass rendering. Tile memory access
+// via [[color(0), raster_order_group(0)]] lets the fragment shader read the
+// already-written pixel from the same render pass and do alpha blending in
+// shader code. With pipeline blend disabled (one, zero) the output is written
+// straight to the tile, matching the previous 2-pass result without doubling
+// fragment shader invocations from the discard pattern of two-pass overdraw.
+//
+// Vertex submission order (bg → underline → glyph → strike → overline) is
+// preserved by raster_order_group, so glyph/decoration fragments observe the
+// already-written background color when they read the tile.
+fragment float4 ps_unified_blur(VSOut in [[stage_in]],
+                                 float4 current [[color(0), raster_order_group(0)]],
+                                 texture2d<float> tex [[texture(0)]],
+                                 sampler samp [[sampler(0)]],
+                                 constant DrawableSize& drawableSize [[buffer(0)]],
+                                 constant float& backgroundAlpha [[buffer(1)]],
+                                 constant uint& cursorBlinkVisible [[buffer(2)]]) {
+    // ── Common discards (apply to every quad type) ─────────────────────
+    if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
+        discard_fragment();
+    }
+    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
+    if (in.was_content > 0.5) {
+        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
+            discard_fragment();
+        }
+    }
+
+    // ── Branch by quad type ─────────────────────────────────────────────
+    // - bg-only quad: uv.x < 0, no visual decoration, no glow flag
+    // - decoration quad: uv.x < 0, visual decoration flag set
+    // - glyph quad: uv.x >= 0 (atlas sample) — also catches glow quads that
+    //   carry an atlas UV
+    // - solid-color glow quad: glow flag set, treated as alpha-blended layer
+    bool is_bg = (in.uv.x < 0.0)
+                 && ((in.deco_flags & DECO_VISUAL_MASK) == 0)
+                 && ((in.deco_flags & DECO_GLOW) == 0);
+
+    if (is_bg) {
+        // Background path: overwrite tile with new bg color (matches the
+        // previous (one, zero) blend behavior of ps_background).
+        if (backgroundAlpha <= 0.0) {
+            // Same semantics as ps_background's discard: don't paint over
+            // the underlying NSVisualEffectView. Returning `current` keeps
+            // tile content untouched under our overwrite-blend pipeline.
+            return current;
+        }
+        if (backgroundAlpha >= 1.0) {
+            return float4(in.color.rgb, 1.0);
+        }
+        return float4(in.color.rgb, backgroundAlpha);
+    }
+
+    bool is_decoration = (in.uv.x < 0.0) && ((in.deco_flags & DECO_VISUAL_MASK) != 0);
+    if (is_decoration) {
+        // Compute the decoration's source color the same way ps_glyph does,
+        // then manually alpha-blend onto the already-written bg tile pixel.
+        float4 deco;
+        if (in.deco_flags & DECO_UNDERCURL) {
+            float wave_freq = 3.14159265 * 2.0;
+            float wave_amp = 0.35;
+            float cell_width = 8.0;
+            float wave_x = (in.position.x / cell_width) + in.deco_phase;
+            float wave_y = sin(wave_x * wave_freq) * wave_amp;
+            float local_y = in.uv.y;
+            float dist = abs(local_y - (0.5 + wave_y));
+            if (dist > 0.25) {
+                return current;  // outside the curve → preserve tile
+            }
+            float a = 1.0 - smoothstep(0.0, 0.25, dist);
+            deco = float4(in.color.rgb, in.color.a * a);
+        } else if (in.deco_flags & DECO_UNDERDOTTED) {
+            float x_mod = fmod(in.position.x, 4.0);
+            if (x_mod >= 2.0) {
+                return current;
+            }
+            deco = in.color;
+        } else if (in.deco_flags & DECO_UNDERDASHED) {
+            float x_mod = fmod(in.position.x, 8.0);
+            if (x_mod >= 5.0) {
+                return current;
+            }
+            deco = in.color;
+        } else if (in.deco_flags & DECO_UNDERDOUBLE) {
+            float local_y = in.uv.y;
+            float line_thickness = 0.15;
+            float dist1 = abs(local_y - 0.2);
+            float dist2 = abs(local_y - 0.8);
+            if (dist1 > line_thickness && dist2 > line_thickness) {
+                return current;
+            }
+            deco = in.color;
+        } else {
+            // solid line: underline / strikethrough / overline / cursor
+            deco = in.color;
+        }
+        float a = deco.a;
+        return float4(mix(current.rgb, deco.rgb, a), a + current.a * (1.0 - a));
+    }
+
+    // Glyph (or atlas-textured glow) quad: sample atlas, manual alpha blend.
+    float2 uv = in.uv;
+    float4 src;
+    if (in.deco_flags & DECO_COLOR_EMOJI) {
+        float4 emoji = tex.sample(samp, uv);
+        src = float4(emoji.rgb, emoji.a);
+    } else {
+        float cov = tex.sample(samp, uv).r;
+        src = float4(in.color.rgb, in.color.a * cov);
+    }
+    float a = src.a;
+    return float4(mix(current.rgb, src.rgb, a), a + current.a * (1.0 - a));
+}
+
+// ============================================================================
 // Fullscreen Quad Copy Shader (Blit Replacement)
 // ============================================================================
 // Used to copy backBuffer to drawable without MTLBlitCommandEncoder.
