@@ -842,11 +842,23 @@ pub fn shiftScrollCacheAndValidate(
         }
     }
 
-    // Check all non-regen rows have valid cache
+    // Check all non-regen rows have valid cache.
+    // regen_rows were unset in scroll_cache_valid above, so any row reported
+    // as valid here is by construction not a regen row — count it directly.
+    // Only invalid rows need a regen_rows membership check to distinguish an
+    // expected miss (regen) from a genuine cache miss (fast-path fail).
     var all_valid = true;
     var cached_emit_count: u32 = 0;
     var empty_emit_count: u32 = 0;
     for (0..total_rows) |ri| {
+        if (core.scroll_cache_valid.isSet(ri)) {
+            cached_emit_count += 1;
+            if (core.scroll_cache.items[ri].items.len == 0) {
+                empty_emit_count += 1;
+            }
+            continue;
+        }
+
         var is_regen = false;
         for (regen_rows) |rr| {
             if (rr == @as(u32, @intCast(ri))) {
@@ -854,15 +866,9 @@ pub fn shiftScrollCacheAndValidate(
                 break;
             }
         }
-        if (is_regen) continue;
-
-        if (!core.scroll_cache_valid.isSet(ri)) {
+        if (!is_regen) {
             all_valid = false;
             break;
-        }
-        cached_emit_count += 1;
-        if (core.scroll_cache.items[ri].items.len == 0) {
-            empty_emit_count += 1;
         }
     }
 
