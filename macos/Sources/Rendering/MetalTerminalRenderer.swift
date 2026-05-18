@@ -1758,9 +1758,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         expandStart = pendingScroll.rowStart
                         expandEnd = min(pendingScroll.rowEnd, pendingScroll.rowStart + 2 * shift)
                     }
-                    let dirtySet = Set(dirtyRows)
                     for row in expandStart..<expandEnd {
-                        if !dirtySet.contains(row) {
+                        if !dirtyRows.contains(row) {
                             dirtyRows.append(row)
                         }
                     }

@@ -1183,9 +1183,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         clearTopPx: scrollCopy.clearTopPx,
                         clearBottomPx: scrollCopy.clearBottomPx
                     )
-                    let dirtySet = Set(dirtyRows)
                     for row in scrollCopy.vacatedRowStart..<scrollCopy.vacatedRowEnd {
-                        if !dirtySet.contains(row) {
+                        if !dirtyRows.contains(row) {
                             dirtyRows.append(row)
                         }
                     }
