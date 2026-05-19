@@ -224,6 +224,12 @@ final class MetalTerminalView: MTKView {
                 ZonvieCore.appLog("[drawloop] activate: switching to continuous rendering")
                 self.isPaused = false
                 self.enableSetNeedsDisplay = false
+                // Kick a draw immediately. Without this, MTKView's internal
+                // CADisplayLink can take up to 1-2 vsyncs to start firing
+                // after isPaused flips, which lets several commits pile up
+                // and produces a multi-row "jump" on the first draw of a
+                // held-key scroll.
+                self.setNeedsDisplay(self.bounds)
             }
         }
     }
