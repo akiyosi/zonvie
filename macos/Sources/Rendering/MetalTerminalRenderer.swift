@@ -241,6 +241,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
     private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
+    // Tracks whether the most-recently-rendered frame had an active scroll
+    // offset. Used to extend smoothScrolling=true for one extra frame after
+    // the offset hits zero, mirroring ExternalGridView's
+    // wasScrollOffsetActiveInLastPresentedFrame. Without this, when
+    // processPendingScrollClears reduces offset to exactly 0 in a flush that
+    // also carried a grid_scroll (pendingScroll != nil), the next draw sees
+    // smoothScrolling=false + pendingScroll != nil and enters
+    // useGpuScrollCopy. The GPU blit then shifts the back buffer pixels that
+    // were rendered with a non-zero shader offset, producing a mixed-state
+    // frame visible as a 1-row jitter.
+    private var lastDrawnHadActiveScrollOffset: Bool = false // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var defaultBgRGB: UInt32 = 0               // Protected by lock
 
@@ -1368,6 +1379,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let dirtyRectPxOpt: CGRect?
             var dirtyRows: [Int]
             let smoothScrolling: Bool
+            // Raw value of hasActiveScrollOffset at snapshot time (NOT the
+            // combined smoothScrolling). Stored to lastDrawnHadActiveScrollOffset
+            // below so the one-frame extension does not self-latch.
+            let hadActiveScrollOffsetThisFrame: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
             let pendingScroll: SurfaceRowScroll?
             let rowLogicalToSlotSnapshot: [Int]
@@ -1387,7 +1402,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             dirtyRows = Array(pendingDirtyRows)
             pendingDirtyRectPx = nil
             pendingDirtyRows.removeAll()
-            smoothScrolling = hasActiveScrollOffset
+            // Extend smoothScrolling for one extra frame after the offset
+            // drops to zero so the back buffer (still holding pixels rendered
+            // with a non-zero shader offset) is replaced by a full redraw
+            // instead of being GPU-blitted by useGpuScrollCopy, which would
+            // shift those already-shifted pixels and produce a 1-row jitter
+            // for the frame where offset transitions to 0.
+            hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
+            smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
             // Use accumulated scroll delta (covers multiple flushes between draws)
             // instead of per-set pendingScroll which only has the last flush's delta.
@@ -1576,6 +1598,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision
             lastDrawnDrawableSize = view.drawableSize
+            // Record this frame's raw hasActiveScrollOffset (NOT the combined
+            // smoothScrolling) so the one-frame extension does not self-latch.
+            // Storing the combined value would keep smoothScrolling true
+            // forever after the first active frame, permanently disabling
+            // useGpuScrollCopy and the idle/skip paths.
+            lastDrawnHadActiveScrollOffset = hadActiveScrollOffsetThisFrame
 
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkState
