@@ -108,12 +108,8 @@ final class MetalTerminalView: MTKView {
     private var activeDrawIdleFrames: Int = 0
     private let activeDrawIdleThreshold = 15
 
-    // --- Input throttling to prevent event accumulation during slow rendering ---
-    private var pendingInput: String? = nil
-    private let inputLock = NSLock()
+    // DisplayLink drives msg_show throttle ticks and scrollbar viewport polling.
     private var displayLink: CVDisplayLink?
-    // Track if current key event is a repeat (for insertText to use)
-    private var currentKeyEventIsRepeat: Bool = false
     
     private func dirtyLog(_ msg: @autoclosure () -> String) {
         if Self.dirtyLogEnabled {
@@ -121,10 +117,9 @@ final class MetalTerminalView: MTKView {
         }
     }
 
-    // MARK: - Input Throttling (DisplayLink-based)
+    // MARK: - DisplayLink (msg throttle + scrollbar polling)
 
-    /// Start the display link for input throttling
-    private func startInputThrottling() {
+    private func startDisplayLink() {
         guard displayLink == nil else { return }
 
         var link: CVDisplayLink?
@@ -144,8 +139,7 @@ final class MetalTerminalView: MTKView {
         displayLink = link
     }
 
-    /// Stop the display link
-    private func stopInputThrottling() {
+    private func stopDisplayLink() {
         if let link = displayLink {
             CVDisplayLinkStop(link)
             displayLink = nil
@@ -154,14 +148,12 @@ final class MetalTerminalView: MTKView {
 
     /// Called by display link at screen refresh rate
     private func displayLinkFired() {
-        // Flush pending input on main thread
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // Skip all work when minimized: the Zig core's grid state
             // must not be queried while the window is in the Dock.
             if self.window?.isMiniaturized == true { return }
 
-            self.flushPendingInput()
             // Check msg_show throttle timeout (noice.nvim-style)
             self.core?.tickMsgThrottle()
             // Only poll viewport when a flush has occurred since last check.
@@ -184,42 +176,17 @@ final class MetalTerminalView: MTKView {
         ZonvieCore.appLog("[Scrollbar-debug] getViewport(1) = \(String(describing: vp))")
     }
 
-    /// Try to send input, respecting throttling for repeat events
-    private func trySendInput(_ text: String, isRepeat: Bool) -> Bool {
-        // For repeat events, queue and let display link flush when idle.
-        // This ensures input is only sent when rendering is complete,
-        // preventing accumulation when rendering is slow.
-        if isRepeat {
-            inputLock.lock()
-            pendingInput = text
-            inputLock.unlock()
-            // Keep draw loop active while input is queued
-            activeDrawIdleFrames = 0
-            return true
-        }
-
-        // Non-repeat: send immediately
+    /// Send committed text to Neovim immediately on the keyDown path.
+    /// Why: a prior design buffered repeats in a single-slot `pendingInput`
+    /// flushed by displayLink. That added 2-8ms of pre-send latency, which
+    /// gave Neovim a window to batch consecutive keystroke responses into
+    /// one flush (visible as "0-row frame, then 2-row jump" stutter during
+    /// held-`j` scrolling), and silently dropped extras when keys arrived
+    /// faster than vsync.
+    private func sendInputNow(_ text: String) {
         core?.sendInput(text)
+        // Keep the active draw loop alive so the response is drawn promptly.
         activeDrawIdleFrames = 0
-        return true
-    }
-
-    /// Flush pending input (called by display link)
-    /// Sends pending input immediately without waiting for redraw completion.
-    /// With fast rendering (~1.5ms), waiting for redraw adds unnecessary latency.
-    private func flushPendingInput() {
-        inputLock.lock()
-        let pending = pendingInput
-        pendingInput = nil
-        inputLock.unlock()
-
-        if let text = pending {
-            core?.sendInput(text)
-            // Keep draw loop active while input is being sent.
-            // Prevents deactivation during Neovim processing lag
-            // (input arrives faster than Neovim flushes responses).
-            activeDrawIdleFrames = 0
-        }
     }
 
     /// Called after actual drawing runs in MTKViewDelegate.draw(in:)
@@ -440,7 +407,7 @@ final class MetalTerminalView: MTKView {
 
         if window != nil {
             window?.acceptsMouseMovedEvents = true
-            startInputThrottling()
+            startDisplayLink()
 
             // Ensure layer transparency settings are applied after window is available
             if ZonvieConfig.shared.blurEnabled {
@@ -451,14 +418,14 @@ final class MetalTerminalView: MTKView {
                 self.layer?.backgroundColor = NSColor.black.cgColor
             }
         } else {
-            stopInputThrottling()
+            stopDisplayLink()
         }
     }
 
     deinit {
         scrollbarHideTimer?.invalidate()
         scrollbarHideTimer = nil
-        stopInputThrottling()
+        stopDisplayLink()
     }
 
     // MARK: - Mouse Input
@@ -1270,9 +1237,6 @@ final class MetalTerminalView: MTKView {
     override func keyDown(with event: NSEvent) {
         guard let core else { return }
 
-        // Track repeat status for input throttling in insertText
-        currentKeyEventIsRepeat = event.isARepeat
-
         let m = event.modifierFlags
 
         // Check if Option key should be treated as Meta (Alt) based on config.
@@ -1343,19 +1307,6 @@ final class MetalTerminalView: MTKView {
         ZonvieCore.appLog("[keyDown] -> interpretKeyEvents fallback")
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
-    }
-
-    override func keyUp(with event: NSEvent) {
-        // Clear any pending input when key is released.
-        // This prevents accumulated input from continuing after the user stops.
-        inputLock.lock()
-        let hadPending = pendingInput != nil
-        pendingInput = nil
-        inputLock.unlock()
-
-        if hadPending {
-            ZonvieCore.appLog("[keyUp] cleared pending input")
-        }
     }
 
     /// Returns true for special keycodes that should bypass IME.
@@ -1911,14 +1862,11 @@ extension MetalTerminalView: NSTextInputClient {
         markedRange_ = NSRange(location: NSNotFound, length: 0)
         hidePreeditOverlay()
 
-        // Send committed text to Neovim with frame-synchronized throttling.
-        // For repeat events during slow rendering, input may be queued or dropped.
-        let sent = trySendInput(text, isRepeat: currentKeyEventIsRepeat)
-        if !sent {
-            ZonvieCore.appLog("[IME] insertText: input dropped (rendering slow, already have pending)")
-        }
-        // Reset repeat flag
-        currentKeyEventIsRepeat = false
+        // Send committed text to Neovim immediately. Buffering this on the
+        // displayLink delayed input by 2-8ms and let Neovim batch consecutive
+        // keystrokes into one flush, producing a visible stutter when holding
+        // motions like `j`.
+        sendInputNow(text)
     }
 
     /// Called during IME composition to show uncommitted text.
