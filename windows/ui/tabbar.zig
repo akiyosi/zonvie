@@ -1495,10 +1495,18 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         const close_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, close_icon_color);
         const old_close_icon_pen = c.SelectObject(hdc, close_icon_pen);
         const close_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
-        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, close_icon_top, null);
-        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, close_icon_top + wbtn_icon_size);
-        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, close_icon_top, null);
-        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset, close_icon_top + wbtn_icon_size);
+        // GDI LineTo excludes the endpoint pixel. Extend each LineTo target by one
+        // step in the line direction so the visual diagonals fully cover the
+        // wbtn_icon_size_px x wbtn_icon_size_px square symmetrically (otherwise
+        // the bottom corners are clipped, making the bottom of the X look shorter).
+        const x_left = btn_x + wbtn_icon_inset;
+        const x_right_last = btn_x + wbtn_icon_inset + wbtn_icon_size - 1;
+        const y_top = close_icon_top;
+        const y_bottom_last = close_icon_top + wbtn_icon_size - 1;
+        _ = c.MoveToEx(hdc, x_left, y_top, null);
+        _ = c.LineTo(hdc, x_right_last + 1, y_bottom_last + 1);
+        _ = c.MoveToEx(hdc, x_right_last, y_top, null);
+        _ = c.LineTo(hdc, x_left - 1, y_bottom_last + 1);
         _ = c.SelectObject(hdc, old_close_icon_pen);
         _ = c.DeleteObject(close_icon_pen);
     }
