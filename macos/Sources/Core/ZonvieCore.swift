@@ -5551,6 +5551,39 @@ final class ZonvieCore {
 
     // MARK: - Mini View Display
 
+    /// Compute mini window size (width_pt, height_pt, line_count) for given content.
+    /// Width is the max line width plus horizontal padding, clamped to [50, maxWidth].
+    /// Height is cellHeightPt * line_count so multi-line msg_show content is fully visible.
+    private func miniWindowSize(
+        content: String,
+        font: NSFont,
+        maxWidth_pt: CGFloat,
+        cellHeight_pt: CGFloat
+    ) -> (width_pt: CGFloat, height_pt: CGFloat, lineCount: Int) {
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+        let lineCount = max(1, lines.count)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var maxLineWidth_pt: CGFloat = 0
+        for line in lines {
+            let w = (String(line) as NSString).size(withAttributes: attrs).width
+            if w > maxLineWidth_pt { maxLineWidth_pt = w }
+        }
+        let textWidth_pt = maxLineWidth_pt + 16
+        let width_pt = min(max(textWidth_pt, 50), maxWidth_pt)
+        let height_pt = cellHeight_pt * CGFloat(lineCount)
+        return (width_pt, height_pt, lineCount)
+    }
+
+    /// Configure an NSTextField label so explicit `\n` in stringValue produces
+    /// multiple visible lines. Must be called for both create and update paths.
+    private func configureMiniLabelForMultiline(_ label: NSTextField) {
+        label.usesSingleLineMode = false
+        label.maximumNumberOfLines = 0
+        label.lineBreakMode = .byClipping
+        label.cell?.wraps = true
+        label.cell?.isScrollable = false
+    }
+
     /// Update a mini window with new content
     /// - Parameters:
     ///   - miniId: The mini window identifier
@@ -5593,15 +5626,28 @@ final class ZonvieCore {
                 }
             }
 
-            // Resize to fit content (max width = parent window width)
+            // Resize to fit multi-line content (height grows with line count)
+            let scale = mainWindow.backingScaleFactor
+            let cellHeight_pt: CGFloat
+            if let renderer = terminalView?.renderer {
+                cellHeight_pt = CGFloat(renderer.cellHeightPx) / scale
+            } else {
+                cellHeight_pt = 18
+            }
             let font = label.font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-            let textWidth = (content as NSString).size(withAttributes: [.font: font]).width + 16
-            let maxWidth = mainWindow.frame.width
+            let size = miniWindowSize(
+                content: content,
+                font: font,
+                maxWidth_pt: mainWindow.frame.width,
+                cellHeight_pt: cellHeight_pt
+            )
             var frame = window.frame
-            frame.size.width = min(max(textWidth, 50), maxWidth)
+            frame.size.width = size.width_pt
+            frame.size.height = size.height_pt
             window.setFrame(frame, display: true)
 
-            // Ensure left alignment
+            // Ensure multi-line rendering and left alignment
+            configureMiniLabelForMultiline(label)
             label.alignment = .left
         } else {
             // Create new mini window
@@ -5647,13 +5693,14 @@ final class ZonvieCore {
         let fontSize = max(11, cellHeightPt * 0.75)
         let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
 
-        // Calculate content width (max = parent window width)
-        let textWidth = (content as NSString).size(withAttributes: [.font: font]).width + 16
-        let maxWidth = mainWindow.frame.width
-        let windowWidth = min(max(textWidth, 50), maxWidth)
-
-        // Window height = exactly 1 cell height (no margin)
-        let windowRect = NSRect(x: 0, y: 0, width: windowWidth, height: cellHeightPt)
+        // Window size = max line width + horizontal padding, height = cell_h * line_count
+        let size = miniWindowSize(
+            content: content,
+            font: font,
+            maxWidth_pt: mainWindow.frame.width,
+            cellHeight_pt: cellHeightPt
+        )
+        let windowRect = NSRect(x: 0, y: 0, width: size.width_pt, height: size.height_pt)
 
         let window = NSWindow(
             contentRect: windowRect,
@@ -5680,7 +5727,7 @@ final class ZonvieCore {
             containerView.layer?.backgroundColor = bgColor.withAlphaComponent(0.9).cgColor
         }
 
-        // Label (left-aligned in window)
+        // Label (left-aligned, multi-line capable so explicit \n shows all lines)
         let label = NSTextField(labelWithString: content)
         label.font = font
         label.textColor = fgColor
@@ -5688,13 +5735,15 @@ final class ZonvieCore {
         label.isBordered = false
         label.isEditable = false
         label.alignment = .left
+        configureMiniLabelForMultiline(label)
         label.translatesAutoresizingMaskIntoConstraints = false
         containerView.addSubview(label)
 
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: containerView.leadingAnchor, constant: 8),
             label.trailingAnchor.constraint(equalTo: containerView.trailingAnchor, constant: -8),
-            label.centerYAnchor.constraint(equalTo: containerView.centerYAnchor),
+            label.topAnchor.constraint(equalTo: containerView.topAnchor),
+            label.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
         ])
 
         window.contentView = containerView
@@ -5714,7 +5763,6 @@ final class ZonvieCore {
         let scale = mainWindow.backingScaleFactor
         let cellHeightPx = CGFloat(renderer.cellHeightPx)
         let cellWidthPx = CGFloat(renderer.cellWidthPx)
-        let cellHeightPt = cellHeightPx / scale
 
         let config = ZonvieConfig.shared
         let positionMode = config.messages.miniPos
@@ -5793,16 +5841,21 @@ final class ZonvieCore {
         // Build list of visible minis in stack order
         let visibleMinis = MiniWindowId.allCases.filter { miniWindows[$0]?.isVisible == true }
 
-        // Position each visible mini at bottom-right, stacking upward
-        for (stackIndex, miniId) in visibleMinis.enumerated() {
+        // Position each visible mini at bottom-right, stacking upward.
+        // Use each window's actual height so multi-line minis don't overlap.
+        var stackedHeight_pt: CGFloat = 0
+        for miniId in visibleMinis {
             guard let window = miniWindows[miniId]?.window else { continue }
 
             let windowWidth = window.frame.width
+            let windowHeight = window.frame.height
             let x = anchorX - windowWidth
-            let y = anchorY + (CGFloat(stackIndex) * cellHeightPt)
+            let y = anchorY + stackedHeight_pt
 
-            let newFrame = NSRect(x: x, y: y, width: windowWidth, height: cellHeightPt)
+            let newFrame = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
             window.setFrame(newFrame, display: true)
+
+            stackedHeight_pt += windowHeight
         }
     }
 

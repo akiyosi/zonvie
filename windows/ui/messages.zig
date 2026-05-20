@@ -612,7 +612,6 @@ pub fn updateExtFloatPositions(app: *App) void {
     app.mu.lock();
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
-    const linespace = app.linespace_px;
     const cursor_grid = app.last_cursor_grid;
     const pos_mode = app.config.messages.msg_pos.ext_float;
     const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
@@ -694,7 +693,8 @@ pub fn updateExtFloatPositions(app: *App) void {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
                                 grid_right_px = @intCast(end_col * cell_w);
-                                grid_bottom_px = @intCast(end_row * (cell_h + linespace));
+                                // cell_h already includes linespace; do NOT add linespace again.
+                                grid_bottom_px = @intCast(end_row * cell_h);
                                 break;
                             }
                         }
@@ -766,12 +766,13 @@ pub fn updateMiniWindows(app: *App) void {
     app.mu.lock();
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
-    const linespace = app.linespace_px;
     const mini_pos_mode = app.config.messages.msg_pos.mini;
     const cursor_grid = app.last_cursor_grid;
     app.mu.unlock();
 
-    const window_height: c_int = @intCast(cell_h); // Exactly 1 cell height (no margin)
+    // Per-mini window height is computed inside the loop below from line count,
+    // so multi-line msg_show content routed to mini view is fully visible.
+    const cell_h_i: c_int = @intCast(cell_h);
 
     // Calculate target rect based on position mode
     var anchor_x: c_int = 0;
@@ -848,7 +849,8 @@ pub fn updateMiniWindows(app: *App) void {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
                                 grid_right_px = @intCast(end_col * cell_w);
-                                grid_bottom_px = @intCast(end_row * (cell_h + linespace));
+                                // cell_h already includes linespace; do NOT add linespace again.
+                                grid_bottom_px = @intCast(end_row * cell_h);
                                 break;
                             }
                         }
@@ -861,7 +863,7 @@ pub fn updateMiniWindows(app: *App) void {
     }
 
     // Count visible minis and build stack order
-    var stack_index: usize = 0;
+    var stacked_height_px: c_int = 0;
     for (0..3) |idx| {
         app.mu.lock();
         const text_len = app.mini_windows[idx].text_len;
@@ -882,14 +884,31 @@ pub fn updateMiniWindows(app: *App) void {
 
         if (applog.isEnabled()) applog.appLog("[win] updateMiniWindows: idx={d} text=\"{s}\"\n", .{ idx, text_buf[0..text_len] });
 
-        // Calculate width based on text (use cell_w for DPI-aware char width + scaled padding)
-        const text_len_i: c_int = @intCast(text_len);
-        const text_width: c_int = text_len_i * @as(c_int, @intCast(cell_w)) + app.scalePx(16);
+        // Compute line count and longest-line byte length so multi-line messages
+        // are fully visible. UTF-8 '\n' (0x0A) is a single byte so byte-level counting works.
+        var line_count: usize = 1;
+        var max_line_bytes: usize = 0;
+        var line_start: usize = 0;
+        var i: usize = 0;
+        while (i < text_len) : (i += 1) {
+            if (text_buf[i] == '\n') {
+                const len = i - line_start;
+                if (len > max_line_bytes) max_line_bytes = len;
+                line_count += 1;
+                line_start = i + 1;
+            }
+        }
+        if (text_len - line_start > max_line_bytes) max_line_bytes = text_len - line_start;
+
+        // Width based on longest line, height grows with line count
+        const max_line_i: c_int = @intCast(max_line_bytes);
+        const text_width: c_int = max_line_i * @as(c_int, @intCast(cell_w)) + app.scalePx(16);
         const window_width: c_int = @max(app.scalePx(50), text_width);
+        const window_height: c_int = cell_h_i * @as(c_int, @intCast(line_count));
 
         // Position: right edge of target area, stacking upward from bottom
         const window_x = anchor_x - window_width;
-        const window_y = anchor_y - window_height - @as(c_int, @intCast(stack_index)) * window_height;
+        const window_y = anchor_y - window_height - stacked_height_px;
 
         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
             // Update existing window position and size
@@ -937,7 +956,7 @@ pub fn updateMiniWindows(app: *App) void {
             if (applog.isEnabled()) applog.appLog("[win] mini window created for idx={d}\n", .{idx});
         }
 
-        stack_index += 1;
+        stacked_height_px += window_height;
     }
 }
 
@@ -1170,7 +1189,9 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         .bottom = rect.bottom,
     };
 
-    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE);
+    // Multi-line: omit DT_SINGLELINE so '\n' breaks lines; DT_VCENTER is unsupported
+    // without DT_SINGLELINE, so use DT_TOP. Keep DT_CENTER for horizontal centering.
+    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, c.DT_CENTER | c.DT_TOP);
 
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
 }
