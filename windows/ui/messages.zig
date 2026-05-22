@@ -786,9 +786,11 @@ pub fn updateMiniWindows(app: *App) void {
     else
         app.last_cursor_grid;
 
-    // Per-mini window height is computed inside the loop below from line count,
-    // so multi-line msg_show content routed to mini view is fully visible.
-    const cell_h_i: c_int = @intCast(cell_h);
+    // Mini-specific cell dimensions: ~75% of the editor cell so the popup
+    // looks visibly "mini" (matches macOS, which uses cellHeightPt * 0.75 for
+    // the mini font size). Floors keep the popup legible at small DPI.
+    const mini_cell_h_i: c_int = @max(@as(c_int, 12), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
+    const mini_cell_w_i: c_int = @max(@as(c_int, 6), @as(c_int, @intCast(@divTrunc(cell_w * 3, 4))));
 
     // Calculate target rect based on position mode
     var anchor_x: c_int = 0;
@@ -916,11 +918,13 @@ pub fn updateMiniWindows(app: *App) void {
         }
         if (text_len - line_start > max_line_bytes) max_line_bytes = text_len - line_start;
 
-        // Width based on longest line, height grows with line count
+        // Width based on longest line, height grows with line count.
+        // Use mini-cell metrics so the popup is visibly smaller than the
+        // editor (and than ext_float windows that use full cell metrics).
         const max_line_i: c_int = @intCast(max_line_bytes);
-        const text_width: c_int = max_line_i * @as(c_int, @intCast(cell_w)) + app.scalePx(16);
-        const window_width: c_int = @max(app.scalePx(50), text_width);
-        const window_height: c_int = cell_h_i * @as(c_int, @intCast(line_count));
+        const text_width: c_int = max_line_i * mini_cell_w_i + app.scalePx(12);
+        const window_width: c_int = @max(app.scalePx(40), text_width);
+        const window_height: c_int = mini_cell_h_i * @as(c_int, @intCast(line_count));
 
         // Position: right edge of target area, stacking upward from bottom
         const window_x = anchor_x - window_width;
@@ -1157,9 +1161,11 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.FillRect(hdc, &rect, bg_brush);
     _ = c.DeleteObject(bg_brush);
 
-    // Create font
+    // Create font at ~75% of the editor cell height so the mini popup is
+    // visibly smaller than the editor and the ext_float window. Matches the
+    // macOS mini font size (cellHeightPt * 0.75). Floor at 11 px for legibility.
     const cell_h = app.cell_h_px;
-    const font_height: c_int = @intCast(cell_h);
+    const font_height: c_int = @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
     const hfont = c.CreateFontW(
         font_height,
         0,

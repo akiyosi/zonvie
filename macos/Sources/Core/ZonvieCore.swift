@@ -5552,13 +5552,16 @@ final class ZonvieCore {
     // MARK: - Mini View Display
 
     /// Compute mini window size (width_pt, height_pt, line_count) for given content.
-    /// Width is the max line width plus horizontal padding, clamped to [50, maxWidth].
-    /// Height is cellHeightPt * line_count so multi-line msg_show content is fully visible.
+    /// Width is the max line width plus horizontal padding, clamped to [40, maxWidth].
+    /// Height wraps tightly around the font's actual rendered line metrics so the
+    /// popup looks visibly "mini". NSFont.pointSize is a typographic em (not a
+    /// pixel height), so using cellHeightPt * 0.75 directly leaves enough vertical
+    /// gap to make the popup look full-sized — derive the box height from the
+    /// font's ascender/descender/leading instead.
     private func miniWindowSize(
         content: String,
         font: NSFont,
-        maxWidth_pt: CGFloat,
-        cellHeight_pt: CGFloat
+        maxWidth_pt: CGFloat
     ) -> (width_pt: CGFloat, height_pt: CGFloat, lineCount: Int) {
         let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
         let lineCount = max(1, lines.count)
@@ -5568,9 +5571,12 @@ final class ZonvieCore {
             let w = (String(line) as NSString).size(withAttributes: attrs).width
             if w > maxLineWidth_pt { maxLineWidth_pt = w }
         }
-        let textWidth_pt = maxLineWidth_pt + 16
-        let width_pt = min(max(textWidth_pt, 50), maxWidth_pt)
-        let height_pt = cellHeight_pt * CGFloat(lineCount)
+        let textWidth_pt = maxLineWidth_pt + 12
+        let width_pt = min(max(textWidth_pt, 40), maxWidth_pt)
+        // Font's actual rendered line height + small vertical padding.
+        let fontLineHeight_pt = ceil(font.ascender + abs(font.descender) + font.leading)
+        let lineHeight_pt = fontLineHeight_pt + 2
+        let height_pt = lineHeight_pt * CGFloat(lineCount)
         return (width_pt, height_pt, lineCount)
     }
 
@@ -5627,19 +5633,11 @@ final class ZonvieCore {
             }
 
             // Resize to fit multi-line content (height grows with line count)
-            let scale = mainWindow.backingScaleFactor
-            let cellHeight_pt: CGFloat
-            if let renderer = terminalView?.renderer {
-                cellHeight_pt = CGFloat(renderer.cellHeightPx) / scale
-            } else {
-                cellHeight_pt = 18
-            }
             let font = label.font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             let size = miniWindowSize(
                 content: content,
                 font: font,
-                maxWidth_pt: mainWindow.frame.width,
-                cellHeight_pt: cellHeight_pt
+                maxWidth_pt: mainWindow.frame.width
             )
             var frame = window.frame
             frame.size.width = size.width_pt
@@ -5689,16 +5687,17 @@ final class ZonvieCore {
             cellHeightPt = 18
         }
 
-        // Font size based on cell height
-        let fontSize = max(11, cellHeightPt * 0.75)
+        // Mini font is noticeably smaller than the editor font. Use ~60% of
+        // the editor cell height (NSFont.pointSize is a typographic em — a
+        // gentler ratio like 0.75 still renders close to the editor row).
+        let fontSize = max(10, cellHeightPt * 0.6)
         let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
 
-        // Window size = max line width + horizontal padding, height = cell_h * line_count
+        // Window box wraps tightly around the font's actual rendered metrics.
         let size = miniWindowSize(
             content: content,
             font: font,
-            maxWidth_pt: mainWindow.frame.width,
-            cellHeight_pt: cellHeightPt
+            maxWidth_pt: mainWindow.frame.width
         )
         let windowRect = NSRect(x: 0, y: 0, width: size.width_pt, height: size.height_pt)
 
