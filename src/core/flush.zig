@@ -6732,6 +6732,32 @@ pub fn sendMsgShow(self: *Core) void {
         _ = self.grid.external_grids.fetchRemove(msg_grid_id);
         self.msg_show_auto_hide_at = null; // prevent stale timer
     }
+
+    // Drop transient messages from the array so they don't pile up across
+    // subsequent sendMsgShow calls. ext_float-routed messages stay because
+    // renderMsgGridFromCache re-renders from the array on each sendMsgShow;
+    // mini/notification/split routes are fire-and-forget (the frontend or
+    // Neovim takes ownership of display once the callback fires).
+    //
+    // Without this, a later accumulating msg_show (e.g. kind=list_cmd from
+    // `:history`) would skip the addMsgShow clear-on-non-accumulating path
+    // and combine its content with stale mini-routed messages in the same
+    // split window.
+    var i: usize = 0;
+    while (i < self.grid.message_state.messages.items.len) {
+        const m = self.grid.message_state.messages.items[i];
+        const r = self.msg_config.routeMessage(.msg_show, m.kind, total_line_count);
+        const is_transient = switch (r.view) {
+            .mini, .notification, .split => true,
+            else => false,
+        };
+        if (is_transient) {
+            var removed = self.grid.message_state.messages.orderedRemove(i);
+            removed.deinit(self.alloc);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Build line cache from current messages (called once when messages change).
