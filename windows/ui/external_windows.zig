@@ -1299,6 +1299,22 @@ pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_cursor_grid_changed: grid_id={d}\n", .{grid_id});
 
+    // Update last_cursor_grid synchronously so position calculations done by
+    // other posted messages (e.g. WM_APP_MSG_SHOW -> updateMiniWindows) see
+    // the new value even if those messages are processed by the UI thread
+    // before WM_APP_CURSOR_GRID_CHANGED. Without this, a typical
+    // `:echo` from cmdline produces this race:
+    //   1. cmdline_hide moves cursor from grid -100 (cmdline) to grid 2
+    //   2. msg_show fires on_msg_show -> Windows posts WM_APP_MSG_SHOW
+    //   3. UI thread runs WM_APP_MSG_SHOW -> updateMiniWindows reads
+    //      app.last_cursor_grid (still -100) -> anchors mini to the
+    //      closing cmdline ext_win's rect
+    //   4. on_cursor_grid_changed fires -> posts WM_APP_CURSOR_GRID_CHANGED
+    //   5. UI thread updates app.last_cursor_grid = 2 (too late)
+    app.mu.lock();
+    app.last_cursor_grid = grid_id;
+    app.mu.unlock();
+
     // Post message to UI thread to handle window activation
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_CURSOR_GRID_CHANGED, @bitCast(grid_id), 0);

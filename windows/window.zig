@@ -2503,22 +2503,14 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 const grid_id: i64 = @bitCast(wParam);
 
+                // app.last_cursor_grid is already updated synchronously by
+                // onCursorGridChanged (the core callback), so we only fetch
+                // ext_hwnd here. The core fires this callback only when the
+                // cursor grid actually changes, so no is_grid_change guard
+                // is needed in the UI handler.
                 app.mu.lock();
-                const last_grid = app.last_cursor_grid;
                 const ext_hwnd = if (app.external_windows.get(grid_id)) |ext_win| ext_win.hwnd else null;
-
-                // Check if this is actually a grid change (not just same grid)
-                const is_grid_change = (last_grid != grid_id);
-
-                // Update last cursor grid
-                app.last_cursor_grid = grid_id;
                 app.mu.unlock();
-
-                // Only activate windows on actual grid changes
-                if (!is_grid_change) {
-                    if (applog.isEnabled()) applog.appLog("[win] cursor stayed on same grid_id={d}, no activation change\n", .{grid_id});
-                    return 0;
-                }
 
                 if (ext_hwnd) |eh| {
                     // Cursor moved to external grid - activate that window

@@ -608,11 +608,17 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
 pub fn updateExtFloatPositions(app: *App) void {
     const main_hwnd = app.hwnd orelse return;
 
+    // Query core for the live cursor grid (avoids stale app.last_cursor_grid;
+    // see updateMiniWindows for the race rationale).
+    const cursor_grid: i64 = if (app.corep) |cp|
+        app_mod.zonvie_core_get_cursor_position(cp, null, null)
+    else
+        app.last_cursor_grid;
+
     // Get data while mutex is locked
     app.mu.lock();
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
-    const cursor_grid = app.last_cursor_grid;
     const pos_mode = app.config.messages.msg_pos.ext_float;
     const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
     const msg_show_entry = app.external_windows.getPtr(app_mod.MESSAGE_GRID_ID);
@@ -767,8 +773,18 @@ pub fn updateMiniWindows(app: *App) void {
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
     const mini_pos_mode = app.config.messages.msg_pos.mini;
-    const cursor_grid = app.last_cursor_grid;
     app.mu.unlock();
+
+    // Query the core directly for the current cursor grid instead of reading
+    // the cached app.last_cursor_grid. The cache is updated only via posted
+    // messages, so when updateMiniWindows runs from WM_APP_MSG_SHOW (posted
+    // earlier in the same flush than on_cursor_grid_changed fires), the cache
+    // can still point at the previous grid (e.g. a closing cmdline at -100)
+    // and anchor the mini to the wrong screen rect.
+    const cursor_grid: i64 = if (app.corep) |corep|
+        app_mod.zonvie_core_get_cursor_position(corep, null, null)
+    else
+        app.last_cursor_grid;
 
     // Per-mini window height is computed inside the loop below from line count,
     // so multi-line msg_show content routed to mini view is fully visible.
