@@ -3,6 +3,10 @@ import Metal
 import MetalKit
 import simd
 
+// MTLCommandBuffer rule: any command buffer created via queue.makeCommandBuffer()
+// MUST be committed before being dropped. Uncommitted command buffers leak
+// IOAccelerator GPU memory regions that the kernel never reclaims (observable
+// as growing phys_footprint under flush bursts).
 final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let queue: MTLCommandQueue

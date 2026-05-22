@@ -964,6 +964,7 @@ final class GlyphAtlas {
             mipmapped: false
         )
         desc.usage = [.shaderRead, .shaderWrite]
+        // .shared (not .managed): avoids Metal internal dirty-region tracking overhead on Apple Silicon.
         desc.storageMode = .shared
         guard let tex = device.makeTexture(descriptor: desc) else {
             ZonvieCore.appLog("[GlyphAtlas] Failed to create atlas texture (\(w)x\(h))")
