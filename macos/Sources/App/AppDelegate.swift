@@ -63,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // App menu (About, Quit)
         let appMenuItem = NSMenuItem(title: "zonvie", action: nil, keyEquivalent: "")
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About zonvie", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About zonvie", action: #selector(showAboutPanel), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit zonvie", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
@@ -83,6 +83,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         NSApp.mainMenu = mainMenu
+    }
+
+    // Show the standard About panel, but source the version from the Zig core
+    // (git describe) instead of the static Info.plist CFBundleShortVersionString.
+    // .version is left empty so the parenthetical build number is suppressed.
+    @objc private func showAboutPanel() {
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationVersion: ZonvieCore.version(),
+            .version: "",
+        ])
     }
 
     // Deferred tab menu setup (needs ViewController)

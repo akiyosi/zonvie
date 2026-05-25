@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
 const shader_compiler = @import("shader_compiler.zig");
@@ -737,6 +738,13 @@ pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: u
 
 pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
     return @intCast(std.time.nanoTimestamp());
+}
+
+// Build-time version string from `git describe`, null-terminated for C.
+const version_cstr: [*:0]const u8 = std.fmt.comptimePrint("{s}", .{build_options.version});
+
+pub export fn zonvie_version() callconv(.c) [*:0]const u8 {
+    return version_cstr;
 }
 
 pub export fn zonvie_core_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: i64) callconv(.c) void {

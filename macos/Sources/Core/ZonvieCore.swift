@@ -2722,6 +2722,11 @@ final class ZonvieCore {
         return exitCode
     }
 
+    // Build-time version string from the Zig core (git describe).
+    static func version() -> String {
+        return String(cString: zonvie_version())
+    }
+
     private func onExitFromNvim(exitCode: Int32) {
         ZonvieCore.exitCode = exitCode
         Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode), exiting now")

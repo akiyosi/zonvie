@@ -1,5 +1,22 @@
 const std = @import("std");
 
+// Resolve the build-time version string from git. Returns the output of
+// `git describe --tags --always --dirty` (e.g. "v0.3.21", "v0.3.21-9-g4eb0177",
+// or "v0.3.21-dirty"). Falls back to "0.0.0-unknown" when git is unavailable
+// (e.g. a shallow CI checkout with no tags, or a source tarball without .git).
+fn gitVersion(b: *std.Build) []const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "describe", "--tags", "--always", "--dirty" },
+        .cwd = b.build_root.path,
+    }) catch return "0.0.0-unknown";
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return "0.0.0-unknown",
+        else => return "0.0.0-unknown",
+    }
+    return std.mem.trim(u8, result.stdout, " \t\r\n");
+}
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -36,6 +53,12 @@ pub fn build(b: *std.Build) !void {
         .optimize = shader_dep_optimize,
     });
 
+    // Build-time options module. Carries the git-derived version string,
+    // consumed by c_api.zig to back zonvie_version(). createModule() is called
+    // per consumer so each gets its own import of the same option set.
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "version", gitVersion(b));
+
     const core_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -43,6 +66,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/core/c_api.zig"),
         .imports = &.{
             .{ .name = "toml", .module = zig_toml.module("toml") },
+            .{ .name = "build_options", .module = build_opts.createModule() },
         },
     });
 
@@ -338,6 +362,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/core/c_api.zig"),
         .imports = &.{
             .{ .name = "toml", .module = zig_toml.module("toml") },
+            .{ .name = "build_options", .module = build_opts.createModule() },
         },
     });
     const bench_mod = b.createModule(.{

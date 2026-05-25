@@ -113,19 +113,17 @@ extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.w
 // causing intermittent 10-16ms stalls in glyph rasterization during flush.
 extern "winmm" fn timeBeginPeriod(uPeriod: c.UINT) callconv(.winapi) c.UINT;
 
+const ATTACH_PARENT_PROCESS: c.DWORD = 0xFFFFFFFF;
+
 pub fn main() u8 {
     // Enable Per-Monitor DPI Awareness V2 before any window creation.
-    // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
+    // Must run before the askpass branch below, which creates a password
+    // dialog and exits — otherwise that dialog renders DPI-unaware (blurry).
     _ = SetProcessDpiAwarenessContext(@ptrFromInt(@as(usize, @bitCast(@as(isize, -4)))));
-
-    // Reduce Windows scheduler quantum to 1ms for responsive rendering.
-    // DWrite glyph rasterization makes COM calls that can yield the thread;
-    // default 15.6ms quantum causes 10-16ms stalls when preempted.
-    _ = timeBeginPeriod(1);
 
     // Check for askpass mode via environment variable (SSH_ASKPASS helper)
     // SSH calls the program specified in SSH_ASKPASS, so we detect mode via env var
-    const ATTACH_PARENT_PROCESS: c.DWORD = 0xFFFFFFFF;
     var askpass_mode_buf: [8]u8 = undefined;
     const askpass_mode_len = c.GetEnvironmentVariableA("ZONVIE_ASKPASS_MODE", &askpass_mode_buf, askpass_mode_buf.len);
     if (askpass_mode_len > 0) {
@@ -214,6 +212,11 @@ pub fn main() u8 {
         }
         return 0; // Exit immediately
     }
+
+    // Reduce Windows scheduler quantum to 1ms for responsive rendering.
+    // DWrite glyph rasterization makes COM calls that can yield the thread;
+    // default 15.6ms quantum causes 10-16ms stalls when preempted.
+    _ = timeBeginPeriod(1);
 
     // Initialize startup timing
     _ = c.QueryPerformanceFrequency(&app_mod.g_startup_freq);
@@ -313,6 +316,7 @@ pub fn main() u8 {
                     \\                                    Mutually exclusive with --ssh / --devcontainer / --wsl.
                     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
                     \\    --install                     First-launch setup (icon + default config) and exit
+                    \\    --version                     Show version information and exit
                     \\    --help, -h                    Show this help message and exit
                     \\    --                            Pass all remaining arguments to nvim
                     \\
@@ -398,6 +402,20 @@ pub fn main() u8 {
                 }
             }
             return if (has_error) 1 else 0;
+        }
+        if (std.mem.eql(u8, arg, "--version")) {
+            _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
+            const stdout = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
+            if (stdout != c.INVALID_HANDLE_VALUE) {
+                const ver = std.mem.span(app_mod.zonvie_version());
+                var written: c.DWORD = 0;
+                const prefix = "zonvie ";
+                _ = c.WriteFile(stdout, prefix.ptr, prefix.len, &written, null);
+                _ = c.WriteFile(stdout, ver.ptr, @intCast(ver.len), &written, null);
+                const nl = "\r\n";
+                _ = c.WriteFile(stdout, nl.ptr, nl.len, &written, null);
+            }
+            return 0;
         }
     }
 

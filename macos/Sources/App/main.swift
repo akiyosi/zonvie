@@ -59,7 +59,7 @@ do {
         if arg == "--nofork" || arg == "--help" || arg == "-h" ||
            arg == "--extcmdline" || arg == "--extpopup" || arg == "--extpopupmenu" ||
            arg == "--extmessages" || arg == "--exttabline" || arg == "--extwindows" ||
-           arg == "--devcontainer-rebuild" || arg == "--install" {
+           arg == "--devcontainer-rebuild" || arg == "--install" || arg == "--version" {
             // Skip this argument (it's zonvie-specific)
             i += 1
         } else if arg == "--nvim" {
@@ -166,6 +166,7 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
                                             Mutually exclusive with --ssh / --devcontainer.
             --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
             --install                     Create default config file and exit
+            --version                     Show version information and exit
             --help, -h                    Show this help message and exit
             --                            Pass all remaining arguments to nvim
 
@@ -220,6 +221,13 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
         For more information, visit: https://github.com/akiyosi/zonvie
         """
     print(help)
+    exit(0)
+}
+
+// Handle --version before fork (so output goes to terminal). Use zonvieArgs so
+// `zonvie -- --version` forwards the token to nvim instead of printing here.
+if zonvieArgs.contains("--version") {
+    print("zonvie \(ZonvieCore.version())")
     exit(0)
 }
 

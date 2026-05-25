@@ -395,6 +395,15 @@ const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
 const WM_APP_SNAP_MAIN_WINDOW = app_mod.WM_APP_SNAP_MAIN_WINDOW;
 const WM_APP_THEME_REREAD = app_mod.WM_APP_THEME_REREAD;
 
+// System-menu command id for the "About zonvie" item. Must be < 0xF000 and
+// is matched via (wParam & 0xFFF0) in WM_SYSCOMMAND (the OS reserves the low
+// 4 bits), so keep it aligned to 16.
+const IDM_ABOUT: usize = 0x0010;
+// Hoisted to file scope so the comptime UTF-16 conversion is instantiated once
+// here rather than inside WndProc (whose cumulative comptime branch budget is
+// already near the default quota).
+const about_title_w = std.unicode.utf8ToUtf16LeStringLiteral("About zonvie");
+
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
 const TIMER_MINI_AUTOHIDE = app_mod.TIMER_MINI_AUTOHIDE;
@@ -829,6 +838,57 @@ pub export fn WndProc(
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
+        // Custom-titlebar mode: right-click on the empty caption area (the
+        // tabbar space not occupied by tabs/buttons, which WM_NCHITTEST maps
+        // to HTCAPTION) pops the window's system menu — including the
+        // "About zonvie" item appended in WM_CREATE. Without this, the custom
+        // titlebar has no standard frame for the OS to attach that menu to.
+        c.WM_NCRBUTTONUP => {
+            if (getApp(hwnd)) |app| {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and wParam == c.HTCAPTION) {
+                    if (c.GetSystemMenu(hwnd, 0)) |sysmenu| {
+                        // lParam holds screen coordinates for non-client clicks.
+                        const sx = @as(i16, @truncate(lParam & 0xFFFF));
+                        const sy = @as(i16, @truncate((lParam >> 16) & 0xFFFF));
+                        const cmd = c.TrackPopupMenu(
+                            sysmenu,
+                            c.TPM_RETURNCMD | c.TPM_RIGHTBUTTON,
+                            @as(c_int, sx),
+                            @as(c_int, sy),
+                            0,
+                            hwnd,
+                            null,
+                        );
+                        if (cmd != 0) {
+                            // Route through WM_SYSCOMMAND so both IDM_ABOUT and
+                            // the standard verbs (Move/Size/Close/...) are handled.
+                            _ = c.PostMessageW(hwnd, c.WM_SYSCOMMAND, @as(c.WPARAM, @intCast(cmd)), 0);
+                        }
+                    }
+                    return 0;
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
+        c.WM_SYSCOMMAND => {
+            // The OS reserves the low 4 bits of the command id, so mask them.
+            if ((wParam & 0xFFF0) == IDM_ABOUT) {
+                const ver = std.mem.span(app_mod.zonvie_version());
+                var buf: [256]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "zonvie\n\nVersion {s}", .{ver}) catch "zonvie";
+                // 257 elements: convert into the first 256 so wlen <= 256,
+                // leaving wbuf[wlen] in range for the NUL terminator even when
+                // a long tag fills `text` to its full 256 bytes.
+                var wbuf: [257]u16 = undefined;
+                const wlen = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], text) catch 0;
+                wbuf[wlen] = 0;
+                _ = c.MessageBoxW(hwnd, &wbuf, about_title_w, c.MB_OK | c.MB_ICONINFORMATION);
+                return 0;
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
         c.WM_CREATE => {
             // Debug builds no longer force logging on by default.
             // Use --log <path> or [log] config to enable.
@@ -849,6 +909,13 @@ pub export fn WndProc(
 
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
+
+                // Add "About zonvie" to the window's system menu (title-bar
+                // right-click / Alt+Space). Handled in WM_SYSCOMMAND below.
+                if (c.GetSystemMenu(hwnd, 0)) |sysmenu| {
+                    _ = c.AppendMenuW(sysmenu, c.MF_SEPARATOR, 0, null);
+                    _ = c.AppendMenuW(sysmenu, c.MF_STRING, IDM_ABOUT, about_title_w);
+                }
 
                 // Apply the OS app-theme preference to the DWM titlebar so the
                 // very first frame matches the user's light/dark choice.

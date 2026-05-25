@@ -24,6 +24,10 @@ jobs:
             runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` in build.zig can
+          # resolve the version string baked into the binary.
+          fetch-depth: 0
 
       - name: Install dependencies (Homebrew)
         run: brew install freetype harfbuzz
@@ -79,6 +83,10 @@ jobs:
             target: aarch64-windows-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` in build.zig can
+          # resolve the version string baked into the binary.
+          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

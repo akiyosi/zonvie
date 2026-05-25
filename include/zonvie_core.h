@@ -896,6 +896,11 @@ void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int le
 /* Timestamp helper for perf-log correlation across frontend/core stages. */
 ZONVIE_API int64_t zonvie_core_perf_now_ns(void);
 
+/* Build-time version string (from `git describe`), e.g. "v0.3.21" or
+   "v0.3.21-9-g4eb0177". The returned pointer is static and null-terminated;
+   never null. Not tied to a core instance. */
+ZONVIE_API const char *zonvie_version(void);
+
 /* Record the latest frontend input trace marker for redraw/flush correlation. */
 ZONVIE_API void zonvie_core_note_input_trace(
     zonvie_core *core,
