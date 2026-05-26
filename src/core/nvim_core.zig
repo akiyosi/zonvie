@@ -725,6 +725,12 @@ pub const Core = struct {
     // cross-thread reads from the frontend UI thread.
     option_as_meta: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
+    // IME preedit-via-extmark state. Written from the frontend UI thread (IME
+    // composition callbacks) and also from the RPC thread (resetSessionState
+    // on :restart/:connect), so these are atomic.
+    preedit_setup_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // hl groups defined
+    preedit_visible: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // an inline preedit extmark is set
+
     // RPC channel ID (extracted from nvim_get_api_info response)
     channel_id: ?i64 = null,
     get_api_info_msgid: ?i64 = null,
@@ -903,6 +909,11 @@ pub const Core = struct {
 
         // Channel-bound state.
         self.clipboard_setup_done = false;
+
+        // Preedit highlight groups and namespace live in the dead session;
+        // re-define them and re-place the extmark on the next composition.
+        self.preedit_setup_done.store(false, .monotonic);
+        self.preedit_visible.store(false, .monotonic);
 
         // In-flight RPC IDs from the dead channel — drop tracking so any
         // stale response from the new server (very unlikely; new msgid
@@ -3198,6 +3209,158 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_exec_lua with arg (id={d})\n", .{id});
+    }
+
+    // --- IME preedit via inline virt_text extmark --------------------------
+    //
+    // These run on the frontend UI thread from the platform IME composition
+    // callbacks (macOS setMarkedText / Windows WM_IME_COMPOSITION), the same
+    // thread that already calls sendInput, so sendRaw is safe to use here.
+
+    /// Define the preedit highlight groups once. `default = true` lets a user
+    /// colorscheme override them. ZonviePreedit is the normal (unconverted)
+    /// clause; ZonviePreeditTarget marks the clause currently being converted
+    /// (the IME's focused/selected clause), drawn with a bold double underline
+    /// plus a lightened selection background (Visual blended toward Normal) so
+    /// the converting clause stands out.
+    fn ensurePreeditSetup(self: *Core) void {
+        if (self.preedit_setup_done.load(.monotonic)) return;
+        self.preedit_setup_done.store(true, .monotonic);
+        self.requestExecLua(
+            \\vim.api.nvim_set_hl(0, "ZonviePreedit", { underline = true, default = true })
+            \\local function rgb(c) return math.floor(c / 65536) % 256, math.floor(c / 256) % 256, c % 256 end
+            \\local function blend(c1, c2, t)
+            \\  local r1, g1, b1 = rgb(c1)
+            \\  local r2, g2, b2 = rgb(c2)
+            \\  return math.floor(r1 * t + r2 * (1 - t) + 0.5) * 65536
+            \\    + math.floor(g1 * t + g2 * (1 - t) + 0.5) * 256
+            \\    + math.floor(b1 * t + b2 * (1 - t) + 0.5)
+            \\end
+            \\local hl = { underdouble = true, bold = true, default = true }
+            \\local ok_v, vis = pcall(vim.api.nvim_get_hl, 0, { name = "Visual", link = false })
+            \\local visbg = ok_v and vis.bg or nil
+            \\if visbg then
+            \\  -- Lighten the selection color toward the editor background. When
+            \\  -- Normal has no explicit bg (transparent setups), fall back to
+            \\  -- black/white per &background so a color is still produced.
+            \\  local ok_n, nor = pcall(vim.api.nvim_get_hl, 0, { name = "Normal", link = false })
+            \\  local base = (vim.o.background == "light") and 0xffffff or 0x000000
+            \\  local norbg = (ok_n and nor.bg) or base
+            \\  hl.bg = string.format("#%06x", blend(visbg, norbg, 0.5))
+            \\end
+            \\vim.api.nvim_set_hl(0, "ZonviePreeditTarget", hl)
+        ) catch {};
+    }
+
+    /// Delete the inline preedit extmark from the buffer it was last placed in
+    /// (recorded in vim.g.zonvie_preedit_buf), so a buffer/focus change during
+    /// composition cannot leave a stale extmark behind.
+    fn clearPreeditExtmark(self: *Core) void {
+        self.requestExecLua(
+            \\local ns = vim.api.nvim_create_namespace("zonvie_preedit")
+            \\local b = vim.g.zonvie_preedit_buf
+            \\if b and vim.api.nvim_buf_is_valid(b) then
+            \\  vim.api.nvim_buf_clear_namespace(b, ns, 0, -1)
+            \\end
+            \\vim.g.zonvie_preedit_buf = nil
+        ) catch {};
+    }
+
+    /// Set/update the IME preedit display as an inline virt_text extmark at the
+    /// cursor. Returns true when the preedit was placed via extmark (the
+    /// frontend should hide its overlay); false when the frontend should draw
+    /// the preedit itself — extmark mode disabled, or not in an insert/replace
+    /// mode where an inline buffer extmark makes sense (cmdline, terminal, ...).
+    ///
+    /// target_start/target_end are UTF-8 byte offsets into `text` marking the
+    /// clause currently being converted (the IME's focused clause), highlighted
+    /// with ZonviePreeditTarget. When target_start >= target_end the whole
+    /// preedit uses the normal ZonviePreedit group.
+    pub fn setPreedit(self: *Core, text: []const u8, target_start: usize, target_end: usize) bool {
+        if (self.msg_config.ime.preedit_mode != .extmark) return false;
+
+        // Read the current mode under grid_mu, but keep the critical section
+        // tiny: never send RPC (alloc + write-queue lock + possible blocking
+        // write) while holding grid_mu, which is shared with the redraw thread.
+        var editing = false;
+        {
+            self.grid_mu.lock();
+            defer self.grid_mu.unlock();
+            const mode = std.mem.sliceTo(&self.grid.current_mode_name, 0);
+            editing = std.mem.startsWith(u8, mode, "insert") or
+                std.mem.startsWith(u8, mode, "replace");
+        }
+
+        if (!editing) {
+            // Outside insert/replace (cmdline, terminal, ...): the frontend
+            // draws the overlay. Drop any stale extmark from a previous
+            // insert-mode composition first (RPC sent here, outside grid_mu).
+            if (self.preedit_visible.load(.monotonic)) {
+                self.clearPreeditExtmark();
+                self.preedit_visible.store(false, .monotonic);
+            }
+            return false;
+        }
+
+        self.ensurePreeditSetup();
+
+        if (text.len == 0) {
+            self.clearPreedit();
+            return true;
+        }
+
+        // Re-place the extmark at the cursor on every composition update. The
+        // previous preedit (possibly in another buffer) is cleared first via
+        // the buffer recorded in vim.g.zonvie_preedit_buf, so a buffer/focus
+        // change mid-composition can't leave a stale extmark behind. The Lua
+        // splits the preedit into normal/target/normal chunks so the
+        // converting clause is visually distinct.
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        self.sendRequestHeader(&buf, id, "nvim_exec_lua") catch return false;
+        rpc.packArray(&buf, self.alloc, 2) catch return false; // [code, args]
+        rpc.packStr(&buf, self.alloc,
+            \\local text, ts, te = ...
+            \\local ns = vim.api.nvim_create_namespace("zonvie_preedit")
+            \\local buf = vim.api.nvim_get_current_buf()
+            \\local prev = vim.g.zonvie_preedit_buf
+            \\if prev and prev ~= buf and vim.api.nvim_buf_is_valid(prev) then
+            \\  vim.api.nvim_buf_clear_namespace(prev, ns, 0, -1)
+            \\end
+            \\vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+            \\vim.g.zonvie_preedit_buf = buf
+            \\local pos = vim.api.nvim_win_get_cursor(0)
+            \\local chunks
+            \\if ts < te and te <= #text then
+            \\  chunks = {}
+            \\  if ts > 0 then chunks[#chunks + 1] = { text:sub(1, ts), "ZonviePreedit" } end
+            \\  chunks[#chunks + 1] = { text:sub(ts + 1, te), "ZonviePreeditTarget" }
+            \\  if te < #text then chunks[#chunks + 1] = { text:sub(te + 1), "ZonviePreedit" } end
+            \\else
+            \\  chunks = { { text, "ZonviePreedit" } }
+            \\end
+            \\pcall(vim.api.nvim_buf_set_extmark, buf, ns, pos[1] - 1, pos[2], {
+            \\  virt_text = chunks,
+            \\  virt_text_pos = "inline",
+            \\  right_gravity = false,
+            \\})
+        ) catch return false;
+        rpc.packArray(&buf, self.alloc, 3) catch return false; // args: text, ts, te
+        rpc.packStr(&buf, self.alloc, text) catch return false;
+        rpc.packInt(&buf, self.alloc, @intCast(target_start)) catch return false;
+        rpc.packInt(&buf, self.alloc, @intCast(target_end)) catch return false;
+        self.sendRaw(buf.items) catch return false;
+
+        self.preedit_visible.store(true, .monotonic);
+        return true;
+    }
+
+    /// Clear the inline preedit extmark (called on commit or cancel).
+    pub fn clearPreedit(self: *Core) void {
+        if (!self.preedit_visible.load(.monotonic)) return;
+        self.clearPreeditExtmark();
+        self.preedit_visible.store(false, .monotonic);
     }
 
     /// Scroll view to specified line number (1-based) via nvim_exec_lua.

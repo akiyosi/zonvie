@@ -782,6 +782,32 @@ pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: 
     box.core.requestCommand(cmd[0..len]) catch {};
 }
 
+/// Set/update IME preedit (composition) text.
+/// target_start/target_end are UTF-8 byte offsets into `text` marking the
+/// clause being converted (highlighted distinctly); pass target_start >=
+/// target_end when there is no target clause.
+/// Returns 1 if the core placed the preedit as an inline extmark (the frontend
+/// should hide its own preedit overlay), 0 if the frontend should display the
+/// preedit itself (extmark mode disabled, or not in insert/replace mode).
+pub export fn zonvie_core_set_preedit(
+    p: ?*zonvie_core,
+    text: [*]const u8,
+    len: usize,
+    target_start: usize,
+    target_end: usize,
+) callconv(.c) c_int {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return if (box.core.setPreedit(text[0..len], target_start, target_end)) 1 else 0;
+}
+
+/// Clear any inline preedit extmark (called on IME commit or cancel).
+pub export fn zonvie_core_clear_preedit(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.clearPreedit();
+}
+
 /// Request graceful quit (called by frontend on window close button).
 /// This checks for unsaved buffers and calls on_quit_requested callback.
 pub export fn zonvie_core_request_quit(p: ?*zonvie_core) callconv(.c) void {

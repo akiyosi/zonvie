@@ -1699,6 +1699,67 @@ final class ZonvieCore {
         }
     }
 
+    /// Set/update IME preedit (composition) text.
+    /// `attributed` is the IME's marked text (carrying clause-segment info);
+    /// `selectedRange` is the IME selection in UTF-16 units. The converting
+    /// (target) clause is resolved and converted to UTF-8 byte offsets so the
+    /// core can highlight it distinctly.
+    /// Returns true if the core placed the preedit as an inline extmark (the
+    /// caller should hide its overlay), false if the caller should display the
+    /// preedit via its own overlay.
+    func setPreedit(_ attributed: NSAttributedString, selectedRange: NSRange) -> Bool {
+        guard let core else { return false }
+        let text = attributed.string
+        let nsstr = text as NSString
+        let total = nsstr.length
+        // Resolve the converting clause, then convert it to UTF-8 byte offsets.
+        let target = ZonvieCore.targetClauseRange(attributed, selectedRange: selectedRange)
+        var targetStart = 0
+        var targetEnd = 0
+        if target.length > 0 {
+            let loc = min(max(0, target.location), total)
+            let len = min(target.length, total - loc)
+            targetStart = nsstr.substring(to: loc).utf8.count
+            targetEnd = targetStart + nsstr.substring(with: NSRange(location: loc, length: len)).utf8.count
+        }
+        let data = text.data(using: .utf8) ?? Data()
+        return data.withUnsafeBytes { raw -> Bool in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            return zonvie_core_set_preedit(core, base, data.count, targetStart, targetEnd) != 0
+        }
+    }
+
+    /// Resolve the converting (target) clause range, matching the overlay's
+    /// thick-underline logic: the marked clause segment containing the IME
+    /// selection, falling back to the selected range itself. Returns an empty
+    /// range when there is no distinct target clause.
+    private static func targetClauseRange(_ attributed: NSAttributedString, selectedRange: NSRange) -> NSRange {
+        let fullRange = NSRange(location: 0, length: attributed.length)
+        guard fullRange.length > 0 else { return NSRange(location: 0, length: 0) }
+        var clauseRanges: [NSRange] = []
+        attributed.enumerateAttribute(.markedClauseSegment, in: fullRange, options: []) { value, range, _ in
+            if value != nil { clauseRanges.append(range) }
+        }
+        if !clauseRanges.isEmpty, selectedRange.location != NSNotFound {
+            for clause in clauseRanges {
+                if clause.location <= selectedRange.location &&
+                    selectedRange.location < clause.location + clause.length {
+                    return clause
+                }
+            }
+        }
+        if selectedRange.location != NSNotFound && selectedRange.length > 0 {
+            return selectedRange
+        }
+        return NSRange(location: 0, length: 0)
+    }
+
+    /// Clear any inline preedit extmark (called on IME commit or cancel).
+    func clearPreedit() {
+        guard let core else { return }
+        zonvie_core_clear_preedit(core)
+    }
+
     /// Request graceful quit (called by frontend on window close button).
     /// Checks for unsaved buffers and calls on_quit_requested callback with result.
     /// Includes a timeout to handle unresponsive Neovim.

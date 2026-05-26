@@ -3807,8 +3807,41 @@ pub export fn WndProc(
                         }
                     }
 
-                    // Update preedit overlay directly
-                    input.updateImePreeditOverlay(hwnd, app);
+                    // Display preedit: prefer the core's inline-extmark mode
+                    // when it accepts it (extmark mode + insert/replace);
+                    // otherwise fall back to the overlay. Copy the UTF-8 out
+                    // under the lock so the core call runs unlocked.
+                    var handled = false;
+                    if (app.corep) |corep| {
+                        app.mu.lock();
+                        // ime_composition_utf8 is mutated only on this (UI)
+                        // thread, and the core call below runs synchronously on
+                        // it, so the backing buffer stays valid after unlock —
+                        // pass the full string directly (no copy/truncation).
+                        const utf8_ptr = app.ime_composition_utf8.items.ptr;
+                        const utf8_len = app.ime_composition_utf8.items.len;
+                        // Map the target clause (UTF-16 unit indices) to UTF-8
+                        // byte offsets within the composition string.
+                        const units = app.ime_composition_str.items;
+                        var ts: usize = 0;
+                        var te: usize = 0;
+                        if (app.ime_target_start < app.ime_target_end) {
+                            ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
+                            te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
+                        }
+                        app.mu.unlock();
+                        if (utf8_len == 0) {
+                            app_mod.zonvie_core_clear_preedit(corep);
+                            handled = true; // nothing to display
+                        } else {
+                            handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
+                        }
+                    }
+                    if (handled) {
+                        input.hideImePreeditOverlay(app);
+                    } else {
+                        input.updateImePreeditOverlay(hwnd, app);
+                    }
                 }
             }
             // Let DefWindowProc handle for default IME processing
@@ -3827,7 +3860,8 @@ pub export fn WndProc(
                 app.ime_target_end = 0;
                 app.mu.unlock();
 
-                // Hide preedit overlay
+                // Clear any inline preedit extmark and hide the overlay.
+                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
                 input.hideImePreeditOverlay(app);
             }
             return 0;

@@ -2075,9 +2075,11 @@ extension ExternalGridView: NSTextInputClient {
             return
         }
 
-        // Clear marked text state and hide preedit overlay.
+        // Clear marked text state, the inline preedit extmark (if any), and the
+        // overlay before sending the committed text.
         markedText = NSMutableAttributedString()
         markedRange_ = NSRange(location: NSNotFound, length: 0)
+        mainTerminalView?.core?.clearPreedit()
         hidePreeditOverlay()
 
         // Send committed text to Neovim via core.
@@ -2098,9 +2100,18 @@ extension ExternalGridView: NSTextInputClient {
 
         if markedText.length > 0 {
             markedRange_ = NSRange(location: 0, length: markedText.length)
-            showPreeditOverlay(attributedText: markedText, selectedRange: selectedRange)
+            // Prefer the core's inline-extmark preedit when it accepts it
+            // (extmark mode + insert/replace in a real buffer, e.g. a floating
+            // window); otherwise draw the overlay (e.g. cmdline, which has no
+            // buffer to anchor an extmark to).
+            if mainTerminalView?.core?.setPreedit(markedText, selectedRange: selectedRange) == true {
+                hidePreeditOverlay()
+            } else {
+                showPreeditOverlay(attributedText: markedText, selectedRange: selectedRange)
+            }
         } else {
             markedRange_ = NSRange(location: NSNotFound, length: 0)
+            mainTerminalView?.core?.clearPreedit()
             hidePreeditOverlay()
         }
         selectedRange_ = selectedRange
@@ -2110,6 +2121,7 @@ extension ExternalGridView: NSTextInputClient {
     func unmarkText() {
         markedText = NSMutableAttributedString()
         markedRange_ = NSRange(location: NSNotFound, length: 0)
+        mainTerminalView?.core?.clearPreedit()
         hidePreeditOverlay()
     }
 

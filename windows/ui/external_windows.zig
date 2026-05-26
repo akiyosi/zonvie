@@ -1961,9 +1961,42 @@ pub export fn ExternalWndProc(
                     }
                 }
 
-                // Update preedit overlay (must be called WITHOUT app.mu held,
-                // because updateImePreeditOverlay acquires app.mu internally).
-                input.updateImePreeditOverlay(hwnd, app);
+                // Display preedit: prefer the core's inline-extmark mode when
+                // it accepts it (extmark mode + insert/replace in the focused
+                // external window's buffer); otherwise fall back to the
+                // overlay. Mirrors the main window's WM_IME_COMPOSITION path so
+                // preedit_mode behaves the same across window types.
+                var handled = false;
+                if (app.corep) |corep| {
+                    app.mu.lock();
+                    // ime_composition_utf8 is mutated only on this (UI) thread,
+                    // and the core call below runs synchronously on it, so the
+                    // backing buffer stays valid after unlock — pass the full
+                    // string directly (no copy/truncation).
+                    const utf8_ptr = app.ime_composition_utf8.items.ptr;
+                    const utf8_len = app.ime_composition_utf8.items.len;
+                    const units = app.ime_composition_str.items;
+                    var ts: usize = 0;
+                    var te: usize = 0;
+                    if (app.ime_target_start < app.ime_target_end) {
+                        ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
+                        te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
+                    }
+                    app.mu.unlock();
+                    if (utf8_len == 0) {
+                        app_mod.zonvie_core_clear_preedit(corep);
+                        handled = true; // nothing to display
+                    } else {
+                        handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
+                    }
+                }
+                if (handled) {
+                    input.hideImePreeditOverlay(app);
+                } else {
+                    // Update preedit overlay (must be called WITHOUT app.mu
+                    // held, because updateImePreeditOverlay acquires app.mu).
+                    input.updateImePreeditOverlay(hwnd, app);
+                }
             }
             // Let DefWindowProc handle for default IME processing
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1982,7 +2015,8 @@ pub export fn ExternalWndProc(
                 app.ime_target_end = 0;
                 app.mu.unlock();
 
-                // Hide overlay
+                // Clear any inline preedit extmark and hide the overlay.
+                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
                 input.hideImePreeditOverlay(app);
 
                 // Trigger redraw to show cursor after IME composition ends

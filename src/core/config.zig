@@ -285,10 +285,18 @@ pub const Config = struct {
     /// 0=both, 1=none, 2=only_left, 3=only_right
     pub const OptionAsMeta = enum(u8) { both = 0, none = 1, only_left = 2, only_right = 3 };
 
+    /// How IME preedit (composition) text is displayed.
+    /// overlay: frontend draws a floating overlay on top of the grid (default).
+    /// extmark: core inserts the preedit as an inline virt_text extmark in the
+    ///   buffer, so trailing text shifts right as it would after commit.
+    ///   Falls back to overlay outside insert/replace modes (e.g. cmdline).
+    pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
+
     pub const IMEConfig = struct {
         disable_on_activate: bool = false,
         disable_on_modechange: bool = false,
         option_as_meta: OptionAsMeta = .both,
+        preedit_mode: PreeditMode = .overlay,
     };
 
     pub const ShaderConfig = struct {
@@ -515,6 +523,10 @@ pub const Config = struct {
                 else if (std.mem.eql(u8, v, "none")) { self.ime.option_as_meta = .none; }
                 else if (std.mem.eql(u8, v, "only_left")) { self.ime.option_as_meta = .only_left; }
                 else if (std.mem.eql(u8, v, "only_right")) { self.ime.option_as_meta = .only_right; }
+            }
+            if (i.preedit_mode) |v| {
+                if (std.mem.eql(u8, v, "extmark")) { self.ime.preedit_mode = .extmark; }
+                else if (std.mem.eql(u8, v, "overlay")) { self.ime.preedit_mode = .overlay; }
             }
         }
 
@@ -836,6 +848,7 @@ const TomlIME = struct {
     disable_on_activate: ?bool = null,
     disable_on_modechange: ?bool = null,
     option_as_meta: ?[]const u8 = null,
+    preedit_mode: ?[]const u8 = null,
 };
 
 const TomlShaders = struct {

@@ -1863,9 +1863,11 @@ extension MetalTerminalView: NSTextInputClient {
 
         ZonvieCore.appLog("[IME] insertText: \"\(text)\" core=\(core != nil ? "set" : "nil")")
 
-        // Clear marked text state and hide preedit overlay.
+        // Clear marked text state, the inline preedit extmark (if any), and the
+        // overlay before sending the committed text.
         markedText = NSMutableAttributedString()
         markedRange_ = NSRange(location: NSNotFound, length: 0)
+        core?.clearPreedit()
         hidePreeditOverlay()
 
         // Send committed text to Neovim immediately. Buffering this on the
@@ -1889,9 +1891,16 @@ extension MetalTerminalView: NSTextInputClient {
 
         if markedText.length > 0 {
             markedRange_ = NSRange(location: 0, length: markedText.length)
-            showPreeditOverlay(attributedText: markedText, selectedRange: selectedRange)
+            // Prefer the core's inline-extmark preedit when it accepts it
+            // (extmark mode + insert/replace); otherwise draw the overlay.
+            if core?.setPreedit(markedText, selectedRange: selectedRange) == true {
+                hidePreeditOverlay()
+            } else {
+                showPreeditOverlay(attributedText: markedText, selectedRange: selectedRange)
+            }
         } else {
             markedRange_ = NSRange(location: NSNotFound, length: 0)
+            core?.clearPreedit()
             hidePreeditOverlay()
         }
         selectedRange_ = selectedRange
@@ -1971,6 +1980,7 @@ extension MetalTerminalView: NSTextInputClient {
     func unmarkText() {
         markedText = NSMutableAttributedString()
         markedRange_ = NSRange(location: NSNotFound, length: 0)
+        core?.clearPreedit()
         hidePreeditOverlay()
     }
 

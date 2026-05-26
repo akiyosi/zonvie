@@ -153,20 +153,52 @@ pub fn isSpecialVk(vk: u32) bool {
 
 /// Convert UTF-16 composition string to UTF-8.
 /// Must be called with app.mu locked.
+/// Decode the UTF-16 code unit at units[i], combining a surrogate pair when
+/// present. Returns the codepoint and the number of units consumed (1 or 2).
+fn decodeUtf16At(units: []const u16, i: usize) struct { cp: u21, consumed: usize } {
+    const hi = units[i];
+    if (hi >= 0xD800 and hi <= 0xDBFF and i + 1 < units.len) {
+        const lo = units[i + 1];
+        if (lo >= 0xDC00 and lo <= 0xDFFF) {
+            const cp = 0x10000 + ((@as(u21, hi) - 0xD800) << 10) + (@as(u21, lo) - 0xDC00);
+            return .{ .cp = cp, .consumed = 2 };
+        }
+    }
+    return .{ .cp = @as(u21, hi), .consumed = 1 };
+}
+
 pub fn updateImeCompositionUtf8(app: *App) void {
     app.ime_composition_utf8.clearRetainingCapacity();
 
-    for (app.ime_composition_str.items) |unit| {
-        // Handle non-surrogate characters
-        if (unit >= 0xD800 and unit <= 0xDFFF) {
-            // Skip surrogates for now (would need pair handling)
-            continue;
-        }
-
+    const units = app.ime_composition_str.items;
+    var i: usize = 0;
+    while (i < units.len) {
+        const d = decodeUtf16At(units, i);
+        i += d.consumed;
+        // Skip a lone surrogate that could not be combined.
+        if (d.cp >= 0xD800 and d.cp <= 0xDFFF) continue;
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(@as(u21, @intCast(unit)), &buf) catch continue;
+        const n = std.unicode.utf8Encode(d.cp, &buf) catch continue;
         app.ime_composition_utf8.appendSlice(app.alloc, buf[0..n]) catch continue;
     }
+}
+
+/// UTF-8 byte length of the first `unit_count` UTF-16 code units of `units`,
+/// decoding surrogate pairs. Used to map an IME clause boundary (a UTF-16 unit
+/// index) to a byte offset into the UTF-8 composition string, matching
+/// updateImeCompositionUtf8's encoding.
+pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
+    const end = @min(unit_count, units.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < end) {
+        const d = decodeUtf16At(units, i);
+        i += d.consumed;
+        if (d.cp >= 0xD800 and d.cp <= 0xDFFF) continue;
+        var buf: [4]u8 = undefined;
+        n += std.unicode.utf8Encode(d.cp, &buf) catch 0;
+    }
+    return n;
 }
 
 /// Position IME candidate window at cursor location.

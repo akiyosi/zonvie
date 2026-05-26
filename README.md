@@ -206,6 +206,7 @@ atlas_size = 2048
 disable_on_activate = false
 disable_on_modechange = false
 option_as_meta = "both"  # "both", "none", "only_left", "only_right"
+preedit_mode = "overlay"  # "overlay" (floating overlay) or "extmark" (inline virt_text)
 
 [shaders]
 enabled = false
@@ -320,6 +321,7 @@ Message routing rules are processed in order; first match wins.
 | `disable_on_activate` | Disable IME when app becomes active (true/false) |
 | `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
 | `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
+| `preedit_mode` | IME preedit display: "overlay" (floating overlay) or "extmark" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
 
 #### [shaders]
 | Key | Description |

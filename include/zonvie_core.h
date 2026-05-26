@@ -930,6 +930,20 @@ ZONVIE_API void zonvie_core_set_option_value(
    len: length of command string */
 ZONVIE_API void zonvie_core_send_command(zonvie_core *core, const unsigned char *cmd, size_t len);
 
+/* Set/update IME preedit (composition) text.
+   text: UTF-8 preedit string; len: its byte length.
+   target_start/target_end: UTF-8 byte offsets into text marking the clause
+   being converted (highlighted distinctly). Pass target_start >= target_end
+   when there is no target clause.
+   Returns 1 if the core placed the preedit as an inline extmark (frontend
+   should hide its own preedit overlay), 0 if the frontend should display the
+   preedit itself (extmark mode disabled, or not in insert/replace mode). */
+ZONVIE_API int zonvie_core_set_preedit(zonvie_core *core, const unsigned char *text, size_t len,
+                                       size_t target_start, size_t target_end);
+
+/* Clear any inline preedit extmark (call on IME commit or cancel). */
+ZONVIE_API void zonvie_core_clear_preedit(zonvie_core *core);
+
 /* Request graceful quit (called by frontend on window close button).
    This checks for unsaved buffers and calls on_quit_requested callback. */
 ZONVIE_API void zonvie_core_request_quit(zonvie_core *core);
