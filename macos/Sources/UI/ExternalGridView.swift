@@ -58,9 +58,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private let redrawScheduler = SurfaceRedrawScheduler()
 
     // --- IME / NSTextInputClient support ---
-    private var markedText: NSMutableAttributedString = NSMutableAttributedString()
-    private var markedRange_: NSRange = NSRange(location: NSNotFound, length: 0)
-    private var selectedRange_: NSRange = NSRange(location: 0, length: 0)
+    // Shared composition handling: inline-extmark preedit with overlay fallback.
+    private lazy var ime = IMEPreeditController(host: self)
     private var _inputContext: NSTextInputContext?
 
     override var inputContext: NSTextInputContext? {
@@ -69,14 +68,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
         return _inputContext
     }
-
-    // Preedit overlay for showing IME composition text
-    private lazy var preeditView: PreeditOverlayView = {
-        let view = PreeditOverlayView()
-        view.isHidden = true
-        addSubview(view)
-        return view
-    }()
 
     private var pipeline: MTLRenderPipelineState?
     private var sampler: MTLSamplerState?
@@ -1999,169 +1990,53 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     }
 
-    // MARK: - IME Preedit Overlay
-
-    /// Show the preedit overlay with the given attributed text.
-    private func showPreeditOverlay(attributedText: NSAttributedString, selectedRange: NSRange) {
-        guard let main = mainTerminalView else { return }
-
-        let scale = window?.backingScaleFactor ?? 2.0
-        let cellW = CGFloat(main.renderer.cellWidthPx) / scale
-        let cellH = CGFloat(main.renderer.cellHeightPx) / scale
-
-        // Use the actual font from renderer
-        let fontName = main.renderer.currentFontName
-        let pointSize = main.renderer.currentPointSize
-        let font = NSFont(name: fontName, size: pointSize) ?? NSFont.monospacedSystemFont(ofSize: pointSize, weight: .regular)
-
-        // Configure preedit view with attributed text (preserves IME underline info)
-        preeditView.configure(
-            attributedText: attributedText,
-            selectedRange: selectedRange,
-            font: font,
-            cellWidth: cellW,
-            cellHeight: cellH
-        )
-
-        // Position at cursor location within this external window
-        positionPreeditOverlay()
-
-        preeditView.isHidden = false
-    }
-
-    /// Position the preedit overlay at the cursor location.
-    private func positionPreeditOverlay() {
-        guard let main = mainTerminalView, let core = main.core else { return }
-
-        let scale = window?.backingScaleFactor ?? 2.0
-        let cellW = CGFloat(main.renderer.cellWidthPx) / scale
-        let cellH = CGFloat(main.renderer.cellHeightPx) / scale
-
-        // Get cursor position from core if available
-        let cursor = core.getCursorPosition()
-        if cursor.row >= 0 && cursor.col >= 0 && cursor.gridId == gridId {
-            // For external window, cursor position is relative to the grid itself.
-            // Add viewportOriginPx to account for decorated surfaces (e.g. cmdline icon/padding).
-            let gridContentHeight = CGFloat(gridRows) * cellH
-            let x = viewportOriginPx.x + CGFloat(cursor.col) * cellW
-            let y = viewportOriginPx.y + gridContentHeight - CGFloat(cursor.row + 1) * cellH
-
-            preeditView.frame.origin = CGPoint(x: x, y: y)
-            return
-        }
-
-        // Fallback: position near top-left
-        preeditView.frame.origin = CGPoint(x: cellW, y: bounds.height - cellH - preeditView.frame.height)
-    }
-
-    /// Hide the preedit overlay.
-    private func hidePreeditOverlay() {
-        preeditView.isHidden = true
-        preeditView.clear()
-    }
 }
 
-// MARK: - NSTextInputClient (IME support)
-extension ExternalGridView: NSTextInputClient {
+// MARK: - IME host
 
-    /// Called when IME commits composed text or when direct character input occurs.
-    func insertText(_ string: Any, replacementRange: NSRange) {
-        let text: String
-        if let s = string as? String {
-            text = s
-        } else if let attr = string as? NSAttributedString {
-            text = attr.string
-        } else {
-            return
+extension ExternalGridView: IMEPreeditHost {
+    var imeCore: ZonvieCore? { mainTerminalView?.core }
+
+    var imePreeditFont: NSFont {
+        guard let main = mainTerminalView else {
+            return NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         }
+        return NSFont(name: main.renderer.currentFontName, size: main.renderer.currentPointSize)
+            ?? NSFont.monospacedSystemFont(ofSize: main.renderer.currentPointSize, weight: .regular)
+    }
 
-        // Clear marked text state, the inline preedit extmark (if any), and the
-        // overlay before sending the committed text.
-        markedText = NSMutableAttributedString()
-        markedRange_ = NSRange(location: NSNotFound, length: 0)
-        mainTerminalView?.core?.clearPreedit()
-        hidePreeditOverlay()
+    var imePreeditCellSize: CGSize {
+        guard let main = mainTerminalView else { return CGSize(width: 8, height: 16) }
+        let scale = window?.backingScaleFactor ?? 2.0
+        return CGSize(width: CGFloat(main.renderer.cellWidthPx) / scale,
+                      height: CGFloat(main.renderer.cellHeightPx) / scale)
+    }
 
-        // Send committed text to Neovim via core.
+    var imePreeditContainer: NSView { self }
+
+    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
+        let cell = imePreeditCellSize
         if let core = mainTerminalView?.core {
-            core.sendInput(text)
-        }
-    }
-
-    /// Called during IME composition to show uncommitted text.
-    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        if let s = string as? String {
-            markedText = NSMutableAttributedString(string: s)
-        } else if let attr = string as? NSAttributedString {
-            markedText = NSMutableAttributedString(attributedString: attr)
-        } else {
-            markedText = NSMutableAttributedString()
-        }
-
-        if markedText.length > 0 {
-            markedRange_ = NSRange(location: 0, length: markedText.length)
-            // Prefer the core's inline-extmark preedit when it accepts it
-            // (extmark mode + insert/replace in a real buffer, e.g. a floating
-            // window); otherwise draw the overlay (e.g. cmdline, which has no
-            // buffer to anchor an extmark to).
-            if mainTerminalView?.core?.setPreedit(markedText, selectedRange: selectedRange) == true {
-                hidePreeditOverlay()
-            } else {
-                showPreeditOverlay(attributedText: markedText, selectedRange: selectedRange)
+            let cursor = core.getCursorPosition()
+            if cursor.row >= 0 && cursor.col >= 0 && cursor.gridId == gridId {
+                // Cursor is grid-local; add viewportOriginPx for decorated
+                // surfaces (e.g. the cmdline icon/padding).
+                let gridContentHeight = CGFloat(gridRows) * cell.height
+                let x = viewportOriginPx.x + CGFloat(cursor.col) * cell.width
+                let y = viewportOriginPx.y + gridContentHeight - CGFloat(cursor.row + 1) * cell.height
+                return CGPoint(x: x, y: y)
             }
-        } else {
-            markedRange_ = NSRange(location: NSNotFound, length: 0)
-            mainTerminalView?.core?.clearPreedit()
-            hidePreeditOverlay()
         }
-        selectedRange_ = selectedRange
+        return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
     }
 
-    /// Called when IME composition is cancelled.
-    func unmarkText() {
-        markedText = NSMutableAttributedString()
-        markedRange_ = NSRange(location: NSNotFound, length: 0)
-        mainTerminalView?.core?.clearPreedit()
-        hidePreeditOverlay()
-    }
-
-    /// Returns the range of the current marked (composing) text.
-    func markedRange() -> NSRange {
-        return markedRange_
-    }
-
-    /// Returns the range of the currently selected text.
-    func selectedRange() -> NSRange {
-        return selectedRange_
-    }
-
-    /// Returns whether there is currently marked (composing) text.
-    func hasMarkedText() -> Bool {
-        return markedRange_.location != NSNotFound && markedRange_.length > 0
-    }
-
-    /// Returns valid attributes for marked text styling.
-    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-        return [.underlineStyle, .foregroundColor, .backgroundColor]
-    }
-
-    /// Returns the attributed string for the given range (used by IME).
-    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        return nil
-    }
-
-    /// Returns the rectangle for the character at the given index.
-    /// Used by IME to position the candidate window.
-    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+    func imeFirstRect() -> NSRect {
         guard let win = window, let main = mainTerminalView else { return .zero }
-
         let scale = win.backingScaleFactor
         let cellW = CGFloat(main.renderer.cellWidthPx) / scale
         let rowH = CGFloat(main.renderer.cellHeightPx) / scale
-
         var screenRow = 0
         var screenCol = 0
-
         if let core = main.core {
             let cursor = core.getCursorPosition()
             if cursor.row >= 0 && cursor.col >= 0 && cursor.gridId == gridId {
@@ -2169,19 +2044,47 @@ extension ExternalGridView: NSTextInputClient {
                 screenCol = Int(cursor.col)
             }
         }
-
-        // Add viewportOriginPx to account for decorated surfaces (e.g. cmdline icon/padding).
         let gridContentHeight = CGFloat(gridRows) * rowH
         let cursorXPt = viewportOriginPx.x + CGFloat(screenCol) * cellW
         let cursorYPt = viewportOriginPx.y + gridContentHeight - CGFloat(screenRow + 1) * rowH
-
         let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
-        let rectInWindow = convert(rectInView, to: nil)
-        let rectInScreen = win.convertToScreen(rectInWindow)
-        return rectInScreen
+        return win.convertToScreen(convert(rectInView, to: nil))
     }
 
-    /// Returns the character index closest to the given point.
+    func imeSendCommitted(_ text: String) { mainTerminalView?.core?.sendInput(text) }
+}
+
+// MARK: - NSTextInputClient (IME support)
+extension ExternalGridView: NSTextInputClient {
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        ime.insertText(string)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        ime.setMarkedText(string, selectedRange: selectedRange)
+    }
+
+    func unmarkText() {
+        ime.unmarkText()
+    }
+
+    func markedRange() -> NSRange { ime.markedRange }
+
+    func selectedRange() -> NSRange { ime.selectedRange }
+
+    func hasMarkedText() -> Bool { ime.hasMarkedText }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { ime.validAttributes }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        return nil
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        return ime.firstRect()
+    }
+
     func characterIndex(for point: NSPoint) -> Int {
         return 0
     }
