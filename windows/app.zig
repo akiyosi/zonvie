@@ -2626,6 +2626,10 @@ pub const App = struct {
     ime_target_start: u32 = 0, // start of target clause (thick underline)
     ime_target_end: u32 = 0, // end of target clause
     ime_overlay_hwnd: ?c.HWND = null, // Layered window for preedit overlay
+    // True while the current composition is shown via the core's inline extmark
+    // (preedit_mode = extmark). The preedit overlay must stay hidden then, even
+    // when a repaint calls updateImePreeditOverlay, to avoid a doubled preedit.
+    ime_extmark_active: bool = false,
 
     // Pending UTF-16 high surrogate from a previous WM_CHAR / WM_IME_CHAR.
     // Windows delivers a non-BMP character (e.g. emoji) as two consecutive

@@ -3837,6 +3837,9 @@ pub export fn WndProc(
                             handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
                         }
                     }
+                    app.mu.lock();
+                    app.ime_extmark_active = handled;
+                    app.mu.unlock();
                     if (handled) {
                         input.hideImePreeditOverlay(app);
                     } else {
@@ -3858,6 +3861,7 @@ pub export fn WndProc(
                 app.ime_cursor_pos = 0;
                 app.ime_target_start = 0;
                 app.ime_target_end = 0;
+                app.ime_extmark_active = false;
                 app.mu.unlock();
 
                 // Clear any inline preedit extmark and hide the overlay.

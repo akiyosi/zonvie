@@ -353,13 +353,15 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     app.mu.lock();
     const composing = app.ime_composing;
     const comp_len = app.ime_composition_str.items.len;
+    const extmark_active = app.ime_extmark_active;
     app.mu.unlock();
 
     const log_active = applog.isEnabled();
-    if (log_active) applog.appLog("[IME] updateImePreeditOverlay composing={d} comp_len={d}\n", .{ @intFromBool(composing), comp_len });
+    if (log_active) applog.appLog("[IME] updateImePreeditOverlay composing={d} comp_len={d} extmark={d}\n", .{ @intFromBool(composing), comp_len, @intFromBool(extmark_active) });
 
-    // Hide overlay if not composing
-    if (!composing or comp_len == 0) {
+    // Hide overlay if not composing, or if the preedit is rendered inline by the
+    // core via an extmark (the overlay would otherwise double the preedit).
+    if (!composing or comp_len == 0 or extmark_active) {
         if (app.ime_overlay_hwnd) |overlay| {
             _ = c.ShowWindow(overlay, c.SW_HIDE);
         }
