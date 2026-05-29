@@ -13,6 +13,15 @@ pub const std_options = std.Options{
     .enable_segfault_handler = true,
 };
 
+/// MAKEINTRESOURCE: turn a resource ordinal into the LPCWSTR the resource
+/// APIs expect. The integer is never dereferenced, but LPCWSTR's element
+/// type has alignment 2, so route the value through a runtime usize to skip
+/// the comptime alignment check that a bare `@ptrFromInt(odd_id)` would hit.
+fn makeIntResource(id: u16) c.LPCWSTR {
+    const addr: usize = id;
+    return @ptrFromInt(addr);
+}
+
 /// Custom panic handler for debug builds that prints stack traces.
 /// In release builds, falls back to std default behavior.
 pub fn panic(
@@ -640,6 +649,21 @@ pub fn main() u8 {
     wc.lpfnWndProc = window.WndProc;
     wc.hInstance = c.GetModuleHandleW(null);
     wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
+    // Application icon (IDI_ICON1 = 1 in zonvie.rc). The taskbar button picks
+    // up the executable's icon resource automatically, but the title-bar /
+    // Alt-Tab icon comes from the window class; without these it falls back to
+    // the generic default. MAKEINTRESOURCE isn't translated by the C import,
+    // so pass the numeric resource id directly as a pointer (same as the
+    // IDC_ARROW / IDI_APPLICATION uses elsewhere).
+    wc.hIcon = c.LoadIconW(wc.hInstance, makeIntResource(1)); // large icon (Alt-Tab)
+    wc.hIconSm = @ptrCast(@alignCast(c.LoadImageW( // small icon (title bar) at exact size
+        wc.hInstance,
+        makeIntResource(1),
+        c.IMAGE_ICON,
+        c.GetSystemMetrics(c.SM_CXSMICON),
+        c.GetSystemMetrics(c.SM_CYSMICON),
+        c.LR_DEFAULTCOLOR,
+    )));
     wc.hbrBackground = null;
     wc.lpszClassName = @ptrCast(class_name.ptr);
 
