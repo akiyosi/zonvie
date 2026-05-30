@@ -85,6 +85,18 @@ do {
                   arg.hasPrefix("--connect-nvim=") || arg.hasPrefix("--remote-ui=") {
             // Skip =value style arguments
             i += 1
+        } else if arg.hasPrefix("-NS") || arg.hasPrefix("-Apple") || arg.hasPrefix("-com.apple") {
+            // macOS/Cocoa-injected launch arguments — NOT nvim arguments.
+            // Xcode injects "-NSDocumentRevisionsDebugMode YES"; Finder / state
+            // restoration injects "-ApplePersistenceIgnoreState YES", etc. These
+            // are user-defaults "-Key Value" pairs; forwarding them to nvim makes
+            // it exit with an error (e.g. unknown option). Drop the key, and its
+            // value when the following token is the value (not another flag).
+            if i + 1 < args.count, !args[i + 1].hasPrefix("-"), !args[i + 1].hasPrefix("+") {
+                i += 2
+            } else {
+                i += 1
+            }
         } else {
             // Not a zonvie argument - pass to nvim
             nvimExtraArgs.append(arg)
