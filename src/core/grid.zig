@@ -1933,11 +1933,13 @@ pub const Grid = struct {
         _ = self.external_grids.remove(grid_id);
 
         // Mark old position dirty if this float is moving
+        var affects_main = false;
         const old_pos_opt = self.win_pos.get(grid_id);
         if (old_pos_opt) |old_pos| {
             if (old_pos.anchor_grid == 1) {
                 const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
                 self.markDirtyRect(old_pos.row, old_pos.row + h_old);
+                affects_main = true;
             }
         }
 
@@ -1947,7 +1949,15 @@ pub const Grid = struct {
         if (anchor_grid == 1) {
             const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
             self.markDirtyRect(row, row + h_new);
+            affects_main = true;
         }
+
+        // Bump content_rev so the next flush's need_main is true and actually
+        // recomposes the float overlay at its new position. markDirtyRect alone
+        // is insufficient: need_main gates the whole main rebuild on content_rev,
+        // so a win_float_pos arriving without any accompanying content change
+        // would otherwise leave the float composited at its stale row.
+        if (affects_main) self.content_rev +%= 1;
 
         // Preserve existing order if present.
         var ord: u64 = 0;
