@@ -728,6 +728,7 @@ pub const GridPos = struct {
     row: u32,
     col: u32,
     anchor_grid: i64 = 1, // which grid this float is anchored to (1 = global grid)
+    follows_scroll: bool = false, // float has been repositioned (row changed) after creation
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -1934,19 +1935,31 @@ pub const Grid = struct {
 
         // Mark old position dirty if this float is moving
         var affects_main = false;
+        // Sticky "buffer-tracking" flag: a float that is repositioned to a new
+        // row after creation (e.g. to track a buffer line as the window scrolls)
+        // may pixel-follow smooth scroll. A truly fixed float never changes row
+        // and so must not pixel-shift. Only set on an actual reposition (old_pos
+        // exists), never on the initial placement.
+        var follows_scroll = false;
         const old_pos_opt = self.win_pos.get(grid_id);
         if (old_pos_opt) |old_pos| {
-            if (old_pos.anchor_grid == 1) {
+            follows_scroll = old_pos.follows_scroll or (old_pos.row != row);
+            // Affects the main composite unless anchored to an external grid
+            // (those float over a separate top-level window, not the main grid).
+            if (!self.external_grids.contains(old_pos.anchor_grid)) {
                 const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
                 self.markDirtyRect(old_pos.row, old_pos.row + h_old);
                 affects_main = true;
             }
         }
 
-        try self.win_pos.put(self.alloc, grid_id, .{ .row = row, .col = col, .anchor_grid = anchor_grid });
+        try self.win_pos.put(self.alloc, grid_id, .{ .row = row, .col = col, .anchor_grid = anchor_grid, .follows_scroll = follows_scroll });
 
-        // Mark new position dirty so row-mode recomposes with float overlay
-        if (anchor_grid == 1) {
+        // Mark new position dirty so row-mode recomposes with float overlay.
+        // Covers editor-anchored (anchor_grid==1) and window-anchored floats
+        // (e.g. bufpos, anchor_grid>1) alike — both are composited into the main
+        // grid, so creating/moving them must trigger a recompose.
+        if (!self.external_grids.contains(anchor_grid)) {
             const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
             self.markDirtyRect(row, row + h_new);
             affects_main = true;

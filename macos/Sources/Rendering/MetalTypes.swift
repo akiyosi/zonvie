@@ -723,7 +723,8 @@ func bindSurfaceFragmentState(
     viewportMetrics: SurfaceViewportMetrics,
     backgroundAlphaBuffer: MTLBuffer?,
     cursorBlinkBuffer: MTLBuffer?,
-    cursorBlinkVisible: Bool
+    cursorBlinkVisible: Bool,
+    fixedFloatRects: [MetalTerminalRenderer.FixedFloatRect] = []
 ) {
     var size = DrawableSize(width: viewportMetrics.fragmentWidth, height: viewportMetrics.fragmentHeight)
     encoder.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
@@ -737,6 +738,24 @@ func bindSurfaceFragmentState(
         memcpy(blinkBuf.contents(), &visible, MemoryLayout<UInt32>.size)
         encoder.setFragmentBuffer(blinkBuf, offset: 0, index: 2)
     }
+
+    // Fixed (non-following) float rects (fragment buffers 3/4). A dummy is bound
+    // when empty so the shader's buffer(3) is always valid; count gates the loop.
+    // Clamp to the 4096-byte setFragmentBytes limit (256 rects) — far above any
+    // realistic count, and avoids a per-frame MTLBuffer allocation.
+    let rectStride = MemoryLayout<MetalTerminalRenderer.FixedFloatRect>.stride
+    let maxRects = 4096 / rectStride
+    let n = min(fixedFloatRects.count, maxRects)
+    var fixedCount = UInt32(n)
+    if n == 0 {
+        var dummy = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 0, top: 0, bottom: 0)
+        encoder.setFragmentBytes(&dummy, length: rectStride, index: 3)
+    } else {
+        fixedFloatRects.withUnsafeBytes { ptr in
+            encoder.setFragmentBytes(ptr.baseAddress!, length: n * rectStride, index: 3)
+        }
+    }
+    encoder.setFragmentBytes(&fixedCount, length: MemoryLayout<UInt32>.size, index: 4)
 }
 
 /// Encode non-row-mode content draw (2-pass for blur, or single-pass with optional scissor).

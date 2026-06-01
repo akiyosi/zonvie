@@ -989,6 +989,20 @@ typedef struct zonvie_grid_info {
     int32_t margin_bottom;
     int32_t margin_left;
     int32_t margin_right;
+    /* Total buffer line count for this grid (from win_viewport), 0 if unknown.
+     * Lets a frontend decide logical scrollability (line_count > content rows)
+     * without a blocking viewport query on the input path. */
+    int64_t line_count;
+    /* For float sub-grids, the grid this float is anchored to (1 = editor/global).
+     * Lets a frontend route smooth-scroll following: a window-anchored float
+     * follows only that window, not any window it merely overlaps. */
+    int64_t anchor_grid;
+    /* 1 if this float has been repositioned (row changed) since creation, i.e. it
+     * tracks the buffer on scroll. A fixed float stays 0 and must not pixel-shift. */
+    int32_t follows_scroll;
+    /* 1 if this grid is an external (separate top-level) window. Such grids are
+     * reported with start (0,0) and must be excluded from main-window hit-testing. */
+    int32_t is_external;
 } zonvie_grid_info;
 
 /* Viewport info for scrollbar rendering */

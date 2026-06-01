@@ -375,6 +375,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // to avoid shared MTLBuffer GPU/CPU race during smooth scrolling.
     private var scrollOffsetData: [ScrollOffset] = []
     private var hasActiveScrollOffset: Bool = false  // true when smooth scrolling is active
+    // Screen rects (NDC) of fixed, non-following floats; scrolled content inside
+    // them is discarded by the fragment shader so it does not bleed over them.
+    private var fixedFloatRectData: [FixedFloatRect] = []
 
     // ScrollOffset struct matching Shaders.metal
     struct ScrollOffset {
@@ -382,6 +385,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var offset_y: Float         // Y offset in NDC
         var content_top_y: Float    // Top Y of scrollable content (below margin top), in NDC
         var content_bottom_y: Float // Bottom Y of scrollable content (above margin bottom), in NDC
+        var move_all: Int32 = 0     // 1 = translate every vertex of this grid (float bodily move)
+    }
+
+    // FixedFloatRect struct matching Shaders.metal (NDC edges; top > bottom).
+    struct FixedFloatRect {
+        var x0: Float
+        var x1: Float
+        var top: Float
+        var bottom: Float
+    }
+
+    /// Set the fixed (non-following) float rects used by the fragment shader to
+    /// keep scrolled content from bleeding over them. Called from the main thread.
+    func updateFixedFloatRects(_ rects: [FixedFloatRect]) {
+        lock.lock()
+        fixedFloatRectData = rects
+        lock.unlock()
     }
 
     // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
@@ -1212,6 +1232,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var gridRows: Int32        // Total rows in grid
         var marginTop: Int32       // Margin rows at top (not scrollable)
         var marginBottom: Int32    // Margin rows at bottom (not scrollable)
+        // When false, the fragment shader does not clip scrolled content to the
+        // grid's own bounds. Used for float windows that must translate bodily
+        // (frame + content) by the underlying window's sub-cell scroll offset,
+        // rather than scroll their content within a fixed frame.
+        var clipToContent: Bool = true
     }
 
     /// - Parameters:
@@ -1235,15 +1260,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Scroll decision is now flag-based (DECO_SCROLLABLE in vertex data),
             // so these bounds only control fragment-level clipping of scrolled content
             // that ends up in margin areas.
-            let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC
-            let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
+            // Float windows (clipToContent == false) translate as a whole; widen the
+            // bounds past the screen so no part of the float is clipped while moving.
+            let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
+            let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
             ZonvieCore.appLog("[renderer] scroll offset: gridId=\(info.gridId) offsetYPx=\(info.offsetYPx) ndc=\(ndc) contentTop=\(contentTopY) contentBottom=\(contentBottomY)")
             return ScrollOffset(
                 grid_id: Int32(truncatingIfNeeded: info.gridId),
                 offset_y: ndc,
                 content_top_y: contentTopY,
-                content_bottom_y: contentBottomY
+                content_bottom_y: contentBottomY,
+                move_all: info.clipToContent ? 0 : 1
             )
         }
 
@@ -1279,15 +1307,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let cellHeightNDC: Float = cellHeightPx * scale
         let ndc = -info.offsetYPx * scale
 
-        // Content bounds for fragment shader clipping (exact boundaries).
-        let contentTopY = info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC
-        let contentBottomY = info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC
+        // Content bounds for fragment shader clipping. Float windows
+        // (clipToContent == false) translate as a whole; widen the bounds past the
+        // screen so nothing is clipped, matching updateScrollOffsets.
+        let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
+        let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
         return ScrollOffset(
             grid_id: Int32(truncatingIfNeeded: info.gridId),
             offset_y: ndc,
             content_top_y: contentTopY,
-            content_bottom_y: contentBottomY
+            content_bottom_y: contentBottomY,
+            move_all: info.clipToContent ? 0 : 1
         )
     }
 
@@ -1388,6 +1419,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // below so the one-frame extension does not self-latch.
             let hadActiveScrollOffsetThisFrame: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
+            let fixedFloatSnapshot: [FixedFloatRect]  // Snapshot for setFragmentBytes
             let pendingScroll: SurfaceRowScroll?
             let rowLogicalToSlotSnapshot: [Int]
             let rowSlotSourceRowsSnapshot: [Int]
@@ -1415,6 +1447,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
             smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            fixedFloatSnapshot = fixedFloatRectData  // Value-type copy (safe across frames)
             // Use accumulated scroll delta (covers multiple flushes between draws)
             // instead of per-set pendingScroll which only has the last flush's delta.
             pendingScroll = pendingScrollAccum ?? bufferSets[csi].pendingScroll
@@ -1903,7 +1936,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 viewportMetrics: viewportMetrics,
                 backgroundAlphaBuffer: backgroundAlphaBuffer,
                 cursorBlinkBuffer: cursorBlinkBuffer,
-                cursorBlinkVisible: true  // always visible; cursor drawn as separate overlay pass
+                cursorBlinkVisible: true,  // always visible; cursor drawn as separate overlay pass
+                fixedFloatRects: fixedFloatSnapshot
             )
             var zeroRowTranslation: Float = 0
             enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
@@ -2407,7 +2441,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         viewportMetrics: viewportMetrics,
                         backgroundAlphaBuffer: backgroundAlphaBuffer,
                         cursorBlinkBuffer: cursorBlinkBuffer,
-                        cursorBlinkVisible: true
+                        cursorBlinkVisible: true,
+                        fixedFloatRects: fixedFloatSnapshot  // mask a scrolling cursor under a fixed float
                     )
                     var zeroTranslation: Float = 0
                     cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)

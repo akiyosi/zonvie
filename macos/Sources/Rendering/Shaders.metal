@@ -43,6 +43,8 @@ struct ScrollOffset {
     float offset_y;         // Y offset in NDC
     float content_top_y;    // Top Y of scrollable content (below margin top), in NDC
     float content_bottom_y; // Bottom Y of scrollable content (above margin bottom), in NDC
+    int move_all;           // 1 = translate every vertex of this grid (ignore DECO_SCROLLABLE);
+                            // used for float windows that move bodily with their parent's scroll
 };
 
 // Drawable size for NDC conversion in fragment shader
@@ -80,15 +82,23 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
             o.content_top_y = scrollOffsets[i].content_top_y;
             o.content_bottom_y = scrollOffsets[i].content_bottom_y;
 
-            // Only scroll vertices flagged as scrollable (content area, not margins)
-            if (in.deco_flags & DECO_SCROLLABLE) {
+            // Float windows (move_all) translate as a whole, including their border
+            // rows which are viewport-margin rows and therefore lack DECO_SCROLLABLE.
+            bool move_all = scrollOffsets[i].move_all != 0;
+
+            // Scroll vertices flagged as scrollable (content area, not margins), or
+            // every vertex when move_all is set.
+            if (move_all || (in.deco_flags & DECO_SCROLLABLE)) {
                 float offset = scrollOffsets[i].offset_y;
 
                 // Check if this is a plain background quad (uv.x < 0, no deco/cursor flags).
                 // Check visual decoration flags; if none set → plain background.
                 bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & DECO_VISUAL_MASK) == 0);
 
-                if (is_plain_bg) {
+                // move_all grids translate uniformly (no edge pinning): their content
+                // bounds span the screen so nothing is clipped, and the whole float
+                // including margins must shift together.
+                if (is_plain_bg && !move_all) {
                     // Background quads at content area edges: keep the boundary vertex
                     // pinned so the edge row stretches to fill the gap left by scrolling.
                     // This prevents transparent gaps at top/bottom during smooth scroll.
@@ -110,7 +120,10 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
                     // Glyph/decoration: uniform scroll (no deformation)
                     pos.y += offset;
                 }
-                o.was_content = 1.0;
+                // 2.0 marks bodily-moved float content (move_all); 1.0 marks
+                // window-scrolled content. The fixed-float bleed guard targets
+                // only window content so it never discards a moving float.
+                o.was_content = move_all ? 2.0 : 1.0;
             }
             break;
         }
@@ -124,12 +137,37 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
     return o;
 }
 
+// Screen rectangle (NDC) of a fixed, non-following float. Scrolled content must
+// not bleed over it when an adjacent row is shifted by the smooth-scroll offset.
+struct FixedFloatRect {
+    float x0;     // left edge, NDC
+    float x1;     // right edge, NDC
+    float top;    // top edge, NDC (higher value)
+    float bottom; // bottom edge, NDC (lower value)
+};
+
+// True if a scrolled fragment at (ndc_x, ndc_y) lies inside any fixed,
+// non-following float — such fragments are discarded so the scrolled buffer
+// content does not bleed over the float's (unscrolled) cells.
+static inline bool insideFixedFloat(float ndc_x, float ndc_y,
+                                    constant FixedFloatRect* rects, uint count) {
+    for (uint i = 0u; i < count; i++) {
+        constant FixedFloatRect& r = rects[i];
+        if (ndc_x >= r.x0 && ndc_x <= r.x1 && ndc_y <= r.top && ndc_y >= r.bottom) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fragment float4 ps_main(VSOut in [[stage_in]],
                         texture2d<float> tex [[texture(0)]],
                         sampler samp [[sampler(0)]],
                         constant DrawableSize& drawableSize [[buffer(0)]],
                         constant float& backgroundAlpha [[buffer(1)]],
-                        constant uint& cursorBlinkVisible [[buffer(2)]]) {
+                        constant uint& cursorBlinkVisible [[buffer(2)]],
+                        constant FixedFloatRect* fixedFloats [[buffer(3)]],
+                        constant uint& fixedFloatCount [[buffer(4)]]) {
 
     // Discard cursor vertices when cursor blink is off
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
@@ -145,6 +183,14 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     if (in.was_content > 0.5) {
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
+        }
+        // Only window content (was_content ~1.0) is guarded against bleeding over
+        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
+        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
+            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
+            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+                discard_fragment();
+            }
         }
     }
 
@@ -260,13 +306,23 @@ fragment float4 ps_background(VSOut in [[stage_in]],
                                texture2d<float> tex [[texture(0)]],
                                sampler samp [[sampler(0)]],
                                constant DrawableSize& drawableSize [[buffer(0)]],
-                               constant float& backgroundAlpha [[buffer(1)]]) {
+                               constant float& backgroundAlpha [[buffer(1)]],
+                               constant FixedFloatRect* fixedFloats [[buffer(3)]],
+                               constant uint& fixedFloatCount [[buffer(4)]]) {
 
     // Clip scrolled content in margin area (same as ps_main)
     float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
     if (in.was_content > 0.5) {
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
+        }
+        // Only window content (was_content ~1.0) is guarded against bleeding over
+        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
+        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
+            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
+            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+                discard_fragment();
+            }
         }
     }
 
@@ -303,7 +359,9 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
                           sampler samp [[sampler(0)]],
                           constant DrawableSize& drawableSize [[buffer(0)]],
                           constant float& backgroundAlpha [[buffer(1)]],
-                          constant uint& cursorBlinkVisible [[buffer(2)]]) {
+                          constant uint& cursorBlinkVisible [[buffer(2)]],
+                          constant FixedFloatRect* fixedFloats [[buffer(3)]],
+                          constant uint& fixedFloatCount [[buffer(4)]]) {
 
     // Discard cursor vertices when cursor blink is off
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
@@ -315,6 +373,14 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
     if (in.was_content > 0.5) {
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
+        }
+        // Only window content (was_content ~1.0) is guarded against bleeding over
+        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
+        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
+            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
+            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+                discard_fragment();
+            }
         }
     }
 
@@ -411,7 +477,9 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
                                  sampler samp [[sampler(0)]],
                                  constant DrawableSize& drawableSize [[buffer(0)]],
                                  constant float& backgroundAlpha [[buffer(1)]],
-                                 constant uint& cursorBlinkVisible [[buffer(2)]]) {
+                                 constant uint& cursorBlinkVisible [[buffer(2)]],
+                                 constant FixedFloatRect* fixedFloats [[buffer(3)]],
+                                 constant uint& fixedFloatCount [[buffer(4)]]) {
     // ── Common discards (apply to every quad type) ─────────────────────
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
         discard_fragment();
@@ -420,6 +488,14 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
     if (in.was_content > 0.5) {
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
+        }
+        // Only window content (was_content ~1.0) is guarded against bleeding over
+        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
+        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
+            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
+            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+                discard_fragment();
+            }
         }
     }
 

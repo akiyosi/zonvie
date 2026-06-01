@@ -1325,28 +1325,47 @@ final class MetalTerminalView: MTKView {
 
     // MARK: - Smooth Scrolling
 
+    /// Scroll target locked at the start of a trackpad gesture. Subsequent
+    /// events (including momentum) scroll this grid even if the pointer drifts
+    /// over another grid. Cleared when the gesture and its momentum finish.
+    private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
+
     override func scrollWheel(with event: NSEvent) {
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
         if deltaY == 0 && deltaX == 0 { return }
 
-        // Get cursor position in cell coordinates
         let location = convert(event.locationInWindow, from: nil)
-        let (gridId, row, col) = hitTestGrid(at: location, adjustForSmoothScroll: false)
+
+        // Determine the grid to scroll. For trackpad (precise) gestures the
+        // target is resolved once at gesture start and held for the whole
+        // gesture + momentum, so the scroll stays on the grid the gesture began
+        // over even if the pointer later drifts over a scrollable float (req #2).
+        // Mouse-wheel events resolve per event.
+        let target: (gridId: Int64, row: Int32, col: Int32)
+        let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        if event.hasPreciseScrollingDeltas && isGesture {
+            if event.phase.contains(.began) || lockedScrollTarget == nil {
+                lockedScrollTarget = resolveScrollTarget(at: location)
+            }
+            target = lockedScrollTarget ?? resolveScrollTarget(at: location)
+        } else {
+            // Mouse wheel, or a phase-less precise event with no gesture lifecycle:
+            // resolve per event and drop any stale lock so it is never reused.
+            lockedScrollTarget = nil
+            target = resolveScrollTarget(at: location)
+        }
 
         let scale = window?.backingScaleFactor ?? 2.0
-
-        // Build modifier string for scroll event
         let modifier = buildModifierString(from: event.modifierFlags)
 
-        // Vertical scroll
         if deltaY != 0 {
-            ZonvieCore.appLog("[scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId)")
+            ZonvieCore.appLog("[scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId)")
 
             let newOffset = handleScrollInput(
-                gridId: gridId,
-                row: row,
-                col: col,
+                gridId: target.gridId,
+                row: target.row,
+                col: target.col,
                 deltaY: deltaY,
                 scale: scale,
                 hasPrecise: event.hasPreciseScrollingDeltas,
@@ -1363,6 +1382,13 @@ final class MetalTerminalView: MTKView {
             }
         }
 
+        // Release the lock once the gesture and its inertia have finished. The
+        // gesture's own .ended is not released here so momentum keeps the same
+        // target; a fresh gesture re-locks on its .began.
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
+            || event.phase.contains(.cancelled) {
+            lockedScrollTarget = nil
+        }
     }
 
     /// Update the shader uniform with current scroll offsets
@@ -1388,7 +1414,7 @@ final class MetalTerminalView: MTKView {
         // NDC scale: 2.0 / drawableHeight (top = 1.0, bottom = -1.0)
         let ndcScale: Float = 2.0 / drawableHeight
 
-        let offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
+        var offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
             guard let info = gridInfoMap[gridId] else { return nil }
             let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: CGFloat(cellHeightPx))
             // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
@@ -1411,6 +1437,37 @@ final class MetalTerminalView: MTKView {
             )
         }
         scrollOffsetLock.unlock()
+
+        // Propagate the underlying window's sub-cell offset to float windows that
+        // sit over it. Neovim repositions floats discretely (cell granularity) on
+        // every committed line scroll, but during the sub-line smooth phase the
+        // buffer is shifted by offsetYPx while the float stays put. Shifting the
+        // float by the same amount keeps it glued to the buffer line it annotates.
+        // Floats carry their own grid_id with DECO_SCROLLABLE already set by the
+        // core, so adding a scroll-offset entry is sufficient — no vertex regen.
+        appendFloatScrollOffsets(into: &offsets, grids: grids, gridInfoMap: gridInfoMap, cellHeightPx: cellHeightPx, ndcScale: ndcScale)
+
+        // Collect fixed (non-following) floats so the fragment shader can discard
+        // scrolled content that would otherwise bleed over them while an adjacent
+        // row is shifted. Only relevant while a smooth scroll is active.
+        var fixedRects: [MetalTerminalRenderer.FixedFloatRect] = []
+        if !offsets.isEmpty {
+            let cellW = Float(renderer.cellWidthPx)
+            let ndcXScale: Float = 2.0 / Float(drawableSize.width)
+            for g in grids where g.zindex > 0 && g.gridId != 1 && !g.followsScroll {
+                // A fixed float that is itself being scrolled (its own content,
+                // because it is logically scrollable) must not mask its own
+                // scrolled content — skip it so the guard never self-discards.
+                if offsets.contains(where: { $0.gridId == g.gridId }) { continue }
+                fixedRects.append(MetalTerminalRenderer.FixedFloatRect(
+                    x0: Float(g.startCol) * cellW * ndcXScale - 1.0,
+                    x1: Float(g.startCol + g.cols) * cellW * ndcXScale - 1.0,
+                    top: 1.0 - Float(g.startRow) * cellHeightPx * ndcScale,
+                    bottom: 1.0 - Float(g.startRow + g.rows) * cellHeightPx * ndcScale
+                ))
+            }
+        }
+        renderer.updateFixedFloatRects(fixedRects)
 
         renderer.updateScrollOffsets(offsets, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
 
@@ -1786,6 +1843,9 @@ final class MetalTerminalView: MTKView {
         var localCol: Int32 = globalCol
 
         for grid in grids {
+            // External grids are separate top-level windows reported at (0,0);
+            // they must not be hit by the main window's coordinate-space test.
+            if grid.isExternal { continue }
             let inRowRange = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
             let inColRange = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
 
@@ -1828,7 +1888,147 @@ final class MetalTerminalView: MTKView {
         return (bestGridId, localRow, localCol)
     }
 
+    /// True when the float has more buffer content than fits in its visible
+    /// area, i.e. it can scroll its own content. Floats that fully show their
+    /// content must not capture smooth scroll — it falls through to the window
+    /// beneath them (req #1). Uses the cached grid info (line_count) so the input
+    /// path never makes a blocking viewport query into the core.
+    private func isFloatLogicallyScrollable(_ grid: ZonvieCore.GridInfo) -> Bool {
+        // Content rows = grid height minus border/winbar margins. Logical
+        // scrollability is position-independent: the buffer simply has more
+        // lines than fit in the visible content area.
+        let contentRows = Int64(max(0, grid.rows - grid.marginTop - grid.marginBottom))
+        return grid.lineCount > contentRows
+    }
+
+    /// Resolve which grid a scroll at `point` should target. A non-scrollable
+    /// float overlay is transparent to scrolling, so the scroll falls through to
+    /// the topmost window beneath it (req #1). Returns grid-local row/col.
+    private func resolveScrollTarget(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let core, renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return (1, 0, 0) }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
+        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+        let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
+        let pointPx: CGPoint = isFlipped
+            ? CGPoint(x: point.x * scale, y: point.y * scale)
+            : CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
+        let globalCol = Int32(pointPx.x / cellW)
+        let globalRow = Int32(pointPx.y / cellH)
+
+        let grids = core.getVisibleGridsCached()
+
+        // Pick the topmost (highest zindex) grid at this point that can actually
+        // receive scroll: a window (zindex 0) or a logically-scrollable float.
+        // Non-scrollable floats are transparent to scrolling and skipped, so a
+        // scrollable grid directly beneath one — be it another float or the base
+        // window — shows through (req #1).
+        var target: ZonvieCore.GridInfo?
+        var bestZ = Int64.min
+        for grid in grids {
+            // External grids are separate top-level windows reported at (0,0);
+            // exclude them from the main window's scroll-target resolution.
+            if grid.isExternal { continue }
+            let inRow = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
+            let inCol = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
+            guard inRow && inCol else { continue }
+            // Skip non-scrollable floats — they do not capture scroll.
+            if grid.zindex > 0 && !isFloatLogicallyScrollable(grid) { continue }
+            let dominated = target == nil || grid.zindex > bestZ ||
+                (grid.zindex == bestZ && grid.gridId > 1 && target!.gridId == 1)
+            if dominated { target = grid; bestZ = grid.zindex }
+        }
+        guard let g = target else { return (1, globalRow, globalCol) }
+        return (g.gridId, globalRow - g.startRow, globalCol - g.startCol)
+    }
+
     /// Clamp visual scroll offset to the range the shader can actually display.
+    /// Give float windows the sub-cell scroll offset of the window they sit over,
+    /// so they stay glued to the buffer line during smooth scrolling. Floats are
+    /// sub-grids with a non-zero zindex; each follows the scrolled window with the
+    /// largest rectangle overlap (so a float whose border extends a row/column past
+    /// the window edge still tracks it). The whole float — including its border
+    /// (viewport-margin) rows — translates via move_all, so a scroll-offset entry
+    /// is all that is needed; the float's vertices are not regenerated.
+    private func appendFloatScrollOffsets(
+        into offsets: inout [MetalTerminalRenderer.ScrollOffsetInfo],
+        grids: [ZonvieCore.GridInfo],
+        gridInfoMap: [Int64: ZonvieCore.GridInfo],
+        cellHeightPx: Float,
+        ndcScale: Float
+    ) {
+        // Nothing to propagate unless a window is actively being scrolled.
+        guard !offsets.isEmpty else { return }
+
+        // Only the window entries built before this call are scroll sources; the
+        // float entries appended below must not be treated as sources. Capture the
+        // count up front and scan offsets[0..<windowCount] in place — no per-frame
+        // array allocation (this runs in the pre-draw path every scrolled frame).
+        let windowCount = offsets.count
+
+        for floatGrid in grids {
+            guard floatGrid.zindex > 0, floatGrid.gridId != 1 else { continue }
+            // Only buffer-tracking floats (repositioned on scroll) pixel-follow.
+            // A fixed editor overlay never repositions and must stay put.
+            guard floatGrid.followsScroll else { continue }
+            // Skip floats that were scrolled directly (already have a window entry).
+            var alreadyScrolled = false
+            for i in 0..<windowCount where offsets[i].gridId == floatGrid.gridId {
+                alreadyScrolled = true
+                break
+            }
+            if alreadyScrolled { continue }
+
+            // Choose which scroll offset to follow:
+            //  - A window-anchored float (anchorGrid > 1) follows ONLY its anchor
+            //    window's scroll, never another window it merely overlaps.
+            //  - An editor/global-anchored float (anchorGrid == 1, e.g. a plugin
+            //    that re-pins it to a buffer line on scroll) follows the scrolled
+            //    window it sits over, by largest rectangle overlap. anchorGrid
+            //    alone cannot tell a buffer-tracking editor float from a fixed one,
+            //    so this case keeps the overlap heuristic.
+            var followedOffsetYPx: Float?
+            if floatGrid.anchorGrid > 1 {
+                for i in 0..<windowCount where offsets[i].gridId == floatGrid.anchorGrid {
+                    // Only follow when the anchor is itself a scrolled window.
+                    if let aw = gridInfoMap[offsets[i].gridId], aw.zindex <= 0 {
+                        followedOffsetYPx = offsets[i].offsetYPx
+                    }
+                    break
+                }
+            } else {
+                // Only windows (zindex <= 0) are valid overlap sources: a directly
+                // scrolled float scrolls its own content and must not bodily-move
+                // other floats.
+                var bestOverlap: Int32 = 0
+                for i in 0..<windowCount {
+                    guard let w = gridInfoMap[offsets[i].gridId], w.zindex <= 0 else { continue }
+                    let rowOverlap = min(floatGrid.startRow + floatGrid.rows, w.startRow + w.rows) - max(floatGrid.startRow, w.startRow)
+                    let colOverlap = min(floatGrid.startCol + floatGrid.cols, w.startCol + w.cols) - max(floatGrid.startCol, w.startCol)
+                    guard rowOverlap > 0, colOverlap > 0 else { continue }
+                    let overlap = rowOverlap * colOverlap
+                    if overlap > bestOverlap {
+                        bestOverlap = overlap
+                        followedOffsetYPx = offsets[i].offsetYPx
+                    }
+                }
+            }
+            guard let offsetYPx = followedOffsetYPx else { continue }
+
+            let gridTopPx = Float(floatGrid.startRow) * cellHeightPx
+            let gridTopYNDC = 1.0 - gridTopPx * ndcScale
+            offsets.append(MetalTerminalRenderer.ScrollOffsetInfo(
+                gridId: floatGrid.gridId,
+                offsetYPx: offsetYPx,
+                gridTopYNDC: gridTopYNDC,
+                gridRows: floatGrid.rows,
+                marginTop: 0,
+                marginBottom: 0,
+                clipToContent: false
+            ))
+        }
+    }
+
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
         let safeCellHeightPx = max(0, cellHeightPx)
         let maxOffsetPx = safeCellHeightPx * 2.0

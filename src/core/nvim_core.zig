@@ -1863,6 +1863,10 @@ pub const Core = struct {
                 .margin_bottom = @intCast(m1.bottom),
                 .margin_left = @intCast(m1.left),
                 .margin_right = @intCast(m1.right),
+                .line_count = if (self.grid.getViewport(1)) |vp| vp.line_count else 0,
+                .anchor_grid = 1,
+                .follows_scroll = 0,
+                .is_external = 0,
             };
             count += 1;
         }
@@ -1895,6 +1899,10 @@ pub const Core = struct {
                 .margin_bottom = @intCast(margins.bottom),
                 .margin_left = @intCast(margins.left),
                 .margin_right = @intCast(margins.right),
+                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                .anchor_grid = pos.anchor_grid,
+                .follows_scroll = if (pos.follows_scroll) 1 else 0,
+                .is_external = 0,
             };
             count += 1;
         }
@@ -1919,6 +1927,10 @@ pub const Core = struct {
                 .margin_bottom = @intCast(margins.bottom),
                 .margin_left = @intCast(margins.left),
                 .margin_right = @intCast(margins.right),
+                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                .anchor_grid = 1,
+                .follows_scroll = 0,
+                .is_external = 1,
             };
             count += 1;
         }

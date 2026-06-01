@@ -2004,6 +2004,17 @@ final class ZonvieCore {
         var marginBottom: Int32
         var marginLeft: Int32
         var marginRight: Int32
+        // Total buffer line count (from win_viewport), 0 if unknown. Used to
+        // decide logical scrollability without a blocking viewport query.
+        var lineCount: Int64
+        // For float sub-grids, the grid this float is anchored to (1 = editor).
+        var anchorGrid: Int64
+        // True if this float has been repositioned since creation (tracks the
+        // buffer on scroll). A fixed float stays false and must not pixel-shift.
+        var followsScroll: Bool
+        // True if this is an external (separate top-level) window grid; excluded
+        // from main-window hit-testing.
+        var isExternal: Bool
     }
 
     /// Get visible grids for hit-testing (highest zindex wins)
@@ -2028,7 +2039,11 @@ final class ZonvieCore {
                 marginTop: g.margin_top,
                 marginBottom: g.margin_bottom,
                 marginLeft: g.margin_left,
-                marginRight: g.margin_right
+                marginRight: g.margin_right,
+                lineCount: g.line_count,
+                anchorGrid: g.anchor_grid,
+                followsScroll: g.follows_scroll != 0,
+                isExternal: g.is_external != 0
             )
         }
     }
@@ -2068,7 +2083,11 @@ final class ZonvieCore {
                     marginTop: g.margin_top,
                     marginBottom: g.margin_bottom,
                     marginLeft: g.margin_left,
-                    marginRight: g.margin_right
+                    marginRight: g.margin_right,
+                    lineCount: g.line_count,
+                    anchorGrid: g.anchor_grid,
+                    followsScroll: g.follows_scroll != 0,
+                    isExternal: g.is_external != 0
                 )
                 if i < cachedVisibleGrids.count {
                     cachedVisibleGrids[i] = info

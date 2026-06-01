@@ -224,6 +224,20 @@ pub const GridInfo = extern struct {
     margin_bottom: i32,
     margin_left: i32,
     margin_right: i32,
+    // Total buffer line count for this grid (from win_viewport), or 0 if unknown.
+    // Lets a frontend decide logical scrollability (line_count > content rows)
+    // without a blocking viewport query on the input path.
+    line_count: i64,
+    // For float sub-grids, the grid this float is anchored to (1 = editor/global).
+    // Lets a frontend route smooth-scroll following: a window-anchored float
+    // follows only that window, not any window it merely overlaps.
+    anchor_grid: i64,
+    // 1 if this float has been repositioned (row changed) since creation, i.e. it
+    // tracks the buffer on scroll. A fixed float stays 0 and must not pixel-shift.
+    follows_scroll: i32,
+    // 1 if this grid is an external (separate top-level) window. Such grids are
+    // reported with start (0,0) and must be excluded from main-window hit-testing.
+    is_external: i32,
 };
 
 /// Viewport info for scrollbar rendering
