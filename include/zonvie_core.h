@@ -807,6 +807,12 @@ ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
  * messages are displayed even when Neovim is waiting for user input. */
 void zonvie_core_tick_msg_throttle(zonvie_core *core);
 
+/* Returns milliseconds until the earliest pending msg_show/msg_history timeout
+ * (throttle or auto-hide), clamped to >= 0. Returns -1 if no timeout is armed.
+ * Lets the frontend schedule a single one-shot timer instead of calling
+ * zonvie_core_tick_msg_throttle every frame. */
+int64_t zonvie_core_next_msg_timeout_ms(zonvie_core *core);
+
 /* Enable blur transparency for background (macOS only).
  * When enabled, default background uses semi-transparent alpha for blur effect.
  * Windows should NOT enable this (causes rendering artifacts). */

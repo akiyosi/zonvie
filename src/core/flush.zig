@@ -6459,6 +6459,36 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
     }
 }
 
+/// Earliest absolute deadline (nanos) among the armed msg_show/msg_history
+/// timeouts, or null if none is pending. Lets the frontend schedule a single
+/// one-shot timer instead of polling every frame.
+/// IMPORTANT: Caller must hold grid_mu.
+pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
+    if (!self.ext_messages_enabled) return null;
+
+    var earliest: ?i128 = null;
+    const consider = struct {
+        fn f(acc: *?i128, deadline: i128) void {
+            if (acc.*) |cur| {
+                if (deadline < cur) acc.* = deadline;
+            } else {
+                acc.* = deadline;
+            }
+        }
+    }.f;
+
+    if (self.msg_show_pending_since) |since| {
+        consider(&earliest, since + self.msg_show_throttle_ns);
+    }
+    if (self.msg_show_auto_hide_at) |hide_at| {
+        consider(&earliest, hide_at);
+    }
+    if (self.msg_history_auto_hide_at) |hide_at| {
+        consider(&earliest, hide_at);
+    }
+    return earliest;
+}
+
 /// Handle message changes - notify frontend via callbacks.
 /// Uses throttle for msg_show (like noice.nvim) to accumulate messages before deciding view.
 pub fn notifyMessageChanges(self: *Core) void {

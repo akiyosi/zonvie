@@ -728,6 +728,13 @@ final class ZonvieCore {
                 // first frame when still in paused mode.  No-op in active mode
                 // (enableSetNeedsDisplay=false).
                 me.terminalView?.requestRedraw()
+                // Re-evaluate the msg throttle/auto-hide deadline after this
+                // flush armed/cleared it.  Dispatched async so grid_mu (held
+                // here on the core thread) is released before scheduleMsgTimer
+                // queries nextMsgTimeoutMs(), which re-acquires it.
+                DispatchQueue.main.async {
+                    me.terminalView?.scheduleMsgTimer()
+                }
                 // Commit external grids directly from core thread — commitFlush()
                 // is thread-safe (uses tripleBufferLock). This eliminates async
                 // dispatch latency that caused smoothness gap vs main window.
@@ -957,6 +964,14 @@ final class ZonvieCore {
     func tickMsgThrottle() {
         guard let core else { return }
         zonvie_core_tick_msg_throttle(core)
+    }
+
+    /// Milliseconds until the core's earliest pending msg_show/msg_history
+    /// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
+    /// timeout is armed. Used to schedule a one-shot tick instead of polling.
+    func nextMsgTimeoutMs() -> Int64 {
+        guard let core else { return -1 }
+        return zonvie_core_next_msg_timeout_ms(core)
     }
 
     func start(nvimPath: String, rows: UInt32, cols: UInt32) -> Int32 {
@@ -2166,6 +2181,16 @@ final class ZonvieCore {
     private var lastBlinkOnMs: UInt32 = 0
     private var lastBlinkOffMs: UInt32 = 0
 
+    /// Single gate for whether the cursor blink timer may run: only while the
+    /// main window is frontmost and visible. Centralizes the focus/occlusion
+    /// check so that background flushes (e.g. a mode change in an unfocused
+    /// nvim, routed through updateCursorBlinking) cannot revive a timer that
+    /// the resign-active / occlusion handlers intentionally stopped.
+    private var cursorBlinkAllowed: Bool {
+        guard let window = terminalView?.window else { return false }
+        return NSApp.isActive && window.occlusionState.contains(.visible) && !window.isMiniaturized
+    }
+
     /// Get current cursor blink parameters from core
     func getCursorBlink() -> (waitMs: UInt32, onMs: UInt32, offMs: UInt32) {
         guard let core else { return (0, 0, 0) }
@@ -2213,6 +2238,15 @@ final class ZonvieCore {
         for (_, gridView) in externalGridViews {
             gridView.cursorBlinkState = true
             gridView.setNeedsDisplay(gridView.bounds)
+        }
+
+        // Do not arm the timer while the window is not frontmost/visible.
+        // The cursor is left solid-visible (state reset above). The
+        // applicationDidBecomeActive / occlusion handlers re-arm via
+        // resetCursorBlink once the window is foregrounded again.
+        if !cursorBlinkAllowed {
+            ZonvieCore.appLog("[blink] window not frontmost/visible, not arming")
+            return
         }
 
         // If all blink values are 0, no blinking - cursor always visible

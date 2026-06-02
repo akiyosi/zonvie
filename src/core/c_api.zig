@@ -1018,6 +1018,22 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     box.core.checkMsgShowThrottleTimeout();
 }
 
+/// Returns milliseconds until the earliest pending msg_show/msg_history
+/// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
+/// timeout is currently armed. Frontend uses this to schedule a one-shot
+/// timer instead of calling zonvie_core_tick_msg_throttle every frame.
+pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64 {
+    if (p == null) return -1;
+    const box = asBox(p.?);
+    box.core.grid_mu.lock();
+    defer box.core.grid_mu.unlock();
+    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
+    const now = std.time.nanoTimestamp();
+    if (deadline <= now) return 0;
+    const remaining_ms = @divTrunc(deadline - now, std.time.ns_per_ms);
+    return @intCast(remaining_ms);
+}
+
 pub export fn zonvie_core_set_blur_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

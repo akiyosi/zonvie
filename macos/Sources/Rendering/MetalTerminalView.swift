@@ -100,62 +100,49 @@ final class MetalTerminalView: MTKView {
     private var activeDrawIdleFrames: Int = 0
     private let activeDrawIdleThreshold = 15
 
-    // DisplayLink drives msg_show throttle ticks and scrollbar viewport polling.
-    private var displayLink: CVDisplayLink?
-    
+    // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
+    // only while the core reports a pending deadline. Replaces the former
+    // always-on CVDisplayLink (see scheduleMsgTimer).
+    private var msgTimer: Timer?
+
     private func dirtyLog(_ msg: @autoclosure () -> String) {
         if Self.dirtyLogEnabled {
             ZonvieCore.appLog(msg())
         }
     }
 
-    // MARK: - DisplayLink (msg throttle + scrollbar polling)
+    // MARK: - Msg throttle timer (replaces the always-on display link)
 
-    private func startDisplayLink() {
-        guard displayLink == nil else { return }
-
-        var link: CVDisplayLink?
-        CVDisplayLinkCreateWithActiveCGDisplays(&link)
-        guard let link else { return }
-
-        let callback: CVDisplayLinkOutputCallback = { _, _, _, _, _, userInfo in
-            guard let userInfo else { return kCVReturnSuccess }
-            let view = Unmanaged<MetalTerminalView>.fromOpaque(userInfo).takeUnretainedValue()
-            view.displayLinkFired()
-            return kCVReturnSuccess
-        }
-
-        let userInfo = Unmanaged.passUnretained(self).toOpaque()
-        CVDisplayLinkSetOutputCallback(link, callback, userInfo)
-        CVDisplayLinkStart(link)
-        displayLink = link
-    }
-
-    private func stopDisplayLink() {
-        if let link = displayLink {
-            CVDisplayLinkStop(link)
-            displayLink = nil
-        }
-    }
-
-    /// Called by display link at screen refresh rate
-    private func displayLinkFired() {
-        DispatchQueue.main.async { [weak self] in
+    /// Schedule a one-shot tick at the core's next pending msg timeout.
+    /// No timer is armed when the core reports no pending work (idle case),
+    /// so the app does not wake the CPU while the editor is idle.
+    /// Main thread only.
+    func scheduleMsgTimer() {
+        msgTimer?.invalidate()
+        msgTimer = nil
+        guard let core else { return }
+        // Skip while minimized: the Zig core's grid state must not be queried
+        // while the window is in the Dock, and nothing is visible anyway.
+        if window?.isMiniaturized == true { return }
+        let ms = core.nextMsgTimeoutMs()
+        guard ms >= 0 else { return }  // -1 => nothing pending
+        msgTimer = Timer.scheduledTimer(withTimeInterval: Double(max(0, ms)) / 1000.0,
+                                        repeats: false) { [weak self] _ in
             guard let self else { return }
-            // Skip all work when minimized: the Zig core's grid state
-            // must not be queried while the window is in the Dock.
+            // Re-check at fire time: the window may have been minimized after
+            // the timer was armed.  The Zig core's grid state must not be
+            // queried while the window is in the Dock.  Let the timer die here;
+            // windowDidDeminiaturize re-arms it on restore.
             if self.window?.isMiniaturized == true { return }
-
-            // Check msg_show throttle timeout (noice.nvim-style)
             self.core?.tickMsgThrottle()
-            // Only poll viewport when a flush has occurred since last check.
-            // This prevents bursts of getViewport calls after scrolling stops
-            // while displayLink is still active.
-            if self.flushSinceLastPoll {
-                self.flushSinceLastPoll = false
-                self.updateScrollbarIfNeeded()
-            }
+            self.scheduleMsgTimer()  // re-arm for the next deadline, if any
         }
+    }
+
+    /// Stop the msg throttle timer (e.g. while minimized). Main thread only.
+    func cancelMsgTimer() {
+        msgTimer?.invalidate()
+        msgTimer = nil
     }
 
     // Debug: call this from draw to test scrollbar update
@@ -404,7 +391,6 @@ final class MetalTerminalView: MTKView {
 
         if window != nil {
             window?.acceptsMouseMovedEvents = true
-            startDisplayLink()
 
             // Ensure layer transparency settings are applied after window is available
             if ZonvieConfig.shared.blurEnabled {
@@ -415,14 +401,16 @@ final class MetalTerminalView: MTKView {
                 self.layer?.backgroundColor = NSColor.black.cgColor
             }
         } else {
-            stopDisplayLink()
+            msgTimer?.invalidate()
+            msgTimer = nil
         }
     }
 
     deinit {
         scrollbarHideTimer?.invalidate()
         scrollbarHideTimer = nil
-        stopDisplayLink()
+        msgTimer?.invalidate()
+        msgTimer = nil
     }
 
     // MARK: - Mouse Input
@@ -713,12 +701,6 @@ final class MetalTerminalView: MTKView {
     }
 
     // MARK: - Scrollbar
-
-    /// Set when a flush completes; consumed by displayLinkFired to gate
-    /// viewport polling. Without this, displayLink calls getViewport every
-    /// tick (~60fps) even when nothing has changed, causing bursts of
-    /// redundant calls after scrolling stops. Only accessed on main thread.
-    private var flushSinceLastPoll = false
 
     /// Update scrollbar if viewport changed
     private func updateScrollbarIfNeeded() {
@@ -1026,7 +1008,6 @@ final class MetalTerminalView: MTKView {
 
         // Update scrollbar on vertex submission
         DispatchQueue.main.async { [weak self] in
-            self?.flushSinceLastPoll = true
             self?.updateScrollbarIfNeeded()
         }
     }
@@ -1189,7 +1170,6 @@ final class MetalTerminalView: MTKView {
 
         // Update scrollbar on vertex submission
         DispatchQueue.main.async { [weak self] in
-            self?.flushSinceLastPoll = true
             self?.updateScrollbarIfNeeded()
         }
     }

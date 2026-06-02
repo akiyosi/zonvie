@@ -252,11 +252,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        // Stop the msg throttle timer while in the Dock: a timer that fires here
+        // would query the Zig core's grid state, which must not happen while the
+        // window is minimized.
+        let win = notification.object as? NSWindow ?? window
+        if let vc = win?.contentViewController as? ViewController {
+            vc.core?.terminalView?.cancelMsgTimer()
+        }
+    }
+
     func windowDidDeminiaturize(_ notification: Notification) {
         // Trigger a full redraw so the window content is up-to-date after restore.
         let win = notification.object as? NSWindow ?? window
         if let vc = win?.contentViewController as? ViewController {
             vc.requestFullRedraw()
+            // Re-arm the msg throttle timer explicitly rather than relying on a
+            // flush to do it: a pending auto-hide deadline armed before minimize
+            // must resume firing on restore.
+            vc.core?.terminalView?.scheduleMsgTimer()
         }
     }
 
@@ -271,12 +285,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(true)
+            // Resume cursor blinking now that we are frontmost.
+            vc.core?.resetCursorBlink()
         }
     }
 
     func applicationWillResignActive(_ notification: Notification) {
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(false)
+            // Stop the recursive blink timer while in the background so it does
+            // not wake the CPU to redraw a window the user isn't looking at.
+            vc.core?.stopCursorBlinking()
+        }
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        let win = notification.object as? NSWindow ?? window
+        guard let vc = win?.contentViewController as? ViewController else { return }
+        // Pause blinking when the window is fully occluded; resume only when it
+        // is visible and the app is frontmost (focus gating handled separately).
+        if win?.occlusionState.contains(.visible) == true && NSApp.isActive {
+            vc.core?.resetCursorBlink()
+        } else {
+            vc.core?.stopCursorBlinking()
         }
     }
 
