@@ -421,12 +421,25 @@ final class ZonvieCore {
                                     gridView.bumpRevisionAndRedraw()
                                 } else {
                                     // Still no gridView: save to pending for window creation replay.
-                                    // Skip cursor-only updates (flags & 2): cursor vertices have
-                                    // the cursor foreground as bg color (white in dark themes),
-                                    // which would overwrite the correct Normal bg in pending config
-                                    // and replace main content vertices with cursor-only data.
+                                    // Cursor-only updates (flags & 2) must NOT go into the per-row
+                                    // pendingExternalVertices: cursor vertices carry the cursor fg as
+                                    // bg color and would overwrite the correct Normal bg in pending
+                                    // config and replace the main content row at the same rowStart.
+                                    // Keep the cursor layer in a separate slot (full-layer replace)
+                                    // so it can be replayed with the CURSOR flag on window creation —
+                                    // otherwise the cursor is invisible until the next live flush.
                                     let isCursorOnly = (fl & 2) != 0
-                                    if !isCursorOnly {
+                                    if isCursorOnly {
+                                        // Only plain external floats need the pending-cursor replay.
+                                        // Decorated grids (cmdline / popupmenu / message) re-submit
+                                        // their cursor live once the window exists and position it
+                                        // relative to the firstc icon / prompt; replaying a stale
+                                        // captured cursor here draws it at the wrong spot (e.g. the
+                                        // ext_cmdline cursor before the firstc icon at col 0).
+                                        if core.classifyExternalGridKind(gridId) == .normal {
+                                            core.pendingExternalCursor[gridId] = (verts: prepared.vertices, row: rs)
+                                        }
+                                    } else {
                                         if rs == 0 {
                                             let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
                                             let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
@@ -2906,6 +2919,13 @@ final class ZonvieCore {
     /// copies vertex data on the RPC thread and dispatches to main for submission.
     private var pendingExternalVertices: [Int64: (rowVertices: [Int: [zonvie_vertex]], rows: UInt32, cols: UInt32)] = [:]
 
+    /// Pending external-grid cursor layer (the CURSOR-flag submission), held
+    /// separately from pendingExternalVertices because cursor verts carry the
+    /// cursor fg as bg and must not overwrite the main content row at the same
+    /// rowStart. Replayed with flags=CURSOR once the window is created so the
+    /// cursor is visible immediately, not only after the next live flush.
+    private var pendingExternalCursor: [Int64: (verts: [zonvie_vertex], row: Int)] = [:]
+
     /// Pending external window requests (queued when terminalView or pipeline is not ready yet)
     private struct PendingExternalWindowRequest {
         let gridId: Int64
@@ -3514,6 +3534,7 @@ final class ZonvieCore {
             // would leak indefinitely when the grid is closed.
             self.pendingExternalVertices.removeValue(forKey: gridId)
             self.pendingExternalGridConfig.removeValue(forKey: gridId)
+            self.pendingExternalCursor.removeValue(forKey: gridId)
 
             // Drop any queued window-creation request for this gridId.
             // resetSessionState fires close callbacks for every external
@@ -4240,6 +4261,25 @@ final class ZonvieCore {
                 rows: pendingConfig.rows,
                 cols: pendingConfig.cols
             )
+        }
+
+        // Replay the cursor layer captured before the window existed, with the
+        // CURSOR flag so the gridView populates its dedicated cursor buffer.
+        // Without this the cursor stays invisible until the next live flush.
+        if let pendingCursor = self.pendingExternalCursor.removeValue(forKey: gridId), !pendingCursor.verts.isEmpty {
+            ZonvieCore.appLog("[external_window] applying pending cursor for gridId=\(gridId) verts=\(pendingCursor.verts.count)")
+            pendingCursor.verts.withUnsafeBufferPointer { buffer in
+                gridView.submitVerticesRowRaw(
+                    rowStart: pendingCursor.row,
+                    rowCount: 1,
+                    ptr: buffer.baseAddress,
+                    count: buffer.count,
+                    flags: 2, // ZONVIE_VERT_UPDATE_CURSOR
+                    totalRows: 0,
+                    totalCols: 0
+                )
+            }
+            requestedRedraw = true
         }
 
         if requestedRedraw {
@@ -4985,6 +5025,14 @@ final class ZonvieCore {
                     extWindow.makeFirstResponder(gridView)
                 }
                 ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId)")
+            } else if self.classifyExternalGridKind(gridId) != .normal {
+                // Cursor moved onto a synthetic decorated grid (cmdline /
+                // popupmenu / message) whose host window is not registered yet:
+                // its creation runs in a later main-queue block and makes itself
+                // key on creation. Activating the main window here would steal
+                // front ordering away from a focused external float while the
+                // cmdline is being shown.
+                ZonvieCore.appLog("[cursor_grid_changed] special grid \(gridId) not yet registered; skip main activation")
             } else {
                 // Cursor moved to global grid - activate main window
                 if let mainWindow = self.terminalView?.window {

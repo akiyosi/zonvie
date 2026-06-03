@@ -13,14 +13,23 @@ pub const std_options = std.Options{
     .enable_segfault_handler = true,
 };
 
-/// MAKEINTRESOURCE: turn a resource ordinal into the LPCWSTR the resource
-/// APIs expect. The integer is never dereferenced, but LPCWSTR's element
-/// type has alignment 2, so route the value through a runtime usize to skip
-/// the comptime alignment check that a bare `@ptrFromInt(odd_id)` would hit.
-fn makeIntResource(id: u16) c.LPCWSTR {
-    const addr: usize = id;
-    return @ptrFromInt(addr);
+/// MAKEINTRESOURCE: turn a resource ordinal into the pointer the resource APIs
+/// expect. The ordinal is never dereferenced, but a typed LPCWSTR
+/// ([*c]const u16) has alignment 2, so `@ptrFromInt` of an odd ordinal (e.g. 1)
+/// trips the Debug-build *runtime* alignment check and panics with
+/// "incorrect alignment". (Routing through a runtime usize only defeats the
+/// *comptime* check; the runtime assertion still fires.) Return an align-1
+/// opaque pointer so no alignment is asserted; the resource-name parameter of
+/// our local LoadIconW takes the same type, so the value never coerces back to
+/// an align-2 pointer.
+fn makeIntResource(id: u16) ?*const anyopaque {
+    return @ptrFromInt(@as(usize, id));
 }
+
+/// user32 LoadIconW redeclared with an align-agnostic resource-name pointer
+/// (see makeIntResource) and a direct HICON return, so neither the ordinal
+/// argument nor the returned handle is forced through an alignment assertion.
+extern "user32" fn LoadIconW(hInstance: c.HINSTANCE, lpIconName: ?*const anyopaque) callconv(.winapi) c.HICON;
 
 /// Custom panic handler for debug builds that prints stack traces.
 /// In release builds, falls back to std default behavior.
@@ -655,15 +664,15 @@ pub fn main() u8 {
     // the generic default. MAKEINTRESOURCE isn't translated by the C import,
     // so pass the numeric resource id directly as a pointer (same as the
     // IDC_ARROW / IDI_APPLICATION uses elsewhere).
-    wc.hIcon = c.LoadIconW(wc.hInstance, makeIntResource(1)); // large icon (Alt-Tab)
-    wc.hIconSm = @ptrCast(@alignCast(c.LoadImageW( // small icon (title bar) at exact size
-        wc.hInstance,
-        makeIntResource(1),
-        c.IMAGE_ICON,
-        c.GetSystemMetrics(c.SM_CXSMICON),
-        c.GetSystemMetrics(c.SM_CYSMICON),
-        c.LR_DEFAULTCOLOR,
-    )));
+    wc.hIcon = LoadIconW(wc.hInstance, makeIntResource(1)); // large icon (Alt-Tab)
+    // Small icon (title bar / Alt-Tab small slot). LoadIconW returns HICON
+    // directly. The earlier LoadImageW path returned HANDLE and cast it to HICON
+    // ([*c]HICON__, align 4) via @ptrCast(@alignCast(...)); a Win32 USER handle
+    // is an opaque table entry, not a real pointer, so it is not guaranteed
+    // 4-byte aligned and the cast tripped the Debug alignment check. A direct
+    // HICON return needs no conversion. Windows scales it to the small-icon
+    // size; exact-size LoadImageW is not worth a startup crash.
+    wc.hIconSm = LoadIconW(wc.hInstance, makeIntResource(1));
     wc.hbrBackground = null;
     wc.lpszClassName = @ptrCast(class_name.ptr);
 

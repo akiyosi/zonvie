@@ -818,10 +818,15 @@ pub fn onVerticesRow(
                         ext_win.surface.last_cursor_row = null;
                     }
                 } else {
-                    // Flat-mode: append cursor verts to flat vert array (legacy path).
+                    // Flat-mode: store the cursor in the dedicated cursor_verts
+                    // buffer (replace, not append). Appending into surface.verts
+                    // accumulated stale cursor geometry across mode/shape changes
+                    // — the old block stayed drawn under the new insert-bar shape.
+                    // The non-row-mode paint path reads surface.cursor_verts (see
+                    // paintExternalWindow), so this is also where it must live.
+                    ext_win.surface.cursor_verts.clearRetainingCapacity();
                     if (verts_ptr != null and vert_count != 0) {
-                        ext_win.surface.verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch return;
-                        ext_win.vert_count = ext_win.surface.verts.items.len;
+                        ext_win.surface.cursor_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch return;
                         ext_win.surface.last_cursor_row = row_start;
                     } else {
                         ext_win.surface.last_cursor_row = null;

@@ -2735,6 +2735,12 @@ pub const FlushCtx = struct {
                         const grid_id = e.key_ptr.*;
                         // Only sub grids
                         if (grid_id == 1) continue;
+                        // An external float is composited here via win_pos but is
+                        // ALSO rendered in its own top-level window. Compositing it
+                        // into the main grid double-draws its content (and its
+                        // cursor cell) behind the float window. Its own window is
+                        // the sole renderer, so skip it here.
+                        if (ctx.core.grid.external_grids.contains(grid_id)) continue;
 
                         const layer = ctx.core.grid.win_layer.get(grid_id) orelse @as(@import("grid.zig").WinLayer, .{
                             .zindex = 0,
@@ -4241,7 +4247,15 @@ pub const FlushCtx = struct {
                 // Embedded grids (win_pos) have their cursor drawn on global grid via coordinate transform
                 // External/special grids (external_grids, cmdline, etc.) render their own cursor
                 const cursor_grid = ctx.core.grid.cursor_grid;
-                const cursor_embedded_in_main = (cursor_grid == 1) or ctx.core.grid.win_pos.contains(cursor_grid);
+                // A float that is also an external (separate-window) grid is
+                // composited into the main grid via win_pos AND rendered in its
+                // own window. Its window draws the real, shape-aware cursor, so
+                // the main grid must NOT also embed one — otherwise a second,
+                // stale block cursor is drawn at the float's anchor and never
+                // tracks the mode (block / vertical / horizontal) change.
+                const cursor_embedded_in_main = (cursor_grid == 1) or
+                    (ctx.core.grid.win_pos.contains(cursor_grid) and
+                        !ctx.core.grid.external_grids.contains(cursor_grid));
 
                 if (cursor_embedded_in_main) {
                     _ = cursor.ensureTotalCapacity(ctx.core.alloc, 64) catch {};
@@ -4665,8 +4679,18 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Otherwise we consume the cursor state before the grid window is created.
     // Always update cursor rev to prevent stale changed=true accumulation.
     const has_external_grids = self.known_external_grids.count() > 0;
+    // Hold off consuming the cursor grid while the cursor sits on an external
+    // grid whose host window has not been created yet (in external_grids but
+    // not yet known_external_grids). Consuming it here lets grid_changed go
+    // false on the next flush, so the cursor layer is never re-emitted into
+    // the freshly created grid view and the cursor stays invisible until the
+    // next keystroke. This happens when another external window is already
+    // open (e.g. opening ext_cmdline from a focused float): has_external_grids
+    // is already true, so the old broad gate did not protect this case.
+    const cursor_grid_pending = self.grid.external_grids.contains(cursor_grid) and
+        !self.known_external_grids.contains(cursor_grid);
     defer {
-        if (has_external_grids) {
+        if (has_external_grids and !cursor_grid_pending) {
             self.last_ext_cursor_grid = cursor_grid;
         }
         self.last_ext_cursor_rev = cursor_rev;

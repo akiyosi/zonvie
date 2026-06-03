@@ -2583,6 +2583,15 @@ pub export fn WndProc(
                     // Cursor moved to external grid - activate that window
                     _ = c.SetForegroundWindow(eh);
                     if (applog.isEnabled()) applog.appLog("[win] activated external window for grid_id={d}\n", .{grid_id});
+                } else if (grid_id == CMDLINE_GRID_ID or grid_id == POPUPMENU_GRID_ID or grid_id == MESSAGE_GRID_ID or grid_id == MSG_HISTORY_GRID_ID) {
+                    // Cursor moved onto a synthetic decorated grid (cmdline /
+                    // popupmenu / message) whose host window has not been
+                    // created yet: its WM_APP_CREATE_EXTERNAL_WINDOW is still
+                    // behind us in the UI queue and the window (WS_EX_TOPMOST,
+                    // shown with SW_SHOWNA) surfaces itself on creation.
+                    // Activating the main window here would yank it in front of
+                    // a focused float while the cmdline is shown.
+                    if (applog.isEnabled()) applog.appLog("[win] special grid {d} not yet registered; skip main activation\n", .{grid_id});
                 } else {
                     // Cursor moved to global grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
