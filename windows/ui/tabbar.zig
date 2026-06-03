@@ -1384,10 +1384,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Draw X
             const pen = c.CreatePen(c.PS_SOLID, 1, pal.glyph_pen);
             const old_pen = c.SelectObject(hdc, pen);
+            // GDI LineTo excludes the endpoint pixel. Extend each LineTo target by
+            // one step in the line direction so both bottom corners of the X are
+            // covered (otherwise the bottom of the X looks clipped).
             _ = c.MoveToEx(hdc, close_x + close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y + close_size - close_inset);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset + 1, close_y + close_size - close_inset + 1);
             _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_inset, close_y + close_size - close_inset);
+            _ = c.LineTo(hdc, close_x + close_inset - 1, close_y + close_size - close_inset + 1);
             _ = c.SelectObject(hdc, old_pen);
             _ = c.DeleteObject(pen);
         }
@@ -1410,15 +1413,29 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             _ = c.DeleteObject(plus_hover_brush);
         }
 
-        // Draw + icon
-        const pen = c.CreatePen(c.PS_SOLID, 2, pal.glyph_pen);
-        const old_pen = c.SelectObject(hdc, pen);
-        _ = c.MoveToEx(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_icon_inset, null);
-        _ = c.LineTo(hdc, plus_x + @divTrunc(plus_btn_size, 2), plus_y + plus_btn_size - plus_icon_inset);
-        _ = c.MoveToEx(hdc, plus_x + plus_icon_inset, plus_y + @divTrunc(plus_btn_size, 2), null);
-        _ = c.LineTo(hdc, plus_x + plus_btn_size - plus_icon_inset, plus_y + @divTrunc(plus_btn_size, 2));
-        _ = c.SelectObject(hdc, old_pen);
-        _ = c.DeleteObject(pen);
+        // Draw + icon as two filled 2px bars. A width-2 GDI pen renders
+        // asymmetrically, so each bar spans inset-1 .. (btn-inset) inclusive to
+        // keep the arms equal: the 2px thickness sits at center-1..center (half a
+        // pixel up-left), so without the -1 on top/left the up-left arms come out
+        // 1px short. The +1 on right/bottom also covers FillRect's excluded edge.
+        const plus_cx = plus_x + @divTrunc(plus_btn_size, 2);
+        const plus_cy = plus_y + @divTrunc(plus_btn_size, 2);
+        const plus_brush = c.CreateSolidBrush(pal.glyph_pen);
+        var v_bar = c.RECT{
+            .left = plus_cx - 1,
+            .top = plus_y + plus_icon_inset - 1,
+            .right = plus_cx + 1,
+            .bottom = plus_y + plus_btn_size - plus_icon_inset + 1,
+        };
+        var h_bar = c.RECT{
+            .left = plus_x + plus_icon_inset - 1,
+            .top = plus_cy - 1,
+            .right = plus_x + plus_btn_size - plus_icon_inset + 1,
+            .bottom = plus_cy + 1,
+        };
+        _ = c.FillRect(hdc, &v_bar, plus_brush);
+        _ = c.FillRect(hdc, &h_bar, plus_brush);
+        _ = c.DeleteObject(plus_brush);
     }
 
     // Draw window control buttons (min, max, close) on the right
