@@ -2679,13 +2679,62 @@ final class ZonvieCore {
         // can trigger windowDidResize → updateLayoutPx, which would deadlock
         // if grid_mu were still held by this thread.
         DispatchQueue.main.async { [weak self] in
-            self?.snapMainWindowContentToCell()
+            self?.scheduleWindowSnap()
             view.requestRedraw()
             self?.externalGridViews.values.forEach {
                 $0.notifyFontChanged()
                 $0.requestRedraw()
             }
         }
+    }
+
+    /// Coalesces window snaps that arrive in a burst. Replaces a direct
+    /// snapMainWindowContentToCell() call.
+    ///
+    /// During startup nvim emits the built-in default `guifont` first and the
+    /// user's configured `guifont` a moment later (typically <200ms apart), so
+    /// two cell-metric changes fire back to back with *different* cell sizes.
+    /// Snapping on each one compounds: the first snap shrinks the restored
+    /// frame to the default font's grid, then the second snaps that
+    /// already-shrunk frame to the real font's grid. Because the saved frame
+    /// was restored aligned to the *final* font's grid, the only snap that
+    /// should run is the last one in the burst — for which the remainder is
+    /// zero, making it a no-op and keeping the window size stable across
+    /// launches. Without coalescing the window loses a remainder strip on
+    /// every launch and shrinks indefinitely.
+    ///
+    /// LIMITATIONS — the 300ms below is a probabilistic threshold, not an
+    /// invariant:
+    ///
+    ///   1. Fragile to slow startup. The coalescing assumes the user's
+    ///      `guifont` arrives within 300ms of the default. On a slow machine,
+    ///      a heavy init.lua, or late plugin-driven `guifont`/`linespace`, the
+    ///      user font can land *after* the window has already fired, splitting
+    ///      the burst into two snaps with different cell sizes — and the
+    ///      shrink-per-launch bug recurs. A truly robust design would gate the
+    ///      snap on a startup-complete / config-settled event instead of a
+    ///      timer; 300ms is a pragmatic compromise, not a guarantee.
+    ///
+    ///   2. Adds 300ms to steady-state font changes. A `:set guifont=...` run
+    ///      interactively now snaps 300ms late, so the remainder strip this
+    ///      snap exists to remove is visible for that window — i.e. the very
+    ///      artifact the snap fixes briefly flashes. Minor and accepted.
+    ///
+    /// Synchronization: the work item is created, cancelled, and executed
+    /// exclusively on the main thread (this method is only reached from the
+    /// main-queue block above), so `snapWorkItem` needs no additional locking.
+    private var snapWorkItem: DispatchWorkItem?
+    private func scheduleWindowSnap() {
+        snapWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.snapWorkItem = nil
+            self?.snapMainWindowContentToCell()
+        }
+        snapWorkItem = item
+        // 300ms spans the observed ~150ms default→user guifont gap with margin
+        // while staying a single, barely-perceptible settle after first paint.
+        // See LIMITATIONS above: this is a heuristic threshold, not a bound.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
     /// Snap the main NSWindow's content size down to the largest multiple of
@@ -2700,8 +2749,20 @@ final class ZonvieCore {
     ///
     /// Must run on the main thread (touches NSWindow). Must be called with
     /// grid_mu NOT held — setFrame can trigger windowDidResize synchronously.
-    /// No-op when the remainder is already zero on both axes, so it does
-    /// not interfere with steady-state user resizes.
+    /// No-op when the window already holds the target terminal size, so it
+    /// does not interfere with steady-state user resizes.
+    ///
+    /// The user's *desired* terminal size, in points, that this snaps. It is
+    /// the restored frame's terminal area at launch, then whatever a user or
+    /// system resize sets — never our own snap result. Read and written on the
+    /// main thread only (the snap below; MetalTerminalView.maybeResizeCoreGrid),
+    /// never from the RPC thread, so it needs no lock.
+    var desiredTermPx: CGSize?
+    /// Terminal point size the last snap set the window to. Lets
+    /// maybeResizeCoreGrid distinguish the resize echo from our own setFrame
+    /// (which matches this) from a genuine user resize (which does not), so the
+    /// echo does not overwrite desiredTermPx. Main-thread only.
+    var lastSnappedTermPx: CGSize?
     private func snapMainWindowContentToCell() {
         guard let view = terminalView else { return }
         guard let window = view.window else { return }
@@ -2711,25 +2772,55 @@ final class ZonvieCore {
         let scale = window.backingScaleFactor
         guard scale > 0 else { return }
 
-        // Use the view's bounds (in points) as the authoritative current
-        // content size. drawableSize is in pixels and may lag bounds by one
-        // frame; bounds is what NSWindow setContentSize would round-trip to.
-        let currentContentPt = view.bounds.size
-        let currentWPx = Int((currentContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
-        let currentHPx = Int((currentContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
+        // Snap the *desired* terminal size, not the live view.bounds. During
+        // startup the cell metrics change twice (the built-in default guifont,
+        // then the user's configured guifont) and each requests a snap. Snap is
+        // idempotent only for the *same* cell — snap(snap(x, c1), c2) ≤
+        // snap(x, c2) — so chaining each snap onto the previous one's (already
+        // shrunk) result loses a strip on every launch. Snapping a stable
+        // reference makes the final snap reproduce the same frame no matter how
+        // many intermediate snaps ran or how far apart they arrived, which is
+        // what removes the timing dependency of the scheduleWindowSnap debounce
+        // (LIMITATION #1 there): even if the burst splits, correctness holds.
+        let actualContentPt = view.bounds.size
+        if desiredTermPx == nil { desiredTermPx = actualContentPt }
+        let baseContentPt = desiredTermPx ?? actualContentPt
 
-        let snappedWPx = (currentWPx / cellWPx) * cellWPx
-        let snappedHPx = (currentHPx / cellHPx) * cellHPx
+        let baseWPx = Int((baseContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
+        let baseHPx = Int((baseContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
+        let snappedWPx = (baseWPx / cellWPx) * cellWPx
+        let snappedHPx = (baseHPx / cellHPx) * cellHPx
         if snappedWPx <= 0 || snappedHPx <= 0 { return }
 
-        let remainderW = currentWPx - snappedWPx
-        let remainderH = currentHPx - snappedHPx
-        if remainderW == 0 && remainderH == 0 { return }
+        // No-op when the window already holds the target terminal size on both
+        // axes — steady state, or the resize echo from our own setFrame.
+        let curWPx = Int((actualContentPt.width * scale).rounded(.toNearestOrAwayFromZero))
+        let curHPx = Int((actualContentPt.height * scale).rounded(.toNearestOrAwayFromZero))
+        if snappedWPx == curWPx && snappedHPx == curHPx { return }
+
+        // terminalView may be inset within the window's content view: the
+        // 36pt Chrome tab bar in titlebar mode (vertical) or the sidebar
+        // width in sidebar mode (horizontal). Snapping operates on the
+        // terminal area, but the frame is rebuilt from the full window
+        // content size, so the inset must be preserved. Without this, each
+        // launch sets the window content to the snapped *terminal* size,
+        // dropping the inset every time and shrinking the window by the tab
+        // bar height (or sidebar width) on every startup. The inset is taken
+        // from the live rects (actual content), not the desired size.
+        let windowContentPt = window.contentView?.bounds.size ?? actualContentPt
+        let insetWPt = windowContentPt.width - actualContentPt.width
+        let insetHPt = windowContentPt.height - actualContentPt.height
 
         let newContentPt = CGSize(
-            width: CGFloat(snappedWPx) / scale,
-            height: CGFloat(snappedHPx) / scale
+            width: CGFloat(snappedWPx) / scale + insetWPt,
+            height: CGFloat(snappedHPx) / scale + insetHPt
         )
+
+        // Record the terminal size this snap produces so the resize echo it
+        // triggers is recognised in maybeResizeCoreGrid and not mistaken for a
+        // user resize that would overwrite desiredTermPx.
+        lastSnappedTermPx = CGSize(width: CGFloat(snappedWPx) / scale,
+                                   height: CGFloat(snappedHPx) / scale)
 
         // Keep the top-left corner fixed (macOS frame origin is bottom-left).
         let oldFrame = window.frame
@@ -2743,7 +2834,7 @@ final class ZonvieCore {
             width: frameRect.width,
             height: frameRect.height
         )
-        Self.appLog("[snap] cell=(\(cellWPx)x\(cellHPx)) content_px=(\(currentWPx)x\(currentHPx)) -> (\(snappedWPx)x\(snappedHPx)) remainder=(\(remainderW),\(remainderH))")
+        Self.appLog("[snap] cell=(\(cellWPx)x\(cellHPx)) base_px=(\(baseWPx)x\(baseHPx)) cur_px=(\(curWPx)x\(curHPx)) -> (\(snappedWPx)x\(snappedHPx))")
         window.setFrame(newFrame, display: true)
     }
 

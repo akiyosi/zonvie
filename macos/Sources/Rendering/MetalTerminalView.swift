@@ -931,6 +931,23 @@ final class MetalTerminalView: MTKView {
             let cols = UInt32(max(1, pxWi / cellWi))
             let rows = UInt32(max(1, pxHi / cellHi))
             core.notifyInitialLayout(rows: rows, cols: cols)
+
+            // Track the user's desired terminal size as the reference the main
+            // window cell-snap operates on (see snapMainWindowContentToCell).
+            // Update on every genuine resize — the restored frame at launch,
+            // user drags, zoom, display changes — but skip the resize echo our
+            // own snap setFrame produces: it matches the size the snap recorded
+            // in lastSnappedTermPx. Gated on the >= 1 cell check above so the
+            // transient 1×N / N×1 placeholder layout never becomes the
+            // reference. Main-thread only, same as the snap.
+            let curTermPt = bounds.size
+            if let snapped = core.lastSnappedTermPx,
+               abs(curTermPt.width - snapped.width) < 0.5,
+               abs(curTermPt.height - snapped.height) < 0.5 {
+                // Echo from our own snap; leave desiredTermPx untouched.
+            } else {
+                core.desiredTermPx = curTermPt
+            }
         }
 
         // Set screen width in cells for cmdline max width.
