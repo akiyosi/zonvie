@@ -47,6 +47,8 @@ jobs:
             -configuration Release \
             -derivedDataPath macos/.derived \
             -destination "platform=macOS,arch=${{ matrix.arch }}" \
+            ARCHS="${{ matrix.arch }}" \
+            ONLY_ACTIVE_ARCH=YES \
             build
 
       - name: Create macOS DMG
