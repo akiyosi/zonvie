@@ -2342,6 +2342,12 @@ pub const CursorOverlayParams = struct {
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     last_painted_cursor_row: *?u32,
+    /// When true, clear the cursor row to bg and redraw its content before
+    /// drawing the cursor. External windows use preserve_back and do not clear
+    /// their back_tex per paint, so an in-place cursor shape/position change
+    /// would stack the new overlay on top of the stale one (block + bar). The
+    /// clear+redraw erases the old overlay even over empty (no-bg-quad) cells.
+    erase_cursor_row: bool = false,
 };
 
 pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
@@ -2392,8 +2398,31 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
         f(p.ctx_ptr, 1, &sc);
     }
 
-    // 4. Blink on: draw cursor VB. Blink off: redraw row VB to erase cursor.
-    if (p.blink_visible) {
+    // 4. Erase the previous cursor overlay, then draw the new one.
+    // erase_cursor_row (external windows): clear the cursor row to bg and redraw
+    // its content first, so a stale overlay left in the preserved back_tex is
+    // erased even over empty cells. Without it, an in-place shape change stacks
+    // the new overlay on top of the old (block + bar). Then draw the cursor when
+    // blink is visible.
+    // Default path (main window): blink on draws the cursor; blink off redraws
+    // the row content to erase the cursor.
+    if (p.erase_cursor_row) {
+        if (log_enabled) applog.appLog("[cursor-overlay] erase+draw row={d} verts={d} blink={}\n", .{ cursor_row, p.cursor_verts.len, p.blink_visible });
+        g.drawClearRow() catch {};
+        if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
+            const rvb = &p.row_vbs[cursor_row];
+            const mapping = p.row_map[cursor_row];
+            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slots.items[mapping.slot].verts.items.len else 0;
+            if (rvb.vb) |row_vb| {
+                if (slot_verts_len > 0) {
+                    g.drawVB(row_vb, slot_verts_len) catch {};
+                }
+            }
+        }
+        if (p.blink_visible) {
+            g.drawVB(vb, p.cursor_verts.len) catch {};
+        }
+    } else if (p.blink_visible) {
         if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
         g.drawVB(vb, p.cursor_verts.len) catch {};
     } else {

@@ -988,19 +988,21 @@ pub fn onVerticesRow(
                 }
             }
 
-            // Handle cursor update for pending entries (same logic as ext_win above)
+            // Handle cursor update for pending entries. Store the cursor in the
+            // dedicated cursor_verts buffer (same as the live ext_win path),
+            // NOT baked into row/flat content. Baking left a stale cursor block
+            // in the row that was never erased once the window existed: later
+            // cursor-only updates do not re-send the row's content, so the old
+            // block kept being drawn under the new shape-aware overlay cursor.
             if (is_cursor_update) {
                 if (found_idx) |idx| {
                     const pv = &app.pending_external_verts.items[idx];
+                    pv.surface.cursor_verts.clearRetainingCapacity();
                     if (verts_ptr != null and vert_count != 0) {
-                        const cursor_slice = verts_ptr.?[0..vert_count];
-                        if (pv.surface.row_mode) {
-                            if (!ensureRowStorageGeneric(app.alloc, &pv.surface.row_verts, row_start)) return;
-                            pv.surface.row_verts.items[row_start].verts.appendSlice(app.alloc, cursor_slice) catch return;
-                            pv.surface.row_verts.items[row_start].gen +%= 1;
-                        } else {
-                            pv.surface.verts.appendSlice(app.alloc, cursor_slice) catch return;
-                        }
+                        pv.surface.cursor_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch return;
+                        pv.surface.last_cursor_row = row_start;
+                    } else {
+                        pv.surface.last_cursor_row = null;
                     }
                 }
                 // No pending entry yet means no content rows either; cursor alone is not useful.

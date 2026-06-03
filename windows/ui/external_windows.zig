@@ -505,6 +505,9 @@ fn drawNormalExternalSurfaceRowMode(
         .ctx_ptr = result.ctx_ptr,
         .rs_set_sc_fn = result.rs_set_sc_fn,
         .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
+        // External windows preserve back_tex and may not redraw the cursor row on
+        // an in-place shape change, so erase the stale overlay before redrawing.
+        .erase_cursor_row = true,
     });
 
     // Scrollbar overlay.
@@ -1060,6 +1063,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 ext_win.vert_count = pv.surface.verts.items.len;
             }
 
+            // Transfer the pending cursor overlay. It is stored separately (not
+            // baked into row/flat content), so the first paint draws it as an
+            // overlay and later cursor-only updates replace it cleanly.
+            ext_win.surface.cursor_verts.clearRetainingCapacity();
+            if (pv.surface.cursor_verts.items.len != 0) {
+                ext_win.surface.cursor_verts.appendSlice(app.alloc, pv.surface.cursor_verts.items) catch {};
+            }
+            ext_win.surface.last_cursor_row = pv.surface.last_cursor_row;
+
             // TBS: seed the initial committed set so paintExternalWindow can read data immediately.
             // The ext_win was just created; no flush has committed data to TBS yet.
             {
@@ -1090,6 +1102,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                     cs.flat_verts.clearRetainingCapacity();
                     cs.flat_verts.appendSlice(app.alloc, pv.surface.verts.items) catch {};
                 }
+                // Seed the committed cursor overlay so the first paint draws it.
+                cs.cursor_verts.clearRetainingCapacity();
+                if (pv.surface.cursor_verts.items.len != 0) {
+                    cs.cursor_verts.appendSlice(app.alloc, pv.surface.cursor_verts.items) catch {};
+                }
+                cs.last_cursor_row = pv.surface.last_cursor_row;
+
                 // Mark full paint so first acquireForPaint triggers full draw.
                 ext_win.tbs.pending_paint_full = true;
             }
