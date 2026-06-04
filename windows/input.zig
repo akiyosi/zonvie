@@ -484,6 +484,13 @@ pub fn imeCellWidth(codepoint: u21) u32 {
 /// Wide string constant for "STATIC" window class
 const ime_overlay_class: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
 
+/// HWND_TOPMOST is ((HWND)-1); translate-c's cast of -1 to HWND ([*c]HWND__,
+/// align 4) trips Zig's pointer alignment check. Win32 USER handles are opaque
+/// values, never dereferenced, so redeclare SetWindowPos with an align-agnostic
+/// insert-after pointer (same approach as LoadIconW in main.zig).
+const HWND_TOPMOST: *const anyopaque = @ptrFromInt(std.math.maxInt(usize));
+extern "user32" fn SetWindowPos(hWnd: c.HWND, hWndInsertAfter: ?*const anyopaque, X: c_int, Y: c_int, cx: c_int, cy: c_int, uFlags: c.UINT) callconv(.winapi) c.BOOL;
+
 /// Create or update the IME preedit overlay window using layered window.
 pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     app.mu.lock();
@@ -787,15 +794,18 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     var src_pt: c.POINT = .{ .x = 0, .y = 0 };
     var wnd_size: c.SIZE = .{ .cx = overlay_width, .cy = overlay_height };
 
-    // Window already has WS_EX_TOPMOST extended style, use SWP_NOZORDER
-    _ = c.SetWindowPos(
+    // Re-assert the top of the topmost band on every show: external windows
+    // (e.g. ext-cmdline) are also WS_EX_TOPMOST and may have been created or
+    // brought to foreground after this overlay was created, which would leave
+    // the overlay hidden behind them if SWP_NOZORDER were used.
+    _ = SetWindowPos(
         overlay,
-        null,
+        HWND_TOPMOST,
         pt.x,
         pt.y,
         overlay_width,
         overlay_height,
-        c.SWP_NOACTIVATE | c.SWP_SHOWWINDOW | c.SWP_NOZORDER,
+        c.SWP_NOACTIVATE | c.SWP_SHOWWINDOW,
     );
 
     _ = c.UpdateLayeredWindow(
