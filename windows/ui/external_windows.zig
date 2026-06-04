@@ -1367,96 +1367,6 @@ pub fn ensureExternalWindowClassRegistered() bool {
     return true;
 }
 
-pub fn handleMouseWheel(
-    hwnd: c.HWND,
-    wParam: c.WPARAM,
-    lParam: c.LPARAM,
-    app: *App,
-    grid_id: i64,
-    scroll_accum: *i16,
-    horizontal: bool,
-) void {
-    // Extract scroll delta from high word of wParam
-    const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
-    if (delta == 0) return;
-
-    // Use a smaller threshold for better trackpad support.
-    // Standard WHEEL_DELTA is 120, but trackpads send smaller deltas.
-    // Using 40 (WHEEL_DELTA/3) provides good responsiveness for both
-    // trackpads and regular mice.
-    const SCROLL_THRESHOLD: i16 = 40;
-
-    // Get mouse position (in screen coordinates)
-    const x_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-    const y_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-
-    // Convert to client coordinates
-    var pt: c.POINT = .{ .x = x_screen, .y = y_screen };
-    _ = c.ScreenToClient(hwnd, &pt);
-
-    // Get cell dimensions
-    app.mu.lock();
-    const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px;
-    const linespace = app.linespace_px;
-    const corep = app.corep;
-    app.mu.unlock();
-
-    // Calculate cell position (include linespace in row height)
-    const row_h = cell_h + linespace;
-    const col: i32 = if (cell_w > 0) @divTrunc(pt.x, @as(c.LONG, @intCast(cell_w))) else 0;
-    // When ext_tabline is enabled on main window, subtract tabbar height to get content-relative Y coordinate.
-    // External windows (floating windows) don't have a tabbar, so only apply offset for main window.
-    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const content_y: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.content_hwnd == null)
-        pt.y - @as(c.LONG, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-    else
-        pt.y;
-    const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;
-
-    // Build modifier string from wParam flags and GetKeyState
-    var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-    var mod_len: usize = 0;
-    if ((wParam & c.MK_SHIFT) != 0) {
-        mod_buf[mod_len] = 'S';
-        mod_len += 1;
-    }
-    if ((wParam & c.MK_CONTROL) != 0) {
-        mod_buf[mod_len] = 'C';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_MENU) < 0) {
-        mod_buf[mod_len] = 'A';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-        mod_buf[mod_len] = 'D';
-        mod_len += 1;
-    }
-    mod_buf[mod_len] = 0;
-
-    // Accumulate scroll delta
-    scroll_accum.* += delta;
-
-    // Determine scroll direction
-    // Vertical: positive delta = scroll up (wheel away from user)
-    // Horizontal: positive delta = scroll right (wheel tilt right)
-    const direction: [*:0]const u8 = if (horizontal)
-        (if (scroll_accum.* > 0) "right" else "left")
-    else
-        (if (scroll_accum.* > 0) "up" else "down");
-
-    // Send scroll events for each threshold accumulated
-    while (scroll_accum.* >= SCROLL_THRESHOLD or scroll_accum.* <= -SCROLL_THRESHOLD) {
-        app_mod.zonvie_core_send_mouse_scroll(corep, grid_id, row, col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
-        if (scroll_accum.* > 0) {
-            scroll_accum.* -= SCROLL_THRESHOLD;
-        } else {
-            scroll_accum.* += SCROLL_THRESHOLD;
-        }
-    }
-}
-
 pub export fn ExternalWndProc(
     hwnd: c.HWND,
     msg: c.UINT,
@@ -1674,7 +1584,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock();
 
                 if (grid_id != null and ext_window != null) {
-                    handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum, false);
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum, false);
 
                     // Show scrollbar on scroll if in scroll mode
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
@@ -1704,7 +1614,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock();
 
                 if (grid_id != null and ext_window != null) {
-                    handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.h_scroll_accum, true);
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.h_scroll_accum, true);
                 }
                 return 0;
             }

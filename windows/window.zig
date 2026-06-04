@@ -3909,14 +3909,14 @@ pub export fn WndProc(
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
-                external_windows.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.scroll_accum, false);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.scroll_accum, false);
                 return 0;
             }
         },
 
         c.WM_MOUSEHWHEEL => {
             if (getApp(hwnd)) |app| {
-                external_windows.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.h_scroll_accum, true);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, &app.h_scroll_accum, true);
                 return 0;
             }
         },
@@ -4014,25 +4014,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-                var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) {
-                    mod_buf[mod_len] = 'S';
-                    mod_len += 1;
-                }
-                if ((wParam & c.MK_CONTROL) != 0) {
-                    mod_buf[mod_len] = 'C';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_MENU) < 0) {
-                    mod_buf[mod_len] = 'A';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-                    mod_buf[mod_len] = 'D';
-                    mod_len += 1;
-                }
-                mod_buf[mod_len] = 0;
+                const mod_buf = input.buildMouseModifiers(wParam);
 
                 // Track mouse grid for mini window positioning (main window = grid 1)
                 app.last_mouse_grid_id = 1;
@@ -4134,25 +4116,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-                var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) {
-                    mod_buf[mod_len] = 'S';
-                    mod_len += 1;
-                }
-                if ((wParam & c.MK_CONTROL) != 0) {
-                    mod_buf[mod_len] = 'C';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_MENU) < 0) {
-                    mod_buf[mod_len] = 'A';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-                    mod_buf[mod_len] = 'D';
-                    mod_len += 1;
-                }
-                mod_buf[mod_len] = 0;
+                const mod_buf = input.buildMouseModifiers(wParam);
 
                 core.zonvie_core_send_mouse_input(
                     app.corep,
@@ -4203,25 +4167,7 @@ pub export fn WndProc(
                     @as(i32, y);
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
-                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-                var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) {
-                    mod_buf[mod_len] = 'S';
-                    mod_len += 1;
-                }
-                if ((wParam & c.MK_CONTROL) != 0) {
-                    mod_buf[mod_len] = 'C';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_MENU) < 0) {
-                    mod_buf[mod_len] = 'A';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-                    mod_buf[mod_len] = 'D';
-                    mod_len += 1;
-                }
-                mod_buf[mod_len] = 0;
+                const mod_buf = input.buildMouseModifiers(wParam);
 
                 app.last_mouse_grid_id = 1;
 
@@ -4270,25 +4216,7 @@ pub export fn WndProc(
                     @as(i32, y);
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
-                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-                var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) {
-                    mod_buf[mod_len] = 'S';
-                    mod_len += 1;
-                }
-                if ((wParam & c.MK_CONTROL) != 0) {
-                    mod_buf[mod_len] = 'C';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_MENU) < 0) {
-                    mod_buf[mod_len] = 'A';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-                    mod_buf[mod_len] = 'D';
-                    mod_len += 1;
-                }
-                mod_buf[mod_len] = 0;
+                const mod_buf = input.buildMouseModifiers(wParam);
 
                 core.zonvie_core_send_mouse_input(
                     app.corep,
@@ -4523,25 +4451,7 @@ pub export fn WndProc(
                 const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
 
                 // Build modifier string
-                var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-                var mod_len: usize = 0;
-                if ((wParam & c.MK_SHIFT) != 0) {
-                    mod_buf[mod_len] = 'S';
-                    mod_len += 1;
-                }
-                if ((wParam & c.MK_CONTROL) != 0) {
-                    mod_buf[mod_len] = 'C';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_MENU) < 0) {
-                    mod_buf[mod_len] = 'A';
-                    mod_len += 1;
-                }
-                if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-                    mod_buf[mod_len] = 'D';
-                    mod_len += 1;
-                }
-                mod_buf[mod_len] = 0;
+                const mod_buf = input.buildMouseModifiers(wParam);
 
                 core.zonvie_core_send_mouse_input(
                     app.corep,

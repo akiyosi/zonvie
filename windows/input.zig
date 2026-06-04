@@ -148,6 +148,142 @@ pub fn isSpecialVk(vk: u32) bool {
 }
 
 // =========================================================================
+// Mouse Input
+// =========================================================================
+
+/// Build a NUL-terminated mouse modifier string ('S'/'C'/'A'/'D') from a
+/// mouse message's wParam MK_* flags plus GetKeyState for Alt/Win.
+/// The returned buffer is zero-padded, so &result casts to [*:0]const u8.
+pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
+    var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    var mod_len: usize = 0;
+    if ((wParam & c.MK_SHIFT) != 0) {
+        mod_buf[mod_len] = 'S';
+        mod_len += 1;
+    }
+    if ((wParam & c.MK_CONTROL) != 0) {
+        mod_buf[mod_len] = 'C';
+        mod_len += 1;
+    }
+    if (c.GetKeyState(c.VK_MENU) < 0) {
+        mod_buf[mod_len] = 'A';
+        mod_len += 1;
+    }
+    if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
+        mod_buf[mod_len] = 'D';
+        mod_len += 1;
+    }
+    return mod_buf;
+}
+
+/// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
+/// external windows.
+pub fn handleMouseWheel(
+    hwnd: c.HWND,
+    wParam: c.WPARAM,
+    lParam: c.LPARAM,
+    app: *App,
+    grid_id: i64,
+    scroll_accum: *i16,
+    horizontal: bool,
+) void {
+    // Extract scroll delta from high word of wParam
+    const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
+    if (delta == 0) return;
+
+    // One scroll event per WHEEL_DELTA (120) so a physical wheel notch maps
+    // to exactly one Neovim wheel event ('mousescroll' then decides the line
+    // count). Touchpads send smaller deltas, but the accumulator below
+    // preserves their total scroll amount across events.
+    const SCROLL_THRESHOLD: i16 = 120;
+
+    // Get mouse position (in screen coordinates)
+    const x_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+    const y_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+
+    // Convert to client coordinates
+    var pt: c.POINT = .{ .x = x_screen, .y = y_screen };
+    _ = c.ScreenToClient(hwnd, &pt);
+
+    // Get cell dimensions
+    app.mu.lock();
+    const cell_w = app.cell_w_px;
+    const cell_h = app.cell_h_px;
+    const linespace = app.linespace_px;
+    const corep = app.corep;
+    app.mu.unlock();
+
+    // Calculate cell position (include linespace in row height).
+    // Mirror the click handler's content-offset rules (window.zig WM_LBUTTONDOWN):
+    // titlebar tabline shifts Y, left sidebar shifts X. External windows
+    // (floating windows) have neither, so only apply offsets for the main window.
+    const row_h = cell_h + linespace;
+    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
+    const content_x: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+        pt.x - @as(c.LONG, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        pt.x;
+    const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(c.LONG, @intCast(cell_w))) else 0;
+    const content_y: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+        pt.y - @as(c.LONG, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
+    else
+        pt.y;
+    const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;
+
+    // Resolve the scroll target on the main window: hit-test visible grids so
+    // a wheel event over a composited grid (float/split) targets that grid
+    // with grid-local coordinates, matching the URL-hover hit-test and macOS
+    // resolveScrollTarget. External windows already receive their own grid_id
+    // and window-local coordinates. Uses the non-blocking cached query, so no
+    // lock contention is added to the input path.
+    var target_grid_id: i64 = grid_id;
+    var target_row: i32 = row;
+    var target_col: i32 = col;
+    if (is_main_window) {
+        if (corep) |cp| {
+            const vg = app.getVisibleGridsCached(cp);
+            var best_zindex: i64 = -1;
+            for (vg.grids[0..vg.count]) |g| {
+                if (row >= g.start_row and row < g.start_row + g.rows and
+                    col >= g.start_col and col < g.start_col + g.cols and
+                    g.zindex > best_zindex)
+                {
+                    best_zindex = g.zindex;
+                    target_grid_id = g.grid_id;
+                    target_row = row - g.start_row;
+                    target_col = col - g.start_col;
+                }
+            }
+        }
+    }
+
+    // Build modifier string from wParam flags and GetKeyState
+    const mod_buf = buildMouseModifiers(wParam);
+
+    // Accumulate scroll delta (saturating: a hostile/buggy delta near i16 max
+    // must not wrap the accumulator and flip the scroll direction)
+    scroll_accum.* +|= delta;
+
+    // Determine scroll direction
+    // Vertical: positive delta = scroll up (wheel away from user)
+    // Horizontal: positive delta = scroll right (wheel tilt right)
+    const direction: [*:0]const u8 = if (horizontal)
+        (if (scroll_accum.* > 0) "right" else "left")
+    else
+        (if (scroll_accum.* > 0) "up" else "down");
+
+    // Send scroll events for each threshold accumulated
+    while (scroll_accum.* >= SCROLL_THRESHOLD or scroll_accum.* <= -SCROLL_THRESHOLD) {
+        app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
+        if (scroll_accum.* > 0) {
+            scroll_accum.* -= SCROLL_THRESHOLD;
+        } else {
+            scroll_accum.* += SCROLL_THRESHOLD;
+        }
+    }
+}
+
+// =========================================================================
 // IME Helper Functions
 // =========================================================================
 
