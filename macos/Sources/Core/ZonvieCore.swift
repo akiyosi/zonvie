@@ -115,7 +115,7 @@ final class ZonvieCore {
     private static func isScrollModeLine(_ msg: String) -> Bool {
         return msg.hasPrefix("[perf]") || msg.hasPrefix("[perf_")
             || msg.hasPrefix("[scroll_debug]") || msg.hasPrefix("[keyDown]")
-            || msg.hasPrefix("[drawloop]")
+            || msg.hasPrefix("[drawloop]") || msg.hasPrefix("[keyRepeat]")
     }
 
     static func appLog(_ message: @autoclosure () -> String) {

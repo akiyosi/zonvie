@@ -1330,6 +1330,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        // Drive key-repeat synthesis off the render clock (main thread; 60Hz
+        // while the continuous draw loop is active). No-op unless armed.
+        (view as? MetalTerminalView)?.tickKeyRepeatSynthesis()
         if ZonvieCore.appLogEnabled,
            let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
            inputTrace.seq != 0,

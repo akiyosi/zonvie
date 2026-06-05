@@ -163,9 +163,136 @@ final class MetalTerminalView: MTKView {
     /// held-`j` scrolling), and silently dropped extras when keys arrived
     /// faster than vsync.
     private func sendInputNow(_ text: String) {
+        // Record what a fresh keyDown actually sent, so synthesized repeats
+        // can replay exactly the same input (see Key Repeat Synthesis below).
+        if keyRepeatCaptureActive {
+            keyRepeatCapturedText = text
+            keyRepeatCapturedCount += 1
+        }
         core?.sendInput(text)
         // Keep the active draw loop alive so the response is drawn promptly.
         activeDrawIdleFrames = 0
+    }
+
+    // MARK: - Key Repeat Synthesis
+    //
+    // macOS key-repeat delivery is not metronomic: the system repeat timer
+    // (and especially Karabiner-Elements' virtual-device path) can drift and
+    // beat against the 60Hz display, dropping ~1 repeat/sec and producing a
+    // visible scroll hitch (see tmp/ scroll-jank investigation, runs 1-8).
+    // Instead of trusting the OS cadence, zonvie uses OS events only as
+    // edges: the initial keyDown is processed normally and its outgoing
+    // input recorded; the FIRST OS auto-repeat proves the key is repeatable
+    // (this also keeps press-and-hold/accent-popup behavior intact, since
+    // those keys never produce OS repeats) and hands the cadence over to a
+    // render-clock-driven synthesizer. Subsequent OS repeats are swallowed.
+    // The synthesizer fires from the draw callback (main thread, 60Hz in
+    // continuous mode) at the user's configured repeat interval, so held-key
+    // scrolling advances in lockstep with the display: no beats, no holes,
+    // and no per-repeat IME round-trip (~4ms main-thread each).
+
+    /// What the initial keyDown sent to Neovim; replayed verbatim per repeat.
+    private enum HeldKeyAction {
+        case text(String)
+        case keyEvent(mods: UInt32, characters: String?, charactersIgnoringModifiers: String?)
+    }
+    private var heldKeyCode: UInt16? = nil
+    private var heldKeyAction: HeldKeyAction? = nil
+    private var synthRepeatActive = false
+    /// CLOCK_UPTIME_RAW seconds of the next synthesized fire.
+    private var synthNextFire: Double = 0
+    private var synthInterval: Double = 1.0 / 60.0
+    // Capture window: set for the duration of a fresh keyDown's processing.
+    private var keyRepeatCaptureActive = false
+    private var keyRepeatCapturedText: String? = nil
+    private var keyRepeatCapturedCount = 0
+
+    private static func uptimeNow() -> Double {
+        return Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000.0
+    }
+
+    /// Record the held key after a fresh keyDown was processed.
+    private func armHeldKey(code: UInt16, action: HeldKeyAction) {
+        heldKeyCode = code
+        heldKeyAction = action
+    }
+
+    private func disarmKeyRepeatSynthesis(_ reason: String) {
+        if synthRepeatActive {
+            ZonvieCore.appLog("[keyRepeat] disarm (\(reason))")
+        }
+        synthRepeatActive = false
+        heldKeyCode = nil
+        heldKeyAction = nil
+    }
+
+    /// First OS auto-repeat observed for the held key: take over the cadence.
+    private func takeOverKeyRepeat() {
+        // NSEvent.keyRepeatInterval mirrors the user's key-repeat setting.
+        // Clamp defensively; 0 would spin and >1s is nonsense for repeats.
+        synthInterval = max(1.0 / 120.0, min(1.0, NSEvent.keyRepeatInterval))
+        synthRepeatActive = true
+        synthNextFire = Self.uptimeNow() + synthInterval
+        ZonvieCore.appLog("[keyRepeat] takeover keyCode=0x\(String(heldKeyCode ?? 0, radix: 16)) interval_ms=\(String(format: "%.2f", synthInterval * 1000.0))")
+        // This OS repeat is replaced by an immediate synthesized one, then
+        // the render clock paces the rest.
+        replayHeldKey()
+        activateDrawLoop()
+    }
+
+    private func replayHeldKey() {
+        guard let code = heldKeyCode, let action = heldKeyAction else {
+            disarmKeyRepeatSynthesis("no held action")
+            return
+        }
+        switch action {
+        case .text(let t):
+            sendInputNow(t)
+        case .keyEvent(let mods, let chars, let charsIg):
+            core?.sendKeyEvent(
+                keyCode: UInt32(code),
+                mods: mods,
+                characters: chars,
+                charactersIgnoringModifiers: charsIg
+            )
+        }
+    }
+
+    /// Called from the renderer's draw entry every frame (main thread).
+    /// No-op unless a synthesized repeat is armed.
+    func tickKeyRepeatSynthesis() {
+        guard synthRepeatActive else { return }
+        // Safety net: lost keyUps (Cmd-Tab etc.) and IME activation must
+        // never leave a key repeating forever.
+        if hasMarkedText() || window?.isKeyWindow != true {
+            disarmKeyRepeatSynthesis("safety")
+            return
+        }
+        let now = Self.uptimeNow()
+        guard now >= synthNextFire else { return }
+        replayHeldKey()
+        // At most one send per frame; if we fell behind (loop was paused),
+        // re-anchor instead of bursting catch-up repeats.
+        synthNextFire += synthInterval
+        if synthNextFire < now {
+            synthNextFire = now + synthInterval
+        }
+        activeDrawIdleFrames = 0
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == heldKeyCode {
+            disarmKeyRepeatSynthesis("keyUp")
+        }
+        super.keyUp(with: event)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Any modifier change invalidates the recorded input (e.g. j -> C-j).
+        if heldKeyCode != nil {
+            disarmKeyRepeatSynthesis("flagsChanged")
+        }
+        super.flagsChanged(with: event)
     }
 
     /// Called after actual drawing runs in MTKViewDelegate.draw(in:)
@@ -223,6 +350,13 @@ final class MetalTerminalView: MTKView {
 
     /// Called from draw() early-return paths when no rendering was needed.
     func notifyDrawIdle() {
+        // While a synthesized key repeat is armed, the draw loop is its clock:
+        // never deactivate, even if individual frames had nothing to render
+        // (e.g. holding j at the end of the buffer).
+        if synthRepeatActive {
+            activeDrawIdleFrames = 0
+            return
+        }
         // If a flush committed data recently (within ~50ms = ~3 vsync periods),
         // the "idle" frame is likely a timing race: the flush completed between
         // the draw's lock snapshot and the next vsync.  Don't count it toward
@@ -1255,6 +1389,24 @@ final class MetalTerminalView: MTKView {
         // repeat generator's cadence from main-runloop delivery quantization.
         ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
 
+        // --- Key repeat synthesis (see MARK above) ---
+        if event.isARepeat {
+            if synthRepeatActive && event.keyCode == heldKeyCode {
+                return  // synthesis owns this key's cadence; swallow OS repeats
+            }
+            if !synthRepeatActive, event.keyCode == heldKeyCode,
+               heldKeyAction != nil, !hasMarkedText()
+            {
+                takeOverKeyRepeat()
+                return
+            }
+            // Unknown repeat state: stay transparent, process normally below.
+        } else {
+            // Fresh press (also rollover to another key): previous synthesis
+            // no longer matches reality.
+            disarmKeyRepeatSynthesis("new keyDown")
+        }
+
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
         if hasMarkedText() {
@@ -1293,7 +1445,33 @@ final class MetalTerminalView: MTKView {
                 characters: chars,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers
             )
+            // Cmd shortcuts must not synthesize repeats; everything else
+            // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
+            if !event.isARepeat && !m.contains(.command) {
+                armHeldKey(code: event.keyCode, action: .keyEvent(
+                    mods: mods,
+                    characters: chars,
+                    charactersIgnoringModifiers: event.charactersIgnoringModifiers
+                ))
+            }
             return
+        }
+
+        // Plain key: capture what this keyDown sends (via IME insertText ->
+        // sendInputNow) so repeats can replay it. Only a clean single-send
+        // keyDown is a synthesis candidate.
+        keyRepeatCaptureActive = !event.isARepeat
+        keyRepeatCapturedText = nil
+        keyRepeatCapturedCount = 0
+        defer {
+            if keyRepeatCaptureActive {
+                keyRepeatCaptureActive = false
+                if keyRepeatCapturedCount == 1, let t = keyRepeatCapturedText,
+                   !hasMarkedText()
+                {
+                    armHeldKey(code: event.keyCode, action: .text(t))
+                }
+            }
         }
 
         // Let the system handle IME input.
