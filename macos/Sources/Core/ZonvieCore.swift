@@ -39,6 +39,12 @@ final class ZonvieCore {
     /// When true, only [perf...] tagged lines reach the on_log callback at the
     /// core boundary. Set from config.log.perfOnly during configureLogging.
     static var appLogPerfOnly = false
+    /// Scroll-pipeline analysis mode: only [perf...], [scroll_debug], and
+    /// [keyDown] lines are emitted (both at the core boundary and for
+    /// frontend appLog calls), so the j-repeat input -> grid_scroll -> flush
+    /// -> commit -> draw -> present chain can be traced without other debug
+    /// noise. Takes precedence over appLogPerfOnly when both are set.
+    static var appLogScrollOnly = false
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
     /// Process start time captured at first appLog reference; used to prefix
@@ -102,14 +108,26 @@ final class ZonvieCore {
         return zonvie_core_get_glow_intensity(c)
     }
 
+    /// Allowlist for scroll-analysis mode. Closed forms ("[perf]" / "[perf_")
+    /// to match the core Logger filter; [keyDown] is included so key-repeat
+    /// cadence can be correlated with frame pacing, [drawloop] so continuous/
+    /// on-demand rendering mode transitions are visible around scroll bursts.
+    private static func isScrollModeLine(_ msg: String) -> Bool {
+        return msg.hasPrefix("[perf]") || msg.hasPrefix("[perf_")
+            || msg.hasPrefix("[scroll_debug]") || msg.hasPrefix("[keyDown]")
+            || msg.hasPrefix("[drawloop]")
+    }
+
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
         autoreleasepool {
+            let msg = message()
+            if appLogScrollOnly && !isScrollModeLine(msg) { return }
             // Prefix with elapsed milliseconds since process start for startup
             // latency diagnostics. Sub-millisecond resolution on Apple Silicon.
             let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let elapsedMs = Double(nowNs &- appLogStartNs) / 1_000_000.0
-            let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, message())
+            let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, msg)
 
             if let handle = logFileHandle {
                 if let data = line.data(using: .utf8) {
@@ -122,9 +140,10 @@ final class ZonvieCore {
     }
 
     /// Configure logging with file path (called from AppDelegate)
-    static func configureLogging(enabled: Bool, filePath: String?, perfOnly: Bool = false) {
+    static func configureLogging(enabled: Bool, filePath: String?, perfOnly: Bool = false, scrollOnly: Bool = false) {
         appLogEnabled = enabled
         appLogPerfOnly = perfOnly
+        appLogScrollOnly = scrollOnly
         appLogFilePath = filePath
 
         // Close existing handle if any
@@ -1201,6 +1220,7 @@ final class ZonvieCore {
             }
             zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
             zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+            zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
             return result
         }
 
@@ -2004,9 +2024,10 @@ final class ZonvieCore {
         guard let core else { return }
         zonvie_core_set_log_enabled(core, enabled ? 1 : 0)
         ZonvieCore.appLogEnabled = enabled
-        // Re-apply perf_only on each enable toggle so a runtime toggle of the
-        // log flag never resets perf_only to its core default (off).
+        // Re-apply perf_only/scroll_only on each enable toggle so a runtime
+        // toggle of the log flag never resets them to their core defaults (off).
         zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
     }
 
     /// Drop all non-[perf...] log lines at the core boundary. Independent of

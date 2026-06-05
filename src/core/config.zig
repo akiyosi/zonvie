@@ -272,6 +272,9 @@ pub const Config = struct {
         // When true, only [perf...] tagged lines reach the on_log callback.
         // Lets users profile hot paths without the noise of debug logs.
         perf_only: bool = false,
+        // Scroll-pipeline analysis mode: [perf...] plus [scroll_debug] lines
+        // only. Takes precedence over perf_only when both are set.
+        scroll_only: bool = false,
     };
 
     pub const PerformanceConfig = struct {
@@ -505,6 +508,7 @@ pub const Config = struct {
             if (l.enabled) |e| self.log.enabled = e;
             if (l.path) |p| self.log.path = alloc.dupe(u8, p) catch null;
             if (l.perf_only) |po| self.log.perf_only = po;
+            if (l.scroll_only) |so| self.log.scroll_only = so;
         }
 
         if (cfg.performance) |p| {
@@ -834,6 +838,7 @@ const TomlLog = struct {
     enabled: ?bool = null,
     path: ?[]const u8 = null,
     perf_only: ?bool = null,
+    scroll_only: ?bool = null,
 };
 
 const TomlPerformance = struct {

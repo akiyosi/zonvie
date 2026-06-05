@@ -779,6 +779,14 @@ void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
  * profiling. */
 void zonvie_core_set_log_perf_only(zonvie_core *core, int enabled);
 
+/* Scroll-pipeline analysis mode: when enabled is non-zero, only [perf...]
+ * and [scroll_debug] log lines are emitted, so the input -> grid_scroll ->
+ * flush -> commit -> draw chain can be traced without other debug noise.
+ * Takes precedence over zonvie_core_set_log_perf_only when both are set.
+ * Independent of zonvie_core_set_log_enabled — caller must still enable
+ * logging for any output to appear. */
+void zonvie_core_set_log_scroll_only(zonvie_core *core, int enabled);
+
 /* Enable ext_cmdline UI extension (must call before zonvie_core_start).
  * When enabled, cmdline is rendered as a separate external window. */
 void zonvie_core_set_ext_cmdline(zonvie_core *core, int enabled);
@@ -1291,6 +1299,7 @@ typedef struct zonvie_config_values {
     bool log_enabled;
     const char* log_path;             /* NULL if not set */
     bool log_perf_only;               /* true = drop non-[perf...] lines */
+    bool log_scroll_only;             /* true = [perf...] + [scroll_debug] only */
     // performance
     int32_t perf_glyph_cache_ascii;
     int32_t perf_glyph_cache_non_ascii;

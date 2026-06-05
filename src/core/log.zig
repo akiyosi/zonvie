@@ -14,6 +14,11 @@ pub const Logger = struct {
     /// [msg], etc. Independent of `verbose` (which gates the
     /// highest-frequency [shape_dump] / [glyph_quad] lines).
     perf_only: bool = false,
+    /// Scroll-pipeline analysis mode: like `perf_only` but additionally lets
+    /// [scroll_debug] lines through, so the input -> grid_scroll -> flush ->
+    /// commit -> draw chain can be traced without the rest of the debug
+    /// noise. Takes precedence over `perf_only` when both are set.
+    scroll_only: bool = false,
 
     pub fn write(self: *Logger, comptime fmt: []const u8, args: anytype) void {
         if (self.cb == null) return;
@@ -22,7 +27,10 @@ pub const Logger = struct {
         // the perf-only filter.
         const is_perf = comptime (std.mem.startsWith(u8, fmt, "[perf]") or
             std.mem.startsWith(u8, fmt, "[perf_"));
-        if (self.perf_only and !is_perf) return;
+        const is_scroll = comptime std.mem.startsWith(u8, fmt, "[scroll_debug]");
+        if (self.scroll_only) {
+            if (!is_perf and !is_scroll) return;
+        } else if (self.perf_only and !is_perf) return;
 
         var buf: [1024]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;

@@ -414,6 +414,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var pendingDirtyRows: IndexSet = IndexSet()
     private var hasPresentedOnce: Bool = false
 
+    /// Previous on-glass presentation time (MTLDrawable.presentedTime, seconds).
+    /// Written from presented handlers (Metal internal thread) under `lock`;
+    /// only touched when logging is enabled, to measure true present cadence.
+    private var lastPresentedTime: CFTimeInterval = 0
+
     // --- Accumulated scroll delta (survives across flushes, consumed by draw) ---
     // When multiple flushes occur between draws, each commitFlush accumulates
     // the scroll delta here.  draw() snapshots and resets under lock.
@@ -2458,6 +2463,31 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 t_present_start = CFAbsoluteTimeGetCurrent()
                 if !hasPresentedOnce {
                     ZonvieCore.appLog("[startup] first present scheduled (cmd.present called)")
+                }
+                // On-glass presentation cadence: presentedTime is the host time
+                // the frame actually hit the display (0 if it never did). The
+                // interval between consecutive presentedTimes is the ground
+                // truth for vsync slips that CPU-side draw timing cannot see.
+                let presentLock = lock
+                drawable.addPresentedHandler { [weak self] d in
+                    guard ZonvieCore.appLogEnabled else { return }
+                    let t = d.presentedTime
+                    guard t > 0 else {
+                        ZonvieCore.appLog("[perf] presented skipped=true")
+                        return
+                    }
+                    var prev: CFTimeInterval = 0
+                    if let self {
+                        presentLock.lock()
+                        prev = self.lastPresentedTime
+                        self.lastPresentedTime = t
+                        presentLock.unlock()
+                    }
+                    if prev > 0 {
+                        ZonvieCore.appLog("[perf] presented interval_ms=\(String(format: "%.3f", (t - prev) * 1000.0)) t_ms=\(String(format: "%.3f", t * 1000.0))")
+                    } else {
+                        ZonvieCore.appLog("[perf] presented first t_ms=\(String(format: "%.3f", t * 1000.0))")
+                    }
                 }
             }
             cmd.present(drawable)

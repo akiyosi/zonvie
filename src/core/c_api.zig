@@ -928,6 +928,18 @@ pub export fn zonvie_core_set_log_perf_only(p: ?*zonvie_core, enabled: i32) call
     box.core.log.perf_only = (enabled != 0);
 }
 
+/// Scroll-pipeline analysis mode: when enabled is non-zero, only [perf...]
+/// and [scroll_debug] log lines are emitted, so the input -> grid_scroll ->
+/// flush -> commit -> draw chain can be traced without other debug noise.
+/// Takes precedence over zonvie_core_set_log_perf_only when both are set.
+/// Independent of zonvie_core_set_log_enabled — caller must still enable
+/// logging for any output to appear.
+pub export fn zonvie_core_set_log_scroll_only(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.log.scroll_only = (enabled != 0);
+}
+
 /// Enable ext_cmdline UI extension. Must be called before zonvie_core_start().
 /// When enabled, cmdline is rendered as a separate external window.
 pub export fn zonvie_core_set_ext_cmdline(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -1502,6 +1514,7 @@ pub const zonvie_config_values = extern struct {
     log_enabled: bool = false,
     log_path: ?[*:0]const u8 = null,
     log_perf_only: bool = false,
+    log_scroll_only: bool = false,
     // performance
     perf_glyph_cache_ascii: i32 = 512,
     perf_glyph_cache_non_ascii: i32 = 256,
@@ -1610,6 +1623,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .log_enabled = cfg.log.enabled,
         .log_path = dupeZForCOpt(alloc, cfg.log.path),
         .log_perf_only = cfg.log.perf_only,
+        .log_scroll_only = cfg.log.scroll_only,
         // performance
         .perf_glyph_cache_ascii = @intCast(cfg.performance.glyph_cache_ascii_size),
         .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),

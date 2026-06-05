@@ -1250,7 +1250,10 @@ final class MetalTerminalView: MTKView {
         }()
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
-        ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat)")
+        // evt_ts: NSEvent.timestamp (kernel event time, seconds since boot) in ms.
+        // Comparing evt_ts deltas against handler-entry deltas separates the
+        // repeat generator's cadence from main-runloop delivery quantization.
+        ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.

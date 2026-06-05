@@ -120,6 +120,9 @@ struct ZonvieConfig {
         var path: String? = nil  // If nil, logs to stderr
         // When true, only [perf...] tagged lines reach the on_log callback.
         var perfOnly: Bool = false
+        // Scroll-pipeline analysis mode: [perf...] plus [scroll_debug] lines
+        // only. Takes precedence over perfOnly when both are set.
+        var scrollOnly: Bool = false
     }
 
     struct PerformanceConfig {
@@ -259,6 +262,7 @@ struct ZonvieConfig {
         config.log.enabled = v.log_enabled
         if let s = v.log_path { config.log.path = String(cString: s) }
         config.log.perfOnly = v.log_perf_only
+        config.log.scrollOnly = v.log_scroll_only
 
         // Performance
         config.performance.glyphCacheAsciiSize = Int(v.perf_glyph_cache_ascii)
