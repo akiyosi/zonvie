@@ -67,7 +67,7 @@ struct ZonvieConfig {
     struct WindowConfig {
         var blur: Bool = true
         var opacity: Double = 0.5  // Only used when blur=true
-        var blurRadius: Int = 20   // Blur radius (1-100), only used when blur=true
+        var blurRadius: Int = 20   // Blur radius (0-100), only used when blur=true; 0 = translucent without blur
     }
 
     struct ScrollbarConfig {

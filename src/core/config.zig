@@ -205,6 +205,8 @@ pub const Config = struct {
     pub const WindowConfig = struct {
         opacity: f32 = if (builtin.os.tag == .macos) 0.5 else 1.0,
         blur: bool = if (builtin.os.tag == .macos) true else false,
+        // 0..100. 0 keeps the translucent window but applies no backdrop
+        // blur (used to separate blur cost from translucency cost).
         blur_radius: i32 = 20,
     };
 
@@ -393,7 +395,7 @@ pub const Config = struct {
         if (cfg.window) |w| {
             if (w.opacity) |o| self.window.opacity = @max(0.0, @min(1.0, o));
             if (w.blur) |b| self.window.blur = b;
-            if (w.blur_radius) |r| self.window.blur_radius = @max(1, @min(100, r));
+            if (w.blur_radius) |r| self.window.blur_radius = @max(0, @min(100, r));
         }
 
         if (cfg.scrollbar) |s| {
