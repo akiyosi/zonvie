@@ -269,7 +269,13 @@ final class MetalTerminalView: MTKView {
             return
         }
         let now = Self.uptimeNow()
-        guard now >= synthNextFire else { return }
+        // synthInterval can equal the draw tick period exactly (16.67ms repeat
+        // on the 60Hz loop), making a bare `now >= synthNextFire` a per-tick
+        // race: a tick arriving microseconds early skips an entire frame of
+        // input (visible as a one-frame scroll stall). Fire when the due time
+        // is closer to this tick than to the next one (half-tick tolerance).
+        let tickPeriod = 1.0 / Double(max(1, preferredFramesPerSecond))
+        guard now >= synthNextFire - min(tickPeriod, synthInterval) * 0.5 else { return }
         replayHeldKey()
         // At most one send per frame; if we fell behind (loop was paused),
         // re-anchor instead of bursting catch-up repeats.
