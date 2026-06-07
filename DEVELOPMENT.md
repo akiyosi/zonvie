@@ -81,7 +81,10 @@ xcodebuild -project macos/zonvie.xcodeproj \
   build
 ```
 
-Release build:
+Release build (single-arch, matching the CI release pipeline — Homebrew
+on Apple Silicon ships arm64-only dylibs, so a universal link is not
+possible locally; official releases build each arch on its native
+runner, see `.github/workflows/release.yml`):
 
 ```bash
 xcodebuild -project macos/zonvie.xcodeproj \
@@ -89,6 +92,8 @@ xcodebuild -project macos/zonvie.xcodeproj \
   -configuration Release \
   -derivedDataPath macos/.derived \
   -destination "platform=macOS,arch=arm64" \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 ```
 
