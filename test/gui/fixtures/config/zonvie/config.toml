@@ -1,0 +1,3 @@
+# Deterministic config for GUI tests. Intentionally (almost) empty:
+# app behavior under test is shaped by CLI flags only (e.g. --extcmdline).
+# The GUI test driver points XDG_CONFIG_HOME at the parent of this dir.
