@@ -1046,6 +1046,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 activateDrawLoop()
             }
 
+            // Keep the draw loop alive while this grid's edge bounce is held
+            // or animating, so the bounce-back keeps ticking after input
+            // events stop (serviceSharedScrollStateForExternalView above is
+            // what advances the animation).
+            if mainTerminalView?.isScrollEdgeBounceActive(gridId: gridId) == true {
+                activateDrawLoop()
+            }
+
             if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling && !shaderAnimates {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // If a visual commit occurred recently, a timing race likely caused
@@ -1946,6 +1954,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     override func scrollWheel(with event: NSEvent) {
         guard let main = mainTerminalView else { return }
+        main.noteScrollGesturePhase(event)
 
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
@@ -1985,6 +1994,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 main.serviceSharedScrollStateForExternalView()
                 updateScrollShaderOffset()
                 requestRedraw()
+                // Keep this view's draw clock running while a sub-cell offset
+                // is showing: at a buffer edge there are no flushes to
+                // activate it, and the edge bounce advances on draw ticks.
+                if isPaused && newOffset != 0 {
+                    activateDrawLoop()
+                }
             }
         }
 

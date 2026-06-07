@@ -55,11 +55,41 @@ final class MetalTerminalView: MTKView {
     private var pendingScrollClear = [Int64: Int]()  // gridId → count of grid_scroll events
     private let pendingScrollClearLock = NSLock()
 
-    // Stale scroll detection: tracks frames since last grid_scroll per grid.
-    // When pendingSentScroll > 0 but no grid_scroll arrives for several frames,
-    // the scroll likely hit a buffer boundary (Neovim can't scroll further).
-    // In that case, we decay the offset to prevent it from getting stuck.
-    private var scrollStaleFrameCount: [Int64: Int] = [:]
+    // Stale scroll detection: timestamp of the first unanswered tick per grid.
+    // When pendingSentScroll > 0 but no grid_scroll arrives for a while, the
+    // scroll likely hit a buffer boundary (Neovim can't scroll further).
+    // Time-based (not frame-counted) so multiple tick callers per frame
+    // (main onPreDraw + external views) cannot distort the thresholds.
+    private var scrollStaleSince: [Int64: CFAbsoluteTime] = [:]
+
+    // --- Edge bounce (rubber-band) state ---
+    // Grids whose scroll hit a buffer edge. Value is the blocked direction:
+    // +1 = top edge (positive offset, "up" refused), -1 = bottom edge.
+    // Protected by scrollOffsetLock. While blocked, further input toward the
+    // edge gets rubber-band resistance; once the gesture and momentum end,
+    // the offset eases back to 0 (bounce-back).
+    private var scrollEdgeBlocked: [Int64: CGFloat] = [:]
+    // Lock-free hint for the per-frame tick's early exit. May lag behind
+    // removals (harmless extra lock acquisition) but inserts happen on the
+    // main thread — the same thread as the tick — so it never under-reports
+    // an active bounce.
+    private var scrollEdgeBlockedHint = false
+    // Trackpad gesture lifecycle (main thread only): true while fingers are
+    // on the pad. Gates the bounce-back animation so a held overscroll stays
+    // put until the fingers lift (native rubber-band feel). Momentum does NOT
+    // gate the bounce: like the native one, it starts as soon as the edge is
+    // hit and swallows the remaining momentum.
+    private var scrollGestureTouching = false
+    // True while a momentum phase is running. Only used to keep momentum
+    // events from refreshing lastPreciseScrollInputTime, which would gate the
+    // bounce-back of unrelated grids.
+    private var scrollMomentumRunning = false
+    // Last precise scroll input timestamp: fallback gate for phase-less
+    // precise events (devices without a gesture lifecycle).
+    private var lastPreciseScrollInputTime: CFAbsoluteTime = 0
+    // Last tick timestamp: dedupes multiple tick callers in the same frame
+    // and scales the bounce decay by actual elapsed time.
+    private var lastScrollEdgeTickTime: CFAbsoluteTime = 0
 
     // --- Scrollbar ---
     private lazy var verticalScroller: NSScroller = {
@@ -89,9 +119,30 @@ final class MetalTerminalView: MTKView {
 
     /// Scroll offset below this threshold (in pixels) is treated as zero and removed.
     /// Used consistently in processPendingScrollClears, updateScrollShaderOffset,
-    /// and decayStaleScrollOffsets to prevent stale zero-offset entries from keeping
+    /// and tickScrollEdgeBounce to prevent stale zero-offset entries from keeping
     /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
     private static let scrollOffsetEpsilon: CGFloat = 1.0
+
+    /// Stale-scroll thresholds: seconds without a grid_scroll response (while
+    /// scrolls are pending) after which the scroll is considered blocked at a
+    /// buffer edge. The short threshold applies when the viewport confirms the
+    /// edge; the long one is the safety fallback when viewport info is missing
+    /// or disagrees — a genuinely slow response mid-buffer must not be
+    /// mistaken for an edge, while folds at end of buffer (which the viewport
+    /// check cannot see) must still decay eventually.
+    private static let scrollEdgeConfirmedSeconds: TimeInterval = 0.066
+    private static let scrollEdgeFallbackSeconds: TimeInterval = 0.2
+
+    /// Per-60fps-frame decay factor for the edge bounce-back animation,
+    /// scaled by actual elapsed time in the tick. From a full overscroll this
+    /// eases to epsilon in ~250ms.
+    private static let scrollBounceDecayPerFrame: CGFloat = 0.75
+
+    /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
+    /// renderer clamp (clampVisualScrollOffsetPx) and the rubber-band
+    /// resistance curve — they must agree or the band stops responding before
+    /// (or keeps stretching past) what the renderer can display.
+    private static let scrollMaxOverscrollCells: CGFloat = 2.0
 
     // --- Active draw loop (mirrors ExternalGridView.activateDrawLoop pattern) ---
     // During rapid updates (scrolling, typing), switch MTKView to continuous
@@ -465,9 +516,14 @@ final class MetalTerminalView: MTKView {
             // This ensures scroll offsets are cleared before vertices are drawn,
             // preventing double-shift glitches in split windows.
             self?.processPendingScrollClears()
-            // Decay stale scroll offsets (pending scrolls that never got grid_scroll response,
-            // e.g. when Neovim is at buffer boundary and can't scroll further).
-            self?.decayStaleScrollOffsets()
+            // Detect buffer-edge blocked scrolls and run the rubber-band
+            // bounce-back animation once the gesture/momentum ends.
+            self?.tickScrollEdgeBounce()
+            // Keep the draw loop alive while an edge bounce is held/animating,
+            // so the bounce-back keeps ticking after input events stop.
+            if let self, self.isPaused, self.isScrollEdgeBounceActive() {
+                self.activateDrawLoop()
+            }
             // Update shader with current scroll offsets (safe to call here on main thread).
             self?.updateScrollShaderOffset()
             // Update cursor blink state for rendering
@@ -1515,6 +1571,7 @@ final class MetalTerminalView: MTKView {
     private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
 
     override func scrollWheel(with event: NSEvent) {
+        noteScrollGesturePhase(event)
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
         if deltaY == 0 && deltaX == 0 { return }
@@ -1575,6 +1632,28 @@ final class MetalTerminalView: MTKView {
         }
     }
 
+    /// Track the trackpad gesture lifecycle for the edge bounce. A held
+    /// overscroll must stay put while fingers are down; bounce-back starts as
+    /// soon as they lift. Called from scrollWheel of this view and of external
+    /// grid views (shared scroll state).
+    func noteScrollGesturePhase(_ event: NSEvent) {
+        let phase = event.phase
+        if phase.contains(.mayBegin) || phase.contains(.began) || phase.contains(.changed) {
+            scrollGestureTouching = true
+        } else if phase.contains(.ended) || phase.contains(.cancelled) {
+            scrollGestureTouching = false
+            // Lift: drop the recent-input window so a blocked offset starts
+            // its bounce-back on the very next tick.
+            lastPreciseScrollInputTime = 0
+        }
+        let momentum = event.momentumPhase
+        if momentum.contains(.began) || momentum.contains(.changed) {
+            scrollMomentumRunning = true
+        } else if momentum.contains(.ended) || momentum.contains(.cancelled) {
+            scrollMomentumRunning = false
+        }
+    }
+
     /// Update the shader uniform with current scroll offsets
     private func updateScrollShaderOffset() {
         guard let core else { return }
@@ -1593,6 +1672,7 @@ final class MetalTerminalView: MTKView {
         let staleKeys = scrollOffsetPx.keys.filter { !visibleGridIds.contains($0) }
         for key in staleKeys {
             scrollOffsetPx.removeValue(forKey: key)
+            scrollEdgeBlocked.removeValue(forKey: key)
         }
 
         // NDC scale: 2.0 / drawableHeight (top = 1.0, bottom = -1.0)
@@ -1664,6 +1744,7 @@ final class MetalTerminalView: MTKView {
     private func clearScrollOffset(gridId: Int64) {
         scrollOffsetLock.lock()
         scrollOffsetPx.removeValue(forKey: gridId)
+        scrollEdgeBlocked.removeValue(forKey: gridId)
         scrollOffsetLock.unlock()
         updateScrollShaderOffset()
     }
@@ -1672,6 +1753,7 @@ final class MetalTerminalView: MTKView {
     private func clearAllScrollOffsets() {
         scrollOffsetLock.lock()
         scrollOffsetPx.removeAll()
+        scrollEdgeBlocked.removeAll()
         scrollOffsetLock.unlock()
         renderer.clearScrollOffsets()
     }
@@ -1700,6 +1782,7 @@ final class MetalTerminalView: MTKView {
         guard let core else { return 0 }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        guard rowHeightPx > 0 else { return 0 }
 
         // grid=1 (global grid) does not support pixel-based smooth scrolling
         // gridId < 0 means Zonvie-managed external windows (ext_messages, ext_cmdline)
@@ -1717,16 +1800,27 @@ final class MetalTerminalView: MTKView {
             }
         }
 
+        // Instant edge detection from the (non-blocking) viewport cache:
+        // engage the rubber band on the first overscroll pixel instead of
+        // waiting for the stale-frame fallback. Checked before the fast-scroll
+        // switch — a hard flick at the edge must stretch the band, not switch
+        // to discrete mode (whose scrolls the edge would refuse anyway).
+        // nil = viewport unavailable (no info, or lock busy with empty cache).
+        let edgeBlockedNow: Bool? = effectiveHasPrecise
+            ? isScrollBlockedAtEdge(gridId: gridId, deltaY: deltaY)
+            : nil
+
         // Disable pixel scrolling for fast scrolling to prevent overwhelming Neovim
         // If deltaY is large (fast scroll), switch to cell-based scrolling
-        if effectiveHasPrecise {
+        if effectiveHasPrecise && edgeBlockedNow != true {
             let fastScrollThreshold = rowHeightPx / scale  // ~20 points at 2x scale
             if abs(deltaY) > fastScrollThreshold {
                 effectiveHasPrecise = false
                 // Clear any accumulated offset when switching to fast mode
                 scrollOffsetLock.lock()
                 scrollOffsetPx.removeValue(forKey: gridId)
-                scrollStaleFrameCount.removeValue(forKey: gridId)
+                scrollStaleSince.removeValue(forKey: gridId)
+                scrollEdgeBlocked.removeValue(forKey: gridId)
                 scrollOffsetLock.unlock()
                 pendingSentScrollLock.lock()
                 pendingSentScroll.removeValue(forKey: gridId)
@@ -1751,23 +1845,86 @@ final class MetalTerminalView: MTKView {
             // core thread during flush, not concurrently with main-thread scroll input.
             scrollOffsetLock.lock()
             let currentOffset = scrollOffsetPx[gridId] ?? 0
-            var newOffset = currentOffset + deltaYPx
+            if let edgeBlockedNow {
+                let sign: CGFloat = deltaYPx > 0 ? 1 : -1
+                if edgeBlockedNow {
+                    // Viewport says this direction is refused — mark the edge
+                    // immediately. The stale-time path in tickScrollEdgeBounce
+                    // remains as fallback when viewport info is missing or
+                    // inexact (e.g. folds at end of buffer).
+                    if currentOffset * sign >= 0 {
+                        scrollEdgeBlocked[gridId] = sign
+                        scrollEdgeBlockedHint = true
+                    }
+                } else if scrollEdgeBlocked[gridId] == sign {
+                    // Fresh viewport disproves the block in this direction —
+                    // a false positive from the stale-time fallback or from a
+                    // stale lock-busy cache. Unblock so scrolling resumes.
+                    scrollEdgeBlocked.removeValue(forKey: gridId)
+                }
+            }
+            let blockedSign = scrollEdgeBlocked[gridId] ?? 0
+            let pushingIntoEdge = blockedSign != 0
+                && deltaYPx * blockedSign > 0
+                && currentOffset * blockedSign >= 0
 
-            // When accumulated offset reaches row height, emit nvim_input_mouse.
-            // Don't consume offset here — wait for grid_scroll response in
-            // processPendingScrollClears to keep visual offset synchronized
-            // with actual content movement (prevents flickering).
+            var newOffset: CGFloat
             var scrollCount = 0
-            var checkOffset = newOffset
-            while abs(checkOffset) >= rowHeightPx && canSendMore && scrollCount < 3 {
-                let direction = checkOffset > 0 ? "up" : "down"
-                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-                scrollCount += 1
+            if pushingIntoEdge {
+                // Pushing into a blocked edge: apply rubber-band resistance
+                // (response fades quadratically toward the visual clamp) and
+                // send no scroll commands — the edge refuses them. Fingers
+                // refresh the recent-input window so the band holds while
+                // touched; momentum does not, so the bounce-back decays the
+                // band concurrently and swallows the remaining momentum,
+                // like the native rubber band.
+                let maxOverscrollPx = rowHeightPx * Self.scrollMaxOverscrollCells
+                let frac = min(1.0, abs(currentOffset) / maxOverscrollPx)
+                newOffset = currentOffset + deltaYPx * (1.0 - frac) * (1.0 - frac)
+                if scrollGestureTouching {
+                    lastPreciseScrollInputTime = CFAbsoluteTimeGetCurrent()
+                }
+            } else {
+                // Momentum events must not refresh the recent-input window:
+                // it would gate the bounce-back of unrelated grids.
+                if !scrollMomentumRunning {
+                    lastPreciseScrollInputTime = CFAbsoluteTimeGetCurrent()
+                }
+                var canSendNow = canSendMore
+                if blockedSign != 0 {
+                    // Reversing away from a blocked edge.
+                    scrollEdgeBlocked.removeValue(forKey: gridId)
+                    // Drop pending scrolls only when provably dead (no response
+                    // for scrollEdgeFallbackSeconds). A viewport-detected block
+                    // can still have live in-flight scrolls from the approach;
+                    // their grid_scroll responses must stay accounted for.
+                    if let since = scrollStaleSince[gridId],
+                       CFAbsoluteTimeGetCurrent() - since >= Self.scrollEdgeFallbackSeconds {
+                        scrollStaleSince.removeValue(forKey: gridId)
+                        pendingSentScrollLock.lock()
+                        pendingSentScroll.removeValue(forKey: gridId)
+                        pendingSentScrollLock.unlock()
+                        canSendNow = true
+                    }
+                }
 
-                if checkOffset > 0 {
-                    checkOffset -= rowHeightPx
-                } else {
-                    checkOffset += rowHeightPx
+                newOffset = currentOffset + deltaYPx
+
+                // When accumulated offset reaches row height, emit nvim_input_mouse.
+                // Don't consume offset here — wait for grid_scroll response in
+                // processPendingScrollClears to keep visual offset synchronized
+                // with actual content movement (prevents flickering).
+                var checkOffset = newOffset
+                while abs(checkOffset) >= rowHeightPx && canSendNow && scrollCount < 3 {
+                    let direction = checkOffset > 0 ? "up" : "down"
+                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                    scrollCount += 1
+
+                    if checkOffset > 0 {
+                        checkOffset -= rowHeightPx
+                    } else {
+                        checkOffset += rowHeightPx
+                    }
                 }
             }
 
@@ -1776,11 +1933,12 @@ final class MetalTerminalView: MTKView {
             // during sustained trackpad scrolling.
             newOffset = clampVisualScrollOffsetPx(newOffset, cellHeightPx: rowHeightPx)
 
-            // Store final offset (atomic with read above — no TOCTOU gap)
+            // Store final offset (atomic with read above — no TOCTOU gap).
+            // Note: the stale counter is NOT reset on input — it must keep
+            // ticking during a held gesture so tickScrollEdgeBounce can detect
+            // a blocked edge. Bounce-back is gated on gesture/momentum state
+            // instead, so it never fights active user input.
             scrollOffsetPx[gridId] = newOffset
-            // Reset stale counter — user is actively scrolling.
-            // This prevents decayStaleScrollOffsets from fighting active user input.
-            scrollStaleFrameCount[gridId] = 0
             scrollOffsetLock.unlock()
 
             // Track how many scroll commands we sent (outside scrollOffsetLock)
@@ -1788,6 +1946,15 @@ final class MetalTerminalView: MTKView {
                 pendingSentScrollLock.lock()
                 pendingSentScroll[gridId, default: 0] += scrollCount
                 pendingSentScrollLock.unlock()
+            }
+
+            // Keep the draw clock running while scrolls are in flight or a
+            // sub-cell offset is showing: edge detection and bounce-back
+            // advance on draw ticks, and at a buffer edge Neovim sends no
+            // flushes, so flush-driven activation never fires (a paused loop
+            // would freeze the rubber band, e.g. while the finger holds still).
+            if isPaused && (abs(newOffset) >= Self.scrollOffsetEpsilon || alreadyPending + scrollCount > 0) {
+                activateDrawLoop()
             }
 
             return newOffset
@@ -1806,6 +1973,31 @@ final class MetalTerminalView: MTKView {
         }
     }
 
+    /// Direction-specific buffer-edge check from the non-blocking viewport
+    /// cache. deltaY > 0 scrolls "up" (blocked at the buffer top); negative
+    /// scrolls "down" (blocked once the last line reached the window top,
+    /// which is where Neovim stops). Returns nil when viewport info is
+    /// unavailable — the stale-time fallback in tickScrollEdgeBounce covers
+    /// that case.
+    private func isScrollBlockedAtEdge(gridId: Int64, deltaY: CGFloat) -> Bool? {
+        guard let vp = core?.getViewportNonBlocking(gridId: gridId), vp.lineCount > 0 else {
+            return nil
+        }
+        if deltaY > 0 { return vp.topline <= 0 }
+        return vp.topline >= vp.lineCount - 1
+    }
+
+    /// Drop all scroll bookkeeping for a grid (offset, edge flag, stale time,
+    /// pending sends). Caller must hold scrollOffsetLock.
+    private func clearScrollStateLocked(gridId: Int64) {
+        scrollOffsetPx.removeValue(forKey: gridId)
+        scrollEdgeBlocked.removeValue(forKey: gridId)
+        scrollStaleSince.removeValue(forKey: gridId)
+        pendingSentScrollLock.lock()
+        pendingSentScroll.removeValue(forKey: gridId)
+        pendingSentScrollLock.unlock()
+    }
+
     /// Get the current scroll offset for a grid.
     func getScrollOffset(gridId: Int64) -> CGFloat {
         scrollOffsetLock.lock()
@@ -1822,62 +2014,96 @@ final class MetalTerminalView: MTKView {
         pendingScrollClearLock.unlock()
     }
 
-    /// Decay stale scroll offsets. Called every frame from onPreDraw.
-    /// When pendingSentScroll > 0 but no grid_scroll response arrives for several
-    /// frames, the scroll likely hit a buffer boundary (Neovim can't scroll further).
-    /// Decay the offset toward 0 over several frames to prevent it from getting stuck.
-    private func decayStaleScrollOffsets() {
+    /// Per-frame scroll edge tick. Called from onPreDraw and from external
+    /// grid views; a time-based guard dedupes multiple callers per frame.
+    ///
+    /// Edge detection (fallback): when pendingSentScroll > 0 but no
+    /// grid_scroll response arrives, the scroll may have hit a buffer edge.
+    /// The viewport is consulted to confirm: a confirmed edge blocks after
+    /// scrollEdgeConfirmedSeconds, while a missing or disagreeing viewport
+    /// (slow response mid-buffer, folds at end of buffer) only blocks after
+    /// scrollEdgeFallbackSeconds. The primary, instant detection happens in
+    /// handleScrollInput from the same viewport cache.
+    ///
+    /// Bounce-back: once the trackpad gesture and its momentum end, blocked
+    /// offsets ease back to 0 (native rubber-band feel). While the user holds
+    /// the overscroll, the offset stays put.
+    private func tickScrollEdgeBounce() {
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
         guard rowHeightPx > 0 else { return }
 
-        // Threshold: ~10 frames at 60fps ≈ 166ms without grid_scroll response
-        let staleThreshold = 10
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastScrollEdgeTickTime >= 0.008 else { return }
+        // Elapsed time in 60fps frames, for rate-independent decay.
+        let elapsedFrames = min((now - lastScrollEdgeTickTime) * 60.0, 3.0)
+        lastScrollEdgeTickTime = now
 
         pendingSentScrollLock.lock()
         let pendingSnapshot = pendingSentScroll
         pendingSentScrollLock.unlock()
 
-        // Only process grids that have pending sent scrolls
-        guard !pendingSnapshot.isEmpty else {
-            scrollStaleFrameCount.removeAll()
-            return
-        }
+        // Cheap early exit without taking scrollOffsetLock (render-path rule).
+        // The hint may lag behind removals (one harmless extra pass) but
+        // inserts happen on this thread, so it never under-reports.
+        if pendingSnapshot.isEmpty && !scrollEdgeBlockedHint { return }
+
+        // Input is active while fingers are down; the timestamp fallback
+        // covers phase-less precise events. Momentum deliberately does not
+        // count: a blocked edge bounces back immediately, swallowing the
+        // remaining momentum (native rubber-band behavior).
+        let inputActive = scrollGestureTouching || now - lastPreciseScrollInputTime < 0.03
 
         scrollOffsetLock.lock()
+        defer {
+            scrollEdgeBlockedHint = !scrollEdgeBlocked.isEmpty
+            scrollOffsetLock.unlock()
+        }
+
+        // 1) Edge detection fallback: track time without a grid_scroll response.
         for (gridId, pendingCount) in pendingSnapshot {
             guard pendingCount > 0 else { continue }
 
-            scrollStaleFrameCount[gridId, default: 0] += 1
-            let staleFrames = scrollStaleFrameCount[gridId]!
+            let since: CFAbsoluteTime
+            if let existing = scrollStaleSince[gridId] {
+                since = existing
+            } else {
+                scrollStaleSince[gridId] = now
+                since = now
+            }
+            guard scrollEdgeBlocked[gridId] == nil else { continue }
 
-            if staleFrames >= staleThreshold {
-                let currentOffset = scrollOffsetPx[gridId] ?? 0
-                if abs(currentOffset) < Self.scrollOffsetEpsilon {
-                    // Close enough to 0 — clear everything
-                    scrollOffsetPx.removeValue(forKey: gridId)
-                    scrollStaleFrameCount.removeValue(forKey: gridId)
-                    pendingSentScrollLock.lock()
-                    pendingSentScroll.removeValue(forKey: gridId)
-                    pendingSentScrollLock.unlock()
-                    ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) cleared (offset was \(currentOffset))")
-                } else {
-                    // Decay: reduce offset by ~30% per frame (converges in ~5 frames)
-                    let decayed = currentOffset * 0.7
-                    if abs(decayed) < Self.scrollOffsetEpsilon {
-                        scrollOffsetPx.removeValue(forKey: gridId)
-                        scrollStaleFrameCount.removeValue(forKey: gridId)
-                        pendingSentScrollLock.lock()
-                        pendingSentScroll.removeValue(forKey: gridId)
-                        pendingSentScrollLock.unlock()
-                        ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) cleared after decay (was \(currentOffset) -> \(decayed))")
-                    } else {
-                        scrollOffsetPx[gridId] = decayed
-                        ZonvieCore.appLog("[decayStaleScroll] gridId=\(gridId) decay offset=\(currentOffset) -> \(decayed) pending=\(pendingCount) staleFrames=\(staleFrames)")
-                    }
-                }
+            let currentOffset = scrollOffsetPx[gridId] ?? 0
+            // Confirm with the viewport when possible. tryLock inside
+            // scrollOffsetLock cannot deadlock against the core thread's
+            // grid_mu -> scrollOffsetLock order because it never blocks.
+            let confirmed = abs(currentOffset) >= Self.scrollOffsetEpsilon
+                && isScrollBlockedAtEdge(gridId: gridId, deltaY: currentOffset) == true
+            let threshold = confirmed ? Self.scrollEdgeConfirmedSeconds : Self.scrollEdgeFallbackSeconds
+            guard now - since >= threshold else { continue }
+
+            if abs(currentOffset) < Self.scrollOffsetEpsilon {
+                // No visual offset to bounce — just drop the dead pending state.
+                clearScrollStateLocked(gridId: gridId)
+                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) cleared (offset was \(currentOffset))")
+            } else {
+                scrollEdgeBlocked[gridId] = currentOffset > 0 ? 1 : -1
+                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) blocked at edge, offset=\(currentOffset) pending=\(pendingCount) confirmed=\(confirmed)")
             }
         }
-        scrollOffsetLock.unlock()
+
+        // 2) Bounce-back: ease blocked offsets to 0 once input has ended.
+        guard !inputActive && !scrollEdgeBlocked.isEmpty else { return }
+        let decay = CGFloat(pow(Double(Self.scrollBounceDecayPerFrame), elapsedFrames))
+        for (gridId, _) in scrollEdgeBlocked {
+            let currentOffset = scrollOffsetPx[gridId] ?? 0
+            let eased = currentOffset * decay
+            if abs(eased) < Self.scrollOffsetEpsilon {
+                clearScrollStateLocked(gridId: gridId)
+                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) bounce settled (was \(currentOffset))")
+            } else {
+                scrollOffsetPx[gridId] = eased
+            }
+        }
     }
 
     /// Process pending scroll clears (can be called from any thread).
@@ -1896,8 +2122,10 @@ final class MetalTerminalView: MTKView {
 
         scrollOffsetLock.lock()
         for (gridId, scrollEventCount) in pending {
-            // grid_scroll received — reset stale counter for this grid
-            scrollStaleFrameCount.removeValue(forKey: gridId)
+            // grid_scroll received — reset stale tracking for this grid.
+            // A response also proves the grid is not blocked at a buffer edge.
+            scrollStaleSince.removeValue(forKey: gridId)
+            scrollEdgeBlocked.removeValue(forKey: gridId)
 
             // Check if this is a response to our scroll command or Neovim-initiated
             pendingSentScrollLock.lock()
@@ -1947,7 +2175,17 @@ final class MetalTerminalView: MTKView {
     /// onPreDraw hook every frame.
     func serviceSharedScrollStateForExternalView() {
         processPendingScrollClears()
-        decayStaleScrollOffsets()
+        tickScrollEdgeBounce()
+    }
+
+    /// True while an edge bounce is held or animating (for the given grid, or
+    /// any grid when nil). Views use this to keep their draw loop alive while
+    /// the bounce-back animation runs.
+    func isScrollEdgeBounceActive(gridId: Int64? = nil) -> Bool {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        if let gridId { return scrollEdgeBlocked[gridId] != nil }
+        return !scrollEdgeBlocked.isEmpty
     }
 
     /// Get scroll offset info for a specific grid (for external window shader update).
@@ -2215,7 +2453,7 @@ final class MetalTerminalView: MTKView {
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
         let safeCellHeightPx = max(0, cellHeightPx)
-        let maxOffsetPx = safeCellHeightPx * 2.0
+        let maxOffsetPx = safeCellHeightPx * Self.scrollMaxOverscrollCells
         guard maxOffsetPx > 0 else { return 0 }
         return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
     }

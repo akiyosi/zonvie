@@ -1106,6 +1106,19 @@ pub export fn zonvie_core_get_viewport(
     return box.core.getViewportInfo(grid_id, out_viewport.?);
 }
 
+/// Non-blocking version of zonvie_core_get_viewport.
+/// Returns 1 if found, 0 if not found, or -1 if the lock could not be acquired.
+/// Use this from the UI thread to avoid blocking when the core is in handleRedraw.
+pub export fn zonvie_core_try_get_viewport(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    out_viewport: ?*ViewportInfo,
+) callconv(.c) i32 {
+    if (p == null or out_viewport == null) return -1;
+    const box = asBox(p.?);
+    return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
+}
+
 /// Get current cursor position.
 /// Returns the grid_id of the cursor.
 pub export fn zonvie_core_get_cursor_position(

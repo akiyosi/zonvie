@@ -1961,7 +1961,19 @@ pub const Core = struct {
     pub fn getViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
         self.grid_mu.lock();
         defer self.grid_mu.unlock();
+        return self.getViewportInfoLocked(grid_id, out);
+    }
 
+    /// Non-blocking version of getViewportInfo.
+    /// Returns null if grid_mu could not be acquired (another thread holds it).
+    pub fn tryGetViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) ?i32 {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock();
+        return self.getViewportInfoLocked(grid_id, out);
+    }
+
+    /// Internal: get viewport info assuming grid_mu is already held.
+    fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
         const vp = self.grid.getViewport(grid_id) orelse {
             // self.log.write("[getViewportInfo] grid_id={d} not found\n", .{grid_id});
             return 0;

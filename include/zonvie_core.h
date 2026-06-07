@@ -1038,6 +1038,15 @@ ZONVIE_API int zonvie_core_get_viewport(
     zonvie_viewport_info *out_viewport
 );
 
+/* Non-blocking version of zonvie_core_get_viewport for input/render paths.
+   Returns 1 if found, 0 if not found, or -1 if the grid lock could not be
+   acquired (caller should reuse its last cached value). */
+ZONVIE_API int32_t zonvie_core_try_get_viewport(
+    zonvie_core *core,
+    int64_t grid_id,
+    zonvie_viewport_info *out_viewport
+);
+
 /* Get list of visible grids for hit-testing.
    Returns number of grids written (up to max_count).
    Global grid (id=1) is always included first. */

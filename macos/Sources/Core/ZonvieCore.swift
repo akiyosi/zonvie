@@ -2172,6 +2172,18 @@ final class ZonvieCore {
             guard lineCount > 0 else { return 1.0 }
             return min(1.0, Double(botline - topline) / Double(lineCount))
         }
+
+        /// Single mapping point from the C ABI struct, shared by the blocking
+        /// and non-blocking queries so field additions cannot drift apart.
+        init(_ vp: zonvie_viewport_info) {
+            gridId = vp.grid_id
+            topline = vp.topline
+            botline = vp.botline
+            lineCount = vp.line_count
+            curline = vp.curline
+            curcol = vp.curcol
+            scrollDelta = vp.scroll_delta
+        }
     }
 
     /// Get viewport info for a specific grid (for scrollbar)
@@ -2188,15 +2200,33 @@ final class ZonvieCore {
             return nil
         }
 
-        return ViewportInfo(
-            gridId: vp.grid_id,
-            topline: vp.topline,
-            botline: vp.botline,
-            lineCount: vp.line_count,
-            curline: vp.curline,
-            curcol: vp.curcol,
-            scrollDelta: vp.scroll_delta
-        )
+        return ViewportInfo(vp)
+    }
+
+    /// Cached viewports for the non-blocking query below (main thread only).
+    private var cachedViewports: [Int64: ViewportInfo] = [:]
+
+    /// Non-blocking version of getViewport with cache fallback.
+    /// Attempts tryLock on grid_mu; on success updates the per-grid cache.
+    /// On lock contention returns the previously cached value so the input
+    /// path never blocks on the core thread's handleRedraw.
+    func getViewportNonBlocking(gridId: Int64) -> ViewportInfo? {
+        guard let core else { return cachedViewports[gridId] }
+
+        var vp = zonvie_viewport_info()
+        let result = zonvie_core_try_get_viewport(core, gridId, &vp)
+        if result == 1 {
+            let info = ViewportInfo(vp)
+            cachedViewports[gridId] = info
+            return info
+        }
+        if result == 0 {
+            // Grid genuinely has no viewport info — drop any stale cache entry.
+            cachedViewports.removeValue(forKey: gridId)
+            return nil
+        }
+        // Lock busy — reuse the last known viewport (at most one flush stale).
+        return cachedViewports[gridId]
     }
 
     /// Timer for processing pending message scroll
