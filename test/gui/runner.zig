@@ -71,13 +71,30 @@ test "gui:wheel_scroll" {
 }
 
 test "gui:visual_baseline" {
-    // Runs wherever the screenshot layer is implemented (macOS today;
-    // Windows once WIC capture lands).
+    // Visual scenarios run wherever the screenshot layer is implemented.
     if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/baseline.zig").run(testing.allocator);
     } else {
         std.debug.print("[gui] skipped: screenshot capture not implemented on this host\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_split" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/split.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_float" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/float.zig").run(testing.allocator);
+    } else {
         return error.SkipZigTest;
     }
 }
