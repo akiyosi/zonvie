@@ -9,7 +9,7 @@
 // disappearing in response to a keystroke, rendered by the real frontend.
 
 const std = @import("std");
-const Gui = @import("../driver.zig").Gui;
+const Gui = @import("../../driver.zig").Gui;
 
 pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--extcmdline", "--log", "tmp/gui_app.log" } });

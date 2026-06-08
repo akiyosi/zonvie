@@ -9,7 +9,7 @@
 // a REAL second OS window appear; closing it makes the window disappear.
 
 const std = @import("std");
-const Gui = @import("../driver.zig").Gui;
+const Gui = @import("../../driver.zig").Gui;
 
 pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", "tmp/gui_app.log" } });

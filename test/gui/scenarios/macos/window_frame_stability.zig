@@ -9,7 +9,7 @@
 // asserts the main window frame reproduces within tolerance.
 
 const std = @import("std");
-const driver = @import("../driver.zig");
+const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 

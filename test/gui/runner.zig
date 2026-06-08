@@ -31,14 +31,21 @@ fn requirePrereqs() !void {
     testing.allocator.free(app);
 }
 
+// Scenarios are grouped by platform applicability:
+//   common/  — run on every host (behavior-level, driven via nvim RPC)
+//   macos/   — macOS-only behavior
+//   windows/ — Windows-only behavior
+// Platform-specific tests gate the @import behind a comptime os check so
+// the host that cannot run them never analyzes their platform-only code.
+
 test "gui:cmdline_window" {
     try requirePrereqs();
-    try @import("scenarios/cmdline_window.zig").run(testing.allocator);
+    try @import("scenarios/common/cmdline_window.zig").run(testing.allocator);
 }
 
 test "gui:external_window" {
     try requirePrereqs();
-    try @import("scenarios/external_window.zig").run(testing.allocator);
+    try @import("scenarios/common/external_window.zig").run(testing.allocator);
 }
 
 test "gui:window_frame_stability" {
@@ -46,7 +53,18 @@ test "gui:window_frame_stability" {
     // frame across launches, so the 44705f8 regression cannot occur there.
     if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
-        try @import("scenarios/window_frame_stability.zig").run(testing.allocator);
+        try @import("scenarios/macos/window_frame_stability.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:wheel_scroll" {
+    // Windows only: synthesizes WM_MOUSEWHEEL into the real frontend wheel
+    // handler (7b37537). No macOS equivalent in this driver.
+    if (comptime builtin.os.tag == .windows) {
+        try requirePrereqs();
+        try @import("scenarios/windows/wheel_scroll.zig").run(testing.allocator);
     } else {
         return error.SkipZigTest;
     }

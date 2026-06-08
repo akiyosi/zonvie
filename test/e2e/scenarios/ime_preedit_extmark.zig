@@ -4,6 +4,13 @@
 // true → frontend hides its overlay), render it in the grid, remove it on
 // clearPreedit, and fall back to frontend-overlay mode (returns false)
 // outside insert/replace.
+//
+// The setPreedit return value is also the core-side contract behind
+// 60e3081 (Windows: hide the preedit overlay while the inline extmark is
+// active): true tells the frontend to suppress its own overlay window so
+// the two don't both draw. We assert that contract here; the frontend's
+// actual overlay-window hiding is a pixel/z-order effect that needs the
+// not-yet-built screenshot layer to observe directly.
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
