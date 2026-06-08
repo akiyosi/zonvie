@@ -20,12 +20,10 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 
-fn topLine(g: *Gui) !i64 {
-    const out = try g.remoteExpr("line('w0')");
-    defer g.alloc.free(out);
-    // Robustly extract the integer: scan for an optional '-' then digits,
-    // tolerating stray whitespace / CR / BOM that `--remote-expr` output
-    // can carry on Windows. On no digits, dump the raw bytes for diagnosis.
+/// Extract the first integer (optional '-' then digits) from a byte slice,
+/// tolerating stray whitespace / CR / BOM that `--remote-expr` output can
+/// carry on Windows. Used for every numeric remote-expr result.
+fn extractInt(out: []const u8) ?i64 {
     var start: ?usize = null;
     var end: usize = 0;
     for (out, 0..) |c, i| {
@@ -39,9 +37,22 @@ fn topLine(g: *Gui) !i64 {
             break;
         }
     }
-    if (start) |s| return std.fmt.parseInt(i64, out[s..end], 10);
-    std.debug.print("[gui] line('w0') returned no integer; raw ({d} bytes): \"{s}\"\n", .{ out.len, out });
-    return error.NonNumericViewport;
+    if (start) |s| return std.fmt.parseInt(i64, out[s..end], 10) catch null;
+    return null;
+}
+
+/// Evaluate a remote-expr and parse its result as an integer.
+fn evalInt(g: *Gui, expr: []const u8) !i64 {
+    const out = try g.remoteExpr(expr);
+    defer g.alloc.free(out);
+    return extractInt(out) orelse {
+        std.debug.print("[gui] {s} returned no integer; raw ({d} bytes): \"{s}\"\n", .{ expr, out.len, out });
+        return error.NonNumericResult;
+    };
+}
+
+fn topLine(g: *Gui) !i64 {
+    return evalInt(g, "line('w0')");
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -96,13 +107,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.debug.print("\n", .{});
     }
 
-    const last = blk: {
-        const o = try g.remoteExpr("line('$')");
-        defer g.alloc.free(o);
-        break :blk std.fmt.parseInt(i64, std.mem.trim(u8, o, " \t\r\n"), 10) catch -1;
-    };
+    const last = try evalInt(g, "line('$')");
     const base = try topLine(g);
-    if (last != 200 or base < 1 or base > 10) {
+    if (last != 200 or base < 1 or base > 20) {
         std.debug.print("[gui] wheel_scroll unexpected state: line('$')={d} top={d} (expected $=200, top near 1)\n", .{ last, base });
         return error.UnexpectedBufferState;
     }
