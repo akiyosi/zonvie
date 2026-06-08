@@ -49,6 +49,10 @@ pub const default_app_rel_path = switch (builtin.os.tag) {
 
 extern "kernel32" fn GetProcessId(h: std.os.windows.HANDLE) callconv(.winapi) u32;
 
+/// Per-process sequence so each Gui gets a unique listen address even
+/// though all scenarios share the test process PID.
+var gui_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 /// Resolve the nvim binary: $ZONVIE_TEST_NVIM if set, else "nvim" on PATH.
 pub fn resolveNvim(alloc: std.mem.Allocator) ![]u8 {
     const path = std.process.getEnvVarOwned(alloc, "ZONVIE_TEST_NVIM") catch
@@ -125,16 +129,22 @@ pub const Gui = struct {
             .app_pid = 0,
         };
 
-        // Unique listen address. macOS: ABSOLUTE socket path (the core's
-        // connect-address validation rejects relative paths). Windows:
-        // named pipe (the only transport the core supports there).
+        // Unique listen address PER Gui instance. All scenarios run in one
+        // test process (same PID), so the address must also carry a
+        // per-instance sequence — otherwise sibling scenarios share a pipe
+        // name and a new app/driver can attach to a previous scenario's
+        // lingering nvim (observed on Windows: stale buffer state, e.g. a
+        // viewport line far beyond the buffer the scenario created).
+        // macOS: ABSOLUTE socket path (the core rejects relative paths).
+        // Windows: named pipe (the only transport the core supports there).
+        const seq = gui_seq.fetchAdd(1, .monotonic);
         if (builtin.os.tag == .windows) {
-            g.listen_addr = try std.fmt.allocPrint(alloc, "\\\\.\\pipe\\zonvie_gui_e2e_{d}", .{currentPid()});
+            g.listen_addr = try std.fmt.allocPrint(alloc, "\\\\.\\pipe\\zonvie_gui_e2e_{d}_{d}", .{ currentPid(), seq });
         } else {
             std.fs.cwd().makePath("tmp") catch {};
             const tmp_abs = try std.fs.cwd().realpathAlloc(alloc, "tmp");
             defer alloc.free(tmp_abs);
-            g.listen_addr = try std.fmt.allocPrint(alloc, "{s}/gui_e2e_{d}.sock", .{ tmp_abs, currentPid() });
+            g.listen_addr = try std.fmt.allocPrint(alloc, "{s}/gui_e2e_{d}_{d}.sock", .{ tmp_abs, currentPid(), seq });
             std.fs.cwd().deleteFile(g.listen_addr) catch {};
         }
         errdefer alloc.free(g.listen_addr);

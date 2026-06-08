@@ -53,7 +53,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
         const o = try g.remoteExpr("execute('set mousescroll=ver:3')");
         alloc.free(o);
     }
-    // A long buffer, parked at the top.
+    // A long buffer (replace any existing content), parked at the top.
+    {
+        const o = try g.remoteExpr("execute('silent! %delete _')");
+        alloc.free(o);
+    }
     {
         const o = try g.remoteExpr("setline(1, map(range(1, 200), 'string(v:val)'))");
         alloc.free(o);
@@ -63,13 +67,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
         alloc.free(o);
     }
 
-    // Let the view settle at the top.
-    var settle: u32 = 0;
-    while (settle < 20) : (settle += 1) {
-        if ((try topLine(g)) == 1) break;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Sanity-check the buffer/view state (diagnostic on the connected nvim).
+    const last = blk: {
+        const o = try g.remoteExpr("line('$')");
+        defer g.alloc.free(o);
+        break :blk std.fmt.parseInt(i64, std.mem.trim(u8, o, " \t\r\n"), 10) catch -1;
+    };
+    const base = try topLine(g);
+    if (last != 200 or base < 1 or base > 10) {
+        std.debug.print("[gui] wheel_scroll unexpected state: line('$')={d} top={d} (expected $=200, top near 1)\n", .{ last, base });
+        return error.UnexpectedBufferState;
     }
-    try std.testing.expectEqual(@as(i64, 1), try topLine(g));
 
     // Aim the wheel at the center of the main window (screen coords).
     const b = platform.mainWindowBoundsForPid(g.app_pid) orelse return error.NoMainWindow;
@@ -79,11 +87,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // One notch down. Win32 convention: negative delta scrolls down.
     if (!platform.sendWheel(g.app_pid, -1, cx, cy)) return error.WheelSendFailed;
 
-    // Wait for the viewport to move, then read how far.
+    // Wait for the viewport to move, then read how far (from the measured
+    // baseline, not an assumed top-of-1).
     var moved: i64 = 0;
     var waited: u32 = 0;
     while (waited < 40) : (waited += 1) {
-        moved = (try topLine(g)) - 1;
+        moved = (try topLine(g)) - base;
         if (moved > 0) break;
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
@@ -92,7 +101,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // sent 3 events -> 9 lines. A tolerant upper bound cleanly separates
     // the two while allowing minor viewport rounding.
     if (moved <= 0) {
-        std.debug.print("[gui] wheel notch produced no scroll (top still {d})\n", .{moved + 1});
+        std.debug.print("[gui] wheel notch produced no scroll (top still {d})\n", .{base});
         return error.WheelNoScroll;
     }
     if (moved > 5) {
