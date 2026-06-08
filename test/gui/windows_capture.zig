@@ -24,7 +24,10 @@ const HDC = W.HDC;
 const HBITMAP = W.HANDLE;
 const HGDIOBJ = W.HANDLE;
 
+const POINT = extern struct { x: i32, y: i32 };
+
 extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *W.RECT) callconv(.winapi) W.BOOL;
+extern "user32" fn ClientToScreen(hwnd: W.HWND, pt: *POINT) callconv(.winapi) W.BOOL;
 extern "user32" fn GetDC(hwnd: ?W.HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(hwnd: ?W.HWND, hdc: HDC) callconv(.winapi) i32;
 extern "user32" fn PrintWindow(hwnd: W.HWND, hdc: HDC, flags: W.UINT) callconv(.winapi) W.BOOL;
@@ -123,11 +126,22 @@ pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image
 
     const src: [*]const u8 = @ptrCast(bits.?);
 
-    // Crop region in device pixels (DPI-scaled to mirror macOS points).
+    // Anchor the crop at the CLIENT area's top-left, skipping the window
+    // title bar / caption: that chrome changes run-to-run (focus state,
+    // caption buttons) and is the sole source of cross-run pixel noise —
+    // the terminal content below it reproduces exactly. Offset is the
+    // client origin within the window-sized DIB.
+    var client_origin = POINT{ .x = 0, .y = 0 };
+    _ = ClientToScreen(hwnd, &client_origin);
+    const off_x: u32 = @intCast(@max(0, client_origin.x - rect.left));
+    const off_y: u32 = @intCast(@max(0, client_origin.y - rect.top));
+
     const dpi = GetDpiForWindow(hwnd);
     const scale: f64 = if (dpi == 0) 1.0 else @as(f64, @floatFromInt(dpi)) / 96.0;
-    const cw: u32 = if (crop) |c| @min(@as(u32, @intCast(win_w)), @as(u32, @intFromFloat(c.w_pt * scale))) else @intCast(win_w);
-    const ch: u32 = if (crop) |c| @min(@as(u32, @intCast(win_h)), @as(u32, @intFromFloat(c.h_pt * scale))) else @intCast(win_h);
+    const avail_w: u32 = @as(u32, @intCast(win_w)) -| off_x;
+    const avail_h: u32 = @as(u32, @intCast(win_h)) -| off_y;
+    const cw: u32 = if (crop) |c| @min(avail_w, @as(u32, @intFromFloat(c.w_pt * scale))) else avail_w;
+    const ch: u32 = if (crop) |c| @min(avail_h, @as(u32, @intFromFloat(c.h_pt * scale))) else avail_h;
 
     const rgba = try alloc.alloc(u8, @as(usize, cw) * @as(usize, ch) * 4);
     errdefer alloc.free(rgba);
@@ -136,7 +150,7 @@ pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image
     while (y < ch) : (y += 1) {
         var x: u32 = 0;
         while (x < cw) : (x += 1) {
-            const s = @as(usize, y) * stride + @as(usize, x) * 4;
+            const s = (@as(usize, y) + off_y) * stride + (@as(usize, x) + off_x) * 4;
             const d = (@as(usize, y) * @as(usize, cw) + @as(usize, x)) * 4;
             rgba[d + 0] = src[s + 2]; // R <- BGRA.R
             rgba[d + 1] = src[s + 1]; // G
