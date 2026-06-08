@@ -37,6 +37,11 @@ pub const platform = switch (builtin.os.tag) {
     else => @import("macos_window.zig"),
 };
 
+pub const capture = switch (builtin.os.tag) {
+    .windows => @import("windows_capture.zig"),
+    else => @import("macos_capture.zig"),
+};
+
 pub const default_app_rel_path = switch (builtin.os.tag) {
     .windows => "windows/zig-out/bin/zonvie.exe",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
@@ -296,6 +301,40 @@ pub const Gui = struct {
 
     pub fn windowCount(g: *Gui) u32 {
         return platform.windowCountForPid(g.app_pid);
+    }
+
+    /// Capture the app's main window, retrying until two consecutive
+    /// captures are pixel-identical (the frame has settled) or timeout.
+    /// `crop` (a fixed top-left region) keeps the output dimensions stable
+    /// across runs; pass null for the whole window. Caller frees the image.
+    /// Cursor blink etc. must be disabled by the scenario first, or the
+    /// frames will never settle.
+    pub fn captureStable(g: *Gui, crop: ?capture.Crop, timeout_ms: u64) !capture.Image {
+        var timer = std.time.Timer.start() catch unreachable;
+        var prev: ?capture.Image = null;
+        defer if (prev) |*p| p.deinit(g.alloc);
+        while (true) {
+            std.Thread.sleep(150 * std.time.ns_per_ms);
+            const cur = capture.captureMainWindow(g.alloc, g.app_pid, crop) catch |e| {
+                if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
+                continue;
+            };
+            if (prev) |*p| {
+                if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
+                    p.deinit(g.alloc);
+                    prev = null;
+                    return cur;
+                }
+                p.deinit(g.alloc);
+                prev = null;
+            }
+            prev = cur;
+            if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
+                const out = prev.?;
+                prev = null;
+                return out; // last capture even if not fully settled
+            }
+        }
     }
 
     /// True while the app process is still running. Reaps/observes at most

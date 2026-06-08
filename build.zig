@@ -390,6 +390,7 @@ pub fn build(b: *std.Build) !void {
         if (host_os == .macos) {
             gui_mod.linkFramework("CoreGraphics", .{});
             gui_mod.linkFramework("CoreFoundation", .{});
+            gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
         } else {
             gui_mod.linkSystemLibrary("user32", .{});
         }

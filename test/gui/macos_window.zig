@@ -28,6 +28,7 @@ const CGRect = extern struct {
 extern const kCGWindowOwnerPID: *anyopaque;
 extern const kCGWindowLayer: *anyopaque;
 extern const kCGWindowBounds: *anyopaque;
+extern const kCGWindowNumber: *anyopaque;
 
 const kCGWindowListOptionOnScreenOnly: u32 = 1 << 0;
 const kCGNullWindowID: u32 = 0;
@@ -59,13 +60,17 @@ pub fn windowCountForPid(pid: i32) u32 {
 
 pub const Bounds = struct { x: f64, y: f64, w: f64, h: f64 };
 
-/// Bounds of the first on-screen LAYER-0 (normal) window owned by `pid` —
-/// i.e. the app's main window, skipping floating overlays. Null when the
+pub const MainWindow = struct { number: u32, bounds: Bounds };
+
+/// The app's main window: the largest-area on-screen LAYER-0 (normal)
+/// window owned by `pid`, with its CGWindowID and bounds. Null when the
 /// app has no normal window on screen.
-pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
+pub fn mainWindowForPid(pid: i32) ?MainWindow {
     const list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) orelse return null;
     defer CFRelease(list);
 
+    var best: ?MainWindow = null;
+    var best_area: f64 = -1;
     const n = CFArrayGetCount(list);
     var i: isize = 0;
     while (i < n) : (i += 1) {
@@ -85,9 +90,24 @@ pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
         const bounds_ref = CFDictionaryGetValue(dict, kCGWindowBounds) orelse continue;
         var rect = CGRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
         if (!CGRectMakeWithDictionaryRepresentation(bounds_ref, &rect)) continue;
-        return .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h };
+
+        const num_ref = CFDictionaryGetValue(dict, kCGWindowNumber) orelse continue;
+        var num: i64 = 0;
+        if (!CFNumberGetValue(num_ref, 4, &num)) continue; // kCFNumberSInt64Type = 4
+
+        const area = rect.w * rect.h;
+        if (area > best_area) {
+            best_area = area;
+            best = .{ .number = @intCast(num), .bounds = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h } };
+        }
     }
-    return null;
+    return best;
+}
+
+/// Bounds of the app's main window. Null when none on screen.
+pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
+    const mw = mainWindowForPid(pid) orelse return null;
+    return mw.bounds;
 }
 
 /// Debug helper: print layer and bounds of every on-screen window owned by
