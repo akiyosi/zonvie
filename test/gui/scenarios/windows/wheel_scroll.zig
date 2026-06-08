@@ -20,9 +20,43 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 
-/// Extract the first integer (optional '-' then digits) from a byte slice,
-/// tolerating stray whitespace / CR / BOM that `--remote-expr` output can
-/// carry on Windows. Used for every numeric remote-expr result.
+/// Strip ANSI/VT escape sequences and control bytes in place, returning the
+/// cleaned length. On Windows `nvim --server --remote-expr` wraps its output
+/// in TUI control codes (ESC 7, ESC[?47h, ESC[H, ESC[J, ...); the actual
+/// value is plain text in between. Without this, a digit scan grabs the '7'
+/// of the leading "ESC 7" (DECSC) instead of the real value.
+fn stripEscapes(buf: []u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < buf.len) {
+        const c = buf[i];
+        if (c == 0x1b) { // ESC
+            i += 1;
+            if (i >= buf.len) break;
+            const k = buf[i];
+            if (k == '[') { // CSI: params then a final byte 0x40..0x7e
+                i += 1;
+                while (i < buf.len and !(buf[i] >= 0x40 and buf[i] <= 0x7e)) i += 1;
+                if (i < buf.len) i += 1; // consume final byte
+            } else if (k == ']') { // OSC: until BEL or ESC
+                i += 1;
+                while (i < buf.len and buf[i] != 0x07 and buf[i] != 0x1b) i += 1;
+                if (i < buf.len and buf[i] == 0x07) i += 1;
+            } else { // two-byte escape (ESC 7, ESC =, ...)
+                i += 1;
+            }
+        } else if (c < 0x20) { // other control bytes (CR, LF, NUL, ...)
+            i += 1;
+        } else {
+            buf[n] = c;
+            n += 1;
+            i += 1;
+        }
+    }
+    return n;
+}
+
+/// Extract the first integer (optional '-' then digits) from a byte slice.
 fn extractInt(out: []const u8) ?i64 {
     var start: ?usize = null;
     var end: usize = 0;
@@ -41,12 +75,14 @@ fn extractInt(out: []const u8) ?i64 {
     return null;
 }
 
-/// Evaluate a remote-expr and parse its result as an integer.
+/// Evaluate a remote-expr and parse its result as an integer, stripping the
+/// TUI escape sequences that Windows nvim injects into the output.
 fn evalInt(g: *Gui, expr: []const u8) !i64 {
     const out = try g.remoteExpr(expr);
     defer g.alloc.free(out);
-    return extractInt(out) orelse {
-        std.debug.print("[gui] {s} returned no integer; raw ({d} bytes): \"{s}\"\n", .{ expr, out.len, out });
+    const clean = stripEscapes(out);
+    return extractInt(out[0..clean]) orelse {
+        std.debug.print("[gui] {s} returned no integer after strip; raw ({d} bytes)\n", .{ expr, out.len });
         return error.NonNumericResult;
     };
 }
@@ -76,35 +112,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
     {
         const o = try g.remoteExpr("execute('normal! gg')");
         alloc.free(o);
-    }
-
-    // Diagnostic: dump raw remote-expr output for a set of probes so the
-    // actual values/format are visible on the connected nvim. Remove once
-    // the wheel path is confirmed on real Windows.
-    const probes = [_][]const u8{
-        "string(1+1)",
-        "string(line('$'))",
-        "string(line('w0'))",
-        "string(line('w$'))",
-        "string(winheight(0))",
-        "getline(1)",
-        "string(mode())",
-    };
-    for (probes) |p| {
-        const o = g.remoteExpr(p) catch |e| {
-            std.debug.print("[gui] probe {s} => error {s}\n", .{ p, @errorName(e) });
-            continue;
-        };
-        defer g.alloc.free(o);
-        std.debug.print("[gui] probe {s} => ({d} bytes) text=\"{s}\" hex=", .{ p, o.len, o });
-        for (o, 0..) |byte, idx| {
-            if (idx >= 16) {
-                std.debug.print("..", .{});
-                break;
-            }
-            std.debug.print("{x:0>2} ", .{byte});
-        }
-        std.debug.print("\n", .{});
     }
 
     const last = try evalInt(g, "line('$')");
