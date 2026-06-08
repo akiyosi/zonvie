@@ -23,8 +23,25 @@ const Gui = driver.Gui;
 fn topLine(g: *Gui) !i64 {
     const out = try g.remoteExpr("line('w0')");
     defer g.alloc.free(out);
-    const trimmed = std.mem.trim(u8, out, " \t\r\n");
-    return std.fmt.parseInt(i64, trimmed, 10);
+    // Robustly extract the integer: scan for an optional '-' then digits,
+    // tolerating stray whitespace / CR / BOM that `--remote-expr` output
+    // can carry on Windows. On no digits, dump the raw bytes for diagnosis.
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (out, 0..) |c, i| {
+        const is_digit = c >= '0' and c <= '9';
+        if (start == null and (is_digit or (c == '-' and i + 1 < out.len and out[i + 1] >= '0' and out[i + 1] <= '9'))) {
+            start = i;
+            end = i + 1;
+        } else if (start != null and is_digit) {
+            end = i + 1;
+        } else if (start != null) {
+            break;
+        }
+    }
+    if (start) |s| return std.fmt.parseInt(i64, out[s..end], 10);
+    std.debug.print("[gui] line('w0') returned no integer; raw ({d} bytes): \"{s}\"\n", .{ out.len, out });
+    return error.NonNumericViewport;
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
