@@ -17,9 +17,17 @@
 // the golden is created and the test passes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const visual = @import("../../visual.zig");
 const Gui = driver.Gui;
+
+// A monospace font that exists on the host OS, so cell metrics / glyph
+// rasterization are stable within the environment.
+const fixed_guifont = switch (builtin.os.tag) {
+    .windows => "Consolas:h13",
+    else => "Menlo:h13",
+};
 
 fn exec(g: *Gui, expr: []const u8) !void {
     const o = try g.remoteExpr(expr);
@@ -40,7 +48,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Steady cursor + fixed font for stable, repeatable pixels.
     try exec(g, "execute('set guicursor+=a:blinkon0')");
-    try exec(g, "execute('set guifont=Menlo:h13')");
+    try exec(g, "execute('set guifont=" ++ fixed_guifont ++ "')");
     // A fixed pattern: text, digits, and box-drawing glyphs.
     try exec(g,
         \\setline(1, ['Zonvie visual baseline', 'abcdefg 0123456789', '┌──────┐', '│ box  │', '└──────┘'])

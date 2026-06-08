@@ -59,6 +59,9 @@ const kCGWindowImageBoundsIgnoreFraming: u32 = 1 << 0;
 
 pub const supported = true;
 
+/// On-disk format for goldens / dumps on this platform.
+pub const image_ext = ".png";
+
 /// True when the host process holds Screen Recording permission. Capturing
 /// another process's window requires it on macOS 10.15+; without it
 /// CGWindowListCreateImage yields no window content. Does not prompt.
@@ -131,8 +134,10 @@ fn rgbaToCGImage(img: Image) !CGImageRef {
     return CGBitmapContextCreateImage(ctx) orelse error.ImageFromContextFailed;
 }
 
-/// Write an RGBA image to `path` as PNG.
-pub fn writePng(path: []const u8, img: Image) !void {
+/// Write an RGBA image to `path` as PNG. `alloc` is unused (ImageIO owns
+/// its buffers); it is in the signature for cross-platform uniformity.
+pub fn writeImage(alloc: std.mem.Allocator, path: []const u8, img: Image) !void {
+    _ = alloc;
     const cg = try rgbaToCGImage(img);
     defer CGImageRelease(cg);
 
@@ -148,7 +153,7 @@ pub fn writePng(path: []const u8, img: Image) !void {
 }
 
 /// Read a PNG at `path` into an RGBA image.
-pub fn readPng(alloc: std.mem.Allocator, path: []const u8) !Image {
+pub fn readImage(alloc: std.mem.Allocator, path: []const u8) !Image {
     const url = CFURLCreateFromFileSystemRepresentation(null, path.ptr, @intCast(path.len), false) orelse return error.UrlFailed;
     defer CFRelease(url);
     const src = CGImageSourceCreateWithURL(url, null) orelse return error.SourceFailed;

@@ -393,6 +393,7 @@ pub fn build(b: *std.Build) !void {
             gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
         } else {
             gui_mod.linkSystemLibrary("user32", .{});
+            gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture
         }
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
@@ -415,6 +416,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("test/gui/runner.zig"),
     });
     gui_win_mod.linkSystemLibrary("user32", .{});
+    gui_win_mod.linkSystemLibrary("gdi32", .{});
     const gui_win_tests = b.addTest(.{
         .name = "zonvie-gui-test",
         .root_module = gui_win_mod,

@@ -43,7 +43,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
     const dir = try std.fmt.allocPrint(alloc, "test/gui/golden/{s}", .{os_dir});
     defer alloc.free(dir);
     std.fs.cwd().makePath(dir) catch {};
-    const golden = try std.fmt.allocPrint(alloc, "{s}/{s}.png", .{ dir, name });
+    const golden = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir, name, capture.image_ext });
     defer alloc.free(golden);
 
     const update = std.process.hasEnvVarConstant("ZONVIE_GUI_UPDATE_GOLDEN");
@@ -53,7 +53,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
     };
 
     if (update or !exists) {
-        try capture.writePng(golden, captured);
+        try capture.writeImage(alloc, golden, captured);
         std.debug.print(
             "[gui] golden {s}: {s} ({d}x{d}) — passing\n",
             .{ if (update) "updated" else "created", golden, captured.w, captured.h },
@@ -61,7 +61,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
         return;
     }
 
-    var ref = try capture.readPng(alloc, golden);
+    var ref = try capture.readImage(alloc, golden);
     defer ref.deinit(alloc);
 
     if (ref.w != captured.w or ref.h != captured.h) {
@@ -104,9 +104,9 @@ fn absDiff(a: u8, b: u8) u8 {
 
 fn dumpActual(alloc: std.mem.Allocator, name: []const u8, captured: capture.Image) !void {
     std.fs.cwd().makePath("tmp") catch {};
-    const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_actual.png", .{name});
+    const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_actual{s}", .{ name, capture.image_ext });
     defer alloc.free(p);
-    capture.writePng(p, captured) catch {};
+    capture.writeImage(alloc, p, captured) catch {};
     std.debug.print("[gui]   wrote actual to {s}\n", .{p});
 }
 
@@ -133,8 +133,8 @@ fn dumpDiff(alloc: std.mem.Allocator, name: []const u8, ref: capture.Image, capt
         }
         buf[o + 3] = 255;
     }
-    const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_diff.png", .{name});
+    const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_diff{s}", .{ name, capture.image_ext });
     defer alloc.free(p);
-    capture.writePng(p, .{ .w = captured.w, .h = captured.h, .rgba = buf }) catch {};
+    capture.writeImage(alloc, p, .{ .w = captured.w, .h = captured.h, .rgba = buf }) catch {};
     std.debug.print("[gui]   wrote diff to {s}\n", .{p});
 }
