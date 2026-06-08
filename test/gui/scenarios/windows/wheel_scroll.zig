@@ -20,69 +20,28 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 
-/// Strip ANSI/VT escape sequences and control bytes in place, returning the
-/// cleaned length. On Windows `nvim --server --remote-expr` wraps its output
-/// in TUI control codes (ESC 7, ESC[?47h, ESC[H, ESC[J, ...); the actual
-/// value is plain text in between. Without this, a digit scan grabs the '7'
-/// of the leading "ESC 7" (DECSC) instead of the real value.
-fn stripEscapes(buf: []u8) usize {
-    var i: usize = 0;
-    var n: usize = 0;
-    while (i < buf.len) {
-        const c = buf[i];
-        if (c == 0x1b) { // ESC
-            i += 1;
-            if (i >= buf.len) break;
-            const k = buf[i];
-            if (k == '[') { // CSI: params then a final byte 0x40..0x7e
-                i += 1;
-                while (i < buf.len and !(buf[i] >= 0x40 and buf[i] <= 0x7e)) i += 1;
-                if (i < buf.len) i += 1; // consume final byte
-            } else if (k == ']') { // OSC: until BEL or ESC
-                i += 1;
-                while (i < buf.len and buf[i] != 0x07 and buf[i] != 0x1b) i += 1;
-                if (i < buf.len and buf[i] == 0x07) i += 1;
-            } else { // two-byte escape (ESC 7, ESC =, ...)
-                i += 1;
-            }
-        } else if (c < 0x20) { // other control bytes (CR, LF, NUL, ...)
-            i += 1;
-        } else {
-            buf[n] = c;
-            n += 1;
-            i += 1;
-        }
-    }
-    return n;
-}
+const query_file = "tmp/wheel_query.txt";
 
-/// Extract the first integer (optional '-' then digits) from a byte slice.
-fn extractInt(out: []const u8) ?i64 {
-    var start: ?usize = null;
-    var end: usize = 0;
-    for (out, 0..) |c, i| {
-        const is_digit = c >= '0' and c <= '9';
-        if (start == null and (is_digit or (c == '-' and i + 1 < out.len and out[i + 1] >= '0' and out[i + 1] <= '9'))) {
-            start = i;
-            end = i + 1;
-        } else if (start != null and is_digit) {
-            end = i + 1;
-        } else if (start != null) {
-            break;
-        }
-    }
-    if (start) |s| return std.fmt.parseInt(i64, out[s..end], 10) catch null;
-    return null;
-}
-
-/// Evaluate a remote-expr and parse its result as an integer, stripping the
-/// TUI escape sequences that Windows nvim injects into the output.
+/// Evaluate `expr` on the server and return it as an integer.
+///
+/// Windows `nvim --server --remote-expr` writes a whole TUI frame (alt
+/// screen + cursor moves) to stdout, so parsing stdout is hopeless there.
+/// Instead have the SERVER write the value to a file via writefile() (a
+/// side effect, like --remote-send, which is unaffected by the client's
+/// TUI output) and read that file. Server and driver share the cwd
+/// (repo root), so a relative path resolves to the same file.
 fn evalInt(g: *Gui, expr: []const u8) !i64 {
-    const out = try g.remoteExpr(expr);
-    defer g.alloc.free(out);
-    const clean = stripEscapes(out);
-    return extractInt(out[0..clean]) orelse {
-        std.debug.print("[gui] {s} returned no integer after strip; raw ({d} bytes)\n", .{ expr, out.len });
+    std.fs.cwd().deleteFile(query_file) catch {};
+    const wexpr = try std.fmt.allocPrint(g.alloc, "writefile([string({s})], '{s}')", .{ expr, query_file });
+    defer g.alloc.free(wexpr);
+    const out = try g.remoteExpr(wexpr); // stdout discarded (TUI noise on Windows)
+    g.alloc.free(out);
+
+    const data = try std.fs.cwd().readFileAlloc(g.alloc, query_file, 4096);
+    defer g.alloc.free(data);
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    return std.fmt.parseInt(i64, trimmed, 10) catch {
+        std.debug.print("[gui] {s} wrote non-integer: \"{s}\"\n", .{ expr, trimmed });
         return error.NonNumericResult;
     };
 }
