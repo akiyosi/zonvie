@@ -92,6 +92,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
             "[gui] visual mismatch for {s}: {d}/{d} pixels differ ({d:.4} > {d:.4})\n",
             .{ name, diff_count, total, ratio, opts.max_diff_ratio },
         );
+        printDiffHeatmap(ref, captured, opts.tol_per_channel);
         try dumpActual(alloc, name, captured);
         try dumpDiff(alloc, name, ref, captured, opts.tol_per_channel);
         return error.VisualMismatch;
@@ -100,6 +101,48 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
 
 fn absDiff(a: u8, b: u8) u8 {
     return if (a > b) a - b else b - a;
+}
+
+/// Print a coarse ASCII heatmap of where pixels differ, so the diff
+/// distribution is visible without opening the image. Scattered density
+/// across all text => antialiasing/subpixel (e.g. ClearType) variance;
+/// a few hot cells => a localized element (cursor, a line, chrome).
+fn printDiffHeatmap(ref: capture.Image, captured: capture.Image, tol: u8) void {
+    const cols: u32 = 40;
+    const rows: u32 = 20;
+    var grid = [_]u32{0} ** (40 * 20);
+    const cw = @max(1, captured.w / cols);
+    const ch = @max(1, captured.h / rows);
+
+    var y: u32 = 0;
+    while (y < captured.h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < captured.w) : (x += 1) {
+            const o = (@as(usize, y) * @as(usize, captured.w) + @as(usize, x)) * 4;
+            const differ = absDiff(ref.rgba[o], captured.rgba[o]) > tol or
+                absDiff(ref.rgba[o + 1], captured.rgba[o + 1]) > tol or
+                absDiff(ref.rgba[o + 2], captured.rgba[o + 2]) > tol;
+            if (!differ) continue;
+            const gx = @min(cols - 1, x / cw);
+            const gy = @min(rows - 1, y / ch);
+            grid[gy * cols + gx] += 1;
+        }
+    }
+
+    const cell_px = cw * ch;
+    std.debug.print("[gui] diff heatmap ({d}x{d} cells, ' '=0 .<2% :<10% +<30% #>=30%):\n", .{ cols, rows });
+    var gy: u32 = 0;
+    while (gy < rows) : (gy += 1) {
+        std.debug.print("[gui] ", .{});
+        var gx: u32 = 0;
+        while (gx < cols) : (gx += 1) {
+            const d = grid[gy * cols + gx];
+            const pct = if (cell_px == 0) 0 else d * 100 / cell_px;
+            const ch_out: u8 = if (d == 0) ' ' else if (pct < 2) '.' else if (pct < 10) ':' else if (pct < 30) '+' else '#';
+            std.debug.print("{c}", .{ch_out});
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 fn dumpActual(alloc: std.mem.Allocator, name: []const u8, captured: capture.Image) !void {
