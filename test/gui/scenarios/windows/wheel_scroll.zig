@@ -67,7 +67,35 @@ pub fn run(alloc: std.mem.Allocator) !void {
         alloc.free(o);
     }
 
-    // Sanity-check the buffer/view state (diagnostic on the connected nvim).
+    // Diagnostic: dump raw remote-expr output for a set of probes so the
+    // actual values/format are visible on the connected nvim. Remove once
+    // the wheel path is confirmed on real Windows.
+    const probes = [_][]const u8{
+        "string(1+1)",
+        "string(line('$'))",
+        "string(line('w0'))",
+        "string(line('w$'))",
+        "string(winheight(0))",
+        "getline(1)",
+        "string(mode())",
+    };
+    for (probes) |p| {
+        const o = g.remoteExpr(p) catch |e| {
+            std.debug.print("[gui] probe {s} => error {s}\n", .{ p, @errorName(e) });
+            continue;
+        };
+        defer g.alloc.free(o);
+        std.debug.print("[gui] probe {s} => ({d} bytes) text=\"{s}\" hex=", .{ p, o.len, o });
+        for (o, 0..) |byte, idx| {
+            if (idx >= 16) {
+                std.debug.print("..", .{});
+                break;
+            }
+            std.debug.print("{x:0>2} ", .{byte});
+        }
+        std.debug.print("\n", .{});
+    }
+
     const last = blk: {
         const o = try g.remoteExpr("line('$')");
         defer g.alloc.free(o);
