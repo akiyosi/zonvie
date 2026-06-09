@@ -46,7 +46,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
     const golden = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir, name, capture.image_ext });
     defer alloc.free(golden);
 
-    const update = std.process.hasEnvVarConstant("ZONVIE_GUI_UPDATE_GOLDEN");
+    const update = updateRequested(alloc);
     const exists = blk: {
         std.fs.cwd().access(golden, .{}) catch break :blk false;
         break :blk true;
@@ -101,6 +101,16 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
 
 fn absDiff(a: u8, b: u8) u8 {
     return if (a > b) a - b else b - a;
+}
+
+/// Golden-update mode is requested only when ZONVIE_GUI_UPDATE_GOLDEN is set
+/// to a non-empty, non-"0" value. Checking the VALUE (not mere existence)
+/// avoids a common footgun: an empty/leftover var silently forcing every
+/// run into update mode so comparisons never happen.
+fn updateRequested(alloc: std.mem.Allocator) bool {
+    const v = std.process.getEnvVarOwned(alloc, "ZONVIE_GUI_UPDATE_GOLDEN") catch return false;
+    defer alloc.free(v);
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
 }
 
 /// Print a coarse ASCII heatmap of where pixels differ, so the diff
