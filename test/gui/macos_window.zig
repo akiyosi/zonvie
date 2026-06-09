@@ -110,6 +110,15 @@ pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
     return mw.bounds;
 }
 
+/// No-op on macOS: moving another process's window needs the Accessibility
+/// API, and macOS uses grayscale AA (no ClearType subpixel-phase issue), so
+/// capture is already position-stable. Mirrors the Windows pinWindow.
+pub fn pinWindow(pid: i32, x: i32, y: i32) void {
+    _ = pid;
+    _ = x;
+    _ = y;
+}
+
 /// Debug helper: print layer and bounds of every on-screen window owned by
 /// `pid`. Used by waitWindowCount on failure to identify stray windows.
 pub fn dumpWindowsForPid(pid: i32) void {

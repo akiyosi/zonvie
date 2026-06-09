@@ -32,6 +32,10 @@ pub fn open(alloc: std.mem.Allocator) !*Gui {
     }
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", "tmp/gui_app.log" } });
     errdefer g.deinit();
+    // Pin the window to a fixed screen position so subpixel (ClearType)
+    // rendering is identical run-to-run; the OS otherwise places the window
+    // at varying positions, the top cross-run visual-flake source.
+    driver.platform.pinWindow(g.app_pid, 80, 80);
     try exec(g, "execute('set guicursor+=a:blinkon0')");
     try exec(g, "execute('set guifont=" ++ guifont ++ "')");
     return g;

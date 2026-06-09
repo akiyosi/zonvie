@@ -20,6 +20,21 @@ extern "user32" fn GetClassNameW(hwnd: W.HWND, out: [*]u16, max: i32) callconv(.
 extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *W.RECT) callconv(.winapi) W.BOOL;
 extern "user32" fn PostMessageW(hwnd: W.HWND, msg: W.UINT, wParam: W.WPARAM, lParam: W.LPARAM) callconv(.winapi) W.BOOL;
 extern "user32" fn SetForegroundWindow(hwnd: W.HWND) callconv(.winapi) W.BOOL;
+extern "user32" fn SetWindowPos(hwnd: W.HWND, after: ?W.HWND, x: i32, y: i32, cx: i32, cy: i32, flags: W.UINT) callconv(.winapi) W.BOOL;
+
+const SWP_NOSIZE: W.UINT = 0x0001;
+const SWP_NOZORDER: W.UINT = 0x0004;
+const SWP_NOACTIVATE: W.UINT = 0x0010;
+
+/// Move the app's main window to a fixed screen position (no resize). This
+/// pins the absolute pixel origin so ClearType subpixel rendering is
+/// identical run-to-run — without it, the OS places the window at varying
+/// positions and the subpixel phase shifts make every glyph edge differ,
+/// the dominant cross-run visual-flake source on Windows.
+pub fn pinWindow(pid: i32, x: i32, y: i32) void {
+    const hwnd = mainWindowHandleForPid(pid) orelse return;
+    _ = SetWindowPos(hwnd, null, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 const main_class = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieWin");
 const external_class = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieExternalWin");
