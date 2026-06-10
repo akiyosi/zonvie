@@ -2000,6 +2000,12 @@ fn cleanupSession(
     // our process; doesn't affect the running nvim).
     const orphan_child = self.connect_keeps_child_alive;
 
+    // Serialize with stop() (nvim_core.zig) to prevent a race where both
+    // threads close the same fd. For POSIX .socket transport, double-close
+    // causes EBADF. Whichever thread gets the lock first closes and nulls;
+    // the other thread's `if (self.stdin_file)` check then sees null and skips.
+    self.stdin_close_mu.lock();
+    defer self.stdin_close_mu.unlock();
     if (self.stdin_file) |f| {
         // POSIX socket transport aliases stdin/stdout on the same fd.
         // Issue shutdown(SHUT_RDWR) before close() so the writer

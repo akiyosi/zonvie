@@ -450,6 +450,11 @@ pub const Core = struct {
     // Mutex to protect grid state access from concurrent RPC and UI threads.
     grid_mu: std.Thread.Mutex = .{},
 
+    // Mutex to protect stdin_file close-and-null (POSIX socket transport
+    // aliases stdin/stdout on one fd). Prevents race between stop() and
+    // cleanupSession() closing the same fd. Both must serialize via this mutex.
+    stdin_close_mu: std.Thread.Mutex = .{},
+
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Set to true after nvim_ui_attach completes successfully.
@@ -1127,8 +1132,13 @@ pub const Core = struct {
         //     still null the stdout alias to keep the cleanupSession path
         //     symmetric: closeHandles is idempotent under its swap()
         //     guard, but skipping the duplicate call is clearer.
-        // The same alias guard lives in cleanupSession() (rpc_session.zig)
-        // — keep both sides in sync.
+        // Serialize with cleanupSession() (rpc_session.zig) to prevent
+        // a race where both threads close the same fd. For POSIX .socket
+        // transport (where stdin/stdout alias the same fd), double-close
+        // causes EBADF signal 6. Whichever thread gets the lock first wins;
+        // the other thread's `if (self.stdin_file)` check then sees null.
+        self.stdin_close_mu.lock();
+        defer self.stdin_close_mu.unlock();
         if (self.stdin_file) |f| {
             // For POSIX .socket transport (connect mode, where stdin/
             // stdout alias the same fd) close() alone does not wake
