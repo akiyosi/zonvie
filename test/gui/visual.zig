@@ -8,7 +8,8 @@
 //   - Per-OS goldens under test/gui/golden/<os>/ (subpixel-AA vs ClearType
 //     means cross-OS comparison is meaningless).
 //   - Missing golden => write it and PASS (baseline established).
-//   - ZONVIE_GUI_UPDATE_GOLDEN set => overwrite the golden and PASS.
+//   - ZONVIE_GUI_UPDATE_GOLDEN non-empty and not "0" => overwrite the
+//     golden and PASS (see updateRequested).
 //   - Otherwise compare with a small per-channel tolerance and a max
 //     fraction of differing pixels; on failure write actual.png + diff.png
 //     to tmp/ for human inspection.
@@ -69,6 +70,10 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
             "[gui] visual size mismatch for {s}: golden {d}x{d} vs captured {d}x{d}\n",
             .{ name, ref.w, ref.h, captured.w, captured.h },
         );
+        std.debug.print(
+            "[gui]   goldens are per-environment (DPI, font rendering) — if the environment changed, regenerate on a known-good state with ZONVIE_GUI_UPDATE_GOLDEN=1\n",
+            .{},
+        );
         try dumpActual(alloc, name, captured);
         return error.VisualSizeMismatch;
     }
@@ -77,11 +82,7 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
     var diff_count: usize = 0;
     var i: usize = 0;
     while (i < total) : (i += 1) {
-        const o = i * 4;
-        const dr = absDiff(ref.rgba[o], captured.rgba[o]);
-        const dg = absDiff(ref.rgba[o + 1], captured.rgba[o + 1]);
-        const db = absDiff(ref.rgba[o + 2], captured.rgba[o + 2]);
-        if (dr > opts.tol_per_channel or dg > opts.tol_per_channel or db > opts.tol_per_channel) {
+        if (pixelDiffers(ref, captured, i * 4, opts.tol_per_channel)) {
             diff_count += 1;
         }
     }
@@ -101,6 +102,15 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
 
 fn absDiff(a: u8, b: u8) u8 {
     return if (a > b) a - b else b - a;
+}
+
+/// The one definition of "this pixel differs": any of R/G/B exceeds the
+/// per-channel tolerance at byte offset `o`. Compare, heatmap, and diff
+/// image must all agree on this predicate.
+fn pixelDiffers(ref: capture.Image, captured: capture.Image, o: usize, tol: u8) bool {
+    return absDiff(ref.rgba[o], captured.rgba[o]) > tol or
+        absDiff(ref.rgba[o + 1], captured.rgba[o + 1]) > tol or
+        absDiff(ref.rgba[o + 2], captured.rgba[o + 2]) > tol;
 }
 
 /// Golden-update mode is requested only when ZONVIE_GUI_UPDATE_GOLDEN is set
@@ -129,10 +139,7 @@ fn printDiffHeatmap(ref: capture.Image, captured: capture.Image, tol: u8) void {
         var x: u32 = 0;
         while (x < captured.w) : (x += 1) {
             const o = (@as(usize, y) * @as(usize, captured.w) + @as(usize, x)) * 4;
-            const differ = absDiff(ref.rgba[o], captured.rgba[o]) > tol or
-                absDiff(ref.rgba[o + 1], captured.rgba[o + 1]) > tol or
-                absDiff(ref.rgba[o + 2], captured.rgba[o + 2]) > tol;
-            if (!differ) continue;
+            if (!pixelDiffers(ref, captured, o, tol)) continue;
             const gx = @min(cols - 1, x / cw);
             const gy = @min(rows - 1, y / ch);
             grid[gy * cols + gx] += 1;
@@ -159,7 +166,10 @@ fn dumpActual(alloc: std.mem.Allocator, name: []const u8, captured: capture.Imag
     std.fs.cwd().makePath("tmp") catch {};
     const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_actual{s}", .{ name, capture.image_ext });
     defer alloc.free(p);
-    capture.writeImage(alloc, p, captured) catch {};
+    capture.writeImage(alloc, p, captured) catch |err| {
+        std.debug.print("[gui]   failed to write actual to {s}: {s}\n", .{ p, @errorName(err) });
+        return;
+    };
     std.debug.print("[gui]   wrote actual to {s}\n", .{p});
 }
 
@@ -171,10 +181,7 @@ fn dumpDiff(alloc: std.mem.Allocator, name: []const u8, ref: capture.Image, capt
     var i: usize = 0;
     while (i < total) : (i += 1) {
         const o = i * 4;
-        const differ = absDiff(ref.rgba[o], captured.rgba[o]) > tol or
-            absDiff(ref.rgba[o + 1], captured.rgba[o + 1]) > tol or
-            absDiff(ref.rgba[o + 2], captured.rgba[o + 2]) > tol;
-        if (differ) {
+        if (pixelDiffers(ref, captured, o, tol)) {
             buf[o] = 255;
             buf[o + 1] = 0;
             buf[o + 2] = 0;
@@ -188,6 +195,9 @@ fn dumpDiff(alloc: std.mem.Allocator, name: []const u8, ref: capture.Image, capt
     }
     const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_diff{s}", .{ name, capture.image_ext });
     defer alloc.free(p);
-    capture.writeImage(alloc, p, .{ .w = captured.w, .h = captured.h, .rgba = buf }) catch {};
+    capture.writeImage(alloc, p, .{ .w = captured.w, .h = captured.h, .rgba = buf }) catch |err| {
+        std.debug.print("[gui]   failed to write diff to {s}: {s}\n", .{ p, @errorName(err) });
+        return;
+    };
     std.debug.print("[gui]   wrote diff to {s}\n", .{p});
 }

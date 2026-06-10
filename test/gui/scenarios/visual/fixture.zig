@@ -15,12 +15,6 @@ pub const guifont = switch (builtin.os.tag) {
     else => "Menlo:h13",
 };
 
-/// Run a remote-expr for its side effect, discarding the result.
-pub fn exec(g: *Gui, expr: []const u8) !void {
-    const o = try g.remoteExpr(expr);
-    g.alloc.free(o);
-}
-
 /// Launch the app ready for visual capture, or skip when screen capture is
 /// unavailable. Caller owns the returned Gui (defer g.deinit()).
 pub fn open(alloc: std.mem.Allocator) !*Gui {
@@ -36,7 +30,7 @@ pub fn open(alloc: std.mem.Allocator) !*Gui {
     // rendering is identical run-to-run; the OS otherwise places the window
     // at varying positions, the top cross-run visual-flake source.
     driver.platform.pinWindow(g.app_pid, 80, 80);
-    try exec(g, "execute('set guicursor+=a:blinkon0')");
-    try exec(g, "execute('set guifont=" ++ guifont ++ "')");
+    try g.exec("execute('set guicursor+=a:blinkon0')");
+    try g.exec("execute('set guifont=" ++ guifont ++ "')");
     return g;
 }

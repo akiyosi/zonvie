@@ -280,6 +280,39 @@ pub const Gui = struct {
         return result.stdout;
     }
 
+    /// Run a remote-expr for its side effect, discarding the result.
+    pub fn exec(g: *Gui, expr: []const u8) !void {
+        const o = try g.remoteExpr(expr);
+        g.alloc.free(o);
+    }
+
+    /// Evaluate `expr` on the server and return it as an integer.
+    ///
+    /// Windows `nvim --server --remote-expr` writes a whole TUI frame (alt
+    /// screen + cursor moves) to stdout, so parsing stdout is hopeless
+    /// there. Instead have the SERVER write the value to a file via
+    /// writefile() (a side effect, like --remote-send, which is unaffected
+    /// by the client's TUI output) and read that file. Server and driver
+    /// share the cwd (repo root), so a relative path resolves to the same
+    /// file. Scenarios run sequentially in one test process, so a single
+    /// shared scratch path is safe.
+    pub fn evalInt(g: *Gui, expr: []const u8) !i64 {
+        const query_file = "tmp/gui_eval_query.txt";
+        std.fs.cwd().makePath("tmp") catch {};
+        std.fs.cwd().deleteFile(query_file) catch {};
+        const wexpr = try std.fmt.allocPrint(g.alloc, "writefile([string({s})], '{s}')", .{ expr, query_file });
+        defer g.alloc.free(wexpr);
+        try g.exec(wexpr);
+
+        const data = try std.fs.cwd().readFileAlloc(g.alloc, query_file, 4096);
+        defer g.alloc.free(data);
+        const trimmed = std.mem.trim(u8, data, " \t\r\n");
+        return std.fmt.parseInt(i64, trimmed, 10) catch {
+            std.debug.print("[gui] {s} wrote non-integer: \"{s}\"\n", .{ expr, trimmed });
+            return error.NonNumericResult;
+        };
+    }
+
     /// Send keys (nvim notation) to the shared server.
     pub fn remoteSend(g: *Gui, keys: []const u8) !void {
         const result = try std.process.Child.run(.{

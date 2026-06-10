@@ -15,12 +15,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try fixture.open(alloc);
     defer g.deinit();
 
-    try fixture.exec(g,
+    try g.exec(
         \\setline(1, ['main buffer line 1', 'main buffer line 2', 'main buffer line 3', 'main buffer line 4', 'main buffer line 5'])
     );
-    try fixture.exec(g, "execute('normal! gg0')");
+    try g.exec("execute('normal! gg0')");
     // Internal float with a single border, fixed position/size/content.
-    try fixture.exec(g,
+    try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, false, {"float A", "float B"}) vim.api.nvim_open_win(b, false, {relative="editor", row=2, col=8, width=16, height=2, style="minimal", border="single"}) return 1 end)()')
     );
 

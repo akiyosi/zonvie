@@ -20,34 +20,10 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 
-const query_file = "tmp/wheel_query.txt";
-
-/// Evaluate `expr` on the server and return it as an integer.
-///
-/// Windows `nvim --server --remote-expr` writes a whole TUI frame (alt
-/// screen + cursor moves) to stdout, so parsing stdout is hopeless there.
-/// Instead have the SERVER write the value to a file via writefile() (a
-/// side effect, like --remote-send, which is unaffected by the client's
-/// TUI output) and read that file. Server and driver share the cwd
-/// (repo root), so a relative path resolves to the same file.
-fn evalInt(g: *Gui, expr: []const u8) !i64 {
-    std.fs.cwd().deleteFile(query_file) catch {};
-    const wexpr = try std.fmt.allocPrint(g.alloc, "writefile([string({s})], '{s}')", .{ expr, query_file });
-    defer g.alloc.free(wexpr);
-    const out = try g.remoteExpr(wexpr); // stdout discarded (TUI noise on Windows)
-    g.alloc.free(out);
-
-    const data = try std.fs.cwd().readFileAlloc(g.alloc, query_file, 4096);
-    defer g.alloc.free(data);
-    const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    return std.fmt.parseInt(i64, trimmed, 10) catch {
-        std.debug.print("[gui] {s} wrote non-integer: \"{s}\"\n", .{ expr, trimmed });
-        return error.NonNumericResult;
-    };
-}
-
 fn topLine(g: *Gui) !i64 {
-    return evalInt(g, "line('w0')");
+    // evalInt (writefile round-trip) because remote-expr stdout is TUI
+    // noise on Windows — see Gui.evalInt.
+    return g.evalInt("line('w0')");
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -55,25 +31,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
 
     // Deterministic scroll amount: 3 lines per wheel event.
-    {
-        const o = try g.remoteExpr("execute('set mousescroll=ver:3')");
-        alloc.free(o);
-    }
+    try g.exec("execute('set mousescroll=ver:3')");
     // A long buffer (replace any existing content), parked at the top.
-    {
-        const o = try g.remoteExpr("execute('silent! %delete _')");
-        alloc.free(o);
-    }
-    {
-        const o = try g.remoteExpr("setline(1, map(range(1, 200), 'string(v:val)'))");
-        alloc.free(o);
-    }
-    {
-        const o = try g.remoteExpr("execute('normal! gg')");
-        alloc.free(o);
-    }
+    try g.exec("execute('silent! %delete _')");
+    try g.exec("setline(1, map(range(1, 200), 'string(v:val)'))");
+    try g.exec("execute('normal! gg')");
 
-    const last = try evalInt(g, "line('$')");
+    const last = try g.evalInt("line('$')");
     const base = try topLine(g);
     if (last != 200 or base < 1 or base > 20) {
         std.debug.print("[gui] wheel_scroll unexpected state: line('$')={d} top={d} (expected $=200, top near 1)\n", .{ last, base });
