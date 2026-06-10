@@ -208,6 +208,9 @@ disable_on_modechange = false
 option_as_meta = "both"  # "both", "none", "only_left", "only_right"
 preedit_mode = "overlay"  # "overlay" (floating overlay) or "extmark" (inline virt_text)
 
+[input]
+swap_colon_semicolon = false  # swap the `:` and `;` keys (single keypresses only)
+
 [shaders]
 enabled = false
 post_process = "after_bloom"  # only "after_bloom" is implemented today
@@ -322,6 +325,11 @@ Message routing rules are processed in order; first match wins.
 | `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
 | `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
 | `preedit_mode` | IME preedit display: "overlay" (floating overlay) or "extmark" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
+
+#### [input]
+| Key | Description |
+|-----|-------------|
+| `swap_colon_semicolon` | Swap the `:` and `;` keys (true/false). Applies to single keypresses only; pasted text and IME commits are unaffected |
 
 #### [shaders]
 | Key | Description |

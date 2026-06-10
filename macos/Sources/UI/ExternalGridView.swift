@@ -1916,6 +1916,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return
         }
 
+        // `:` <-> `;` swap (config-gated). Handle single keypresses here,
+        // bypassing IME; paste flows through a separate path and is unaffected.
+        if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
+           let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
+        {
+            core.sendInput(swapped)
+            return
+        }
+
         // Let the system handle IME input.
         if let ctx = inputContext, ctx.handleEvent(event) {
             return

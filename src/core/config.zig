@@ -164,6 +164,7 @@ pub const Config = struct {
     performance: PerformanceConfig = .{},
     ime: IMEConfig = .{},
     shaders: ShaderConfig = .{},
+    input: InputConfig = .{},
 
     // Internal state
     alloc: ?std.mem.Allocator = null,
@@ -302,6 +303,12 @@ pub const Config = struct {
         disable_on_modechange: bool = false,
         option_as_meta: OptionAsMeta = .both,
         preedit_mode: PreeditMode = .overlay,
+    };
+
+    pub const InputConfig = struct {
+        /// Swap the `:` and `;` keys at the frontend input layer. Applies to
+        /// single keypresses only (paste/IME commits are unaffected).
+        swap_colon_semicolon: bool = false,
     };
 
     pub const ShaderConfig = struct {
@@ -576,6 +583,10 @@ pub const Config = struct {
                 }
             }
         }
+
+        if (cfg.input) |i| {
+            if (i.swap_colon_semicolon) |v| self.input.swap_colon_semicolon = v;
+        }
     }
 
     /// Route a message to the appropriate view
@@ -766,6 +777,7 @@ const TomlConfig = struct {
     performance: ?TomlPerformance = null,
     ime: ?TomlIME = null,
     shaders: ?TomlShaders = null,
+    input: ?TomlInput = null,
 };
 
 const TomlNeovim = struct {
@@ -862,4 +874,8 @@ const TomlShaders = struct {
     enabled: ?bool = null,
     paths: ?[]const []const u8 = null,
     post_process: ?[]const u8 = null,
+};
+
+const TomlInput = struct {
+    swap_colon_semicolon: ?bool = null,
 };

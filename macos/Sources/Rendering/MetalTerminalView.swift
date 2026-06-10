@@ -1519,6 +1519,28 @@ final class MetalTerminalView: MTKView {
             return
         }
 
+        // `:` <-> `;` swap (config-gated). Handle it here, on the keyDown path
+        // for a single keypress, rather than in sendInputNow: paste also flows
+        // through sendInputNow, and swapping there would corrupt pasted text
+        // containing `:`/`;`. These two ASCII chars never start IME
+        // composition, so bypassing IME for them is safe. The held action
+        // stores the swapped char so synthesized repeats replay it verbatim.
+        if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
+           let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
+        {
+            keyRepeatCaptureActive = !event.isARepeat
+            keyRepeatCapturedText = nil
+            keyRepeatCapturedCount = 0
+            sendInputNow(swapped)
+            if keyRepeatCaptureActive {
+                keyRepeatCaptureActive = false
+                if keyRepeatCapturedCount == 1 {
+                    armHeldKey(code: event.keyCode, action: .text(swapped))
+                }
+            }
+            return
+        }
+
         // Plain key: capture what this keyDown sends (via IME insertText ->
         // sendInputNow) so repeats can replay it. Only a clean single-send
         // keyDown is a synthesis candidate.

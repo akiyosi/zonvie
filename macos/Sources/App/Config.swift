@@ -15,6 +15,7 @@ struct ZonvieConfig {
     var performance: PerformanceConfig = PerformanceConfig()
     var ime: IMEConfig = IMEConfig()
     var shaders: ShaderConfig = ShaderConfig()
+    var input: InputConfig = InputConfig()
 
     /// Tabline display style
     enum TablineStyle: String {
@@ -181,6 +182,22 @@ struct ZonvieConfig {
         var postProcess: ShaderPostProcess = .afterBloom
     }
 
+    struct InputConfig {
+        /// Swap the `:` and `;` keys on single keypresses (paste/IME unaffected).
+        var swapColonSemicolon: Bool = false
+    }
+
+    /// Returns the swapped counterpart for `:`/`;`, or nil for any other string.
+    /// Used by the keyDown paths to apply the `[input] swap_colon_semicolon`
+    /// remap to single keypresses only.
+    static func swapColonSemicolon(_ s: String) -> String? {
+        switch s {
+        case ":": return ";"
+        case ";": return ":"
+        default: return nil
+        }
+    }
+
     /// Shared instance loaded at app startup
     static var shared: ZonvieConfig = ZonvieConfig.load()
 
@@ -275,6 +292,7 @@ struct ZonvieConfig {
         config.ime.disableOnActivate = v.ime_disable_on_activate
         config.ime.disableOnModechange = v.ime_disable_on_modechange
         config.ime.optionAsMeta = OptionAsMeta(rawValue: v.ime_option_as_meta) ?? .both
+        config.input.swapColonSemicolon = v.input_swap_colon_semicolon
 
         // Shaders
         config.shaders.enabled = v.shader_enabled

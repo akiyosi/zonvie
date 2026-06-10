@@ -3659,7 +3659,7 @@ pub export fn WndProc(
                     return 0;
                 }
 
-                const ch0: u16 = @as(u16, @intCast(wParam));
+                var ch0: u16 = @as(u16, @intCast(wParam));
 
                 // Skip control characters that are already handled by WM_KEYDOWN as special keys.
                 // This prevents double-input of Enter, Backspace, Tab, Escape.
@@ -3667,6 +3667,16 @@ pub export fn WndProc(
                 if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
                     app.pending_high_surrogate_char = 0;
                     return 0;
+                }
+
+                // `:` <-> `;` swap (config-gated) for single keypresses. Paste
+                // arrives via a separate clipboard path, so it is unaffected.
+                if (app.config.input.swap_colon_semicolon) {
+                    if (ch0 == 0x3A) {
+                        ch0 = 0x3B; // ':' -> ';'
+                    } else if (ch0 == 0x3B) {
+                        ch0 = 0x3A; // ';' -> ':'
+                    }
                 }
 
                 // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high

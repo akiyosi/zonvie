@@ -1542,6 +1542,8 @@ pub const zonvie_config_values = extern struct {
     // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
     shader_enabled: bool = false,
     shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
+    // input
+    input_swap_colon_semicolon: bool = false, // swap `:` and `;` on single keypresses
 };
 
 const ConfigHandle = struct {
@@ -1650,6 +1652,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         // shaders
         .shader_enabled = cfg.shaders.enabled,
         .shader_post_process = @intFromEnum(cfg.shaders.post_process),
+        // input
+        .input_swap_colon_semicolon = cfg.input.swap_colon_semicolon,
     };
 }
 
