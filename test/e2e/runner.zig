@@ -68,3 +68,33 @@ test "e2e:ime_preedit_extmark" {
     try requireNvim();
     try @import("scenarios/ime_preedit_extmark.zig").run(testing.allocator);
 }
+
+test "e2e:search_highlight" {
+    try requireNvim();
+    try @import("scenarios/search_highlight.zig").run(testing.allocator);
+}
+
+test "e2e:cursorline" {
+    try requireNvim();
+    try @import("scenarios/cursorline.zig").run(testing.allocator);
+}
+
+test "e2e:visual_selection" {
+    try requireNvim();
+    try @import("scenarios/visual_selection.zig").run(testing.allocator);
+}
+
+test "e2e:undo_redo" {
+    try requireNvim();
+    try @import("scenarios/undo_redo.zig").run(testing.allocator);
+}
+
+test "e2e:substitute" {
+    try requireNvim();
+    try @import("scenarios/substitute.zig").run(testing.allocator);
+}
+
+test "e2e:tab_switch" {
+    try requireNvim();
+    try @import("scenarios/tab_switch.zig").run(testing.allocator);
+}
