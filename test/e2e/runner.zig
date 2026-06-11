@@ -98,3 +98,23 @@ test "e2e:tab_switch" {
     try requireNvim();
     try @import("scenarios/tab_switch.zig").run(testing.allocator);
 }
+
+test "e2e:goto_line" {
+    try requireNvim();
+    try @import("scenarios/goto_line.zig").run(testing.allocator);
+}
+
+test "e2e:copy_paste_yank" {
+    try requireNvim();
+    try @import("scenarios/copy_paste_yank.zig").run(testing.allocator);
+}
+
+test "e2e:marks_navigate" {
+    try requireNvim();
+    try @import("scenarios/marks_navigate.zig").run(testing.allocator);
+}
+
+test "e2e:word_boundary_motion" {
+    try requireNvim();
+    try @import("scenarios/word_boundary_motion.zig").run(testing.allocator);
+}
