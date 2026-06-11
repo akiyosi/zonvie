@@ -138,3 +138,13 @@ test "e2e:restart_preedit_cleanup" {
     try requireNvim();
     try @import("scenarios/restart_preedit_cleanup.zig").run(testing.allocator);
 }
+
+test "e2e:float_lifecycle" {
+    try requireNvim();
+    try @import("scenarios/float_lifecycle.zig").run(testing.allocator);
+}
+
+test "e2e:split_scroll_animation" {
+    try requireNvim();
+    try @import("scenarios/split_scroll_animation.zig").run(testing.allocator);
+}
