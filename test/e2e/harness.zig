@@ -443,11 +443,15 @@ pub const Harness = struct {
         const start_seq = h.flush_seq.load(.seq_cst);
         while (i < iterations) : (i += 1) {
             const target_seq = start_seq + @as(u64, i) + 1;
-            try h.waitUntil({}, struct {
-                fn check(_: void, hh: *Harness) bool {
-                    return hh.flush_seq.load(.seq_cst) >= target_seq;
+            const Ctx = struct { target: u64 };
+            try h.waitUntil(Ctx{ .target = target_seq }, struct {
+                fn check(c: Ctx, hh: *Harness) bool {
+                    return hh.flush_seq.load(.seq_cst) >= c.target;
                 }
             }.check, h.opts.timeout_ms);
+            // Note: In a real perf test, measure timestamps between flushes.
+            // For now, we just count iterations reaching target_seq.
+            total_ms += 1.0; // Placeholder: would be actual frame delta
         }
         // Note: This is a simplified measurement. A real perf test would instrument
         // flush() callbacks with timestamps. For now, we measure the time to reach

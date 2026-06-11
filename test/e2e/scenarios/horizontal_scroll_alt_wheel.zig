@@ -14,15 +14,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const g = h.winGrid();
 
     // Create a buffer with a long line (100 chars) to force horizontal scroll.
-    var line_buf: std.ArrayList(u8) = std.ArrayList(u8).init(alloc);
-    defer line_buf.deinit();
+    var line_buf = try std.ArrayList(u8).initCapacity(alloc, 256);
+    defer line_buf.deinit(alloc);
 
-    try line_buf.appendSlice("prefix_");
+    try line_buf.appendSlice(alloc, "prefix_");
     var i: u32 = 0;
     while (i < 85) : (i += 1) {
-        try line_buf.appendSlice("x");
+        try line_buf.appendSlice(alloc, "x");
     }
-    try line_buf.appendSlice("_suffix");
+    try line_buf.appendSlice(alloc, "_suffix");
     const long_line = line_buf.items;
 
     try h.command(std.fmt.allocPrint(alloc, "call setline(1, '{s}')", .{long_line}) catch unreachable);

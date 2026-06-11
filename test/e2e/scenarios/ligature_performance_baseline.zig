@@ -18,17 +18,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const g = h.winGrid();
 
     // Create a 10,000-line buffer.
-    var buf: std.ArrayList(u8) = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf = try std.ArrayList(u8).initCapacity(alloc, 256 * 1024);
+    defer buf.deinit(alloc);
 
-    try buf.appendSlice("call setline(1, [");
+    try buf.appendSlice(alloc, "call setline(1, [");
     var line: u32 = 1;
     while (line <= 10000) : (line += 1) {
-        if (line > 1) try buf.appendSlice(", ");
+        if (line > 1) try buf.appendSlice(alloc, ", ");
         // Use '->' ligature to exercise shaping (if available).
-        try std.fmt.format(buf.writer(), "'line {d} -> data'", .{line});
+        try std.fmt.format(buf.writer(alloc), "'line {d} -> data'", .{line});
     }
-    try buf.appendSlice("])");
+    try buf.appendSlice(alloc, "])");
 
     try h.command(buf.items);
     try h.waitRowText(g, 0, "line 1 -> data", h.opts.timeout_ms);

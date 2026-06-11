@@ -14,16 +14,16 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const g = h.winGrid();
 
     // Create a 100-line buffer using ex command (simpler).
-    var buf: std.ArrayList(u8) = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf = try std.ArrayList(u8).initCapacity(alloc, 256);
+    defer buf.deinit(alloc);
 
-    try buf.appendSlice("call setline(1, [");
+    try buf.appendSlice(alloc, "call setline(1, [");
     var line: u32 = 1;
     while (line <= 100) : (line += 1) {
-        if (line > 1) try buf.appendSlice(", ");
-        try std.fmt.format(buf.writer(), "'line {d}'", .{line});
+        if (line > 1) try buf.appendSlice(alloc, ", ");
+        try std.fmt.format(buf.writer(alloc), "'line {d}'", .{line});
     }
-    try buf.appendSlice("])");
+    try buf.appendSlice(alloc, "])");
 
     try h.command(buf.items);
     try h.waitRowText(g, 0, "line 1", h.opts.timeout_ms);
@@ -33,7 +33,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Initial cursor at line 1; viewport should be stable.
     try h.waitCursor(0, 0, h.opts.timeout_ms);
-    var initial_viewport = h.getViewportTop(g);
+    const initial_viewport = h.getViewportTop(g);
 
     // Verify viewport is reasonable (between 0 and buffer size).
     if (initial_viewport > 100) {

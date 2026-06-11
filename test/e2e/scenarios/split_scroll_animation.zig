@@ -59,9 +59,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Switch to grid B (split pane)
     try h.input("<C-w>w");
 
-    // Record grid B's cursor position
-    const scrolled_cursor_b = h.cursor();
-    const scrolled_row_b = scrolled_cursor_b.row;
+    // Grid B's cursor position is recorded but not directly used in this test;
+    // the key assertion is that grid A scrolled independently.
+    _ = h.cursor();
 
     // Verify grid A scrolled significantly (to near end of buffer)
     try std.testing.expect(scrolled_row_a > initial_row_a + 10);
