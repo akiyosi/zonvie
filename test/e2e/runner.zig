@@ -118,3 +118,23 @@ test "e2e:word_boundary_motion" {
     try requireNvim();
     try @import("scenarios/word_boundary_motion.zig").run(testing.allocator);
 }
+
+test "e2e:startup_error_surface" {
+    try requireNvim();
+    try @import("scenarios/startup_error_surface.zig").run(testing.allocator);
+}
+
+test "e2e:linespace_geometry_persist" {
+    try requireNvim();
+    try @import("scenarios/linespace_geometry_persist.zig").run(testing.allocator);
+}
+
+test "e2e:guifont_init_order" {
+    try requireNvim();
+    try @import("scenarios/guifont_init_order.zig").run(testing.allocator);
+}
+
+test "e2e:restart_preedit_cleanup" {
+    try requireNvim();
+    try @import("scenarios/restart_preedit_cleanup.zig").run(testing.allocator);
+}
