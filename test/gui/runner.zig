@@ -116,3 +116,21 @@ test "gui:visual_pmenusel_bounds" {
         return error.SkipZigTest;
     }
 }
+
+test "gui:visual_vertical_cursor_width" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/vertical_cursor_width.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_cmdline_cursor_animation" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/cmdline_cursor_animation.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
