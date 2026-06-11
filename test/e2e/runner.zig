@@ -168,3 +168,28 @@ test "e2e:horizontal_scroll_alt_wheel" {
     try requireNvim();
     try @import("scenarios/horizontal_scroll_alt_wheel.zig").run(testing.allocator);
 }
+
+test "e2e:rendering_glitch_event_buffering" {
+    try requireNvim();
+    try @import("scenarios/rendering_glitch_event_buffering.zig").run(testing.allocator);
+}
+
+test "e2e:text_cutoff_vertical_metrics" {
+    try requireNvim();
+    try @import("scenarios/text_cutoff_vertical_metrics.zig").run(testing.allocator);
+}
+
+test "e2e:macos_alt_key_mapping" {
+    try requireNvim();
+    try @import("scenarios/macos_alt_key_mapping.zig").run(testing.allocator);
+}
+
+test "e2e:macos_option_key_meta" {
+    try requireNvim();
+    try @import("scenarios/macos_option_key_meta.zig").run(testing.allocator);
+}
+
+test "e2e:linux_macos_alt_compat" {
+    try requireNvim();
+    try @import("scenarios/linux_macos_alt_compat.zig").run(testing.allocator);
+}
