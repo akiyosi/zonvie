@@ -99,6 +99,15 @@ test "gui:visual_float" {
     }
 }
 
+test "gui:visual_emoji_cursor_width" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/emoji_cursor_width.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_float_border_continuity" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();

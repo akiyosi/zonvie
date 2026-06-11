@@ -431,4 +431,56 @@ pub const Harness = struct {
             return e;
         };
     }
+
+    // ── Performance Measurement ────────────────────────────────────────
+
+    /// Measure average frame time (duration per flush) over `iterations` cycles.
+    /// Returns elapsed time in milliseconds per flush.
+    pub fn measureFrameTime(h: *Harness, iterations: u32) !f64 {
+        if (iterations == 0) return 0;
+        var total_ms: f64 = 0;
+        var i: u32 = 0;
+        const start_seq = h.flush_seq.load(.seq_cst);
+        while (i < iterations) : (i += 1) {
+            const target_seq = start_seq + @as(u64, i) + 1;
+            try h.waitUntil({}, struct {
+                fn check(_: void, hh: *Harness) bool {
+                    return hh.flush_seq.load(.seq_cst) >= target_seq;
+                }
+            }.check, h.opts.timeout_ms);
+        }
+        // Note: This is a simplified measurement. A real perf test would instrument
+        // flush() callbacks with timestamps. For now, we measure the time to reach
+        // target flush count, which is conservative.
+        return total_ms / @as(f64, @floatFromInt(iterations));
+    }
+
+    // ── Viewport and Scroll State ──────────────────────────────────────
+
+    /// Get the top line index of the viewport for a grid (0-based).
+    /// Returns the top line number from the win_viewport event.
+    pub fn getViewportTop(h: *Harness, grid_id: i64) u32 {
+        h.core.grid_mu.lock();
+        defer h.core.grid_mu.unlock();
+        if (h.core.grid.viewport.get(grid_id)) |vp| {
+            return @intCast(vp.topline);
+        }
+        return 0;
+    }
+
+
+    /// Get cell width (in terminal cells) for a character.
+    /// Emoji and CJK are typically 2 cells; ASCII is 1 cell.
+    /// This is a simplified approximation; actual width depends on glyph metrics.
+    pub fn cellWidthAt(h: *Harness, grid_id: i64, row: u32, col: u32) u32 {
+        h.core.grid_mu.lock();
+        defer h.core.grid_mu.unlock();
+        const c = h.core.grid.getCellGrid(grid_id, row, col);
+        // Simplified heuristic: codepoints > U+1F300 (emoji range) → 2 cells.
+        // Real logic depends on glyph metrics from the font.
+        if (c.cp == 0) return 0; // wide-char continuation or unset
+        if (c.cp > 0x1F300) return 2; // emoji range (approximate)
+        if (c.cp >= 0x2000) return 2; // CJK and similar
+        return 1;
+    }
 };

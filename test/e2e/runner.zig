@@ -148,3 +148,23 @@ test "e2e:split_scroll_animation" {
     try requireNvim();
     try @import("scenarios/split_scroll_animation.zig").run(testing.allocator);
 }
+
+test "e2e:flush_order_correctness" {
+    try requireNvim();
+    try @import("scenarios/flush_order_correctness.zig").run(testing.allocator);
+}
+
+test "e2e:scrollbar_first_line" {
+    try requireNvim();
+    try @import("scenarios/scrollbar_first_line.zig").run(testing.allocator);
+}
+
+test "e2e:ligature_performance_baseline" {
+    try requireNvim();
+    try @import("scenarios/ligature_performance_baseline.zig").run(testing.allocator);
+}
+
+test "e2e:horizontal_scroll_alt_wheel" {
+    try requireNvim();
+    try @import("scenarios/horizontal_scroll_alt_wheel.zig").run(testing.allocator);
+}
