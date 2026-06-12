@@ -228,3 +228,58 @@ test "e2e:scroll_selection_artifacts" {
     try requireNvim();
     try @import("scenarios/scroll_selection_artifacts.zig").run(testing.allocator);
 }
+
+test "e2e:float_border_continuity" {
+    try requireNvim();
+    try @import("scenarios/float_border_continuity.zig").run(testing.allocator);
+}
+
+test "e2e:pmenusel_bounds" {
+    try requireNvim();
+    try @import("scenarios/pmenusel_bounds.zig").run(testing.allocator);
+}
+
+test "e2e:vertical_cursor_width" {
+    try requireNvim();
+    try @import("scenarios/vertical_cursor_width.zig").run(testing.allocator);
+}
+
+test "e2e:cmdline_cursor_animation" {
+    try requireNvim();
+    try @import("scenarios/cmdline_cursor_animation.zig").run(testing.allocator);
+}
+
+test "e2e:ime_composition_state" {
+    try requireNvim();
+    try @import("scenarios/ime_composition_state.zig").run(testing.allocator);
+}
+
+test "e2e:multigrid_resize_animation" {
+    try requireNvim();
+    try @import("scenarios/multigrid_resize_animation.zig").run(testing.allocator);
+}
+
+test "e2e:float_position_update_race" {
+    try requireNvim();
+    try @import("scenarios/float_position_update_race.zig").run(testing.allocator);
+}
+
+test "e2e:cursor_position_after_delete" {
+    try requireNvim();
+    try @import("scenarios/cursor_position_after_delete.zig").run(testing.allocator);
+}
+
+test "e2e:grid_resize_artifact" {
+    try requireNvim();
+    try @import("scenarios/grid_resize_artifact.zig").run(testing.allocator);
+}
+
+test "e2e:highlight_change_async" {
+    try requireNvim();
+    try @import("scenarios/highlight_change_async.zig").run(testing.allocator);
+}
+
+test "e2e:message_state_corruption" {
+    try requireNvim();
+    try @import("scenarios/message_state_corruption.zig").run(testing.allocator);
+}
