@@ -143,3 +143,12 @@ test "gui:visual_cmdline_cursor_animation" {
         return error.SkipZigTest;
     }
 }
+
+test "gui:visual_proportional_font_support" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/proportional_font_support.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}

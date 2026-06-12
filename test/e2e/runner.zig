@@ -193,3 +193,38 @@ test "e2e:linux_macos_alt_compat" {
     try requireNvim();
     try @import("scenarios/linux_macos_alt_compat.zig").run(testing.allocator);
 }
+
+test "e2e:braille_emoji_rendering" {
+    try requireNvim();
+    try @import("scenarios/braille_emoji_rendering.zig").run(testing.allocator);
+}
+
+test "e2e:keyboard_event_buffering" {
+    try requireNvim();
+    try @import("scenarios/keyboard_event_buffering.zig").run(testing.allocator);
+}
+
+test "e2e:input_latency_performance" {
+    try requireNvim();
+    try @import("scenarios/input_latency_performance.zig").run(testing.allocator);
+}
+
+test "e2e:cursor_animate_in_insert" {
+    try requireNvim();
+    try @import("scenarios/cursor_animate_in_insert.zig").run(testing.allocator);
+}
+
+test "e2e:extmessage_window_bounds" {
+    try requireNvim();
+    try @import("scenarios/extmessage_window_bounds.zig").run(testing.allocator);
+}
+
+test "e2e:numpad_key_handling" {
+    try requireNvim();
+    try @import("scenarios/numpad_key_handling.zig").run(testing.allocator);
+}
+
+test "e2e:scroll_selection_artifacts" {
+    try requireNvim();
+    try @import("scenarios/scroll_selection_artifacts.zig").run(testing.allocator);
+}
