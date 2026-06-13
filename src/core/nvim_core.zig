@@ -1137,8 +1137,16 @@ pub const Core = struct {
         // transport (where stdin/stdout alias the same fd), double-close
         // causes EBADF signal 6. Whichever thread gets the lock first wins;
         // the other thread's `if (self.stdin_file)` check then sees null.
+        // Hold stdin_close_mu ONLY across the close-and-null critical
+        // section, NOT across the thread joins below. cleanupSession()
+        // runs on the runLoop thread and also takes this mutex; if stop()
+        // held it while joining that thread (self.thread join below), the
+        // runLoop thread would block on the mutex inside cleanupSession
+        // while stop() blocks on the join — a deadlock that hangs every
+        // teardown. Releasing here preserves the double-close protection
+        // (whoever nulls stdin_file first wins; the other sees null and
+        // skips) without the lock-ordering hazard.
         self.stdin_close_mu.lock();
-        defer self.stdin_close_mu.unlock();
         if (self.stdin_file) |f| {
             // For POSIX .socket transport (connect mode, where stdin/
             // stdout alias the same fd) close() alone does not wake
@@ -1153,6 +1161,7 @@ pub const Core = struct {
                 self.stdout_file = null;
             }
         }
+        self.stdin_close_mu.unlock();
 
         // Join writer thread. It exits via:
         //   - clean shutdown: write_queue_closed observed with empty queue
