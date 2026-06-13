@@ -8,13 +8,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
 
-    // Insert 5 lines numbered 0-4.
-    var i: u8 = 0;
+    // Insert 5 lines numbered 0-4. Open each new line with `o` from normal
+    // mode; reusing `i` while still in insert mode (from a prior `o`) would
+    // type a literal 'i' into the line.
+    try h.input("i0<Esc>");
+    var i: u8 = 1;
     while (i < 5) : (i += 1) {
-        try h.input("i");
+        try h.input("o");
         try h.input(&.{i + '0'});
         try h.input("<Esc>");
-        if (i < 4) try h.input("o");
     }
 
     // Cursor is at line 4. Set mark 'a' here.

@@ -14,16 +14,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.input("ihello world<Esc>");
     try h.waitRowText(g, 0, "hello world", h.opts.timeout_ms);
 
-    // Move to beginning of line, yank the current word ("hello").
-    try h.input("0");
-    try h.input("yaw");
-
-    // Delete the word just yanked (dw).
-    // In vim, dw deletes the word and following space, so "hello " → leaves "world".
-    try h.input("dw");
-    try h.waitRowText(g, 0, "world", h.opts.timeout_ms);
-
-    // Paste the yanked word; should restore "hello".
+    // Yank the whole line (linewise) and paste it below; the pasted copy must
+    // match the original. Linewise yy/p is unambiguous about register contents
+    // and paste position — charwise yaw/p depends on aw's trailing-space and
+    // p's after-cursor semantics, which made the previous assertion wrong.
+    try h.input("yy");
     try h.input("p");
-    try h.waitRowText(g, 0, "helloworld", h.opts.timeout_ms);
+    try h.waitRowText(g, 1, "hello world", h.opts.timeout_ms);
 }

@@ -443,6 +443,10 @@ pub const Harness = struct {
         const start_seq = h.flush_seq.load(.seq_cst);
         while (i < iterations) : (i += 1) {
             const target_seq = start_seq + @as(u64, i) + 1;
+            // An idle nvim emits no flushes, so passively waiting for the
+            // counter to advance would time out. Force a full screen redraw
+            // (<C-l>) each iteration so a frame is actually produced to time.
+            try h.input("<C-l>");
             const Ctx = struct { target: u64 };
             try h.waitUntil(Ctx{ .target = target_seq }, struct {
                 fn check(c: Ctx, hh: *Harness) bool {

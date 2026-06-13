@@ -1,6 +1,8 @@
 // highlight_change_async — verify that highlight definition changes
 // are applied correctly when they occur asynchronously.
-// Issue: #612 (Goneovim)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Goneovim #612, which is actually
+// "character under cursor rendered slightly higher" — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

@@ -44,9 +44,20 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.TestFailed;
     }
 
-    // Move cursor down to line 20, then back to line 1.
+    // Move cursor down to line 20, then back to line 1. `waitCursor` reports
+    // GRID-relative coordinates, and with scrolloff=5 jumping to buffer line 20
+    // scrolls the viewport (line 20 + context exceeds the 24-row grid), so the
+    // cursor's grid row is NOT 19. Sync on the viewport having scrolled instead
+    // of asserting a grid cursor row.
     try h.input("20G");
-    try h.waitCursor(19, 0, h.opts.timeout_ms);
+    {
+        const Vp = struct { g: i64, base: u32 };
+        try h.waitUntil(Vp{ .g = g, .base = initial_viewport }, struct {
+            fn check(c: Vp, hh: *Harness) bool {
+                return hh.getViewportTop(c.g) != c.base;
+            }
+        }.check, h.opts.timeout_ms);
+    }
 
     try h.input("gg");
     try h.waitCursor(0, 0, h.opts.timeout_ms);

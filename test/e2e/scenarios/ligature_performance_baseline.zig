@@ -33,9 +33,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.command(buf.items);
     try h.waitRowText(g, 0, "line 1 -> data", h.opts.timeout_ms);
 
-    // Enable relative line numbers.
-    try h.command("set relativenumber");
-    try h.waitRowText(g, 1, "1 line 2 -> data", h.opts.timeout_ms);
+    // Enable relative line numbers. The number column is rendered into the grid
+    // row, so row 1 (relative number 1, right-justified in numberwidth=4) reads
+    // "  1 line 2 -> data". Pin numberwidth so the expected text is
+    // deterministic regardless of the nvim default.
+    try h.command("set relativenumber numberwidth=4");
+    try h.waitRowText(g, 1, "  1 line 2 -> data", h.opts.timeout_ms);
 
     // Measure frame time over 10 flush cycles (average should stay well under 16.7ms).
     const avg_frame_time_ms = try h.measureFrameTime(10);

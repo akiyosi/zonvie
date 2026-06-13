@@ -25,7 +25,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try line_buf.appendSlice(alloc, "_suffix");
     const long_line = line_buf.items;
 
-    try h.command(std.fmt.allocPrint(alloc, "call setline(1, '{s}')", .{long_line}) catch unreachable);
+    const setline_cmd = std.fmt.allocPrint(alloc, "call setline(1, '{s}')", .{long_line}) catch unreachable;
+    defer alloc.free(setline_cmd);
+    try h.command(setline_cmd);
 
     // Initial visible content: prefix at the start.
     try h.waitRowText(g, 0, long_line[0..40], h.opts.timeout_ms);

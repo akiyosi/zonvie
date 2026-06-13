@@ -1,6 +1,8 @@
 // ime_composition_state — verify that IME composition state
 // is correctly tracked and displayed across commit/cancel events.
-// Issue: #3467 (Neovide)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Neovide #3467, which is actually
+// "init.vim error causes silent startup failure on Windows" — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

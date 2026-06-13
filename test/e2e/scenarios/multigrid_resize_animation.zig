@@ -1,6 +1,8 @@
 // multigrid_resize_animation — verify that when multiple grids are resized,
 // animation state and partial redraw remain correct.
-// Issue: #3466 (Neovide)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Neovide #3466, which is actually
+// "neovim-bin behavior has changed" — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

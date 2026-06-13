@@ -1,6 +1,8 @@
 // cursor_position_after_delete — verify that cursor position is correct
 // after delete operations (dd, d$, dw, etc.).
-// Issue: #614 (Goneovim)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Goneovim #614, which is actually
+// a PR for Windows 11 title-bar colors — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

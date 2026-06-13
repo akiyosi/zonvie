@@ -1,6 +1,8 @@
 // grid_resize_artifact — verify that resizing grids doesn't leave
 // rendering artifacts (partial characters, stale cells, etc.).
-// Issue: #582 (Goneovim)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Goneovim #582, which is actually
+// "text invisible while composing with IME (CorvusSKK)" — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

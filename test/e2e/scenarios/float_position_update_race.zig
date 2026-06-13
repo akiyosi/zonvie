@@ -1,6 +1,8 @@
 // float_position_update_race — verify that rapid float position updates
 // don't cause rendering artifacts or position inconsistencies.
-// Issue: #603 (Goneovim)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Goneovim #603, which is actually
+// "Goneovim crash when using LazyVim" — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

@@ -1,7 +1,9 @@
 // message_state_corruption — verify that message/statusline state
 // doesn't get corrupted when messages are displayed, cleared, and
 // updated rapidly.
-// Issue: #625 (Goneovim)
+// Note: general frontend robustness test; not derived from a specific
+// upstream issue. (A prior header cited Goneovim #625, which is actually
+// a PR for forcing IME off on mode change — unrelated.)
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
