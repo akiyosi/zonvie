@@ -59,6 +59,28 @@ test "gui:window_frame_stability" {
     }
 }
 
+test "gui:mini_message_position" {
+    // macOS only: exercises the macOS frontend's mini-popup anchoring
+    // (updateMiniPositions); the Windows frontend has its own message UI.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/mini_message_position.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extfloat_message_position" {
+    // macOS only: exercises the macOS frontend's ext-float anchoring
+    // (getExtFloatTargetFrame); the Windows frontend has its own message UI.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_message_position.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:wheel_scroll" {
     // Windows only: synthesizes WM_MOUSEWHEEL into the real frontend wheel
     // handler (7b37537). No macOS equivalent in this driver.

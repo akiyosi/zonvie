@@ -96,6 +96,10 @@ pub const Options = struct {
     /// state (e.g. NSUserDefaults frame autosave) from the user's real
     /// state — required by relaunch-comparison scenarios.
     home_dir: ?[]const u8 = null,
+    /// Config root override (XDG_CONFIG_HOME / APPDATA). Defaults to the
+    /// empty shared fixtures dir; scenarios that need a config.toml ship
+    /// their own fixture dir (<dir>/zonvie/config.toml layout).
+    config_dir: []const u8 = "test/gui/fixtures/config",
 };
 
 pub const Gui = struct {
@@ -180,7 +184,7 @@ pub const Gui = struct {
         // behavior. Both platforms resolve <root>/zonvie/config.toml.
         g.app_env = try std.process.getEnvMap(alloc);
         errdefer g.app_env.deinit();
-        const fixtures_abs = try std.fs.cwd().realpathAlloc(alloc, "test/gui/fixtures/config");
+        const fixtures_abs = try std.fs.cwd().realpathAlloc(alloc, opts.config_dir);
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
 

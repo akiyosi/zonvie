@@ -110,6 +110,38 @@ pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
     return mw.bounds;
 }
 
+/// Fill `out` with every on-screen window owned by `pid` (any layer),
+/// returning the count. Scenarios identify a newly appeared overlay
+/// (e.g. a mini message popup) by diffing two snapshots by window number.
+pub fn windowsForPid(pid: i32, out: []MainWindow) usize {
+    const list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) orelse return 0;
+    defer CFRelease(list);
+
+    var count: usize = 0;
+    const n = CFArrayGetCount(list);
+    var i: isize = 0;
+    while (i < n and count < out.len) : (i += 1) {
+        const dict = CFArrayGetValueAtIndex(list, i) orelse continue;
+
+        const pid_ref = CFDictionaryGetValue(dict, kCGWindowOwnerPID) orelse continue;
+        var owner_pid: i32 = 0;
+        if (!CFNumberGetValue(pid_ref, kCFNumberSInt32Type, &owner_pid)) continue;
+        if (owner_pid != pid) continue;
+
+        const bounds_ref = CFDictionaryGetValue(dict, kCGWindowBounds) orelse continue;
+        var rect = CGRect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        if (!CGRectMakeWithDictionaryRepresentation(bounds_ref, &rect)) continue;
+
+        const num_ref = CFDictionaryGetValue(dict, kCGWindowNumber) orelse continue;
+        var num: i64 = 0;
+        if (!CFNumberGetValue(num_ref, 4, &num)) continue; // kCFNumberSInt64Type = 4
+
+        out[count] = .{ .number = @intCast(num), .bounds = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h } };
+        count += 1;
+    }
+    return count;
+}
+
 /// No-op on macOS: moving another process's window needs the Accessibility
 /// API, and macOS uses grayscale AA (no ClearType subpixel-phase issue), so
 /// capture is already position-stable. Mirrors the Windows pinWindow.

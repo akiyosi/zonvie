@@ -719,21 +719,31 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if p.1 < minY { minY = p.1 }
             if p.1 > maxY { maxY = p.1 }
         }
-        let extW = Float(self.drawableSize.width)
-        let extH = Float(self.drawableSize.height)
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
-        // Position the cursor at the NDC center, but size it using the
-        // main grid's cell metrics. ext-cmdline / popupmenu drawables
-        // are often taller than a single cell (multi-row prompt /
-        // padding), and cursor verts always span NDC y = -1..+1
-        // regardless. Translating that NDC range across the full
-        // drawable height makes the cursor SDF render at the
-        // ext drawable's height (e.g., 88 px) instead of the actual
-        // cell height (~40 px), so cursor_blaze and friends look
-        // vertically stretched on those surfaces.
-        let centerPxX = offX + (minX + maxX + 2.0) * 0.25 * extW
-        let centerPxY = offY + (2.0 - minY - maxY) * 0.25 * extH
+        // Map the cursor's NDC center through the SAME viewport the grid is
+        // actually rendered into — MTLViewport(origin: viewportOriginPx*scale,
+        // size: gridCols*cell x gridRows*cell) — NOT across the full drawable.
+        // The viewport origin carries the ext-cmdline leading icon / padding
+        // shift (set from layout.gridFrame.origin); omitting it, and scaling by
+        // the full drawable instead of the grid viewport, lands iCurrentCursor
+        // to the left of the real cursor on decorated surfaces. Keeping the
+        // mapping identical to the render path preserves the Ghostty contract:
+        // iCurrentCursor == the cursor's true on-screen rect.
+        //
+        // The cursor SIZE still comes from the main grid's cell metrics, not
+        // the NDC span: cursor verts always cover NDC y = -1..+1, so stretching
+        // them across a tall ext drawable (multi-row prompt / padding) would
+        // render the cursor SDF at the drawable's height instead of one cell.
+        let scale = Float(self.window?.backingScaleFactor ?? 2.0)
+        let cellWpx = max(1.0, renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))
+        let cellHpx = max(1.0, renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))
+        let vpW = Float(gridCols) * cellWpx
+        let vpH = Float(gridRows) * cellHpx
+        let vpOriginX = Float(viewportOriginPx.x) * scale
+        let vpOriginY = Float(viewportOriginPx.y) * scale
+        let centerPxX = offX + vpOriginX + (minX + maxX + 2.0) * 0.25 * vpW
+        let centerPxY = offY + vpOriginY + (2.0 - minY - maxY) * 0.25 * vpH
         let cellW = renderer.cellWidthPx
         let cellH = renderer.cellHeightPx
         let leftPx = centerPxX - cellW * 0.5
