@@ -104,10 +104,17 @@ pub const Harness = struct {
 
         // rpc_session splits this string on spaces and inserts --embed
         // after argv[0], so "--clean" rides along with no core changes.
+        //
+        // `-n` disables swap files ('noswapfile'). Without it, every spawned
+        // nvim writes a swap file; across a full suite (and repeated runs)
+        // these accumulate in 'directory' until nvim hits E326 "Too many swap
+        // files" / E325 "swap file exists" and blocks on a |hit-enter| prompt,
+        // which freezes the window grid and makes content-bearing tests time
+        // out non-deterministically. A test harness never needs swap files.
         h.nvim_cmd = if (opts.clean)
-            try std.fmt.allocPrint(alloc, "{s} --clean", .{nvim_path})
+            try std.fmt.allocPrint(alloc, "{s} --clean -n", .{nvim_path})
         else
-            try alloc.dupe(u8, nvim_path);
+            try std.fmt.allocPrint(alloc, "{s} -n", .{nvim_path});
         errdefer alloc.free(h.nvim_cmd);
 
         const cbs = Callbacks{
