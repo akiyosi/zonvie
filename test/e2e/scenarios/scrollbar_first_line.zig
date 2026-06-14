@@ -50,11 +50,21 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // cursor's grid row is NOT 19. Sync on the viewport having scrolled instead
     // of asserting a grid cursor row.
     try h.input("20G");
+    // Sync on line 20 (the cursor's line after the jump) becoming visible — it
+    // always is, since the cursor sits on it. Waiting on the viewport TOP to
+    // change was flaky: whether 20G scrolls depends on the exact window height,
+    // so the top sometimes stayed at its initial value.
     {
-        const Vp = struct { g: i64, base: u32 };
-        try h.waitUntil(Vp{ .g = g, .base = initial_viewport }, struct {
-            fn check(c: Vp, hh: *Harness) bool {
-                return hh.getViewportTop(c.g) != c.base;
+        const Ctx = struct { alloc: std.mem.Allocator, g: i64 };
+        try h.waitUntil(Ctx{ .alloc = alloc, .g = g }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                var r: u32 = 0;
+                while (r < 24) : (r += 1) {
+                    const t = hh.rowTextAlloc(c.alloc, c.g, r) catch return false;
+                    defer c.alloc.free(t);
+                    if (std.mem.eql(u8, t, "line 20")) return true;
+                }
+                return false;
             }
         }.check, h.opts.timeout_ms);
     }

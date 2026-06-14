@@ -17,11 +17,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.input("gg0V");
     try h.waitMode("visual", h.opts.timeout_ms);
 
+    // Compare a mid-line cell (col 2), NOT column 0: in linewise Visual the
+    // cursor sits at column 0, and the cell under the cursor keeps the default
+    // hl (the cursor is a separate overlay), so only the non-cursor cells of
+    // the line carry the Visual highlight.
     const Ctx = struct { g: i64 };
     h.waitUntil(Ctx{ .g = g }, struct {
         fn check(c: Ctx, hh: *Harness) bool {
             // Row 0 selected (Visual bg), row 1 not.
-            return hh.hlAt(c.g, 0, 0).bg != hh.hlAt(c.g, 1, 0).bg;
+            return hh.hlAt(c.g, 0, 2).bg != hh.hlAt(c.g, 1, 2).bg;
         }
     }.check, h.opts.timeout_ms) catch return error.SelectionNotHighlighted;
 

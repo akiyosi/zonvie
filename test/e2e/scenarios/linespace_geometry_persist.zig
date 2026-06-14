@@ -26,16 +26,20 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Set linespace via command.
     try h.command("set linespace=10");
 
-    // Wait for callback to process.
-    try h.waitRowText(h.winGrid(), 0, "", h.opts.timeout_ms);
-
-    // Verify linespace_px was updated in core.
-    h.core.grid_mu.lock();
-    const after_linespace = h.core.linespace_px;
-    h.core.grid_mu.unlock();
-
-    if (after_linespace != 10) {
-        std.debug.print("[e2e] linespace_geometry_persist: linespace not saved: expected 10 got {d}\n", .{after_linespace});
+    // Wait for the linespace option_set event to propagate into the core.
+    // Waiting on an already-empty row would return immediately, before the
+    // event is processed — a race that read the stale value of 0.
+    h.waitUntil({}, struct {
+        fn check(_: void, hh: *Harness) bool {
+            hh.core.grid_mu.lock();
+            defer hh.core.grid_mu.unlock();
+            return hh.core.linespace_px == 10;
+        }
+    }.check, h.opts.timeout_ms) catch {
+        h.core.grid_mu.lock();
+        const got = h.core.linespace_px;
+        h.core.grid_mu.unlock();
+        std.debug.print("[e2e] linespace_geometry_persist: linespace not saved: expected 10 got {d}\n", .{got});
         return error.LinespaceNotPersisted;
-    }
+    };
 }

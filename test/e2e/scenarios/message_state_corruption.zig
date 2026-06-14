@@ -1,6 +1,5 @@
-// message_state_corruption — verify that message/statusline state
-// doesn't get corrupted when messages are displayed, cleared, and
-// updated rapidly.
+// message_state_corruption — a burst of message-generating commands (echoes,
+// searches) must not corrupt the buffer grid or leave nvim unresponsive.
 // Note: general frontend robustness test; not derived from a specific
 // upstream issue. (A prior header cited Goneovim #625, which is actually
 // a PR for forcing IME off on mode change — unrelated.)
@@ -12,89 +11,24 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
 
-    // Create initial content
-    try h.command("normal! gg");
-    try h.command("normal! i");
-    try h.input("test content");
-    try h.input("<Escape>");
+    const g = h.winGrid();
 
-    // Trigger messages via search
-    try h.command("/test");
-    try h.input("<Escape>");
+    // Put known content in the buffer.
+    try h.input("itest content<Esc>");
+    try h.waitRowText(g, 0, "test content", h.opts.timeout_ms);
 
-    // Trigger error message
-    try h.command("normal! gg");
-    try h.command("normal! 1000j");
+    // Burst of messages: rapid echoes plus a search. None of these should
+    // disturb the buffer grid (messages render in the cmdline area, not the
+    // buffer rows).
+    try h.command("echo 'msg1'");
+    try h.command("echo 'msg2'");
+    try h.command("echo 'msg3'");
+    try h.command("nohlsearch");
 
-    // Trigger multiple operations that generate messages
-    try h.command("set showmode");
+    // Buffer content must still be intact after the message burst.
+    try h.waitRowText(g, 0, "test content", h.opts.timeout_ms);
 
-    try h.command("normal! i");
-    try h.input("insert_mode");
-    try h.input("<Escape>");
-
-    // Command that produces message
-    try h.command(":echo 'hello world'");
-
-    // Search again
-    try h.command("/content");
-    try h.input("<Escape>");
-
-    // Rapid command execution
-    try h.command(":echo 'msg1'");
-    try h.command(":echo 'msg2'");
-    try h.command(":echo 'msg3'");
-
-    // Message during editing
-    try h.command("normal! i");
-    try h.input("edit");
-    try h.input("<Escape>");
-
-    // Trigger substitution
-    try h.command(":%s/test/TEST/");
-
-    // More operations
-    try h.command("normal! gg");
-    try h.command("normal! dd");
-
-    // Search with no matches
-    try h.command("/nonexistent");
-    try h.input("<Escape>");
-
-    // Undo message
-    try h.command("normal! u");
-
-    // Redo message
-    try h.command("normal! <C-r>");
-
-    // Large operation (undo/redo multiple times)
-    try h.command("normal! u");
-    try h.command("normal! u");
-    try h.command("normal! <C-r>");
-    try h.command("normal! <C-r>");
-
-    // More messages
-    try h.command(":set ruler");
-    try h.command(":set noruler");
-
-    // Edit and error together
-    try h.command("normal! i");
-    try h.input("abc");
-    try h.input("<Escape>");
-
-    try h.command("normal! 999G");
-
-    // Rapid escape key presses
-    try h.input("<Escape>");
-    try h.input("<Escape>");
-
-    // More message-generating operations
-    try h.command("normal! gg");
-    try h.command("normal! yy");
-
-    // Paste operation
-    try h.command("normal! p");
-
-    // Final state verification
-    try h.command("normal! gg");
+    // nvim is still responsive: a further edit applies normally.
+    try h.input("oand more<Esc>");
+    try h.waitRowText(g, 1, "and more", h.opts.timeout_ms);
 }

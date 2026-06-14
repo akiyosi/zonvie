@@ -1,8 +1,8 @@
-// highlight_change_async — verify that highlight definition changes
-// are applied correctly when they occur asynchronously.
-// Note: general frontend robustness test; not derived from a specific
-// upstream issue. (A prior header cited Goneovim #612, which is actually
-// "character under cursor rendered slightly higher" — unrelated.)
+// highlight_change_async — redefining a highlight group AFTER it is applied
+// updates the resolved color in the grid, i.e. the hl cache is invalidated on
+// hl_attr_define rather than only on a fresh redraw.
+// Related: Goneovim #605 (Telescope/colorscheme colors not reflected until a
+// later reload — a highlight-cache timing bug; verified real upstream).
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -10,83 +10,40 @@ const Harness = @import("../harness.zig").Harness;
 pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
+    const g = h.winGrid();
 
-    // Set up initial highlights
-    try h.command("highlight Normal ctermfg=7 ctermbg=0");
-    try h.command("highlight Search ctermfg=0 ctermbg=11");
+    // Content with a word to search-highlight.
+    try h.input("itarget word<Esc>");
+    try h.waitRowText(g, 0, "target word", h.opts.timeout_ms);
 
-    // Add content
-    try h.command("normal! gg");
-    try h.command("normal! i");
-    try h.input("test content for searching");
-    try h.input("<Escape>");
-
-    // Apply search highlighting
+    // Define Search with a known bg, enable hlsearch, and match "target".
+    try h.command("hi Search guibg=#00ff00 guifg=#000000");
     try h.command("set hlsearch");
-    try h.command("/searching");
-    try h.input("<Escape>");
+    try h.command("/target");
+    try h.input("<Esc>");
 
-    // Change highlight definition
-    try h.command("highlight Search ctermfg=0 ctermbg=14");
+    // A matched, non-cursor cell (col 1 = 'a'; the cursor sits on col 0 and is
+    // a separate overlay) must resolve to Search's green bg.
+    const green: u32 = 0x00ff00;
+    {
+        const Ctx = struct { g: i64, want: u32 };
+        try h.waitUntil(Ctx{ .g = g, .want = green }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                return hh.hlAt(c.g, 0, 1).bg == c.want;
+            }
+        }.check, h.opts.timeout_ms);
+    }
 
-    // Continue editing
-    try h.command("normal! i");
-    try h.input(" more");
-    try h.input("<Escape>");
-
-    // Add more lines and apply different highlights
-    try h.command("normal! o");
-    try h.input("another line");
-    try h.input("<Escape>");
-
-    // Change multiple highlights at once
-    try h.command("highlight Normal ctermfg=15 ctermbg=1");
-    try h.command("highlight CursorLine ctermbg=8");
-
-    // Enable cursorline
-    try h.command("set cursorline");
-
-    // Move cursor (triggers cursorline highlight)
-    try h.command("normal! j");
-
-    // Change cursorline highlight
-    try h.command("highlight CursorLine ctermbg=7");
-
-    try h.command("normal! j");
-
-    // Change highlight again
-    try h.command("highlight CursorLine ctermbg=2");
-
-    // Test with visual selection highlight
-    try h.command("normal! gg");
-    try h.command("normal! v");
-    try h.command("normal! e");
-
-    // Change visual highlight
-    try h.command("highlight Visual ctermfg=0 ctermbg=10");
-
-    try h.input("<Escape>");
-
-    // Disable/enable highlights
-    try h.command("set nohls");
-    try h.command("set hlsearch");
-
-    // Multiple rapid highlight changes
-    try h.command("highlight Search ctermfg=1 ctermbg=0");
-    try h.command("highlight Search ctermfg=2 ctermbg=0");
-    try h.command("highlight Search ctermfg=3 ctermbg=0");
-    try h.command("highlight Search ctermfg=4 ctermbg=0");
-
-    // Continue editing
-    try h.command("normal! o");
-    try h.input("final_test");
-    try h.input("<Escape>");
-
-    // Clear all matches and highlights
-    try h.command("call clearmatches()");
-    try h.command("set nocursorline");
-    try h.command("set nohls");
-
-    // Final cleanup
-    try h.command("normal! gg");
+    // Redefine Search WITHOUT re-searching; the same matched cell must pick up
+    // the new bg, proving the hl cache invalidates on the new definition.
+    try h.command("hi Search guibg=#0000ff guifg=#ffffff");
+    const blue: u32 = 0x0000ff;
+    {
+        const Ctx = struct { g: i64, want: u32 };
+        try h.waitUntil(Ctx{ .g = g, .want = blue }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                return hh.hlAt(c.g, 0, 1).bg == c.want;
+            }
+        }.check, h.opts.timeout_ms);
+    }
 }

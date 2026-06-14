@@ -1,6 +1,8 @@
-// input_latency_performance — Input to grid update latency is within 16.7ms @ 60Hz.
-// Neovide #2602: Input processing could stall on expensive per-frame operations.
-// Exercises: input event latency, vertex generation performance.
+// input_latency_performance — a keystroke drives the core flush pipeline
+// promptly (at least one flush, and not a runaway loop).
+// Note: the headless harness runs no vertex generation, so this is a
+// flush-pipeline smoke check — NOT the wall-clock latency / per-frame-cost
+// measurement of Neovide #2602 (that needs the GUI driver with real rendering).
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -13,9 +15,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // In a headless harness, we can't measure real wall-clock latency,
     // but we can measure flush count changes (number of render cycles).
 
+    // Enter insert mode first — a bare "a" in normal mode is the append
+    // command and inserts no text. Measure the single-keystroke render below.
+    try h.input("i");
+    try h.waitMode("insert", h.opts.timeout_ms);
     const initial_flush = h.flush_seq.load(.seq_cst);
 
-    // Send a single key and wait for flush.
+    // Send a single key and wait for it to render.
     try h.input("a");
 
     // Wait for the keystroke to appear in the grid.

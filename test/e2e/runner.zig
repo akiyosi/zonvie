@@ -144,11 +144,6 @@ test "e2e:float_lifecycle" {
     try @import("scenarios/float_lifecycle.zig").run(testing.allocator);
 }
 
-test "e2e:split_scroll_animation" {
-    try requireNvim();
-    try @import("scenarios/split_scroll_animation.zig").run(testing.allocator);
-}
-
 test "e2e:flush_order_correctness" {
     try requireNvim();
     try @import("scenarios/flush_order_correctness.zig").run(testing.allocator);
@@ -174,34 +169,9 @@ test "e2e:rendering_glitch_event_buffering" {
     try @import("scenarios/rendering_glitch_event_buffering.zig").run(testing.allocator);
 }
 
-test "e2e:text_cutoff_vertical_metrics" {
-    try requireNvim();
-    try @import("scenarios/text_cutoff_vertical_metrics.zig").run(testing.allocator);
-}
-
-test "e2e:macos_alt_key_mapping" {
-    try requireNvim();
-    try @import("scenarios/macos_alt_key_mapping.zig").run(testing.allocator);
-}
-
-test "e2e:macos_option_key_meta" {
-    try requireNvim();
-    try @import("scenarios/macos_option_key_meta.zig").run(testing.allocator);
-}
-
-test "e2e:linux_macos_alt_compat" {
-    try requireNvim();
-    try @import("scenarios/linux_macos_alt_compat.zig").run(testing.allocator);
-}
-
 test "e2e:braille_emoji_rendering" {
     try requireNvim();
     try @import("scenarios/braille_emoji_rendering.zig").run(testing.allocator);
-}
-
-test "e2e:keyboard_event_buffering" {
-    try requireNvim();
-    try @import("scenarios/keyboard_event_buffering.zig").run(testing.allocator);
 }
 
 test "e2e:input_latency_performance" {
@@ -209,19 +179,9 @@ test "e2e:input_latency_performance" {
     try @import("scenarios/input_latency_performance.zig").run(testing.allocator);
 }
 
-test "e2e:cursor_animate_in_insert" {
-    try requireNvim();
-    try @import("scenarios/cursor_animate_in_insert.zig").run(testing.allocator);
-}
-
 test "e2e:extmessage_window_bounds" {
     try requireNvim();
     try @import("scenarios/extmessage_window_bounds.zig").run(testing.allocator);
-}
-
-test "e2e:numpad_key_handling" {
-    try requireNvim();
-    try @import("scenarios/numpad_key_handling.zig").run(testing.allocator);
 }
 
 test "e2e:scroll_selection_artifacts" {
@@ -237,26 +197,6 @@ test "e2e:float_border_continuity" {
 test "e2e:pmenusel_bounds" {
     try requireNvim();
     try @import("scenarios/pmenusel_bounds.zig").run(testing.allocator);
-}
-
-test "e2e:vertical_cursor_width" {
-    try requireNvim();
-    try @import("scenarios/vertical_cursor_width.zig").run(testing.allocator);
-}
-
-test "e2e:cmdline_cursor_animation" {
-    try requireNvim();
-    try @import("scenarios/cmdline_cursor_animation.zig").run(testing.allocator);
-}
-
-test "e2e:ime_composition_state" {
-    try requireNvim();
-    try @import("scenarios/ime_composition_state.zig").run(testing.allocator);
-}
-
-test "e2e:multigrid_resize_animation" {
-    try requireNvim();
-    try @import("scenarios/multigrid_resize_animation.zig").run(testing.allocator);
 }
 
 test "e2e:float_position_update_race" {

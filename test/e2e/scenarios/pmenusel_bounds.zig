@@ -1,6 +1,9 @@
-// pmenusel_bounds — verify that popupmenu selection highlighting
-// respects cell boundaries and doesn't overflow into adjacent cells.
-// Issue: #619 (Goneovim)
+// pmenusel_bounds — keyword completion surfaces candidates and accepting the
+// selected one inserts it (the logical completion path the frontend renders).
+// The PIXEL concern of Goneovim #619 (1-cell pmenusel overpaint) is a rendering
+// matter covered by the GUI visual test `visual_pmenusel_bounds`; the headless
+// harness has no pixels, so this verifies the observable half.
+// Related: Goneovim #619 (verified real upstream).
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -8,63 +11,17 @@ const Harness = @import("../harness.zig").Harness;
 pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
+    const g = h.winGrid();
 
-    // Enable completion menu
-    try h.command("set completeopt=menu,menuone");
+    // Candidate words in the buffer, then a fresh line to complete on.
+    try h.command("call setline(1, ['foobar', 'foobaz'])");
+    try h.input("Gofoo");
+    try h.waitRowText(g, 2, "foo", h.opts.timeout_ms);
 
-    // Go to insert mode and start typing to trigger completion
-    try h.command("normal! ggO");
-    try h.input("func");
-
-    // Wait for popupmenu to appear (simplified)
-    const Ctx = struct { alloc: std.mem.Allocator };
-    try h.waitUntil(Ctx{ .alloc = alloc }, struct {
-        fn check(_: Ctx, _: *Harness) bool {
-            return true; // Placeholder
-        }
-    }.check, 50);
-
-    // Move through menu items
-    try h.input("<C-n>");
-
-    // Move again
-    try h.input("<C-n>");
-
-    // Move back
-    try h.input("<C-p>");
-
-    // Close menu
+    // Keyword completion (<C-x><C-n>) from the current buffer selects the first
+    // candidate ("foobar"); <C-y> accepts it, so the line becomes that word.
+    try h.input("<C-x><C-n>");
+    try h.input("<C-y>");
     try h.input("<Esc>");
-
-    // Trigger completion again
-    try h.command("normal! gg");
-    try h.command("normal! O");
-    try h.input("if");
-
-    // Wait for pmenu
-    try h.waitUntil(Ctx{ .alloc = alloc }, struct {
-        fn check(_: Ctx, _: *Harness) bool {
-            return true;
-        }
-    }.check, 50);
-
-    // Navigate and close
-    try h.input("<C-n>");
-    try h.input("<C-n>");
-    try h.input("<C-n>");
-
-    try h.input("<Esc>");
-
-    // Test with longer words
-    try h.command("normal! o");
-    try h.input("complete");
-
-    try h.waitUntil(Ctx{ .alloc = alloc }, struct {
-        fn check(_: Ctx, _: *Harness) bool {
-            return true;
-        }
-    }.check, 50);
-
-    try h.input("<C-n><C-p>");
-    try h.input("<Esc>");
+    try h.waitRowText(g, 2, "foobar", h.opts.timeout_ms);
 }
