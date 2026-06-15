@@ -24,14 +24,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
 
     // Capture row 0 (narrow characters).
+    // Distinct variable per capture: `defer img.deinit` evaluates `img` at
+    // scope exit, so a reused variable would double-free the last image and
+    // leak the earlier one.
     try g.exec("execute('normal! gg0')");
-    var img = try g.captureStable(.{ .w_pt = 400, .h_pt = 150 }, 4000);
-    defer img.deinit(alloc);
-    try visual.assertMatch(alloc, "proportional_font_narrow", img, .{});
+    var img_narrow = try g.captureStable(.{ .w_pt = 400, .h_pt = 150 }, 4000);
+    defer img_narrow.deinit(alloc);
+    try visual.assertMatch(alloc, "proportional_font_narrow", img_narrow, .{});
 
     // Capture row 1 (wide characters).
     try g.exec("execute('normal! j0')");
-    img = try g.captureStable(.{ .w_pt = 400, .h_pt = 150 }, 4000);
-    defer img.deinit(alloc);
-    try visual.assertMatch(alloc, "proportional_font_wide", img, .{});
+    var img_wide = try g.captureStable(.{ .w_pt = 400, .h_pt = 150 }, 4000);
+    defer img_wide.deinit(alloc);
+    try visual.assertMatch(alloc, "proportional_font_wide", img_wide, .{});
 }

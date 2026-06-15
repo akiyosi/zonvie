@@ -22,22 +22,25 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
 
     // Position 1: cursor on 'a' (ASCII).
+    // Use a distinct variable per capture: `defer img.deinit` evaluates `img`
+    // at scope exit, so reusing one variable would point every defer at the
+    // last image — a double-free of it plus a leak of the earlier ones.
     try g.exec("execute('normal! gg0')");
-    var img = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
-    defer img.deinit(alloc);
-    try visual.assertMatch(alloc, "emoji_cursor_width_pos1_ascii", img, .{});
+    var img1 = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
+    defer img1.deinit(alloc);
+    try visual.assertMatch(alloc, "emoji_cursor_width_pos1_ascii", img1, .{});
 
     // Position 2: cursor on '😀' (emoji, 2 cells wide in font metrics, but cursor = 1 cell).
     try g.exec("execute('normal! l')");
-    img = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
-    defer img.deinit(alloc);
-    try visual.assertMatch(alloc, "emoji_cursor_width_pos2_emoji", img, .{});
+    var img2 = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
+    defer img2.deinit(alloc);
+    try visual.assertMatch(alloc, "emoji_cursor_width_pos2_emoji", img2, .{});
 
     // Position 3: cursor on 'b' (ASCII again).
     try g.exec("execute('normal! l')");
-    img = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
-    defer img.deinit(alloc);
-    try visual.assertMatch(alloc, "emoji_cursor_width_pos3_ascii", img, .{});
+    var img3 = try g.captureStable(.{ .w_pt = 300, .h_pt = 150 }, 4000);
+    defer img3.deinit(alloc);
+    try visual.assertMatch(alloc, "emoji_cursor_width_pos3_ascii", img3, .{});
 
     // The visual assertion will fail if the cursor is rendered at 2 cells before the emoji,
     // which would show as a wider block in the middle position.
