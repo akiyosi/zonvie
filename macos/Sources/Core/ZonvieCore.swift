@@ -6093,10 +6093,14 @@ final class ZonvieCore {
             }
 
         case .window:
-            // Window-based: bottom-right of the window where cursor is
+            // Window-based: bottom-right of the window where cursor is.
+            // A float grid (e.g. telescope prompt) is not a window — anchor
+            // to the main window instead of the float's host.
             let cursorPos = getCursorPosition()
             let targetWindow: NSWindow
-            if let extWindow = externalWindows[cursorPos.gridId] {
+            if isFloatGrid(cursorPos.gridId) {
+                targetWindow = mainWindow
+            } else if let extWindow = externalWindows[cursorPos.gridId] {
                 // Cursor is in an external window
                 targetWindow = extWindow
             } else {
@@ -6121,6 +6125,12 @@ final class ZonvieCore {
                     targetGrid = grid
                     break
                 }
+            }
+
+            // Cursor inside a float (e.g. telescope prompt): anchor to the
+            // non-float grid the float hangs off instead of the float itself.
+            if let g = targetGrid, g.zindex > 0 {
+                targetGrid = resolveNonFloatAnchorGrid(of: g, in: grids)
             }
 
             // Fallback to global grid (id=1) if not found
@@ -6228,6 +6238,27 @@ final class ZonvieCore {
         )
     }
 
+    /// True if the grid is a float (zindex > 0) per the cached visible grids.
+    /// Synthetic grids (cmdline/message) are not in the list and return false.
+    private func isFloatGrid(_ gridId: Int64) -> Bool {
+        guard let g = getVisibleGridsCached().first(where: { $0.gridId == gridId }) else { return false }
+        return g.zindex > 0
+    }
+
+    /// Walk anchorGrid links from a float until a non-float grid is reached.
+    /// Returns nil when the chain dead-ends or exceeds the hop guard, so
+    /// callers fall back to the global grid.
+    private func resolveNonFloatAnchorGrid(of float: GridInfo, in grids: [GridInfo]) -> GridInfo? {
+        var current: GridInfo? = float
+        var hops = 0
+        while let g = current, g.zindex > 0, hops < 8 {
+            current = grids.first { $0.gridId == g.anchorGrid }
+            hops += 1
+        }
+        if let g = current, g.zindex <= 0 { return g }
+        return nil
+    }
+
     /// Get target frame for ext-float positioning based on config
     private func getExtFloatTargetFrame() -> NSRect {
         guard let mainView = self.terminalView,
@@ -6244,10 +6275,14 @@ final class ZonvieCore {
             return screen.visibleFrame
 
         case .window:
-            // Window-based: use the window where cursor is
+            // Window-based: use the window where cursor is.
+            // A float grid (e.g. telescope prompt) is not a window — anchor
+            // to the main window instead of the float's host.
             let cursorPos = getCursorPosition()
             let targetWindow: NSWindow
-            if let extWindow = externalWindows[cursorPos.gridId] {
+            if isFloatGrid(cursorPos.gridId) {
+                targetWindow = mainWindow
+            } else if let extWindow = externalWindows[cursorPos.gridId] {
                 // Cursor is in an external window
                 targetWindow = extWindow
             } else {
@@ -6283,6 +6318,12 @@ final class ZonvieCore {
                     targetGrid = grid
                     break
                 }
+            }
+
+            // Cursor inside a float (e.g. telescope prompt): anchor to the
+            // non-float grid the float hangs off instead of the float itself.
+            if let g = targetGrid, g.zindex > 0 {
+                targetGrid = resolveNonFloatAnchorGrid(of: g, in: grids)
             }
 
             if targetGrid == nil {

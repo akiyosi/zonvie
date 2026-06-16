@@ -1,0 +1,4 @@
+# Fixture for the extfloat_message_position scenario: route the ext-float
+# message view's anchor to the grid under the cursor (default is "window").
+[messages.msg_pos]
+ext-float = "grid"

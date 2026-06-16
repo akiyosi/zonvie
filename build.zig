@@ -351,6 +351,78 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(lig_tests).step);
 
+    // E2E harness: drives a REAL headless nvim through the core pipeline
+    // (rpc_session → redraw_handler → grid → flush) and asserts on logical
+    // grid state. Separate `zig build e2e` step (not part of `zig build
+    // test`) because it needs an nvim binary at runtime.
+    const e2e_step = b.step("e2e", "Run headless E2E tests against a real nvim");
+    const e2e_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .root_source_file = b.path("test/e2e/runner.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const e2e_tests = b.addTest(.{
+        .root_module = e2e_mod,
+    });
+    const e2e_run = b.addRunArtifact(e2e_tests);
+    // Force rerun — results depend on the external nvim binary.
+    e2e_run.has_side_effects = true;
+    e2e_step.dependOn(&e2e_run.step);
+
+    // GUI test driver (macOS and Windows hosts): launches the REAL zonvie
+    // app against a shared `nvim --listen` server and observes OS windows
+    // (CGWindowList / EnumWindows). Local-only (real windows appear);
+    // `zig build gui-test` on the respective host.
+    const host_os = @import("builtin").os.tag;
+    if (host_os == .macos or host_os == .windows) {
+        const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (local only)");
+        const gui_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("test/gui/runner.zig"),
+        });
+        if (host_os == .macos) {
+            gui_mod.linkFramework("CoreGraphics", .{});
+            gui_mod.linkFramework("CoreFoundation", .{});
+            gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
+        } else {
+            gui_mod.linkSystemLibrary("user32", .{});
+            gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture
+        }
+        const gui_tests = b.addTest(.{
+            .root_module = gui_mod,
+        });
+        const gui_run = b.addRunArtifact(gui_tests);
+        // Force rerun — results depend on the external app and nvim.
+        gui_run.has_side_effects = true;
+        gui_step.dependOn(&gui_run.step);
+    }
+
+    // Cross-compile check for the Windows GUI test binary (no run). Lets a
+    // macOS host verify the Windows driver compiles; the artifact installs
+    // to zig-out/bin/zonvie-gui-test.exe and can be run on a Windows box
+    // (a Windows host should normally just use `zig build gui-test`).
+    const gui_win_step = b.step("gui-test-windows", "Build the Windows GUI test binary (compile only)");
+    const gui_win_mod = b.createModule(.{
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = true,
+        .root_source_file = b.path("test/gui/runner.zig"),
+    });
+    gui_win_mod.linkSystemLibrary("user32", .{});
+    gui_win_mod.linkSystemLibrary("gdi32", .{});
+    const gui_win_tests = b.addTest(.{
+        .name = "zonvie-gui-test",
+        .root_module = gui_win_mod,
+    });
+    gui_win_step.dependOn(&b.addInstallArtifact(gui_win_tests, .{}).step);
+
     // mpack decode-path micro benchmark. Built in ReleaseFast regardless
     // of the top-level optimize option so numbers reflect release perf.
     // Run: `zig build bench`.

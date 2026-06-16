@@ -1,0 +1,50 @@
+name: Test Suite
+
+on: [push, pull_request]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  e2e:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: E2E Tests
+        run: zig build e2e --summary all
+        timeout-minutes: 30
+      - name: Upload E2E Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: zig-cache/
+          retention-days: 7
+
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build (Linux)
+        run: zig build
+        timeout-minutes: 20
+      - name: Build (Windows Target)
+        run: zig build windows -Dtarget=x86_64-windows-gnu
+        timeout-minutes: 30
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Unit Tests
+        run: zig build test
+        timeout-minutes: 20

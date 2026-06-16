@@ -1,0 +1,5 @@
+# Golden screenshots are environment-specific (DPI, font rendering) and are
+# regenerated locally on a known-good state via ZONVIE_GUI_UPDATE_GOLDEN.
+# Do not commit them.
+*
+!.gitignore
