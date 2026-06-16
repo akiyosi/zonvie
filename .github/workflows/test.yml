@@ -2,12 +2,17 @@ name: Test Suite
 
 on: [push, pull_request]
 
+env:
+  ZIG_VERSION: "0.15.2"
+
 jobs:
   e2e:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v3
       - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - name: E2E Tests
         run: zig build e2e --summary all
         timeout-minutes: 30
@@ -24,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - name: Build (Linux)
         run: zig build
         timeout-minutes: 20
@@ -36,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - name: Unit Tests
         run: zig build test
         timeout-minutes: 20
