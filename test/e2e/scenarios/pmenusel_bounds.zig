@@ -13,8 +13,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer h.deinit();
     const g = h.winGrid();
 
-    // Candidate words in the buffer, then a fresh line to complete on.
+    // Candidate words in the buffer. Wait for the setup to land before driving
+    // input: without this barrier the keys race the buffer mutation (seen on
+    // Windows as the input applying to the pre-setline buffer, leaving row 2 the
+    // empty-buffer "~" marker). Matches the build→confirm→act order other
+    // command+input scenarios use (horizontal_scroll_alt_wheel, edit_dd).
     try h.command("call setline(1, ['foobar', 'foobaz'])");
+    try h.waitRowText(g, 1, "foobaz", h.opts.timeout_ms);
+
+    // A fresh line to complete on.
     try h.input("Gofoo");
     try h.waitRowText(g, 2, "foo", h.opts.timeout_ms);
 
