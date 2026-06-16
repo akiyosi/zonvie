@@ -276,8 +276,7 @@ pub const Gui = struct {
                 if (!quiet) {
                     std.debug.print("[gui] remote-expr failed ({d}): {s}\n{s}\n", .{ code, expr, result.stderr });
                 }
-                g.alloc.free(result.stdout);
-                return error.RemoteExprFailed;
+                return error.RemoteExprFailed; // errdefer frees result.stdout
             },
             else => return error.RemoteExprFailed,
         }

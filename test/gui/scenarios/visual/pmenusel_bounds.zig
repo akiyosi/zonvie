@@ -20,7 +20,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('normal! gg0')");
 
     // Set up completion to use popup style
-    try g.exec("set completeopt=menuone,popup");
+    try g.exec("execute('set completeopt=menuone,popup')");
 
     // Start insert mode and type a prefix to trigger completion
     try g.exec("execute('normal! Aa')");
