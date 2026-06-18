@@ -32,6 +32,23 @@ fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
     }
 }
 
+// AI-agent indicator glyphs (with trailing space) drawn before the tab name.
+// Idle uses ● (GDI-safe monochrome; color emoji can't render via DrawTextW).
+// Claude's official thinking sequence is · ✢ ✳ ✶ ✻ ✽ (120ms/frame); Codex and
+// generic agents animate the standard Braille spinner. All are monochrome.
+const agent_claude_frames = [_][]const u8{ "· ", "✢ ", "✳ ", "✶ ", "✻ ", "✽ " };
+const agent_braille_frames = [_][]const u8{ "⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ " };
+
+/// Leading agent glyph (with trailing space) for a tab state+frame, or "".
+fn agentPrefix(state: u8, frame: u32) []const u8 {
+    return switch (state) {
+        1 => "● ",
+        2 => agent_claude_frames[frame % agent_claude_frames.len],
+        3 => agent_braille_frames[frame % agent_braille_frames.len],
+        else => "",
+    };
+}
+
 /// Calculate the Neovim :tabmove position from a drop target index.
 /// Returns the value N for `:tabmove N`.
 fn calculateTabMovePosition(to_idx: usize, tab_count: usize) i32 {
@@ -1068,17 +1085,9 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                         if (drag_idx < app.tabline_state.tab_count) {
                             const tab = &app.tabline_state.tabs[drag_idx];
                             if (tab.name_len > 0) {
-                                // Get just the filename
-                                var display_name: []const u8 = tab.name[0..tab.name_len];
-                                var last_sep: usize = 0;
-                                for (display_name, 0..) |ch, i| {
-                                    if (ch == '/' or ch == '\\') {
-                                        last_sep = i + 1;
-                                    }
-                                }
-                                if (last_sep < display_name.len) {
-                                    display_name = display_name[last_sep..];
-                                }
+                                // Display name (basename, preserving the agent-status glyph).
+                                var name_buf: [256]u8 = undefined;
+                                const display_name = name_buf[0..extractTabDisplayName(tab, &name_buf)];
 
                                 // Draw text
                                 var text_rect = rect;
@@ -1353,12 +1362,17 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             .bottom = bar_height,
         };
 
-        // Convert name to display
-        var display_name: [256]u8 = undefined;
-        const display_len = extractTabDisplayName(tab, &display_name);
+        // Display name = AI-agent indicator glyph (state+frame) + basename.
+        var base_buf: [256]u8 = undefined;
+        const base_len = extractTabDisplayName(tab, &base_buf);
+        const prefix = agentPrefix(app.tabline_state.agentState(tab.handle), app.tabline_state.spinner_frame);
+        var display_name: [320]u8 = undefined;
+        @memcpy(display_name[0..prefix.len], prefix);
+        @memcpy(display_name[prefix.len..][0..base_len], base_buf[0..base_len]);
+        const display_len = prefix.len + base_len;
 
         // Convert to wide string
-        var wide_buf: [256]u16 = undefined;
+        var wide_buf: [320]u16 = undefined;
         const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
 
         _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
@@ -1629,6 +1643,22 @@ pub fn onTablineUpdate(
 
     // Request repaint via PostMessage to UI thread
     // Tabline is now drawn on parent window, so invalidate parent
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+    }
+}
+
+// AI-agent work state for a tab (from on_agent_status). Stored per handle;
+// the spinner timer + paint (drawTablineContent) render the indicator. Fired
+// on the core RPC thread, so update under app.mu then invalidate on the UI
+// thread (the WM_APP_TABLINE_INVALIDATE handler also reconciles the timer).
+pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    {
+        app.mu.lock();
+        defer app.mu.unlock();
+        app.tabline_state.setAgentState(tab_handle, state);
+    }
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
     }

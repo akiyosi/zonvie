@@ -525,6 +525,11 @@ pub const Callbacks = extern struct {
     // that don't fill this field get a null callback and lose the
     // notification — the reconnect itself still happens transparently.
     on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
+
+    // AI-agent work status per tab. Appended at the end for ABI compat (see
+    // on_restart note). state: 0=none, 1=idle (agent present), 2=working/claude,
+    // 3=working/braille (codex & generic).
+    on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8) callconv(.c) void = null,
 };
 
 
@@ -628,6 +633,7 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // ext_tabline callbacks
         .on_tabline_update = box.cb.on_tabline_update,
         .on_tabline_hide = box.cb.on_tabline_hide,
+        .on_agent_status = box.cb.on_agent_status,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,

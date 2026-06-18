@@ -170,6 +170,10 @@ pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
 pub const TIMER_CUSTOM_SHADER_ANIM: c.UINT_PTR = 11;
 /// ~60Hz cadence for TIMER_CUSTOM_SHADER_ANIM.
 pub const CUSTOM_SHADER_ANIM_INTERVAL_MS: c.UINT = 16;
+/// AI-agent tab spinner animation timer (only runs while a tab is working).
+pub const TIMER_AGENT_SPINNER: c.UINT_PTR = 12;
+/// Frame cadence for the agent spinner (matches Claude Code's 120ms).
+pub const AGENT_SPINNER_INTERVAL_MS: c.UINT = 120;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)
@@ -995,6 +999,14 @@ pub const TablineState = struct {
     // Window button pressed state (for proper click handling on min/max/close)
     pressed_window_btn: ?u8 = null, // 0=min, 1=max, 2=close
 
+    // AI-agent indicator state, keyed by tab handle (set via on_agent_status).
+    // state: 1=idle (agent present)→●, 2=working/claude, 3=working/braille.
+    agent_handles: [32]i64 = [_]i64{0} ** 32,
+    agent_states: [32]u8 = [_]u8{0} ** 32,
+    agent_count: usize = 0,
+    spinner_frame: u32 = 0,
+    spinner_timer_active: bool = false,
+
     // Tab bar constants
     pub const TAB_BAR_HEIGHT: c_int = 32;
     pub const TAB_MIN_WIDTH: c_int = 100;
@@ -1022,6 +1034,44 @@ pub const TablineState = struct {
         self.tab_count = 0;
         self.current_tab = 0;
         self.visible = false;
+    }
+
+    /// Upsert/remove (state==0) the AI-agent state for a tab handle.
+    pub fn setAgentState(self: *TablineState, handle: i64, state: u8) void {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_handles[i] == handle) {
+                if (state == 0) {
+                    self.agent_count -= 1;
+                    self.agent_handles[i] = self.agent_handles[self.agent_count];
+                    self.agent_states[i] = self.agent_states[self.agent_count];
+                } else {
+                    self.agent_states[i] = state;
+                }
+                return;
+            }
+        }
+        if (state != 0 and self.agent_count < 32) {
+            self.agent_handles[self.agent_count] = handle;
+            self.agent_states[self.agent_count] = state;
+            self.agent_count += 1;
+        }
+    }
+
+    pub fn agentState(self: *const TablineState, handle: i64) u8 {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_handles[i] == handle) return self.agent_states[i];
+        }
+        return 0;
+    }
+
+    pub fn anyAgentWorking(self: *const TablineState) bool {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_states[i] == 2 or self.agent_states[i] == 3) return true;
+        }
+        return false;
     }
 
     pub fn cancelDrag(self: *TablineState) void {

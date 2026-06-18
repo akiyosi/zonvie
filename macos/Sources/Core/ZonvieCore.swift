@@ -916,6 +916,11 @@ final class ZonvieCore {
                     addr = ""
                 }
                 core.handleConnectEvent(serverAddr: addr)
+            },
+            on_agent_status: { ctx, tabHandle, state in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.onAgentStatus(tabHandle: tabHandle, state: state)
             }
         )
 
@@ -6998,6 +7003,16 @@ final class ZonvieCore {
         }
     }
 
+    // Fired on the core RPC thread when a tab's AI-agent state changes.
+    nonisolated private func onAgentStatus(tabHandle: Int64, state: UInt8) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: ZonvieCore.agentStatusNotification,
+                object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
+            )
+        }
+    }
+
     // MARK: - Grid scroll callback
 
     nonisolated private func onGridScroll(gridId: Int64) {
@@ -7064,6 +7079,19 @@ final class ZonvieCore {
             self.currentTab = currentTab
         }
     }
+
+    /// Container for an AI-agent status update passed via NSNotification.object.
+    final class AgentStatusInfo {
+        let tabHandle: Int64
+        let state: UInt8  // 0=none, 1=idle, 2=working/claude, 3=working/braille
+        init(tabHandle: Int64, state: UInt8) {
+            self.tabHandle = tabHandle
+            self.state = state
+        }
+    }
+
+    /// Notification name for AI-agent tab status
+    static let agentStatusNotification = NSNotification.Name("ZonvieAgentStatus")
 
     /// Notification name for tabline update
     static let tablineUpdateNotification = NSNotification.Name("ZonvieTablineUpdate")

@@ -502,6 +502,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_msg_history_show = messages.onMsgHistoryShow,
         .on_tabline_update = tabline_mod.onTablineUpdate,
         .on_tabline_hide = tabline_mod.onTablineHide,
+        .on_agent_status = tabline_mod.onAgentStatus,
         .on_clipboard_get = callbacks.onClipboardGet,
         .on_clipboard_set = callbacks.onClipboardSet,
         .on_ssh_auth_prompt = callbacks.onSSHAuthPrompt,
@@ -2859,12 +2860,25 @@ pub export fn WndProc(
 
         WM_APP_TABLINE_INVALIDATE => {
             if (getApp(hwnd)) |app| {
+                // Start/stop the agent spinner animation timer to match whether
+                // any tab is currently working (idle/none need no animation).
+                const working = blk: {
+                    app.mu.lock();
+                    defer app.mu.unlock();
+                    break :blk app.tabline_state.anyAgentWorking();
+                };
+                if (working and !app.tabline_state.spinner_timer_active) {
+                    _ = c.SetTimer(hwnd, app_mod.TIMER_AGENT_SPINNER, app_mod.AGENT_SPINNER_INTERVAL_MS, null);
+                    app.tabline_state.spinner_timer_active = true;
+                } else if (!working and app.tabline_state.spinner_timer_active) {
+                    _ = c.KillTimer(hwnd, app_mod.TIMER_AGENT_SPINNER);
+                    app.tabline_state.spinner_timer_active = false;
+                }
                 // Tabline is rendered as D3D11 texture via renderTablineToD3D
                 // Invalidate main window to trigger WM_PAINT which calls renderTablineToD3D
                 _ = c.InvalidateRect(hwnd, null, 0);
                 // Force immediate repaint so tabline updates without waiting for next message
                 _ = c.UpdateWindow(hwnd);
-                _ = app;
             }
             return 0;
         },
@@ -3023,6 +3037,12 @@ pub export fn WndProc(
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
                 if (getApp(hwnd)) |app| {
                     input.handleCursorBlinkTimer(hwnd, app);
+                }
+            } else if (wParam == app_mod.TIMER_AGENT_SPINNER) {
+                // Advance the AI-agent spinner frame and repaint the tabline.
+                if (getApp(hwnd)) |app| {
+                    app.tabline_state.spinner_frame +%= 1;
+                    _ = c.InvalidateRect(hwnd, null, 0);
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
                 // Continuous-redraw tick for animated custom shaders.

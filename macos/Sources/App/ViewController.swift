@@ -13,6 +13,7 @@ final class ViewController: NSViewController {
     // Notification observers for tabline
     private var tablineUpdateObserver: Any?
     private var tablineHideObserver: Any?
+    private var agentStatusObserver: Any?
 
     // Current tab list for lookup
     private var currentTabs: [(handle: Int64, name: String)] = []
@@ -235,6 +236,16 @@ final class ViewController: NSViewController {
             queue: .main
         ) { [weak self] _ in
             self?.handleTablineHide()
+        }
+
+        agentStatusObserver = NotificationCenter.default.addObserver(
+            forName: ZonvieCore.agentStatusNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let info = notification.object as? ZonvieCore.AgentStatusInfo else { return }
+            self?.tabBarView?.setAgentState(handle: info.tabHandle, state: info.state)
+            self?.sidebarView?.setAgentState(handle: info.tabHandle, state: info.state)
         }
     }
 

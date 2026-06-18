@@ -830,6 +830,84 @@ pub fn setupClipboard(self: *Core) void {
     self.log.write("clipboard setup done (via nvim_list_chans lookup)\n", .{});
 }
 
+/// Inject the AI-agent tab-status reporter into the connected Neovim so the
+/// feature needs no user-side config. Classifies each terminal's OSC title into
+/// a per-tabpage state and reports it via the zonvie_agent_status notification:
+///   0=none  1=idle (agent present)  2=working/claude  3=working/braille(codex).
+/// Agent presence + kind are latched per buffer (claude is recognized by its
+/// '✳' U+2733 idle marker or "Claude" in the title; anything else with a Braille
+/// spinner is treated as codex/generic). The frontend renders/animates from the
+/// state. augroup clear=true keeps re-injection idempotent. Fire-and-forget.
+pub fn setupAgentStatus(self: *Core) void {
+    const lua_code =
+        \\local present, kind, last = {}, {}, {}
+        \\local function classify(buf, title)
+        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
+        \\  local spinner = cp >= 0x2800 and cp <= 0x28FF
+        \\  if cp == 0x2733 or title:find('Claude') then present[buf] = true; kind[buf] = 'claude' end
+        \\  if spinner then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
+        \\  if spinner then return (kind[buf] == 'claude') and 2 or 3 end
+        \\  if present[buf] then return 1 end
+        \\  return 0
+        \\end
+        \\local function tabs_for_buf(buf)
+        \\  local out = {}
+        \\  for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+        \\    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(t)) do
+        \\      if vim.api.nvim_win_get_buf(w) == buf then out[#out+1] = t; break end
+        \\    end
+        \\  end
+        \\  return out
+        \\end
+        \\local function report(tab, state)
+        \\  if last[tab] == state then return end
+        \\  last[tab] = state
+        \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state })
+        \\end
+        \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
+        \\vim.api.nvim_create_autocmd('TermRequest', {
+        \\  group = grp,
+        \\  callback = function(ev)
+        \\    local seq = ev.data and ev.data.sequence or ''
+        \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
+        \\    if not body then return end
+        \\    local s = classify(ev.buf, body)
+        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s) end
+        \\  end,
+        \\})
+        \\vim.api.nvim_create_autocmd('TermClose', {
+        \\  group = grp,
+        \\  callback = function(ev)
+        \\    present[ev.buf] = nil; kind[ev.buf] = nil
+        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
+        \\  end,
+        \\})
+        \\-- Agent exit (claude/codex quit while the shell stays open) clears the
+        \\-- terminal title to "" but fires NO TermRequest, so poll present
+        \\-- buffers and drop the indicator when the title goes empty.
+        \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
+        \\_G.__zonvie_agent_timer = vim.fn.timer_start(500, function()
+        \\  for buf in pairs(present) do
+        \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
+        \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
+        \\      if ok and (t == nil or t == '') then
+        \\        present[buf] = nil; kind[buf] = nil
+        \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
+        \\      end
+        \\    else
+        \\      present[buf] = nil; kind[buf] = nil
+        \\    end
+        \\  end
+        \\end, { ['repeat'] = -1 })
+    ;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupAgentStatus: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+    self.log.write("agent status reporter installed\n", .{});
+}
+
 pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
     if (top.len < 3) return;
     if (top[1] != .str or top[2] != .arr) return;
@@ -1202,6 +1280,34 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 else if (std.mem.eql(u8, val_str, "only_right")) 3
                 else return;  // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
+        // Custom RPC notification: AI-agent work state for one tabpage.
+        // params[0] = { tab: Integer (tabpage handle), state: Integer 0..3 }
+        //   0=none, 1=idle (agent present), 2=working/claude, 3=working/braille.
+        // Emitted (debounced) by the auto-injected reporter. Forwarded straight
+        // to the frontend, which owns the per-tab indicator + spinner animation.
+        // Not coupled to grid/redraw, so a background-tab agent still updates.
+        if (params.len > 0 and params[0] == .map) {
+            var tab_handle: i64 = 0;
+            var have_tab = false;
+            var state: u8 = 0;
+            for (params[0].map) |pair| {
+                if (pair.key != .str) continue;
+                if (std.mem.eql(u8, pair.key.str, "tab")) {
+                    if (pair.val == .int) {
+                        tab_handle = pair.val.int;
+                        have_tab = true;
+                    }
+                } else if (std.mem.eql(u8, pair.key.str, "state")) {
+                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 3) {
+                        state = @intCast(pair.val.int);
+                    }
+                }
+            }
+            if (have_tab) {
+                if (self.cb.on_agent_status) |cb| cb(self.ctx, tab_handle, state);
+            }
         }
     }
 }
@@ -1701,6 +1807,9 @@ pub fn runLoop(self: *Core) void {
         // Discover our channel_id via vim.api.nvim_list_chans() and install
         // the clipboard provider hooks.
         setupClipboard(self);
+
+        // Install the AI-agent tab-status reporter (zero user-side config).
+        setupAgentStatus(self);
 
         if (self.pending_resize_valid) {
             const pr2 = self.pending_resize_rows;

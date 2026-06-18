@@ -69,7 +69,7 @@ final class TabMenuManager {
 
         // Add tab items
         for (index, tab) in tabs.enumerated() {
-            let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
+            let displayName = TabBarView.baseLabel(tab.name)
             let item = NSMenuItem(title: displayName, action: #selector(handleSelectTab(_:)), keyEquivalent: "")
             item.target = self
             item.tag = index
