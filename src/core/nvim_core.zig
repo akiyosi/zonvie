@@ -251,7 +251,7 @@ pub const Callbacks = struct {
     /// 3=working/braille (codex & generic). The frontend renders/animates the
     /// per-tab indicator from this; fired immediately on change (not coupled to
     /// redraw, so a background-tab agent still updates).
-    on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8) callconv(.c) void = null,
+    on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 
     /// Called when a grid receives a grid_scroll event.
     /// Frontend should clear pixel-based smooth scroll offset for this grid.

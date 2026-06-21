@@ -859,10 +859,10 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  end
         \\  return out
         \\end
-        \\local function report(tab, state)
+        \\local function report(tab, state, title)
         \\  if last[tab] == state then return end
         \\  last[tab] = state
-        \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state })
+        \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state, title = title or '' })
         \\end
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
         \\vim.api.nvim_create_autocmd('TermRequest', {
@@ -872,7 +872,9 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
         \\    if not body then return end
         \\    local s = classify(ev.buf, body)
-        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s) end
+        \\    local cp0 = body ~= '' and vim.fn.char2nr(body) or 0
+        \\    local title = (cp0 == 0x2733 or (cp0 >= 0x2800 and cp0 <= 0x28FF)) and (body:gsub('^[^ ]+%s*', '')) or body
+        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
         \\  end,
         \\})
         \\vim.api.nvim_create_autocmd('TermClose', {
@@ -1292,6 +1294,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             var tab_handle: i64 = 0;
             var have_tab = false;
             var state: u8 = 0;
+            var title: []const u8 = "";
             for (params[0].map) |pair| {
                 if (pair.key != .str) continue;
                 if (std.mem.eql(u8, pair.key.str, "tab")) {
@@ -1303,10 +1306,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                     if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 3) {
                         state = @intCast(pair.val.int);
                     }
+                } else if (std.mem.eql(u8, pair.key.str, "title")) {
+                    if (pair.val == .str) title = pair.val.str;
                 }
             }
             if (have_tab) {
-                if (self.cb.on_agent_status) |cb| cb(self.ctx, tab_handle, state);
+                if (self.cb.on_agent_status) |cb| cb(self.ctx, tab_handle, state, title.ptr, title.len);
             }
         }
     }

@@ -1805,11 +1805,17 @@ pub fn onTablineUpdate(
 // the spinner timer + paint (drawTablineContent) render the indicator. Fired
 // on the core RPC thread, so update under app.mu then invalidate on the UI
 // thread (the WM_APP_TABLINE_INVALIDATE handler also reconciles the timer).
-pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8) callconv(.c) void {
+pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     {
         app.mu.lock();
         defer app.mu.unlock();
+        // Detect a working(2/3) -> idle(1) transition; queue the tab handle +
+        // the agent's title so the UI thread can fire a completion notification.
+        const prev = app.tabline_state.agentState(tab_handle);
+        if ((prev == 2 or prev == 3) and state == 1) {
+            app.tabline_state.pushCompleted(tab_handle, title[0..title_len]);
+        }
         app.tabline_state.setAgentState(tab_handle, state);
     }
     if (app.hwnd) |main_hwnd| {

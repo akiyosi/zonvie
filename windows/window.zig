@@ -2874,6 +2874,40 @@ pub export fn WndProc(
                     _ = c.KillTimer(hwnd, app_mod.TIMER_AGENT_SPINNER);
                     app.tabline_state.spinner_timer_active = false;
                 }
+                // Drain queued agent completions into a per-tab OS notification.
+                // Always notify (window-level focus suppression doesn't fit
+                // running the agent inside zonvie's own terminal). Keep the queue
+                // if the tray isn't ready yet (startup race).
+                const n_completed = blk: {
+                    app.mu.lock();
+                    defer app.mu.unlock();
+                    break :blk app.tabline_state.agent_completed_count;
+                };
+                if (n_completed > 0) {
+                    if (app.tray_icon) |*tray| {
+                        var msg_buf: [320]u8 = undefined;
+                        var bmsg: []const u8 = "AI agent finished";
+                        {
+                            app.mu.lock();
+                            defer app.mu.unlock();
+                            if (app.tabline_state.agent_completed_count == 1) {
+                                const tlen = app.tabline_state.agent_completed_title_lens[0];
+                                const summary = if (tlen > 0)
+                                    app.tabline_state.agent_completed_titles[0][0..tlen]
+                                else
+                                    app.tabline_state.tabName(app.tabline_state.agent_completed[0]);
+                                if (summary.len > 0) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "Finished: {s}", .{summary}) catch "AI agent finished";
+                                }
+                            } else {
+                                bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents finished", .{app.tabline_state.agent_completed_count}) catch "AI agents finished";
+                            }
+                            app.tabline_state.agent_completed_count = 0;
+                        }
+                        tray.showBalloon("Zonvie", bmsg);
+                    }
+                    // else: tray not ready — keep the queue for a later drain.
+                }
                 // Tabline is rendered as D3D11 texture via renderTablineToD3D
                 // Invalidate main window to trigger WM_PAINT which calls renderTablineToD3D
                 _ = c.InvalidateRect(hwnd, null, 0);

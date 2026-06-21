@@ -618,7 +618,7 @@ typedef void (*zonvie_on_tabline_hide_fn)(void* ctx);
    3=working/braille (codex & generic). The frontend renders/animates the
    per-tab indicator from this; fired immediately on change (not coupled to
    redraw, so a background-tab agent still updates). */
-typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state);
+typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state, const char* title, size_t title_len);
 
 /* --- Clipboard callbacks --- */
 

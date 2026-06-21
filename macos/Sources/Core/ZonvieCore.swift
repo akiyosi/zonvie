@@ -917,10 +917,16 @@ final class ZonvieCore {
                 }
                 core.handleConnectEvent(serverAddr: addr)
             },
-            on_agent_status: { ctx, tabHandle, state in
+            on_agent_status: { ctx, tabHandle, state, titlePtr, titleLen in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onAgentStatus(tabHandle: tabHandle, state: state)
+                let title: String
+                if let p = titlePtr, titleLen > 0 {
+                    title = String(decoding: UnsafeRawBufferPointer(start: p, count: titleLen), as: UTF8.self)
+                } else {
+                    title = ""
+                }
+                me.onAgentStatus(tabHandle: tabHandle, state: state, title: title)
             }
         )
 
@@ -6985,7 +6991,8 @@ final class ZonvieCore {
         // Dispatch to main thread via NotificationCenter.
         // Pass data as notification.object (reference type) to avoid Obj-C
         // bridging issues with named tuples in NSDictionary-backed userInfo.
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            self?.agentTabNames = Dictionary(parsedTabs.map { ($0.handle, $0.name) }, uniquingKeysWith: { a, _ in a })
             NotificationCenter.default.post(
                 name: ZonvieCore.tablineUpdateNotification,
                 object: TablineUpdateInfo(tabs: parsedTabs, currentTab: curtab)
@@ -7004,8 +7011,40 @@ final class ZonvieCore {
     }
 
     // Fired on the core RPC thread when a tab's AI-agent state changes.
-    nonisolated private func onAgentStatus(tabHandle: Int64, state: UInt8) {
-        DispatchQueue.main.async {
+    // Main-thread-only: previous agent state and last-known name per tab handle,
+    // used to fire a per-tab "finished" notification on a working(2/3)->idle(1)
+    // transition (the name map is refreshed from onTablineUpdate).
+    private var agentPrevStates: [Int64: UInt8] = [:]
+    private var agentTabNames: [Int64: String] = [:]
+
+    nonisolated private func onAgentStatus(tabHandle: Int64, state: UInt8, title: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let prev = self.agentPrevStates[tabHandle] ?? 0
+            if state == 0 {
+                self.agentPrevStates.removeValue(forKey: tabHandle)
+            } else {
+                self.agentPrevStates[tabHandle] = state
+            }
+            // Completion = work just finished -> always notify. Window-level
+            // focus suppression doesn't fit this app: the agent runs inside
+            // zonvie's own :terminal, so the app is effectively always frontmost
+            // and suppression would silence every notification. Include the tab
+            // name to identify which agent finished.
+            if (prev == 2 || prev == 3) && state == 1 {
+                // Prefer the agent's own title/summary (e.g. Claude's task topic);
+                // fall back to the tab name basename.
+                let summary: String
+                if !title.isEmpty {
+                    summary = title
+                } else {
+                    let raw = self.agentTabNames[tabHandle] ?? ""
+                    summary = raw.isEmpty ? "" : (raw as NSString).lastPathComponent
+                }
+                let body = summary.isEmpty ? "AI agent finished" : "Finished: \(summary)"
+                self.showOSNotification(title: "Zonvie", body: body)
+            }
+
             NotificationCenter.default.post(
                 name: ZonvieCore.agentStatusNotification,
                 object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)

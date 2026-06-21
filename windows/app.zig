@@ -1006,6 +1006,14 @@ pub const TablineState = struct {
     agent_count: usize = 0,
     spinner_frame: u32 = 0,
     spinner_timer_active: bool = false,
+    // Tab handles that just finished (working 2/3 -> idle 1). Drained on the UI
+    // thread for per-tab completion notifications; kept (not dropped) until the
+    // tray is ready so a startup-race completion isn't silently lost.
+    agent_completed: [32]i64 = [_]i64{0} ** 32,
+    // Agent title/summary captured at each completion (parallel to agent_completed).
+    agent_completed_titles: [32][128]u8 = undefined,
+    agent_completed_title_lens: [32]usize = [_]usize{0} ** 32,
+    agent_completed_count: usize = 0,
 
     // Cached color-emoji bitmap for the idle indicator (🤖), rasterized via
     // D2D and AlphaBlend'd onto the tab (GDI DrawTextW can't render color
@@ -1078,6 +1086,38 @@ pub const TablineState = struct {
             if (self.agent_states[i] == 2 or self.agent_states[i] == 3) return true;
         }
         return false;
+    }
+
+    /// Queue a completed tab handle + its title (de-duplicated, capped).
+    pub fn pushCompleted(self: *TablineState, handle: i64, title: []const u8) void {
+        var i: usize = 0;
+        while (i < self.agent_completed_count) : (i += 1) {
+            if (self.agent_completed[i] == handle) return;
+        }
+        if (self.agent_completed_count < self.agent_completed.len) {
+            const idx = self.agent_completed_count;
+            self.agent_completed[idx] = handle;
+            const n = @min(title.len, self.agent_completed_titles[idx].len);
+            @memcpy(self.agent_completed_titles[idx][0..n], title[0..n]);
+            self.agent_completed_title_lens[idx] = n;
+            self.agent_completed_count += 1;
+        }
+    }
+
+    /// Basename of a tab's name by handle (term://…/bin/zsh -> "zsh"), or "".
+    pub fn tabName(self: *const TablineState, handle: i64) []const u8 {
+        var i: usize = 0;
+        while (i < self.tab_count) : (i += 1) {
+            if (self.tabs[i].handle == handle) {
+                const full = self.tabs[i].name[0..self.tabs[i].name_len];
+                var last: usize = 0;
+                for (full, 0..) |ch, j| {
+                    if (ch == '/' or ch == '\\') last = j + 1;
+                }
+                return full[last..];
+            }
+        }
+        return "";
     }
 
     pub fn cancelDrag(self: *TablineState) void {
