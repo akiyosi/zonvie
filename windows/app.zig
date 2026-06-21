@@ -1007,6 +1007,12 @@ pub const TablineState = struct {
     spinner_frame: u32 = 0,
     spinner_timer_active: bool = false,
 
+    // Cached color-emoji bitmap for the idle indicator (🤖), rasterized via
+    // D2D and AlphaBlend'd onto the tab (GDI DrawTextW can't render color
+    // emoji). Re-rasterized only on size change; freed in App deinit.
+    agent_emoji_hbm: ?c.HBITMAP = null,
+    agent_emoji_px: i32 = 0,
+
     // Tab bar constants
     pub const TAB_BAR_HEIGHT: c_int = 32;
     pub const TAB_MIN_WIDTH: c_int = 100;
@@ -3080,6 +3086,12 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // Cached AI-agent color-emoji bitmap (tabline idle indicator).
+        if (self.tabline_state.agent_emoji_hbm) |hbm| {
+            _ = c.DeleteObject(hbm);
+            self.tabline_state.agent_emoji_hbm = null;
+        }
+
         // Main surface: release GPU VBs from row_verts, then CPU state
         for (self.surface.row_verts.items) |*rv| {
             if (rv.vb) |p| {

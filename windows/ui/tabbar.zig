@@ -40,6 +40,7 @@ const agent_claude_frames = [_][]const u8{ "· ", "✢ ", "✳ ", "✶ ", "✻ "
 const agent_braille_frames = [_][]const u8{ "⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ " };
 
 /// Leading agent glyph (with trailing space) for a tab state+frame, or "".
+/// Used for the working spinner (monochrome, GDI) and the idle text fallback.
 fn agentPrefix(state: u8, frame: u32) []const u8 {
     return switch (state) {
         1 => "● ",
@@ -47,6 +48,133 @@ fn agentPrefix(state: u8, frame: u32) []const u8 {
         3 => agent_braille_frames[frame % agent_braille_frames.len],
         else => "",
     };
+}
+
+// 🤖 (U+1F916 ROBOT FACE) as a UTF-16 surrogate pair, for the idle indicator.
+const agent_emoji_utf16 = [_]c.WCHAR{ 0xD83E, 0xDD16 };
+
+/// Rasterize 🤖 in color into a px×px premultiplied-BGRA DIBSection via D2D and
+/// return the HBITMAP (caller owns it; freed by ensureAgentEmoji on resize /
+/// App deinit). GDI DrawTextW cannot render color emoji, so we reuse the
+/// renderer's proven CreateDCRenderTarget + DrawTextW(ENABLE_COLOR_FONT) path.
+/// Premultiplied alpha matches AlphaBlend(AC_SRC_ALPHA).
+fn rasterizeAgentEmoji(d2d_factory: *c.ID2D1Factory, dwrite_factory: *c.IDWriteFactory, px: i32) ?c.HBITMAP {
+    if (px <= 0) return null;
+
+    const hdc = c.CreateCompatibleDC(null);
+    if (hdc == null) return null;
+    defer _ = c.DeleteDC(hdc);
+
+    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = px;
+    bmi.bmiHeader.biHeight = -px; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var bits: ?*anyopaque = null;
+    const hbm = c.CreateDIBSection(hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
+    if (hbm == null or bits == null) return null;
+    _ = c.SelectObject(hdc, hbm);
+
+    const ok = blk: {
+        const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
+            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            .pixelFormat = .{ .format = c.DXGI_FORMAT_B8G8R8A8_UNORM, .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED },
+            .dpiX = 0,
+            .dpiY = 0,
+            .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
+            .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        var dc_rt: ?*c.ID2D1DCRenderTarget = null;
+        const create_fn = d2d_factory.lpVtbl.*.CreateDCRenderTarget orelse break :blk false;
+        if (create_fn(d2d_factory, &rtp, &dc_rt) != 0 or dc_rt == null) break :blk false;
+        defer {
+            const u: *c.IUnknown = @ptrCast(dc_rt.?);
+            _ = u.lpVtbl.*.Release.?(u);
+        }
+
+        var bind_rect: c.RECT = .{ .left = 0, .top = 0, .right = px, .bottom = px };
+        const bind_fn = dc_rt.?.lpVtbl.*.BindDC orelse break :blk false;
+        if (bind_fn(dc_rt.?, hdc, &bind_rect) != 0) break :blk false;
+
+        const emoji_font: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+        const font_size: f32 = @as(f32, @floatFromInt(px)) * 0.78;
+        var fmt: ?*c.IDWriteTextFormat = null;
+        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse break :blk false;
+        if (create_tf(dwrite_factory, emoji_font, null, c.DWRITE_FONT_WEIGHT_NORMAL, c.DWRITE_FONT_STYLE_NORMAL, c.DWRITE_FONT_STRETCH_NORMAL, font_size, std.unicode.utf8ToUtf16LeStringLiteral("en-us"), &fmt) != 0 or fmt == null) break :blk false;
+        defer {
+            const u: *c.IUnknown = @ptrCast(fmt.?);
+            _ = u.lpVtbl.*.Release.?(u);
+        }
+        if (fmt.?.lpVtbl.*.SetTextAlignment) |f| _ = f(fmt.?, c.DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (fmt.?.lpVtbl.*.SetParagraphAlignment) |f| _ = f(fmt.?, c.DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        const rt_base: *c.ID2D1RenderTarget = @ptrCast(dc_rt.?);
+        const vtbl = rt_base.lpVtbl.*;
+        if (vtbl.BeginDraw) |f| f(rt_base);
+        if (vtbl.Clear) |f| {
+            const transparent = c.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 0 };
+            f(rt_base, &transparent);
+        }
+        var brush: ?*c.ID2D1SolidColorBrush = null;
+        if (vtbl.CreateSolidColorBrush) |f| {
+            const white = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
+            _ = f(rt_base, &white, null, &brush);
+        }
+        defer {
+            if (brush) |b| {
+                const u: *c.IUnknown = @ptrCast(b);
+                _ = u.lpVtbl.*.Release.?(u);
+            }
+        }
+        if (brush) |b| {
+            const layout = c.D2D1_RECT_F{ .left = 0, .top = 0, .right = @floatFromInt(px), .bottom = @floatFromInt(px) };
+            if (vtbl.DrawTextW) |draw_fn| {
+                draw_fn(rt_base, &agent_emoji_utf16, agent_emoji_utf16.len, fmt.?, &layout, @ptrCast(b), c.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, c.DWRITE_MEASURING_MODE_NATURAL);
+            }
+        }
+        var t1: u64 = 0;
+        var t2: u64 = 0;
+        if (vtbl.EndDraw) |f| {
+            if (f(rt_base, &t1, &t2) != 0) break :blk false;
+        }
+        break :blk true;
+    };
+
+    if (!ok) {
+        _ = c.DeleteObject(hbm);
+        return null;
+    }
+    return hbm;
+}
+
+/// Cached 🤖 bitmap at the requested square size; re-rasterizes on size change.
+fn ensureAgentEmoji(app: *App, px: i32) ?c.HBITMAP {
+    if (app.tabline_state.agent_emoji_hbm) |hbm| {
+        if (app.tabline_state.agent_emoji_px == px) return hbm;
+        _ = c.DeleteObject(hbm);
+        app.tabline_state.agent_emoji_hbm = null;
+    }
+    const r = if (app.atlas) |*rr| rr else return null;
+    const d2d = r.d2d_factory orelse return null;
+    const dw = r.dwrite_factory orelse return null;
+    const hbm = rasterizeAgentEmoji(d2d, dw, px) orelse return null;
+    app.tabline_state.agent_emoji_hbm = hbm;
+    app.tabline_state.agent_emoji_px = px;
+    return hbm;
+}
+
+/// AlphaBlend the cached premultiplied 🤖 bitmap onto the tabline DC.
+fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void {
+    const mem = c.CreateCompatibleDC(dst_hdc);
+    if (mem == null) return;
+    defer _ = c.DeleteDC(mem);
+    const old = c.SelectObject(mem, hbm);
+    defer _ = c.SelectObject(mem, old);
+    const bf = c.BLENDFUNCTION{ .BlendOp = c.AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = c.AC_SRC_ALPHA };
+    _ = c.AlphaBlend(dst_hdc, x, y, px, px, mem, 0, 0, px, px, bf);
 }
 
 /// Calculate the Neovim :tabmove position from a drop target index.
@@ -1362,10 +1490,27 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             .bottom = bar_height,
         };
 
-        // Display name = AI-agent indicator glyph (state+frame) + basename.
+        // AI-agent indicator: idle shows a color 🤖 (AlphaBlend, since GDI
+        // DrawTextW can't render color emoji); working shows a monochrome
+        // spinner glyph as a text prefix. Emoji falls back to "● " text.
+        const a_state = app.tabline_state.agentState(tab.handle);
+        var prefix: []const u8 = "";
+        if (a_state == 1) {
+            const emoji_px = bar_height - top_padding * 2;
+            if (if (emoji_px > 0) ensureAgentEmoji(app, emoji_px) else null) |hbm| {
+                const ey = @divTrunc(bar_height - emoji_px, 2);
+                blendAgentEmoji(hdc, hbm, text_rect.left, ey, emoji_px);
+                text_rect.left += emoji_px + top_padding; // reserve emoji + gap
+            } else {
+                prefix = "● ";
+            }
+        } else if (a_state == 2 or a_state == 3) {
+            prefix = agentPrefix(a_state, app.tabline_state.spinner_frame);
+        }
+
+        // Display name = indicator text prefix + basename.
         var base_buf: [256]u8 = undefined;
         const base_len = extractTabDisplayName(tab, &base_buf);
-        const prefix = agentPrefix(app.tabline_state.agentState(tab.handle), app.tabline_state.spinner_frame);
         var display_name: [320]u8 = undefined;
         @memcpy(display_name[0..prefix.len], prefix);
         @memcpy(display_name[prefix.len..][0..base_len], base_buf[0..base_len]);
