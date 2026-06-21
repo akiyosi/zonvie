@@ -1496,7 +1496,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         const a_state = app.tabline_state.agentState(tab.handle);
         var prefix: []const u8 = "";
         if (a_state == 1) {
-            const emoji_px = bar_height - top_padding * 2;
+            // Size the emoji near the text cap height, not the full bar, so it
+            // sits visually inline with the tab label and spinner glyphs.
+            const emoji_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
             if (if (emoji_px > 0) ensureAgentEmoji(app, emoji_px) else null) |hbm| {
                 const ey = @divTrunc(bar_height - emoji_px, 2);
                 blendAgentEmoji(hdc, hbm, text_rect.left, ey, emoji_px);
