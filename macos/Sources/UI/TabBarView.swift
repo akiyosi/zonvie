@@ -226,7 +226,6 @@ final class TabBarView: NSView {
             floatPath.stroke()
 
             // Draw tab name
-            let displayName = agentPrefix(forHandle: tab.handle) + Self.baseLabel(tab.name)
             let font = NSFont.systemFont(ofSize: 12, weight: .medium)
             let attributes: [NSAttributedString.Key: Any] = [
                 .foregroundColor: NSColor.labelColor,
@@ -238,7 +237,10 @@ final class TabBarView: NSView {
                 width: tabWidth - tabPadding * 2,
                 height: 16
             )
-            displayName.draw(in: textRect, withAttributes: attributes)
+            let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: NSColor.labelColor)
+            let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
+                                   width: textRect.width - indicatorW, height: textRect.height)
+            Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
         }
     }
 
@@ -275,14 +277,33 @@ final class TabBarView: NSView {
         needsDisplay = true
     }
 
-    /// Leading agent glyph (with trailing space) for a tab, or "" if none.
-    func agentPrefix(forHandle handle: Int64) -> String {
+    // Fixed width reserved for the agent indicator, so that varying spinner
+    // glyph widths don't shift the tab title left/right between frames.
+    static let agentIndicatorWidth: CGFloat = 18
+
+    /// Single agent indicator glyph for a tab (no trailing space), or nil.
+    func agentGlyph(forHandle handle: Int64) -> String? {
         switch agentStates[handle] {
-        case 1: return "🤖 "
-        case 2: return Self.claudeFrames[spinnerFrame % Self.claudeFrames.count] + " "
-        case 3: return Self.brailleFrames[spinnerFrame % Self.brailleFrames.count] + " "
-        default: return ""
+        case 1: return "🤖"
+        case 2: return Self.claudeFrames[spinnerFrame % Self.claudeFrames.count]
+        case 3: return Self.brailleFrames[spinnerFrame % Self.brailleFrames.count]
+        default: return nil
         }
+    }
+
+    /// Draw the agent indicator centered in a fixed-width box at the left edge
+    /// of `rect`, and return the x-offset the title should start at (0 if none).
+    /// Centering in a fixed box keeps the title anchored across spinner frames.
+    func drawAgentIndicator(forHandle handle: Int64, in rect: NSRect, font: NSFont, color: NSColor) -> CGFloat {
+        guard let glyph = agentGlyph(forHandle: handle) else { return 0 }
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: color, .paragraphStyle: para,
+        ]
+        let box = NSRect(x: rect.minX, y: rect.minY, width: Self.agentIndicatorWidth, height: rect.height)
+        glyph.draw(in: box, withAttributes: attrs)
+        return Self.agentIndicatorWidth
     }
 
     deinit { spinnerTimer?.invalidate() }
@@ -338,8 +359,10 @@ final class TabBarView: NSView {
             .paragraphStyle: paragraphStyle
         ]
 
-        let displayName = agentPrefix(forHandle: tab.handle) + Self.baseLabel(tab.name)
-        displayName.draw(in: titleRect, withAttributes: attributes)
+        let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: titleRect, font: font, color: textColor)
+        let labelRect = NSRect(x: titleRect.minX + indicatorW, y: titleRect.minY,
+                               width: titleRect.width - indicatorW, height: titleRect.height)
+        Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
 
         // Close button (X) - show on selected or hovered tabs
         if isSelected || isHovered {

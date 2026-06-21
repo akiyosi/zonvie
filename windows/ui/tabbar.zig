@@ -32,22 +32,29 @@ fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
     }
 }
 
-// AI-agent indicator glyphs (with trailing space) drawn before the tab name.
-// Idle uses ● (GDI-safe monochrome; color emoji can't render via DrawTextW).
-// Claude's official thinking sequence is · ✢ ✳ ✶ ✻ ✽ (120ms/frame); Codex and
-// generic agents animate the standard Braille spinner. All are monochrome.
-const agent_claude_frames = [_][]const u8{ "· ", "✢ ", "✳ ", "✶ ", "✻ ", "✽ " };
-const agent_braille_frames = [_][]const u8{ "⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ " };
+// AI-agent spinner glyphs (single glyph, no trailing space; drawn centered in a
+// fixed-width indicator cell). Claude's official thinking sequence is
+// · ✢ ✳ ✶ ✻ ✽ (120ms/frame); Codex and generic agents animate the standard
+// Braille spinner. All monochrome (GDI-rendered).
+const agent_claude_frames = [_][]const u8{ "·", "✢", "✳", "✶", "✻", "✽" };
+const agent_braille_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/// Leading agent glyph (with trailing space) for a tab state+frame, or "".
-/// Used for the working spinner (monochrome, GDI) and the idle text fallback.
-fn agentPrefix(state: u8, frame: u32) []const u8 {
+/// Working spinner glyph for a tab state+frame ("" for non-working states).
+fn agentSpinnerGlyph(state: u8, frame: u32) []const u8 {
     return switch (state) {
-        1 => "● ",
         2 => agent_claude_frames[frame % agent_claude_frames.len],
         3 => agent_braille_frames[frame % agent_braille_frames.len],
         else => "",
     };
+}
+
+/// Draw a single monochrome indicator glyph centered in a fixed-width cell
+/// [x, x+cell_w) so the title (drawn after the cell) never shifts per frame.
+fn drawIndicatorGlyph(hdc: c.HDC, glyph: []const u8, x: c_int, cell_w: c_int, top: c_int, bottom: c_int) void {
+    var wide: [8]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, glyph) catch return;
+    var r = c.RECT{ .left = x, .top = top, .right = x + cell_w, .bottom = bottom };
+    _ = c.DrawTextW(hdc, &wide, @intCast(n), &r, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOCLIP);
 }
 
 // 🤖 (U+1F916 ROBOT FACE) as a UTF-16 surrogate pair, for the idle indicator.
@@ -1490,37 +1497,36 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             .bottom = bar_height,
         };
 
-        // AI-agent indicator: idle shows a color 🤖 (AlphaBlend, since GDI
-        // DrawTextW can't render color emoji); working shows a monochrome
-        // spinner glyph as a text prefix. Emoji falls back to "● " text.
+        // AI-agent indicator drawn in a FIXED-WIDTH cell so varying spinner
+        // glyph widths never shift the tab title between frames. Idle shows a
+        // color 🤖 (AlphaBlend; GDI DrawTextW can't render color emoji);
+        // working shows a monochrome spinner glyph centered in the same cell.
         const a_state = app.tabline_state.agentState(tab.handle);
-        var prefix: []const u8 = "";
-        if (a_state == 1) {
-            // Size the emoji near the text cap height, not the full bar, so it
-            // sits visually inline with the tab label and spinner glyphs.
-            const emoji_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
-            if (if (emoji_px > 0) ensureAgentEmoji(app, emoji_px) else null) |hbm| {
-                const ey = @divTrunc(bar_height - emoji_px, 2);
-                blendAgentEmoji(hdc, hbm, text_rect.left, ey, emoji_px);
-                text_rect.left += emoji_px + top_padding; // reserve emoji + gap
+        if (a_state != 0) {
+            // Indicator cell sized near the text cap height, sitting inline.
+            const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
+            const cell_w = ind_px + top_padding; // glyph box + gap, reserved
+            if (a_state == 1) {
+                if (if (ind_px > 0) ensureAgentEmoji(app, ind_px) else null) |hbm| {
+                    const ey = @divTrunc(bar_height - ind_px, 2);
+                    blendAgentEmoji(hdc, hbm, text_rect.left, ey, ind_px);
+                } else {
+                    drawIndicatorGlyph(hdc, "●", text_rect.left, ind_px, text_rect.top, text_rect.bottom);
+                }
             } else {
-                prefix = "● ";
+                const g = agentSpinnerGlyph(a_state, app.tabline_state.spinner_frame);
+                drawIndicatorGlyph(hdc, g, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
             }
-        } else if (a_state == 2 or a_state == 3) {
-            prefix = agentPrefix(a_state, app.tabline_state.spinner_frame);
+            text_rect.left += cell_w; // anchor the title past the fixed cell
         }
 
-        // Display name = indicator text prefix + basename.
+        // Display name = basename only (indicator drawn separately above).
         var base_buf: [256]u8 = undefined;
         const base_len = extractTabDisplayName(tab, &base_buf);
-        var display_name: [320]u8 = undefined;
-        @memcpy(display_name[0..prefix.len], prefix);
-        @memcpy(display_name[prefix.len..][0..base_len], base_buf[0..base_len]);
-        const display_len = prefix.len + base_len;
 
         // Convert to wide string
         var wide_buf: [320]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
+        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, base_buf[0..base_len]) catch 0;
 
         _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
 

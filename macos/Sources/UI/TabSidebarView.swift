@@ -35,13 +35,29 @@ final class TabSidebarView: NSView {
         needsDisplay = true
     }
 
-    private func agentPrefix(forHandle handle: Int64) -> String {
+    /// Single agent indicator glyph for a tab (no trailing space), or nil.
+    private func agentGlyph(forHandle handle: Int64) -> String? {
         switch agentStates[handle] {
-        case 1: return "🤖 "
-        case 2: return TabBarView.claudeFrames[spinnerFrame % TabBarView.claudeFrames.count] + " "
-        case 3: return TabBarView.brailleFrames[spinnerFrame % TabBarView.brailleFrames.count] + " "
-        default: return ""
+        case 1: return "🤖"
+        case 2: return TabBarView.claudeFrames[spinnerFrame % TabBarView.claudeFrames.count]
+        case 3: return TabBarView.brailleFrames[spinnerFrame % TabBarView.brailleFrames.count]
+        default: return nil
         }
+    }
+
+    /// Draw the agent indicator centered in a fixed-width box at the left edge
+    /// of `rect`, and return the x-offset the title should start at (0 if none).
+    /// Centering in a fixed box keeps the title anchored across spinner frames.
+    private func drawAgentIndicator(forHandle handle: Int64, in rect: NSRect, font: NSFont, color: NSColor) -> CGFloat {
+        guard let glyph = agentGlyph(forHandle: handle) else { return 0 }
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: color, .paragraphStyle: para,
+        ]
+        let box = NSRect(x: rect.minX, y: rect.minY, width: TabBarView.agentIndicatorWidth, height: rect.height)
+        glyph.draw(in: box, withAttributes: attrs)
+        return TabBarView.agentIndicatorWidth
     }
 
     private var hoveredTabIndex: Int? = nil
@@ -321,7 +337,6 @@ final class TabSidebarView: NSView {
 
             // Draw tab name in floating row
             let tab = tabs[dragIdx]
-            let displayName = agentPrefix(forHandle: tab.handle) + TabBarView.baseLabel(tab.name)
             let font = NSFont.systemFont(ofSize: 12, weight: .medium)
             let paragraphStyle = NSMutableParagraphStyle()
             paragraphStyle.lineBreakMode = .byTruncatingTail
@@ -336,7 +351,10 @@ final class TabSidebarView: NSView {
                 width: floatRect.width - tabPadding * 2,
                 height: 16
             )
-            displayName.draw(in: textRect, withAttributes: attributes)
+            let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: tabTextSelectedColor)
+            let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
+                                   width: textRect.width - indicatorW, height: textRect.height)
+            TabBarView.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
         }
     }
 
@@ -368,7 +386,6 @@ final class TabSidebarView: NSView {
         }
 
         // Tab name
-        let displayName = agentPrefix(forHandle: tab.handle) + TabBarView.baseLabel(tab.name)
         let textColor = isSelected ? tabTextSelectedColor : tabTextColor
         let font = NSFont.systemFont(ofSize: 12, weight: isSelected ? .medium : .regular)
 
@@ -389,7 +406,10 @@ final class TabSidebarView: NSView {
             .font: font,
             .paragraphStyle: paragraphStyle
         ]
-        displayName.draw(in: textRect, withAttributes: attributes)
+        let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: textColor)
+        let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
+                               width: textRect.width - indicatorW, height: textRect.height)
+        TabBarView.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
 
         // Close button (X) on hover or selected
         if isSelected || isHovered {
