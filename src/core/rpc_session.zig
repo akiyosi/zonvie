@@ -844,9 +844,15 @@ pub fn setupAgentStatus(self: *Core) void {
         \\local function classify(buf, title)
         \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
         \\  local spinner = cp >= 0x2800 and cp <= 0x28FF
-        \\  if cp == 0x2733 or title:find('Claude') then present[buf] = true; kind[buf] = 'claude' end
+        \\  local claudeish = cp == 0x2733 or title:find('Claude') ~= nil
+        \\  if claudeish then present[buf] = true; kind[buf] = 'claude' end
         \\  if spinner then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
         \\  if spinner then return (kind[buf] == 'claude') and 2 or 3 end
+        \\  if claudeish then return 1 end
+        \\  -- Claude always shows the U+2733 marker when idle; a claude tab whose
+        \\  -- title lost every agent marker means Claude exited (the shell took the
+        \\  -- title over, e.g. cmd.exe) -> clear so the robot indicator goes away.
+        \\  if kind[buf] == 'claude' then present[buf] = nil; kind[buf] = nil; return 0 end
         \\  if present[buf] then return 1 end
         \\  return 0
         \\end
@@ -892,7 +898,12 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  for buf in pairs(present) do
         \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
         \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
-        \\      if ok and (t == nil or t == '') then
+        \\      t = (ok and t) or ''
+        \\      local cp = t ~= '' and vim.fn.char2nr(t) or 0
+        \\      local agentish = cp == 0x2733 or (cp >= 0x2800 and cp <= 0x28FF) or t:find('Claude') ~= nil
+        \\      -- Gone if the title is empty (zsh after exit), or a claude tab no
+        \\      -- longer shows any agent marker (cmd.exe took the title over).
+        \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
         \\        present[buf] = nil; kind[buf] = nil
         \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
         \\      end

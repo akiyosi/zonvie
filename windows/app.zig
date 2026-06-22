@@ -848,23 +848,13 @@ pub const TrayIcon = struct {
         self.nid.uFlags = c.NIF_INFO;
         self.nid.dwInfoFlags = c.NIIF_INFO;
 
-        // Copy title to szInfoTitle (max 63 chars + null)
-        var title_buf: [64]u16 = undefined;
-        const title_len = @min(title.len, 63);
-        for (0..title_len) |i| {
-            title_buf[i] = title[i];
-        }
-        title_buf[title_len] = 0;
-        @memcpy(self.nid.szInfoTitle[0 .. title_len + 1], title_buf[0 .. title_len + 1]);
+        // Title -> szInfoTitle (proper UTF-8 -> UTF-16; byte-copy garbles non-ASCII).
+        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..63], title) catch 0;
+        self.nid.szInfoTitle[tn] = 0;
 
-        // Copy msg to szInfo (max 255 chars + null)
-        var msg_buf: [256]u16 = undefined;
-        const msg_len = @min(msg_text.len, 255);
-        for (0..msg_len) |i| {
-            msg_buf[i] = msg_text[i];
-        }
-        msg_buf[msg_len] = 0;
-        @memcpy(self.nid.szInfo[0 .. msg_len + 1], msg_buf[0 .. msg_len + 1]);
+        // Message -> szInfo (proper UTF-8 -> UTF-16).
+        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..255], msg_text) catch 0;
+        self.nid.szInfo[mn] = 0;
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
         if (applog.isEnabled()) applog.appLog("[tray] showBalloon: title='{s}' msg='{s}'\n", .{ title, msg_text });
