@@ -1307,6 +1307,8 @@ typedef struct zonvie_config_values {
     const char* tabline_style;
     const char* tabline_sidebar_position;
     int32_t tabline_sidebar_width;
+    bool tabline_agent_indicator;
+    bool tabline_agent_notification;
     bool windows_external;
     // neovim
     const char* neovim_path;

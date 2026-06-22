@@ -839,6 +839,9 @@ pub fn setupClipboard(self: *Core) void {
 /// spinner is treated as codex/generic). The frontend renders/animates from the
 /// state. augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 pub fn setupAgentStatus(self: *Core) void {
+    // Skip the reporter entirely when both the indicator and the completion
+    // notification are disabled -- nothing would consume the status updates.
+    if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
     const lua_code =
         \\local present, kind, last = {}, {}, {}
         \\local function classify(buf, title)

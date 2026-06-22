@@ -7031,7 +7031,8 @@ final class ZonvieCore {
             // zonvie's own :terminal, so the app is effectively always frontmost
             // and suppression would silence every notification. Include the tab
             // name to identify which agent finished.
-            if (prev == 2 || prev == 3) && state == 1 {
+            if ZonvieConfig.shared.tabline.agentNotification,
+               (prev == 2 || prev == 3) && state == 1 {
                 // Prefer the agent's own title/summary (e.g. Claude's task topic);
                 // fall back to the tab name basename.
                 let summary: String
@@ -7045,10 +7046,15 @@ final class ZonvieCore {
                 self.showOSNotification(title: "Zonvie", body: body)
             }
 
-            NotificationCenter.default.post(
-                name: ZonvieCore.agentStatusNotification,
-                object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
-            )
+            // Indicator rendering is driven by this notification; skip it (no icon)
+            // when the indicator is disabled. State is still tracked above so the
+            // completion notification keeps working independently.
+            if ZonvieConfig.shared.tabline.agentIndicator {
+                NotificationCenter.default.post(
+                    name: ZonvieCore.agentStatusNotification,
+                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
+                )
+            }
         }
     }
 

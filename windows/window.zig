@@ -2863,6 +2863,7 @@ pub export fn WndProc(
                 // Start/stop the agent spinner animation timer to match whether
                 // any tab is currently working (idle/none need no animation).
                 const working = blk: {
+                    if (!app.config.tabline.agent_indicator) break :blk false;
                     app.mu.lock();
                     defer app.mu.unlock();
                     break :blk app.tabline_state.anyAgentWorking();

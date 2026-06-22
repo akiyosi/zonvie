@@ -1501,7 +1501,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // glyph widths never shift the tab title between frames. Idle shows a
         // color 🤖 (AlphaBlend; GDI DrawTextW can't render color emoji);
         // working shows a monochrome spinner glyph centered in the same cell.
-        const a_state = app.tabline_state.agentState(tab.handle);
+        const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
         if (a_state != 0) {
             // Indicator cell sized near the text cap height, sitting inline.
             const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
@@ -1813,7 +1813,7 @@ pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]con
         // Detect a working(2/3) -> idle(1) transition; queue the tab handle +
         // the agent's title so the UI thread can fire a completion notification.
         const prev = app.tabline_state.agentState(tab_handle);
-        if ((prev == 2 or prev == 3) and state == 1) {
+        if (app.config.tabline.agent_notification and (prev == 2 or prev == 3) and state == 1) {
             app.tabline_state.pushCompleted(tab_handle, title[0..title_len]);
         }
         app.tabline_state.setAgentState(tab_handle, state);

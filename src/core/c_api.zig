@@ -1522,6 +1522,8 @@ pub const zonvie_config_values = extern struct {
     tabline_style: [*:0]const u8 = "titlebar",
     tabline_sidebar_position: [*:0]const u8 = "left",
     tabline_sidebar_width: i32 = 200,
+    tabline_agent_indicator: bool = true,
+    tabline_agent_notification: bool = true,
     windows_external: bool = false,
     // neovim
     neovim_path: [*:0]const u8 = "nvim",
@@ -1633,6 +1635,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .tabline_style = dupeZForC(alloc, cfg.tabline.style, "titlebar"),
         .tabline_sidebar_position = dupeZForC(alloc, cfg.tabline.sidebar_position, "left"),
         .tabline_sidebar_width = @intCast(cfg.tabline.sidebar_width),
+        .tabline_agent_indicator = cfg.tabline.agent_indicator,
+        .tabline_agent_notification = cfg.tabline.agent_notification,
         .windows_external = cfg.windows.external,
         // neovim
         .neovim_path = dupeZForC(alloc, cfg.neovim.path, "nvim"),
