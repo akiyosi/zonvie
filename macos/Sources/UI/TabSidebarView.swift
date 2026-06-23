@@ -41,6 +41,7 @@ final class TabSidebarView: NSView {
         case 1: return "🤖"
         case 2: return TabBarView.claudeFrames[spinnerFrame % TabBarView.claudeFrames.count]
         case 3: return TabBarView.brailleFrames[spinnerFrame % TabBarView.brailleFrames.count]
+        case 4: return "⏸️"
         default: return nil
         }
     }

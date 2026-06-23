@@ -57,6 +57,26 @@ fn drawIndicatorGlyph(hdc: c.HDC, glyph: []const u8, x: c_int, cell_w: c_int, to
     _ = c.DrawTextW(hdc, &wide, @intCast(n), &r, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOCLIP);
 }
 
+/// Pause glyph (waiting-for-input): two vertical bars in the text color, drawn
+/// as filled rects so it stays crisp without depending on an emoji font.
+fn drawPauseGlyph(hdc: c.HDC, x: c_int, cell_w: c_int, top: c_int, bottom: c_int) void {
+    // Size off cell_w (= ind_px, the robot emoji's footprint), not the full text
+    // rect height, so the pause icon matches the robot's scale rather than dwarfing it.
+    const bar_h = @divTrunc(cell_w * 8, 10);
+    const h = bottom - top;
+    const by = top + @divTrunc(h - bar_h, 2);
+    const bar_w = @max(@as(c_int, 2), @divTrunc(cell_w, 6));
+    const gap = @max(@as(c_int, 2), @divTrunc(cell_w, 6));
+    const total = bar_w * 2 + gap;
+    const bx = x + @divTrunc(cell_w - total, 2);
+    const brush = c.CreateSolidBrush(c.GetTextColor(hdc));
+    defer _ = c.DeleteObject(brush);
+    var r1 = c.RECT{ .left = bx, .top = by, .right = bx + bar_w, .bottom = by + bar_h };
+    _ = c.FillRect(hdc, &r1, brush);
+    var r2 = c.RECT{ .left = bx + bar_w + gap, .top = by, .right = bx + bar_w + gap + bar_w, .bottom = by + bar_h };
+    _ = c.FillRect(hdc, &r2, brush);
+}
+
 // 🤖 (U+1F916 ROBOT FACE) as a UTF-16 surrogate pair, for the idle indicator.
 const agent_emoji_utf16 = [_]c.WCHAR{ 0xD83E, 0xDD16 };
 
@@ -1501,9 +1521,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // glyph widths never shift the tab title between frames. Idle shows a
         // color 🤖 (AlphaBlend; GDI DrawTextW can't render color emoji);
         // working shows a monochrome spinner glyph centered in the same cell.
-        const a_raw = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
-        // Waiting-for-input (4) renders like idle (the robot icon) for now.
-        const a_state: u8 = if (a_raw == 4) 1 else a_raw;
+        const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
         if (a_state != 0) {
             // Indicator cell sized near the text cap height, sitting inline.
             const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
@@ -1515,6 +1533,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
                 } else {
                     drawIndicatorGlyph(hdc, "●", text_rect.left, ind_px, text_rect.top, text_rect.bottom);
                 }
+            } else if (a_state == 4) {
+                // Waiting for user input -> pause glyph (two bars).
+                drawPauseGlyph(hdc, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
             } else {
                 const g = agentSpinnerGlyph(a_state, app.tabline_state.spinner_frame);
                 drawIndicatorGlyph(hdc, g, text_rect.left, ind_px, text_rect.top, text_rect.bottom);

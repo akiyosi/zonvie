@@ -7056,13 +7056,12 @@ final class ZonvieCore {
 
             // Indicator rendering is driven by this notification; skip it (no icon)
             // when the indicator is disabled. State is still tracked above so the
-            // completion notification keeps working independently. The waiting
-            // state (4) renders like idle (the robot icon) for now.
+            // completion notification keeps working independently. State 4 (waiting)
+            // renders a distinct pause glyph in the views.
             if ZonvieConfig.shared.tabline.agentIndicator {
-                let viewState: UInt8 = (state == 4) ? 1 : state
                 NotificationCenter.default.post(
                     name: ZonvieCore.agentStatusNotification,
-                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: viewState)
+                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
                 )
             }
         }

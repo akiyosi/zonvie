@@ -245,7 +245,7 @@ final class TabBarView: NSView {
     }
 
     // AI-agent indicator, set via on_agent_status. Per-tab state:
-    // 1=idle (agent present)→🤖, 2=working/claude→star spinner, 3=working/braille (codex).
+    // 1=idle→🤖, 2=working/claude→star spinner, 3=working/braille (codex), 4=waiting→⏸️.
     private var agentStates: [Int64: UInt8] = [:]
     private var spinnerFrame = 0
     private var spinnerTimer: Timer?
@@ -287,6 +287,7 @@ final class TabBarView: NSView {
         case 1: return "🤖"
         case 2: return Self.claudeFrames[spinnerFrame % Self.claudeFrames.count]
         case 3: return Self.brailleFrames[spinnerFrame % Self.brailleFrames.count]
+        case 4: return "⏸️"
         default: return nil
         }
     }
