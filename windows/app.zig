@@ -1003,6 +1003,8 @@ pub const TablineState = struct {
     // Agent title/summary captured at each completion (parallel to agent_completed).
     agent_completed_titles: [32][128]u8 = undefined,
     agent_completed_title_lens: [32]usize = [_]usize{0} ** 32,
+    // true = paused waiting for user input; false = finished (parallel array).
+    agent_completed_waiting: [32]bool = [_]bool{false} ** 32,
     agent_completed_count: usize = 0,
 
     // Cached color-emoji bitmap for the idle indicator (🤖), rasterized via
@@ -1078,8 +1080,8 @@ pub const TablineState = struct {
         return false;
     }
 
-    /// Queue a completed tab handle + its title (de-duplicated, capped).
-    pub fn pushCompleted(self: *TablineState, handle: i64, title: []const u8) void {
+    /// Queue a finished/waiting tab handle + its title (de-duplicated, capped).
+    pub fn pushCompleted(self: *TablineState, handle: i64, title: []const u8, waiting: bool) void {
         var i: usize = 0;
         while (i < self.agent_completed_count) : (i += 1) {
             if (self.agent_completed[i] == handle) return;
@@ -1090,6 +1092,7 @@ pub const TablineState = struct {
             const n = @min(title.len, self.agent_completed_titles[idx].len);
             @memcpy(self.agent_completed_titles[idx][0..n], title[0..n]);
             self.agent_completed_title_lens[idx] = n;
+            self.agent_completed_waiting[idx] = waiting;
             self.agent_completed_count += 1;
         }
     }

@@ -2897,8 +2897,13 @@ pub export fn WndProc(
                                     app.tabline_state.agent_completed_titles[0][0..tlen]
                                 else
                                     app.tabline_state.tabName(app.tabline_state.agent_completed[0]);
+                                const waiting = app.tabline_state.agent_completed_waiting[0];
+                                const label = if (waiting) "Needs input" else "Finished";
+                                const fallback = if (waiting) "AI agent needs input" else "AI agent finished";
                                 if (summary.len > 0) {
-                                    bmsg = std.fmt.bufPrint(&msg_buf, "Finished: {s}", .{summary}) catch "AI agent finished";
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ label, summary }) catch fallback;
+                                } else {
+                                    bmsg = fallback;
                                 }
                             } else {
                                 bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents finished", .{app.tabline_state.agent_completed_count}) catch "AI agents finished";

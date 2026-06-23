@@ -844,13 +844,35 @@ pub fn setupAgentStatus(self: *Core) void {
     if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
     const lua_code =
         \\local present, kind, last = {}, {}, {}
+        \\-- Scrape the terminal tail for a pending decision prompt (permission /
+        \\-- yes-no / numbered choice). This is how an agent "waiting for the user"
+        \\-- is told apart from "done"; the title alone can't (both look idle).
+        \\-- Conservative, English-string patterns -- fragile by nature.
+        \\local function waiting_prompt(buf)
+        \\  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, -20, -1, false)
+        \\  if not ok then return false end
+        \\  local t = table.concat(lines, '\n')
+        \\  -- Selection-menu footer (AskUserQuestion / ExitPlanMode / permission):
+        \\  -- present only while an interactive prompt is on screen, language-agnostic.
+        \\  return t:find('Enter to select') ~= nil or t:find('to navigate') ~= nil
+        \\    or t:find('Esc to cancel') ~= nil or t:find('Do you want') ~= nil
+        \\    or t:find('to proceed') ~= nil or t:find('tell Claude') ~= nil
+        \\    or t:find('%[y/n%]') ~= nil or t:find('Allow command') ~= nil
+        \\end
+        \\local function spinning(title)
+        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
+        \\  return cp >= 0x2800 and cp <= 0x28FF
+        \\end
+        \\-- classify returns 2/3 = working, 0 = gone, 1 = present-but-stopped
+        \\-- (done OR waiting -- decided later by a deferred scrape, because the
+        \\-- prompt box may not be in the buffer yet at the instant the spinner stops).
         \\local function classify(buf, title)
         \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
-        \\  local spinner = cp >= 0x2800 and cp <= 0x28FF
+        \\  local spin = cp >= 0x2800 and cp <= 0x28FF
         \\  local claudeish = cp == 0x2733 or title:find('Claude') ~= nil
         \\  if claudeish then present[buf] = true; kind[buf] = 'claude' end
-        \\  if spinner then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
-        \\  if spinner then return (kind[buf] == 'claude') and 2 or 3 end
+        \\  if spin then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
+        \\  if spin then return (kind[buf] == 'claude') and 2 or 3 end
         \\  if claudeish then return 1 end
         \\  -- Claude always shows the U+2733 marker when idle; a claude tab whose
         \\  -- title lost every agent marker means Claude exited (the shell took the
@@ -873,6 +895,22 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  last[tab] = state
         \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state, title = title or '' })
         \\end
+        \\-- The done-vs-waiting decision is deferred ~0.8s after the spinner stops,
+        \\-- so the prompt box has time to render into the buffer before we scrape.
+        \\-- pend[buf] is a token that any newer event bumps to cancel a stale decision.
+        \\local pend = {}
+        \\local function decide_stopped(buf, title)
+        \\  pend[buf] = (pend[buf] or 0) + 1
+        \\  local tok = pend[buf]
+        \\  vim.defer_fn(function()
+        \\    if pend[buf] ~= tok then return end
+        \\    if not (vim.api.nvim_buf_is_valid(buf) and present[buf]) then return end
+        \\    local ok, t = pcall(function() return vim.b[buf].term_title end)
+        \\    if ok and spinning(t or '') then return end
+        \\    local s = waiting_prompt(buf) and 4 or 1
+        \\    for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, s, title) end
+        \\  end, 800)
+        \\end
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
         \\vim.api.nvim_create_autocmd('TermRequest', {
         \\  group = grp,
@@ -883,12 +921,18 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local s = classify(ev.buf, body)
         \\    local cp0 = body ~= '' and vim.fn.char2nr(body) or 0
         \\    local title = (cp0 == 0x2733 or (cp0 >= 0x2800 and cp0 <= 0x28FF)) and (body:gsub('^[^ ]+%s*', '')) or body
-        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
+        \\    if s == 1 then
+        \\      decide_stopped(ev.buf, title)
+        \\    else
+        \\      pend[ev.buf] = (pend[ev.buf] or 0) + 1
+        \\      for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
+        \\    end
         \\  end,
         \\})
         \\vim.api.nvim_create_autocmd('TermClose', {
         \\  group = grp,
         \\  callback = function(ev)
+        \\    pend[ev.buf] = (pend[ev.buf] or 0) + 1
         \\    present[ev.buf] = nil; kind[ev.buf] = nil
         \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
         \\  end,
@@ -907,10 +951,12 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      -- Gone if the title is empty (zsh after exit), or a claude tab no
         \\      -- longer shows any agent marker (cmd.exe took the title over).
         \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
+        \\        pend[buf] = (pend[buf] or 0) + 1
         \\        present[buf] = nil; kind[buf] = nil
         \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
         \\      end
         \\    else
+        \\      pend[buf] = (pend[buf] or 0) + 1
         \\      present[buf] = nil; kind[buf] = nil
         \\    end
         \\  end
@@ -1299,8 +1345,9 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
-        // params[0] = { tab: Integer (tabpage handle), state: Integer 0..3 }
-        //   0=none, 1=idle (agent present), 2=working/claude, 3=working/braille.
+        // params[0] = { tab, state: Integer 0..4, title: String }
+        //   0=none, 1=idle (agent present, done), 2=working/claude,
+        //   3=working/braille, 4=waiting for user input (decision prompt on screen).
         // Emitted (debounced) by the auto-injected reporter. Forwarded straight
         // to the frontend, which owns the per-tab indicator + spinner animation.
         // Not coupled to grid/redraw, so a background-tab agent still updates.
@@ -1317,7 +1364,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                         have_tab = true;
                     }
                 } else if (std.mem.eql(u8, pair.key.str, "state")) {
-                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 3) {
+                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 4) {
                         state = @intCast(pair.val.int);
                     }
                 } else if (std.mem.eql(u8, pair.key.str, "title")) {

@@ -7031,10 +7031,13 @@ final class ZonvieCore {
             // zonvie's own :terminal, so the app is effectively always frontmost
             // and suppression would silence every notification. Include the tab
             // name to identify which agent finished.
+            // A working(2/3) -> idle(1) transition means the agent finished;
+            // working -> waiting(4) means it paused for a decision/input. Notify
+            // with a distinct message for each (done vs needs-action). done-vs-
+            // error can't be told apart from an interactive terminal, so both
+            // land here as "finished".
             if ZonvieConfig.shared.tabline.agentNotification,
-               (prev == 2 || prev == 3) && state == 1 {
-                // Prefer the agent's own title/summary (e.g. Claude's task topic);
-                // fall back to the tab name basename.
+               (prev == 2 || prev == 3), (state == 1 || state == 4) {
                 let summary: String
                 if !title.isEmpty {
                     summary = title
@@ -7042,17 +7045,24 @@ final class ZonvieCore {
                     let raw = self.agentTabNames[tabHandle] ?? ""
                     summary = raw.isEmpty ? "" : (raw as NSString).lastPathComponent
                 }
-                let body = summary.isEmpty ? "AI agent finished" : "Finished: \(summary)"
+                let body: String
+                if state == 4 {
+                    body = summary.isEmpty ? "AI agent needs input" : "Needs input: \(summary)"
+                } else {
+                    body = summary.isEmpty ? "AI agent finished" : "Finished: \(summary)"
+                }
                 self.showOSNotification(title: "Zonvie", body: body)
             }
 
             // Indicator rendering is driven by this notification; skip it (no icon)
             // when the indicator is disabled. State is still tracked above so the
-            // completion notification keeps working independently.
+            // completion notification keeps working independently. The waiting
+            // state (4) renders like idle (the robot icon) for now.
             if ZonvieConfig.shared.tabline.agentIndicator {
+                let viewState: UInt8 = (state == 4) ? 1 : state
                 NotificationCenter.default.post(
                     name: ZonvieCore.agentStatusNotification,
-                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
+                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: viewState)
                 )
             }
         }

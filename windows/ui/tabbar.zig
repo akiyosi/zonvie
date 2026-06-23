@@ -1501,7 +1501,9 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // glyph widths never shift the tab title between frames. Idle shows a
         // color 🤖 (AlphaBlend; GDI DrawTextW can't render color emoji);
         // working shows a monochrome spinner glyph centered in the same cell.
-        const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
+        const a_raw = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
+        // Waiting-for-input (4) renders like idle (the robot icon) for now.
+        const a_state: u8 = if (a_raw == 4) 1 else a_raw;
         if (a_state != 0) {
             // Indicator cell sized near the text cap height, sitting inline.
             const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
@@ -1810,11 +1812,11 @@ pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]con
     {
         app.mu.lock();
         defer app.mu.unlock();
-        // Detect a working(2/3) -> idle(1) transition; queue the tab handle +
-        // the agent's title so the UI thread can fire a completion notification.
+        // working(2/3) -> idle(1) = finished; working -> waiting(4) = paused for
+        // input. Queue either (with the title + which kind) for the UI thread.
         const prev = app.tabline_state.agentState(tab_handle);
-        if (app.config.tabline.agent_notification and (prev == 2 or prev == 3) and state == 1) {
-            app.tabline_state.pushCompleted(tab_handle, title[0..title_len]);
+        if (app.config.tabline.agent_notification and (prev == 2 or prev == 3) and (state == 1 or state == 4)) {
+            app.tabline_state.pushCompleted(tab_handle, title[0..title_len], state == 4);
         }
         app.tabline_state.setAgentState(tab_handle, state);
     }
