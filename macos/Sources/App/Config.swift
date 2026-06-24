@@ -110,6 +110,8 @@ struct ZonvieConfig {
         var style: String = "titlebar"       // "titlebar", "menu", "sidebar"
         var sidebarPosition: String = "left" // "left" or "right"
         var sidebarWidth: Int = 200          // 100-500 pixels
+        var agentIndicator: Bool = true      // per-tab AI-agent status icon
+        var agentNotification: Bool = true   // OS notification on agent completion
     }
 
     struct WindowsConfig {
@@ -266,6 +268,8 @@ struct ZonvieConfig {
         if let s = v.tabline_style { config.tabline.style = String(cString: s) }
         if let s = v.tabline_sidebar_position { config.tabline.sidebarPosition = String(cString: s) }
         config.tabline.sidebarWidth = Int(v.tabline_sidebar_width)
+        config.tabline.agentIndicator = v.tabline_agent_indicator
+        config.tabline.agentNotification = v.tabline_agent_notification
         config.windows.external = v.windows_external
 
         // Neovim

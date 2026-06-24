@@ -502,6 +502,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_msg_history_show = messages.onMsgHistoryShow,
         .on_tabline_update = tabline_mod.onTablineUpdate,
         .on_tabline_hide = tabline_mod.onTablineHide,
+        .on_agent_status = tabline_mod.onAgentStatus,
         .on_clipboard_get = callbacks.onClipboardGet,
         .on_clipboard_set = callbacks.onClipboardSet,
         .on_ssh_auth_prompt = callbacks.onSSHAuthPrompt,
@@ -2859,12 +2860,80 @@ pub export fn WndProc(
 
         WM_APP_TABLINE_INVALIDATE => {
             if (getApp(hwnd)) |app| {
+                // Start/stop the agent spinner animation timer to match whether
+                // any tab is currently working (idle/none need no animation).
+                const working = blk: {
+                    if (!app.config.tabline.agent_indicator) break :blk false;
+                    app.mu.lock();
+                    defer app.mu.unlock();
+                    break :blk app.tabline_state.anyAgentWorking();
+                };
+                if (working and !app.tabline_state.spinner_timer_active) {
+                    _ = c.SetTimer(hwnd, app_mod.TIMER_AGENT_SPINNER, app_mod.AGENT_SPINNER_INTERVAL_MS, null);
+                    app.tabline_state.spinner_timer_active = true;
+                } else if (!working and app.tabline_state.spinner_timer_active) {
+                    _ = c.KillTimer(hwnd, app_mod.TIMER_AGENT_SPINNER);
+                    app.tabline_state.spinner_timer_active = false;
+                }
+                // Drain queued agent completions into a per-tab OS notification.
+                // Always notify (window-level focus suppression doesn't fit
+                // running the agent inside zonvie's own terminal). Keep the queue
+                // if the tray isn't ready yet (startup race).
+                const n_completed = blk: {
+                    app.mu.lock();
+                    defer app.mu.unlock();
+                    break :blk app.tabline_state.agent_completed_count;
+                };
+                if (n_completed > 0) {
+                    if (app.tray_icon) |*tray| {
+                        var msg_buf: [320]u8 = undefined;
+                        var bmsg: []const u8 = "AI agent finished";
+                        {
+                            app.mu.lock();
+                            defer app.mu.unlock();
+                            if (app.tabline_state.agent_completed_count == 1) {
+                                const tlen = app.tabline_state.agent_completed_title_lens[0];
+                                const summary = if (tlen > 0)
+                                    app.tabline_state.agent_completed_titles[0][0..tlen]
+                                else
+                                    app.tabline_state.tabName(app.tabline_state.agent_completed[0]);
+                                const waiting = app.tabline_state.agent_completed_waiting[0];
+                                const label = if (waiting) "Needs input" else "Finished";
+                                const fallback = if (waiting) "AI agent needs input" else "AI agent finished";
+                                if (summary.len > 0) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ label, summary }) catch fallback;
+                                } else {
+                                    bmsg = fallback;
+                                }
+                            } else {
+                                // Multiple completions drained together: some may be
+                                // "waiting for input" rather than finished. Count them
+                                // so the message doesn't falsely claim work is done.
+                                const total = app.tabline_state.agent_completed_count;
+                                var waiting_n: usize = 0;
+                                var wi: usize = 0;
+                                while (wi < total) : (wi += 1) {
+                                    if (app.tabline_state.agent_completed_waiting[wi]) waiting_n += 1;
+                                }
+                                if (waiting_n == total) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents need input", .{total}) catch "AI agents need input";
+                                } else if (waiting_n > 0) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} finished, {d} need input", .{ total - waiting_n, waiting_n }) catch "AI agents finished";
+                                } else {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents finished", .{total}) catch "AI agents finished";
+                                }
+                            }
+                            app.tabline_state.agent_completed_count = 0;
+                        }
+                        tray.showBalloon("Zonvie", bmsg);
+                    }
+                    // else: tray not ready — keep the queue for a later drain.
+                }
                 // Tabline is rendered as D3D11 texture via renderTablineToD3D
                 // Invalidate main window to trigger WM_PAINT which calls renderTablineToD3D
                 _ = c.InvalidateRect(hwnd, null, 0);
                 // Force immediate repaint so tabline updates without waiting for next message
                 _ = c.UpdateWindow(hwnd);
-                _ = app;
             }
             return 0;
         },
@@ -3023,6 +3092,22 @@ pub export fn WndProc(
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
                 if (getApp(hwnd)) |app| {
                     input.handleCursorBlinkTimer(hwnd, app);
+                }
+            } else if (wParam == app_mod.TIMER_AGENT_SPINNER) {
+                // Advance the AI-agent spinner frame and repaint only the tabline.
+                // Invalidating the whole window would re-present the entire grid at
+                // the spinner rate (~8 Hz) even when the content is static; bound
+                // the dirty region to the tabline strip instead (matches the hover
+                // redraw path).
+                if (getApp(hwnd)) |app| {
+                    app.tabline_state.spinner_frame +%= 1;
+                    var tabline_rect: c.RECT = .{
+                        .left = 0,
+                        .top = 0,
+                        .right = 4096,
+                        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
+                    };
+                    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
                 // Continuous-redraw tick for animated custom shaders.

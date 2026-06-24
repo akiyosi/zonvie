@@ -613,6 +613,14 @@ typedef void (*zonvie_on_tabline_update_fn)(
 /* Called when tabline should be hidden. */
 typedef void (*zonvie_on_tabline_hide_fn)(void* ctx);
 
+/* AI-agent work state for a tabpage (from the zonvie_agent_status RPC
+   notification). state: 0=none, 1=idle (agent present, done), 2=working/claude,
+   3=working/braille (codex & generic), 4=waiting for user input (a decision
+   prompt is on screen). The frontend renders/animates the per-tab indicator
+   from this; fired immediately on change (not coupled to redraw, so a
+   background-tab agent still updates). */
+typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state, const char* title, size_t title_len);
+
 /* --- Clipboard callbacks --- */
 
 /* Called to get clipboard content.
@@ -768,6 +776,9 @@ typedef struct zonvie_callbacks {
     /* Connect UI event observer (informational; core handles reconnect).
        Appended after on_restart for the same ABI-compat reason. */
     zonvie_on_connect_fn on_connect;
+
+    /* AI-agent work state per tab. Appended at the end for ABI compat. */
+    zonvie_on_agent_status_fn on_agent_status;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1297,6 +1308,8 @@ typedef struct zonvie_config_values {
     const char* tabline_style;
     const char* tabline_sidebar_position;
     int32_t tabline_sidebar_width;
+    bool tabline_agent_indicator;
+    bool tabline_agent_notification;
     bool windows_external;
     // neovim
     const char* neovim_path;

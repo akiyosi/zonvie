@@ -525,6 +525,12 @@ pub const Callbacks = extern struct {
     // that don't fill this field get a null callback and lose the
     // notification — the reconnect itself still happens transparently.
     on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
+
+    // AI-agent work status per tab. Appended at the end for ABI compat (see
+    // on_restart note). state: 0=none, 1=idle (agent present, done),
+    // 2=working/claude, 3=working/braille (codex & generic),
+    // 4=waiting for user input (a decision prompt is on screen).
+    on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 };
 
 
@@ -628,6 +634,7 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // ext_tabline callbacks
         .on_tabline_update = box.cb.on_tabline_update,
         .on_tabline_hide = box.cb.on_tabline_hide,
+        .on_agent_status = box.cb.on_agent_status,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
@@ -1516,6 +1523,8 @@ pub const zonvie_config_values = extern struct {
     tabline_style: [*:0]const u8 = "titlebar",
     tabline_sidebar_position: [*:0]const u8 = "left",
     tabline_sidebar_width: i32 = 200,
+    tabline_agent_indicator: bool = true,
+    tabline_agent_notification: bool = true,
     windows_external: bool = false,
     // neovim
     neovim_path: [*:0]const u8 = "nvim",
@@ -1627,6 +1636,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .tabline_style = dupeZForC(alloc, cfg.tabline.style, "titlebar"),
         .tabline_sidebar_position = dupeZForC(alloc, cfg.tabline.sidebar_position, "left"),
         .tabline_sidebar_width = @intCast(cfg.tabline.sidebar_width),
+        .tabline_agent_indicator = cfg.tabline.agent_indicator,
+        .tabline_agent_notification = cfg.tabline.agent_notification,
         .windows_external = cfg.windows.external,
         // neovim
         .neovim_path = dupeZForC(alloc, cfg.neovim.path, "nvim"),

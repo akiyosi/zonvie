@@ -16,20 +16,186 @@ const TabEntry = app_mod.TabEntry;
 /// Returns the length of the display name written to out_buf.
 fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
     if (tab.name_len > 0) {
-        var last_sep: usize = 0;
-        for (0..tab.name_len) |j| {
-            if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                last_sep = j + 1;
-            }
-        }
-        const display_len = tab.name_len - last_sep;
-        @memcpy(out_buf[0..display_len], tab.name[last_sep..tab.name_len]);
-        return display_len;
+        const display = app_mod.baseName(tab.name[0..tab.name_len]);
+        @memcpy(out_buf[0..display.len], display);
+        return display.len;
     } else {
         const no_name = "[No Name]";
         @memcpy(out_buf[0..no_name.len], no_name);
         return no_name.len;
     }
+}
+
+// AI-agent spinner glyphs (single glyph, no trailing space; drawn centered in a
+// fixed-width indicator cell). Claude's official thinking sequence is
+// · ✢ ✳ ✶ ✻ ✽ (120ms/frame); Codex and generic agents animate the standard
+// Braille spinner. All monochrome (GDI-rendered).
+const agent_claude_frames = [_][]const u8{ "·", "✢", "✳", "✶", "✻", "✽" };
+const agent_braille_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+/// Working spinner glyph for a tab state+frame ("" for non-working states).
+fn agentSpinnerGlyph(state: u8, frame: u32) []const u8 {
+    return switch (state) {
+        2 => agent_claude_frames[frame % agent_claude_frames.len],
+        3 => agent_braille_frames[frame % agent_braille_frames.len],
+        else => "",
+    };
+}
+
+/// Draw a single monochrome indicator glyph centered in a fixed-width cell
+/// [x, x+cell_w) so the title (drawn after the cell) never shifts per frame.
+fn drawIndicatorGlyph(hdc: c.HDC, glyph: []const u8, x: c_int, cell_w: c_int, top: c_int, bottom: c_int) void {
+    var wide: [8]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, glyph) catch return;
+    var r = c.RECT{ .left = x, .top = top, .right = x + cell_w, .bottom = bottom };
+    _ = c.DrawTextW(hdc, &wide, @intCast(n), &r, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_NOCLIP);
+}
+
+/// Pause glyph (waiting-for-input): two vertical bars in the text color, drawn
+/// as filled rects so it stays crisp without depending on an emoji font.
+fn drawPauseGlyph(hdc: c.HDC, x: c_int, cell_w: c_int, top: c_int, bottom: c_int) void {
+    // Size off cell_w (= ind_px, the robot emoji's footprint), not the full text
+    // rect height, so the pause icon matches the robot's scale rather than dwarfing it.
+    const bar_h = @divTrunc(cell_w * 8, 10);
+    const h = bottom - top;
+    const by = top + @divTrunc(h - bar_h, 2);
+    const bar_w = @max(@as(c_int, 2), @divTrunc(cell_w, 6));
+    const gap = @max(@as(c_int, 2), @divTrunc(cell_w, 6));
+    const total = bar_w * 2 + gap;
+    const bx = x + @divTrunc(cell_w - total, 2);
+    const brush = c.CreateSolidBrush(c.GetTextColor(hdc));
+    defer _ = c.DeleteObject(brush);
+    var r1 = c.RECT{ .left = bx, .top = by, .right = bx + bar_w, .bottom = by + bar_h };
+    _ = c.FillRect(hdc, &r1, brush);
+    var r2 = c.RECT{ .left = bx + bar_w + gap, .top = by, .right = bx + bar_w + gap + bar_w, .bottom = by + bar_h };
+    _ = c.FillRect(hdc, &r2, brush);
+}
+
+// 🤖 (U+1F916 ROBOT FACE) as a UTF-16 surrogate pair, for the idle indicator.
+const agent_emoji_utf16 = [_]c.WCHAR{ 0xD83E, 0xDD16 };
+
+/// Rasterize 🤖 in color into a px×px premultiplied-BGRA DIBSection via D2D and
+/// return the HBITMAP (caller owns it; freed by ensureAgentEmoji on resize /
+/// App deinit). GDI DrawTextW cannot render color emoji, so we reuse the
+/// renderer's proven CreateDCRenderTarget + DrawTextW(ENABLE_COLOR_FONT) path.
+/// Premultiplied alpha matches AlphaBlend(AC_SRC_ALPHA).
+fn rasterizeAgentEmoji(d2d_factory: *c.ID2D1Factory, dwrite_factory: *c.IDWriteFactory, px: i32) ?c.HBITMAP {
+    if (px <= 0) return null;
+
+    const hdc = c.CreateCompatibleDC(null);
+    if (hdc == null) return null;
+    defer _ = c.DeleteDC(hdc);
+
+    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = px;
+    bmi.bmiHeader.biHeight = -px; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var bits: ?*anyopaque = null;
+    const hbm = c.CreateDIBSection(hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
+    if (hbm == null or bits == null) return null;
+    _ = c.SelectObject(hdc, hbm);
+
+    const ok = blk: {
+        const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
+            .type = c.D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            .pixelFormat = .{ .format = c.DXGI_FORMAT_B8G8R8A8_UNORM, .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED },
+            .dpiX = 0,
+            .dpiY = 0,
+            .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
+            .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        var dc_rt: ?*c.ID2D1DCRenderTarget = null;
+        const create_fn = d2d_factory.lpVtbl.*.CreateDCRenderTarget orelse break :blk false;
+        if (create_fn(d2d_factory, &rtp, &dc_rt) != 0 or dc_rt == null) break :blk false;
+        defer {
+            const u: *c.IUnknown = @ptrCast(dc_rt.?);
+            _ = u.lpVtbl.*.Release.?(u);
+        }
+
+        var bind_rect: c.RECT = .{ .left = 0, .top = 0, .right = px, .bottom = px };
+        const bind_fn = dc_rt.?.lpVtbl.*.BindDC orelse break :blk false;
+        if (bind_fn(dc_rt.?, hdc, &bind_rect) != 0) break :blk false;
+
+        const emoji_font: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+        const font_size: f32 = @as(f32, @floatFromInt(px)) * 0.78;
+        var fmt: ?*c.IDWriteTextFormat = null;
+        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse break :blk false;
+        if (create_tf(dwrite_factory, emoji_font, null, c.DWRITE_FONT_WEIGHT_NORMAL, c.DWRITE_FONT_STYLE_NORMAL, c.DWRITE_FONT_STRETCH_NORMAL, font_size, std.unicode.utf8ToUtf16LeStringLiteral("en-us"), &fmt) != 0 or fmt == null) break :blk false;
+        defer {
+            const u: *c.IUnknown = @ptrCast(fmt.?);
+            _ = u.lpVtbl.*.Release.?(u);
+        }
+        if (fmt.?.lpVtbl.*.SetTextAlignment) |f| _ = f(fmt.?, c.DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (fmt.?.lpVtbl.*.SetParagraphAlignment) |f| _ = f(fmt.?, c.DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        const rt_base: *c.ID2D1RenderTarget = @ptrCast(dc_rt.?);
+        const vtbl = rt_base.lpVtbl.*;
+        if (vtbl.BeginDraw) |f| f(rt_base);
+        if (vtbl.Clear) |f| {
+            const transparent = c.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 0 };
+            f(rt_base, &transparent);
+        }
+        var brush: ?*c.ID2D1SolidColorBrush = null;
+        if (vtbl.CreateSolidColorBrush) |f| {
+            const white = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
+            _ = f(rt_base, &white, null, &brush);
+        }
+        defer {
+            if (brush) |b| {
+                const u: *c.IUnknown = @ptrCast(b);
+                _ = u.lpVtbl.*.Release.?(u);
+            }
+        }
+        if (brush) |b| {
+            const layout = c.D2D1_RECT_F{ .left = 0, .top = 0, .right = @floatFromInt(px), .bottom = @floatFromInt(px) };
+            if (vtbl.DrawTextW) |draw_fn| {
+                draw_fn(rt_base, &agent_emoji_utf16, agent_emoji_utf16.len, fmt.?, &layout, @ptrCast(b), c.D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, c.DWRITE_MEASURING_MODE_NATURAL);
+            }
+        }
+        var t1: u64 = 0;
+        var t2: u64 = 0;
+        if (vtbl.EndDraw) |f| {
+            if (f(rt_base, &t1, &t2) != 0) break :blk false;
+        }
+        break :blk true;
+    };
+
+    if (!ok) {
+        _ = c.DeleteObject(hbm);
+        return null;
+    }
+    return hbm;
+}
+
+/// Cached 🤖 bitmap at the requested square size; re-rasterizes on size change.
+fn ensureAgentEmoji(app: *App, px: i32) ?c.HBITMAP {
+    if (app.tabline_state.agent_emoji_hbm) |hbm| {
+        if (app.tabline_state.agent_emoji_px == px) return hbm;
+        _ = c.DeleteObject(hbm);
+        app.tabline_state.agent_emoji_hbm = null;
+    }
+    const r = if (app.atlas) |*rr| rr else return null;
+    const d2d = r.d2d_factory orelse return null;
+    const dw = r.dwrite_factory orelse return null;
+    const hbm = rasterizeAgentEmoji(d2d, dw, px) orelse return null;
+    app.tabline_state.agent_emoji_hbm = hbm;
+    app.tabline_state.agent_emoji_px = px;
+    return hbm;
+}
+
+/// AlphaBlend the cached premultiplied 🤖 bitmap onto the tabline DC.
+fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void {
+    const mem = c.CreateCompatibleDC(dst_hdc);
+    if (mem == null) return;
+    defer _ = c.DeleteDC(mem);
+    const old = c.SelectObject(mem, hbm);
+    defer _ = c.SelectObject(mem, old);
+    const bf = c.BLENDFUNCTION{ .BlendOp = c.AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = c.AC_SRC_ALPHA };
+    _ = c.AlphaBlend(dst_hdc, x, y, px, px, mem, 0, 0, px, px, bf);
 }
 
 /// Calculate the Neovim :tabmove position from a drop target index.
@@ -1068,17 +1234,9 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                         if (drag_idx < app.tabline_state.tab_count) {
                             const tab = &app.tabline_state.tabs[drag_idx];
                             if (tab.name_len > 0) {
-                                // Get just the filename
-                                var display_name: []const u8 = tab.name[0..tab.name_len];
-                                var last_sep: usize = 0;
-                                for (display_name, 0..) |ch, i| {
-                                    if (ch == '/' or ch == '\\') {
-                                        last_sep = i + 1;
-                                    }
-                                }
-                                if (last_sep < display_name.len) {
-                                    display_name = display_name[last_sep..];
-                                }
+                                // Display name (basename, preserving the agent-status glyph).
+                                var name_buf: [256]u8 = undefined;
+                                const display_name = name_buf[0..extractTabDisplayName(tab, &name_buf)];
 
                                 // Draw text
                                 var text_rect = rect;
@@ -1353,13 +1511,39 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             .bottom = bar_height,
         };
 
-        // Convert name to display
-        var display_name: [256]u8 = undefined;
-        const display_len = extractTabDisplayName(tab, &display_name);
+        // AI-agent indicator drawn in a FIXED-WIDTH cell so varying spinner
+        // glyph widths never shift the tab title between frames. Idle shows a
+        // color 🤖 (AlphaBlend; GDI DrawTextW can't render color emoji);
+        // working shows a monochrome spinner glyph centered in the same cell.
+        const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
+        if (a_state != 0) {
+            // Indicator cell sized near the text cap height, sitting inline.
+            const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
+            const cell_w = ind_px + top_padding; // glyph box + gap, reserved
+            if (a_state == 1) {
+                if (if (ind_px > 0) ensureAgentEmoji(app, ind_px) else null) |hbm| {
+                    const ey = @divTrunc(bar_height - ind_px, 2);
+                    blendAgentEmoji(hdc, hbm, text_rect.left, ey, ind_px);
+                } else {
+                    drawIndicatorGlyph(hdc, "●", text_rect.left, ind_px, text_rect.top, text_rect.bottom);
+                }
+            } else if (a_state == 4) {
+                // Waiting for user input -> pause glyph (two bars).
+                drawPauseGlyph(hdc, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
+            } else {
+                const g = agentSpinnerGlyph(a_state, app.tabline_state.spinner_frame);
+                drawIndicatorGlyph(hdc, g, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
+            }
+            text_rect.left += cell_w; // anchor the title past the fixed cell
+        }
+
+        // Display name = basename only (indicator drawn separately above).
+        var base_buf: [256]u8 = undefined;
+        const base_len = extractTabDisplayName(tab, &base_buf);
 
         // Convert to wide string
-        var wide_buf: [256]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
+        var wide_buf: [320]u16 = undefined;
+        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, base_buf[0..base_len]) catch 0;
 
         _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
 
@@ -1629,6 +1813,28 @@ pub fn onTablineUpdate(
 
     // Request repaint via PostMessage to UI thread
     // Tabline is now drawn on parent window, so invalidate parent
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+    }
+}
+
+// AI-agent work state for a tab (from on_agent_status). Stored per handle;
+// the spinner timer + paint (drawTablineContent) render the indicator. Fired
+// on the core RPC thread, so update under app.mu then invalidate on the UI
+// thread (the WM_APP_TABLINE_INVALIDATE handler also reconciles the timer).
+pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    {
+        app.mu.lock();
+        defer app.mu.unlock();
+        // working(2/3) -> idle(1) = finished; working -> waiting(4) = paused for
+        // input. Queue either (with the title + which kind) for the UI thread.
+        const prev = app.tabline_state.agentState(tab_handle);
+        if (app.config.tabline.agent_notification and (prev == 2 or prev == 3) and (state == 1 or state == 4)) {
+            app.tabline_state.pushCompleted(tab_handle, title[0..title_len], state == 4);
+        }
+        app.tabline_state.setAgentState(tab_handle, state);
+    }
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
     }

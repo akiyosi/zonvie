@@ -830,6 +830,146 @@ pub fn setupClipboard(self: *Core) void {
     self.log.write("clipboard setup done (via nvim_list_chans lookup)\n", .{});
 }
 
+/// Inject the AI-agent tab-status reporter into the connected Neovim so the
+/// feature needs no user-side config. Classifies each terminal's OSC title into
+/// a per-tabpage state and reports it via the zonvie_agent_status notification:
+///   0=none  1=idle (agent present)  2=working/claude  3=working/braille(codex).
+/// Agent presence + kind are latched per buffer (claude is recognized by its
+/// '✳' U+2733 idle marker or "Claude" in the title; anything else with a Braille
+/// spinner is treated as codex/generic). The frontend renders/animates from the
+/// state. augroup clear=true keeps re-injection idempotent. Fire-and-forget.
+pub fn setupAgentStatus(self: *Core) void {
+    // Skip the reporter entirely when both the indicator and the completion
+    // notification are disabled -- nothing would consume the status updates.
+    if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
+    const lua_code =
+        \\local present, kind, last = {}, {}, {}
+        \\-- Scrape the terminal tail for a pending decision prompt (permission /
+        \\-- yes-no / numbered choice). This is how an agent "waiting for the user"
+        \\-- is told apart from "done"; the title alone can't (both look idle).
+        \\-- Conservative, English-string patterns -- fragile by nature.
+        \\local function waiting_prompt(buf)
+        \\  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, -20, -1, false)
+        \\  if not ok then return false end
+        \\  local t = table.concat(lines, '\n')
+        \\  -- Selection-menu footer (AskUserQuestion / ExitPlanMode / permission):
+        \\  -- present only while an interactive prompt is on screen, language-agnostic.
+        \\  return t:find('Enter to select') ~= nil or t:find('to navigate') ~= nil
+        \\    or t:find('Esc to cancel') ~= nil or t:find('Do you want') ~= nil
+        \\    or t:find('to proceed') ~= nil or t:find('tell Claude') ~= nil
+        \\    or t:find('%[y/n%]') ~= nil or t:find('Allow command') ~= nil
+        \\end
+        \\local function spinning(title)
+        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
+        \\  return cp >= 0x2800 and cp <= 0x28FF
+        \\end
+        \\-- classify returns 2/3 = working, 0 = gone, 1 = present-but-stopped
+        \\-- (done OR waiting -- decided later by a deferred scrape, because the
+        \\-- prompt box may not be in the buffer yet at the instant the spinner stops).
+        \\local function classify(buf, title)
+        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
+        \\  local spin = cp >= 0x2800 and cp <= 0x28FF
+        \\  local claudeish = cp == 0x2733 or title:find('Claude') ~= nil
+        \\  if claudeish then present[buf] = true; kind[buf] = 'claude' end
+        \\  if spin then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
+        \\  if spin then return (kind[buf] == 'claude') and 2 or 3 end
+        \\  if claudeish then return 1 end
+        \\  -- Claude always shows the U+2733 marker when idle; a claude tab whose
+        \\  -- title lost every agent marker means Claude exited (the shell took the
+        \\  -- title over, e.g. cmd.exe) -> clear so the robot indicator goes away.
+        \\  if kind[buf] == 'claude' then present[buf] = nil; kind[buf] = nil; return 0 end
+        \\  if present[buf] then return 1 end
+        \\  return 0
+        \\end
+        \\local function tabs_for_buf(buf)
+        \\  local out = {}
+        \\  for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+        \\    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(t)) do
+        \\      if vim.api.nvim_win_get_buf(w) == buf then out[#out+1] = t; break end
+        \\    end
+        \\  end
+        \\  return out
+        \\end
+        \\local function report(tab, state, title)
+        \\  if last[tab] == state then return end
+        \\  last[tab] = state
+        \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state, title = title or '' })
+        \\end
+        \\-- The done-vs-waiting decision is deferred ~0.8s after the spinner stops,
+        \\-- so the prompt box has time to render into the buffer before we scrape.
+        \\-- pend[buf] is a token that any newer event bumps to cancel a stale decision.
+        \\local pend = {}
+        \\local function decide_stopped(buf, title)
+        \\  pend[buf] = (pend[buf] or 0) + 1
+        \\  local tok = pend[buf]
+        \\  vim.defer_fn(function()
+        \\    if pend[buf] ~= tok then return end
+        \\    if not (vim.api.nvim_buf_is_valid(buf) and present[buf]) then return end
+        \\    local ok, t = pcall(function() return vim.b[buf].term_title end)
+        \\    if ok and spinning(t or '') then return end
+        \\    local s = waiting_prompt(buf) and 4 or 1
+        \\    for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, s, title) end
+        \\  end, 800)
+        \\end
+        \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
+        \\vim.api.nvim_create_autocmd('TermRequest', {
+        \\  group = grp,
+        \\  callback = function(ev)
+        \\    local seq = ev.data and ev.data.sequence or ''
+        \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
+        \\    if not body then return end
+        \\    local s = classify(ev.buf, body)
+        \\    local cp0 = body ~= '' and vim.fn.char2nr(body) or 0
+        \\    local title = (cp0 == 0x2733 or (cp0 >= 0x2800 and cp0 <= 0x28FF)) and (body:gsub('^[^ ]+%s*', '')) or body
+        \\    if s == 1 then
+        \\      decide_stopped(ev.buf, title)
+        \\    else
+        \\      pend[ev.buf] = (pend[ev.buf] or 0) + 1
+        \\      for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
+        \\    end
+        \\  end,
+        \\})
+        \\vim.api.nvim_create_autocmd('TermClose', {
+        \\  group = grp,
+        \\  callback = function(ev)
+        \\    pend[ev.buf] = (pend[ev.buf] or 0) + 1
+        \\    present[ev.buf] = nil; kind[ev.buf] = nil
+        \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
+        \\  end,
+        \\})
+        \\-- Agent exit (claude/codex quit while the shell stays open) clears the
+        \\-- terminal title to "" but fires NO TermRequest, so poll present
+        \\-- buffers and drop the indicator when the title goes empty.
+        \\if _G.__zonvie_agent_timer then pcall(vim.fn.timer_stop, _G.__zonvie_agent_timer) end
+        \\_G.__zonvie_agent_timer = vim.fn.timer_start(500, function()
+        \\  for buf in pairs(present) do
+        \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
+        \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
+        \\      t = (ok and t) or ''
+        \\      local cp = t ~= '' and vim.fn.char2nr(t) or 0
+        \\      local agentish = cp == 0x2733 or (cp >= 0x2800 and cp <= 0x28FF) or t:find('Claude') ~= nil
+        \\      -- Gone if the title is empty (zsh after exit), or a claude tab no
+        \\      -- longer shows any agent marker (cmd.exe took the title over).
+        \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
+        \\        pend[buf] = (pend[buf] or 0) + 1
+        \\        present[buf] = nil; kind[buf] = nil
+        \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
+        \\      end
+        \\    else
+        \\      pend[buf] = (pend[buf] or 0) + 1
+        \\      present[buf] = nil; kind[buf] = nil
+        \\    end
+        \\  end
+        \\end, { ['repeat'] = -1 })
+    ;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupAgentStatus: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+    self.log.write("agent status reporter installed\n", .{});
+}
+
 pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
     if (top.len < 3) return;
     if (top[1] != .str or top[2] != .arr) return;
@@ -1202,6 +1342,43 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 else if (std.mem.eql(u8, val_str, "only_right")) 3
                 else return;  // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
+        // Custom RPC notification: AI-agent work state for one tabpage.
+        // params[0] = { tab, state: Integer 0..4, title: String }
+        //   0=none, 1=idle (agent present, done), 2=working/claude,
+        //   3=working/braille, 4=waiting for user input (decision prompt on screen).
+        // Emitted (debounced) by the auto-injected reporter. Forwarded straight
+        // to the frontend, which owns the per-tab indicator + spinner animation.
+        // Not coupled to grid/redraw, so a background-tab agent still updates.
+        if (params.len > 0 and params[0] == .map) {
+            var tab_handle: i64 = 0;
+            var have_tab = false;
+            var state: u8 = 0;
+            var have_state = false;
+            var title: []const u8 = "";
+            for (params[0].map) |pair| {
+                if (pair.key != .str) continue;
+                if (std.mem.eql(u8, pair.key.str, "tab")) {
+                    if (pair.val == .int) {
+                        tab_handle = pair.val.int;
+                        have_tab = true;
+                    }
+                } else if (std.mem.eql(u8, pair.key.str, "state")) {
+                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 4) {
+                        state = @intCast(pair.val.int);
+                        have_state = true;
+                    }
+                } else if (std.mem.eql(u8, pair.key.str, "title")) {
+                    if (pair.val == .str) title = pair.val.str;
+                }
+            }
+            // Require an explicit, valid state. A notification with only `tab`
+            // (state missing or out of range) must NOT fire with state=0, which
+            // would erase a working tab's indicator on malformed input.
+            if (have_tab and have_state) {
+                if (self.cb.on_agent_status) |cb| cb(self.ctx, tab_handle, state, title.ptr, title.len);
+            }
         }
     }
 }
@@ -1701,6 +1878,9 @@ pub fn runLoop(self: *Core) void {
         // Discover our channel_id via vim.api.nvim_list_chans() and install
         // the clipboard provider hooks.
         setupClipboard(self);
+
+        // Install the AI-agent tab-status reporter (zero user-side config).
+        setupAgentStatus(self);
 
         if (self.pending_resize_valid) {
             const pr2 = self.pending_resize_rows;

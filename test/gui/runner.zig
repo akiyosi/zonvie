@@ -103,6 +103,16 @@ test "gui:visual_baseline" {
     }
 }
 
+test "gui:visual_agent_status" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/agent_status.zig").run(testing.allocator);
+    } else {
+        std.debug.print("[gui] skipped: screenshot capture not implemented on this host\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_split" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();

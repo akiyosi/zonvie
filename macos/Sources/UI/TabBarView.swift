@@ -226,7 +226,6 @@ final class TabBarView: NSView {
             floatPath.stroke()
 
             // Draw tab name
-            let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
             let font = NSFont.systemFont(ofSize: 12, weight: .medium)
             let attributes: [NSAttributedString.Key: Any] = [
                 .foregroundColor: NSColor.labelColor,
@@ -238,9 +237,77 @@ final class TabBarView: NSView {
                 width: tabWidth - tabPadding * 2,
                 height: 16
             )
-            displayName.draw(in: textRect, withAttributes: attributes)
+            let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: textRect, font: font, color: NSColor.labelColor)
+            let labelRect = NSRect(x: textRect.minX + indicatorW, y: textRect.minY,
+                                   width: textRect.width - indicatorW, height: textRect.height)
+            Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
         }
     }
+
+    // AI-agent indicator, set via on_agent_status. Per-tab state:
+    // 1=idle→🤖, 2=working/claude→star spinner, 3=working/braille (codex), 4=waiting→⏸️.
+    private var agentStates: [Int64: UInt8] = [:]
+    private var spinnerFrame = 0
+    private var spinnerTimer: Timer?
+
+    // Claude Code's official thinking-icon sequence (120ms/frame), per the
+    // reverse-engineered default frames: · ✢ ✳ ✶ ✻ ✽.
+    static let claudeFrames = ["·", "✢", "✳", "✶", "✻", "✽"]
+    // Standard Braille spinner — Codex (and generic agents) animate this.
+    static let brailleFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    /// Beautified tab label (basename of the term:// or file path).
+    static func baseLabel(_ name: String) -> String {
+        return name.isEmpty ? "[No Name]" : (name as NSString).lastPathComponent
+    }
+
+    /// Update one tab's agent state; drives the animation timer + repaint.
+    func setAgentState(handle: Int64, state: UInt8) {
+        if state == 0 { agentStates.removeValue(forKey: handle) } else { agentStates[handle] = state }
+        let anyWorking = agentStates.values.contains { $0 == 2 || $0 == 3 }
+        if anyWorking, spinnerTimer == nil {
+            spinnerTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+                self?.spinnerFrame &+= 1
+                self?.needsDisplay = true
+            }
+        } else if !anyWorking, let t = spinnerTimer {
+            t.invalidate()
+            spinnerTimer = nil
+        }
+        needsDisplay = true
+    }
+
+    // Fixed width reserved for the agent indicator, so that varying spinner
+    // glyph widths don't shift the tab title left/right between frames.
+    static let agentIndicatorWidth: CGFloat = 18
+
+    /// Single agent indicator glyph for a tab (no trailing space), or nil.
+    func agentGlyph(forHandle handle: Int64) -> String? {
+        switch agentStates[handle] {
+        case 1: return "🤖"
+        case 2: return Self.claudeFrames[spinnerFrame % Self.claudeFrames.count]
+        case 3: return Self.brailleFrames[spinnerFrame % Self.brailleFrames.count]
+        case 4: return "⏸️"
+        default: return nil
+        }
+    }
+
+    /// Draw the agent indicator centered in a fixed-width box at the left edge
+    /// of `rect`, and return the x-offset the title should start at (0 if none).
+    /// Centering in a fixed box keeps the title anchored across spinner frames.
+    func drawAgentIndicator(forHandle handle: Int64, in rect: NSRect, font: NSFont, color: NSColor) -> CGFloat {
+        guard let glyph = agentGlyph(forHandle: handle) else { return 0 }
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: color, .paragraphStyle: para,
+        ]
+        let box = NSRect(x: rect.minX, y: rect.minY, width: Self.agentIndicatorWidth, height: rect.height)
+        glyph.draw(in: box, withAttributes: attrs)
+        return Self.agentIndicatorWidth
+    }
+
+    deinit { spinnerTimer?.invalidate() }
 
     // Tab border color for subtle shadow effect
     private var tabBorderColor: NSColor {
@@ -293,8 +360,10 @@ final class TabBarView: NSView {
             .paragraphStyle: paragraphStyle
         ]
 
-        let displayName = tab.name.isEmpty ? "[No Name]" : (tab.name as NSString).lastPathComponent
-        displayName.draw(in: titleRect, withAttributes: attributes)
+        let indicatorW = drawAgentIndicator(forHandle: tab.handle, in: titleRect, font: font, color: textColor)
+        let labelRect = NSRect(x: titleRect.minX + indicatorW, y: titleRect.minY,
+                               width: titleRect.width - indicatorW, height: titleRect.height)
+        Self.baseLabel(tab.name).draw(in: labelRect, withAttributes: attributes)
 
         // Close button (X) - show on selected or hovered tabs
         if isSelected || isHovered {

@@ -181,6 +181,9 @@ pub fn build(b: *std.Build) !void {
 
         // --- Timer resolution for reducing scheduler quantum ---
         win_exe.linkSystemLibrary("winmm");
+
+        // --- AlphaBlend (color-emoji tab indicator composite) ---
+        win_exe.linkSystemLibrary("msimg32");
     }
 
     const install_win = b.addInstallArtifact(win_exe, .{

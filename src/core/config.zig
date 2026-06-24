@@ -263,6 +263,9 @@ pub const Config = struct {
         style: []const u8 = "titlebar",
         sidebar_position: []const u8 = "left",
         sidebar_width: u32 = 200,
+        // AI-agent status: per-tab indicator icon and completion OS notification.
+        agent_indicator: bool = true,
+        agent_notification: bool = true,
     };
 
     pub const WindowsConfig = struct {
@@ -507,6 +510,8 @@ pub const Config = struct {
                 }
             }
             if (t.sidebar_width) |w| self.tabline.sidebar_width = @max(100, @min(500, w));
+            if (t.agent_indicator) |b| self.tabline.agent_indicator = b;
+            if (t.agent_notification) |b| self.tabline.agent_notification = b;
         }
 
         if (cfg.windows) |w| {
@@ -842,6 +847,8 @@ const TomlTabline = struct {
     style: ?[]const u8 = null,
     sidebar_position: ?[]const u8 = null,
     sidebar_width: ?u32 = null,
+    agent_indicator: ?bool = null,
+    agent_notification: ?bool = null,
 };
 
 const TomlWindows = struct {

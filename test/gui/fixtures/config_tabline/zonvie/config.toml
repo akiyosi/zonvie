@@ -1,0 +1,5 @@
+# ext_tabline enabled (titlebar/Chrome-style tabs) for the agent-status
+# visual scenario.
+[tabline]
+external = true
+style = "titlebar"

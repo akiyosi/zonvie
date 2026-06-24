@@ -89,6 +89,31 @@ pub const MsgHistoryEntry = core.MsgHistoryEntry;
 pub const zonvie_msg_event = core.zonvie_msg_event;
 
 // =========================================================================
+// Small shared text helpers
+// =========================================================================
+
+/// Length of the longest prefix of `s` that fits in `max_bytes` without
+/// splitting a UTF-8 codepoint. Used to truncate user text before copying into
+/// a fixed buffer so later UTF-16 conversion can't see a partial codepoint.
+pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
+    var n = @min(s.len, max_bytes);
+    // Back up off any UTF-8 continuation byte (0b10xxxxxx) so we end on a
+    // codepoint boundary.
+    while (n > 0 and (s[n - 1] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+/// Basename of a path-like name: the part after the last '/' or '\\'.
+/// Returns the whole string when there is no separator.
+pub fn baseName(name: []const u8) []const u8 {
+    var last: usize = 0;
+    for (name, 0..) |ch, j| {
+        if (ch == '/' or ch == '\\') last = j + 1;
+    }
+    return name[last..];
+}
+
+// =========================================================================
 // Custom window messages (WM_APP + N)
 // =========================================================================
 
@@ -170,6 +195,10 @@ pub const TIMER_TRAY_INIT: c.UINT_PTR = 9;
 pub const TIMER_CUSTOM_SHADER_ANIM: c.UINT_PTR = 11;
 /// ~60Hz cadence for TIMER_CUSTOM_SHADER_ANIM.
 pub const CUSTOM_SHADER_ANIM_INTERVAL_MS: c.UINT = 16;
+/// AI-agent tab spinner animation timer (only runs while a tab is working).
+pub const TIMER_AGENT_SPINNER: c.UINT_PTR = 12;
+/// Frame cadence for the agent spinner (matches Claude Code's 120ms).
+pub const AGENT_SPINNER_INTERVAL_MS: c.UINT = 120;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)
@@ -844,23 +873,21 @@ pub const TrayIcon = struct {
         self.nid.uFlags = c.NIF_INFO;
         self.nid.dwInfoFlags = c.NIIF_INFO;
 
-        // Copy title to szInfoTitle (max 63 chars + null)
-        var title_buf: [64]u16 = undefined;
-        const title_len = @min(title.len, 63);
-        for (0..title_len) |i| {
-            title_buf[i] = title[i];
-        }
-        title_buf[title_len] = 0;
-        @memcpy(self.nid.szInfoTitle[0 .. title_len + 1], title_buf[0 .. title_len + 1]);
+        // Title -> szInfoTitle (proper UTF-8 -> UTF-16; byte-copy garbles non-ASCII).
+        // utf8ToUtf16Le does NOT bounds-check its destination, so the source must
+        // be truncated to fit first. Each UTF-8 codepoint yields <= as many UTF-16
+        // units as bytes, so bounding the source to the dest u16 capacity (minus
+        // the null terminator slot) guarantees the conversion stays in bounds.
+        const title_cap = self.nid.szInfoTitle.len - 1;
+        const tt = title[0..utf8TruncLen(title, title_cap)];
+        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..title_cap], tt) catch 0;
+        self.nid.szInfoTitle[tn] = 0;
 
-        // Copy msg to szInfo (max 255 chars + null)
-        var msg_buf: [256]u16 = undefined;
-        const msg_len = @min(msg_text.len, 255);
-        for (0..msg_len) |i| {
-            msg_buf[i] = msg_text[i];
-        }
-        msg_buf[msg_len] = 0;
-        @memcpy(self.nid.szInfo[0 .. msg_len + 1], msg_buf[0 .. msg_len + 1]);
+        // Message -> szInfo (proper UTF-8 -> UTF-16, same bounding rule).
+        const msg_cap = self.nid.szInfo.len - 1;
+        const mt = msg_text[0..utf8TruncLen(msg_text, msg_cap)];
+        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..msg_cap], mt) catch 0;
+        self.nid.szInfo[mn] = 0;
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
         if (applog.isEnabled()) applog.appLog("[tray] showBalloon: title='{s}' msg='{s}'\n", .{ title, msg_text });
@@ -995,6 +1022,30 @@ pub const TablineState = struct {
     // Window button pressed state (for proper click handling on min/max/close)
     pressed_window_btn: ?u8 = null, // 0=min, 1=max, 2=close
 
+    // AI-agent indicator state, keyed by tab handle (set via on_agent_status).
+    // state: 1=idle (agent present)→●, 2=working/claude, 3=working/braille.
+    agent_handles: [32]i64 = [_]i64{0} ** 32,
+    agent_states: [32]u8 = [_]u8{0} ** 32,
+    agent_count: usize = 0,
+    spinner_frame: u32 = 0,
+    spinner_timer_active: bool = false,
+    // Tab handles that just finished (working 2/3 -> idle 1). Drained on the UI
+    // thread for per-tab completion notifications; kept (not dropped) until the
+    // tray is ready so a startup-race completion isn't silently lost.
+    agent_completed: [32]i64 = [_]i64{0} ** 32,
+    // Agent title/summary captured at each completion (parallel to agent_completed).
+    agent_completed_titles: [32][128]u8 = undefined,
+    agent_completed_title_lens: [32]usize = [_]usize{0} ** 32,
+    // true = paused waiting for user input; false = finished (parallel array).
+    agent_completed_waiting: [32]bool = [_]bool{false} ** 32,
+    agent_completed_count: usize = 0,
+
+    // Cached color-emoji bitmap for the idle indicator (🤖), rasterized via
+    // D2D and AlphaBlend'd onto the tab (GDI DrawTextW can't render color
+    // emoji). Re-rasterized only on size change; freed in App deinit.
+    agent_emoji_hbm: ?c.HBITMAP = null,
+    agent_emoji_px: i32 = 0,
+
     // Tab bar constants
     pub const TAB_BAR_HEIGHT: c_int = 32;
     pub const TAB_MIN_WIDTH: c_int = 100;
@@ -1022,6 +1073,75 @@ pub const TablineState = struct {
         self.tab_count = 0;
         self.current_tab = 0;
         self.visible = false;
+    }
+
+    /// Upsert/remove (state==0) the AI-agent state for a tab handle.
+    pub fn setAgentState(self: *TablineState, handle: i64, state: u8) void {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_handles[i] == handle) {
+                if (state == 0) {
+                    self.agent_count -= 1;
+                    self.agent_handles[i] = self.agent_handles[self.agent_count];
+                    self.agent_states[i] = self.agent_states[self.agent_count];
+                } else {
+                    self.agent_states[i] = state;
+                }
+                return;
+            }
+        }
+        if (state != 0 and self.agent_count < 32) {
+            self.agent_handles[self.agent_count] = handle;
+            self.agent_states[self.agent_count] = state;
+            self.agent_count += 1;
+        }
+    }
+
+    pub fn agentState(self: *const TablineState, handle: i64) u8 {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_handles[i] == handle) return self.agent_states[i];
+        }
+        return 0;
+    }
+
+    pub fn anyAgentWorking(self: *const TablineState) bool {
+        var i: usize = 0;
+        while (i < self.agent_count) : (i += 1) {
+            if (self.agent_states[i] == 2 or self.agent_states[i] == 3) return true;
+        }
+        return false;
+    }
+
+    /// Queue a finished/waiting tab handle + its title (de-duplicated, capped).
+    pub fn pushCompleted(self: *TablineState, handle: i64, title: []const u8, waiting: bool) void {
+        var i: usize = 0;
+        while (i < self.agent_completed_count) : (i += 1) {
+            if (self.agent_completed[i] == handle) return;
+        }
+        if (self.agent_completed_count < self.agent_completed.len) {
+            const idx = self.agent_completed_count;
+            self.agent_completed[idx] = handle;
+            // Truncate on a UTF-8 boundary so the stored title never holds a
+            // partial codepoint (which would later fail UTF-16 conversion and
+            // produce an empty balloon body).
+            const n = utf8TruncLen(title, self.agent_completed_titles[idx].len);
+            @memcpy(self.agent_completed_titles[idx][0..n], title[0..n]);
+            self.agent_completed_title_lens[idx] = n;
+            self.agent_completed_waiting[idx] = waiting;
+            self.agent_completed_count += 1;
+        }
+    }
+
+    /// Basename of a tab's name by handle (term://…/bin/zsh -> "zsh"), or "".
+    pub fn tabName(self: *const TablineState, handle: i64) []const u8 {
+        var i: usize = 0;
+        while (i < self.tab_count) : (i += 1) {
+            if (self.tabs[i].handle == handle) {
+                return baseName(self.tabs[i].name[0..self.tabs[i].name_len]);
+            }
+        }
+        return "";
     }
 
     pub fn cancelDrag(self: *TablineState) void {
@@ -3030,6 +3150,12 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // Cached AI-agent color-emoji bitmap (tabline idle indicator).
+        if (self.tabline_state.agent_emoji_hbm) |hbm| {
+            _ = c.DeleteObject(hbm);
+            self.tabline_state.agent_emoji_hbm = null;
+        }
+
         // Main surface: release GPU VBs from row_verts, then CPU state
         for (self.surface.row_verts.items) |*rv| {
             if (rv.vb) |p| {

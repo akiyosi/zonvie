@@ -187,6 +187,8 @@ external = true
 style = "titlebar"  # "titlebar", "menu", or "sidebar"
 sidebar_position = "left"  # "left" or "right" (for sidebar style)
 sidebar_width = 200  # 100-500 (for sidebar style)
+agent_indicator = true  # show AI-agent status icon on terminal tabs
+agent_notification = true  # OS notification when an AI agent finishes
 
 [windows]
 external = false  # Each Neovim window as a separate OS window
@@ -297,6 +299,8 @@ Message routing rules are processed in order; first match wins.
 | `style` | Tabline style: "titlebar", "menu", or "sidebar" |
 | `sidebar_position` | Sidebar position: "left" or "right" (for sidebar style) |
 | `sidebar_width` | Sidebar width in pixels (100-500, for sidebar style) |
+| `agent_indicator` | Show AI-agent status icon on terminal tabs (true/false, default true) |
+| `agent_notification` | OS notification when an AI agent finishes (true/false, default true) |
 
 #### [windows]
 | Key | Description |
