@@ -762,7 +762,11 @@ pub fn sendClipboardGetResponse(self: *Core, msgid: i64, content: []const u8) !v
     var i: usize = 0;
     while (i <= content.len) : (i += 1) {
         if (i == content.len or content[i] == '\n') {
-            try rpc.packStr(&buf, self.alloc, content[line_start..i]);
+            // Strip a trailing CR so CRLF clipboard text (Windows) does not
+            // leave a stray \r that nvim renders as ^M.
+            var line_end = i;
+            if (line_end > line_start and content[line_end - 1] == '\r') line_end -= 1;
+            try rpc.packStr(&buf, self.alloc, content[line_start..line_end]);
             line_start = i + 1;
         }
     }
