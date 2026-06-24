@@ -527,8 +527,9 @@ pub const Callbacks = extern struct {
     on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
 
     // AI-agent work status per tab. Appended at the end for ABI compat (see
-    // on_restart note). state: 0=none, 1=idle (agent present), 2=working/claude,
-    // 3=working/braille (codex & generic).
+    // on_restart note). state: 0=none, 1=idle (agent present, done),
+    // 2=working/claude, 3=working/braille (codex & generic),
+    // 4=waiting for user input (a decision prompt is on screen).
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 };
 

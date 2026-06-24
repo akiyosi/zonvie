@@ -89,6 +89,31 @@ pub const MsgHistoryEntry = core.MsgHistoryEntry;
 pub const zonvie_msg_event = core.zonvie_msg_event;
 
 // =========================================================================
+// Small shared text helpers
+// =========================================================================
+
+/// Length of the longest prefix of `s` that fits in `max_bytes` without
+/// splitting a UTF-8 codepoint. Used to truncate user text before copying into
+/// a fixed buffer so later UTF-16 conversion can't see a partial codepoint.
+pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
+    var n = @min(s.len, max_bytes);
+    // Back up off any UTF-8 continuation byte (0b10xxxxxx) so we end on a
+    // codepoint boundary.
+    while (n > 0 and (s[n - 1] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+/// Basename of a path-like name: the part after the last '/' or '\\'.
+/// Returns the whole string when there is no separator.
+pub fn baseName(name: []const u8) []const u8 {
+    var last: usize = 0;
+    for (name, 0..) |ch, j| {
+        if (ch == '/' or ch == '\\') last = j + 1;
+    }
+    return name[last..];
+}
+
+// =========================================================================
 // Custom window messages (WM_APP + N)
 // =========================================================================
 
@@ -849,11 +874,19 @@ pub const TrayIcon = struct {
         self.nid.dwInfoFlags = c.NIIF_INFO;
 
         // Title -> szInfoTitle (proper UTF-8 -> UTF-16; byte-copy garbles non-ASCII).
-        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..63], title) catch 0;
+        // utf8ToUtf16Le does NOT bounds-check its destination, so the source must
+        // be truncated to fit first. Each UTF-8 codepoint yields <= as many UTF-16
+        // units as bytes, so bounding the source to the dest u16 capacity (minus
+        // the null terminator slot) guarantees the conversion stays in bounds.
+        const title_cap = self.nid.szInfoTitle.len - 1;
+        const tt = title[0..utf8TruncLen(title, title_cap)];
+        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..title_cap], tt) catch 0;
         self.nid.szInfoTitle[tn] = 0;
 
-        // Message -> szInfo (proper UTF-8 -> UTF-16).
-        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..255], msg_text) catch 0;
+        // Message -> szInfo (proper UTF-8 -> UTF-16, same bounding rule).
+        const msg_cap = self.nid.szInfo.len - 1;
+        const mt = msg_text[0..utf8TruncLen(msg_text, msg_cap)];
+        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..msg_cap], mt) catch 0;
         self.nid.szInfo[mn] = 0;
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
@@ -1089,7 +1122,10 @@ pub const TablineState = struct {
         if (self.agent_completed_count < self.agent_completed.len) {
             const idx = self.agent_completed_count;
             self.agent_completed[idx] = handle;
-            const n = @min(title.len, self.agent_completed_titles[idx].len);
+            // Truncate on a UTF-8 boundary so the stored title never holds a
+            // partial codepoint (which would later fail UTF-16 conversion and
+            // produce an empty balloon body).
+            const n = utf8TruncLen(title, self.agent_completed_titles[idx].len);
             @memcpy(self.agent_completed_titles[idx][0..n], title[0..n]);
             self.agent_completed_title_lens[idx] = n;
             self.agent_completed_waiting[idx] = waiting;
@@ -1102,12 +1138,7 @@ pub const TablineState = struct {
         var i: usize = 0;
         while (i < self.tab_count) : (i += 1) {
             if (self.tabs[i].handle == handle) {
-                const full = self.tabs[i].name[0..self.tabs[i].name_len];
-                var last: usize = 0;
-                for (full, 0..) |ch, j| {
-                    if (ch == '/' or ch == '\\') last = j + 1;
-                }
-                return full[last..];
+                return baseName(self.tabs[i].name[0..self.tabs[i].name_len]);
             }
         }
         return "";

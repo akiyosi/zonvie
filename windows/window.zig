@@ -2906,7 +2906,22 @@ pub export fn WndProc(
                                     bmsg = fallback;
                                 }
                             } else {
-                                bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents finished", .{app.tabline_state.agent_completed_count}) catch "AI agents finished";
+                                // Multiple completions drained together: some may be
+                                // "waiting for input" rather than finished. Count them
+                                // so the message doesn't falsely claim work is done.
+                                const total = app.tabline_state.agent_completed_count;
+                                var waiting_n: usize = 0;
+                                var wi: usize = 0;
+                                while (wi < total) : (wi += 1) {
+                                    if (app.tabline_state.agent_completed_waiting[wi]) waiting_n += 1;
+                                }
+                                if (waiting_n == total) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents need input", .{total}) catch "AI agents need input";
+                                } else if (waiting_n > 0) {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} finished, {d} need input", .{ total - waiting_n, waiting_n }) catch "AI agents finished";
+                                } else {
+                                    bmsg = std.fmt.bufPrint(&msg_buf, "{d} AI agents finished", .{total}) catch "AI agents finished";
+                                }
                             }
                             app.tabline_state.agent_completed_count = 0;
                         }
@@ -3079,10 +3094,20 @@ pub export fn WndProc(
                     input.handleCursorBlinkTimer(hwnd, app);
                 }
             } else if (wParam == app_mod.TIMER_AGENT_SPINNER) {
-                // Advance the AI-agent spinner frame and repaint the tabline.
+                // Advance the AI-agent spinner frame and repaint only the tabline.
+                // Invalidating the whole window would re-present the entire grid at
+                // the spinner rate (~8 Hz) even when the content is static; bound
+                // the dirty region to the tabline strip instead (matches the hover
+                // redraw path).
                 if (getApp(hwnd)) |app| {
                     app.tabline_state.spinner_frame +%= 1;
-                    _ = c.InvalidateRect(hwnd, null, 0);
+                    var tabline_rect: c.RECT = .{
+                        .left = 0,
+                        .top = 0,
+                        .right = 4096,
+                        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
+                    };
+                    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
                 // Continuous-redraw tick for animated custom shaders.

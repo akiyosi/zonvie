@@ -614,10 +614,11 @@ typedef void (*zonvie_on_tabline_update_fn)(
 typedef void (*zonvie_on_tabline_hide_fn)(void* ctx);
 
 /* AI-agent work state for a tabpage (from the zonvie_agent_status RPC
-   notification). state: 0=none, 1=idle (agent present), 2=working/claude,
-   3=working/braille (codex & generic). The frontend renders/animates the
-   per-tab indicator from this; fired immediately on change (not coupled to
-   redraw, so a background-tab agent still updates). */
+   notification). state: 0=none, 1=idle (agent present, done), 2=working/claude,
+   3=working/braille (codex & generic), 4=waiting for user input (a decision
+   prompt is on screen). The frontend renders/animates the per-tab indicator
+   from this; fired immediately on change (not coupled to redraw, so a
+   background-tab agent still updates). */
 typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state, const char* title, size_t title_len);
 
 /* --- Clipboard callbacks --- */

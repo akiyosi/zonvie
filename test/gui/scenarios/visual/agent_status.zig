@@ -1,7 +1,7 @@
 // visual/agent_status — verify the AI-agent "working" glyph paints on the tab.
 //
-// The core prepends "● " to a working agent's tab name; the frontend must
-// preserve it across the path-basename beautification and actually draw it.
+// The core forwards the per-tab `state` straight to the frontend, which owns
+// the indicator glyph + spinner animation (the core does not decorate names).
 // We exercise the core->render path directly by broadcasting the
 // zonvie_agent_status notification (no real agent needed), then capture the
 // tab bar so the result can be inspected.
@@ -26,9 +26,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('edit agentwork.txt')");
 
     // Mark tabpage handle 1 (the first/only tabpage) as a working agent,
-    // bypassing the OSC reporter to test core decoration + rendering directly.
-    try g.exec("rpcnotify(0, 'zonvie_agent_status', {'tab': 1, 'status': 'working'})");
-    // Force a redraw so the dirty tabline re-emits with the decorated name.
+    // bypassing the OSC reporter to test rendering directly. state=3 is the
+    // generic/braille "working" spinner (the parser reads an integer `state`).
+    try g.exec("rpcnotify(0, 'zonvie_agent_status', {'tab': 1, 'state': 3})");
+    // Force a redraw so the dirty tabline re-emits with the indicator.
     try g.exec("execute('redraw!')");
 
     var img = try g.captureStable(.{ .w_pt = 900, .h_pt = 140 }, 8000);

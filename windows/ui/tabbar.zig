@@ -16,15 +16,9 @@ const TabEntry = app_mod.TabEntry;
 /// Returns the length of the display name written to out_buf.
 fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
     if (tab.name_len > 0) {
-        var last_sep: usize = 0;
-        for (0..tab.name_len) |j| {
-            if (tab.name[j] == '/' or tab.name[j] == '\\') {
-                last_sep = j + 1;
-            }
-        }
-        const display_len = tab.name_len - last_sep;
-        @memcpy(out_buf[0..display_len], tab.name[last_sep..tab.name_len]);
-        return display_len;
+        const display = app_mod.baseName(tab.name[0..tab.name_len]);
+        @memcpy(out_buf[0..display.len], display);
+        return display.len;
     } else {
         const no_name = "[No Name]";
         @memcpy(out_buf[0..no_name.len], no_name);

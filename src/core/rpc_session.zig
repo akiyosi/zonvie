@@ -1355,6 +1355,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             var tab_handle: i64 = 0;
             var have_tab = false;
             var state: u8 = 0;
+            var have_state = false;
             var title: []const u8 = "";
             for (params[0].map) |pair| {
                 if (pair.key != .str) continue;
@@ -1366,12 +1367,16 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 } else if (std.mem.eql(u8, pair.key.str, "state")) {
                     if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 4) {
                         state = @intCast(pair.val.int);
+                        have_state = true;
                     }
                 } else if (std.mem.eql(u8, pair.key.str, "title")) {
                     if (pair.val == .str) title = pair.val.str;
                 }
             }
-            if (have_tab) {
+            // Require an explicit, valid state. A notification with only `tab`
+            // (state missing or out of range) must NOT fire with state=0, which
+            // would erase a working tab's indicator on malformed input.
+            if (have_tab and have_state) {
                 if (self.cb.on_agent_status) |cb| cb(self.ctx, tab_handle, state, title.ptr, title.len);
             }
         }
