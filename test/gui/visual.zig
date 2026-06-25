@@ -17,6 +17,7 @@
 // each developer regenerates them on a known-good state.
 
 const std = @import("std");
+const gui_io = @import("gui_io.zig");
 const builtin = @import("builtin");
 const capture = @import("driver.zig").capture;
 
@@ -43,13 +44,13 @@ pub const Options = struct {
 pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture.Image, opts: Options) !void {
     const dir = try std.fmt.allocPrint(alloc, "test/gui/golden/{s}", .{os_dir});
     defer alloc.free(dir);
-    std.fs.cwd().makePath(dir) catch {};
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), dir) catch {};
     const golden = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir, name, capture.image_ext });
     defer alloc.free(golden);
 
     const update = updateRequested(alloc);
     const exists = blk: {
-        std.fs.cwd().access(golden, .{}) catch break :blk false;
+        std.Io.Dir.cwd().access(gui_io.io(), golden, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -118,7 +119,7 @@ fn pixelDiffers(ref: capture.Image, captured: capture.Image, o: usize, tol: u8) 
 /// avoids a common footgun: an empty/leftover var silently forcing every
 /// run into update mode so comparisons never happen.
 fn updateRequested(alloc: std.mem.Allocator) bool {
-    const v = std.process.getEnvVarOwned(alloc, "ZONVIE_GUI_UPDATE_GOLDEN") catch return false;
+    const v = std.process.Environ.getAlloc(std.testing.environ, alloc, "ZONVIE_GUI_UPDATE_GOLDEN") catch return false;
     defer alloc.free(v);
     return v.len > 0 and !std.mem.eql(u8, v, "0");
 }
@@ -163,7 +164,7 @@ fn printDiffHeatmap(ref: capture.Image, captured: capture.Image, tol: u8) void {
 }
 
 fn dumpActual(alloc: std.mem.Allocator, name: []const u8, captured: capture.Image) !void {
-    std.fs.cwd().makePath("tmp") catch {};
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     const p = try std.fmt.allocPrint(alloc, "tmp/visual_{s}_actual{s}", .{ name, capture.image_ext });
     defer alloc.free(p);
     capture.writeImage(alloc, p, captured) catch |err| {

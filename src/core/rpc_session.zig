@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
 const highlight = @import("highlight.zig");
@@ -179,24 +180,24 @@ pub const FrameSliceReader = struct {
 
 pub const CwdOwner = struct {
     open: bool = false,
-    dir: std.fs.Dir = undefined,
+    dir: std.Io.Dir = undefined,
 
     pub fn close(self: *CwdOwner) void {
         if (self.open) {
-            self.dir.close();
+            self.dir.close(clock.io());
             self.open = false;
         }
     }
 
     pub fn openPreferred(self: *CwdOwner, alloc: std.mem.Allocator, log: *Logger) void {
         self.close();
-    
+
         // Prefer $HOME when present.
-        const home = std.process.getEnvVarOwned(alloc, "HOME") catch null;
+        const home = envVarOwned(alloc, "HOME") catch null;
         defer if (home) |s| alloc.free(s);
-    
+
         if (home) |home_path| {
-            if (std.fs.openDirAbsolute(home_path, .{})) |d| {
+            if (std.Io.Dir.openDirAbsolute(clock.io(), home_path, .{})) |d| {
                 self.dir = d;
                 self.open = true;
                 log.write("child cwd set to HOME: {s}\n", .{home_path});
@@ -209,35 +210,23 @@ pub const CwdOwner = struct {
         }
     }
 
-    pub fn applyToChild(self: *CwdOwner, child: *std.process.Child) void {
-        const CwdT = @TypeOf(child.cwd_dir);
-
-        comptime {
-            if (!(CwdT == ?std.fs.Dir or CwdT == std.fs.Dir or CwdT == ?*std.fs.Dir or CwdT == *std.fs.Dir)) {
-                @compileError("Unsupported std.process.Child.cwd_dir type: " ++ @typeName(CwdT));
-            }
-        }
-
-        if (!self.open) return;
-
-        if (comptime CwdT == ?std.fs.Dir) {
-            child.cwd_dir = self.dir;
-            return;
-        }
-        if (comptime CwdT == std.fs.Dir) {
-            child.cwd_dir = self.dir;
-            return;
-        }
-        if (comptime CwdT == ?*std.fs.Dir) {
-            child.cwd_dir = &self.dir;
-            return;
-        }
-        if (comptime CwdT == *std.fs.Dir) {
-            child.cwd_dir = &self.dir;
-            return;
-        }
+    /// Produce the `Child.Cwd` value to feed `std.process.spawn`'s
+    /// `SpawnOptions.cwd`. Returns `.inherit` when no preferred dir was
+    /// opened, preserving the prior default-cwd behavior.
+    pub fn childCwd(self: *CwdOwner) std.process.Child.Cwd {
+        if (!self.open) return .inherit;
+        return .{ .dir = self.dir };
     }
 };
+
+/// Owned-copy environment variable lookup. Replaces 0.15's
+/// `std.process.getEnvVarOwned`, which is removed in 0.16. Reads the
+/// process environment via libc `getenv` and returns a heap copy the
+/// caller owns, mirroring the old null/owned-free semantics.
+fn envVarOwned(alloc: std.mem.Allocator, name: [*:0]const u8) error{ EnvironmentVariableNotFound, OutOfMemory }![]u8 {
+    const val = std.c.getenv(name) orelse return error.EnvironmentVariableNotFound;
+    return alloc.dupe(u8, std.mem.span(val));
+}
 
 /// Heap-allocated stderr pump state, refcount-managed so Core and the
 /// pump thread can release their references independently. This
@@ -275,7 +264,7 @@ pub const CwdOwner = struct {
 pub const StderrPump = struct {
     alloc: std.mem.Allocator,
     f: rpc_transport.Stream,
-    mu: std.Thread.Mutex,
+    mu: std.Io.Mutex,
     core: ?*Core,
     refcount: std.atomic.Value(u32),
 
@@ -297,8 +286,8 @@ pub const StderrPump = struct {
         while (true) {
             // Stop check: Core may have flagged termination.
             {
-                self.mu.lock();
-                defer self.mu.unlock();
+                self.mu.lockUncancelable(clock.io());
+                defer self.mu.unlock(clock.io());
                 if (self.core) |c| {
                     if (c.stop_flag.load(.seq_cst)) break;
                 }
@@ -314,8 +303,8 @@ pub const StderrPump = struct {
             // pointer + ctx — both App-owned, safe across Core
             // teardown — but that adds another snapshot field for
             // a feature the orphan path does not need.)
-            self.mu.lock();
-            defer self.mu.unlock();
+            self.mu.lockUncancelable(clock.io());
+            defer self.mu.unlock(clock.io());
             if (self.core) |c| {
                 if (c.cb.on_log) |logfn| logfn(c.ctx, buf[0..n].ptr, n);
 
@@ -338,8 +327,8 @@ pub const StderrPump = struct {
     /// Core. Safe to call from any thread; caller MUST hold a ref to
     /// the pump for the duration of this call.
     pub fn detachFromCore(self: *StderrPump) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
         self.core = null;
     }
 };
@@ -379,14 +368,17 @@ pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 pub fn logEnvHints(self: *Core) void {
     if (self.log.cb == null) return;
 
-    const cwd = std.process.getCwdAlloc(self.alloc) catch null;
-    defer if (cwd) |s| self.alloc.free(s);
+    var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd: ?[]const u8 = if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |p|
+        std.mem.span(@as([*:0]const u8, @ptrCast(p)))
+    else
+        null;
     if (cwd) |s|
         self.log.write("cwd: {s}\n", .{s})
     else
         self.log.write("cwd: (unknown)\n", .{});
 
-    const path_env = std.process.getEnvVarOwned(self.alloc, "PATH") catch null;
+    const path_env = envVarOwned(self.alloc, "PATH") catch null;
     defer if (path_env) |s| self.alloc.free(s);
     if (path_env) |s|
         self.log.write("PATH: {s}\n", .{s})
@@ -469,10 +461,10 @@ fn forceGlowFlush(self: *Core) void {
     self.grid.content_rev +%= 1;
     self.grid.dirty_all = true;
     self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
-    self.grid_mu.lock();
+    self.grid_mu.lockUncancelable(clock.io());
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch {};
-    self.grid_mu.unlock();
+    self.grid_mu.unlock(clock.io());
     self.redraw_thread_id.store(0, .seq_cst);
 }
 
@@ -990,7 +982,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // on_linespace, on_external_window*, on_ime_off, on_cursor_grid_changed)
         // execute while grid_mu is held. Callbacks MUST NOT call
         // zonvie_core_get_* or other APIs that acquire grid_mu.
-        self.grid_mu.lock();
+        self.grid_mu.lockUncancelable(clock.io());
 
         var fctx = flush.FlushCtx{ .core = self };
         redraw.handleRedraw(
@@ -1021,18 +1013,18 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
 
         // Update cmdline grid BEFORE checking external windows
         // (cmdline is rendered as an external grid)
-        const t_notify_cmdline: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
+        const t_notify_cmdline: i128 = if (log_on_notify) clock.nowNs() else 0;
         self.notifyCmdlineChanges();
         if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_cmdline), 1000));
+            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_cmdline), 1000));
             self.log.write("[perf] notify_cmdline us={d}\n", .{dt});
         }
 
         // Handle message changes (ext_messages)
-        const t_notify_msg: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
+        const t_notify_msg: i128 = if (log_on_notify) clock.nowNs() else 0;
         self.notifyMessageChanges();
         if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_msg), 1000));
+            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_msg), 1000));
             self.log.write("[perf] notify_message us={d}\n", .{dt});
         }
 
@@ -1046,10 +1038,10 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
 
         // Handle tabline changes (ext_tabline)
-        const t_notify_tabline: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
+        const t_notify_tabline: i128 = if (log_on_notify) clock.nowNs() else 0;
         self.notifyTablineChanges();
         if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_tabline), 1000));
+            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_tabline), 1000));
             self.log.write("[perf] notify_tabline us={d}\n", .{dt});
         }
 
@@ -1285,10 +1277,10 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // here — it runs after commitFlush/atlas-swap, so rasterized glyphs
         // would go to the new back texture while the front (used for drawing)
         // would have empty texels, causing non-ASCII text to be invisible.
-        const t_notify_extwin: i128 = if (log_on_notify) std.time.nanoTimestamp() else 0;
+        const t_notify_extwin: i128 = if (log_on_notify) clock.nowNs() else 0;
         _ = self.notifyExternalWindowChanges();
         if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_notify_extwin), 1000));
+            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_extwin), 1000));
             self.log.write("[perf] notify_extwin us={d}\n", .{dt});
         }
 
@@ -1319,7 +1311,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
-        self.grid_mu.unlock();
+        self.grid_mu.unlock(clock.io());
         self.redraw_thread_id.store(0, .seq_cst);
 
         if (need_reload_glow_config) {
@@ -1673,33 +1665,33 @@ pub fn runLoop(self: *Core) void {
         }
 
         if (!use_connect) {
-            child = std.process.Child.init(argv_buf[0..argc], self.alloc);
-            child.stdin_behavior = .Pipe;
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Pipe;
-            child.create_no_window = true;
-
+            var child_cwd: std.process.Child.Cwd = .inherit;
             if (!self.inherit_cwd) {
                 cwd_owner.openPreferred(self.alloc, &self.log);
-                cwd_owner.applyToChild(&child);
+                child_cwd = cwd_owner.childCwd();
             } else {
                 self.log.write("inherit_cwd=true; child inherits parent cwd\n", .{});
             }
 
             const has_slash = (std.mem.indexOfScalar(u8, nvim_path, '/') != null) or
                 (std.mem.indexOfScalar(u8, nvim_path, '\\') != null);
-            if (@hasField(@TypeOf(child), "expand_arg0")) {
-                child.expand_arg0 = if (has_slash) .no_expand else .expand;
-            }
             self.log.write("expand_arg0: has_slash={}, mode={s}\n", .{ has_slash, if (has_slash) "no_expand" else "expand" });
 
             self.log.write("about to spawn...\n", .{});
             if (self.cb.on_log) |logfn| {
-                const msg1 = "[DIRECT] calling child.spawn() now\n";
+                const msg1 = "[DIRECT] calling std.process.spawn() now\n";
                 logfn(self.ctx, msg1.ptr, msg1.len);
             }
-            const spawn_start_ns = std.time.nanoTimestamp();
-            child.spawn() catch |e| {
+            const spawn_start_ns = clock.nowNs();
+            child = std.process.spawn(clock.io(), .{
+                .argv = argv_buf[0..argc],
+                .stdin = .pipe,
+                .stdout = .pipe,
+                .stderr = .pipe,
+                .create_no_window = true,
+                .cwd = child_cwd,
+                .expand_arg0 = if (has_slash) .no_expand else .expand,
+            }) catch |e| {
                 self.log.write("spawn failed: {any}\n", .{e});
                 if (self.cb.on_log) |logfn| {
                     const msg_err = "[DIRECT] spawn error occurred\n";
@@ -1708,7 +1700,7 @@ pub fn runLoop(self: *Core) void {
                 session_failed = true;
                 break :session;
             };
-            const spawn_end_ns = std.time.nanoTimestamp();
+            const spawn_end_ns = clock.nowNs();
             const spawn_ms = @divTrunc(spawn_end_ns - spawn_start_ns, 1_000_000);
             if (self.cb.on_log) |logfn| {
                 const msg2 = "[DIRECT] child.spawn() returned successfully\n";
@@ -1746,7 +1738,7 @@ pub fn runLoop(self: *Core) void {
                     p.* = .{
                         .alloc = pump_alloc,
                         .f = ef,
-                        .mu = .{},
+                        .mu = .init,
                         .core = self,
                         // refcount = 2 from the start: one for Core
                         // (kept via self.stderr_pump until cleanup
@@ -1790,7 +1782,7 @@ pub fn runLoop(self: *Core) void {
             if (self.is_ssh_mode) {
                 self.log.write("SSH mode: prompting for password immediately...\n", .{});
                 self.ssh_auth_pending.store(true, .seq_cst);
-                std.Thread.sleep(200 * std.time.ns_per_ms);
+                std.Io.sleep(clock.io(), .{ .nanoseconds = @intCast(200 * std.time.ns_per_ms) }, .awake) catch {};
 
                 if (self.cb.on_ssh_auth_prompt) |cb| {
                     cb(self.ctx, "SSH Password:", 13);
@@ -1802,10 +1794,10 @@ pub fn runLoop(self: *Core) void {
                     while (waited_ms < timeout_ms and !self.stop_flag.load(.seq_cst)) {
                         if (self.ssh_auth_done.load(.seq_cst)) {
                             self.log.write("SSH mode: password sent, waiting for connection...\n", .{});
-                            std.Thread.sleep(2000 * std.time.ns_per_ms);
+                            std.Io.sleep(clock.io(), .{ .nanoseconds = @intCast(2000 * std.time.ns_per_ms) }, .awake) catch {};
                             break;
                         }
-                        std.Thread.sleep(poll_ms * std.time.ns_per_ms);
+                        std.Io.sleep(clock.io(), .{ .nanoseconds = @intCast(poll_ms * std.time.ns_per_ms) }, .awake) catch {};
                         waited_ms += poll_ms;
                     }
 
@@ -1837,11 +1829,11 @@ pub fn runLoop(self: *Core) void {
         // start). For restart iterations ui_attach_ready is already true,
         // so this falls through immediately.
         {
-            self.ui_attach_mutex.lock();
-            defer self.ui_attach_mutex.unlock();
+            self.ui_attach_mutex.lockUncancelable(clock.io());
+            defer self.ui_attach_mutex.unlock(clock.io());
             while (!self.ui_attach_ready) {
                 if (self.stop_flag.load(.seq_cst)) break;
-                self.ui_attach_cond.wait(&self.ui_attach_mutex);
+                self.ui_attach_cond.waitUncancelable(clock.io(), &self.ui_attach_mutex);
             }
         }
 
@@ -1947,18 +1939,18 @@ pub fn runLoop(self: *Core) void {
                 const arena_once = arena_state.allocator();
 
                 var sr = FrameSliceReader{ .data = fr.view() };
-                const t_dec: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
+                const t_dec: i128 = if (log_on_msg) clock.nowNs() else 0;
                 const dec_res = mp.decode(arena_once, &sr);
-                if (log_on_msg) decode_ns += std.time.nanoTimestamp() - t_dec;
+                if (log_on_msg) decode_ns += clock.nowNs() - t_dec;
                 if (dec_res) |v| {
                     fr.consume(sr.i);
                     root = v;
                     break;
                 } else |e| {
                     if (e == error.EndOfStream) {
-                        const t_io: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
+                        const t_io: i128 = if (log_on_msg) clock.nowNs() else 0;
                         const fill_res = fr.fill();
-                        if (log_on_msg) io_wait_ns += std.time.nanoTimestamp() - t_io;
+                        if (log_on_msg) io_wait_ns += clock.nowNs() - t_io;
                         const n = fill_res catch |fe| {
                             self.log.write("pipe read err: {any}\n", .{fe});
                             break :outer;
@@ -1989,10 +1981,10 @@ pub fn runLoop(self: *Core) void {
                 continue;
             }
             if (t == 2) {
-                const t_dispatch_start: i128 = if (log_on_msg) std.time.nanoTimestamp() else 0;
+                const t_dispatch_start: i128 = if (log_on_msg) clock.nowNs() else 0;
                 handleRpcNotification(self, arena, top);
                 if (log_on_msg) {
-                    const dispatch_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_dispatch_start), 1000));
+                    const dispatch_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_dispatch_start), 1000));
                     const decode_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), decode_ns), 1000));
                     const io_wait_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), io_wait_ns), 1000));
                     // Only the method string is interesting here; pull it from
@@ -2098,9 +2090,9 @@ pub fn runLoop(self: *Core) void {
             const exit_code: i32 = if (session_failed)
                 1
             else if (last_term) |t| switch (t) {
-                .Exited => |code| @intCast(code),
-                .Signal => |sig| 128 + @as(i32, @intCast(sig)),
-                .Stopped, .Unknown => 1,
+                .exited => |code| @intCast(code),
+                .signal => |sig| 128 + @as(i32, @intCast(@intFromEnum(sig))),
+                .stopped, .unknown => 1,
             } else if (ui_attached_overall) 0 else 1;
             self.log.write("calling on_exit with code: {d}\n", .{exit_code});
             f(self.ctx, exit_code);
@@ -2118,7 +2110,7 @@ pub fn runLoop(self: *Core) void {
 /// the reaper.
 fn reapOrphanThread(orphan: std.process.Child) void {
     var c = orphan;
-    _ = c.wait() catch {};
+    _ = c.wait(clock.io()) catch {};
 }
 
 /// Tear down the current RPC session: stop the writer thread, close the
@@ -2168,12 +2160,12 @@ fn cleanupSession(
     // in-flight writeAll() does not observe a torn-down handle.
     var wt: ?std.Thread = null;
     {
-        self.write_queue_mu.lock();
+        self.write_queue_mu.lockUncancelable(clock.io());
         self.write_queue_closed = true;
         wt = self.writer_thread;
         self.writer_thread = null;
-        self.write_queue_cond.signal();
-        self.write_queue_mu.unlock();
+        self.write_queue_cond.signal(clock.io());
+        self.write_queue_mu.unlock(clock.io());
     }
     self.log.write("cleanupSession: writer queue closed (wt_present={any})\n", .{wt != null});
     // `:connect` hot-swap: the old nvim is still alive headless on
@@ -2188,8 +2180,8 @@ fn cleanupSession(
     // threads close the same fd. For POSIX .socket transport, double-close
     // causes EBADF. Whichever thread gets the lock first closes and nulls;
     // the other thread's `if (self.stdin_file)` check then sees null and skips.
-    self.stdin_close_mu.lock();
-    defer self.stdin_close_mu.unlock();
+    self.stdin_close_mu.lockUncancelable(clock.io());
+    defer self.stdin_close_mu.unlock(clock.io());
     if (self.stdin_file) |f| {
         // POSIX socket transport aliases stdin/stdout on the same fd.
         // Issue shutdown(SHUT_RDWR) before close() so the writer
@@ -2239,7 +2231,7 @@ fn cleanupSession(
             // a no-op — no double-close races with our own pipe
             // teardown above.
             if (builtin.os.tag == .windows) {
-                std.os.windows.CloseHandle(child.id);
+                if (child.id) |h| std.os.windows.CloseHandle(h);
                 std.os.windows.CloseHandle(child.thread_handle);
             } else {
                 if (std.Thread.spawn(.{}, reapOrphanThread, .{child.*})) |t| {
@@ -2270,13 +2262,22 @@ fn cleanupSession(
                 (kill_on_restart_pending and self.restart_pending_addr != null);
             if (want_kill) {
                 self.log.write("cleanupSession: killing child (pid={any})\n", .{child.id});
-                _ = child.kill() catch {};
+                // Zig 0.16: Child.kill(io) forcibly terminates AND reaps in a
+                // single uncancelable call, leaving child.id == null. wait()
+                // opens with assert(child.id != null), so it MUST NOT be called
+                // after kill(). kill() sends SIGTERM (std Threaded.childKillPosix),
+                // so synthesize the Term the prior (kill + wait) sequence
+                // reported, keeping on_exit's exit-code mapping (128 + SIGTERM)
+                // unchanged.
+                child.kill(clock.io());
+                session_term = .{ .signal = .TERM };
+            } else {
+                self.log.write("cleanupSession: waiting for child (pid={any})\n", .{child.id});
+                session_term = child.wait(clock.io()) catch |e| blk: {
+                    self.log.write("wait err: {any}\n", .{e});
+                    break :blk null;
+                };
             }
-            self.log.write("cleanupSession: waiting for child (pid={any} want_kill={any})\n", .{ child.id, want_kill });
-            session_term = child.wait() catch |e| blk: {
-                self.log.write("wait err: {any}\n", .{e});
-                break :blk null;
-            };
             if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
             self.child_handle = null;
         }

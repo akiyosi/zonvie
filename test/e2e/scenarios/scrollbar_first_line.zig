@@ -21,7 +21,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var line: u32 = 1;
     while (line <= 100) : (line += 1) {
         if (line > 1) try buf.appendSlice(alloc, ", ");
-        try std.fmt.format(buf.writer(alloc), "'line {d}'", .{line});
+        try buf.print(alloc, "'line {d}'", .{line});
     }
     try buf.appendSlice(alloc, "])");
 

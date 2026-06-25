@@ -5,16 +5,16 @@ const std = @import("std");
 // or "v0.3.21-dirty"). Falls back to "0.0.0-unknown" when git is unavailable
 // (e.g. a shallow CI checkout with no tags, or a source tarball without .git).
 fn gitVersion(b: *std.Build) []const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
-        .argv = &.{ "git", "describe", "--tags", "--always", "--dirty" },
-        .cwd = b.build_root.path,
-    }) catch return "0.0.0-unknown";
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return "0.0.0-unknown",
-        else => return "0.0.0-unknown",
-    }
-    return std.mem.trim(u8, result.stdout, " \t\r\n");
+    // Zig 0.16: process spawning in build scripts goes through the build
+    // graph's Io. `runAllowFail` returns captured stdout or an error we map to
+    // the unknown-version fallback.
+    var code: u8 = undefined;
+    const stdout = b.runAllowFail(
+        &.{ "git", "describe", "--tags", "--always", "--dirty" },
+        &code,
+        .ignore,
+    ) catch return "0.0.0-unknown";
+    return std.mem.trim(u8, stdout, " \t\r\n");
 }
 
 pub fn build(b: *std.Build) !void {
@@ -80,13 +80,12 @@ pub fn build(b: *std.Build) !void {
     // Link glslang static library into core_lib so its symbols are
     // available to zonvie_shader_compile_glsl. Headers installed by the
     // upstream package become visible to the core module's C translation.
+    // Zig 0.16: link* methods live on the Module, not the Compile step.
     const glslang_lib = glslang_dep.artifact("glslang");
-    core_lib.linkLibrary(glslang_lib);
     core_mod.linkLibrary(glslang_lib);
 
     // Link SPIRV-Cross static library.
     const spirv_cross_lib = spirv_cross_dep.artifact("spirv_cross");
-    core_lib.linkLibrary(spirv_cross_lib);
     core_mod.linkLibrary(spirv_cross_lib);
 
     b.installArtifact(core_lib);
@@ -144,46 +143,47 @@ pub fn build(b: *std.Build) !void {
         .root_module = win_mod,
     });
     win_exe.subsystem = .Windows;
-    win_exe.linkLibrary(core_lib);
+    // Zig 0.16: link* and resource files live on the Module, not Compile.
+    win_mod.linkLibrary(core_lib);
 
     // Add Windows application icon
-    win_exe.addWin32ResourceFile(.{
+    win_mod.addWin32ResourceFile(.{
         .file = b.path("windows/resources/zonvie.rc"),
     });
 
     // Win32 GUI basics (GDI).
     if (target.result.os.tag == .windows) {
-        win_exe.linkSystemLibrary("user32");
-        win_exe.linkSystemLibrary("gdi32");
-        win_exe.linkSystemLibrary("kernel32");
-        win_exe.linkSystemLibrary("imm32"); // IME support
+        win_mod.linkSystemLibrary("user32", .{});
+        win_mod.linkSystemLibrary("gdi32", .{});
+        win_mod.linkSystemLibrary("kernel32", .{});
+        win_mod.linkSystemLibrary("imm32", .{}); // IME support
 
         // --- Add: DirectWrite/Direct2D + COM ---
-        win_exe.linkSystemLibrary("dwrite");
-        win_exe.linkSystemLibrary("d2d1");
-        win_exe.linkSystemLibrary("ole32");
+        win_mod.linkSystemLibrary("dwrite", .{});
+        win_mod.linkSystemLibrary("d2d1", .{});
+        win_mod.linkSystemLibrary("ole32", .{});
 
         // --- Add: D3D11 + DXGI (+ D3DCompiler for runtime shader compile) ---
-        win_exe.linkSystemLibrary("d3d11");
-        win_exe.linkSystemLibrary("dxgi");
-        win_exe.linkSystemLibrary("d3dcompiler_47");
+        win_mod.linkSystemLibrary("d3d11", .{});
+        win_mod.linkSystemLibrary("dxgi", .{});
+        win_mod.linkSystemLibrary("d3dcompiler_47", .{});
 
         // --- Add: DirectComposition + DWM for transparency ---
-        win_exe.linkSystemLibrary("dcomp");
-        win_exe.linkSystemLibrary("dwmapi");
+        win_mod.linkSystemLibrary("dcomp", .{});
+        win_mod.linkSystemLibrary("dwmapi", .{});
 
         // --- Add: CredUI for password dialogs ---
-        win_exe.linkSystemLibrary("credui");
+        win_mod.linkSystemLibrary("credui", .{});
 
         // --- Add: Registry + Shell for file associations ---
-        win_exe.linkSystemLibrary("advapi32");
-        win_exe.linkSystemLibrary("shell32");
+        win_mod.linkSystemLibrary("advapi32", .{});
+        win_mod.linkSystemLibrary("shell32", .{});
 
         // --- Timer resolution for reducing scheduler quantum ---
-        win_exe.linkSystemLibrary("winmm");
+        win_mod.linkSystemLibrary("winmm", .{});
 
         // --- AlphaBlend (color-emoji tab indicator composite) ---
-        win_exe.linkSystemLibrary("msimg32");
+        win_mod.linkSystemLibrary("msimg32", .{});
     }
 
     const install_win = b.addInstallArtifact(win_exe, .{

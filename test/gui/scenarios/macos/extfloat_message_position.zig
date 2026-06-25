@@ -14,6 +14,7 @@
 // settles, exactly the top-right-aligned popup must be among them.
 
 const std = @import("std");
+const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
@@ -24,12 +25,12 @@ const tol_px = 150.0; // float-anchored placement is off by several hundred px
 
 /// Poll until the main-window bounds stop changing, then return them.
 fn waitStableMainBounds(g: *Gui) !platform.Bounds {
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = gui_io.Timer.start();
     var last: ?platform.Bounds = null;
     var same: u32 = 0;
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 15_000) return error.Timeout;
-        std.Thread.sleep(250 * std.time.ns_per_ms);
+        gui_io.sleepNs(250 * std.time.ns_per_ms);
         const b = platform.mainWindowBoundsForPid(g.app_pid) orelse continue;
         if (last) |l| {
             if (l.x == b.x and l.y == b.y and l.w == b.w and l.h == b.h) {
@@ -79,7 +80,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Wait until at least one new window appeared and the set has settled
     // for 1 s, then require a top-right-aligned popup among the new windows
     // (a hit-enter prompt window may legitimately appear bottom-center).
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = gui_io.Timer.start();
     var stable: u32 = 0;
     var last_fresh: usize = 0;
     while (true) {
@@ -87,7 +88,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             std.debug.print("[gui] no ext-float popup appeared (new windows: {d})\n", .{last_fresh});
             return error.Timeout;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        gui_io.sleepNs(100 * std.time.ns_per_ms);
 
         var now_buf: [max_windows]platform.MainWindow = undefined;
         const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];

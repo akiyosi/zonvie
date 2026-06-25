@@ -1,5 +1,6 @@
 const std = @import("std");
 const shared_config = @import("zonvie_core").config;
+const clock = @import("zonvie_core").clock;
 
 // Re-export types from shared config
 pub const Config = shared_config.Config;
@@ -28,12 +29,15 @@ pub fn loadWithPath(alloc: std.mem.Allocator) struct { config: Config, path: ?[]
 /// Get config file path: %APPDATA%\zonvie\config.toml or %USERPROFILE%\.config\zonvie\config.toml
 pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
     // Try %APPDATA%\zonvie\config.toml first
-    if (std.process.getEnvVarOwned(alloc, "APPDATA")) |appdata| {
+    // 0.16: std.process.getEnvVarOwned was removed; env access goes through
+    // std.process.Environ. On Windows `.block = .global` reads the PEB-backed
+    // environment, and getAlloc returns owned memory freed with alloc.free.
+    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "APPDATA")) |appdata| {
         defer alloc.free(appdata);
         const path = try std.fs.path.join(alloc, &.{ appdata, "zonvie", "config.toml" });
 
         // Check if file exists
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
             return path;
         } else |_| {
             alloc.free(path);
@@ -41,11 +45,11 @@ pub fn getConfigFilePath(alloc: std.mem.Allocator) ![]const u8 {
     } else |_| {}
 
     // Fallback to %USERPROFILE%\.config\zonvie\config.toml
-    if (std.process.getEnvVarOwned(alloc, "USERPROFILE")) |userprofile| {
+    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "USERPROFILE")) |userprofile| {
         defer alloc.free(userprofile);
         const path = try std.fs.path.join(alloc, &.{ userprofile, ".config", "zonvie", "config.toml" });
 
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(clock.io(), path, .{})) |_| {
             return path;
         } else |_| {
             alloc.free(path);

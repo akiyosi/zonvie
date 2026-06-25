@@ -16,6 +16,7 @@
 // DXGI Desktop Duplication API (heavier). Compile-verified only here.
 
 const std = @import("std");
+const gui_io = @import("gui_io.zig");
 const W = std.os.windows;
 const win = @import("windows_window.zig");
 
@@ -25,19 +26,24 @@ const HBITMAP = W.HANDLE;
 const HGDIOBJ = W.HANDLE;
 
 const POINT = extern struct { x: i32, y: i32 };
+// std.os.windows trimmed these in 0.16 (BOOL became a non-integer enum, RECT
+// was removed); declare the plain Win32 shapes so the extern signatures keep
+// their original integer semantics.
+const BOOL = i32;
+const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
 
-extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *W.RECT) callconv(.winapi) W.BOOL;
-extern "user32" fn ClientToScreen(hwnd: W.HWND, pt: *POINT) callconv(.winapi) W.BOOL;
+extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn ClientToScreen(hwnd: W.HWND, pt: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn GetDC(hwnd: ?W.HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(hwnd: ?W.HWND, hdc: HDC) callconv(.winapi) i32;
-extern "user32" fn PrintWindow(hwnd: W.HWND, hdc: HDC, flags: W.UINT) callconv(.winapi) W.BOOL;
+extern "user32" fn PrintWindow(hwnd: W.HWND, hdc: HDC, flags: W.UINT) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: W.HWND) callconv(.winapi) W.UINT;
 
 extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
-extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) W.BOOL;
+extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
 extern "gdi32" fn CreateDIBSection(hdc: ?HDC, bmi: *const BITMAPINFO, usage: W.UINT, bits: *?*anyopaque, section: ?W.HANDLE, offset: W.DWORD) callconv(.winapi) ?HBITMAP;
 extern "gdi32" fn SelectObject(hdc: HDC, obj: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
-extern "gdi32" fn DeleteObject(obj: HGDIOBJ) callconv(.winapi) W.BOOL;
+extern "gdi32" fn DeleteObject(obj: HGDIOBJ) callconv(.winapi) BOOL;
 
 const BITMAPINFOHEADER = extern struct {
     biSize: W.DWORD,
@@ -90,7 +96,7 @@ pub const Image = struct {
 pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image {
     const hwnd = win.mainWindowHandleForPid(pid) orelse return error.NoMainWindow;
 
-    var rect: W.RECT = undefined;
+    var rect: RECT = undefined;
     if (GetWindowRect(hwnd, &rect) == 0) return error.WindowRectFailed;
     const win_w: i32 = rect.right - rect.left;
     const win_h: i32 = rect.bottom - rect.top;
@@ -210,13 +216,11 @@ pub fn writeImage(alloc: std.mem.Allocator, path: []const u8, img: Image) !void 
         }
     }
 
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(buf);
+    try std.Io.Dir.cwd().writeFile(gui_io.io(), .{ .sub_path = path, .data = buf });
 }
 
 pub fn readImage(alloc: std.mem.Allocator, path: []const u8) !Image {
-    const data = try std.fs.cwd().readFileAlloc(alloc, path, 256 * 1024 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(256 * 1024 * 1024));
     defer alloc.free(data);
     if (data.len < bmp_file_header_size + bmp_info_header_size) return error.BadBmp;
     if (data[0] != 'B' or data[1] != 'M') return error.BadBmp;

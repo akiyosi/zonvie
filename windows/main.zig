@@ -1,4 +1,5 @@
 const std = @import("std");
+const clock = @import("zonvie_core").clock;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
@@ -69,20 +70,17 @@ pub fn panic(
     if (applog.isEnabled()) {
         applog.appLog("\nStack trace:\n", .{});
     }
-    var it = std.debug.StackIterator.init(ret_addr orelse @returnAddress(), @frameAddress());
+    // 0.16: std.debug.StackIterator is no longer pub. Use the supported
+    // captureCurrentStackTrace API, which fills the address buffer and
+    // returns a StackTrace; first_address omits frames up to ret_addr,
+    // preserving the previous "start from the panic site" behavior.
     var addr_buf: [32]usize = undefined;
-    var addr_count: usize = 0;
-
-    // Collect addresses
-    while (addr_count < addr_buf.len) {
-        if (it.next()) |addr| {
-            addr_buf[addr_count] = addr;
-            addr_count += 1;
-        } else break;
-    }
+    const trace = std.debug.captureCurrentStackTrace(.{
+        .first_address = ret_addr,
+    }, &addr_buf);
 
     // Print addresses
-    for (addr_buf[0..addr_count]) |addr| {
+    for (trace.return_addresses) |addr| {
         std.debug.print("  0x{x:0>16}\n", .{addr});
         if (applog.isEnabled()) {
             applog.appLog("  0x{x:0>16}\n", .{addr});
@@ -134,6 +132,8 @@ extern "winmm" fn timeBeginPeriod(uPeriod: c.UINT) callconv(.winapi) c.UINT;
 const ATTACH_PARENT_PROCESS: c.DWORD = 0xFFFFFFFF;
 
 pub fn main() u8 {
+    clock.init();
+
     // Enable Per-Monitor DPI Awareness V2 before any window creation.
     // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
     // Must run before the askpass branch below, which creates a password
@@ -240,7 +240,7 @@ pub fn main() u8 {
     _ = c.QueryPerformanceFrequency(&app_mod.g_startup_freq);
     _ = c.QueryPerformanceCounter(&app_mod.g_startup_t0);
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -292,8 +292,16 @@ pub fn main() u8 {
     // before the App is constructed; see the validation block right after
     // argv parsing.
     var connect_addr: ?[]const u8 = null;
-    const args = std.process.argsAlloc(alloc) catch return 1;
-    defer std.process.argsFree(alloc, args);
+    // 0.16: std.process.argsAlloc/argsFree were removed. Obtain the current
+    // process command line from the Windows PEB (GetCommandLineW) and parse it
+    // via std.process.Args.toSlice, which requires an arena that must outlive
+    // every slice referenced below (mirrors the old `defer argsFree` lifetime).
+    const cmdline_w = c.GetCommandLineW();
+    if (cmdline_w == null) return 1;
+    var args_arena = std.heap.ArenaAllocator.init(alloc);
+    defer args_arena.deinit();
+    const args_obj = std.process.Args{ .vector = std.mem.span(cmdline_w) };
+    const args = args_obj.toSlice(args_arena.allocator()) catch return 1;
 
     // Check for --help / -h first. Stop at `--` so `zonvie -- --help` /
     // `zonvie -- --install` forward those tokens to nvim instead of
@@ -447,7 +455,7 @@ pub fn main() u8 {
 
     // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
     // After "--", all remaining arguments are passed to nvim
-    var nvim_extra_args = std.ArrayListUnmanaged([]const u8){};
+    var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
 
     var i: usize = 1; // Skip argv[0] (executable path)
@@ -845,7 +853,10 @@ const ConfigCreateResult = enum { created, already_exists, err };
 
 /// Create default config.toml at %APPDATA%\zonvie\config.toml if it doesn't exist.
 fn createDefaultConfig(alloc: std.mem.Allocator) ConfigCreateResult {
-    const appdata = std.process.getEnvVarOwned(alloc, "APPDATA") catch return .err;
+    // 0.16: std.process.getEnvVarOwned was removed; env access goes through
+    // std.process.Environ. On Windows `.block = .global` reads the PEB-backed
+    // environment, and getAlloc returns owned memory freed with alloc.free.
+    const appdata = (std.process.Environ{ .block = .global }).getAlloc(alloc, "APPDATA") catch return .err;
     defer alloc.free(appdata);
 
     const dir_path = std.fs.path.join(alloc, &.{ appdata, "zonvie" }) catch return .err;
@@ -855,20 +866,20 @@ fn createDefaultConfig(alloc: std.mem.Allocator) ConfigCreateResult {
     defer alloc.free(file_path);
 
     // Skip if config already exists
-    if (std.fs.accessAbsolute(file_path, .{})) |_| {
+    if (std.Io.Dir.accessAbsolute(clock.io(), file_path, .{})) |_| {
         return .already_exists;
     } else |_| {}
 
     // Create directory if needed
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(clock.io(), dir_path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return .err,
     };
 
     // Write default config
-    const file = std.fs.createFileAbsolute(file_path, .{}) catch return .err;
-    defer file.close();
-    file.writeAll(default_config_toml) catch return .err;
+    const file = std.Io.Dir.createFileAbsolute(clock.io(), file_path, .{}) catch return .err;
+    defer file.close(clock.io());
+    file.writeStreamingAll(clock.io(), default_config_toml) catch return .err;
     return .created;
 }
 

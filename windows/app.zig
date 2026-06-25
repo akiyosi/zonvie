@@ -306,9 +306,9 @@ pub const PendingExternalWindow = struct {
 /// tracking, and cursor row info. GPU resources (VBs, scratch buffers)
 /// remain on the owning window struct.
 pub const SurfaceState = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
-    row_verts: std.ArrayListUnmanaged(RowVerts) = .{},
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    row_verts: std.ArrayListUnmanaged(RowVerts) = .empty,
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     dirty_rows: std.AutoHashMapUnmanaged(u32, void) = .{},
     paint_full: bool = true,
@@ -364,9 +364,9 @@ pub const SurfaceState = struct {
 /// Three of these rotate inside TripleBufferedSurface.
 /// Row data is accessed via row_map → SlotPool indirection (COW shared slots).
 pub const VertexSet = struct {
-    row_map: std.ArrayListUnmanaged(RowMapping) = .{}, // logical row → physical slot index
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .{},
-    flat_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_map: std.ArrayListUnmanaged(RowMapping) = .empty, // logical row → physical slot index
+    cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    flat_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     rows: u32 = 0,
     cols: u32 = 0,
@@ -440,7 +440,7 @@ pub const TripleBufferedSurface = struct {
     pool: SlotPool = .{}, // Shared slot pool across all sets
 
     // --- rotation_mu protects these fields ---
-    rotation_mu: std.Thread.Mutex = .{},
+    rotation_mu: std.Io.Mutex = .init,
     write_index: u8 = 0,
     committed_index: u8 = 1,
     flush_source_index: u8 = 1,
@@ -485,8 +485,8 @@ pub const TripleBufferedSurface = struct {
 
     /// Check if a free set exists (read-only, short lock).
     pub fn hasFreeSet(self: *TripleBufferedSurface) bool {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
         const ci = self.committed_index;
         for (0..SET_COUNT) |i| {
             const idx: u8 = @intCast(i);
@@ -503,8 +503,8 @@ pub const TripleBufferedSurface = struct {
         var ci: u8 = undefined;
 
         {
-            self.rotation_mu.lock();
-            defer self.rotation_mu.unlock();
+            self.rotation_mu.lockUncancelable(core.clock.io());
+            defer self.rotation_mu.unlock(core.clock.io());
             ci = self.committed_index;
             for (0..SET_COUNT) |i| {
                 const idx: u8 = @intCast(i);
@@ -549,8 +549,8 @@ pub const TripleBufferedSurface = struct {
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
         if (!self.is_in_flush) return;
 
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
 
         // Merge flush_dirty into pending_dirty.
         if (self.flush_dirty.bit_length > 0) {
@@ -632,8 +632,8 @@ pub const TripleBufferedSurface = struct {
     /// Acquire the committed set for painting. Returns snapshot info.
     /// Caller must call releaseFromPaint when done.
     pub fn acquireForPaint(self: *TripleBufferedSurface) PaintSnapshot {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
 
         const ci = self.committed_index;
         self.ui_read_refcount[ci] += 1;
@@ -690,8 +690,8 @@ pub const TripleBufferedSurface = struct {
     /// Release the committed set after painting. Returns true if
     /// InvalidateRect is needed (pending dirty accumulated during paint).
     pub fn releaseFromPaint(self: *TripleBufferedSurface, index: u8) bool {
-        self.rotation_mu.lock();
-        defer self.rotation_mu.unlock();
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
         self.ui_read_refcount[index] -= 1;
         self.paint_nesting -= 1;
         // When nesting returns to 0, check if new dirty state accumulated.
@@ -1164,7 +1164,7 @@ pub const TablineState = struct {
 /// (owned by the UI thread) so that the core thread can write vertices
 /// without touching GPU resources.
 pub const RowVertsCPU = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // CPU-side generation increments when verts are replaced by onVerticesRow().
     gen: u64 = 0,
@@ -1194,7 +1194,7 @@ pub const SLOT_NONE: u16 = std.math.maxInt(u16);
 
 /// Physical row slot. Ref-counted vertex buffer shared across VertexSets.
 pub const RowSlot = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
     ref_count: u16 = 0, // 0=unused, 1=exclusive, 2+=shared
     origin_row: u32 = 0, // Logical row at vertex generation time (viewport Y translation)
     ver: u64 = 0, // Content version (incremented on each write)
@@ -1207,8 +1207,8 @@ pub const RowMapping = struct {
 
 /// Pool of physical row slots shared across all VertexSets in a TBS.
 pub const SlotPool = struct {
-    slots: std.ArrayListUnmanaged(RowSlot) = .{},
-    free_list: std.ArrayListUnmanaged(u16) = .{},
+    slots: std.ArrayListUnmanaged(RowSlot) = .empty,
+    free_list: std.ArrayListUnmanaged(u16) = .empty,
 
     /// Acquire an unused slot. Returns null on OOM.
     pub fn acquireSlot(self: *SlotPool, alloc: std.mem.Allocator) ?u16 {
@@ -1251,7 +1251,7 @@ pub const SlotPool = struct {
 /// Legacy combined struct for backward compatibility during migration.
 /// Contains both CPU vertex data and GPU VB resources.
 pub const RowVerts = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{},
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // Row-local GPU VB (D3D11). Kept in App so WM_PAINT can bind per row.
     vb: ?*c.ID3D11Buffer = null,
@@ -1301,16 +1301,16 @@ pub const ExternalWindow = struct {
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     is_float_external: bool = false, // True if float-origin external (nvim_open_win external=true)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
-    flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .{}, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
+    flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
     // Per-window GPU vertex buffers for cursor and scrollbar overlays (row-mode rendering).
     cursor_vb: ?*c.ID3D11Buffer = null,
     cursor_vb_bytes: usize = 0,
     // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent scratch buffer for shiftRowVBs; sized to abs(vb_shift) before each shift.
     // Owned here (not on stack) so large scrolls never overflow a fixed stack array.
-    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
     scrollbar_vb: ?*c.ID3D11Buffer = null,
     scrollbar_vb_bytes: usize = 0,
 
@@ -1345,8 +1345,8 @@ pub const ExternalWindow = struct {
 
     // Scratch buffer for vertex copy during paint (avoids per-frame alloc).
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
-    paint_scratch: std.ArrayListUnmanaged(Vertex) = .{},
-    paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .{},
+    paint_scratch: std.ArrayListUnmanaged(Vertex) = .empty,
+    paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .empty,
 
     pub fn recomputeVertCount(self: *ExternalWindow) void {
         self.vert_count = self.surface.recomputeVertCount();
@@ -1859,13 +1859,13 @@ pub fn drawSurfaceRowsVBFromSlots(
         const vb = &row_vbs[@intCast(row)];
         if (vb.uploaded_slot != mapping.slot or vb.uploaded_ver != slot.ver or vb.vb == null or vb.vb_bytes < src.len * @sizeOf(Vertex)) {
             const need_bytes = src.len * @sizeOf(Vertex);
-            const t_upload_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+            const t_upload_start = if (log_enabled) core.clock.nowNs() else 0;
             _ = ensureRowVBReadyFromSlot(g, vb, mapping, pool) catch {
                 metrics.skipped_empty += 1;
                 continue;
             };
             if (log_enabled) {
-                metrics.vb_upload_ns += std.time.nanoTimestamp() - t_upload_start;
+                metrics.vb_upload_ns += core.clock.nowNs() - t_upload_start;
             }
             metrics.vb_upload_rows += 1;
             metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
@@ -1913,13 +1913,13 @@ pub fn drawSurfaceRowsVBFromSlots(
             }
         }
 
-        const t_draw_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
         g.drawVB(vb.vb.?, src.len) catch {
             metrics.skipped_empty += 1;
             continue;
         };
         if (log_enabled) {
-            metrics.draw_vb_ns += std.time.nanoTimestamp() - t_draw_start;
+            metrics.draw_vb_ns += core.clock.nowNs() - t_draw_start;
         }
         metrics.drawn_rows += 1;
     }
@@ -2177,7 +2177,7 @@ pub const RowModeDrawResult = struct {
 pub fn drawRowModeSetupAndRows(
     g: *d3d11.Renderer,
     alloc: std.mem.Allocator,
-    app_mu: *std.Thread.Mutex,
+    app_mu: *std.Io.Mutex,
     row_verts_list: *std.ArrayListUnmanaged(RowVerts),
     rows_to_draw: []const u32,
     bloom_verts: *std.ArrayListUnmanaged(Vertex),
@@ -2226,8 +2226,8 @@ pub fn drawRowModeSetupAndRows(
 
     // 3. Lock, read row_verts slice, draw row VBs, collect bloom verts, unlock.
     {
-        app_mu.lock();
-        defer app_mu.unlock();
+        app_mu.lockUncancelable(core.clock.io());
+        defer app_mu.unlock(core.clock.io());
 
         const row_verts = row_verts_list.items;
 
@@ -2353,13 +2353,13 @@ pub fn drawSurfaceRowsVB(
 
         if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(Vertex)) {
             const need_bytes = src.len * @sizeOf(Vertex);
-            const t_upload_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+            const t_upload_start = if (log_enabled) core.clock.nowNs() else 0;
             _ = ensureRowVBReady(g, rv, src) catch {
                 metrics.skipped_empty += 1;
                 continue;
             };
             if (log_enabled) {
-                metrics.vb_upload_ns += std.time.nanoTimestamp() - t_upload_start;
+                metrics.vb_upload_ns += core.clock.nowNs() - t_upload_start;
             }
             metrics.vb_upload_rows += 1;
             metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
@@ -2415,13 +2415,13 @@ pub fn drawSurfaceRowsVB(
             }
         }
 
-        const t_draw_start = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
         g.drawVB(rv.vb.?, src.len) catch {
             metrics.skipped_empty += 1;
             continue;
         };
         if (log_enabled) {
-            metrics.draw_vb_ns += std.time.nanoTimestamp() - t_draw_start;
+            metrics.draw_vb_ns += core.clock.nowNs() - t_draw_start;
         }
         metrics.drawn_rows += 1;
     }
@@ -2639,7 +2639,7 @@ pub const App = struct {
     // Configuration loaded from config.toml
     config: config_mod.Config = .{},
 
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     hwnd: ?c.HWND = null,
     content_hwnd: ?c.HWND = null, // Child window for D3D11 rendering (when ext_tabline enabled)
@@ -2667,7 +2667,7 @@ pub const App = struct {
     external_windows: std.AutoHashMapUnmanaged(i64, ExternalWindow) = .{},
 
     // Pending external window creation requests (for UI thread processing)
-    pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .{},
+    pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .empty,
 
     // Monotonically increasing identifier assigned to each
     // PendingExternalWindow at enqueue. Used to bind WM_APP_CREATE_
@@ -2685,12 +2685,12 @@ pub const App = struct {
     saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int }) = .{},
 
     // Pending vertices for external windows that haven't been created yet
-    pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .{},
+    pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .empty,
 
     // ext_messages window state
     message_window: ?MessageWindow = null,
-    pending_messages: std.ArrayListUnmanaged(PendingMessageRequest) = .{},
-    display_messages: std.ArrayListUnmanaged(DisplayMessage) = .{}, // Stack of visible messages
+    pending_messages: std.ArrayListUnmanaged(PendingMessageRequest) = .empty,
+    display_messages: std.ArrayListUnmanaged(DisplayMessage) = .empty, // Stack of visible messages
 
     // ext_tabline state
     tabline_state: TablineState = .{},
@@ -2717,9 +2717,9 @@ pub const App = struct {
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
     tbs: TripleBufferedSurface = .{},
     // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
-    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .{},
+    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
@@ -2730,11 +2730,11 @@ pub const App = struct {
 
     // Scratch buffer for WM_PAINT(row): per-row vertex copy.
     // Reused to avoid per-paint alloc/free.
-    row_tmp_verts: std.ArrayListUnmanaged(Vertex) = .{},
+    row_tmp_verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // WM_PAINT(row) persistent buffers (avoid per-frame alloc/free)
-    wm_paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .{},
-    wm_paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .{},
+    wm_paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
+    wm_paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
 
     // Cursor overlay VB for row-mode (avoid extra g.drawEx per paint).
     cursor_vb: ?*c.ID3D11Buffer = null,
@@ -2745,7 +2745,7 @@ pub const App = struct {
     row_mode_max_row_end: u32 = 0,
 
     // ---- NEW: self-managed damage queue (avoid OS update region dependency) ----
-    paint_rects: std.ArrayListUnmanaged(c.RECT) = .{},
+    paint_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
 
     // Set by vertex callbacks when dirty state changes during a flush.
     // Checked and cleared by onFlushEnd to decide whether to InvalidateRect.
@@ -2768,9 +2768,9 @@ pub const App = struct {
 
     // --- IME state ---
     ime_composing: bool = false,
-    ime_composition_str: std.ArrayListUnmanaged(u16) = .{}, // UTF-16 composition string
-    ime_composition_utf8: std.ArrayListUnmanaged(u8) = .{}, // UTF-8 for display
-    ime_clause_info: std.ArrayListUnmanaged(u32) = .{}, // clause boundaries
+    ime_composition_str: std.ArrayListUnmanaged(u16) = .empty, // UTF-16 composition string
+    ime_composition_utf8: std.ArrayListUnmanaged(u8) = .empty, // UTF-8 for display
+    ime_clause_info: std.ArrayListUnmanaged(u32) = .empty, // clause boundaries
     ime_cursor_pos: u32 = 0, // cursor position in composition
     ime_target_start: u32 = 0, // start of target clause (thick underline)
     ime_target_end: u32 = 0, // end of target clause
@@ -2950,7 +2950,7 @@ pub const App = struct {
     connect_addr: ?[]const u8 = null,
 
     // Extra arguments to pass to nvim (not recognized as zonvie arguments)
-    nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .{},
+    nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty,
 
     // CLI --nvim override (points into args allocation, no ownership)
     cli_nvim_path: ?[]const u8 = null,
@@ -2977,7 +2977,7 @@ pub const App = struct {
 
     // Pending glyphs queue: glyphs requested before atlas was ready
     // (for parallel nvim spawn + renderer init)
-    pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .{},
+    pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .empty,
 
     // Cached visible grids for non-blocking UI queries (UI thread only).
     // Updated on successful tryLock; stale data used when grid_mu is contended.

@@ -50,8 +50,8 @@ pub fn onMsgShow(
     }
 
     // Queue message for UI thread processing
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     var req = app_mod.PendingMessageRequest{};
     @memcpy(req.text[0..msg_len], msg_text[0..msg_len]);
@@ -136,10 +136,10 @@ pub fn handleMsgMiniOrExtFloat(
         .mini => {
             // Update mini window
             const idx = @intFromEnum(mini_id);
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
             app.mini_windows[idx].text_len = text_len;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (app.hwnd) |main_hwnd| {
                 _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
@@ -147,8 +147,8 @@ pub fn handleMsgMiniOrExtFloat(
         },
         .ext_float => {
             // Queue message for ext_float display
-            app.mu.lock();
-            defer app.mu.unlock();
+            app.mu.lockUncancelable(core.clock.io());
+            defer app.mu.unlock(core.clock.io());
 
             var req = app_mod.PendingMessageRequest{};
             @memcpy(req.text[0..text_len], text_buf[0..text_len]);
@@ -181,10 +181,10 @@ pub fn handleMsgMiniOrExtFloat(
         else => {
             // Fallback to mini for other views (confirm, split)
             const idx = @intFromEnum(mini_id);
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
             app.mini_windows[idx].text_len = text_len;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (app.hwnd) |main_hwnd| {
                 _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
@@ -218,10 +218,10 @@ pub fn updateMiniFromCallback(app: *App, id: app_mod.MiniWindowId, chunks: [*]co
     if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\"\n", .{ @tagName(id), chunk_count, text_buf[0..text_len] });
 
     // Update state and post to UI thread
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
     app.mini_windows[idx].text_len = text_len;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
@@ -268,8 +268,8 @@ pub fn onMsgHistoryShow(
     if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: entries={d} prev_cmd={d} content_len={d}\n", .{ entry_count, prev_cmd, content_len });
 
     // Queue for UI thread display - reuse message system for split view
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     var req = app_mod.PendingMessageRequest{};
     const copy_len = @min(content_len, req.text.len);
@@ -514,15 +514,15 @@ pub fn hideMessageWindow(app: *App) void {
 /// Handles cmdline (keep center), popupmenu (keep top-left), and regular ext_windows (keep top-left).
 pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const ext_win = app.external_windows.getPtr(grid_id) orelse {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         return;
     };
 
     // Skip if window is pending close or doesn't need resize
     if (ext_win.is_pending_close or !ext_win.needs_window_resize) {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         return;
     }
 
@@ -531,7 +531,7 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     const window_h = ext_win.pending_window_h;
     const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
     ext_win.needs_window_resize = false;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Get current window rect (outside lock)
     var current_rect: c.RECT = undefined;
@@ -589,7 +589,7 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
 
     // Clear suppress_resize_callback after SetWindowPos completes.
     // (SetWindowPos sends WM_SIZE synchronously, so by this point it's already handled.)
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     if (app.external_windows.getPtr(grid_id)) |ew| {
         ew.suppress_resize_callback = false;
     }
@@ -600,7 +600,7 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         app.cmdline_saved_x = null;
         app.cmdline_saved_y = null;
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 }
 
 /// Update ext-float (msg_show/msg_history) window positions
@@ -616,7 +616,7 @@ pub fn updateExtFloatPositions(app: *App) void {
         app.last_cursor_grid;
 
     // Get data while mutex is locked
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
     const pos_mode = app.config.messages.msg_pos.ext_float;
@@ -638,7 +638,7 @@ pub fn updateExtFloatPositions(app: *App) void {
         app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
     else
         0;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Calculate target rect based on position mode (mutex unlocked, safe to call core functions)
     var target_rect: c.RECT = undefined;
@@ -769,11 +769,11 @@ pub fn updateMiniWindows(app: *App) void {
     const main_hwnd = app.hwnd orelse return;
 
     // Get cell dimensions and config
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px + app.linespace_px;
     const mini_pos_mode = app.config.messages.msg_pos.mini;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Query the core directly for the current cursor grid instead of reading
     // the cached app.last_cursor_grid. The cache is updated only via posted
@@ -804,9 +804,9 @@ pub fn updateMiniWindows(app: *App) void {
         },
         .window => {
             // Window-based: check if cursor is in external window
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const ext_win = app.external_windows.get(cursor_grid);
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (ext_win) |ew| {
                 var rect: c.RECT = undefined;
@@ -844,9 +844,9 @@ pub fn updateMiniWindows(app: *App) void {
             var grid_bottom_px: c_int = client_rect.bottom;
 
             // Check if cursor is in external window first
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const ext_win = app.external_windows.get(cursor_grid);
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (ext_win) |ew| {
                 var rect: c.RECT = undefined;
@@ -883,13 +883,13 @@ pub fn updateMiniWindows(app: *App) void {
     // Count visible minis and build stack order
     var stacked_height_px: c_int = 0;
     for (0..3) |idx| {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const text_len = app.mini_windows[idx].text_len;
         var text_buf: [256]u8 = undefined;
         if (text_len > 0) {
             @memcpy(text_buf[0..text_len], app.mini_windows[idx].text[0..text_len]);
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (text_len == 0) {
             // Hide this mini window
@@ -1001,10 +1001,10 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     var bg_rgb: c.COLORREF = c.RGB(38, 38, 46); // Default dark background
     var fg_rgb: c.COLORREF = c.RGB(255, 255, 255); // Default white text
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const fg = app.colorscheme_fg;
         const bg = app.colorscheme_bg;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (bg != 0xFFFFFFFF and bg != 0) {
             // Apply brightness adjustment
@@ -1114,7 +1114,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.GetClientRect(hwnd, &rect);
 
     // Find which mini window this is
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
     inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
@@ -1129,17 +1129,17 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
             }
         }
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Get colors from cached Normal highlight (avoids zonvie_core_get_hl_by_name
     // which locks grid_mu — calling it during WM_PAINT creates deadlock risk).
     var bg_rgb: c.COLORREF = c.RGB(30, 30, 38);
     var fg_rgb: c.COLORREF = c.RGB(180, 180, 180);
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const fg = app.colorscheme_fg;
         const bg = app.colorscheme_bg;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (bg != 0xFFFFFFFF and bg != 0) {
             // Darken background slightly for mini windows

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const toml = @import("toml");
 const redraw_handler = @import("redraw_handler.zig");
+const clock = @import("clock.zig");
 
 /// Message event types for routing
 pub const MsgEvent = enum {
@@ -330,10 +331,13 @@ pub const Config = struct {
     pub fn loadFromPath(alloc: std.mem.Allocator, config_path: []const u8) Self {
         var config = Self{ .alloc = alloc };
 
-        const file = std.fs.openFileAbsolute(config_path, .{}) catch return config;
-        defer file.close();
+        const io = clock.io();
+        const file = std.Io.Dir.openFileAbsolute(io, config_path, .{}) catch return config;
+        defer file.close(io);
 
-        const content = file.readToEndAlloc(alloc, 1024 * 1024) catch return config;
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buf);
+        const content = file_reader.interface.allocRemaining(alloc, .limited(1024 * 1024)) catch return config;
         defer alloc.free(content);
 
         config.parseToml(content) catch {
@@ -438,7 +442,7 @@ pub const Config = struct {
 
             // Parse routes
             if (m.routes) |routes| {
-                var route_list: std.ArrayList(MsgRoute) = .{};
+                var route_list: std.ArrayList(MsgRoute) = .empty;
                 for (routes) |r| {
                     if (r.event) |event_str| {
                         if (MsgEvent.fromString(event_str)) |event| {
@@ -447,7 +451,7 @@ pub const Config = struct {
                             // Parse kinds array
                             var kinds: ?[]const []const u8 = null;
                             if (r.kind) |kind_arr| {
-                                var kinds_list: std.ArrayList([]const u8) = .{};
+                                var kinds_list: std.ArrayList([]const u8) = .empty;
                                 for (kind_arr) |k| {
                                     const duped = alloc.dupe(u8, k) catch continue;
                                     kinds_list.append(alloc, duped) catch {
@@ -569,7 +573,7 @@ pub const Config = struct {
                 }
             }
             if (s.paths) |paths_in| {
-                var list: std.ArrayList([]const u8) = .{};
+                var list: std.ArrayList([]const u8) = .empty;
                 for (paths_in) |p| {
                     const duped = alloc.dupe(u8, p) catch continue;
                     list.append(alloc, duped) catch {
@@ -706,7 +710,7 @@ pub fn splitFontFamilyList(
     arena: std.mem.Allocator,
     raw: []const u8,
 ) ![]const []const u8 {
-    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t");
@@ -739,7 +743,7 @@ pub fn formatFontFamilyAsCandidateList(
     default_size_pt: f64,
     fallback_name: []const u8,
 ) ![]const u8 {
-    var combined: std.ArrayListUnmanaged(u8) = .{};
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
 
     if (raw.len != 0) {
         const cands = try splitFontFamilyList(arena, raw);

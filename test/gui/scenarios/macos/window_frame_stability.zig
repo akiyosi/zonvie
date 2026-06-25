@@ -9,6 +9,7 @@
 // asserts the main window frame reproduces within tolerance.
 
 const std = @import("std");
+const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
@@ -19,12 +20,12 @@ const tol_px = 10.0; // the bug lost whole rows (>= ~30 px) per launch
 
 /// Poll until the main-window bounds stop changing, then return them.
 fn waitStableBounds(g: *Gui) !platform.Bounds {
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = gui_io.Timer.start();
     var last: ?platform.Bounds = null;
     var same: u32 = 0;
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 20_000) return error.Timeout;
-        std.Thread.sleep(250 * std.time.ns_per_ms);
+        gui_io.sleepNs(250 * std.time.ns_per_ms);
         const b = platform.mainWindowBoundsForPid(g.app_pid) orelse continue;
         if (last) |l| {
             if (l.x == b.x and l.y == b.y and l.w == b.w and l.h == b.h) {
@@ -40,8 +41,8 @@ fn waitStableBounds(g: *Gui) !platform.Bounds {
 
 pub fn run(alloc: std.mem.Allocator) !void {
     // Fresh defaults: no saved frame from previous runs (or the user).
-    std.fs.cwd().deleteTree(home_dir) catch {};
-    std.fs.cwd().makePath(home_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(gui_io.io(), home_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), home_dir) catch {};
 
     var g = try Gui.init(alloc, .{
         .app_args = &.{ "--exttabline", "--log", "tmp/gui_app.log" },

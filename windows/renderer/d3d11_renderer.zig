@@ -151,7 +151,7 @@ pub const Renderer = struct {
     hwnd: c.HWND,
 
     // Mutex to protect D3D11 device context access (context is single-threaded)
-    ctx_mu: std.Thread.Mutex = .{},
+    ctx_mu: std.Io.Mutex = .init,
 
     // D3D11 core
     device: ?*c.ID3D11Device = null,
@@ -240,7 +240,7 @@ pub const Renderer = struct {
     // User-supplied custom post-process shaders (Phase 2 macOS parity).
     // Loaded from config `[shaders].paths` after renderer init. Empty when
     // `shaders.enabled = false` or no paths configured.
-    custom_shader_pipelines: std.ArrayListUnmanaged(CustomShaderPipeline) = .{},
+    custom_shader_pipelines: std.ArrayListUnmanaged(CustomShaderPipeline) = .empty,
     custom_shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
     // Scratch copy of back_tex used as the pixel-shader input when running
     // the custom shader pass (reading and writing the same texture is
@@ -466,12 +466,12 @@ pub const Renderer = struct {
     }
 
     pub fn lockContext(self: *Renderer) void {
-        self.ctx_mu.lock();
+        self.ctx_mu.lockUncancelable(core.clock.io());
     }
 
     /// Unlock the D3D11 device context.
     pub fn unlockContext(self: *Renderer) void {
-        self.ctx_mu.unlock();
+        self.ctx_mu.unlock(core.clock.io());
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -769,7 +769,7 @@ pub const Renderer = struct {
         opts: DrawOpts,
     ) !void {
         var t_draw_start: i128 = 0;
-        if (applog.isEnabled()) t_draw_start = std.time.nanoTimestamp();
+        if (applog.isEnabled()) t_draw_start = core.clock.nowNs();
 
         try self.resize();
 
@@ -1215,7 +1215,7 @@ pub const Renderer = struct {
 
         // Performance log: draw_total
         if (applog.isEnabled() and t_draw_start != 0) {
-            const t_draw_end = std.time.nanoTimestamp();
+            const t_draw_end = core.clock.nowNs();
             const dur_us = @divTrunc(@max(0, t_draw_end - t_draw_start), 1000);
             applog.appLog("[perf] draw_total main={d} cursor={d} us={d}\n", .{ main.len, cursor.len, dur_us });
         }
@@ -1418,7 +1418,7 @@ pub const Renderer = struct {
 
     pub fn presentOnlyFromBackRectsNoResize(self: *Renderer, rects: []const c.RECT) !void {
         var t_present_start: i128 = 0;
-        if (applog.isEnabled()) t_present_start = std.time.nanoTimestamp();
+        if (applog.isEnabled()) t_present_start = core.clock.nowNs();
 
         const ctx = self.ctx orelse return error.NoContext;
         const sc = self.swapchain orelse return error.NoSwapchain;
@@ -1512,7 +1512,7 @@ pub const Renderer = struct {
 
         // Performance log: present
         if (applog.isEnabled() and t_present_start != 0) {
-            const t_present_end = std.time.nanoTimestamp();
+            const t_present_end = core.clock.nowNs();
             const present_us = @divTrunc(@max(0, t_present_end - t_present_start), 1000);
             applog.appLog("[perf] present rects={d} us={d}\n", .{ rects.len, present_us });
         }
@@ -1543,7 +1543,7 @@ pub const Renderer = struct {
         var t_copy_ns: i128 = 0;
         var t_cursor_ns: i128 = 0;
         if (log_enabled) {
-            t0_ns = std.time.nanoTimestamp();
+            t0_ns = core.clock.nowNs();
         }
 
         const force_full_copy_effective = force_full_copy or !self.has_presented_once;
@@ -1636,14 +1636,14 @@ pub const Renderer = struct {
             }
         }
         if (log_enabled) {
-            t_copy_ns = std.time.nanoTimestamp();
+            t_copy_ns = core.clock.nowNs();
         }
 
         _ = cursor_vb;
         _ = cursor_vert_count;
         _ = cursor_scissor;
         if (log_enabled) {
-            t_cursor_ns = std.time.nanoTimestamp();
+            t_cursor_ns = core.clock.nowNs();
         }
 
         // When the custom shader pass wrote the full frame, every pixel
@@ -1695,7 +1695,7 @@ pub const Renderer = struct {
             applog.appLog("[d3d] presentFromBackRects: full copy fallback\n", .{});
         }
         if (log_enabled) {
-            const t_done_ns: i128 = std.time.nanoTimestamp();
+            const t_done_ns: i128 = core.clock.nowNs();
             const copy_us: u64 = @intCast(@divTrunc(@max(0, t_copy_ns - t0_ns), 1000));
             const cursor_us: u64 = @intCast(@divTrunc(@max(0, t_cursor_ns - t_copy_ns), 1000));
             const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_cursor_ns), 1000));
@@ -2128,7 +2128,7 @@ pub const Renderer = struct {
 
         // Performance: VB upload timing
         var t_vb_start: i128 = 0;
-        if (applog.isEnabled()) t_vb_start = std.time.nanoTimestamp();
+        if (applog.isEnabled()) t_vb_start = core.clock.nowNs();
 
         const hr = mapDiscard(ctx, res, &mapped);
         if (c.FAILED(hr)) return error.D3DMapFailed;
@@ -2146,7 +2146,7 @@ pub const Renderer = struct {
 
         // Performance log: VB upload
         if (applog.isEnabled() and t_vb_start != 0) {
-            const t_vb_end = std.time.nanoTimestamp();
+            const t_vb_end = core.clock.nowNs();
             const vb_us = @divTrunc(@max(0, t_vb_end - t_vb_start), 1000);
             applog.appLog("[perf] draw_vb_upload bytes={d} us={d}\n", .{ bytes, vb_us });
         }
@@ -2169,7 +2169,7 @@ pub const Renderer = struct {
 
         // Performance: Draw call timing
         var t_draw_start: i128 = 0;
-        if (applog.isEnabled()) t_draw_start = std.time.nanoTimestamp();
+        if (applog.isEnabled()) t_draw_start = core.clock.nowNs();
 
         // Draw
         const draw_fn = ctx_vtbl.*.Draw orelse return error.D3DDrawMissing;
@@ -2177,7 +2177,7 @@ pub const Renderer = struct {
 
         // Performance log: Draw call
         if (applog.isEnabled() and t_draw_start != 0) {
-            const t_draw_end = std.time.nanoTimestamp();
+            const t_draw_end = core.clock.nowNs();
             const draw_us = @divTrunc(@max(0, t_draw_end - t_draw_start), 1000);
             applog.appLog("[perf] draw_call verts={d} us={d}\n", .{ verts.len, draw_us });
         }
@@ -3299,7 +3299,7 @@ pub const Renderer = struct {
         if (std.mem.indexOf(u8, hlsl, main_body_target) == null) return error.PatternNotFound;
 
         // Work in an ArrayList; build up via targeted replacements.
-        var out = std.ArrayListUnmanaged(u8){};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(alloc);
         try out.appendSlice(alloc, hlsl);
 
@@ -3333,12 +3333,14 @@ pub const Renderer = struct {
         dev: *c.ID3D11Device,
         source_path: []const u8,
     ) CustomShaderCompileError!CustomShaderPipeline {
-        const file = std.fs.cwd().openFile(source_path, .{}) catch |e| {
+        const file = std.Io.Dir.cwd().openFile(core.clock.io(), source_path, .{}) catch |e| {
             applog.appLog("[CustomShader] open failed {s}: {any}\n", .{ source_path, e });
             return CustomShaderCompileError.FileOpenFailed;
         };
-        defer file.close();
-        const glsl = file.readToEndAlloc(self.alloc, 1024 * 1024) catch {
+        defer file.close(core.clock.io());
+        var rbuf: [4096]u8 = undefined;
+        var fr = file.reader(core.clock.io(), &rbuf);
+        const glsl = fr.interface.allocRemaining(self.alloc, .limited(1024 * 1024)) catch {
             return CustomShaderCompileError.FileReadFailed;
         };
         defer self.alloc.free(glsl);

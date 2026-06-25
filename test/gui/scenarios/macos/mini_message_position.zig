@@ -13,6 +13,7 @@
 // window hugs the main window's bottom-right corner instead of the float's.
 
 const std = @import("std");
+const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
@@ -23,12 +24,12 @@ const tol_px = 150.0; // float-anchored placement is off by several hundred px
 
 /// Poll until the main-window bounds stop changing, then return them.
 fn waitStableMainBounds(g: *Gui) !platform.Bounds {
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = gui_io.Timer.start();
     var last: ?platform.Bounds = null;
     var same: u32 = 0;
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 15_000) return error.Timeout;
-        std.Thread.sleep(250 * std.time.ns_per_ms);
+        gui_io.sleepNs(250 * std.time.ns_per_ms);
         const b = platform.mainWindowBoundsForPid(g.app_pid) orelse continue;
         if (last) |l| {
             if (l.x == b.x and l.y == b.y and l.w == b.w and l.h == b.h) {
@@ -75,7 +76,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // showcmd minis may also appear — same anchor logic, equally valid).
     // Minis stack upward from the anchor, so every new window must be
     // right-aligned and the bottom-most must sit at the main window bottom.
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = gui_io.Timer.start();
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 10_000) return error.Timeout;
 
@@ -110,6 +111,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
             }
             return;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        gui_io.sleepNs(100 * std.time.ns_per_ms);
     }
 }

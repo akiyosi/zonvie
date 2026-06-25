@@ -26,7 +26,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (line <= 10000) : (line += 1) {
         if (line > 1) try buf.appendSlice(alloc, ", ");
         // Use '->' ligature to exercise shaping (if available).
-        try std.fmt.format(buf.writer(alloc), "'line {d} -> data'", .{line});
+        try buf.print(alloc, "'line {d} -> data'", .{line});
     }
     try buf.appendSlice(alloc, "])");
 

@@ -16,12 +16,12 @@ pub const AtlasEnsureGlyphFn = *const fn (
 /// Persistent buffers for HarfBuzz shaping output.
 /// Reuse across calls to avoid per-call heap allocations on the hot path.
 pub const ShapingBuffers = struct {
-    glyph_ids: std.ArrayListUnmanaged(u32) = .{},
-    clusters: std.ArrayListUnmanaged(u32) = .{},
-    x_adv: std.ArrayListUnmanaged(i32) = .{},
-    y_adv: std.ArrayListUnmanaged(i32) = .{},
-    x_off: std.ArrayListUnmanaged(i32) = .{},
-    y_off: std.ArrayListUnmanaged(i32) = .{},
+    glyph_ids: std.ArrayListUnmanaged(u32) = .empty,
+    clusters: std.ArrayListUnmanaged(u32) = .empty,
+    x_adv: std.ArrayListUnmanaged(i32) = .empty,
+    y_adv: std.ArrayListUnmanaged(i32) = .empty,
+    x_off: std.ArrayListUnmanaged(i32) = .empty,
+    y_off: std.ArrayListUnmanaged(i32) = .empty,
 
     /// Ensure all buffers have at least `cap` capacity.
     pub fn ensureCapacity(self: *ShapingBuffers, alloc: std.mem.Allocator, cap: usize) !void {

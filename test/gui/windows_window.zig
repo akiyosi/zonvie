@@ -10,17 +10,24 @@
 const std = @import("std");
 const W = std.os.windows;
 
+// std.os.windows trimmed these in 0.16 (BOOL became a non-integer enum, and
+// RECT/WPARAM were removed); declare the plain Win32 shapes locally so the
+// extern signatures and callback returns keep their original integer semantics.
+const BOOL = i32;
+const WPARAM = usize;
+const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+
 extern "user32" fn EnumWindows(
-    cb: *const fn (W.HWND, W.LPARAM) callconv(.winapi) W.BOOL,
+    cb: *const fn (W.HWND, W.LPARAM) callconv(.winapi) BOOL,
     lparam: W.LPARAM,
-) callconv(.winapi) W.BOOL;
+) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowThreadProcessId(hwnd: W.HWND, pid: ?*W.DWORD) callconv(.winapi) W.DWORD;
-extern "user32" fn IsWindowVisible(hwnd: W.HWND) callconv(.winapi) W.BOOL;
+extern "user32" fn IsWindowVisible(hwnd: W.HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetClassNameW(hwnd: W.HWND, out: [*]u16, max: i32) callconv(.winapi) i32;
-extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *W.RECT) callconv(.winapi) W.BOOL;
-extern "user32" fn PostMessageW(hwnd: W.HWND, msg: W.UINT, wParam: W.WPARAM, lParam: W.LPARAM) callconv(.winapi) W.BOOL;
-extern "user32" fn SetForegroundWindow(hwnd: W.HWND) callconv(.winapi) W.BOOL;
-extern "user32" fn SetWindowPos(hwnd: W.HWND, after: ?W.HWND, x: i32, y: i32, cx: i32, cy: i32, flags: W.UINT) callconv(.winapi) W.BOOL;
+extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn PostMessageW(hwnd: W.HWND, msg: W.UINT, wParam: WPARAM, lParam: W.LPARAM) callconv(.winapi) BOOL;
+extern "user32" fn SetForegroundWindow(hwnd: W.HWND) callconv(.winapi) BOOL;
+extern "user32" fn SetWindowPos(hwnd: W.HWND, after: ?W.HWND, x: i32, y: i32, cx: i32, cy: i32, flags: W.UINT) callconv(.winapi) BOOL;
 
 const SWP_NOSIZE: W.UINT = 0x0001;
 const SWP_NOZORDER: W.UINT = 0x0004;
@@ -51,7 +58,7 @@ fn isZonvieClass(name: []const u16) bool {
 
 const CountCtx = struct { pid: W.DWORD, count: u32 };
 
-fn countCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
+fn countCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
     const ctx: *CountCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
     var wpid: W.DWORD = 0;
     _ = GetWindowThreadProcessId(hwnd, &wpid);
@@ -75,7 +82,7 @@ pub const Bounds = struct { x: f64, y: f64, w: f64, h: f64 };
 
 const BoundsCtx = struct { pid: W.DWORD, found: ?Bounds = null };
 
-fn boundsCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
+fn boundsCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
     const ctx: *BoundsCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
     var wpid: W.DWORD = 0;
     _ = GetWindowThreadProcessId(hwnd, &wpid);
@@ -83,7 +90,7 @@ fn boundsCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
     if (IsWindowVisible(hwnd) == 0) return 1;
     var buf: [64]u16 = undefined;
     if (!std.mem.eql(u16, classOf(hwnd, &buf), main_class)) return 1;
-    var r: W.RECT = undefined;
+    var r: RECT = undefined;
     if (GetWindowRect(hwnd, &r) == 0) return 1;
     ctx.found = .{
         .x = @floatFromInt(r.left),
@@ -103,7 +110,7 @@ pub fn mainWindowBoundsForPid(pid: i32) ?Bounds {
 
 const HandleCtx = struct { pid: W.DWORD, found: ?W.HWND = null };
 
-fn handleCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
+fn handleCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
     const ctx: *HandleCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
     var wpid: W.DWORD = 0;
     _ = GetWindowThreadProcessId(hwnd, &wpid);
@@ -134,7 +141,7 @@ pub fn sendWheel(pid: i32, notches: i32, x_px: i32, y_px: i32) bool {
     _ = SetForegroundWindow(hwnd);
     const delta: i32 = notches * WHEEL_DELTA;
     // wParam: high word = wheel delta (signed), low word = key state (0).
-    const wparam: W.WPARAM = @as(u32, @bitCast(delta)) << 16;
+    const wparam: WPARAM = @as(u32, @bitCast(delta)) << 16;
     // lParam: low word = x, high word = y (screen coordinates).
     const lo: u32 = @as(u32, @bitCast(x_px)) & 0xFFFF;
     const hi: u32 = @as(u32, @bitCast(y_px)) & 0xFFFF;
@@ -144,7 +151,7 @@ pub fn sendWheel(pid: i32, notches: i32, x_px: i32, y_px: i32) bool {
 
 const DumpCtx = struct { pid: W.DWORD };
 
-fn dumpCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
+fn dumpCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
     const ctx: *DumpCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
     var wpid: W.DWORD = 0;
     _ = GetWindowThreadProcessId(hwnd, &wpid);
@@ -154,7 +161,7 @@ fn dumpCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) W.BOOL {
     const name16 = classOf(hwnd, &buf);
     var name8: [64]u8 = undefined;
     const n8 = std.unicode.utf16LeToUtf8(&name8, name16) catch 0;
-    var r: W.RECT = std.mem.zeroes(W.RECT);
+    var r: RECT = std.mem.zeroes(RECT);
     _ = GetWindowRect(hwnd, &r);
     std.debug.print(
         "[gui]   window: class={s} x={d} y={d} w={d} h={d}\n",

@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const clock = @import("clock.zig");
 
 pub const ConnectError = error{
     InvalidAddress,
@@ -37,10 +38,11 @@ pub const ConnectError = error{
     PipeBusy,
     PipeOpenFailed,
     EventCreateFailed,
-} || std.net.TcpConnectToHostError ||
-    std.net.TcpConnectToAddressError ||
-    std.posix.SocketError ||
-    std.posix.ConnectError ||
+} || std.Io.net.HostName.ConnectError ||
+    std.Io.net.HostName.ValidateError ||
+    std.Io.net.IpAddress.ConnectError ||
+    std.Io.net.UnixAddress.ConnectError ||
+    std.Io.net.UnixAddress.InitError ||
     std.mem.Allocator.Error;
 
 /// Synchronous-blocking I/O abstraction over either a regular file/socket
@@ -48,19 +50,25 @@ pub const ConnectError = error{
 /// hides overlapped-I/O bookkeeping so FrameReader / writerThreadFn / the
 /// stderr pump can treat any backend uniformly.
 pub const Stream = union(enum) {
-    file: std.fs.File,
+    file: std.Io.File,
     win_pipe: *WindowsOverlappedPipe,
 
     pub fn read(self: Stream, buf: []u8) !usize {
         return switch (self) {
-            .file => |f| f.read(buf),
+            // readStreaming signals EOF with error.EndOfStream; the old
+            // std.fs.File.read returned 0 on EOF and callers (FrameReader)
+            // treat 0 as EOF. Map EndOfStream back to 0 to preserve that.
+            .file => |f| f.readStreaming(clock.io(), &.{buf}) catch |e| switch (e) {
+                error.EndOfStream => @as(usize, 0),
+                else => |other| return other,
+            },
             .win_pipe => |p| p.read(buf),
         };
     }
 
     pub fn writeAll(self: Stream, bytes: []const u8) !void {
         return switch (self) {
-            .file => |f| f.writeAll(bytes),
+            .file => |f| f.writeStreamingAll(clock.io(), bytes),
             .win_pipe => |p| p.writeAll(bytes),
         };
     }
@@ -80,7 +88,7 @@ pub const Stream = union(enum) {
     ///     been joined.
     pub fn close(self: Stream) void {
         switch (self) {
-            .file => |f| f.close(),
+            .file => |f| f.close(clock.io()),
             .win_pipe => |p| p.closeHandles(),
         }
     }
@@ -126,13 +134,22 @@ pub const Stream = union(enum) {
         if (builtin.os.tag == .windows) return;
         switch (self) {
             .file => |f| {
-                std.posix.shutdown(f.handle, .both) catch {};
+                // 0.16: shutdown moved to std.Io.net.Stream. The file's
+                // handle aliases the socket fd, so wrap it in a transient
+                // net Stream value to issue shutdown(SHUT_RDWR). address
+                // is unused by shutdown; a placeholder loopback satisfies
+                // the Socket layout.
+                const net_stream = std.Io.net.Stream{ .socket = .{
+                    .handle = f.handle,
+                    .address = .{ .ip4 = .loopback(0) },
+                } };
+                net_stream.shutdown(clock.io(), .both) catch {};
             },
             .win_pipe => {},
         }
     }
 
-    pub fn fromFile(f: std.fs.File) Stream {
+    pub fn fromFile(f: std.Io.File) Stream {
         return .{ .file = f };
     }
 };
@@ -142,6 +159,78 @@ pub const Stream = union(enum) {
 /// around an overlapped HANDLE plus per-direction completion events.
 pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
     const windows = std.os.windows;
+
+    // 0.16 trimmed the medium-level Win32 API out of std.os.windows:
+    // CreateFileW, CreateEventExW, CancelIoEx, GetOverlappedResult,
+    // ReadFile, WriteFile, the related access/flag constants, and the
+    // OVERLAPPED type were all removed. Declare them locally with the
+    // standard Win32 layout/signatures (copied verbatim from the 0.15
+    // std definitions) so behavior is unchanged. These live inside the
+    // Windows-only branch of this `if`, so they never affect the macOS
+    // build (which gets the `else struct {}` form below).
+    const OVERLAPPED = extern struct {
+        Internal: windows.ULONG_PTR,
+        InternalHigh: windows.ULONG_PTR,
+        DUMMYUNIONNAME: extern union {
+            DUMMYSTRUCTNAME: extern struct {
+                Offset: windows.DWORD,
+                OffsetHigh: windows.DWORD,
+            },
+            Pointer: ?windows.PVOID,
+        },
+        hEvent: ?windows.HANDLE,
+    };
+
+    const GENERIC_READ: windows.DWORD = 0x80000000;
+    const GENERIC_WRITE: windows.DWORD = 0x40000000;
+    const OPEN_EXISTING: windows.DWORD = 3;
+    const FILE_FLAG_OVERLAPPED: windows.DWORD = 0x40000000;
+    const EVENT_ALL_ACCESS: windows.DWORD = 0x1F0003;
+
+    extern "kernel32" fn CreateFileW(
+        lpFileName: windows.LPCWSTR,
+        dwDesiredAccess: windows.DWORD,
+        dwShareMode: windows.DWORD,
+        lpSecurityAttributes: ?*windows.SECURITY_ATTRIBUTES,
+        dwCreationDisposition: windows.DWORD,
+        dwFlagsAndAttributes: windows.DWORD,
+        hTemplateFile: ?windows.HANDLE,
+    ) callconv(.winapi) windows.HANDLE;
+
+    extern "kernel32" fn CreateEventExW(
+        lpEventAttributes: ?*windows.SECURITY_ATTRIBUTES,
+        lpName: ?windows.LPCWSTR,
+        dwFlags: windows.DWORD,
+        dwDesiredAccess: windows.DWORD,
+    ) callconv(.winapi) ?windows.HANDLE;
+
+    extern "kernel32" fn CancelIoEx(
+        hFile: windows.HANDLE,
+        lpOverlapped: ?*OVERLAPPED,
+    ) callconv(.winapi) windows.BOOL;
+
+    extern "kernel32" fn GetOverlappedResult(
+        hFile: windows.HANDLE,
+        lpOverlapped: *OVERLAPPED,
+        lpNumberOfBytesTransferred: *windows.DWORD,
+        bWait: windows.BOOL,
+    ) callconv(.winapi) windows.BOOL;
+
+    extern "kernel32" fn ReadFile(
+        hFile: windows.HANDLE,
+        lpBuffer: windows.LPVOID,
+        nNumberOfBytesToRead: windows.DWORD,
+        lpNumberOfBytesRead: ?*windows.DWORD,
+        lpOverlapped: ?*OVERLAPPED,
+    ) callconv(.winapi) windows.BOOL;
+
+    extern "kernel32" fn WriteFile(
+        hFile: windows.HANDLE,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: windows.DWORD,
+        lpNumberOfBytesWritten: ?*windows.DWORD,
+        lpOverlapped: ?*OVERLAPPED,
+    ) callconv(.winapi) windows.BOOL;
 
     handle: windows.HANDLE,
     read_event: windows.HANDLE,
@@ -188,18 +277,18 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, addr) catch return error.OutOfMemory;
         defer alloc.free(path_w);
 
-        const handle = windows.kernel32.CreateFileW(
+        const handle = CreateFileW(
             path_w.ptr,
-            windows.GENERIC_READ | windows.GENERIC_WRITE,
+            GENERIC_READ | GENERIC_WRITE,
             0, // no sharing
             null, // default security
-            windows.OPEN_EXISTING,
-            windows.FILE_FLAG_OVERLAPPED,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
             null,
         );
 
         if (handle == windows.INVALID_HANDLE_VALUE) {
-            return switch (windows.kernel32.GetLastError()) {
+            return switch (windows.GetLastError()) {
                 .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.ConnectionRefused,
                 .PIPE_BUSY => error.PipeBusy,
                 else => error.PipeOpenFailed,
@@ -210,10 +299,10 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         // Auto-reset events (dwFlags=0): GetOverlappedResult resets the
         // event when it returns successfully, so consecutive I/O calls
         // that reuse the same OVERLAPPED+event don't need ResetEvent.
-        const read_event = windows.kernel32.CreateEventExW(null, null, 0, windows.EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
+        const read_event = CreateEventExW(null, null, 0, EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
         errdefer windows.CloseHandle(read_event);
 
-        const write_event = windows.kernel32.CreateEventExW(null, null, 0, windows.EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
+        const write_event = CreateEventExW(null, null, 0, EVENT_ALL_ACCESS) orelse return error.EventCreateFailed;
         errdefer windows.CloseHandle(write_event);
 
         const self = try alloc.create(WindowsOverlappedPipe);
@@ -258,7 +347,7 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         // closeHandles already ran (e.g. via the alias close in socket
         // mode) and CancelIoEx has nothing new to do.
         if (self.handles_closed.swap(true, .acq_rel)) return;
-        _ = windows.kernel32.CancelIoEx(self.handle, null);
+        _ = CancelIoEx(self.handle, null);
     }
 
     /// Phase 2 of teardown: close the pipe HANDLE, the completion
@@ -281,10 +370,10 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
     /// Wait for an overlapped I/O to complete. Returns the byte count on
     /// success; returns null on broken-pipe / EOF (i.e. read EOF, write
     /// to closed pipe). Other errors propagate.
-    fn waitOverlapped(self: *WindowsOverlappedPipe, overlapped: *windows.OVERLAPPED) !?windows.DWORD {
+    fn waitOverlapped(self: *WindowsOverlappedPipe, overlapped: *OVERLAPPED) !?windows.DWORD {
         var bytes: windows.DWORD = 0;
-        if (windows.kernel32.GetOverlappedResult(self.handle, overlapped, &bytes, @intFromBool(true)) == 0) {
-            return switch (windows.kernel32.GetLastError()) {
+        if (!GetOverlappedResult(self.handle, overlapped, &bytes, windows.BOOL.fromBool(true)).toBool()) {
+            return switch (windows.GetLastError()) {
                 .BROKEN_PIPE, .HANDLE_EOF => null,
                 .OPERATION_ABORTED => error.OperationAborted,
                 .NETNAME_DELETED => error.ConnectionResetByPeer,
@@ -305,15 +394,15 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
         // would not catch.
         if (self.handles_closed.load(.acquire)) return 0;
 
-        var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
+        var overlapped: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
         overlapped.hEvent = self.read_event;
 
         const want: windows.DWORD = @intCast(@min(buf.len, std.math.maxInt(windows.DWORD)));
         var bytes_read: windows.DWORD = 0;
 
-        const ok = windows.kernel32.ReadFile(self.handle, buf.ptr, want, &bytes_read, &overlapped);
-        if (ok == 0) {
-            switch (windows.kernel32.GetLastError()) {
+        const ok = ReadFile(self.handle, buf.ptr, want, &bytes_read, &overlapped);
+        if (!ok.toBool()) {
+            switch (windows.GetLastError()) {
                 .IO_PENDING => {
                     // Race recovery: closeHandles may have fired between
                     // our pre-check and ReadFile. The prior CancelIoEx
@@ -323,7 +412,7 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
                     // flag and cancel this specific OVERLAPPED if so;
                     // GetOverlappedResult will then return ABORTED quickly.
                     if (self.handles_closed.load(.acquire)) {
-                        _ = windows.kernel32.CancelIoEx(self.handle, &overlapped);
+                        _ = CancelIoEx(self.handle, &overlapped);
                     }
                 },
                 .BROKEN_PIPE, .HANDLE_EOF => return 0,
@@ -352,15 +441,15 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
             // in closeHandles' swap).
             if (self.handles_closed.load(.acquire)) return error.OperationAborted;
 
-            var overlapped: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED);
+            var overlapped: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
             overlapped.hEvent = self.write_event;
 
             const want: windows.DWORD = @intCast(@min(bytes.len - idx, std.math.maxInt(windows.DWORD)));
             var bytes_written: windows.DWORD = 0;
 
-            const ok = windows.kernel32.WriteFile(self.handle, bytes.ptr + idx, want, &bytes_written, &overlapped);
-            if (ok == 0) {
-                switch (windows.kernel32.GetLastError()) {
+            const ok = WriteFile(self.handle, bytes.ptr + idx, want, &bytes_written, &overlapped);
+            if (!ok.toBool()) {
+                switch (windows.GetLastError()) {
                     .IO_PENDING => {
                         // Race recovery: closeHandles may have fired
                         // between our pre-check and WriteFile. The prior
@@ -371,7 +460,7 @@ pub const WindowsOverlappedPipe = if (builtin.os.tag == .windows) struct {
                         // OVERLAPPED so GetOverlappedResult returns
                         // ABORTED quickly.
                         if (self.handles_closed.load(.acquire)) {
-                            _ = windows.kernel32.CancelIoEx(self.handle, &overlapped);
+                            _ = CancelIoEx(self.handle, &overlapped);
                         }
                     },
                     .BROKEN_PIPE => return error.BrokenPipe,
@@ -518,16 +607,31 @@ pub fn connectListenAddr(alloc: std.mem.Allocator, addr: []const u8) ConnectErro
         };
     }
 
+    const io = clock.io();
     const stream = switch (parsed) {
-        .tcp => |t| try std.net.tcpConnectToHost(alloc, t.host, t.port),
-        .unix => |p| try std.net.connectUnixSocket(p),
+        .tcp => |t| blk: {
+            // 0.16 split host connect by address kind: IP literals (incl.
+            // IPv6 "::1") go through IpAddress.connect; DNS names through
+            // HostName.connect. The old tcpConnectToHost handled both, so
+            // try the literal path first and fall back to name resolution.
+            if (std.Io.net.IpAddress.parse(t.host, t.port)) |ip| {
+                break :blk try ip.connect(io, .{ .mode = .stream });
+            } else |_| {
+                const host = try std.Io.net.HostName.init(t.host);
+                break :blk try host.connect(io, t.port, .{ .mode = .stream });
+            }
+        },
+        .unix => |p| blk: {
+            const ua = try std.Io.net.UnixAddress.init(p);
+            break :blk try ua.connect(io);
+        },
         // Pipe paths are Windows-only; the early return above handled it.
         .pipe => return error.UnsupportedOnPosix,
     };
 
-    // Alias the socket fd as a std.fs.File. On POSIX both expose the same
-    // posix.fd_t, and posix.read/write/close work uniformly on socket fds.
-    return .{ .file = std.fs.File{ .handle = stream.handle } };
+    // Alias the socket fd as a std.Io.File. On POSIX both expose the same
+    // posix.fd_t, and read/write/close work uniformly on socket fds.
+    return .{ .file = std.Io.File{ .handle = stream.socket.handle, .flags = .{ .nonblocking = false } } };
 }
 
 // =========================================================================

@@ -714,8 +714,8 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
 
     // Build command: devcontainer up with features and mount
     var cmd_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    // 0.16: std.io.fixedBufferStream was removed; use the fixed Writer.
+    var writer = std.Io.Writer.fixed(&cmd_buf);
 
     writer.writeAll("cmd /c \"devcontainer up --workspace-folder \"\"") catch {};
     writer.writeAll(workspace) catch {};
@@ -731,7 +731,7 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     writer.writeAll("\\nvim,target=/nvim-config/nvim") catch {};
     writer.writeAll(" --remove-existing-container\"") catch {};
 
-    const cmd_slice = cmd_buf[0..fbs.pos];
+    const cmd_slice = cmd_buf[0..writer.end];
     if (applog.isEnabled()) applog.appLog("[win] devcontainer up command: {s}\n", .{cmd_slice});
 
     // Convert to null-terminated for CreateProcess

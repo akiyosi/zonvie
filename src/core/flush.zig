@@ -2,6 +2,7 @@
 // Extracted from nvim_core.zig. Free functions take *Core as first parameter.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
 const highlight = @import("highlight.zig");
@@ -87,18 +88,18 @@ pub const STYLE_UNDERDASHED: u8 = 1 << 7;
 /// Each field is a separate contiguous array, improving cache utilization
 /// when scans only access 1-2 fields (e.g., bgRGB-only for background RLE).
 pub const RenderCells = struct {
-    scalars: std.ArrayListUnmanaged(u32) = .{},
-    fg_rgbs: std.ArrayListUnmanaged(u32) = .{},
-    bg_rgbs: std.ArrayListUnmanaged(u32) = .{},
-    sp_rgbs: std.ArrayListUnmanaged(u32) = .{},
-    grid_ids: std.ArrayListUnmanaged(i64) = .{},
-    style_flags_arr: std.ArrayListUnmanaged(u8) = .{},
-    overline_arr: std.ArrayListUnmanaged(u8) = .{},
-    glow_arr: std.ArrayListUnmanaged(u8) = .{},
+    scalars: std.ArrayListUnmanaged(u32) = .empty,
+    fg_rgbs: std.ArrayListUnmanaged(u32) = .empty,
+    bg_rgbs: std.ArrayListUnmanaged(u32) = .empty,
+    sp_rgbs: std.ArrayListUnmanaged(u32) = .empty,
+    grid_ids: std.ArrayListUnmanaged(i64) = .empty,
+    style_flags_arr: std.ArrayListUnmanaged(u8) = .empty,
+    overline_arr: std.ArrayListUnmanaged(u8) = .empty,
+    glow_arr: std.ArrayListUnmanaged(u8) = .empty,
     /// Per-cell base decoration flags (e.g. DECO_SCROLLABLE).
     /// Pre-populated by the caller before generateRowVertices so the
     /// unified 5-pass pipeline does not need scroll-flag computation.
-    deco_base_flags: std.ArrayListUnmanaged(u32) = .{},
+    deco_base_flags: std.ArrayListUnmanaged(u32) = .empty,
 
     pub fn ensureTotalCapacity(self: *RenderCells, alloc: std.mem.Allocator, n: usize) !void {
         try self.scalars.ensureTotalCapacity(alloc, n);
@@ -1114,7 +1115,7 @@ pub fn generateRowVertices(
 
     // ── Pass 1: Background (run-length by bgRGB + grid_id) ──────────
     {
-        const t_bg_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_bg_start: i128 = if (log_enabled) clock.nowNs() else 0;
         var c: u32 = 0;
         while (c < cols) {
             const run_bg = rc.bg_rgbs.items[@intCast(c)];
@@ -1139,12 +1140,12 @@ pub fn generateRowVertices(
             try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), vw, vh, run_grid_id, scroll_flag);
             c = end;
         }
-        if (log_enabled) stats.bg_ns = @intCast(@max(0, std.time.nanoTimestamp() - t_bg_start));
+        if (log_enabled) stats.bg_ns = @intCast(@max(0, clock.nowNs() - t_bg_start));
     }
 
     // ── Pass 2: Under-decorations (underline, underdouble, undercurl, underdotted, underdashed) ──
     {
-        const t_under_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_under_start: i128 = if (log_enabled) clock.nowNs() else 0;
         var c: u32 = 0;
         while (c < cols) {
             const cell_style_flags = rc.style_flags_arr.items[@intCast(c)];
@@ -1211,7 +1212,7 @@ pub fn generateRowVertices(
 
             c = run_end;
         }
-        if (log_enabled) stats.under_ns = @intCast(@max(0, std.time.nanoTimestamp() - t_under_start));
+        if (log_enabled) stats.under_ns = @intCast(@max(0, clock.nowNs() - t_under_start));
     }
 
     // ── Pass 3: Glyphs ──────────────────────────────────────────────
@@ -1230,7 +1231,7 @@ pub fn generateRowVertices(
     const glyph_cache_id = core.glyph_cache_by_id;
     const glyph_keys_id = core.glyph_keys_by_id;
 
-    const t_glyph_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+    const t_glyph_start: i128 = if (log_enabled) clock.nowNs() else 0;
     if (has_shaping or ensure_base != null or ensure_styled != null or core.isPhase2Atlas()) {
         // Pre-allocate vertex capacity for entire row (worst case: 1 glyph quad per column)
         try out.ensureUnusedCapacity(core.alloc, cols * 6);
@@ -1409,7 +1410,7 @@ pub fn generateRowVertices(
                         };
                         bufs.setLen(scalar_count);
 
-                        const t_shape_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                        const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
                         const glyph_count = shape_text_run.?(
                             core.ctx,
                             core.shaping_scalars.items.ptr,
@@ -1423,7 +1424,7 @@ pub fn generateRowVertices(
                             scalar_count,
                         );
                         if (log_enabled) {
-                            const t_shape_end = std.time.nanoTimestamp();
+                            const t_shape_end = clock.nowNs();
                             stats.shape_us += @intCast(@divTrunc(@max(0, t_shape_end - t_shape_start), 1000));
                             stats.shape_calls += 1;
                         }
@@ -1441,7 +1442,7 @@ pub fn generateRowVertices(
                             };
                             bufs.setLen(glyph_count);
                             {
-                                const t_shape2_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
                                 final_glyph_count = shape_text_run.?(
                                     core.ctx,
                                     core.shaping_scalars.items.ptr,
@@ -1455,7 +1456,7 @@ pub fn generateRowVertices(
                                     glyph_count,
                                 );
                                 if (log_enabled) {
-                                    const t_shape2_end = std.time.nanoTimestamp();
+                                    const t_shape2_end = clock.nowNs();
                                     stats.shape_us += @intCast(@divTrunc(@max(0, t_shape2_end - t_shape2_start), 1000));
                                     stats.shape_calls += 1;
                                 }
@@ -1551,9 +1552,9 @@ pub fn generateRowVertices(
                             if (ge_valid[cache_key]) {
                                 ge = ge_cache[cache_key];
                             } else {
-                                const t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                                 const ge_opt = core.ensureGlyphPhase2(scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_ens));
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens));
                                 if (ge_opt) |entry| {
                                     ge = entry;
                                     ge_cache[cache_key] = entry;
@@ -1588,9 +1589,9 @@ pub fn generateRowVertices(
                                 // entered for color emoji bitmaps, so DECO_COLOR_EMOJI
                                 // is unconditionally off.
                                 const deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                const t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
                                 VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, deco);
-                                if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_emit));
+                                if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - t_emit));
                             }
 
                             penX += cell_advance;
@@ -1694,9 +1695,9 @@ pub fn generateRowVertices(
                                 }
                                 defer core.emoji_cluster_len = 0;
 
-                                const fb_t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const fb_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                                 const fb_ge_opt = core.ensureGlyphPhase2(fb_scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - fb_t_ens));
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_ens));
                                 if (fb_ge_opt) |fb_ge| {
                                     if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
                                         const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
@@ -1711,9 +1712,9 @@ pub fn generateRowVertices(
                                         const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
 
                                         const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const fb_t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                        const fb_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
                                         VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
-                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - fb_t_emit));
+                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
                                     }
                                 }
                                 penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
@@ -1770,9 +1771,9 @@ pub fn generateRowVertices(
                                     ge = glyph_cache_id.?[hash_idx];
                                     break :gid_blk true;
                                 }
-                                const t_ens_gid1: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const t_ens_gid1: i128 = if (log_enabled) clock.nowNs() else 0;
                                 const ent1_opt = core.ensureGlyphByID(gid, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_ens_gid1));
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid1));
                                 if (ent1_opt) |entry| {
                                     ge = entry;
                                     glyph_cache_id.?[hash_idx] = entry;
@@ -1781,9 +1782,9 @@ pub fn generateRowVertices(
                                 }
                                 break :gid_blk false;
                             }
-                            const t_ens_gid2: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                            const t_ens_gid2: i128 = if (log_enabled) clock.nowNs() else 0;
                             const ent2_opt = core.ensureGlyphByID(gid, c_style);
-                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - t_ens_gid2));
+                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid2));
                             if (ent2_opt) |entry| {
                                 ge = entry;
                                 break :gid_blk true;
@@ -1852,9 +1853,9 @@ pub fn generateRowVertices(
                                     penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
                                     continue;
                                 }
-                                const mc_t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const mc_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                                 const mc_ge_opt = core.ensureGlyphPhase2(mc_scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - mc_t_ens));
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_ens));
                                 if (mc_ge_opt) |mc_ge| {
                                     if (mc_ge.bbox_size_px[0] > 0 and mc_ge.bbox_size_px[1] > 0) {
                                         const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
@@ -1867,9 +1868,9 @@ pub fn generateRowVertices(
                                         const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_max[1] };
                                         const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_max[1] };
                                         const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const mc_t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                        const mc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
                                         VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, vw, vh, run_grid_id, mc_deco);
-                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - mc_t_emit));
+                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
                                     }
                                 }
                                 penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
@@ -1952,9 +1953,9 @@ pub fn generateRowVertices(
                             // Record quad for potential retroactive suppression by later glyphs
                             const vert_start = out.items.len;
                             const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const sg_t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                            const sg_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
-                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - sg_t_emit));
+                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - sg_t_emit));
 
                             recent_quads[recent_quad_total % RECENT_CAP] = .{
                                 .vert_start = vert_start,
@@ -2011,7 +2012,7 @@ pub fn generateRowVertices(
                                         ge = glyph_cache_ascii.?[cache_key];
                                         break :blk true;
                                     }
-                                    const a_t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                    const a_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                                     const ok = if (core.isPhase2Atlas()) cb: {
                                         const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                             @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2027,7 +2028,7 @@ pub fn generateRowVertices(
                                     } else if (ensure_base) |ensure| cb: {
                                         break :cb ensure(core.ctx, scalar, &ge) != 0;
                                     } else false;
-                                    if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - a_t_ens));
+                                    if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - a_t_ens));
                                     if (ok) {
                                         glyph_cache_ascii.?[cache_key] = ge;
                                         glyph_valid_ascii.?[cache_key] = true;
@@ -2043,7 +2044,7 @@ pub fn generateRowVertices(
                                     ge = glyph_cache_non_ascii.?[hash_idx];
                                     break :blk true;
                                 }
-                                const na_t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                                const na_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                                 const ok = if (core.isPhase2Atlas()) cb: {
                                     const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                         @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2059,14 +2060,14 @@ pub fn generateRowVertices(
                                 } else if (ensure_base) |ensure| cb: {
                                     break :cb ensure(core.ctx, scalar, &ge) != 0;
                                 } else false;
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - na_t_ens));
+                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - na_t_ens));
                                 if (ok) {
                                     glyph_cache_non_ascii.?[hash_idx] = ge;
                                     glyph_keys_non_ascii.?[hash_idx] = key;
                                 }
                                 break :blk ok;
                             }
-                            const lf_t_ens: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                            const lf_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
                             const ok = if (core.isPhase2Atlas()) cb: {
                                 const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2082,7 +2083,7 @@ pub fn generateRowVertices(
                             } else if (ensure_base) |ensure| cb: {
                                 break :cb ensure(core.ctx, scalar, &ge) != 0;
                             } else false;
-                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - lf_t_ens));
+                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - lf_t_ens));
                             break :blk ok;
                         };
                         if (!glyph_ok) {
@@ -2111,9 +2112,9 @@ pub fn generateRowVertices(
 
                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const pc_t_emit: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+                            const pc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, pc_glyph_deco);
-                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, std.time.nanoTimestamp() - pc_t_emit));
+                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - pc_t_emit));
                         }
 
                         penX += cellW;
@@ -2124,11 +2125,11 @@ pub fn generateRowVertices(
             c = end;
         }
     }
-    if (log_enabled) stats.glyph_ns = @intCast(@max(0, std.time.nanoTimestamp() - t_glyph_start));
+    if (log_enabled) stats.glyph_ns = @intCast(@max(0, clock.nowNs() - t_glyph_start));
 
     // ── Pass 4: Strikethrough ───────────────────────────────────────
     {
-        const t_strike_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_strike_start: i128 = if (log_enabled) clock.nowNs() else 0;
         var c: u32 = 0;
         while (c < cols) {
             const c_style_flags = rc.style_flags_arr.items[@intCast(c)];
@@ -2163,12 +2164,12 @@ pub fn generateRowVertices(
 
             c = run_end;
         }
-        if (log_enabled) stats.strike_ns = @intCast(@max(0, std.time.nanoTimestamp() - t_strike_start));
+        if (log_enabled) stats.strike_ns = @intCast(@max(0, clock.nowNs() - t_strike_start));
     }
 
     // ── Pass 5: Overline ────────────────────────────────────────────
     {
-        const t_overline_start: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+        const t_overline_start: i128 = if (log_enabled) clock.nowNs() else 0;
         var c: u32 = 0;
         while (c < cols) {
             if (rc.overline_arr.items[@intCast(c)] == 0) {
@@ -2202,7 +2203,7 @@ pub fn generateRowVertices(
 
             c = run_end;
         }
-        if (log_enabled) stats.overline_ns = @intCast(@max(0, std.time.nanoTimestamp() - t_overline_start));
+        if (log_enabled) stats.overline_ns = @intCast(@max(0, clock.nowNs() - t_overline_start));
     }
 
     if (log_enabled) {
@@ -2223,7 +2224,7 @@ pub const FlushCtx = struct {
         const perf_enabled = ctx.core.log.cb != null;
         var t_flush_start: i128 = 0;
         if (perf_enabled) {
-            t_flush_start = std.time.nanoTimestamp();
+            t_flush_start = clock.nowNs();
             // Reset per-flush atlas/callback aggregation counters. The
             // packAndUpload / ensureGlyphPhase2 paths add into these as glyphs
             // miss; the defer below dumps the totals as a single [perf] line.
@@ -2239,7 +2240,7 @@ pub const FlushCtx = struct {
         }
         defer {
             if (perf_enabled) {
-                const t_flush_end = std.time.nanoTimestamp();
+                const t_flush_end = clock.nowNs();
                 const flush_us: i64 = @intCast(@divTrunc(@max(0, t_flush_end - t_flush_start), 1000));
                 ctx.core.log.write("[perf] flush_total rows={d} cols={d} us={d}\n", .{ rows, cols, flush_us });
                 // Per-flush atlas aggregate. Always emitted (even when zero) so
@@ -2300,10 +2301,10 @@ pub const FlushCtx = struct {
 
         // Notify frontend: flush begins (for triple buffer write-set preparation)
         if (ctx.core.cb.on_flush_begin) |cb| {
-            const t_cb_begin: i128 = if (perf_enabled) std.time.nanoTimestamp() else 0;
+            const t_cb_begin: i128 = if (perf_enabled) clock.nowNs() else 0;
             cb(ctx.core.ctx);
             if (perf_enabled) {
-                const cb_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_cb_begin), 1000));
+                const cb_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_cb_begin), 1000));
                 ctx.core.log.write("[perf] cb_flush_begin us={d} aborted={any}\n", .{ cb_us, ctx.core.flush_aborted });
             }
         }
@@ -2312,14 +2313,14 @@ pub const FlushCtx = struct {
         // clearScrolledGrids, msg_show throttle check, notifyCmdlineChanges,
         // notifyPopupmenuChanges, cursor resolve. Closed inside the row_mode
         // branch where t_rows_start_ns is established (search "pre_row_us").
-        const t_pre_row_start: i128 = if (perf_enabled) std.time.nanoTimestamp() else 0;
+        const t_pre_row_start: i128 = if (perf_enabled) clock.nowNs() else 0;
         // Ensure on_flush_end is called on all exit paths (atomic commit point)
         defer {
             if (ctx.core.cb.on_flush_end) |cb| {
-                const t_cb_end: i128 = if (perf_enabled) std.time.nanoTimestamp() else 0;
+                const t_cb_end: i128 = if (perf_enabled) clock.nowNs() else 0;
                 cb(ctx.core.ctx);
                 if (perf_enabled) {
-                    const cb_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_cb_end), 1000));
+                    const cb_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_cb_end), 1000));
                     ctx.core.log.write("[perf] cb_flush_end us={d}\n", .{cb_us});
                 }
             }
@@ -2330,10 +2331,10 @@ pub const FlushCtx = struct {
         // with stale vertex content.
         defer {
             if (!ctx.core.flush_aborted) {
-                const t_ext: i128 = if (perf_enabled) std.time.nanoTimestamp() else 0;
+                const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
                 sendExternalGridVertices(ctx.core, false);
                 if (perf_enabled) {
-                    const ext_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_ext), 1000));
+                    const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
                     ctx.core.log.write("[perf] send_external_grids us={d} known={d}\n", .{ ext_us, ctx.core.known_external_grids.count() });
                 }
             }
@@ -2839,7 +2840,7 @@ pub const FlushCtx = struct {
                                 }
                             }
                         }
-                        t_rows_start_ns = std.time.nanoTimestamp();
+                        t_rows_start_ns = clock.nowNs();
                         // Close pre_row "blackhole" bracket (started after cb_flush_begin).
                         const pre_row_us: i64 = @intCast(@divTrunc(@max(0, t_rows_start_ns - t_pre_row_start), 1000));
                         ctx.core.log.write("[perf] pre_row us={d} dirty_rows={d}\n", .{ pre_row_us, log_dirty_rows });
@@ -2919,21 +2920,21 @@ pub const FlushCtx = struct {
 
                     // Initialize dynamic caches if not already done
                     var t_prep_hl_init_start: i128 = 0;
-                    if (log_enabled) t_prep_hl_init_start = std.time.nanoTimestamp();
+                    if (log_enabled) t_prep_hl_init_start = clock.nowNs();
                     ctx.core.initHlCache() catch {
                         ctx.core.log.write("[flush] Failed to initialize hl cache\n", .{});
                     };
                     if (log_enabled) {
-                        const t_prep_hl_init_end = std.time.nanoTimestamp();
+                        const t_prep_hl_init_end = clock.nowNs();
                         perf_row_prep_hl_init_us = @intCast(@divTrunc(@max(0, t_prep_hl_init_end - t_prep_hl_init_start), 1000));
                     }
                     var t_prep_glyph_init_start: i128 = 0;
-                    if (log_enabled) t_prep_glyph_init_start = std.time.nanoTimestamp();
+                    if (log_enabled) t_prep_glyph_init_start = clock.nowNs();
                     ctx.core.initGlyphCache() catch {
                         ctx.core.log.write("[flush] Failed to initialize glyph cache\n", .{});
                     };
                     if (log_enabled) {
-                        const t_prep_glyph_init_end = std.time.nanoTimestamp();
+                        const t_prep_glyph_init_end = clock.nowNs();
                         perf_row_prep_glyph_init_us = @intCast(@divTrunc(@max(0, t_prep_glyph_init_end - t_prep_glyph_init_start), 1000));
                     }
 
@@ -2957,10 +2958,10 @@ pub const FlushCtx = struct {
                     // This prepares the cache so fallback path can populate it
                     // for future fast-path reuse.
                     var t_prep_scroll_ensure_start: i128 = 0;
-                    if (log_enabled) t_prep_scroll_ensure_start = std.time.nanoTimestamp();
+                    if (log_enabled) t_prep_scroll_ensure_start = clock.nowNs();
                     ctx.core.ensureScrollCache(rows) catch {};
                     if (log_enabled) {
-                        const t_prep_scroll_ensure_end = std.time.nanoTimestamp();
+                        const t_prep_scroll_ensure_end = clock.nowNs();
                         perf_row_prep_scroll_ensure_us = @intCast(@divTrunc(@max(0, t_prep_scroll_ensure_end - t_prep_scroll_ensure_start), 1000));
                     }
 
@@ -3015,7 +3016,7 @@ pub const FlushCtx = struct {
                             perf_row_max_cb_idx = 0;
                             if (log_enabled) {
                                 log_dirty_rows = rows; // Retry processes all rows
-                                t_rows_start_ns = std.time.nanoTimestamp();
+                                t_rows_start_ns = clock.nowNs();
                             }
                             // hl_valid does NOT need reset: hl data is atlas-independent
                             // glyph caches already cleared by resetGlyphCacheFlags() inside resetCoreAtlas()
@@ -3023,7 +3024,7 @@ pub const FlushCtx = struct {
 
                     // Scroll-aware fast path eligibility check
                     var t_prep_fast_path_check_start: i128 = 0;
-                    if (log_enabled) t_prep_fast_path_check_start = std.time.nanoTimestamp();
+                    if (log_enabled) t_prep_fast_path_check_start = clock.nowNs();
                     const scroll_check = checkScrollFastPath(
                         &ctx.core.grid,
                         effective_rebuild_all,
@@ -3032,7 +3033,7 @@ pub const FlushCtx = struct {
                         cached_subgrids[0..cached_subgrid_count],
                     );
                     if (log_enabled) {
-                        const t_prep_fast_path_check_end = std.time.nanoTimestamp();
+                        const t_prep_fast_path_check_end = clock.nowNs();
                         perf_row_prep_fast_path_check_us = @intCast(@divTrunc(@max(0, t_prep_fast_path_check_end - t_prep_fast_path_check_start), 1000));
                     }
                     if (log_enabled and scrolled_count > 0) {
@@ -3051,7 +3052,7 @@ pub const FlushCtx = struct {
 
                     if (use_scroll_fast_path) {
                         var t_prep_regen_build_start: i128 = 0;
-                        if (log_enabled) t_prep_regen_build_start = std.time.nanoTimestamp();
+                        if (log_enabled) t_prep_regen_build_start = clock.nowNs();
                         // Add all touched rows (from grid_line after scroll)
                         const tc = ctx.core.grid.scroll_touched_count;
                         for (ctx.core.grid.scroll_touched_rows[0..tc]) |tr| {
@@ -3084,7 +3085,7 @@ pub const FlushCtx = struct {
                             }
                         }
                         if (log_enabled) {
-                            const t_prep_regen_build_end = std.time.nanoTimestamp();
+                            const t_prep_regen_build_end = clock.nowNs();
                             perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
                         }
 
@@ -3171,7 +3172,7 @@ pub const FlushCtx = struct {
                             const scroll_bot: usize = @intCast(scroll_op.bot + scroll_op.win_pos_row);
 
                             var t_prep_shift_start: i128 = 0;
-                            if (log_enabled) t_prep_shift_start = std.time.nanoTimestamp();
+                            if (log_enabled) t_prep_shift_start = clock.nowNs();
                             const shift_result = shiftScrollCacheAndValidate(
                                 ctx.core,
                                 scroll_top,
@@ -3182,7 +3183,7 @@ pub const FlushCtx = struct {
                                 regen_rows[0..regen_count],
                             );
                             if (log_enabled) {
-                                const t_prep_shift_end = std.time.nanoTimestamp();
+                                const t_prep_shift_end = clock.nowNs();
                                 perf_row_prep_shift_us = @intCast(@divTrunc(@max(0, t_prep_shift_end - t_prep_shift_start), 1000));
                             }
                             cached_empty_rows = shift_result.empty_emit_count;
@@ -3215,7 +3216,7 @@ pub const FlushCtx = struct {
                                     );
                                 } else {
                                     var t_cached_emit_scan_start: i128 = 0;
-                                    if (log_enabled) t_cached_emit_scan_start = std.time.nanoTimestamp();
+                                    if (log_enabled) t_cached_emit_scan_start = clock.nowNs();
                                     for (0..rows) |ri| {
                                         const row_idx: u32 = @intCast(ri);
                                         // Skip regen rows (will be composed below)
@@ -3241,22 +3242,22 @@ pub const FlushCtx = struct {
                                             // Frontend must handle vert_count==0 as "clear row".
                                             const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
                                             var t_cached_emit_cb_start: i128 = 0;
-                                            if (log_enabled) t_cached_emit_cb_start = std.time.nanoTimestamp();
+                                            if (log_enabled) t_cached_emit_cb_start = clock.nowNs();
                                             row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
                                             if (log_enabled) {
-                                                const t_cached_emit_cb_end = std.time.nanoTimestamp();
+                                                const t_cached_emit_cb_end = clock.nowNs();
                                                 perf_cached_emit_cb_sum_us += @intCast(@divTrunc(@max(0, t_cached_emit_cb_end - t_cached_emit_cb_start), 1000));
                                             }
                                         }
                                     }
                                     if (log_enabled) {
-                                        const t_cached_emit_scan_end = std.time.nanoTimestamp();
+                                        const t_cached_emit_scan_end = clock.nowNs();
                                         perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
                                     }
                                 }
                             } else {
                                 var t_cached_emit_scan_start: i128 = 0;
-                                if (log_enabled) t_cached_emit_scan_start = std.time.nanoTimestamp();
+                                if (log_enabled) t_cached_emit_scan_start = clock.nowNs();
                                 for (0..rows) |ri| {
                                     const row_idx: u32 = @intCast(ri);
                                     // Skip regen rows (will be composed below)
@@ -3282,16 +3283,16 @@ pub const FlushCtx = struct {
                                         // Frontend must handle vert_count==0 as "clear row".
                                         const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
                                         var t_cached_emit_cb_start: i128 = 0;
-                                        if (log_enabled) t_cached_emit_cb_start = std.time.nanoTimestamp();
+                                        if (log_enabled) t_cached_emit_cb_start = clock.nowNs();
                                         row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
                                         if (log_enabled) {
-                                            const t_cached_emit_cb_end = std.time.nanoTimestamp();
+                                            const t_cached_emit_cb_end = clock.nowNs();
                                             perf_cached_emit_cb_sum_us += @intCast(@divTrunc(@max(0, t_cached_emit_cb_end - t_cached_emit_cb_start), 1000));
                                         }
                                     }
                                 }
                                 if (log_enabled) {
-                                    const t_cached_emit_scan_end = std.time.nanoTimestamp();
+                                    const t_cached_emit_scan_end = clock.nowNs();
                                     perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
                                 }
                             }
@@ -3332,7 +3333,7 @@ pub const FlushCtx = struct {
                         // Row-mode timing for composition measurement
                         var t_row_compose_start: i128 = 0;
                         if (log_enabled) {
-                            t_row_compose_start = std.time.nanoTimestamp();
+                            t_row_compose_start = clock.nowNs();
                         }
 
                         // Compose this row only (avoid full-screen tmp)
@@ -3446,7 +3447,7 @@ pub const FlushCtx = struct {
                         var t_row_compose_end: i128 = 0;
                         var t_row_gen_start: i128 = 0;
                         if (log_enabled) {
-                            t_row_compose_end = std.time.nanoTimestamp();
+                            t_row_compose_end = clock.nowNs();
                             t_row_gen_start = t_row_compose_end;
                         }
 
@@ -3478,7 +3479,7 @@ pub const FlushCtx = struct {
                         perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
                         // Log row timing for performance measurement
                         if (log_enabled) {
-                            const t_row_gen_end = std.time.nanoTimestamp();
+                            const t_row_gen_end = clock.nowNs();
                             row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
                             const gen_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_gen_start), 1000));
                             const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_compose_start), 1000));
@@ -3563,7 +3564,7 @@ pub const FlushCtx = struct {
                         var t_row_post_misc_before_cache_store: i128 = 0;
                         var t_row_cache_store_end: i128 = 0;
                         if (log_enabled) {
-                            t_row_post_misc_before_cache_store = std.time.nanoTimestamp();
+                            t_row_post_misc_before_cache_store = clock.nowNs();
                         }
 
                         // Store composed vertices in scroll cache for future reuse
@@ -3580,7 +3581,7 @@ pub const FlushCtx = struct {
 
                         var t_row_before_cb: i128 = 0;
                         if (log_enabled) {
-                            t_row_cache_store_end = std.time.nanoTimestamp();
+                            t_row_cache_store_end = clock.nowNs();
                             t_row_before_cb = t_row_cache_store_end;
                         }
 
@@ -3588,7 +3589,7 @@ pub const FlushCtx = struct {
                         row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
 
                         if (log_enabled) {
-                            const t_row_after_cb = std.time.nanoTimestamp();
+                            const t_row_after_cb = clock.nowNs();
                             const cache_store_us: i64 = @intCast(@divTrunc(@max(0, t_row_cache_store_end - t_row_post_misc_before_cache_store), 1000));
                             const row_cb_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_before_cb), 1000));
                             const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
@@ -3643,7 +3644,7 @@ pub const FlushCtx = struct {
                     ctx.core.atlas_reset_during_flush = false;
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
-                        const t_rows_done_ns: i128 = std.time.nanoTimestamp();
+                        const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
                             "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any}\n",
@@ -3908,7 +3909,7 @@ pub const FlushCtx = struct {
                     const perf_log_enabled = ctx.core.log.cb != null;
                     var t_under_deco_start: i128 = 0;
                     if (perf_log_enabled) {
-                        t_under_deco_start = std.time.nanoTimestamp();
+                        t_under_deco_start = clock.nowNs();
                     }
 
                     // 2) Under-decorations: underline, underdouble, undercurl, underdotted, underdashed (drawn BEHIND glyphs)
@@ -4000,7 +4001,7 @@ pub const FlushCtx = struct {
                     var t_under_deco_end: i128 = 0;
                     var t_glyph_start: i128 = 0;
                     if (perf_log_enabled) {
-                        t_under_deco_end = std.time.nanoTimestamp();
+                        t_under_deco_end = clock.nowNs();
                         t_glyph_start = t_under_deco_end;
                     }
 
@@ -4127,7 +4128,7 @@ pub const FlushCtx = struct {
                     var t_glyph_end: i128 = 0;
                     var t_strike_start: i128 = 0;
                     if (perf_log_enabled) {
-                        t_glyph_end = std.time.nanoTimestamp();
+                        t_glyph_end = clock.nowNs();
                         t_strike_start = t_glyph_end;
                     }
 
@@ -4219,7 +4220,7 @@ pub const FlushCtx = struct {
 
                     // Log timing for performance measurement
                     if (perf_log_enabled) {
-                        const t_strike_end = std.time.nanoTimestamp();
+                        const t_strike_end = clock.nowNs();
                         const under_deco_ns: i128 = t_under_deco_end - t_under_deco_start;
                         const glyph_ns: i128 = t_glyph_end - t_glyph_start;
                         const strike_ns: i128 = t_strike_end - t_strike_start;
@@ -4467,7 +4468,7 @@ pub const FlushCtx = struct {
                 const main_ptr_opt: ?[*]const c_api.Vertex = if (send_main_here) main.items.ptr else null;
                 const cur_ptr_opt: ?[*]const c_api.Vertex  = if (need_cursor) cursor.items.ptr else null;
 
-                const t_pf: i128 = if (perf_enabled) std.time.nanoTimestamp() else 0;
+                const t_pf: i128 = if (perf_enabled) clock.nowNs() else 0;
                 const main_n_for_log: usize = if (send_main_here) main.items.len else 0;
                 const cur_n_for_log: usize = if (need_cursor) cursor.items.len else 0;
                 pf(
@@ -4477,7 +4478,7 @@ pub const FlushCtx = struct {
                     flags,
                 );
                 if (perf_enabled) {
-                    const pf_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_pf), 1000));
+                    const pf_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_pf), 1000));
                     ctx.core.log.write(
                         "[perf] cb_vertices_partial us={d} main_n={d} cursor_n={d} flags=0x{x}\n",
                         .{ pf_us, main_n_for_log, cur_n_for_log, flags },
@@ -4560,7 +4561,7 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
     var new_grids_added = false;
 
     // Find closed external windows (were known, but no longer in grid.external_grids)
-    var closed_grids: std.ArrayListUnmanaged(i64) = .{};
+    var closed_grids: std.ArrayListUnmanaged(i64) = .empty;
     defer closed_grids.deinit(self.alloc);
 
     var known_it = self.known_external_grids.keyIterator();
@@ -5491,7 +5492,7 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         }
         // Record start time when command is first shown
         if (self.last_cmd_start_time == null) {
-            self.last_cmd_start_time = std.time.nanoTimestamp();
+            self.last_cmd_start_time = clock.nowNs();
         }
 
         // Notify Swift about cmdline show (for icon update etc.)
@@ -6098,7 +6099,7 @@ pub fn notifyTablineChanges(self: *Core) void {
         self.log.write("[tabline] notify: curtab={d} tabs={d} visible={any}\n", .{ state.current_tab, state.tabs.items.len, state.visible });
 
         // Build C-compatible tab array
-        var c_tabs = std.ArrayListUnmanaged(c_api.TabEntry){};
+        var c_tabs: std.ArrayListUnmanaged(c_api.TabEntry) = .empty;
         defer c_tabs.deinit(self.alloc);
 
         for (state.tabs.items) |tab| {
@@ -6110,7 +6111,7 @@ pub fn notifyTablineChanges(self: *Core) void {
         }
 
         // Build C-compatible buffer array
-        var c_buffers = std.ArrayListUnmanaged(c_api.BufferEntry){};
+        var c_buffers: std.ArrayListUnmanaged(c_api.BufferEntry) = .empty;
         defer c_buffers.deinit(self.alloc);
 
         for (state.buffers.items) |buf| {
@@ -6419,7 +6420,7 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
     if (!self.ext_messages_enabled) return;
 
     const pending_since = self.msg_show_pending_since orelse return;
-    const now = std.time.nanoTimestamp();
+    const now = clock.nowNs();
     const elapsed = now - pending_since;
 
     if (elapsed >= self.msg_show_throttle_ns) {
@@ -6439,7 +6440,7 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
 /// IMPORTANT: Caller must hold grid_mu (via c_api tick entry point).
 pub fn checkMsgAutoHideTimeout(self: *Core) void {
     if (!self.ext_messages_enabled) return;
-    const now = std.time.nanoTimestamp();
+    const now = clock.nowNs();
 
     // msg_show (grid -102) auto-hide
     if (self.msg_show_auto_hide_at) |hide_at| {
@@ -6607,7 +6608,7 @@ pub fn notifyMessageChanges(self: *Core) void {
             if (has_shell_cmd and !has_return_prompt) {
                 // Shell command without return_prompt yet: use throttle to accumulate output
                 if (self.msg_show_pending_since == null) {
-                    self.msg_show_pending_since = std.time.nanoTimestamp();
+                    self.msg_show_pending_since = clock.nowNs();
                 }
             } else {
                 // Other messages (including list_cmd): display immediately
@@ -6730,7 +6731,7 @@ pub fn sendMsgShow(self: *Core) void {
             const timeout_ns: i128 = @intFromFloat(
                 max_ext_float_timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
             );
-            self.msg_show_auto_hide_at = std.time.nanoTimestamp() + timeout_ns;
+            self.msg_show_auto_hide_at = clock.nowNs() + timeout_ns;
         } else {
             self.msg_show_auto_hide_at = null;
         }
@@ -6981,7 +6982,7 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
         self.msg_scroll_offset = new_offset;
 
         // Throttle vertex updates to ~60fps (16ms)
-        const now = std.time.nanoTimestamp();
+        const now = clock.nowNs();
         const throttle_ns: i128 = 16 * std.time.ns_per_ms;
         const elapsed = now - self.msg_scroll_last_send;
 
@@ -7006,7 +7007,7 @@ pub fn processPendingMsgScroll(self: *Core) void {
     self.log.write("[msg] processPendingMsgScroll: offset {d}\n", .{self.msg_scroll_offset});
     renderMsgGridFromCache(self, self.msg_scroll_offset);
     sendExternalGridVerticesFiltered(self, true, grid_mod.MESSAGE_GRID_ID);
-    self.msg_scroll_last_send = std.time.nanoTimestamp();
+    self.msg_scroll_last_send = clock.nowNs();
     self.msg_scroll_pending = false;
 }
 
@@ -7565,7 +7566,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
         const timeout_ns: i128 = @intFromFloat(
             route_result.timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
         );
-        self.msg_history_auto_hide_at = std.time.nanoTimestamp() + timeout_ns;
+        self.msg_history_auto_hide_at = clock.nowNs() + timeout_ns;
     } else {
         self.msg_history_auto_hide_at = null;
     }

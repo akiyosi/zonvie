@@ -49,15 +49,27 @@ pub fn build(b: *std.Build) void {
         "-DSPIRV_CROSS_C_API_REFLECT=0",
     };
 
-    lib.addCSourceFiles(.{
+    mod.addCSourceFiles(.{
         .root = upstream.path("."),
         .files = &cpp_sources,
         .flags = &cpp_flags,
     });
 
+    // Weak std::__1::__hash_memory shim. Zig 0.16's bundled libc++ 21 emits
+    // references to this out-of-line ABI symbol (from glslang's std::hash use)
+    // that Apple's system libc++ does not yet export, breaking the macOS Xcode
+    // link. Compiled here (a libcpp module merged into the macOS app) it
+    // satisfies that link; on Zig-linked outputs the real definition wins.
+    mod.addCSourceFile(.{
+        .file = b.path("hash_memory_shim.cpp"),
+        // Default visibility (not the hidden used for SPIRV-Cross sources) so
+        // the weak symbol is unambiguously available to the final link.
+        .flags = &[_][]const u8{ "-std=c++17", "-fvisibility=default" },
+    });
+
     // Let consumers include <spirv_cross_c.h>. The C header pulls in
     // <spirv.h> (SPIR-V core header) so we install that too.
-    lib.addIncludePath(upstream.path("."));
+    mod.addIncludePath(upstream.path("."));
     lib.installHeader(upstream.path("spirv_cross_c.h"), "spirv_cross_c.h");
     lib.installHeader(upstream.path("spirv.h"), "spirv.h");
 

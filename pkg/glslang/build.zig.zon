@@ -1,0 +1,29 @@
+.{
+    .name = .glslang,
+    .fingerprint = 0x274a355f0fac978,
+    .version = "1.4.309",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Mirror available: https://github.com/Games-by-Mason/glslang
+        .glslang = .{
+            .url = "https://github.com/KhronosGroup/glslang/archive/7200bc12a8979d13b22cd52de80ffb7d41939615.tar.gz",
+            .hash = "N-V-__8AAP4lXQKz3tL4vtQfkU_xbsKoxat8ehi0lpR9s7-3",
+        },
+        // Mirror available: https://github.com/Games-by-Mason/SPIRV-Tools
+        .@"SPIRV-Tools" = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Tools/archive/f289d047f49fb60488301ec62bafab85573668cc.tar.gz",
+            .hash = "N-V-__8AALI5agF9e8bfTFSiJU8WAeG6Qu90t9vSM9tDsgeL",
+        },
+        // Mirror available: https://github.com/Games-by-Mason/SPIRV-Headers
+        .@"SPIRV-Headers" = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Headers/archive/09913f088a1197aba4aefd300a876b2ebbaa3391.tar.gz",
+            .hash = "N-V-__8AAHgEOgBtc1wN1FEbxkhfZ2mjZ1rElhauQ0FnJ-FT",
+        },
+    },
+    .paths = .{
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "generated",
+    },
+}
