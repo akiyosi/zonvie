@@ -4,10 +4,14 @@
 //! `std.Io` interface. zonvie's core is a C-ABI library with no `main(init)`
 //! entry point, so we own a single process-wide `std.Io` backed by a
 //! `std.Io.Threaded`. The backing implementation is constructed lazily on first
-//! use (and eagerly at the real entry points via `init`). Constructing a
-//! `Threaded` does not install signal handlers — those are deferred until
-//! async/concurrent I/O is first used, which the time/sleep/mutex paths never
-//! trigger — so this is safe to embed inside a host application.
+//! use (and eagerly at the real entry points via `init`).
+//!
+//! NOTE: on POSIX, `std.Io.Threaded.init` installs process-global SIGPIPE and
+//! SIGIO handlers (replacing the host app's dispositions; never restored, since
+//! the instance lives for the process lifetime). This is benign for zonvie —
+//! SIGPIPE is ignored (desirable for the RPC socket/pipe writes) and zonvie
+//! does not rely on SIGIO — but it is a side effect of embedding this Io, not
+//! a no-op.
 
 const std = @import("std");
 const builtin = @import("builtin");

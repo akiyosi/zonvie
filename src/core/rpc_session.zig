@@ -2265,12 +2265,13 @@ fn cleanupSession(
                 // Zig 0.16: Child.kill(io) forcibly terminates AND reaps in a
                 // single uncancelable call, leaving child.id == null. wait()
                 // opens with assert(child.id != null), so it MUST NOT be called
-                // after kill(). kill() sends SIGTERM (std Threaded.childKillPosix),
-                // so synthesize the Term the prior (kill + wait) sequence
-                // reported, keeping on_exit's exit-code mapping (128 + SIGTERM)
-                // unchanged.
+                // after kill(). Synthesize the Term the prior (kill + wait)
+                // sequence reported so on_exit's exit-code mapping is unchanged
+                // per platform: POSIX kill sends SIGTERM (Threaded.childKillPosix)
+                // -> Term.signal -> 128+SIGTERM; Windows kill terminates with
+                // exit code 1 (Threaded.childKillWindows) -> Term.exited -> 1.
                 child.kill(clock.io());
-                session_term = .{ .signal = .TERM };
+                session_term = if (builtin.os.tag == .windows) .{ .exited = 1 } else .{ .signal = .TERM };
             } else {
                 self.log.write("cleanupSession: waiting for child (pid={any})\n", .{child.id});
                 session_term = child.wait(clock.io()) catch |e| blk: {
