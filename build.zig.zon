@@ -4,19 +4,22 @@
 
     .fingerprint = 0x27bbe734fac1eb4,
 
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
         .@"zig-toml" = .{
-            .url = "git+https://github.com/sam701/zig-toml#zig-0.15",
-            .hash = "toml-0.3.0-bV14BfV7AQD8DkuQI7skP8ekQTaBYKTO0MY_35Cw_EXo",
+            .url = "git+https://github.com/sam701/zig-toml?ref=zig-0.16#8685923e32e8b8a795eb2715684236975a70faed",
+            .hash = "toml-0.3.0-bV14BRmKAQAWR0FT0KUKFwVJTImaFhWjSe6HfSMtNZOH",
         },
-        // Games-by-Mason's Zig-0.15-compatible port of glslang.
-        // Pulls upstream KhronosGroup/glslang + SPIRV-Tools + SPIRV-Headers
-        // as transitive deps and compiles them via Zig's build system.
+        // Vendored fork of Games-by-Mason's glslang-zig (originally
+        // git+.../glslang-zig#734f197). Upstream has no Zig 0.16 port — its
+        // build.zig still uses the 0.15 build API — so the package is vendored
+        // under pkg/glslang/ with its build.zig migrated to the 0.16 build API
+        // (Compile->Module link methods). The upstream KhronosGroup/glslang +
+        // SPIRV-Tools + SPIRV-Headers C++ sources are still pulled as transitive
+        // deps (declared in pkg/glslang/build.zig.zon) and need no patching.
         .glslang = .{
-            .url = "git+https://github.com/Games-by-Mason/glslang-zig#734f1971036ad8364ba8f6ef10cfdcb589e04be9",
-            .hash = "glslang-1.4.309-eMn68KLGCQDAuHVUzugaYOOEhbkyHmN526R7mHIq9YUs",
+            .path = "pkg/glslang",
         },
         // Local thin build wrapper around KhronosGroup/SPIRV-Cross.
         // No public Zig-0.15-compatible port exists, so we vendor our own

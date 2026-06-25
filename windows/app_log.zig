@@ -1,7 +1,8 @@
 const std = @import("std");
+const clock = @import("zonvie_core").clock;
 
 var g_enabled: bool = false;
-var g_log_file: ?std.fs.File = null;
+var g_log_file: ?std.Io.File = null;
 
 /// App-root log switch (Windows side).
 /// This is the single source of truth for "frontend logging enabled".
@@ -17,13 +18,13 @@ pub fn isEnabled() bool {
 pub fn setLogPath(path: ?[]const u8) void {
     // Close existing file if any
     if (g_log_file) |f| {
-        f.close();
+        f.close(clock.io());
         g_log_file = null;
     }
 
     if (path) |p| {
         if (p.len > 0) {
-            g_log_file = std.fs.createFileAbsolute(p, .{ .truncate = true }) catch null;
+            g_log_file = std.Io.Dir.createFileAbsolute(clock.io(), p, .{ .truncate = true }) catch null;
         }
     }
 }
@@ -39,7 +40,7 @@ pub fn appLog(comptime fmt: []const u8, args: anytype) void {
             .@"struct" => std.fmt.bufPrint(&buf, fmt, args) catch return,
             else => std.fmt.bufPrint(&buf, fmt, .{args}) catch return,
         };
-        _ = f.write(msg) catch {};
+        f.writeStreamingAll(clock.io(), msg) catch {};
     } else {
         // Write to stderr
         switch (@typeInfo(@TypeOf(args))) {
@@ -54,9 +55,9 @@ pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
     if (!g_enabled) return;
 
     if (g_log_file) |f| {
-        _ = f.write(prefix) catch {};
-        _ = f.write(bytes) catch {};
-        _ = f.write("\n") catch {};
+        f.writeStreamingAll(clock.io(), prefix) catch {};
+        f.writeStreamingAll(clock.io(), bytes) catch {};
+        f.writeStreamingAll(clock.io(), "\n") catch {};
     } else {
         std.debug.print("{s}{s}\n", .{ prefix, bytes });
     }
@@ -65,7 +66,7 @@ pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
 /// Cleanup: close log file if open
 pub fn deinit() void {
     if (g_log_file) |f| {
-        f.close();
+        f.close(clock.io());
         g_log_file = null;
     }
 }

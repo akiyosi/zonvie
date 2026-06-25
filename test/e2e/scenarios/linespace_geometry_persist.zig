@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
+const zc = @import("zonvie_core");
 
 pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{ .rows = 24, .cols = 80 });
@@ -14,9 +15,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.waitRowText(h.winGrid(), 0, "", h.opts.timeout_ms);
 
     // Verify initial linespace is 0 (default).
-    h.core.grid_mu.lock();
+    h.core.grid_mu.lockUncancelable(zc.clock.io());
     const initial_linespace = h.core.linespace_px;
-    h.core.grid_mu.unlock();
+    h.core.grid_mu.unlock(zc.clock.io());
 
     if (initial_linespace != 0) {
         std.debug.print("[e2e] linespace_geometry_persist: initial linespace should be 0, got {d}\n", .{initial_linespace});
@@ -31,14 +32,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // event is processed — a race that read the stale value of 0.
     h.waitUntil({}, struct {
         fn check(_: void, hh: *Harness) bool {
-            hh.core.grid_mu.lock();
-            defer hh.core.grid_mu.unlock();
+            hh.core.grid_mu.lockUncancelable(zc.clock.io());
+            defer hh.core.grid_mu.unlock(zc.clock.io());
             return hh.core.linespace_px == 10;
         }
     }.check, h.opts.timeout_ms) catch {
-        h.core.grid_mu.lock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
         const got = h.core.linespace_px;
-        h.core.grid_mu.unlock();
+        h.core.grid_mu.unlock(zc.clock.io());
         std.debug.print("[e2e] linespace_geometry_persist: linespace not saved: expected 10 got {d}\n", .{got});
         return error.LinespaceNotPersisted;
     };

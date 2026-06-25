@@ -324,9 +324,9 @@ pub fn tablineWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
                 }
 
                 // Check tabs and + button area
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const tab_count = app.tabline_state.tab_count;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (tab_count > 0) {
                     // Calculate tab dimensions (same as handleTablineMouseDown)
@@ -1145,7 +1145,7 @@ pub fn externalizeTab(app: *App, tab_idx: usize, screen_x: c_int, screen_y: c_in
 
     // Set pending position for the new external window (with timestamp for timeout)
     app.pending_external_window_position = .{ .x = screen_x, .y = screen_y };
-    app.pending_external_window_position_time = std.time.milliTimestamp();
+    app.pending_external_window_position_time = @as(i64, @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms)));
 
     // Execute single Lua script that does both tab switch and externalization atomically.
     // Uses nvim_open_win to create a new external window instead of vnew + nvim_win_set_config.
@@ -1790,8 +1790,8 @@ pub fn onTablineUpdate(
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
     {
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
 
         app.tabline_state.clear();
         app.tabline_state.current_tab = curtab;
@@ -1825,8 +1825,8 @@ pub fn onTablineUpdate(
 pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     {
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
         // working(2/3) -> idle(1) = finished; working -> waiting(4) = paused for
         // input. Queue either (with the title + which kind) for the UI thread.
         const prev = app.tabline_state.agentState(tab_handle);
@@ -1844,9 +1844,9 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_tabline_hide\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.tabline_state.visible = false;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Hide child window
     if (app.tabline_state.hwnd) |tabline_hwnd| {

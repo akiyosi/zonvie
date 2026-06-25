@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
+const zc = @import("zonvie_core");
 
 pub fn run(alloc: std.mem.Allocator) !void {
     // Test that nvim startup reaches first flush and callback fires.
@@ -20,9 +21,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.waitRowText(g, 0, "", h.opts.timeout_ms);
 
     // Verify grid is actually initialized.
-    h.core.grid_mu.lock();
+    h.core.grid_mu.lockUncancelable(zc.clock.io());
     const rows = h.core.grid.rows;
-    h.core.grid_mu.unlock();
+    h.core.grid_mu.unlock(zc.clock.io());
 
     if (rows == 0) {
         return error.GridNotInitialized;

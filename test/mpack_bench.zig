@@ -242,13 +242,13 @@ fn bench(
     // for peak allocation — the arena only retains what it needed.
     const peak_bytes = arena_state.queryCapacity();
 
-    var timer = try std.time.Timer.start();
+    const t0 = zc.clock.nowNs();
     var i: u32 = 0;
     while (i < n_iter) : (i += 1) {
         _ = arena_state.reset(.retain_capacity);
         try variant.fun(arena_state.allocator(), bytes);
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns = @as(u64, @intCast(zc.clock.nowNs() - t0));
     return .{
         .ns_per_iter = elapsed_ns / n_iter,
         .peak_bytes = peak_bytes,
@@ -445,9 +445,9 @@ fn benchFull(
         defer hl.deinit();
         _ = arena_state.reset(.retain_capacity);
 
-        var timer = try std.time.Timer.start();
+        const t0 = zc.clock.nowNs();
         try variant_fn(arena_state.allocator(), bytes, &grid, &hl, &log, &ctx);
-        total_ns += timer.read();
+        total_ns += @as(u64, @intCast(zc.clock.nowNs() - t0));
     }
 
     return .{

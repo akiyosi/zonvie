@@ -542,8 +542,8 @@ fn d3dInitThreadFn(app: *App) void {
 fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
     const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
     if (app.nvim_extra_args.items.len == 0) return effective_nvim;
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+    var w = std.Io.Writer.fixed(buf);
+    const writer = &w;
     const needs_quote = std.mem.indexOfScalar(u8, effective_nvim, ' ') != null;
     if (needs_quote) writer.writeByte('\'') catch {};
     writer.writeAll(effective_nvim) catch {};
@@ -558,7 +558,7 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
             writer.writeAll(arg) catch {};
         }
     }
-    return buf[0..fbs.pos];
+    return buf[0..w.end];
 }
 
 // =========================================================================
@@ -803,9 +803,9 @@ pub export fn WndProc(
                         }
 
                         // Check if clicking on a tab or + button
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         const tab_count = app.tabline_state.tab_count;
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
 
                         if (tab_count > 0) {
                             // Calculate tab positions using same logic as drawTablineContent
@@ -982,9 +982,9 @@ pub export fn WndProc(
                 // the colorscheme is light.
                 if (app.renderer == null) {
                     const hdc = ps.hdc;
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     const bg_rgb = app.colorscheme_bg;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     if (bg_rgb != 0xFFFFFFFF) {
                         // Win32 COLORREF is 0x00BBGGRR — swap from our 0x00RRGGBB.
                         const r: u32 = (bg_rgb >> 16) & 0xFF;
@@ -1018,9 +1018,9 @@ pub export fn WndProc(
                 const did_need_seed = app.need_full_seed.swap(false, .seq_cst);
                 if (did_need_seed) {
                     // Keep rows/cols synced to client size before we snapshot row-mode state.
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     updateRowsColsFromClientForce(hwnd, app);
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
 
                     // IMPORTANT: do not hold app.mu while calling into core.
                     updateLayoutToCore(hwnd, app);
@@ -1031,10 +1031,10 @@ pub export fn WndProc(
                     // Ensure we get a paint covering the whole surface.
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     {
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
                     }
                 }
 
@@ -1048,7 +1048,7 @@ pub export fn WndProc(
                 var t_snapshot_end_ns: i128 = 0;
                 var t_atlas_end_ns: i128 = 0;
                 if (log_enabled) {
-                    t_snapshot_start_ns = std.time.nanoTimestamp();
+                    t_snapshot_start_ns = core.clock.nowNs();
                 }
 
                 // Step 1: TBS acquire (rotation_mu short lock).
@@ -1063,7 +1063,7 @@ pub export fn WndProc(
                 const committed = &app.tbs.sets[tbs_snapshot.committed_index];
 
                 // Step 2: UI metadata snapshot (app.mu short lock).
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.surface.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
                 }
@@ -1097,8 +1097,8 @@ pub export fn WndProc(
                     var cur_atlas_w: u32 = 0;
                     var cur_atlas_h: u32 = 0;
                     {
-                        a.mu.lock();
-                        defer a.mu.unlock();
+                        a.mu.lockUncancelable(core.clock.io());
+                        defer a.mu.unlock(core.clock.io());
                         reset_pending = a.atlas_reset_pending;
                         if (reset_pending) a.atlas_reset_pending = false;
                         cur_atlas_w = a.atlas_w;
@@ -1110,7 +1110,7 @@ pub export fn WndProc(
                             g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch {
                                 if (log_enabled) applog.appLog("[win] FATAL: D3D atlas texture recreation failed, skipping frame\n", .{});
                                 if (app.hwnd) |h| _ = c.PostMessageW(h, c.WM_CLOSE, 0, 0);
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 return 0;
                             };
                         }
@@ -1126,7 +1126,7 @@ pub export fn WndProc(
 
                 // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
                 // The bitset iterator yields sorted, unique row indices — no dedup needed.
-                var dirty_row_keys: std.ArrayListUnmanaged(u32) = .{};
+                var dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty;
                 defer dirty_row_keys.deinit(app.alloc);
 
                 if (row_mode) {
@@ -1148,17 +1148,17 @@ pub export fn WndProc(
                 const effective_row_valid_count: u32 =
                     if (effective_rows < row_valid_count_snapshot) effective_rows else row_valid_count_snapshot;
 
-                var paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .{};
+                var paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .empty;
                 defer paint_rects_snapshot.deinit(app.alloc);
                 paint_rects_snapshot.appendSlice(app.alloc, app.paint_rects.items) catch {};
                 app.paint_rects.clearRetainingCapacity();
 
                 const paint_full_snapshot = tbs_snapshot.paint_full;
 
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (log_enabled) {
-                    t_snapshot_end_ns = std.time.nanoTimestamp();
+                    t_snapshot_end_ns = core.clock.nowNs();
                 }
 
                 if (log_enabled) {
@@ -1200,7 +1200,7 @@ pub export fn WndProc(
                     applog.appLog("[win] atlas_uploads flushed (cursor={d})\n", .{app.atlas_upload_cursor});
                 }
                 if (log_enabled) {
-                    t_atlas_end_ns = std.time.nanoTimestamp();
+                    t_atlas_end_ns = core.clock.nowNs();
                 }
 
                 var render_ok = false;
@@ -1296,9 +1296,9 @@ pub export fn WndProc(
                         // -> self-deadlock (SRWLOCK is non-reentrant).
                         // Use local arrays (not app fields) so that even if DXGI message pumping
                         // causes a re-entrant WM_PAINT, each invocation has its own snapshot.
-                        var local_main: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        var local_main: std.ArrayListUnmanaged(core.Vertex) = .empty;
                         defer local_main.deinit(app.alloc);
-                        var local_cursor: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        var local_cursor: std.ArrayListUnmanaged(core.Vertex) = .empty;
                         defer local_cursor.deinit(app.alloc);
                         var non_row_draw = false;
                         {
@@ -1346,9 +1346,9 @@ pub export fn WndProc(
                                     back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
                                 const rendered_complete =
                                     !seed_pending_snapshot and dirty == null;
-                                app.mu.lock();
+                                app.mu.lockUncancelable(core.clock.io());
                                 app.back_tex_valid = draw_preserved or rendered_complete;
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                             } else |e| {
                                 if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
                             }
@@ -1358,7 +1358,7 @@ pub export fn WndProc(
                         var t_row_start_ns: i128 = 0;
                         var t_present_start_ns: i128 = 0;
                         if (log_enabled) {
-                            t_row_start_ns = std.time.nanoTimestamp();
+                            t_row_start_ns = core.clock.nowNs();
                         }
 
                         // Build sorted, deduplicated list of rows to draw.
@@ -1410,14 +1410,14 @@ pub export fn WndProc(
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
                         if (atlas_uploaded and rows_to_draw.items.len == 0) {
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                             {
-                                app.tbs.rotation_mu.lock();
+                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
                                 app.tbs.pending_paint_full = true;
-                                app.tbs.rotation_mu.unlock();
+                                app.tbs.rotation_mu.unlock(core.clock.io());
                             }
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
@@ -1793,7 +1793,7 @@ pub export fn WndProc(
                         // When did_need_seed is true, we must NOT preserve old back buffer contents,
                         // so integrate "seed-clear" behavior here (no extra drawEx).
                         // With TBS, committed set is read-only — only clear row_valid under app.mu.
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
 
                         // Use the snapshot rather than a live re-read so seed_clear matches the
                         // value force_full_rows above was computed from. If an RPC callback
@@ -1821,7 +1821,7 @@ pub export fn WndProc(
                                 }
                             }
                         }
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
 
                         // Gate preservation on back_tex_valid (mirror of macOS hasPresentedOnce
                         // plus explicit invalidation on font/linespace/DPI changes) rather than
@@ -1866,7 +1866,7 @@ pub export fn WndProc(
                         };
 
                         // Bloom: collect row verts, draw after row VBs
-                        var bloom_verts: std.ArrayListUnmanaged(core.Vertex) = .{};
+                        var bloom_verts: std.ArrayListUnmanaged(core.Vertex) = .empty;
                         defer bloom_verts.deinit(app.alloc);
 
                         // Ensure row_vbs array covers committed set's row count.
@@ -2021,15 +2021,15 @@ pub export fn WndProc(
                         }
 
                         if (log_enabled) {
-                            t_present_start_ns = std.time.nanoTimestamp();
+                            t_present_start_ns = core.clock.nowNs();
                         }
 
                         var layout_ok: bool = true;
                         var rows_current: u32 = 0;
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
                         rows_current = committed.rows;
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
 
                         const allow_present = blk: {
                             // When seed_clear is true, we must present to sync the cleared back buffer
@@ -2168,26 +2168,26 @@ pub export fn WndProc(
                                 const new_back_tex_valid =
                                     (back_tex_valid_snapshot and preserve_back) or
                                     rendered_complete_frame;
-                                app.mu.lock();
+                                app.mu.lockUncancelable(core.clock.io());
                                 app.back_tex_valid = new_back_tex_valid;
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 // last_painted_cursor_row is tracked by drawCursorOverlay above.
                             } else |e| {
                                 if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
                             }
 
                             if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
-                                app.mu.lock();
+                                app.mu.lockUncancelable(core.clock.io());
                                 app.seed_pending = false;
                                 app.surface.paint_full = true;
                                 app.paint_rects.clearRetainingCapacity();
                                 app.seed_clear_pending = true;
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 // Also set TBS pending_paint_full for next paint cycle.
                                 {
-                                    app.tbs.rotation_mu.lock();
+                                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
                                     app.tbs.pending_paint_full = true;
-                                    app.tbs.rotation_mu.unlock();
+                                    app.tbs.rotation_mu.unlock(core.clock.io());
                                 }
                                 if (log_enabled) applog.appLog(
                                     "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
@@ -2199,7 +2199,7 @@ pub export fn WndProc(
                             var resize_age_ms: i64 = -1;
                             const last_resize_ns = app.last_resize_ns;
                             if (last_resize_ns != 0) {
-                                const now_ns = std.time.nanoTimestamp();
+                                const now_ns = core.clock.nowNs();
                                 const diff_ns = now_ns - last_resize_ns;
                                 if (diff_ns > 0) {
                                     resize_age_ms = @intCast(@divTrunc(diff_ns, 1_000_000));
@@ -2227,7 +2227,7 @@ pub export fn WndProc(
                         }
 
                         if (log_enabled) {
-                            const t_done_ns: i128 = std.time.nanoTimestamp();
+                            const t_done_ns: i128 = core.clock.nowNs();
                             const snapshot_us: u64 = @intCast(@divTrunc(@max(0, t_snapshot_end_ns - t_snapshot_start_ns), 1000));
                             const atlas_us: u64 = @intCast(@divTrunc(@max(0, t_atlas_end_ns - t_snapshot_end_ns), 1000));
                             const row_us: u64 = @intCast(@divTrunc(@max(0, t_present_start_ns - t_row_start_ns), 1000));
@@ -2246,13 +2246,13 @@ pub export fn WndProc(
                 // Recover dirty state if rendering failed, so the next
                 // WM_PAINT will retry a full redraw instead of showing stale content.
                 if (!render_ok) {
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     app.surface.paint_full = true;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     {
-                        app.tbs.rotation_mu.lock();
+                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
                         app.tbs.pending_paint_full = true;
-                        app.tbs.rotation_mu.unlock();
+                        app.tbs.rotation_mu.unlock(core.clock.io());
                     }
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                 }
@@ -2307,16 +2307,16 @@ pub export fn WndProc(
                 // updateDpi to maintain consistent lock ordering (avoid holding
                 // app.mu while acquiring renderer.mu inside updateDpi).
                 var atlas_ptr: ?*dwrite_d2d.Renderer = null;
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.atlas) |*a| atlas_ptr = a;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (atlas_ptr) |a| {
                     a.updateDpi(new_dpi);
                 }
 
                 // Update app-level state under app.mu
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (atlas_ptr) |a| {
                     app.cell_w_px = a.cellW();
                     app.cell_h_px = a.cellH();
@@ -2331,7 +2331,7 @@ pub export fn WndProc(
                 // DPI change shifts cell metrics; back_tex content is no longer
                 // geometrically valid even if pixel dimensions happen to match.
                 app.back_tex_valid = false;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Resize window to the suggested rect from WM_DPICHANGED
                 const suggested: *const c.RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
@@ -2360,8 +2360,8 @@ pub export fn WndProc(
 
             if (getApp(hwnd)) |app| {
                 // 1) GPU state transition must not race with WM_PAINT (which holds app.mu).
-                app.mu.lock();
-                app.last_resize_ns = std.time.nanoTimestamp();
+                app.mu.lockUncancelable(core.clock.io());
+                app.last_resize_ns = core.clock.nowNs();
                 app.need_full_seed.store(true, .seq_cst);
                 app.seed_pending = true;
                 app.seed_clear_pending = true;
@@ -2371,7 +2371,7 @@ pub export fn WndProc(
                 }
                 // Always keep rows/cols in sync with current client size on resize.
                 updateRowsColsFromClientForce(hwnd, app);
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 var rc: c.RECT = undefined;
                 _ = c.GetClientRect(hwnd, &rc);
@@ -2439,9 +2439,9 @@ pub export fn WndProc(
                 // on the same thread -> self-deadlock (SRWLOCK is non-reentrant).
                 {
                     var gpu_ptr: ?*d3d11.Renderer = null;
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     if (app.renderer) |*g| gpu_ptr = g;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
 
                     if (gpu_ptr) |g| {
                         g.resize() catch {};
@@ -2451,17 +2451,17 @@ pub export fn WndProc(
                         // back_tex_valid so preserve_back keeps the buffer across no-op
                         // resizes but forces a clear when the swapchain was rebuilt.
                         if (!g.has_presented_once) {
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.back_tex_valid = false;
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
                 }
                 {
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     app.surface.paint_full = true;
                     app.paint_rects.clearRetainingCapacity();
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                 }
 
                 // 5) repaint
@@ -2537,7 +2537,7 @@ pub export fn WndProc(
                 // posts WM_APP_CREATE with the same seq after the destroy
                 // completes, and the next pass will find the slot free.
                 const msg_seq: u64 = @bitCast(lParam);
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var dequeue_idx: ?usize = null;
                 for (app.pending_external_windows.items, 0..) |item, i| {
                     if (item.seq != msg_seq) continue;
@@ -2545,7 +2545,7 @@ pub export fn WndProc(
                     if (blocked) {
                         // Matching entry exists but is blocked — leave
                         // it; the deferred close will re-post a wake.
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
                         return 0;
                     }
                     dequeue_idx = i;
@@ -2556,11 +2556,11 @@ pub export fn WndProc(
                     // removed by onExternalWindowClose (old session) or
                     // it was already dequeued by an earlier same-seq
                     // wake message. Either way, this is a no-op.
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     return 0;
                 }
                 const req = app.pending_external_windows.orderedRemove(dequeue_idx.?);
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 external_windows.createExternalWindowOnUIThread(app, req);
             }
@@ -2577,9 +2577,9 @@ pub export fn WndProc(
                 // ext_hwnd here. The core fires this callback only when the
                 // cursor grid actually changes, so no is_grid_change guard
                 // is needed in the UI handler.
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const ext_hwnd = if (app.external_windows.get(grid_id)) |ext_win| ext_win.hwnd else null;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (ext_hwnd) |eh| {
                     // Cursor moved to external grid - activate that window
@@ -2600,9 +2600,9 @@ pub export fn WndProc(
                     // Only invalidate if no paint is already pending from on_vertices_row/partial.
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
                     // will handle cursor rendering as part of the normal draw.
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     const has_pending = app.paint_rects.items.len > 0;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     if (!has_pending) {
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
@@ -2625,12 +2625,12 @@ pub export fn WndProc(
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_MSG_SHOW received\n", .{});
             if (getApp(hwnd)) |app| {
                 // Process all pending messages
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const pending = app.pending_messages.toOwnedSlice(app.alloc) catch {
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     return 0;
                 };
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Process each pending message individually based on its view_type
                 for (pending) |req| {
@@ -2864,8 +2864,8 @@ pub export fn WndProc(
                 // any tab is currently working (idle/none need no animation).
                 const working = blk: {
                     if (!app.config.tabline.agent_indicator) break :blk false;
-                    app.mu.lock();
-                    defer app.mu.unlock();
+                    app.mu.lockUncancelable(core.clock.io());
+                    defer app.mu.unlock(core.clock.io());
                     break :blk app.tabline_state.anyAgentWorking();
                 };
                 if (working and !app.tabline_state.spinner_timer_active) {
@@ -2880,8 +2880,8 @@ pub export fn WndProc(
                 // running the agent inside zonvie's own terminal). Keep the queue
                 // if the tray isn't ready yet (startup race).
                 const n_completed = blk: {
-                    app.mu.lock();
-                    defer app.mu.unlock();
+                    app.mu.lockUncancelable(core.clock.io());
+                    defer app.mu.unlock(core.clock.io());
                     break :blk app.tabline_state.agent_completed_count;
                 };
                 if (n_completed > 0) {
@@ -2889,8 +2889,8 @@ pub export fn WndProc(
                         var msg_buf: [320]u8 = undefined;
                         var bmsg: []const u8 = "AI agent finished";
                         {
-                            app.mu.lock();
-                            defer app.mu.unlock();
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
                             if (app.tabline_state.agent_completed_count == 1) {
                                 const tlen = app.tabline_state.agent_completed_title_lens[0];
                                 const summary = if (tlen > 0)
@@ -2954,12 +2954,12 @@ pub export fn WndProc(
             // SendMessage(WM_SETTEXT), blocking with grid_mu held → deadlock.
             if (getApp(hwnd)) |app| {
                 var local_buf: [512]u16 = undefined;
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const len = app.pending_title_len;
                 if (len > 0) {
                     @memcpy(local_buf[0..len], app.pending_title[0..len]);
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
                 if (len > 0) {
                     local_buf[len] = 0; // null terminate
                     _ = c.SetWindowTextW(hwnd, &local_buf);
@@ -2985,10 +2985,10 @@ pub export fn WndProc(
                 if (c.GetClientRect(hwnd, &client_rc) == 0) return 0;
                 if (c.GetWindowRect(hwnd, &window_rc) == 0) return 0;
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w: u32 = app.cell_w_px;
                 const cell_h: u32 = app.cell_h_px + app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
                 if (cell_w == 0 or cell_h == 0) return 0;
 
                 const client_w_i: i32 = client_rc.right - client_rc.left;
@@ -3036,13 +3036,13 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 var local_ops: [App.MAX_DEFERRED_WIN_OPS]App.DeferredWinOp = undefined;
                 var count: usize = 0;
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 count = @min(app.deferred_win_ops_count, App.MAX_DEFERRED_WIN_OPS);
                 if (count > 0) {
                     @memcpy(local_ops[0..count], app.deferred_win_ops[0..count]);
                     app.deferred_win_ops_count = 0;
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
                 for (local_ops[0..count]) |op| {
                     _ = c.SetWindowPos(op.hwnd, null, op.x, op.y, op.w, op.h, op.flags);
                 }
@@ -3132,7 +3132,7 @@ pub export fn WndProc(
                     var ext_grids: [MaxExt]i64 = undefined;
                     var ext_renderers: [MaxExt]*d3d11.Renderer = undefined;
                     var ext_count: usize = 0;
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     var it = app.external_windows.iterator();
                     while (it.next()) |entry| {
                         if (ext_count >= MaxExt) break;
@@ -3143,7 +3143,7 @@ pub export fn WndProc(
                         ext_renderers[ext_count] = &ew.renderer;
                         ext_count += 1;
                     }
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
 
                     var i: usize = 0;
                     while (i < ext_count) : (i += 1) {
@@ -3170,8 +3170,8 @@ pub export fn WndProc(
                             var nvim_cmd_slice: []const u8 = undefined;
 
                             if (app.devcontainer_workspace) |workspace| {
-                                var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                                const writer = fbs.writer();
+                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
+                                const writer = &w;
                                 writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
                                 writer.writeAll(workspace) catch {};
                                 writer.writeAll("\"") catch {};
@@ -3181,7 +3181,7 @@ pub export fn WndProc(
                                     writer.writeAll("\"") catch {};
                                 }
                                 writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
                                 // Start nvim
@@ -3347,18 +3347,18 @@ pub export fn WndProc(
                     defer if (quoted_nvim.ptr != effective_nvim.ptr) app.alloc.free(@constCast(quoted_nvim));
 
                     if (app.wsl_mode) {
-                        var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                        const writer = fbs.writer();
+                        var w = std.Io.Writer.fixed(&nvim_cmd_buf);
+                        const writer = &w;
                         writer.writeAll("wsl.exe") catch {};
                         if (app.wsl_distro) |distro| {
                             writer.print(" -d {s}", .{distro}) catch {};
                         }
                         writer.writeAll(" --shell-type login -- nvim --embed") catch {};
-                        nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                        nvim_cmd_slice = nvim_cmd_buf[0..w.end];
                     } else if (app.ssh_mode) {
                         if (app.ssh_host) |host| {
-                            var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                            const writer = fbs.writer();
+                            var w = std.Io.Writer.fixed(&nvim_cmd_buf);
+                            const writer = &w;
                             writer.writeAll("ssh-askpass ") catch {};
                             writer.writeAll("C:\\Windows\\System32\\OpenSSH\\ssh.exe") catch {};
                             if (app.ssh_port) |port| {
@@ -3371,7 +3371,7 @@ pub export fn WndProc(
                             writer.writeAll(" -o StrictHostKeyChecking=accept-new") catch {};
                             const remote_nvim = app.cli_nvim_path orelse "nvim";
                             writer.print(" {s} \"'{s}'\" --headless --embed", .{ host, remote_nvim }) catch {};
-                            nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                            nvim_cmd_slice = nvim_cmd_buf[0..w.end];
 
                             if (app.ssh_password) |pwd| {
                                 var pwd_utf16: [256]u16 = undefined;
@@ -3415,8 +3415,8 @@ pub export fn WndProc(
                                 break :devcontainer_block;
                             } else {
                                 dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
-                                var fbs = std.io.fixedBufferStream(&nvim_cmd_buf);
-                                const writer = fbs.writer();
+                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
+                                const writer = &w;
                                 writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
                                 writer.writeAll(workspace) catch {};
                                 writer.writeAll("\"") catch {};
@@ -3426,7 +3426,7 @@ pub export fn WndProc(
                                     writer.writeAll("\"") catch {};
                                 }
                                 writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
+                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
                             }
                         } else {
                             nvim_cmd_slice = quoted_nvim;
@@ -3473,9 +3473,9 @@ pub export fn WndProc(
                 // ============================================================
 
                 // Assign atlas BEFORE renderer creation so callbacks can use it
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.atlas = atlas;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Notify layout ready BEFORE renderer setup (atlas is ready, unblock RPC thread)
                 core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
@@ -3553,9 +3553,9 @@ pub export fn WndProc(
                     applog.appLog("  [TIMING] d3d11.Renderer.init: {d}ms", .{d3d_ms});
                 }
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.renderer = gpu;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
 
@@ -3584,14 +3584,14 @@ pub export fn WndProc(
 
                 // Process pending glyphs
                 {
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     const pending_count = app.pending_glyphs.items.len;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
 
                     if (pending_count > 0) {
                         if (deferred_log_enabled) applog.appLog("  processing {d} pending glyphs", .{pending_count});
-                        app.mu.lock();
-                        defer app.mu.unlock();
+                        app.mu.lockUncancelable(core.clock.io());
+                        defer app.mu.unlock(core.clock.io());
                         if (app.atlas) |*a| {
                             for (app.pending_glyphs.items) |pg| {
                                 if (pg.style_flags == 0) {
@@ -3690,9 +3690,9 @@ pub export fn WndProc(
                 const has_ctrl_alt = (mods & (input.MOD_CTRL | input.MOD_ALT)) != 0;
 
                 // Check if IME is composing
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const ime_composing = app.ime_composing;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // 1) Special keys always go through send_key_event (chars=nil)
                 //    BUT skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
@@ -3793,7 +3793,7 @@ pub export fn WndProc(
         c.WM_IME_STARTCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
             if (getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.ime_composing = true;
                 app.ime_composition_str.clearRetainingCapacity();
                 app.ime_composition_utf8.clearRetainingCapacity();
@@ -3801,7 +3801,7 @@ pub export fn WndProc(
                 app.ime_cursor_pos = 0;
                 app.ime_target_start = 0;
                 app.ime_target_end = 0;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Position IME candidate window at cursor
                 input.positionImeCandidateWindow(hwnd, app);
@@ -3824,9 +3824,9 @@ pub export fn WndProc(
                         if (byte_len > 0) {
                             const char_len: usize = @intCast(@divTrunc(byte_len, 2));
 
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_composition_str.resize(app.alloc, char_len) catch {
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 return 0;
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
@@ -3834,12 +3834,12 @@ pub export fn WndProc(
                             // Convert to UTF-8 for display
                             input.updateImeCompositionUtf8(app);
                             if (applog.isEnabled()) applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         } else {
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_composition_str.clearRetainingCapacity();
                             app.ime_composition_utf8.clearRetainingCapacity();
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
 
@@ -3848,22 +3848,22 @@ pub export fn WndProc(
                         const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
                         if (clause_byte_len > 0) {
                             const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_clause_info.resize(app.alloc, clause_count) catch {
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 return 0;
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
 
                     // Get cursor position in composition
                     if ((lparam_u & c.GCS_CURSORPOS) != 0) {
                         const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
                     }
 
                     // Get target clause (the clause being converted)
@@ -3891,7 +3891,7 @@ pub export fn WndProc(
                             // Find target clause (ATTR_TARGET_CONVERTED or ATTR_TARGET_NOTCONVERTED)
                             // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
                             // ATTR_CONVERTED = 0x02, ATTR_TARGET_NOTCONVERTED = 0x03
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_target_start = 0;
                             app.ime_target_end = 0;
                             var found_start: bool = false;
@@ -3908,7 +3908,7 @@ pub export fn WndProc(
                                 }
                             }
                             if (applog.isEnabled()) applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
 
@@ -3918,7 +3918,7 @@ pub export fn WndProc(
                     // under the lock so the core call runs unlocked.
                     var handled = false;
                     if (app.corep) |corep| {
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         // ime_composition_utf8 is mutated only on this (UI)
                         // thread, and the core call below runs synchronously on
                         // it, so the backing buffer stays valid after unlock —
@@ -3934,7 +3934,7 @@ pub export fn WndProc(
                             ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
                             te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
                         }
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
                         if (utf8_len == 0) {
                             app_mod.zonvie_core_clear_preedit(corep);
                             handled = true; // nothing to display
@@ -3942,9 +3942,9 @@ pub export fn WndProc(
                             handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
                         }
                     }
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     app.ime_extmark_active = handled;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     if (handled) {
                         input.hideImePreeditOverlay(app);
                     } else {
@@ -3958,7 +3958,7 @@ pub export fn WndProc(
 
         c.WM_IME_ENDCOMPOSITION => {
             if (getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.ime_composing = false;
                 app.ime_composition_str.clearRetainingCapacity();
                 app.ime_composition_utf8.clearRetainingCapacity();
@@ -3967,7 +3967,7 @@ pub export fn WndProc(
                 app.ime_target_start = 0;
                 app.ime_target_end = 0;
                 app.ime_extmark_active = false;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Clear any inline preedit extmark and hide the overlay.
                 if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
@@ -4089,11 +4089,11 @@ pub export fn WndProc(
                 };
 
                 // Get cell dimensions
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
                 const cell_h = app.cell_h_px;
                 const linespace = app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
@@ -4191,11 +4191,11 @@ pub export fn WndProc(
                 const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
 
                 // Get cell dimensions
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
                 const cell_h = app.cell_h_px;
                 const linespace = app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
@@ -4245,11 +4245,11 @@ pub export fn WndProc(
                     break :blk "x2";
                 };
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
                 const cell_h = app.cell_h_px;
                 const linespace = app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 const row_h = cell_h + linespace;
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
@@ -4294,11 +4294,11 @@ pub export fn WndProc(
 
                 app.mouse_button_held = 0;
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
                 const cell_h = app.cell_h_px;
                 const linespace = app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 const row_h = cell_h + linespace;
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
@@ -4368,11 +4368,11 @@ pub export fn WndProc(
                     const mx: i16 = @intCast(cursor_pt.x);
                     const my: i16 = @intCast(cursor_pt.y);
 
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     const sc_cell_w = app.cell_w_px;
                     const sc_cell_h = app.cell_h_px;
                     const sc_ls = app.linespace_px;
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
 
                     const sc_row_h = sc_cell_h + sc_ls;
                     const sc_cx: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
@@ -4526,11 +4526,11 @@ pub export fn WndProc(
                 };
 
                 // Get cell dimensions
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
                 const cell_h = app.cell_h_px;
                 const linespace = app.linespace_px;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
@@ -4768,8 +4768,8 @@ pub export fn WndProc(
                         _ = c.ShowWindow(msg_win.hwnd, c.SW_HIDE);
                     }
                     // Hide special external windows (cmdline, popupmenu, msg_show, msg_history)
-                    app.mu.lock();
-                    defer app.mu.unlock();
+                    app.mu.lockUncancelable(core.clock.io());
+                    defer app.mu.unlock(core.clock.io());
                     var ext_it = app.external_windows.iterator();
                     while (ext_it.next()) |entry| {
                         const grid_id = entry.key_ptr.*;
@@ -4784,8 +4784,8 @@ pub export fn WndProc(
                         input.setIMEOff(hwnd);
                     }
                     // App is being activated - show special external windows
-                    app.mu.lock();
-                    defer app.mu.unlock();
+                    app.mu.lockUncancelable(core.clock.io());
+                    defer app.mu.unlock(core.clock.io());
                     var ext_it = app.external_windows.iterator();
                     while (ext_it.next()) |entry| {
                         const grid_id = entry.key_ptr.*;

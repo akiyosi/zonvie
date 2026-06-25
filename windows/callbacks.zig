@@ -373,7 +373,7 @@ pub fn appendRowsFromUpdateRegion(
     row_verts_len: u32,
 ) void {
     const log_enabled = applog.isEnabled();
-    const log_t0_ns: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+    const log_t0_ns: i128 = if (log_enabled) core.clock.nowNs() else 0;
 
     // Pre-allocate capacity for worst case (all rows dirty)
     rows_to_draw.ensureTotalCapacity(app.alloc, row_verts_len) catch {};
@@ -444,7 +444,7 @@ pub fn appendRowsFromUpdateRegion(
     }
 
     if (log_enabled) {
-        const log_t1_ns: i128 = std.time.nanoTimestamp();
+        const log_t1_ns: i128 = core.clock.nowNs();
         const log_dur_us: u64 = @intCast(@max(@as(i128, 0), log_t1_ns - log_t0_ns) / 1_000);
         applog.appLog(
             "[win] updateRgn rects={d} rows_appended={d} area_px={d} dur_us={d} got_bytes={d}\n",
@@ -481,7 +481,7 @@ pub fn onVerticesPartial(
         .{ flags, main_count, cursor_count },
     );
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
 
     var row_mode = app.surface.row_mode;
 
@@ -651,7 +651,7 @@ pub fn onVerticesPartial(
     // where global grid gets cursor_count=0 but blink settings may have changed via mode_change).
     const blink_update_needed = cursor_updated or ((flags & app_mod.VERT_UPDATE_CURSOR) != 0);
 
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Post message to update cursor blinking (avoid deadlock by doing it on UI thread)
     if (blink_update_needed) {
@@ -673,8 +673,8 @@ pub fn onVerticesRow(
     total_cols: u32,
 ) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     if (applog.isEnabled()) {
         var cur_enabled: u32 = 0;
@@ -1228,8 +1228,8 @@ pub fn onMainRowScroll(
     total_cols: u32,
 ) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     if (applog.isEnabled()) applog.appLog(
         "[scroll_diag] onMainRowScroll row_start={d} row_end={d} rows_delta={d} total_rows={d} total_cols={d}\n",
@@ -1378,8 +1378,8 @@ pub fn onGridRowScroll(
     total_cols: u32,
 ) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     if (rows_delta == 0 or row_end <= row_start) return;
     if (col_start != 0 or col_end != total_cols) return;
@@ -1497,7 +1497,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     // Phase 1: Pre-flight — check all surfaces have a free set.
     var can_flush = app.tbs.hasFreeSet();
     if (can_flush) {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         var it = app.external_windows.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.tbs.hasFreeSet()) {
@@ -1505,7 +1505,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
                 break;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
 
     if (!can_flush) {
@@ -1516,7 +1516,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     // Phase 2: beginFlush on all surfaces.
     var ok = app.tbs.beginFlush(app.alloc);
     if (ok) {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         var it = app.external_windows.iterator();
         while (it.next()) |entry| {
             if (!entry.value_ptr.tbs.beginFlush(app.alloc)) {
@@ -1524,18 +1524,18 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
                 break;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
 
     if (!ok) {
         // Partial success: cancel all surfaces.
         app.tbs.cancelFlush();
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         var it2 = app.external_windows.iterator();
         while (it2.next()) |entry| {
             entry.value_ptr.tbs.cancelFlush();
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (app.corep) |corep| app_mod.zonvie_core_abort_flush(corep);
         return;
     }
@@ -1575,12 +1575,12 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // Commit triple-buffered write sets (is_in_flush==false → no-op after abort).
     app.tbs.commitFlush(app.alloc);
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         var ext_it = app.external_windows.iterator();
         while (ext_it.next()) |entry| {
             entry.value_ptr.tbs.commitFlush(app.alloc);
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
 
     // Coalesce: only post if not already pending (atomic CAS: false -> true)
@@ -1604,7 +1604,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // flush_needs_invalidate).  This prevents mid-flush WM_PAINT from drawing
     // incomplete frames, and skips InvalidateRect entirely for flushes that
     // carry no visual changes (e.g. msg_showcmd-only flushes).
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const main_dirty = app.flush_needs_invalidate;
     app.flush_needs_invalidate = false;
     const main_hwnd = if (main_dirty) app.hwnd else null;
@@ -1623,7 +1623,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             }
         }
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // InvalidateRect outside of lock — triggers a single WM_PAINT per window.
     if (main_hwnd) |hwnd| {
@@ -1650,7 +1650,7 @@ pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.Gly
     }
 
     if (applog.isEnabled()) {
-        const now_ns: i128 = std.time.nanoTimestamp();
+        const now_ns: i128 = core.clock.nowNs();
         if (log_atlas_ensure_last_report_ns == 0) log_atlas_ensure_last_report_ns = now_ns;
 
         // report once per second
@@ -1668,9 +1668,9 @@ pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.Gly
     // Synchronize read of app.atlas to avoid data race with UI thread initialization.
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
@@ -1715,8 +1715,8 @@ pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.Gly
         return 1;
     } else {
         // Atlas not ready yet - queue for later processing
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
         app.pending_glyphs.append(app.alloc, .{ .scalar = scalar, .style_flags = 0 }) catch {};
         return 0;
     }
@@ -1736,9 +1736,9 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
     // Synchronize read of app.atlas to avoid data race with UI thread initialization.
     var atlas_ptr_s: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr_s = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr_s) |a| {
         const e = a.atlasEnsureGlyphEntryStyled(scalar, style_flags) catch |err| {
@@ -1750,7 +1750,7 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
 
         // Report stats once per second
         if (applog.isEnabled()) {
-            const now_ns: i128 = std.time.nanoTimestamp();
+            const now_ns: i128 = core.clock.nowNs();
             if (log_styled_glyph_last_report_ns == 0) log_styled_glyph_last_report_ns = now_ns;
             if (now_ns - log_styled_glyph_last_report_ns >= @as(i128, 1_000_000_000)) {
                 applog.appLog("[styled] calls/s={d} ok/s={d} fail/s={d}\n", .{ log_styled_glyph_calls, log_styled_glyph_ok, log_styled_glyph_fail });
@@ -1765,8 +1765,8 @@ pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32,
         return 1;
     } else {
         // Atlas not ready yet - queue for later processing
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
         app.pending_glyphs.append(app.alloc, .{ .scalar = scalar, .style_flags = style_flags }) catch {};
         return 0;
     }
@@ -1784,15 +1784,15 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         if (applog.isEnabled()) {
-            const t0 = std.time.nanoTimestamp();
+            const t0 = core.clock.nowNs();
             a.rasterizeGlyphOnly(scalar, style_flags, app.corep, out_bitmap) catch return 0;
-            const elapsed_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t0));
+            const elapsed_ns: u64 = @intCast(@max(0, core.clock.nowNs() - t0));
             _ = app.rasterize_call_count.fetchAdd(1, .monotonic);
             _ = app.rasterize_total_ns.fetchAdd(elapsed_ns, .monotonic);
             var cur_max = app.rasterize_max_ns.load(.monotonic);
@@ -1817,9 +1817,9 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         a.uploadAtlasRegion(dest_x, dest_y, width, height, bitmap) catch {};
@@ -1834,9 +1834,9 @@ pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) 
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         a.recreateAtlasTexture(atlas_w, atlas_h);
@@ -1866,9 +1866,9 @@ pub fn onShapeTextRun(
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         return a.shapeTextRunDWrite(
@@ -1899,15 +1899,15 @@ pub fn onRasterizeGlyphById(
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         if (applog.isEnabled()) {
-            const t0 = std.time.nanoTimestamp();
+            const t0 = core.clock.nowNs();
             a.rasterizeGlyphByIdDWrite(glyph_id, style_flags, out_bitmap) catch return 0;
-            const elapsed_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t0));
+            const elapsed_ns: u64 = @intCast(@max(0, core.clock.nowNs() - t0));
             _ = app.rasterize_call_count.fetchAdd(1, .monotonic);
             _ = app.rasterize_total_ns.fetchAdd(elapsed_ns, .monotonic);
             var cur_max = app.rasterize_max_ns.load(.monotonic);
@@ -1938,9 +1938,9 @@ pub fn onGetAsciiTable(
 
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.atlas) |*a| atlas_ptr = a;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
     }
     if (atlas_ptr) |a| {
         return if (a.getAsciiTableDWrite(style_flags, out_glyph_ids, out_x_advances, out_lig_triggers)) 1 else 0;
@@ -2000,7 +2000,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         if (applog.isEnabled()) applog.appLog("onGuiFont: empty payload, using config font", .{});
     }
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
 
     if (app.atlas) |*a| {
         const prev_font_generation = a.font_generation;
@@ -2129,9 +2129,9 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         if (a.font_generation != prev_font_generation) {
             if (applog.isEnabled()) applog.appLog("onGuiFont: font changed (gen {}->{}), invalidating core glyph cache\n", .{ prev_font_generation, a.font_generation });
             if (app.corep) |cp| {
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
                 app_mod.zonvie_core_invalidate_glyph_cache(cp);
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
             }
         }
     } else {
@@ -2208,7 +2208,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     app.seed_clear_pending = true;
     app.back_tex_valid = false;
 
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);
@@ -2238,7 +2238,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     // Defer external window resizes via PostMessage to avoid deadlock.
     // SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler calls
     // zonvie_core_try_resize_grid which needs core locks held by the flush path.
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.linespace_px = v;
     const hwnd = app.hwnd;
     if (hwnd) |h| {
@@ -2305,7 +2305,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     app.seed_clear_pending = true;
     app.back_tex_valid = false;
 
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);
@@ -2381,7 +2381,7 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     if (applog.isEnabled()) applog.appLog("[win] onDefaultColorsSet: fg=0x{x:0>8} bg=0x{x:0>8}\n", .{ fg, bg });
 
     // 0xFFFFFFFF means "not set" — only update the color that is valid
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
     if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
     // Push the bg into the d3d11 renderer so its ClearRenderTargetView
@@ -2392,7 +2392,7 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     if (bg != 0xFFFFFFFF) {
         if (app.renderer) |*r| r.setDefaultBgColor(bg);
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Invalidate tabline/sidebar to repaint with new colors, and
     // update cached highlight group bg colors for external window clear color.
@@ -2421,7 +2421,7 @@ pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) c
     // If the full title doesn't fit, progressively shorten the UTF-8 slice at
     // codepoint boundaries until it fits, so we always get a partial update
     // rather than silently dropping the title.
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     var src = title;
     var wide_len: usize = 0;
     while (src.len > 0) {
@@ -2437,7 +2437,7 @@ pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) c
     const clamped_len = @min(wide_len, app.pending_title.len - 1);
     app.pending_title[clamped_len] = 0; // null terminate
     app.pending_title_len = clamped_len;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (clamped_len > 0) {
         _ = c.PostMessageW(hwnd, app_mod.WM_APP_SET_TITLE, 0, 0);
@@ -2463,9 +2463,9 @@ pub fn onCmdlineShow(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_cmdline_show: firstc={c}({d})\n", .{ firstc, firstc });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.cmdline_firstc = firstc;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Request UI thread to update cmdline colors from core highlights.
     // We can't call zonvie_core_get_hl_by_name here (callback context) because
@@ -2480,9 +2480,9 @@ pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_cmdline_hide\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.cmdline_firstc = 0;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 }
 
 // =========================================================================
@@ -2501,18 +2501,18 @@ pub fn onPopupmenuShow(
 ) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (colors) |clrs| {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         app.popupmenu_bg_rgb = clrs.pmenu_bg;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (applog.isEnabled()) applog.appLog("[win] on_popupmenu_show: pmenu_bg=0x{x:0>6}\n", .{clrs.pmenu_bg});
     }
 }
 
 pub fn onPopupmenuHide(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.popupmenu_bg_rgb = 0xFFFFFFFF;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
     if (applog.isEnabled()) applog.appLog("[win] on_popupmenu_hide\n", .{});
 }
 

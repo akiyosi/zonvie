@@ -15,6 +15,7 @@ const rpc_session = @import("rpc_session.zig");
 const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
+const clock = @import("clock.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
 /// reaching into `rpc_transport`.
@@ -416,16 +417,16 @@ pub const Core = struct {
     hl: Highlights,
 
     // Reusable vertex buffers (avoid alloc/free on every flush)
-    main_verts: std.ArrayListUnmanaged(c_api.Vertex) = .{},
-    cursor_verts: std.ArrayListUnmanaged(c_api.Vertex) = .{},
+    main_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
+    cursor_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
 
-    row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .{},
+    row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
 
     // Scroll-aware flush: per-row vertex cache.
     // Each entry holds the last emitted vertices for that row.
     // On scroll, entries are logically shifted and y-coordinates adjusted.
     // Invalidated on resize, guifont, atlas reset.
-    scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .{},
+    scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
     scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
     scroll_cache_rows: u32 = 0,
 
@@ -440,28 +441,28 @@ pub const Core = struct {
     // Reusable scratch buffers (zero-allocation hot path)
     tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
-    grid_entries: std.ArrayListUnmanaged(GridEntry) = .{},
-    key_buf: std.ArrayListUnmanaged(u8) = .{},
+    grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    key_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
 
     // Writer thread: non-blocking stdin writes via dedicated thread.
     // sendRaw() enqueues data here; writerThreadFn drains to stdin pipe.
     // Lock order: grid_mu must be acquired before write_queue_mu if both are needed.
-    write_queue_mu: std.Thread.Mutex = .{},
-    write_queue_cond: std.Thread.Condition = .{},
-    write_queue: std.ArrayListUnmanaged(u8) = .{},
+    write_queue_mu: std.Io.Mutex = .init,
+    write_queue_cond: std.Io.Condition = .init,
+    write_queue: std.ArrayListUnmanaged(u8) = .empty,
     write_queue_closed: bool = false,
     writer_failed: bool = false,
     writer_thread: ?std.Thread = null,
 
     // Mutex to protect grid state access from concurrent RPC and UI threads.
-    grid_mu: std.Thread.Mutex = .{},
+    grid_mu: std.Io.Mutex = .init,
 
     // Mutex to protect stdin_file close-and-null (POSIX socket transport
     // aliases stdin/stdout on one fd). Prevents race between stop() and
     // cleanupSession() closing the same fd. Both must serialize via this mutex.
-    stdin_close_mu: std.Thread.Mutex = .{},
+    stdin_close_mu: std.Io.Mutex = .init,
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -559,8 +560,8 @@ pub const Core = struct {
     // Synchronization for delaying nvim_ui_attach until actual layout is known.
     // The RPC thread waits on ui_attach_cond before sending nvim_ui_attach.
     // Call notifyLayoutReady() from the UI thread after renderer init.
-    ui_attach_mutex: std.Thread.Mutex = .{},
-    ui_attach_cond: std.Thread.Condition = .{},
+    ui_attach_mutex: std.Io.Mutex = .init,
+    ui_attach_cond: std.Io.Condition = .init,
     ui_attach_ready: bool = false,
     ui_attach_rows: u32 = 0,
     ui_attach_cols: u32 = 0,
@@ -631,7 +632,7 @@ pub const Core = struct {
     msg_scroll_last_send: i128 = 0, // Last vertex send time (nanos)
 
     // Cached line data for msg_show scrolling (avoids re-parsing on every scroll)
-    msg_line_cache: std.ArrayListUnmanaged(MsgCachedLine) = .{},
+    msg_line_cache: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_cache_valid: bool = false,
 
     // Track last executed command for split view label
@@ -681,10 +682,10 @@ pub const Core = struct {
 
     // Phase B: Persistent shaping buffers (reused across flushes, zero per-call alloc)
     shaping_bufs: vertexgen.ShapingBuffers = .{},
-    shaping_scalars: std.ArrayListUnmanaged(u32) = .{},
-    shaping_col_widths: std.ArrayListUnmanaged(u32) = .{},
+    shaping_scalars: std.ArrayListUnmanaged(u32) = .empty,
+    shaping_col_widths: std.ArrayListUnmanaged(u32) = .empty,
     /// Maps each shaping_scalars entry back to its composited column index.
-    shaping_src_cols: std.ArrayListUnmanaged(u32) = .{},
+    shaping_src_cols: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Pointer to the float overlay overflow map for the current ext grid.
     /// Set during ext grid composition, null during main grid / non-ext-grid paths.
@@ -764,7 +765,7 @@ pub const Core = struct {
     glow_intensity_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
     glow_hl_ids: ?std.AutoHashMap(u32, void) = null,
     // Owned strings — each element is alloc.dupe'd from RPC response
-    glow_group_names: std.ArrayListUnmanaged([]const u8) = .{},
+    glow_group_names: std.ArrayListUnmanaged([]const u8) = .empty,
     // Atomic msgid for tracking pending glow config RPC request (0 = no pending)
     glow_request_msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     // Startup retry counter: decremented on nil response, not on each flush.
@@ -958,11 +959,11 @@ pub const Core = struct {
         // write_queue_closed=true so the writer thread would drain and exit.
         // Clearing it now allows startWriterThread() to succeed for the
         // next session.
-        self.write_queue_mu.lock();
+        self.write_queue_mu.lockUncancelable(clock.io());
         self.write_queue_closed = false;
         self.writer_failed = false;
         self.write_queue.clearRetainingCapacity();
-        self.write_queue_mu.unlock();
+        self.write_queue_mu.unlock(clock.io());
 
         // === Grid-protected critical section ===
         //
@@ -981,8 +982,8 @@ pub const Core = struct {
         //
         // The `defer unlock` covers every early return path here (none
         // exist today, but future edits stay safe).
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
 
         // Tear down channel-bound external-window state. See doc comment
         // above for the rationale (new server's grid_id space is fresh,
@@ -1091,8 +1092,8 @@ pub const Core = struct {
     /// thread after the renderer is initialized and actual rows/cols are computed.
     /// Idempotent: subsequent calls after the first are no-ops.
     pub fn notifyLayoutReady(self: *Core, rows: u32, cols: u32) void {
-        self.ui_attach_mutex.lock();
-        defer self.ui_attach_mutex.unlock();
+        self.ui_attach_mutex.lockUncancelable(clock.io());
+        defer self.ui_attach_mutex.unlock(clock.io());
         if (self.ui_attach_ready) return;
         self.ui_attach_rows = rows;
         self.ui_attach_cols = cols;
@@ -1100,7 +1101,7 @@ pub const Core = struct {
         self.last_layout_rows = rows;
         self.last_layout_cols = cols;
         self.ui_attach_ready = true;
-        self.ui_attach_cond.signal();
+        self.ui_attach_cond.signal(clock.io());
         self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
     }
 
@@ -1109,21 +1110,21 @@ pub const Core = struct {
 
         // Unblock RPC thread if it is waiting on ui_attach_cond
         {
-            self.ui_attach_mutex.lock();
-            defer self.ui_attach_mutex.unlock();
+            self.ui_attach_mutex.lockUncancelable(clock.io());
+            defer self.ui_attach_mutex.unlock(clock.io());
             self.ui_attach_ready = true;
-            self.ui_attach_cond.signal();
+            self.ui_attach_cond.signal(clock.io());
         }
 
         // Signal writer thread to stop and capture thread handle under lock
         var wt: ?std.Thread = null;
         {
-            self.write_queue_mu.lock();
+            self.write_queue_mu.lockUncancelable(clock.io());
             self.write_queue_closed = true;
             wt = self.writer_thread;
             self.writer_thread = null;
-            self.write_queue_cond.signal();
-            self.write_queue_mu.unlock();
+            self.write_queue_cond.signal(clock.io());
+            self.write_queue_mu.unlock(clock.io());
         }
 
         // Unblock writer thread's writeAll() if blocked on transport I/O.
@@ -1154,7 +1155,7 @@ pub const Core = struct {
         // teardown. Releasing here preserves the double-close protection
         // (whoever nulls stdin_file first wins; the other sees null and
         // skips) without the lock-ordering hazard.
-        self.stdin_close_mu.lock();
+        self.stdin_close_mu.lockUncancelable(clock.io());
         if (self.stdin_file) |f| {
             // For POSIX .socket transport (connect mode, where stdin/
             // stdout alias the same fd) close() alone does not wake
@@ -1169,7 +1170,7 @@ pub const Core = struct {
                 self.stdout_file = null;
             }
         }
-        self.stdin_close_mu.unlock();
+        self.stdin_close_mu.unlock(clock.io());
 
         // Join writer thread. It exits via:
         //   - clean shutdown: write_queue_closed observed with empty queue
@@ -1261,7 +1262,7 @@ pub const Core = struct {
         self.known_external_grids.deinit(self.alloc);
         self.known_external_grids = .{};
         self.msg_line_cache.deinit(self.alloc);
-        self.msg_line_cache = .{};
+        self.msg_line_cache = .empty;
         self.msg_config.deinit();
         self.msg_config = .{};
 
@@ -1286,7 +1287,7 @@ pub const Core = struct {
 
         // Grow: append empty row buffers
         while (self.scroll_cache.items.len < target_rows) {
-            try self.scroll_cache.append(self.alloc, .{});
+            try self.scroll_cache.append(self.alloc, .empty);
         }
 
         // Resize the valid bitset
@@ -1424,7 +1425,7 @@ pub const Core = struct {
         const cb = self.cb.on_get_ascii_table orelse return false;
 
         const log_active = self.log.cb != null;
-        const t0: i128 = if (log_active) std.time.nanoTimestamp() else 0;
+        const t0: i128 = if (log_active) clock.nowNs() else 0;
 
         const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
         var all_ok = true;
@@ -1439,7 +1440,7 @@ pub const Core = struct {
             if (ok == 0) all_ok = false;
         }
 
-        const t1: i128 = if (log_active) std.time.nanoTimestamp() else 0;
+        const t1: i128 = if (log_active) clock.nowNs() else 0;
 
         self.ascii_tables_valid = all_ok;
         if (all_ok) {
@@ -1447,7 +1448,7 @@ pub const Core = struct {
         }
 
         if (log_active) {
-            const t2 = std.time.nanoTimestamp();
+            const t2 = clock.nowNs();
             const table_us: i64 = @intCast(@divTrunc(@max(0, t1 - t0), 1000));
             const preraster_us: i64 = @intCast(@divTrunc(@max(0, t2 - t1), 1000));
             self.log.write("[perf] loadAsciiTables table_fetch_us={d} preraster_us={d} ok={}\n", .{ table_us, preraster_us, all_ok });
@@ -1539,7 +1540,7 @@ pub const Core = struct {
 
         // Try to pack
         var packer = &(self.atlas_packer.?);
-        const t_pack: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        const t_pack: i128 = if (log_on) clock.nowNs() else 0;
         var rect = packer.alloc(bm.width, bm.height);
 
         // Atlas full → reset and retry once.
@@ -1551,7 +1552,7 @@ pub const Core = struct {
             if (rect == null) return null;
         }
         if (log_on) {
-            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_pack));
+            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_pack));
             self.perf_pack_ns_total +%= dt;
         }
 
@@ -1559,10 +1560,10 @@ pub const Core = struct {
 
         // Upload glyph bitmap
         if (self.cb.on_atlas_upload) |f| {
-            const t_up: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+            const t_up: i128 = if (log_on) clock.nowNs() else 0;
             f(self.ctx, r.x + packer.padding, r.y + packer.padding, bm.width, bm.height, bm);
             if (log_on) {
-                const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_up));
+                const dt: u64 = @intCast(@max(0, clock.nowNs() - t_up));
                 self.perf_upload_ns_total +%= dt;
                 self.perf_upload_calls +%= 1;
             }
@@ -1596,10 +1597,10 @@ pub const Core = struct {
             self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
             if (self.cb.on_atlas_create) |f| {
                 const log_on = self.log.cb != null;
-                const t: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+                const t: i128 = if (log_on) clock.nowNs() else 0;
                 f(self.ctx, self.atlas_w, self.atlas_h);
                 if (log_on) {
-                    const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t));
+                    const dt: u64 = @intCast(@max(0, clock.nowNs() - t));
                     self.perf_atlas_create_ns_total +%= dt;
                     self.perf_atlas_create_calls +%= 1;
                 }
@@ -1663,9 +1664,9 @@ pub const Core = struct {
     /// Returns null on unrecoverable failure (rasterize callback returned 0).
     pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
-        const t_total: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        const t_total: i128 = if (log_on) clock.nowNs() else 0;
         defer if (log_on) {
-            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_total));
+            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_total));
             self.perf_atlas_total_ns_total +%= dt;
             self.perf_atlas_total_calls +%= 1;
         };
@@ -1674,10 +1675,10 @@ pub const Core = struct {
 
         // Ask frontend to rasterize (no packing / UV)
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
-        const t_r: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        const t_r: i128 = if (log_on) clock.nowNs() else 0;
         const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
         if (log_on) {
-            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_r));
+            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
@@ -1690,9 +1691,9 @@ pub const Core = struct {
     /// Similar to ensureGlyphPhase2 but uses on_rasterize_glyph_by_id callback.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
-        const t_total: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        const t_total: i128 = if (log_on) clock.nowNs() else 0;
         defer if (log_on) {
-            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_total));
+            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_total));
             self.perf_atlas_total_ns_total +%= dt;
             self.perf_atlas_total_calls +%= 1;
         };
@@ -1700,10 +1701,10 @@ pub const Core = struct {
         self.ensureAtlasInit();
 
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
-        const t_r: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+        const t_r: i128 = if (log_on) clock.nowNs() else 0;
         const ok = self.cb.on_rasterize_glyph_by_id.?(self.ctx, glyph_id, style_flags, &bm);
         if (log_on) {
-            const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t_r));
+            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
@@ -1725,10 +1726,10 @@ pub const Core = struct {
         self.atlas_initialized = true;
         if (self.cb.on_atlas_create) |f| {
             const log_on = self.log.cb != null;
-            const t: i128 = if (log_on) std.time.nanoTimestamp() else 0;
+            const t: i128 = if (log_on) clock.nowNs() else 0;
             f(self.ctx, self.atlas_w, self.atlas_h);
             if (log_on) {
-                const dt: u64 = @intCast(@max(0, std.time.nanoTimestamp() - t));
+                const dt: u64 = @intCast(@max(0, clock.nowNs() - t));
                 self.perf_atlas_create_ns_total +%= dt;
                 self.perf_atlas_create_calls +%= 1;
             }
@@ -1779,8 +1780,8 @@ pub const Core = struct {
     }
 
     pub fn noteInputTrace(self: *Core, seq: u64, sent_ns: i64) void {
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
         self.grid.noteInputTrace(seq, sent_ns);
         if (self.log.cb != null) {
             self.log.write("[perf_input] seq={d} stage=input_send sent_ns={d}\n", .{ seq, sent_ns });
@@ -1859,8 +1860,8 @@ pub const Core = struct {
     /// Get list of visible grids for hit-testing.
     /// Returns number of grids written (up to out.len).
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
         return self.getVisibleGridsLocked(out);
     }
 
@@ -1868,7 +1869,7 @@ pub const Core = struct {
     /// Returns null if grid_mu could not be acquired (another thread holds it).
     pub fn tryGetVisibleGrids(self: *Core, out: []c_api.GridInfo) ?usize {
         if (!self.grid_mu.tryLock()) return null;
-        defer self.grid_mu.unlock();
+        defer self.grid_mu.unlock(clock.io());
         return self.getVisibleGridsLocked(out);
     }
 
@@ -1973,8 +1974,8 @@ pub const Core = struct {
 
     pub fn getCursorPosition(self: *Core) CursorPosition {
         // Lock grid_mu to prevent concurrent modification from RPC thread.
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
 
         return .{
             .grid_id = self.grid.cursor_grid,
@@ -1986,8 +1987,8 @@ pub const Core = struct {
     /// Get viewport info for a specific grid (for scrollbar rendering).
     /// Returns 1 if found, 0 if not found.
     pub fn getViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
         return self.getViewportInfoLocked(grid_id, out);
     }
 
@@ -1995,7 +1996,7 @@ pub const Core = struct {
     /// Returns null if grid_mu could not be acquired (another thread holds it).
     pub fn tryGetViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) ?i32 {
         if (!self.grid_mu.tryLock()) return null;
-        defer self.grid_mu.unlock();
+        defer self.grid_mu.unlock(clock.io());
         return self.getViewportInfoLocked(grid_id, out);
     }
 
@@ -2027,8 +2028,8 @@ pub const Core = struct {
 
     /// Get highlight colors by group name (e.g., "Search", "Normal").
     pub fn getHlByName(self: *Core, name: []const u8) HlColors {
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
 
         // Look up hl_id from group name
         const hl_id = self.hl.groups.get(name) orelse {
@@ -2086,8 +2087,8 @@ pub const Core = struct {
         }
 
         // Called from UI thread - acquire grid_mu to protect grid state access.
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
 
         self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
     }
@@ -2160,8 +2161,8 @@ pub const Core = struct {
             self.grid.screen_cols = cols;
             return;
         }
-        self.grid_mu.lock();
-        defer self.grid_mu.unlock();
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
         self.grid.screen_cols = cols;
     }
 
@@ -2587,36 +2588,36 @@ pub const Core = struct {
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
     /// Receives the stream by value to avoid racing with stop().
     fn writerThreadFn(self: *Core, file: Stream) void {
-        var drain: std.ArrayListUnmanaged(u8) = .{};
+        var drain: std.ArrayListUnmanaged(u8) = .empty;
         defer drain.deinit(self.alloc);
 
         while (true) {
-            self.write_queue_mu.lock();
+            self.write_queue_mu.lockUncancelable(clock.io());
 
             // Wait for data or close signal
             while (self.write_queue.items.len == 0 and !self.write_queue_closed) {
-                self.write_queue_cond.wait(&self.write_queue_mu);
+                self.write_queue_cond.waitUncancelable(clock.io(), &self.write_queue_mu);
             }
 
             if (self.write_queue.items.len == 0 and self.write_queue_closed) {
-                self.write_queue_mu.unlock();
+                self.write_queue_mu.unlock(clock.io());
                 self.log.write("writer thread: clean shutdown (queue drained)\n", .{});
                 break;
             }
 
             // O(1) swap: take full queue, leave empty drain buffer for producers
             std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_queue, &drain);
-            self.write_queue_mu.unlock();
+            self.write_queue_mu.unlock(clock.io());
 
             // Write to pipe WITHOUT holding any mutex
             file.writeAll(drain.items) catch |e| {
                 self.log.write("writer thread writeAll err: {any}\n", .{e});
                 // Mark writer as failed + closed, notify any future waiters
-                self.write_queue_mu.lock();
+                self.write_queue_mu.lockUncancelable(clock.io());
                 self.writer_failed = true;
                 self.write_queue_closed = true;
-                self.write_queue_cond.broadcast();
-                self.write_queue_mu.unlock();
+                self.write_queue_cond.broadcast(clock.io());
+                self.write_queue_mu.unlock(clock.io());
                 break;
             };
 
@@ -2632,13 +2633,13 @@ pub const Core = struct {
             return;
         };
 
-        self.write_queue_mu.lock();
+        self.write_queue_mu.lockUncancelable(clock.io());
 
         // Guard: don't start if shutdown is in progress or already running.
         // write_queue_closed is set by stop() under the same mutex, so this
         // check fully closes the race window between stop_flag and lock acquisition.
         if (self.write_queue_closed or self.writer_thread != null) {
-            self.write_queue_mu.unlock();
+            self.write_queue_mu.unlock(clock.io());
             return;
         }
 
@@ -2647,12 +2648,12 @@ pub const Core = struct {
         self.write_queue.clearRetainingCapacity();
 
         self.writer_thread = std.Thread.spawn(.{}, writerThreadFn, .{ self, file }) catch |e| {
-            self.write_queue_mu.unlock();
+            self.write_queue_mu.unlock(clock.io());
             self.log.write("FATAL: failed to spawn writer thread: {any}, using sync writes\n", .{e});
             return; // writer_thread remains null → sendRaw uses sync fallback
         };
 
-        self.write_queue_mu.unlock();
+        self.write_queue_mu.unlock(clock.io());
     }
 
     pub fn sendRaw(self: *Core, bytes: []const u8) !void {
@@ -2663,7 +2664,7 @@ pub const Core = struct {
         if (self.is_ssh_mode and self.ssh_auth_pending.load(.seq_cst)) {
             self.log.write("sendRaw: blocked during SSH auth, waiting...\n", .{});
             while (self.ssh_auth_pending.load(.seq_cst) and !self.stop_flag.load(.seq_cst)) {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                std.Io.sleep(clock.io(), .{ .nanoseconds = @intCast(50 * std.time.ns_per_ms) }, .awake) catch {};
             }
             if (self.stop_flag.load(.seq_cst)) {
                 return error.BrokenPipe;
@@ -2672,12 +2673,12 @@ pub const Core = struct {
         }
 
         // Check writer thread state under lock to avoid data race with stop()/startWriterThread()
-        self.write_queue_mu.lock();
+        self.write_queue_mu.lockUncancelable(clock.io());
 
         if (self.writer_thread != null) {
             // Writer thread is active → enqueue (non-blocking path)
             if (self.writer_failed or self.write_queue_closed) {
-                self.write_queue_mu.unlock();
+                self.write_queue_mu.unlock(clock.io());
                 return error.BrokenPipe;
             }
 
@@ -2685,20 +2686,20 @@ pub const Core = struct {
             if (bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue.items.len) {
                 self.log.write("sendRaw: write queue full ({d} bytes), dropping\n",
                     .{self.write_queue.items.len});
-                self.write_queue_mu.unlock();
+                self.write_queue_mu.unlock(clock.io());
                 return error.OutOfMemory;
             }
 
             self.write_queue.appendSlice(self.alloc, bytes) catch {
-                self.write_queue_mu.unlock();
+                self.write_queue_mu.unlock(clock.io());
                 return error.OutOfMemory;
             };
-            self.write_queue_cond.signal();
-            self.write_queue_mu.unlock();
+            self.write_queue_cond.signal(clock.io());
+            self.write_queue_mu.unlock(clock.io());
             return;
         }
 
-        self.write_queue_mu.unlock();
+        self.write_queue_mu.unlock(clock.io());
 
         // Fallback: no writer thread → synchronous write (startup / spawn failure)
         if (self.stdin_file) |f| {
@@ -3335,8 +3336,8 @@ pub const Core = struct {
         // write) while holding grid_mu, which is shared with the redraw thread.
         var editing = false;
         {
-            self.grid_mu.lock();
-            defer self.grid_mu.unlock();
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
             const mode = std.mem.sliceTo(&self.grid.current_mode_name, 0);
             editing = std.mem.startsWith(u8, mode, "insert") or
                 std.mem.startsWith(u8, mode, "replace");
@@ -3466,8 +3467,8 @@ pub const Core = struct {
 
         // Resolve grid_id -> Neovim winid (requires grid_mu)
         const winid: i64 = blk: {
-            self.grid_mu.lock();
-            defer self.grid_mu.unlock();
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
             break :blk self.grid.getWinId(grid_id) orelse 0;
         };
 

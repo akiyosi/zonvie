@@ -59,7 +59,7 @@ pub const CmdlineChunk = struct {
 
 /// State for a single cmdline level.
 pub const CmdlineState = struct {
-    content: std.ArrayListUnmanaged(CmdlineChunk) = .{},
+    content: std.ArrayListUnmanaged(CmdlineChunk) = .empty,
     pos: u32 = 0, // cursor position
     firstc: u8 = 0, // ':' '/' '?' etc.
     prompt: []const u8 = "",
@@ -81,7 +81,7 @@ pub const CmdlineState = struct {
             }
         }
         self.content.deinit(alloc);
-        self.content = .{};
+        self.content = .empty;
         // Free duped prompt
         if (self.prompt.len > 0) {
             alloc.free(self.prompt);
@@ -125,7 +125,7 @@ pub const CmdlineState = struct {
 /// State for cmdline block (multi-line input).
 pub const CmdlineBlock = struct {
     /// Each line is an array of chunks
-    lines: std.ArrayListUnmanaged(std.ArrayListUnmanaged(CmdlineChunk)) = .{},
+    lines: std.ArrayListUnmanaged(std.ArrayListUnmanaged(CmdlineChunk)) = .empty,
     visible: bool = false,
 
     pub fn deinit(self: *CmdlineBlock, alloc: std.mem.Allocator) void {
@@ -139,7 +139,7 @@ pub const CmdlineBlock = struct {
             line.deinit(alloc);
         }
         self.lines.deinit(alloc);
-        self.lines = .{};
+        self.lines = .empty;
     }
 
     pub fn clear(self: *CmdlineBlock, alloc: std.mem.Allocator) void {
@@ -175,7 +175,7 @@ pub const MsgChunk = struct {
 pub const Message = struct {
     id: i64 = 0, // msg_id from Neovim
     kind: []const u8 = "", // "emsg", "echo", etc.
-    content: std.ArrayListUnmanaged(MsgChunk) = .{},
+    content: std.ArrayListUnmanaged(MsgChunk) = .empty,
     history: bool = false, // added to :messages
     append: bool = false, // append to previous
     replace_last: bool = false, // replace last message
@@ -188,7 +188,7 @@ pub const Message = struct {
             }
         }
         self.content.deinit(alloc);
-        self.content = .{};
+        self.content = .empty;
         // Free duped kind
         if (self.kind.len > 0) {
             alloc.free(self.kind);
@@ -257,10 +257,10 @@ pub const ConfirmMessage = struct {
 };
 
 pub const MessageState = struct {
-    messages: std.ArrayListUnmanaged(Message) = .{},
-    showmode_content: std.ArrayListUnmanaged(MsgChunk) = .{},
-    showcmd_content: std.ArrayListUnmanaged(MsgChunk) = .{},
-    ruler_content: std.ArrayListUnmanaged(MsgChunk) = .{},
+    messages: std.ArrayListUnmanaged(Message) = .empty,
+    showmode_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
+    showcmd_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
+    ruler_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
     visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
@@ -288,7 +288,7 @@ pub const MessageState = struct {
             msg.deinit(alloc);
         }
         self.messages.deinit(alloc);
-        self.messages = .{};
+        self.messages = .empty;
 
         // Free showmode chunks
         for (self.showmode_content.items) |chunk| {
@@ -355,7 +355,7 @@ pub const MessageState = struct {
 /// A single entry in message history (for msg_history_show).
 pub const MsgHistoryEntry = struct {
     kind: []const u8 = "",
-    content: std.ArrayListUnmanaged(MsgChunk) = .{},
+    content: std.ArrayListUnmanaged(MsgChunk) = .empty,
     append: bool = false,
 
     pub fn deinit(self: *MsgHistoryEntry, alloc: std.mem.Allocator) void {
@@ -369,7 +369,7 @@ pub const MsgHistoryEntry = struct {
 
 /// State for msg_history_show event.
 pub const MsgHistoryState = struct {
-    entries: std.ArrayListUnmanaged(MsgHistoryEntry) = .{},
+    entries: std.ArrayListUnmanaged(MsgHistoryEntry) = .empty,
     prev_cmd: bool = false,
     dirty: bool = false,
 
@@ -402,7 +402,7 @@ pub const PopupmenuItem = struct {
 
 /// State for popup menu.
 pub const PopupmenuState = struct {
-    items: std.ArrayListUnmanaged(PopupmenuItem) = .{},
+    items: std.ArrayListUnmanaged(PopupmenuItem) = .empty,
     selected: i32 = -1,
     row: i32 = 0,
     col: i32 = 0,
@@ -418,7 +418,7 @@ pub const PopupmenuState = struct {
             if (item.info.len > 0) alloc.free(item.info);
         }
         self.items.deinit(alloc);
-        self.items = .{};
+        self.items = .empty;
     }
 
     pub fn clear(self: *PopupmenuState, alloc: std.mem.Allocator) void {
@@ -454,8 +454,8 @@ pub const BufferEntry = struct {
 
 /// State for tabline (Chrome-style tabs).
 pub const TablineState = struct {
-    tabs: std.ArrayListUnmanaged(TabEntry) = .{},
-    buffers: std.ArrayListUnmanaged(BufferEntry) = .{},
+    tabs: std.ArrayListUnmanaged(TabEntry) = .empty,
+    buffers: std.ArrayListUnmanaged(BufferEntry) = .empty,
     current_tab: i64 = 0,
     current_buffer: i64 = 0,
     visible: bool = false,
@@ -466,12 +466,12 @@ pub const TablineState = struct {
             if (tab.name.len > 0) alloc.free(tab.name);
         }
         self.tabs.deinit(alloc);
-        self.tabs = .{};
+        self.tabs = .empty;
         for (self.buffers.items) |buf| {
             if (buf.name.len > 0) alloc.free(buf.name);
         }
         self.buffers.deinit(alloc);
-        self.buffers = .{};
+        self.buffers = .empty;
     }
 
     pub fn clear(self: *TablineState, alloc: std.mem.Allocator) void {
@@ -864,7 +864,7 @@ pub const Grid = struct {
     cursor_blink_off_ms: u32 = 0,   // off time for blink cycle (ms)
 
     cursor_style_enabled: bool = false,
-    mode_infos: std.ArrayListUnmanaged(ModeInfo) = .{},
+    mode_infos: std.ArrayListUnmanaged(ModeInfo) = .empty,
     current_mode_idx: usize = 0,
     /// Current mode name (e.g., "normal", "insert", "terminal")
     /// Fixed-size buffer to avoid allocation; null-terminated.
@@ -880,10 +880,10 @@ pub const Grid = struct {
     external_grids: std.AutoHashMapUnmanaged(i64, ExternalGridInfo) = .{},
 
     // ext_windows: pending grid resize requests (processed by core after redraw)
-    pending_grid_resizes: std.ArrayListUnmanaged(PendingGridResize) = .{},
+    pending_grid_resizes: std.ArrayListUnmanaged(PendingGridResize) = .empty,
 
     // ext_windows: pending layout operations (win_move, win_exchange, etc.)
-    pending_win_ops: std.ArrayListUnmanaged(PendingWinOp) = .{},
+    pending_win_ops: std.ArrayListUnmanaged(PendingWinOp) = .empty,
 
     // ext_windows: grids awaiting initial resize response from Neovim.
     // Window creation is deferred until grid_resize provides adequate dimensions.
@@ -1210,7 +1210,7 @@ pub const Grid = struct {
         // Phase 1: Remove all entries in the scroll region from the map.
         // Values are inline (no heap), so no free needed.
         const MovedEntry = struct { new_key: OverflowKey, value: OverflowExtras };
-        var moved = std.ArrayListUnmanaged(MovedEntry){};
+        var moved : std.ArrayListUnmanaged(MovedEntry) = .empty;
         defer moved.deinit(self.alloc);
 
         while (true) {
@@ -2287,7 +2287,7 @@ pub const Grid = struct {
     pub fn setCmdlineBlockShow(self: *Grid, lines: []const []const CmdlineChunk) !void {
         self.cmdline_block.clear(self.alloc);
         for (lines) |line| {
-            var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .{};
+            var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
             errdefer {
                 for (line_chunks.items) |chunk| {
                     if (chunk.text.len > 0) self.alloc.free(chunk.text);
@@ -2311,7 +2311,7 @@ pub const Grid = struct {
 
     /// Handle cmdline_block_append event.
     pub fn appendCmdlineBlock(self: *Grid, line: []const CmdlineChunk) !void {
-        var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .{};
+        var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
         errdefer {
             for (line_chunks.items) |chunk| {
                 if (chunk.text.len > 0) self.alloc.free(chunk.text);
@@ -2427,7 +2427,7 @@ pub const Grid = struct {
         buffers: []const BufferEntry,
     ) !void {
         // --- Phase 1: build new tab list (old state untouched on error) ---
-        var new_tabs: std.ArrayListUnmanaged(TabEntry) = .{};
+        var new_tabs: std.ArrayListUnmanaged(TabEntry) = .empty;
         errdefer {
             for (new_tabs.items) |t| {
                 if (t.name.len > 0) self.alloc.free(t.name);
@@ -2446,7 +2446,7 @@ pub const Grid = struct {
         }
 
         // --- Phase 2: build new buffer list (old state untouched on error) ---
-        var new_bufs: std.ArrayListUnmanaged(BufferEntry) = .{};
+        var new_bufs: std.ArrayListUnmanaged(BufferEntry) = .empty;
         errdefer {
             for (new_bufs.items) |b| {
                 if (b.name.len > 0) self.alloc.free(b.name);

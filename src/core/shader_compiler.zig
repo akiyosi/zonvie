@@ -49,11 +49,19 @@ pub const CompileError = error{
 };
 
 // glslang_initialize_process() is a one-shot global. It is safe to call
-// multiple times in the same process but wasteful; wrap in std.once.
-var glslang_init_once = std.once(initGlslangProcess);
+// multiple times in the same process but wasteful. Zig 0.16 removed std.once,
+// so use a manual 3-state gate (0=uninit, 1=running, 2=done) that makes
+// concurrent callers block until initialization has fully completed.
+var glslang_init_state: std.atomic.Value(u8) = .init(0);
 
-fn initGlslangProcess() void {
-    _ = glslang.glslang_initialize_process();
+fn ensureGlslangInit() void {
+    if (glslang_init_state.load(.acquire) == 2) return;
+    if (glslang_init_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        _ = glslang.glslang_initialize_process();
+        glslang_init_state.store(2, .release);
+        return;
+    }
+    while (glslang_init_state.load(.acquire) != 2) std.atomic.spinLoopHint();
 }
 
 /// Shadertoy-compatible wrapper prepended to Shadertoy-style user sources.
@@ -183,7 +191,7 @@ pub fn compileGlslToTarget(
 ) CompileError![]u8 {
     if (glsl_source.len == 0) return CompileError.EmptySource;
 
-    glslang_init_once.call();
+    ensureGlslangInit();
 
     // Auto-wrap Shadertoy-style sources.
     const wrapped: []u8 = if (isShadertoyStyle(glsl_source))

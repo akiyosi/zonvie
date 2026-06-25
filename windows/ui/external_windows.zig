@@ -45,7 +45,7 @@ fn drawDecoratedExternalSurface(
             const window_w: f32 = @floatFromInt(g.width);
             const window_h: f32 = @floatFromInt(g.height);
 
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const ext_win_relookup = app.external_windows.getPtr(grid_id);
             const content_rows = if (ext_win_relookup) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
@@ -58,7 +58,7 @@ fn drawDecoratedExternalSurface(
             const icon_r = app.cmdline_icon_color[0];
             const icon_g = app.cmdline_icon_color[1];
             const icon_b = app.cmdline_icon_color[2];
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (content_rows == 0 or content_cols == 0) return;
 
@@ -98,7 +98,7 @@ fn drawDecoratedExternalSurface(
                 }
             }
             if (!found_bg_vertex) {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.external_windows.getPtr(grid_id)) |ew| {
                     if (ew.cached_bg_color) |cached| {
                         orig_bg_r = cached[0];
@@ -106,13 +106,13 @@ fn drawDecoratedExternalSurface(
                         orig_bg_b = cached[2];
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
             } else {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.external_windows.getPtr(grid_id)) |ew| {
                     ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
             }
 
             const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
@@ -181,11 +181,11 @@ fn drawDecoratedExternalSurface(
             defer app.alloc.free(pum_verts);
             @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
 
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const border_r = app.cmdline_border_color[0];
             const border_g = app.cmdline_border_color[1];
             const border_b = app.cmdline_border_color[2];
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             var extra_idx: usize = vert_count;
             const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
@@ -206,13 +206,13 @@ fn drawDecoratedExternalSurface(
             const window_w: f32 = @floatFromInt(g.width);
             const window_h: f32 = @floatFromInt(g.height);
 
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const ext_win_relookup2 = app.external_windows.getPtr(grid_id);
             const content_rows = if (ext_win_relookup2) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
             const cell_w = app.cell_w_px;
             const cell_h = app.cell_h_px + app.linespace_px;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
             if (content_rows == 0 or content_cols == 0) return;
 
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
@@ -250,7 +250,7 @@ fn drawDecoratedExternalSurface(
                 }
             }
             if (!found_bg_vertex) {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.external_windows.getPtr(grid_id)) |ew| {
                     if (ew.cached_bg_color) |cached| {
                         orig_bg_r = cached[0];
@@ -258,13 +258,13 @@ fn drawDecoratedExternalSurface(
                         orig_bg_b = cached[2];
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
             } else {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 if (app.external_windows.getPtr(grid_id)) |ew| {
                     ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
             }
 
             const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
@@ -397,7 +397,7 @@ fn drawNormalExternalSurfaceRowMode(
     const force_full_rows = force_full or glow_enabled or (g.opacity < 1.0);
 
     // Build sorted, deduplicated rows_to_draw list.
-    var rows_to_draw: std.ArrayListUnmanaged(u32) = .{};
+    var rows_to_draw: std.ArrayListUnmanaged(u32) = .empty;
     defer rows_to_draw.deinit(app.alloc);
 
     const ext_rows = tbs_committed.rows;
@@ -424,7 +424,7 @@ fn drawNormalExternalSurfaceRowMode(
         .glow_enabled = glow_enabled,
     };
 
-    var bloom_verts: std.ArrayListUnmanaged(app_mod.Vertex) = .{};
+    var bloom_verts: std.ArrayListUnmanaged(app_mod.Vertex) = .empty;
     defer bloom_verts.deinit(app.alloc);
 
     // Ensure row_vbs array covers committed set's row count.
@@ -537,8 +537,8 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_external_window: grid_id={d} win={d} rows={d} cols={d} pos=({d},{d})\n", .{ grid_id, win, rows, cols, start_row, start_col });
 
-    app.mu.lock();
-    defer app.mu.unlock();
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
 
     // Check if already exists. If the existing entry is is_pending_close
     // (queued for destruction by an earlier on_external_window_close —
@@ -696,7 +696,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Tab externalization: use pending position if set (only for regular external windows, not special windows)
     // Also check timeout (500ms) to prevent stale position from affecting unrelated windows.
     const pending_timeout_ms: i64 = 500;
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = @as(i64, @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms)));
     const pending_age_ms = now_ms - app.pending_external_window_position_time;
     if (!is_special_window and app.pending_external_window_position != null and pending_age_ms < pending_timeout_ms) {
         const pos = app.pending_external_window_position.?;
@@ -716,14 +716,14 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     } else if (req.start_row >= 0 and req.start_col >= 0) {
         // Check if anchor window (req.win) is an external window
         // Copy hwnd while holding lock to avoid use-after-free
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const anchor_hwnd: ?c.HWND = if (req.win > 0) blk: {
             if (app.external_windows.get(req.win)) |ew| {
                 break :blk ew.hwnd;
             }
             break :blk null;
         } else null;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (anchor_hwnd) |ahwnd| {
             // Position relative to anchor external window
@@ -772,9 +772,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     } else if (is_cmdline) {
         // Position cmdline window
         // If message window is visible (confirm dialog), position directly below it
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const msg_win = app.message_window;
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (msg_win) |mw| {
             var msg_rect: c.RECT = undefined;
@@ -794,10 +794,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             }
         } else {
             // No message window: use saved position if available, otherwise center on screen
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const saved_x = app.cmdline_saved_x;
             const saved_y = app.cmdline_saved_y;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
 
             if (saved_x != null and saved_y != null) {
                 // Use saved position, but ensure window stays on screen
@@ -817,9 +817,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     } else if (is_popupmenu and req.start_row == -1) {
         // Popupmenu for cmdline completion: position above cmdline window
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const cmdline_win = app.external_windows.get(app_mod.CMDLINE_GRID_ID);
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (cmdline_win) |cw| {
             var cmdline_rect: c.RECT = undefined;
@@ -845,18 +845,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     } else if (is_msg_history) {
         // Message history: position at top-right based on config
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         pos_x = target_rect.right - window_w - 10;
         pos_y = target_rect.top + 10; // 10px from top
         if (applog.isEnabled()) applog.appLog("[win] msg_history at top-right: ({d},{d})\n", .{ pos_x, pos_y });
     } else if (is_msg_show) {
         // Message show (e.g. "Press ENTER..."): position below msg_history if visible, otherwise at top-right
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         const msg_history_win = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
         const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         if (msg_history_win) |hw| {
             // Position below msg_history window
@@ -943,7 +943,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // vs a regular split externalized by ext_windows. Query core before acquiring app.mu.
     const is_float = if (app.corep) |cp| core.zonvie_core_is_float_external(cp, req.grid_id) != 0 else false;
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
 
     // Defense-in-depth: refuse to overwrite a live external_windows entry
     // (i.e., one that is NOT is_pending_close). The main caller flow
@@ -956,7 +956,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // created HWND/renderer instead.
     if (app.external_windows.get(req.grid_id)) |existing| {
         if (!existing.is_pending_close) {
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
             if (applog.isEnabled()) applog.appLog("[win] createExternalWindowOnUIThread: live entry for grid_id={d} would be overwritten; aborting (probable upstream coalesce miss)\n", .{req.grid_id});
             var tmp_renderer = renderer;
             tmp_renderer.deinit();
@@ -967,7 +967,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         // WM_APP_CREATE_EXTERNAL_WINDOW blocked-skip path. Reaching
         // here means we got dequeued before close ran — also a bug.
         // Same teardown response.
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (applog.isEnabled()) applog.appLog("[win] createExternalWindowOnUIThread: pending-close entry for grid_id={d} still in map; aborting (close not yet completed)\n", .{req.grid_id});
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
@@ -986,7 +986,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     app.external_windows.put(app.alloc, req.grid_id, ext_window) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to store external window: {any}\n", .{e});
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
         _ = c.DestroyWindow(hwnd);
@@ -1145,7 +1145,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Now call SetWindowPos outside the lock to avoid deadlock
     if (deferred_setpos) |sp| {
@@ -1176,7 +1176,7 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     // The seq tag on each entry is unique so the old WM_APP_CREATE
     // message — which carries the removed entry's seq in lParam —
     // will find no match and be a no-op when the UI thread processes it.
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const main_hwnd = app.hwnd;
     if (app.external_windows.getPtr(grid_id)) |ext_win| {
         ext_win.is_pending_close = true;
@@ -1191,7 +1191,7 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
             i += 1;
         }
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
     if (removed > 0 and applog.isEnabled()) {
         applog.appLog("[win] on_external_window_close: dropped {d} stale pending request(s) for grid_id={d}\n", .{ removed, grid_id });
     }
@@ -1210,13 +1210,13 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
     // Check if paint is in progress - if so, defer the close
     // DXGI operations can pump messages, so close could be triggered during paint
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     if (app.external_windows.getPtr(grid_id)) |ew| {
         if (ew.paint_ref_count > 0) {
             // Paint is in progress - just mark as pending and let paint trigger close when done
             ew.is_pending_close = true;
             if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: paint in progress (ref={d}), deferring close\n", .{ew.paint_ref_count});
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
             return;
         }
     }
@@ -1251,14 +1251,14 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
     // Remove from external_windows HashMap and get the entry
     const entry = app.external_windows.fetchRemove(grid_id);
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (entry) |e| {
         var ext_win = e.value;
 
         // Check if IME overlay was parented to this external window
         // If so, destroy it and reset the handle so main window can create a new one
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         if (app.ime_overlay_hwnd) |overlay| {
             const parent = c.GetParent(overlay);
             if (parent == ext_win.hwnd) {
@@ -1267,7 +1267,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
                 if (applog.isEnabled()) applog.appLog("[win] destroyed IME overlay parented to external window\n", .{});
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
 
         // deinit handles DestroyWindow and resource cleanup
         ext_win.deinit(app.alloc);
@@ -1293,7 +1293,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     // the right one. (Coalesce in onExternalWindow keeps the pending
     // count <=1 per grid_id, but iterate the full set defensively.)
     if (entry != null) {
-        app.mu.lock();
+        app.mu.lockUncancelable(core.clock.io());
         var seqs_buf: [8]u64 = undefined;
         var seq_count: usize = 0;
         for (app.pending_external_windows.items) |item| {
@@ -1302,7 +1302,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
                 seq_count += 1;
             }
         }
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (seq_count > 0) {
             if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: waking {d} pending create(s) for grid_id={d}\n", .{ seq_count, grid_id });
             if (app.hwnd) |main_hwnd| {
@@ -1330,9 +1330,9 @@ pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     //      closing cmdline ext_win's rect
     //   4. on_cursor_grid_changed fires -> posts WM_APP_CURSOR_GRID_CHANGED
     //   5. UI thread updates app.last_cursor_grid = 2 (too late)
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.last_cursor_grid = grid_id;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Post message to UI thread to handle window activation
     if (app.hwnd) |main_hwnd| {
@@ -1441,9 +1441,9 @@ pub export fn ExternalWndProc(
                 const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
 
                 // Check if IME is composing
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 const ime_composing = app.ime_composing;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
                 if (ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK)) {
@@ -1527,7 +1527,7 @@ pub export fn ExternalWndProc(
                     return 0;
                 }
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
 
                 // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
@@ -1545,7 +1545,7 @@ pub export fn ExternalWndProc(
                 const cell_h = app.cell_h_px + app.linespace_px;
                 const corep = app.corep;
 
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Skip tryResizeGrid when window is being resized programmatically
                 // (from Neovim grid_resize). Only report back on user-initiated resizes.
@@ -1570,7 +1570,7 @@ pub export fn ExternalWndProc(
         c.WM_MOUSEWHEEL => {
             if (app_mod.getApp(hwnd)) |app| {
                 // Find grid_id and ext_window for this hwnd
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1581,7 +1581,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
                     input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum, false);
@@ -1600,7 +1600,7 @@ pub export fn ExternalWndProc(
 
         c.WM_MOUSEHWHEEL => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1611,7 +1611,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
                     input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.h_scroll_accum, true);
@@ -1626,7 +1626,7 @@ pub export fn ExternalWndProc(
                 const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
                 const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1637,7 +1637,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
                     if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
@@ -1649,7 +1649,7 @@ pub export fn ExternalWndProc(
 
         c.WM_LBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1660,7 +1660,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
                     scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
@@ -1673,7 +1673,7 @@ pub export fn ExternalWndProc(
                 const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
                 const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1684,7 +1684,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
                     const ext_win = ext_window.?;
@@ -1727,7 +1727,7 @@ pub export fn ExternalWndProc(
 
         c.WM_MOUSELEAVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
@@ -1736,7 +1736,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
                     ext_win.scrollbar_hover = false;
@@ -1749,7 +1749,7 @@ pub export fn ExternalWndProc(
             if (app_mod.getApp(hwnd)) |app| {
                 const timer_id = wParam;
 
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
@@ -1760,7 +1760,7 @@ pub export fn ExternalWndProc(
                         break;
                     }
                 }
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
                     if (timer_id == app_mod.TIMER_SCROLLBAR_FADE) {
@@ -1790,7 +1790,7 @@ pub export fn ExternalWndProc(
         c.WM_IME_STARTCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_STARTCOMPOSITION hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.ime_composing = true;
                 app.ime_composition_str.clearRetainingCapacity();
                 app.ime_composition_utf8.clearRetainingCapacity();
@@ -1798,7 +1798,7 @@ pub export fn ExternalWndProc(
                 app.ime_cursor_pos = 0;
                 app.ime_target_start = 0;
                 app.ime_target_end = 0;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Position IME candidate window at cursor (using this external window)
                 input.positionImeCandidateWindow(hwnd, app);
@@ -1821,19 +1821,19 @@ pub export fn ExternalWndProc(
                         const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
                         if (byte_len > 0) {
                             const char_len: usize = @intCast(@divTrunc(byte_len, 2));
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_composition_str.resize(app.alloc, char_len) catch {
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
                             input.updateImeCompositionUtf8(app);
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         } else {
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_composition_str.clearRetainingCapacity();
                             app.ime_composition_utf8.clearRetainingCapacity();
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
 
@@ -1842,22 +1842,22 @@ pub export fn ExternalWndProc(
                         const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
                         if (clause_byte_len > 0) {
                             const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_clause_info.resize(app.alloc, clause_count) catch {
-                                app.mu.unlock();
+                                app.mu.unlock(core.clock.io());
                                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
                             };
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
 
                     // Get cursor position
                     if ((lParam & c.GCS_CURSORPOS) != 0) {
                         const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        app.mu.lock();
+                        app.mu.lockUncancelable(core.clock.io());
                         app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
-                        app.mu.unlock();
+                        app.mu.unlock(core.clock.io());
                     }
 
                     // Get target clause (same logic as main window)
@@ -1870,7 +1870,7 @@ pub export fn ExternalWndProc(
                             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
 
                             // Find target clause (ATTR_TARGET_CONVERTED=0x01 or ATTR_TARGET_NOTCONVERTED=0x03)
-                            app.mu.lock();
+                            app.mu.lockUncancelable(core.clock.io());
                             app.ime_target_start = 0;
                             app.ime_target_end = 0;
                             var found_start: bool = false;
@@ -1885,7 +1885,7 @@ pub export fn ExternalWndProc(
                                     app.ime_target_end = i + 1;
                                 }
                             }
-                            app.mu.unlock();
+                            app.mu.unlock(core.clock.io());
                         }
                     }
                 }
@@ -1897,7 +1897,7 @@ pub export fn ExternalWndProc(
                 // preedit_mode behaves the same across window types.
                 var handled = false;
                 if (app.corep) |corep| {
-                    app.mu.lock();
+                    app.mu.lockUncancelable(core.clock.io());
                     // ime_composition_utf8 is mutated only on this (UI) thread,
                     // and the core call below runs synchronously on it, so the
                     // backing buffer stays valid after unlock — pass the full
@@ -1911,7 +1911,7 @@ pub export fn ExternalWndProc(
                         ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
                         te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
                     }
-                    app.mu.unlock();
+                    app.mu.unlock(core.clock.io());
                     if (utf8_len == 0) {
                         app_mod.zonvie_core_clear_preedit(corep);
                         handled = true; // nothing to display
@@ -1919,9 +1919,9 @@ pub export fn ExternalWndProc(
                         handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
                     }
                 }
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.ime_extmark_active = handled;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
                 if (handled) {
                     input.hideImePreeditOverlay(app);
                 } else {
@@ -1937,7 +1937,7 @@ pub export fn ExternalWndProc(
         c.WM_IME_ENDCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_ENDCOMPOSITION hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
+                app.mu.lockUncancelable(core.clock.io());
                 app.ime_composing = false;
                 app.ime_composition_str.clearRetainingCapacity();
                 app.ime_composition_utf8.clearRetainingCapacity();
@@ -1946,7 +1946,7 @@ pub export fn ExternalWndProc(
                 app.ime_target_start = 0;
                 app.ime_target_end = 0;
                 app.ime_extmark_active = false;
-                app.mu.unlock();
+                app.mu.unlock(core.clock.io());
 
                 // Clear any inline preedit extmark and hide the overlay.
                 if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
@@ -2002,8 +2002,8 @@ pub export fn ExternalWndProc(
         // Enable drag-to-move for cmdline window (entire window acts as title bar)
         c.WM_NCHITTEST => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
-                defer app.mu.unlock();
+                app.mu.lockUncancelable(core.clock.io());
+                defer app.mu.unlock(core.clock.io());
 
                 // Check if this is the cmdline window
                 if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw| {
@@ -2020,8 +2020,8 @@ pub export fn ExternalWndProc(
         // Save cmdline window position when moved
         c.WM_MOVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lock();
-                defer app.mu.unlock();
+                app.mu.lockUncancelable(core.clock.io());
+                defer app.mu.unlock(core.clock.io());
 
                 // Check if this is the cmdline window
                 if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw| {
@@ -2049,14 +2049,14 @@ pub export fn ExternalWndProc(
 /// Does NOT call core APIs that acquire grid_mu — safe for WM_PAINT context.
 /// Float-origin normal windows use NormalFloat; ext_windows splits use default bg.
 fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind, ext_win: *const app_mod.ExternalWindow) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const cached_bg: u32 = switch (kind) {
         .normal => if (ext_win.is_float_external) app.cached_normal_float_bg else 0xFFFFFFFF,
         .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
         .popupmenu => app.cached_pmenu_bg,
     };
     const fallback_bg = app.colorscheme_bg;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     const bg_rgb = if (cached_bg != 0xFFFFFFFF) cached_bg else fallback_bg;
     if (bg_rgb != 0xFFFFFFFF) {
@@ -2065,7 +2065,7 @@ fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurf
 }
 
 pub fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     var should_post_close = false;
     if (app.external_windows.getPtr(grid_id)) |ew| {
         if (ew.paint_ref_count > 0) {
@@ -2081,7 +2081,7 @@ pub fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
             should_post_close = true;
         }
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Post the close message after unlocking, so it's processed after WM_PAINT completes
     if (should_post_close) {
@@ -2149,13 +2149,13 @@ pub fn updateExternalWindowColors(app: *App) void {
         }
     }
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
     app.cached_normal_float_bg = normal_float_bg;
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 }
 
 /// Paint an external window (simpler rendering path than main window)
@@ -2165,7 +2165,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     _ = c.BeginPaint(hwnd, &ps);
     defer _ = c.EndPaint(hwnd, &ps);
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
 
     // Find the external window for this hwnd (also get grid_id)
     var ext_win_ptr: ?*app_mod.ExternalWindow = null;
@@ -2181,7 +2181,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     }
 
     const ext_win = ext_win_ptr orelse {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no external window for hwnd={*}\n", .{hwnd});
         return;
     };
@@ -2196,13 +2196,13 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Skip painting if window is pending close (renderer may be freed soon)
     if (ext_win.is_pending_close) {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: is_pending_close=true, skipping\n", .{});
         return;
     }
 
     if (ext_win.vert_count == 0) {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: vert_count=0, skipping\n", .{});
         return;
     }
@@ -2352,7 +2352,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             vert_count,
         )) {
             ext_win.paint_ref_count -= 1;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
             return;
         }
@@ -2368,7 +2368,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     ext_win.needs_redraw = false;
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
-    var dirty_row_keys: std.ArrayListUnmanaged(u32) = .{};
+    var dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty;
     if (is_row_mode_normal) {
         var dit = ext_win.tbs.paint_dirty_snapshot.iterator(.{});
         while (dit.next()) |row_idx| {
@@ -2400,7 +2400,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
 
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     defer dirty_row_keys.deinit(app.alloc);
 
@@ -2443,9 +2443,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             ext_paint_full = true;
 
             // After resize, DXGI may have pumped messages. Check if ext_win was closed.
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             const still_valid = app.external_windows.contains(grid_id);
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
             if (!still_valid) {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: ext_win was closed during resize, aborting\n", .{});
                 return;
@@ -2721,9 +2721,9 @@ pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_move: grid={d} flags={d}\n", .{ grid_id, flags });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const coll = collectWindowInfos(app, true);
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     const infos = coll.infos[0..coll.count];
     if (findInDirection(infos, grid_id, flags, 1)) |target| {
@@ -2742,9 +2742,9 @@ pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callc
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: grid={d} count={d}\n", .{ grid_id, count });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const coll = collectWindowInfos(app, true);
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (coll.count < 2) return;
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
@@ -2777,12 +2777,12 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: direction={d} count={d}\n", .{ direction, count });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const coll = collectWindowInfos(app, true);
     const hwnd = app.hwnd;
 
     if (coll.count < 2) {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         return;
     }
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
@@ -2838,14 +2838,14 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
         };
         app.deferred_win_ops_count = i + 1;
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (hwnd) |h| {
         if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
             if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: PostMessageW failed\n", .{});
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             app.deferred_win_ops_count = 0;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
         }
     }
 }
@@ -2858,12 +2858,12 @@ pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const coll = collectWindowInfos(app, true);
     const hwnd = app.hwnd;
 
     if (coll.count < 2) {
-        app.mu.unlock();
+        app.mu.unlock(core.clock.io());
         return;
     }
     const infos = coll.infos[0..coll.count];
@@ -2893,14 +2893,14 @@ pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
         };
         app.deferred_win_ops_count = i + 1;
     }
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (hwnd) |h| {
         if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
             if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal: PostMessageW failed\n", .{});
-            app.mu.lock();
+            app.mu.lockUncancelable(core.clock.io());
             app.deferred_win_ops_count = 0;
-            app.mu.unlock();
+            app.mu.unlock(core.clock.io());
         }
     }
 }
@@ -2909,11 +2909,11 @@ pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: direction={d} count={d}\n", .{ direction, count });
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const cursor_grid = app.last_cursor_grid;
     const coll = collectWindowInfos(app, true);
     const corep = app.corep;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     const infos = coll.infos[0..coll.count];
     if (findInDirection(infos, cursor_grid, direction, count)) |target| {

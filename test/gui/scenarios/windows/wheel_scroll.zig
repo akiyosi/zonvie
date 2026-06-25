@@ -16,6 +16,7 @@
 // a real Windows run to confirm the wheel routing / coordinate handling.
 
 const std = @import("std");
+const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
@@ -59,7 +60,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (waited < 40) : (waited += 1) {
         moved = (try topLine(g)) - base;
         if (moved > 0) break;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        gui_io.sleepNs(50 * std.time.ns_per_ms);
     }
 
     // The fix: 1 notch -> 1 event -> mousescroll(3) lines. The regression

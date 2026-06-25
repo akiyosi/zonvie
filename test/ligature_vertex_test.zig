@@ -269,7 +269,7 @@ test "one_to_one: 3 glyphs, 3 visible quads (no suppression)" {
 
     try fillRow(&core, 3, &[_]u32{ '=', '=', '=' });
 
-    var out: std.ArrayListUnmanaged(c_api.Vertex) = .{};
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
     defer out.deinit(alloc);
 
     _ = try flush_mod.generateRowVertices(&core, genParams(3, @floatFromInt(mctx.cell_px)), &out);
@@ -287,7 +287,7 @@ test "calt_eq_eq: == suppresses placeholder, 1 visible quad" {
 
     try fillRow(&core, 2, &[_]u32{ '=', '=' });
 
-    var out: std.ArrayListUnmanaged(c_api.Vertex) = .{};
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
     defer out.deinit(alloc);
 
     _ = try flush_mod.generateRowVertices(&core, genParams(2, @floatFromInt(mctx.cell_px)), &out);
@@ -306,7 +306,7 @@ test "calt_eq_eq_eq: === suppresses placeholders, 1 visible quad" {
 
     try fillRow(&core, 3, &[_]u32{ '=', '=', '=' });
 
-    var out: std.ArrayListUnmanaged(c_api.Vertex) = .{};
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
     defer out.deinit(alloc);
 
     _ = try flush_mod.generateRowVertices(&core, genParams(3, @floatFromInt(mctx.cell_px)), &out);

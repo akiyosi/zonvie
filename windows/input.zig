@@ -206,12 +206,12 @@ pub fn handleMouseWheel(
     _ = c.ScreenToClient(hwnd, &pt);
 
     // Get cell dimensions
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
     const linespace = app.linespace_px;
     const corep = app.corep;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Calculate cell position (include linespace in row height).
     // Mirror the click handler's content-offset rules (window.zig WM_LBUTTONDOWN):
@@ -344,14 +344,14 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     defer _ = c.ImmReleaseContext(hwnd, himc);
 
     // Get cursor position and cell metrics from core
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const corep = app.corep;
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
     const linespace = app.linespace_px;
     const ext_tabline_enabled = app.ext_tabline_enabled;
     const main_hwnd = app.hwnd;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     if (corep == null) return;
 
@@ -368,8 +368,8 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     // appears behind the topmost external window and is invisible.
     var ext_hwnd: ?c.HWND = null;
     {
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
         if (app.external_windows.get(grid_id)) |ew| {
             ext_hwnd = ew.hwnd;
         }
@@ -493,11 +493,11 @@ extern "user32" fn SetWindowPos(hWnd: c.HWND, hWndInsertAfter: ?*const anyopaque
 
 /// Create or update the IME preedit overlay window using layered window.
 pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const composing = app.ime_composing;
     const comp_len = app.ime_composition_str.items.len;
     const extmark_active = app.ime_extmark_active;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     const log_active = applog.isEnabled();
     if (log_active) applog.appLog("[IME] updateImePreeditOverlay composing={d} comp_len={d} extmark={d}\n", .{ @intFromBool(composing), comp_len, @intFromBool(extmark_active) });
@@ -519,7 +519,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     var font_em_size: f32 = 14.0;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
 
-    app.mu.lock();
+    app.mu.lockUncancelable(core.clock.io());
     const corep = app.corep;
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
@@ -532,12 +532,12 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     atlas_cell_h = cell_h;
     const ext_tabline_enabled = app.ext_tabline_enabled;
     const content_hwnd = app.content_hwnd;
-    app.mu.unlock();
+    app.mu.unlock(core.clock.io());
 
     // Access atlas without holding app.mu to avoid nested locking
     if (atlas_ptr) |atlas| {
-        atlas.mu.lock();
-        defer atlas.mu.unlock();
+        atlas.mu.lockUncancelable(core.clock.io());
+        defer atlas.mu.unlock(core.clock.io());
         @memcpy(&font_name_buf, &atlas.font_name);
         atlas_cell_w = atlas.cell_w_px;
         atlas_cell_h = atlas.cell_h_px;
@@ -565,8 +565,8 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     // Check if hwnd is an external window (use grid-local coords) or main window (use screen coords)
     var is_external_window = false;
     {
-        app.mu.lock();
-        defer app.mu.unlock();
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
         var ext_it = app.external_windows.iterator();
         while (ext_it.next()) |entry| {
             if (entry.value_ptr.hwnd == hwnd) {

@@ -13,6 +13,7 @@ const hlmod = @import("highlight.zig");
 const Highlights = hlmod.Highlights;
 const Styles = hlmod.Styles;
 const Logger = @import("log.zig").Logger;
+const clock = @import("clock.zig");
 
 /// All redraw events handled by `handleRedraw`. Order is not significant;
 /// `std.meta.stringToEnum` is used for perfect-hash-style dispatch.
@@ -213,7 +214,7 @@ fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]c
 
     if (std.mem.indexOfScalar(u8, base, '_') == null) return try arena.dupe(u8, raw);
 
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(arena);
 
     try out.appendSlice(arena, base);
@@ -227,8 +228,8 @@ fn dupeAndMaybeUnderscoreToSpace(arena: std.mem.Allocator, raw: []const u8) ![]c
 
 /// Parse Vim/Neovim 'guifont' list (comma-separated, with escaping).
 fn parseGuiFontList(arena: std.mem.Allocator, s: []const u8) !GuiFontList {
-    var out: std.ArrayListUnmanaged([]const u8) = .{};
-    var cur: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cur: std.ArrayListUnmanaged(u8) = .empty;
 
     var skip_ws = false;
     var bs_count: usize = 0;
@@ -347,7 +348,7 @@ pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFon
     // point_size default: 14
     var name_part: []const u8 = cand;
     var point: f64 = 14.0;
-    var features: std.ArrayListUnmanaged(FontFeature) = .{};
+    var features: std.ArrayListUnmanaged(FontFeature) = .empty;
 
     if (std.mem.indexOfScalar(u8, cand, ':')) |colon| {
         name_part = cand[0..colon];
@@ -399,7 +400,7 @@ pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]co
     }
 
     // Build features string: "+liga,-dlig,ss01=2"
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     const prefix = try std.fmt.allocPrint(arena, "{s}\t{d}\t", .{ r.name, r.point_size });
     try buf.appendSlice(arena, prefix);
 
@@ -660,7 +661,7 @@ fn streamGridLine(
         if (log.cb != null and grid.input_trace_seq != 0 and
             grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq)
         {
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = clock.nowNs();
             const delta_us: i64 = @intCast(@divTrunc(
                 @max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)),
                 1000,
@@ -922,7 +923,7 @@ pub fn handleRedraw(
     // a single batch-level [perf] line so a profiler can see total wall time
     // and event count without scraping per-event lines.
     const log_on_batch = log.cb != null;
-    const t_batch_start: i128 = if (log_on_batch) std.time.nanoTimestamp() else 0;
+    const t_batch_start: i128 = if (log_on_batch) clock.nowNs() else 0;
     var ev_count: u32 = 0;
     var tuple_count: u32 = 0;
     // grid_line cell-write counter (after repeat expansion). Quantifies the
@@ -943,7 +944,7 @@ pub fn handleRedraw(
 
     defer {
         if (log_on_batch) {
-            const batch_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_batch_start), 1000));
+            const batch_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_batch_start), 1000));
             log.write(
                 "[perf] redraw_batch events={d} tuples={d} us={d}\n",
                 .{ ev_count, tuple_count, batch_us },
@@ -995,9 +996,9 @@ pub fn handleRedraw(
         // Per-event timing. defer fires at end of each loop iteration even
         // when the switch case path uses `try` to surface an error, since
         // defer runs on scope exit including through error returns.
-        const t_ev_start: i128 = if (log_on_batch) std.time.nanoTimestamp() else 0;
+        const t_ev_start: i128 = if (log_on_batch) clock.nowNs() else 0;
         defer if (log_on_batch) {
-            const dt_ns: i128 = std.time.nanoTimestamp() - t_ev_start;
+            const dt_ns: i128 = clock.nowNs() - t_ev_start;
             const idx = @intFromEnum(ev_tag);
             per_event_ns[idx] +|= @as(u64, @intCast(@max(@as(i128, 0), dt_ns)));
             per_event_cnt[idx] +|= 1;
@@ -1553,7 +1554,7 @@ pub fn handleRedraw(
                         grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
                     });
                     if (grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
-                        const now_ns = std.time.nanoTimestamp();
+                        const now_ns = clock.nowNs();
                         const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
                         log.write("[perf_input] seq={d} stage=grid_scroll delta_us={d} grid={d}\n", .{
                             grid.input_trace_seq, delta_us, grid_id,
@@ -1654,9 +1655,9 @@ pub fn handleRedraw(
                 // points at the specific option doing the heavy lifting
                 // (typically guifont triggers atlas reset + font rebuild).
                 const log_on_opt = log.cb != null;
-                const t_opt_start: i128 = if (log_on_opt) std.time.nanoTimestamp() else 0;
+                const t_opt_start: i128 = if (log_on_opt) clock.nowNs() else 0;
                 defer if (log_on_opt) {
-                    const dt_us: i64 = @intCast(@divTrunc(@max(0, std.time.nanoTimestamp() - t_opt_start), 1000));
+                    const dt_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_opt_start), 1000));
                     log.write("[perf] option_set name={s} us={d}\n", .{ opt_name, dt_us });
                 };
 
@@ -1700,7 +1701,7 @@ pub fn handleRedraw(
                     // Build a single newline-separated string of all resolved
                     // candidates and notify the frontend once.  The frontend
                     // tries each entry in order and uses the first loadable font.
-                    var combined: std.ArrayListUnmanaged(u8) = .{};
+                    var combined: std.ArrayListUnmanaged(u8) = .empty;
                     for (list.items, 0..) |cand, idx| {
                         const resolved = try parseGuiFontCandidate(arena, cand);
                         const msg = try formatResolvedGuiFont(arena, resolved);
@@ -1903,7 +1904,7 @@ pub fn handleRedraw(
                 const grid_id = t[0].int;
 
                 if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
-                    const now_ns = std.time.nanoTimestamp();
+                    const now_ns = clock.nowNs();
                     const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
                     log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
                         grid.input_trace_seq, delta_us, grid_id, t[1].int,
@@ -2013,7 +2014,7 @@ pub fn handleRedraw(
                 if (t.len < 5) continue;
 
                 // Parse content (array of [attrs, text] or [attrs, text, hl_id])
-                var chunks = std.ArrayListUnmanaged(CmdlineChunk){};
+                var chunks : std.ArrayListUnmanaged(CmdlineChunk) = .empty;
                 if (t[0] == .arr) {
                     for (t[0].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
@@ -2105,10 +2106,10 @@ pub fn handleRedraw(
                 if (t.len < 1) continue;
                 if (t[0] != .arr) continue;
 
-                var lines = std.ArrayListUnmanaged([]const CmdlineChunk){};
+                var lines : std.ArrayListUnmanaged([]const CmdlineChunk) = .empty;
                 for (t[0].arr) |line_v| {
                     if (line_v != .arr) continue;
-                    var line_chunks = std.ArrayListUnmanaged(CmdlineChunk){};
+                    var line_chunks : std.ArrayListUnmanaged(CmdlineChunk) = .empty;
                     for (line_v.arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
                         const chunk = chunk_v.arr;
@@ -2133,7 +2134,7 @@ pub fn handleRedraw(
                 if (t.len < 1) continue;
                 if (t[0] != .arr) continue;
 
-                var line_chunks = std.ArrayListUnmanaged(CmdlineChunk){};
+                var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
                 for (t[0].arr) |chunk_v| {
                     if (chunk_v != .arr) continue;
                     const chunk = chunk_v.arr;
@@ -2165,7 +2166,7 @@ pub fn handleRedraw(
                 if (t.len < 5) continue;
 
                 // Parse items array
-                var items = std.ArrayListUnmanaged(PopupmenuItem){};
+                var items: std.ArrayListUnmanaged(PopupmenuItem) = .empty;
                 if (t[0] == .arr) {
                     for (t[0].arr) |item_v| {
                         if (item_v != .arr) continue;
@@ -2224,7 +2225,7 @@ pub fn handleRedraw(
                 const curtab: i64 = if (t[0] == .int) t[0].int else if (t[0] == .ext) parseExtHandle(t[0].ext) else 0;
 
                 // Parse tabs array
-                var tabs = std.ArrayListUnmanaged(TabEntry){};
+                var tabs: std.ArrayListUnmanaged(TabEntry) = .empty;
                 if (t[1] == .arr) {
                     for (t[1].arr) |tab_v| {
                         if (tab_v != .map) continue;
@@ -2251,7 +2252,7 @@ pub fn handleRedraw(
                 const curbuf: i64 = if (t[2] == .int) t[2].int else if (t[2] == .ext) parseExtHandle(t[2].ext) else 0;
 
                 // Parse buffers array
-                var buffers = std.ArrayListUnmanaged(BufferEntry){};
+                var buffers: std.ArrayListUnmanaged(BufferEntry) = .empty;
                 if (t[3] == .arr) {
                     for (t[3].arr) |buf_v| {
                         if (buf_v != .map) continue;
@@ -2289,7 +2290,7 @@ pub fn handleRedraw(
                 const kind: []const u8 = if (t[0] == .str) t[0].str else "";
 
                 // Parse content array
-                var chunks = std.ArrayListUnmanaged(MsgChunk){};
+                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                 if (t[1] == .arr) {
                     for (t[1].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
@@ -2326,7 +2327,7 @@ pub fn handleRedraw(
                 if (tv != .arr) continue;
                 const t = tv.arr;
 
-                var chunks = std.ArrayListUnmanaged(MsgChunk){};
+                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                 if (t.len > 0 and t[0] == .arr) {
                     for (t[0].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
@@ -2346,7 +2347,7 @@ pub fn handleRedraw(
                 if (tv != .arr) continue;
                 const t = tv.arr;
 
-                var chunks = std.ArrayListUnmanaged(MsgChunk){};
+                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                 if (t.len > 0 and t[0] == .arr) {
                     for (t[0].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
@@ -2366,7 +2367,7 @@ pub fn handleRedraw(
                 if (tv != .arr) continue;
                 const t = tv.arr;
 
-                var chunks = std.ArrayListUnmanaged(MsgChunk){};
+                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                 if (t.len > 0 and t[0] == .arr) {
                     for (t[0].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
@@ -2395,7 +2396,7 @@ pub fn handleRedraw(
                 if (log.cb != null) log.write("  t[0] type={s}\n", .{@tagName(t[0])});
 
                 // Parse entries array
-                var entries = std.ArrayListUnmanaged(grid_mod.MsgHistoryEntry){};
+                var entries: std.ArrayListUnmanaged(grid_mod.MsgHistoryEntry) = .empty;
                 if (t[0] == .arr) {
                     if (log.cb != null) log.write("  t[0].arr.len={d}\n", .{t[0].arr.len});
                     for (t[0].arr, 0..) |entry_v, ei| {
@@ -2412,7 +2413,7 @@ pub fn handleRedraw(
                         const kind: []const u8 = if (entry[0] == .str) entry[0].str else "";
 
                         // Parse content array [[hl_id, text], ...]
-                        var chunks = std.ArrayListUnmanaged(MsgChunk){};
+                        var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                         if (entry[1] == .arr) {
                             for (entry[1].arr) |chunk_v| {
                                 if (chunk_v != .arr) continue;
@@ -2506,7 +2507,7 @@ pub fn handleRedraw(
         }, .flush => {
             if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
             if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
-                const now_ns = std.time.nanoTimestamp();
+                const now_ns = clock.nowNs();
                 const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
                 log.write("[perf_input] seq={d} stage=flush_start delta_us={d} rows={d} cols={d}\n", .{
                     grid.input_trace_seq, delta_us, grid.rows, grid.cols,

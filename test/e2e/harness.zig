@@ -52,18 +52,17 @@ pub const Options = struct {
 /// Probes with `--version`; returns error.NvimNotFound when unusable.
 /// Caller owns the returned string.
 pub fn resolveNvim(alloc: std.mem.Allocator) ![]u8 {
-    const path = std.process.getEnvVarOwned(alloc, "ZONVIE_TEST_NVIM") catch
+    const path = std.process.Environ.getAlloc(std.testing.environ, alloc, "ZONVIE_TEST_NVIM") catch
         try alloc.dupe(u8, "nvim");
     errdefer alloc.free(path);
 
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, zc.clock.io(), .{
         .argv = &.{ path, "--version" },
     }) catch return error.NvimNotFound;
     alloc.free(result.stdout);
     alloc.free(result.stderr);
     switch (result.term) {
-        .Exited => |code| if (code != 0) return error.NvimNotFound,
+        .exited => |code| if (code != 0) return error.NvimNotFound,
         else => return error.NvimNotFound,
     }
     return path;
@@ -76,8 +75,8 @@ pub const Harness = struct {
     nvim_cmd: []u8,
 
     // Flush synchronization (independent of grid_mu).
-    sync_mu: std.Thread.Mutex = .{},
-    sync_cond: std.Thread.Condition = .{},
+    sync_mu: std.Io.Mutex = .init,
+    sync_cond: std.Io.Condition = .init,
     flush_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exit_code: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
@@ -99,7 +98,7 @@ pub const Harness = struct {
             .core = undefined,
             .opts = opts,
             .nvim_cmd = undefined,
-            .verbose = std.process.hasEnvVarConstant("ZONVIE_E2E_VERBOSE"),
+            .verbose = std.process.Environ.containsConstant(std.testing.environ, "ZONVIE_E2E_VERBOSE"),
         };
 
         // rpc_session splits this string on spaces and inserts --embed
@@ -142,8 +141,8 @@ pub const Harness = struct {
         try h.waitUntil({}, struct {
             fn check(_: void, hh: *Harness) bool {
                 if (hh.flush_seq.load(.seq_cst) == 0) return false;
-                hh.core.grid_mu.lock();
-                defer hh.core.grid_mu.unlock();
+                hh.core.grid_mu.lockUncancelable(zc.clock.io());
+                defer hh.core.grid_mu.unlock(zc.clock.io());
                 return hh.core.grid.rows == hh.opts.rows and
                     hh.core.grid.cols == hh.opts.cols;
             }
@@ -165,18 +164,18 @@ pub const Harness = struct {
     fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         const h: *Harness = @ptrCast(@alignCast(ctx.?));
         _ = h.flush_seq.fetchAdd(1, .seq_cst);
-        h.sync_mu.lock();
-        h.sync_cond.signal();
-        h.sync_mu.unlock();
+        h.sync_mu.lockUncancelable(zc.clock.io());
+        h.sync_cond.signal(zc.clock.io());
+        h.sync_mu.unlock(zc.clock.io());
     }
 
     fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
         const h: *Harness = @ptrCast(@alignCast(ctx.?));
         h.exit_code.store(exit_code, .seq_cst);
         h.exited.store(true, .seq_cst);
-        h.sync_mu.lock();
-        h.sync_cond.signal();
-        h.sync_mu.unlock();
+        h.sync_mu.lockUncancelable(zc.clock.io());
+        h.sync_cond.signal(zc.clock.io());
+        h.sync_mu.unlock(zc.clock.io());
     }
 
     fn onLog(_: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
@@ -231,14 +230,14 @@ pub const Harness = struct {
         comptime pred: fn (@TypeOf(ctx), *Harness) bool,
         timeout_ms: u64,
     ) WaitError!void {
-        var timer = std.time.Timer.start() catch unreachable;
+        const t0 = zc.clock.nowNs();
         while (true) {
             if (pred(ctx, h)) return;
             if (h.exited.load(.seq_cst)) return WaitError.NvimExited;
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return WaitError.Timeout;
-            h.sync_mu.lock();
-            h.sync_cond.timedWait(&h.sync_mu, 20 * std.time.ns_per_ms) catch {};
-            h.sync_mu.unlock();
+            if (@as(u64, @intCast(zc.clock.nowNs() - t0)) / std.time.ns_per_ms >= timeout_ms) return WaitError.Timeout;
+            // 0.16 std.Io.Condition has no timed wait, so cap each slice at 20 ms
+            // with a sleep; the loop re-checks pred/exited/timeout each iteration.
+            std.Io.sleep(zc.clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
         }
     }
 
@@ -247,22 +246,22 @@ pub const Harness = struct {
     /// Grid that holds the current window's content (cursor's grid).
     /// With ext_multigrid this is a sub-grid (>= 2), not the global grid 1.
     pub fn winGrid(h: *Harness) i64 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.cursor_grid;
     }
 
     pub fn cellAt(h: *Harness, grid_id: i64, row: u32, col: u32) Cell {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.getCellGrid(grid_id, row, col);
     }
 
     pub const CursorPos = struct { grid_id: i64, row: u32, col: u32 };
 
     pub fn cursor(h: *Harness) CursorPos {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return .{
             .grid_id = h.core.grid.cursor_grid,
             .row = h.core.grid.cursor_row,
@@ -272,24 +271,24 @@ pub const Harness = struct {
 
     /// Resolve the highlight attr (colors + styles) of a cell.
     pub fn hlAt(h: *Harness, grid_id: i64, row: u32, col: u32) ResolvedAttrWithStyles {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         const c = h.core.grid.getCellGrid(grid_id, row, col);
         return h.core.hl.getWithStyles(c.hl);
     }
 
     /// Resolve a highlight id directly (0 = default colors).
     pub fn hlOf(h: *Harness, hl_id: u32) ResolvedAttrWithStyles {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.hl.getWithStyles(hl_id);
     }
 
     /// Grid content revision counter (bumped on cell/layering/scroll changes).
     /// Lets scenarios assert that an event triggered a recomposition.
     pub fn contentRev(h: *Harness) u64 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.content_rev;
     }
 
@@ -299,16 +298,16 @@ pub const Harness = struct {
         const Ctx = struct { prefix: []const u8 };
         h.waitUntil(Ctx{ .prefix = prefix }, struct {
             fn check(c: Ctx, hh: *Harness) bool {
-                hh.core.grid_mu.lock();
-                defer hh.core.grid_mu.unlock();
+                hh.core.grid_mu.lockUncancelable(zc.clock.io());
+                defer hh.core.grid_mu.unlock(zc.clock.io());
                 const mode = std.mem.sliceTo(&hh.core.grid.current_mode_name, 0);
                 return std.mem.startsWith(u8, mode, c.prefix);
             }
         }.check, timeout_ms) catch |e| {
-            h.core.grid_mu.lock();
+            h.core.grid_mu.lockUncancelable(zc.clock.io());
             const mode = std.mem.sliceTo(&h.core.grid.current_mode_name, 0);
             std.debug.print("[e2e] waitMode failed: expected=\"{s}\" actual=\"{s}\"\n", .{ prefix, mode });
-            h.core.grid_mu.unlock();
+            h.core.grid_mu.unlock(zc.clock.io());
             return e;
         };
     }
@@ -316,16 +315,16 @@ pub const Harness = struct {
     /// Float/window placement of a sub-grid (win_pos / win_float_pos), or
     /// null if the grid is not positioned.
     pub fn gridPos(h: *Harness, grid_id: i64) ?GridPos {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.win_pos.get(grid_id);
     }
 
     pub const GridSizeRC = struct { rows: u32, cols: u32 };
 
     pub fn subGridSize(h: *Harness, grid_id: i64) ?GridSizeRC {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         if (h.core.grid.sub_grids.getPtr(grid_id)) |sg| {
             return .{ .rows = sg.rows, .cols = sg.cols };
         }
@@ -335,16 +334,16 @@ pub const Harness = struct {
     /// True if `grid_id` is currently tracked as an external grid
     /// (displayed in a separate OS window; from win_external_pos).
     pub fn isExternalGrid(h: *Harness, grid_id: i64) bool {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.external_grids.contains(grid_id);
     }
 
     /// Snapshot of all external grid ids. Caller owns slice.
     pub fn externalGridsAlloc(h: *Harness, alloc: std.mem.Allocator) ![]i64 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
-        var ids: std.ArrayListUnmanaged(i64) = .{};
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        var ids: std.ArrayListUnmanaged(i64) = .empty;
         errdefer ids.deinit(alloc);
         var it = h.core.grid.external_grids.keyIterator();
         while (it.next()) |k| try ids.append(alloc, k.*);
@@ -353,9 +352,9 @@ pub const Harness = struct {
 
     /// Snapshot of all positioned grid ids (win_pos keys). Caller owns slice.
     pub fn positionedGridsAlloc(h: *Harness, alloc: std.mem.Allocator) ![]i64 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
-        var ids: std.ArrayListUnmanaged(i64) = .{};
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        var ids: std.ArrayListUnmanaged(i64) = .empty;
         errdefer ids.deinit(alloc);
         var it = h.core.grid.win_pos.keyIterator();
         while (it.next()) |k| try ids.append(alloc, k.*);
@@ -366,8 +365,8 @@ pub const Harness = struct {
     /// multi-codepoint cells; cp==0 cells (wide-char continuation / unset)
     /// are skipped; trailing whitespace is trimmed.
     pub fn rowTextAlloc(h: *Harness, alloc: std.mem.Allocator, grid_id: i64, row: u32) ![]u8 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         const cols: u32 = if (grid_id == 1)
             h.core.grid.cols
         else if (h.core.grid.sub_grids.getPtr(grid_id)) |sg|
@@ -375,7 +374,7 @@ pub const Harness = struct {
         else
             0;
 
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(alloc);
         var utf8: [4]u8 = undefined;
         var col: u32 = 0;
@@ -475,8 +474,8 @@ pub const Harness = struct {
     /// Get the top line index of the viewport for a grid (0-based).
     /// Returns the top line number from the win_viewport event.
     pub fn getViewportTop(h: *Harness, grid_id: i64) u32 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         if (h.core.grid.viewport.get(grid_id)) |vp| {
             return @intCast(vp.topline);
         }
@@ -488,8 +487,8 @@ pub const Harness = struct {
     /// Emoji and CJK are typically 2 cells; ASCII is 1 cell.
     /// This is a simplified approximation; actual width depends on glyph metrics.
     pub fn cellWidthAt(h: *Harness, grid_id: i64, row: u32, col: u32) u32 {
-        h.core.grid_mu.lock();
-        defer h.core.grid_mu.unlock();
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
         const c = h.core.grid.getCellGrid(grid_id, row, col);
         // Simplified heuristic: codepoints > U+1F300 (emoji range) → 2 cells.
         // Real logic depends on glyph metrics from the font.

@@ -30,6 +30,7 @@
 // Test-only code: heap allocation is fine here.
 
 const std = @import("std");
+const gui_io = @import("gui_io.zig");
 const builtin = @import("builtin");
 
 pub const platform = switch (builtin.os.tag) {
@@ -48,6 +49,9 @@ pub const default_app_rel_path = switch (builtin.os.tag) {
 };
 
 extern "kernel32" fn GetProcessId(h: std.os.windows.HANDLE) callconv(.winapi) u32;
+// std.os.windows.WaitForSingleObject was removed in 0.16; declare the raw call.
+extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
+const WAIT_TIMEOUT: u32 = 0x00000102;
 
 /// Per-process sequence so each Gui gets a unique listen address even
 /// though all scenarios share the test process PID.
@@ -55,17 +59,16 @@ var gui_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 /// Resolve the nvim binary: $ZONVIE_TEST_NVIM if set, else "nvim" on PATH.
 pub fn resolveNvim(alloc: std.mem.Allocator) ![]u8 {
-    const path = std.process.getEnvVarOwned(alloc, "ZONVIE_TEST_NVIM") catch
+    const path = std.process.Environ.getAlloc(std.testing.environ, alloc, "ZONVIE_TEST_NVIM") catch
         try alloc.dupe(u8, "nvim");
     errdefer alloc.free(path);
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, gui_io.io(), .{
         .argv = &.{ path, "--version" },
     }) catch return error.NvimNotFound;
     alloc.free(result.stdout);
     alloc.free(result.stderr);
     switch (result.term) {
-        .Exited => |code| if (code != 0) return error.NvimNotFound,
+        .exited => |code| if (code != 0) return error.NvimNotFound,
         else => return error.NvimNotFound,
     }
     return path;
@@ -74,10 +77,10 @@ pub fn resolveNvim(alloc: std.mem.Allocator) ![]u8 {
 /// Resolve the built zonvie binary: $ZONVIE_TEST_APP if set, else the
 /// platform default build product. Returns error.AppNotFound when missing.
 pub fn resolveApp(alloc: std.mem.Allocator) ![]u8 {
-    const path = std.process.getEnvVarOwned(alloc, "ZONVIE_TEST_APP") catch
+    const path = std.process.Environ.getAlloc(std.testing.environ, alloc, "ZONVIE_TEST_APP") catch
         try alloc.dupe(u8, default_app_rel_path);
     errdefer alloc.free(path);
-    std.fs.cwd().access(path, .{}) catch return error.AppNotFound;
+    std.Io.Dir.cwd().access(gui_io.io(), path, .{}) catch return error.AppNotFound;
     return path;
 }
 
@@ -108,7 +111,7 @@ pub const Gui = struct {
     listen_addr: []u8,
     nvim_child: std.process.Child,
     app_child: std.process.Child,
-    app_env: std.process.EnvMap,
+    app_env: std.process.Environ.Map,
     /// Owned argv for the app, kept so the scenario can relaunch it.
     app_argv: [][]u8,
     app_pid: i32,
@@ -145,31 +148,29 @@ pub const Gui = struct {
         if (builtin.os.tag == .windows) {
             g.listen_addr = try std.fmt.allocPrint(alloc, "\\\\.\\pipe\\zonvie_gui_e2e_{d}_{d}", .{ currentPid(), seq });
         } else {
-            std.fs.cwd().makePath("tmp") catch {};
-            const tmp_abs = try std.fs.cwd().realpathAlloc(alloc, "tmp");
+            std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+            const tmp_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), "tmp", alloc);
             defer alloc.free(tmp_abs);
             g.listen_addr = try std.fmt.allocPrint(alloc, "{s}/gui_e2e_{d}_{d}.sock", .{ tmp_abs, currentPid(), seq });
-            std.fs.cwd().deleteFile(g.listen_addr) catch {};
+            std.Io.Dir.cwd().deleteFile(gui_io.io(), g.listen_addr) catch {};
         }
         errdefer alloc.free(g.listen_addr);
 
         // 1. Shared nvim server (headless, clean).
-        g.nvim_child = std.process.Child.init(
-            &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
-            alloc,
-        );
-        g.nvim_child.stdin_behavior = .Ignore;
-        g.nvim_child.stdout_behavior = .Ignore;
-        g.nvim_child.stderr_behavior = .Ignore;
-        try g.nvim_child.spawn();
-        errdefer _ = g.nvim_child.kill() catch undefined;
+        g.nvim_child = try std.process.spawn(gui_io.io(), .{
+            .argv = &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        errdefer g.nvim_child.kill(gui_io.io());
 
         // Wait until the server answers a trivial expression.
         try g.waitServerReady(10_000);
 
         // 2. Real frontend, attached to the same nvim. Keep an owned argv
         // so relaunchApp() can spawn an identical instance.
-        var argv: std.ArrayListUnmanaged([]u8) = .{};
+        var argv: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (argv.items) |a| alloc.free(a);
             argv.deinit(alloc);
@@ -182,23 +183,23 @@ pub const Gui = struct {
         // Isolate from the user's real config: point the platform config
         // root at the (empty) fixtures dir so only CLI flags shape app
         // behavior. Both platforms resolve <root>/zonvie/config.toml.
-        g.app_env = try std.process.getEnvMap(alloc);
+        g.app_env = try std.process.Environ.createMap(std.testing.environ, alloc);
         errdefer g.app_env.deinit();
-        const fixtures_abs = try std.fs.cwd().realpathAlloc(alloc, opts.config_dir);
+        const fixtures_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), opts.config_dir, alloc);
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
 
         // Optional home isolation (persisted app state, frame autosave).
         if (opts.home_dir) |home| {
-            std.fs.cwd().makePath(home) catch {};
-            const home_abs = try std.fs.cwd().realpathAlloc(alloc, home);
+            std.Io.Dir.cwd().createDirPath(gui_io.io(), home) catch {};
+            const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
             try g.app_env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", home_abs);
         }
 
         try g.launchApp();
         errdefer if (!g.app_exited) {
-            _ = g.app_child.kill() catch undefined;
+            g.app_child.kill(gui_io.io());
         };
 
         // 3. Wait for the main window to actually appear on screen.
@@ -209,16 +210,17 @@ pub const Gui = struct {
     /// Spawn the app with the stored argv/env. Used by init and relaunchApp.
     fn launchApp(g: *Gui) !void {
         const argv_const: []const []const u8 = @ptrCast(g.app_argv);
-        g.app_child = std.process.Child.init(argv_const, g.alloc);
-        g.app_child.env_map = &g.app_env;
-        g.app_child.stdin_behavior = .Ignore;
-        g.app_child.stdout_behavior = .Ignore;
-        g.app_child.stderr_behavior = .Ignore;
-        try g.app_child.spawn();
+        g.app_child = try std.process.spawn(gui_io.io(), .{
+            .argv = argv_const,
+            .environ_map = &g.app_env,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
         g.app_pid = if (builtin.os.tag == .windows)
-            @intCast(GetProcessId(g.app_child.id))
+            @intCast(GetProcessId(g.app_child.id.?))
         else
-            @intCast(g.app_child.id);
+            @intCast(g.app_child.id.?);
         g.app_exited = false;
     }
 
@@ -226,14 +228,14 @@ pub const Gui = struct {
     /// argv/env, then wait for its main window. The nvim server (and all
     /// its state, e.g. 'guifont') persists across the relaunch.
     pub fn relaunchApp(g: *Gui) !void {
-        if (!g.app_exited) _ = g.app_child.kill() catch undefined;
+        if (!g.app_exited) g.app_child.kill(gui_io.io());
         g.app_exited = true; // kill() reaped it; appAlive must not reap again
 
         // Wait until its windows are gone before measuring the next instance.
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = gui_io.Timer.start();
         while (platform.windowCountForPid(g.app_pid) != 0) {
             if (timer.read() / std.time.ns_per_ms >= 10_000) return error.Timeout;
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            gui_io.sleepNs(100 * std.time.ns_per_ms);
         }
 
         try g.launchApp();
@@ -243,13 +245,13 @@ pub const Gui = struct {
     pub fn deinit(g: *Gui) void {
         // Exact-PID teardown of OUR children only, app first, then nvim.
         // Skip the kill when the app already exited (appAlive reaped it).
-        if (!g.app_exited) _ = g.app_child.kill() catch undefined;
-        _ = g.nvim_child.kill() catch undefined;
+        if (!g.app_exited) g.app_child.kill(gui_io.io());
+        g.nvim_child.kill(gui_io.io());
         g.app_env.deinit();
         for (g.app_argv) |a| g.alloc.free(a);
         g.alloc.free(g.app_argv);
         if (builtin.os.tag != .windows) {
-            std.fs.cwd().deleteFile(g.listen_addr) catch {};
+            std.Io.Dir.cwd().deleteFile(gui_io.io(), g.listen_addr) catch {};
         }
         g.alloc.free(g.listen_addr);
         g.alloc.free(g.nvim_path);
@@ -265,14 +267,13 @@ pub const Gui = struct {
     }
 
     fn remoteExprInner(g: *Gui, expr: []const u8, quiet: bool) ![]u8 {
-        const result = try std.process.Child.run(.{
-            .allocator = g.alloc,
+        const result = try std.process.run(g.alloc, gui_io.io(), .{
             .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-expr", expr },
         });
         errdefer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
         switch (result.term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 if (!quiet) {
                     std.debug.print("[gui] remote-expr failed ({d}): {s}\n{s}\n", .{ code, expr, result.stderr });
                 }
@@ -301,13 +302,13 @@ pub const Gui = struct {
     /// shared scratch path is safe.
     pub fn evalInt(g: *Gui, expr: []const u8) !i64 {
         const query_file = "tmp/gui_eval_query.txt";
-        std.fs.cwd().makePath("tmp") catch {};
-        std.fs.cwd().deleteFile(query_file) catch {};
+        std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+        std.Io.Dir.cwd().deleteFile(gui_io.io(), query_file) catch {};
         const wexpr = try std.fmt.allocPrint(g.alloc, "writefile([string({s})], '{s}')", .{ expr, query_file });
         defer g.alloc.free(wexpr);
         try g.exec(wexpr);
 
-        const data = try std.fs.cwd().readFileAlloc(g.alloc, query_file, 4096);
+        const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), query_file, g.alloc, .limited(4096));
         defer g.alloc.free(data);
         const trimmed = std.mem.trim(u8, data, " \t\r\n");
         return std.fmt.parseInt(i64, trimmed, 10) catch {
@@ -318,24 +319,23 @@ pub const Gui = struct {
 
     /// Send keys (nvim notation) to the shared server.
     pub fn remoteSend(g: *Gui, keys: []const u8) !void {
-        const result = try std.process.Child.run(.{
-            .allocator = g.alloc,
+        const result = try std.process.run(g.alloc, gui_io.io(), .{
             .argv = &.{ g.nvim_path, "--server", g.listen_addr, "--remote-send", keys },
         });
         defer g.alloc.free(result.stdout);
         defer g.alloc.free(result.stderr);
         switch (result.term) {
-            .Exited => |code| if (code != 0) return error.RemoteSendFailed,
+            .exited => |code| if (code != 0) return error.RemoteSendFailed,
             else => return error.RemoteSendFailed,
         }
     }
 
     fn waitServerReady(g: *Gui, timeout_ms: u64) !void {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = gui_io.Timer.start();
         while (true) {
             const out = g.remoteExprInner("1", true) catch {
                 if (timer.read() / std.time.ns_per_ms >= timeout_ms) return error.Timeout;
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                gui_io.sleepNs(100 * std.time.ns_per_ms);
                 continue;
             };
             g.alloc.free(out);
@@ -356,11 +356,11 @@ pub const Gui = struct {
     /// Cursor blink etc. must be disabled by the scenario first, or the
     /// frames will never settle.
     pub fn captureStable(g: *Gui, crop: ?capture.Crop, timeout_ms: u64) !capture.Image {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = gui_io.Timer.start();
         var prev: ?capture.Image = null;
         defer if (prev) |*p| p.deinit(g.alloc);
         while (true) {
-            std.Thread.sleep(150 * std.time.ns_per_ms);
+            gui_io.sleepNs(150 * std.time.ns_per_ms);
             const cur = capture.captureMainWindow(g.alloc, g.app_pid, crop) catch |e| {
                 if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
                 continue;
@@ -388,10 +388,10 @@ pub const Gui = struct {
     fn appAlive(g: *Gui) bool {
         if (g.app_exited) return false;
         if (builtin.os.tag == .windows) {
-            std.os.windows.WaitForSingleObject(g.app_child.id, 0) catch |e| switch (e) {
-                error.WaitTimeOut => return true, // still running
-                else => return true, // indeterminate: assume alive
-            };
+            // Only WAIT_OBJECT_0 (0) means the process is signaled (exited);
+            // WAIT_TIMEOUT or any failure is treated as still-alive (matches
+            // the prior std wrapper, which returned an error in those cases).
+            if (WaitForSingleObject(g.app_child.id.?, 0) != 0) return true;
         } else {
             const res = std.posix.waitpid(@intCast(g.app_pid), std.posix.W.NOHANG);
             if (res.pid == 0) return true;
@@ -405,7 +405,7 @@ pub const Gui = struct {
     /// Fails fast when the app process dies (a vanished window count of 0
     /// must surface as AppExited, not a confusing Timeout).
     pub fn waitWindowCount(g: *Gui, target: u32, timeout_ms: u64) !void {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = gui_io.Timer.start();
         while (true) {
             if (g.windowCount() == target) return;
             if (!g.appAlive()) return error.AppExited;
@@ -417,7 +417,7 @@ pub const Gui = struct {
                 platform.dumpWindowsForPid(g.app_pid);
                 return error.Timeout;
             }
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            gui_io.sleepNs(100 * std.time.ns_per_ms);
         }
     }
 };

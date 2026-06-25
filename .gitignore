@@ -1,6 +1,7 @@
 zig-out/
 zig-out-*/
 .zig-cache/
+zig-pkg/
 macos/.derived/
 windows/zig-out/
 macos/libzonvie_core.a

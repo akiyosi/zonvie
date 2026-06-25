@@ -5,6 +5,10 @@ pub const config = @import("config.zig");
 const shader_compiler = @import("shader_compiler.zig");
 const rpc_transport = @import("rpc_transport.zig");
 
+// Process-wide std.Io provider (Zig 0.16). Re-exported so frontend and test
+// code that imports the core package can reach the shared Io and clock.
+pub const clock = @import("clock.zig");
+
 // Re-exports for test access
 pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
@@ -538,7 +542,7 @@ pub const zonvie_core = opaque {};
 
 const CoreBox = struct {
     // Own an allocator for the core lifetime.
-    gpa: std.heap.GeneralPurposeAllocator(.{}) = .{},
+    gpa: std.heap.DebugAllocator(.{}) = .{},
 
     core: core.Core = undefined,
     cb: Callbacks = .{},
@@ -557,6 +561,9 @@ fn asBox(p: *zonvie_core) *CoreBox {
 }
 
 pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, ctx: ?*anyopaque) ?*zonvie_core {
+    // Eagerly initialize the shared Io before any worker threads spawn.
+    clock.init();
+
     const box = std.heap.c_allocator.create(CoreBox) catch return null;
 
     // Initialize box state.
@@ -758,7 +765,7 @@ pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: u
 }
 
 pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
-    return @intCast(std.time.nanoTimestamp());
+    return @intCast(clock.nowNs());
 }
 
 // Build-time version string from `git describe`, null-terminated for C.
@@ -1032,8 +1039,8 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     // implementations MUST NOT synchronously call back into core APIs that acquire
     // grid_mu. Use async dispatch (DispatchQueue.main.async on macOS, PostMessage
     // on Windows) instead.
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     box.core.checkMsgShowThrottleTimeout();
 }
 
@@ -1044,10 +1051,10 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
 pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64 {
     if (p == null) return -1;
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
-    const now = std.time.nanoTimestamp();
+    const now = clock.nowNs();
     if (deadline <= now) return 0;
     const remaining_ms = @divTrunc(deadline - now, std.time.ns_per_ms);
     return @intCast(remaining_ms);
@@ -1147,8 +1154,8 @@ pub export fn zonvie_core_get_cursor_position(
 pub export fn zonvie_core_get_win_id(p: ?*zonvie_core, grid_id: i64) callconv(.c) i64 {
     if (p == null) return 0;
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     return box.core.grid.getWinId(grid_id) orelse 0;
 }
 
@@ -1158,8 +1165,8 @@ pub export fn zonvie_core_get_win_id(p: ?*zonvie_core, grid_id: i64) callconv(.c
 pub export fn zonvie_core_get_current_mode(p: ?*zonvie_core) callconv(.c) [*:0]const u8 {
     if (p == null) return "";
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     // Return pointer to the internal buffer (null-terminated)
     return @ptrCast(&box.core.grid.current_mode_name);
 }
@@ -1168,8 +1175,8 @@ pub export fn zonvie_core_get_current_mode(p: ?*zonvie_core) callconv(.c) [*:0]c
 pub export fn zonvie_core_is_cursor_visible(p: ?*zonvie_core) callconv(.c) bool {
     if (p == null) return true;
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     return box.core.grid.cursor_visible;
 }
 
@@ -1202,8 +1209,8 @@ pub export fn zonvie_core_get_cursor_blink(
         return;
     }
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
     if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
     if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
@@ -1312,8 +1319,8 @@ pub export fn zonvie_core_get_default_bg(p: ?*zonvie_core) callconv(.c) u32 {
 pub export fn zonvie_core_is_float_external(p: ?*zonvie_core, grid_id: i64) callconv(.c) i32 {
     if (p == null) return 0;
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
-    defer box.core.grid_mu.unlock();
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
     const info = box.core.grid.external_grids.get(grid_id) orelse return 0;
     // start_row == -1 means no prior win_pos → created directly as external (float origin)
     return if (info.start_row < 0) 1 else 0;
@@ -1741,7 +1748,7 @@ pub export fn zonvie_core_try_cell_has_url(
     if (row < 0 or col < 0) return 0;
     const box = asBox(p.?);
     if (!box.core.grid_mu.tryLock()) return -1;
-    defer box.core.grid_mu.unlock();
+    defer box.core.grid_mu.unlock(clock.io());
     const hl_id = box.core.grid.getCellHLGrid(grid_id, @intCast(row), @intCast(col));
     const attr = box.core.hl.map.get(hl_id) orelse return 0;
     return if (attr.has_url) @as(i32, 1) else @as(i32, 0);
@@ -1789,13 +1796,13 @@ pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
 pub export fn zonvie_core_lock_grid(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.grid_mu.lock();
+    box.core.grid_mu.lockUncancelable(clock.io());
 }
 
 pub export fn zonvie_core_unlock_grid(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.grid_mu.unlock();
+    box.core.grid_mu.unlock(clock.io());
 }
 
 // updateLayoutPx variant for callers that already hold grid_mu (typically

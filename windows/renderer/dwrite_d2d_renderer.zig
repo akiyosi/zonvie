@@ -42,7 +42,7 @@ pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
 
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     d2d_factory: ?*c.ID2D1Factory = null,
     d2d_factory1: ?*c.ID2D1Factory1 = null,
@@ -102,15 +102,15 @@ pub const Renderer = struct {
     atlas_h: u32 = 2048,
 
     // CPU-side atlas (full size: atlas_w * atlas_h * 4 bytes).
-    atlas_cpu: std.ArrayListUnmanaged(u8) = .{},
+    atlas_cpu: std.ArrayListUnmanaged(u8) = .empty,
     
     // temporary buffer for a single glyph (padded) generation
-    glyph_tmp: std.ArrayListUnmanaged(u8) = .{},
+    glyph_tmp: std.ArrayListUnmanaged(u8) = .empty,
     
     // Append-only queue of atlas dirty rects. Entries are appended when glyphs
     // are rasterized and consumed independently by the D2D bitmap path (renderVertices)
     // and each D3D window via per-consumer cursors. Only cleared on atlas reset.
-    pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .{},
+    pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .empty,
     // Monotonic sequence number of the first entry in pending_uploads.
     // Advances only on atlas reset (when all entries become invalid).
     // head_seq = pending_upload_base_seq + pending_uploads.items.len.
@@ -520,8 +520,8 @@ pub const Renderer = struct {
 
     /// Public wrapper that acquires self.mu before recreating the render target.
     fn recreateRenderTarget(self: *Renderer) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
         try self.recreateRenderTargetLocked();
     }
 
@@ -648,12 +648,12 @@ pub const Renderer = struct {
 pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     // Guard shared atlas state (glyph_map/atlas_cpu/pending_uploads) against
     // concurrent WM_PAINT uploads and other ensure calls.
-    self.mu.lock();
-    defer self.mu.unlock();
+    self.mu.lockUncancelable(core.clock.io());
+    defer self.mu.unlock(core.clock.io());
 
     // ---- log/profiling (aggregated) ----
     const log_enabled = applog.isEnabled();
-    const log_start_ns: i128 = if (log_enabled) std.time.nanoTimestamp() else 0;
+    const log_start_ns: i128 = if (log_enabled) core.clock.nowNs() else 0;
 
     self.log_atlas_ensure_calls += 1;
 
@@ -662,7 +662,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         self.log_atlas_ensure_hits += 1;
 
         if (log_enabled) {
-            const log_now_ns: i128 = std.time.nanoTimestamp();
+            const log_now_ns: i128 = core.clock.nowNs();
             if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
 
             // once per second
@@ -700,7 +700,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         });
 
         if (log_enabled) {
-            const log_end_ns: i128 = std.time.nanoTimestamp();
+            const log_end_ns: i128 = core.clock.nowNs();
             const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
             if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
             applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
@@ -762,7 +762,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         });
 
         if (log_enabled) {
-            const log_end_ns: i128 = std.time.nanoTimestamp();
+            const log_end_ns: i128 = core.clock.nowNs();
             const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
             if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
             applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
@@ -791,7 +791,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         });
 
         if (log_enabled) {
-            const log_end_ns: i128 = std.time.nanoTimestamp();
+            const log_end_ns: i128 = core.clock.nowNs();
             const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
             if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
             applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
@@ -825,13 +825,13 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         try self.glyph_map.put(scalar, empty);
 
         if (log_enabled) {
-            const log_end_ns: i128 = std.time.nanoTimestamp();
+            const log_end_ns: i128 = core.clock.nowNs();
             const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
             if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
             applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
 
             // also allow once-per-second summary emission on miss path
-            const log_now_ns: i128 = std.time.nanoTimestamp();
+            const log_now_ns: i128 = core.clock.nowNs();
             if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
             if (log_now_ns - self.log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
                 applog.appLog(
@@ -876,7 +876,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         });
 
         if (log_enabled) {
-            const log_end_ns: i128 = std.time.nanoTimestamp();
+            const log_end_ns: i128 = core.clock.nowNs();
             const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
             if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
             applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
@@ -996,14 +996,14 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     try self.glyph_map.put(scalar, entry);
 
     if (log_enabled) {
-        const log_end_ns: i128 = std.time.nanoTimestamp();
+        const log_end_ns: i128 = core.clock.nowNs();
         const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
         if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
 
         applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
 
         // allow once-per-second summary emission on miss path as well
-        const log_now_ns: i128 = std.time.nanoTimestamp();
+        const log_now_ns: i128 = core.clock.nowNs();
         if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
         if (log_now_ns - self.log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
             applog.appLog(
@@ -1039,7 +1039,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         }
 
         // Guard shared atlas state against concurrent WM_PAINT uploads
-        self.mu.lock();
+        self.mu.lockUncancelable(core.clock.io());
 
         // Composite cache key: scalar in lower 21 bits, style_flags in upper bits
         const cache_key: u32 = scalar | (style_flags << 21);
@@ -1047,7 +1047,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         // Check styled glyph cache first
         if (self.styled_glyph_map.get(cache_key)) |cached| {
             g_log_styled_hits += 1;
-            self.mu.unlock();
+            self.mu.unlock(core.clock.io());
             return cached;
         }
 
@@ -1073,7 +1073,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         };
 
         if (face == null) {
-            self.mu.unlock();
+            self.mu.unlock(core.clock.io());
             return error.NoFont;
         }
 
@@ -1083,12 +1083,12 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
             g_log_styled_fallbacks += 1;
             if (applog.isEnabled()) applog.appLog("[styled] fallback scalar=0x{x} style=0x{x} err={any}\n", .{ scalar, style_flags, err });
             // Unlock before calling atlasEnsureGlyphEntry (which takes its own lock)
-            self.mu.unlock();
+            self.mu.unlock(core.clock.io());
             const fallback_entry = self.atlasEnsureGlyphEntry(scalar) catch {
                 return err; // Both failed, return original error
             };
             // Re-lock to continue with caching
-            self.mu.lock();
+            self.mu.lockUncancelable(core.clock.io());
             break :blk fallback_entry;
         };
 
@@ -1107,7 +1107,7 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
         // Periodic stats report
         if (applog.isEnabled()) {
-            const now_ns: i128 = std.time.nanoTimestamp();
+            const now_ns: i128 = core.clock.nowNs();
             if (g_log_styled_last_report_ns == 0) g_log_styled_last_report_ns = now_ns;
             if (now_ns - g_log_styled_last_report_ns >= @as(i128, 1_000_000_000)) {
                 applog.appLog("[styled] stats: hits={d} misses={d} fallbacks={d}\n", .{ g_log_styled_hits, g_log_styled_misses, g_log_styled_fallbacks });
@@ -1119,10 +1119,10 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
         }
 
         self.styled_glyph_map.put(cache_key, entry) catch {
-            self.mu.unlock();
+            self.mu.unlock(core.clock.io());
             return error.OutOfMemory;
         };
-        self.mu.unlock();
+        self.mu.unlock(core.clock.io());
         return entry;
     }
 
@@ -1673,8 +1673,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     /// Phase 2: Rasterize glyph via DWrite without atlas packing.
     /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
     pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         // Select font face based on style_flags
         const face: *c.IDWriteFontFace = blk: {
@@ -1831,8 +1831,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     /// Phase 2: Upload glyph bitmap to atlas_cpu at (dest_x, dest_y).
     /// Handles ClearType RGB 3bpp -> RGBA 4bpp conversion.
     pub fn uploadAtlasRegion(self: *Renderer, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const core.GlyphBitmap) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         const pixels = bitmap.pixels orelse return;
         const bpp = bitmap.bytes_per_pixel;
@@ -1919,8 +1919,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 
     /// Phase 2: Recreate atlas texture with given dimensions.
     pub fn recreateAtlasTexture(self: *Renderer, atlas_w: u32, atlas_h: u32) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         // Resize CPU atlas buffer before updating dimensions to avoid inconsistency
         const total = @as(usize, atlas_w) * @as(usize, atlas_h) * 4;
@@ -1966,8 +1966,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     }
 
     pub fn renderVertices(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
     
         // Ensure RT exists (already holding self.mu)
         if (self.rt == null) {
@@ -2277,8 +2277,8 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
     }
     
     fn flushPendingAtlasUploads(self: *Renderer) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
         self.flushPendingAtlasUploadsLocked();
     }
 
@@ -2344,16 +2344,16 @@ pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
 /// Public wrapper: upload atlas dirty rects added since `since_seq`.
 /// Returns the new head sequence for the caller to store as its cursor.
 pub fn flushPendingAtlasUploadsSinceToD3D(self: *Renderer, d3d: anytype, since_seq: u64) u64 {
-    self.mu.lock();
-    defer self.mu.unlock();
+    self.mu.lockUncancelable(core.clock.io());
+    defer self.mu.unlock(core.clock.io());
     return self.flushPendingAtlasUploadsSinceToD3DLocked(d3d, since_seq);
 }
 
 /// Upload the entire atlas to a D3D11 renderer.
 /// Use this for external windows that need the full atlas texture.
 pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
-    self.mu.lock();
-    defer self.mu.unlock();
+    self.mu.lockUncancelable(core.clock.io());
+    defer self.mu.unlock(core.clock.io());
 
     if (self.atlas_cpu.items.len == 0) return;
 
@@ -2370,8 +2370,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     pub fn descentPx(self: *Renderer) f32 { return self.descent_px; }
 
     pub fn onResize(self: *Renderer) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         if (self.rt == null) return;
 
@@ -2402,8 +2402,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     }
 
     pub fn setFontUtf8WithFeatures(self: *Renderer, name_utf8: []const u8, point_size: f32, features_str: []const u8) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         if (self.dwrite_factory == null) return error.NotInitialized;
 
@@ -2882,8 +2882,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
 
         // Re-scale font_em_size and metrics proportionally
         const scale: f32 = @as(f32, @floatFromInt(new_dpi)) / @as(f32, @floatFromInt(old_dpi));
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         self.font_em_size *= scale;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
@@ -2984,8 +2984,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     ) usize {
         if (scalar_count == 0) return 0;
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         const face = self.selectFontFace(style_flags) orelse return 0;
 
@@ -3258,8 +3258,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
 
     /// Rasterize a glyph by its ID (post-shaping, skips scalar→glyph lookup).
     pub fn rasterizeGlyphByIdDWrite(self: *Renderer, glyph_id: u32, style_flags: u32, out_bitmap: *core.GlyphBitmap) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         const face = self.selectFontFace(style_flags) orelse return error.NoFont;
 
@@ -3381,8 +3381,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         out_lig_triggers: [*]u8,
     ) bool {
         if (applog.isEnabled()) applog.appLog("[ascii_table] getAsciiTableDWrite start style={d}\n", .{style_flags});
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(core.clock.io());
+        defer self.mu.unlock(core.clock.io());
 
         const face = self.selectFontFace(style_flags) orelse {
             if (applog.isEnabled()) applog.appLog("[ascii_table] selectFontFace returned null style={d}\n", .{style_flags});
@@ -3884,7 +3884,7 @@ fn encodeUtf16Scalar(scalar: u32, out: *[2]u16) usize {
 }
 
 fn utf8ToUtf16Alloc(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
-    var list = std.ArrayListUnmanaged(u16){};
+    var list: std.ArrayListUnmanaged(u16) = .empty;
     errdefer list.deinit(alloc);
 
     var it = (try std.unicode.Utf8View.init(s)).iterator();

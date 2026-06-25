@@ -9,7 +9,7 @@ const c = @cImport({
 /// Reads password from ZONVIE_SSH_PASSWORD environment variable and writes to stdout
 pub fn main() void {
     // Get password from environment variable
-    const password = std.process.getEnvVarOwned(std.heap.page_allocator, "ZONVIE_SSH_PASSWORD") catch {
+    const password = (std.process.Environ{ .block = .global }).getAlloc(std.heap.page_allocator, "ZONVIE_SSH_PASSWORD") catch {
         // No password set, just exit
         return;
     };
