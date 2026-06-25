@@ -18,6 +18,35 @@ const scrollbar = @import("ui/scrollbar.zig");
 const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
 
+/// dwData tag identifying a single-instance file-open message (see main.zig's
+/// single-instance forwarding and the WM_COPYDATA handler below). 'ZONV'.
+pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E56;
+
+/// Neovim command-line escape for a single byte of a file path. Returns the
+/// escaped multi-byte sequence, or null if the byte needs no escaping. Shared
+/// by the WM_DROPFILES handler and the single-instance forwarding path
+/// (main.zig) so both escape identically; the set matches the macOS
+/// `escapePathForNeovim`. `$` and `` ` `` are included so Neovim does not
+/// perform environment-variable / backtick expansion on a literal path.
+pub fn escapeNeovimByte(ch: u8) ?[]const u8 {
+    return switch (ch) {
+        '\\' => "\\\\",
+        ' ' => "\\ ",
+        '%' => "\\%",
+        '#' => "\\#",
+        '|' => "\\|",
+        '"' => "\\\"",
+        '\'' => "\\'",
+        '[' => "\\[",
+        ']' => "\\]",
+        '{' => "\\{",
+        '}' => "\\}",
+        '$' => "\\$",
+        '`' => "\\`",
+        else => null,
+    };
+}
+
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
 fn loadSystemCursor(id: usize) c.HCURSOR {
     const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
@@ -4630,22 +4659,7 @@ pub export fn WndProc(
                     // Escape special characters for Neovim
                     for (utf8_path) |ch| {
                         if (pos + 2 > cmd_buf.len) break;
-                        const escaped: ?[]const u8 = switch (ch) {
-                            '\\' => "\\\\",
-                            ' ' => "\\ ",
-                            '%' => "\\%",
-                            '#' => "\\#",
-                            '|' => "\\|",
-                            '"' => "\\\"",
-                            '\'' => "\\'",
-                            '[' => "\\[",
-                            ']' => "\\]",
-                            '{' => "\\{",
-                            '}' => "\\}",
-                            else => null,
-                        };
-
-                        if (escaped) |esc| {
+                        if (escapeNeovimByte(ch)) |esc| {
                             if (pos + esc.len <= cmd_buf.len) {
                                 @memcpy(cmd_buf[pos..][0..esc.len], esc);
                                 pos += esc.len;
@@ -4668,6 +4682,32 @@ pub export fn WndProc(
                 }
             }
             return 0;
+        },
+
+        c.WM_COPYDATA => {
+            // Single-instance file open: a second `zonvie <file>` process found
+            // this running instance and forwarded a pre-built Ex command (e.g.
+            // "tab drop /abs/path"). See main.zig's forwarding path. The payload
+            // is the bare command bytes (no leading ':'); an empty payload means
+            // "just bring me to the front".
+            const cds: *const c.COPYDATASTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            if (cds.dwData != ZONVIE_COPYDATA_MAGIC) {
+                return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+            if (getApp(hwnd)) |app| {
+                // Bring the window to the front (restore if minimized).
+                if (app.hwnd) |main_hwnd| {
+                    if (c.IsIconic(main_hwnd) != 0) _ = c.ShowWindow(main_hwnd, c.SW_RESTORE);
+                    _ = c.SetForegroundWindow(main_hwnd);
+                }
+                if (cds.cbData > 0 and cds.lpData != null) {
+                    if (app.corep) |corep| {
+                        const bytes: [*]const u8 = @ptrCast(cds.lpData.?);
+                        app_mod.zonvie_core_send_command(corep, bytes, @intCast(cds.cbData));
+                    }
+                }
+            }
+            return c.TRUE;
         },
 
         c.WM_CLOSE => {

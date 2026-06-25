@@ -1560,6 +1560,10 @@ pub const zonvie_config_values = extern struct {
     shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
     // input
     input_swap_colon_semicolon: bool = false, // swap `:` and `;` on single keypresses
+    // server (single-instance file open). single_instance is Windows-only and
+    // read directly from config.Config by the Windows frontend, so it is not
+    // mirrored here.
+    server_open_mode: [*:0]const u8 = "tab", // "tab" or "current"
 };
 
 const ConfigHandle = struct {
@@ -1672,6 +1676,8 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .shader_post_process = @intFromEnum(cfg.shaders.post_process),
         // input
         .input_swap_colon_semicolon = cfg.input.swap_colon_semicolon,
+        // server
+        .server_open_mode = dupeZForC(alloc, cfg.server.open_mode, "tab"),
     };
 }
 

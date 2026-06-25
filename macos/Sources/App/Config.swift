@@ -16,6 +16,7 @@ struct ZonvieConfig {
     var ime: IMEConfig = IMEConfig()
     var shaders: ShaderConfig = ShaderConfig()
     var input: InputConfig = InputConfig()
+    var server: ServerConfig = ServerConfig()
 
     /// Tabline display style
     enum TablineStyle: String {
@@ -189,6 +190,13 @@ struct ZonvieConfig {
         var swapColonSemicolon: Bool = false
     }
 
+    struct ServerConfig {
+        /// How a file opened via the running instance is shown: "tab" opens a
+        /// new tab (`:tab drop`), "current" replaces the current window
+        /// (`:drop`). `single_instance` is Windows-only and not mirrored here.
+        var openMode: String = "tab"
+    }
+
     /// Returns the swapped counterpart for `:`/`;`, or nil for any other string.
     /// Used by the keyDown paths to apply the `[input] swap_colon_semicolon`
     /// remap to single keypresses only.
@@ -297,6 +305,9 @@ struct ZonvieConfig {
         config.ime.disableOnModechange = v.ime_disable_on_modechange
         config.ime.optionAsMeta = OptionAsMeta(rawValue: v.ime_option_as_meta) ?? .both
         config.input.swapColonSemicolon = v.input_swap_colon_semicolon
+
+        // Server
+        if let s = v.server_open_mode { config.server.openMode = String(cString: s) }
 
         // Shaders
         config.shaders.enabled = v.shader_enabled

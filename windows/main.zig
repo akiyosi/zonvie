@@ -131,6 +131,90 @@ extern "winmm" fn timeBeginPeriod(uPeriod: c.UINT) callconv(.winapi) c.UINT;
 
 const ATTACH_PARENT_PROCESS: c.DWORD = 0xFFFFFFFF;
 
+/// Current working directory as UTF-8, or null on failure. Used to resolve
+/// relative file arguments to absolute paths before forwarding them to a
+/// running instance (which may have a different cwd).
+fn getCwdUtf8(alloc: std.mem.Allocator) ?[]u8 {
+    var stack_buf: [c.MAX_PATH]u16 = undefined;
+    const len = c.GetCurrentDirectoryW(@intCast(stack_buf.len), &stack_buf);
+    if (len == 0) return null;
+    if (len <= stack_buf.len) {
+        return std.unicode.utf16LeToUtf8Alloc(alloc, stack_buf[0..len]) catch null;
+    }
+    // Path longer than MAX_PATH (long-path-aware system). When the buffer is
+    // too small GetCurrentDirectoryW returns the required size INCLUDING the
+    // null terminator; allocate that and retry. The second call returns the
+    // length EXCLUDING the null.
+    const heap_buf = alloc.alloc(u16, len) catch return null;
+    defer alloc.free(heap_buf);
+    const len2 = c.GetCurrentDirectoryW(@intCast(heap_buf.len), heap_buf.ptr);
+    if (len2 == 0 or len2 >= heap_buf.len) return null;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, heap_buf[0..len2]) catch null;
+}
+
+/// Single-instance mode: forward file arguments to an already-running instance
+/// via WM_COPYDATA, then let the caller exit. Builds a bare Ex command (no
+/// leading ':') of the form "tab drop <abs1> <abs2> ..." — or "drop <abs>" for
+/// a single file when [server] open_mode == "current" — and posts it to the
+/// existing window. Paths are made absolute (the running instance may have a
+/// different working directory) and escaped for Neovim's command line, mirroring
+/// the WM_DROPFILES handler in window.zig. An empty path list sends an empty
+/// payload, which just brings the existing window to the front.
+fn forwardFilesToInstance(
+    alloc: std.mem.Allocator,
+    target: c.HWND,
+    cfg: *const config_mod.Config,
+    paths: []const []const u8,
+) void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    if (paths.len > 0) {
+        const use_current = paths.len == 1 and std.mem.eql(u8, cfg.server.open_mode, "current");
+        buf.appendSlice(alloc, if (use_current) "drop" else "tab drop") catch return;
+
+        const cwd = getCwdUtf8(alloc);
+        defer if (cwd) |w| alloc.free(w);
+
+        for (paths) |p| {
+            buf.append(alloc, ' ') catch return;
+
+            // Resolve to an absolute path against this process's cwd so the
+            // running instance opens the file the user meant. Does not require
+            // the file to exist (supports opening a new file).
+            const abs: []const u8 = blk: {
+                if (std.fs.path.isAbsolute(p)) break :blk p;
+                if (cwd) |w| {
+                    if (std.fs.path.join(alloc, &.{ w, p })) |joined| break :blk joined else |_| {}
+                }
+                break :blk p;
+            };
+            defer if (abs.ptr != p.ptr) alloc.free(abs);
+
+            for (abs) |ch| {
+                if (window.escapeNeovimByte(ch)) |e| buf.appendSlice(alloc, e) catch return else buf.append(alloc, ch) catch return;
+            }
+        }
+    }
+
+    // Grant the existing instance permission to take the foreground. Windows
+    // blocks SetForegroundWindow unless the calling process is the current
+    // foreground process; a freshly-launched process (this one) holds that
+    // privilege briefly and can transfer it to the target via
+    // AllowSetForegroundWindow. Without this the running window only flashes
+    // its taskbar button instead of raising.
+    var target_pid: c.DWORD = 0;
+    _ = c.GetWindowThreadProcessId(target, &target_pid);
+    if (target_pid != 0) _ = c.AllowSetForegroundWindow(target_pid);
+
+    var cds: c.COPYDATASTRUCT = .{
+        .dwData = window.ZONVIE_COPYDATA_MAGIC,
+        .cbData = @intCast(buf.items.len),
+        .lpData = if (buf.items.len > 0) buf.items.ptr else null,
+    };
+    _ = c.SendMessageW(target, c.WM_COPYDATA, 0, @bitCast(@intFromPtr(&cds)));
+}
+
 pub fn main() u8 {
     clock.init();
 
@@ -686,6 +770,36 @@ pub fn main() u8 {
 
     if (c.RegisterClassExW(&wc) == 0) return 1;
 
+    // Single-instance mode (opt-in via [server] single_instance). Use a named
+    // mutex to detect an already-running instance; if one exists, forward the
+    // file arguments to it via WM_COPYDATA and exit. The mutex handle is kept
+    // open for this process's lifetime (released by the OS on exit) so it acts
+    // as the live ownership token for subsequent launches.
+    if (config.server.single_instance) {
+        const mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\ZonvieSingleInstanceMutex");
+        const mutex = c.CreateMutexW(null, c.FALSE, mutex_name);
+        if (mutex != null and c.GetLastError() == c.ERROR_ALREADY_EXISTS) {
+            // Another instance owns the mutex. Route the files to it. The owning
+            // instance creates the mutex before its window, so during a startup
+            // race FindWindowW may not see the window yet; poll briefly (up to
+            // ~2s) before giving up.
+            var existing = c.FindWindowW(@ptrCast(class_name.ptr), null);
+            if (existing == null) {
+                var waited_ms: u32 = 0;
+                while (waited_ms < 2000) : (waited_ms += 50) {
+                    c.Sleep(50);
+                    existing = c.FindWindowW(@ptrCast(class_name.ptr), null);
+                    if (existing != null) break;
+                }
+            }
+            if (existing != null) {
+                forwardFilesToInstance(alloc, existing.?, &config, nvim_extra_args.items);
+                return 0;
+            }
+            // Still no window (owning instance headless or stuck). Fall through
+            // and start normally as a degraded fallback.
+        }
+    }
 
     // Reject empty / missing connect address. Catches both
     // `zonvie --connect-nvim` (bare flag, no value) and
@@ -897,5 +1011,9 @@ const default_config_toml =
     \\
     \\[window]
     \\# opacity = 1.0
+    \\
+    \\[server]
+    \\# single_instance = false   # route `zonvie <file>` to a running instance (Windows only)
+    \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
     \\
 ;

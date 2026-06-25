@@ -280,6 +280,10 @@ if zonvieArgs.contains("--install") {
             # blur = false
             # blur_radius = 20
 
+            [server]
+            # open_mode = "tab"   # "tab" (new tab) or "current" (replace current window)
+            # single_instance is Windows-only (macOS routes file opens via the OS).
+
             """
         do {
             try defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)

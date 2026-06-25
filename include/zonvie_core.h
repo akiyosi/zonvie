@@ -1338,6 +1338,10 @@ typedef struct zonvie_config_values {
     uint8_t shader_post_process;  // 0=after_bloom, 1=before_bloom, 2=replace_bloom
     // input
     bool input_swap_colon_semicolon;  // swap `:` and `;` on single keypresses
+    // server (single-instance file open). single_instance is Windows-only and
+    // read directly from the parsed config by the Windows frontend, so it is
+    // not exposed here.
+    const char* server_open_mode;  // "tab" or "current"
 } zonvie_config_values;
 
 /* Load config from TOML file. path may be NULL for defaults only.

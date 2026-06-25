@@ -355,6 +355,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Queue files for later processing
         pendingFilesToOpen.append(contentsOf: validFiles)
         ZonvieCore.appLog("zonvie: queued \(validFiles.count) files")
+
+        // Drain now if the core is already running (file opened against an
+        // already-running instance via Finder). processPendingFiles() guards on
+        // core availability, so before the core is ready it returns early and
+        // the queue is drained later by the neovimReadyNotification observer.
+        processPendingFiles()
     }
 
     private func processPendingFiles() {
@@ -369,15 +375,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         ZonvieCore.appLog("zonvie: processing \(pendingFilesToOpen.count) pending files")
 
-        // Open each file in Neovim with :tabe
+        // Choose the open command. A single file honors `[server] open_mode`
+        // ("current" replaces the current window via `:drop`, otherwise a new
+        // tab via `:tab drop`). Multiple files always open as new tabs. Using
+        // `:drop`/`:tab drop` (rather than `:edit`/`:tabe`) jumps to a window
+        // already showing the file instead of opening a duplicate.
+        let useCurrent = pendingFilesToOpen.count == 1
+            && ZonvieConfig.shared.server.openMode == "current"
+        let cmd = useCurrent ? "drop" : "tab drop"
         for filename in pendingFilesToOpen {
             let escapedPath = escapePathForNeovim(filename)
-            let input = "\u{1b}:tabe \(escapedPath)\r"
+            let input = "\u{1b}:\(cmd) \(escapedPath)\r"
             core.sendInput(input)
-            ZonvieCore.appLog("zonvie: sent :tabe \(escapedPath)")
+            ZonvieCore.appLog("zonvie: sent :\(cmd) \(escapedPath)")
         }
 
         pendingFilesToOpen = []
+
+        // Bring the running instance to the front (file routed from Finder).
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 
 }

@@ -166,6 +166,7 @@ pub const Config = struct {
     ime: IMEConfig = .{},
     shaders: ShaderConfig = .{},
     input: InputConfig = .{},
+    server: ServerConfig = .{},
 
     // Internal state
     alloc: ?std.mem.Allocator = null,
@@ -323,6 +324,20 @@ pub const Config = struct {
         paths: []const []const u8 = &.{},
         /// Where the custom shader chain inserts relative to bloom.
         post_process: ShaderPostProcess = .after_bloom,
+    };
+
+    pub const ServerConfig = struct {
+        /// Single-instance mode: route files opened via a second `zonvie <file>`
+        /// invocation to the already-running instance. Windows-only (macOS gets
+        /// single-instance behavior from the OS launch services).
+        single_instance: bool = false,
+        /// How a routed file is shown in the running instance: "tab" opens a
+        /// new tab (`:tab drop`), "current" replaces the current window
+        /// (`:drop`). On macOS this governs Finder-routed file opens; on
+        /// Windows it governs files forwarded to the running instance. Files
+        /// passed as command-line arguments at startup are opened by Neovim's
+        /// own argument handling and are unaffected.
+        open_mode: []const u8 = "tab",
     };
 
     const Self = @This();
@@ -596,6 +611,17 @@ pub const Config = struct {
         if (cfg.input) |i| {
             if (i.swap_colon_semicolon) |v| self.input.swap_colon_semicolon = v;
         }
+
+        if (cfg.server) |s| {
+            if (s.single_instance) |v| self.server.single_instance = v;
+            if (s.open_mode) |m| {
+                // Only accept the two known modes; ignore anything else and
+                // keep the default ("tab").
+                if (std.mem.eql(u8, m, "tab") or std.mem.eql(u8, m, "current")) {
+                    self.server.open_mode = alloc.dupe(u8, m) catch self.server.open_mode;
+                }
+            }
+        }
     }
 
     /// Route a message to the appropriate view
@@ -671,6 +697,11 @@ pub const Config = struct {
         // Free duplicated log.path
         if (self.log.path) |s| {
             alloc.free(s);
+        }
+
+        // Free duplicated server.open_mode
+        if (self.server.open_mode.ptr != default.server.open_mode.ptr) {
+            alloc.free(self.server.open_mode);
         }
 
         // Free parse error message
@@ -787,6 +818,7 @@ const TomlConfig = struct {
     ime: ?TomlIME = null,
     shaders: ?TomlShaders = null,
     input: ?TomlInput = null,
+    server: ?TomlServer = null,
 };
 
 const TomlNeovim = struct {
@@ -889,4 +921,9 @@ const TomlShaders = struct {
 
 const TomlInput = struct {
     swap_colon_semicolon: ?bool = null,
+};
+
+const TomlServer = struct {
+    single_instance: ?bool = null,
+    open_mode: ?[]const u8 = null,
 };

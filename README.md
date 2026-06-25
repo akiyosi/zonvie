@@ -213,6 +213,10 @@ preedit_mode = "overlay"  # "overlay" (floating overlay) or "extmark" (inline vi
 [input]
 swap_colon_semicolon = false  # swap the `:` and `;` keys (single keypresses only)
 
+[server]
+single_instance = false  # route `zonvie <file>` to a running instance (Windows only)
+open_mode = "tab"        # "tab" (new tab) or "current" (replace current window)
+
 [shaders]
 enabled = false
 post_process = "after_bloom"  # only "after_bloom" is implemented today
@@ -334,6 +338,12 @@ Message routing rules are processed in order; first match wins.
 | Key | Description |
 |-----|-------------|
 | `swap_colon_semicolon` | Swap the `:` and `;` keys (true/false). Applies to single keypresses only; pasted text and IME commits are unaffected |
+
+#### [server]
+| Key | Description |
+|-----|-------------|
+| `single_instance` | **Windows only.** When true, a second `zonvie <file>` launch routes the file to the already-running instance (and brings it to the front) instead of opening a new window. Default false. macOS gets single-instance behavior from the OS. |
+| `open_mode` | How a routed file is shown: `"tab"` opens a new tab (`:tab drop`), `"current"` replaces the current window (`:drop`). Multiple files always open as tabs. Default `"tab"`. |
 
 #### [shaders]
 | Key | Description |
