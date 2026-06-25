@@ -169,7 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         if config.blurEnabled {
             win.isOpaque = false
-            win.backgroundColor = .clear
+            // Use a near-zero-alpha background instead of .clear. A fully clear
+            // background makes macOS compute the window's contact shadow against
+            // a fully-transparent shape, which bleeds through the translucent
+            // content's outermost pixel as a ~1px dark line around the window
+            // edge. A 0.001-alpha color gives the window a defined shape so the
+            // shadow/border renders correctly while staying visually transparent.
+            // Same workaround used by kitty, Ghostty, and Neovide.
+            win.backgroundColor = NSColor.white.withAlphaComponent(0.001)
             ZonvieCore.appLog("[Window] Set transparent for blur: isOpaque=\(win.isOpaque) backgroundColor=\(String(describing: win.backgroundColor))")
         }
 

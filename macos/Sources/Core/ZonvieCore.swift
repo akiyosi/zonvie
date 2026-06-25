@@ -3248,6 +3248,15 @@ final class ZonvieCore {
     private static let specialWindowCornerRadius: CGFloat = 4.0
     private static let specialWindowBorderLayerName = "ZonvieSpecialWindowBorder"
 
+    /// Background for transparent windows that keep a drop shadow.
+    /// A fully `.clear` background makes macOS compute the window's contact
+    /// shadow against a transparent shape, which bleeds through the content's
+    /// outermost pixel as a ~1px dark line around the window edge. A
+    /// near-zero-alpha color gives the window a defined shape so the shadow
+    /// renders cleanly while staying visually transparent. Matches the
+    /// workaround used by kitty, Ghostty, and Neovide.
+    private static let transparentShadowedWindowBackground = NSColor.white.withAlphaComponent(0.001)
+
     /// Message window for ext_messages (top-right for echo/error/warning)
     private var extFloatWindow: NSWindow?
     /// Message text field for ext_messages
@@ -4180,7 +4189,7 @@ final class ZonvieCore {
             window.hasShadow = true
             window.level = .floating
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
             window.isMovableByWindowBackground = true
             window.hidesOnDeactivate = true
 
@@ -4188,7 +4197,7 @@ final class ZonvieCore {
             window.hasShadow = true
             window.level = .floating
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
             window.hidesOnDeactivate = true
 
         case .normal:
@@ -4265,7 +4274,7 @@ final class ZonvieCore {
         window.contentView = gridView
         if ZonvieConfig.shared.blurEnabled {
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
         }
     }
 
@@ -4855,7 +4864,7 @@ final class ZonvieCore {
             containerView.addSubview(iconView, positioned: .above, relativeTo: gridView)
         }
         window.contentView = containerView
-        window.backgroundColor = .clear
+        window.backgroundColor = Self.transparentShadowedWindowBackground
         window.isOpaque = false
         window.hasShadow = true
 
@@ -6517,7 +6526,7 @@ final class ZonvieCore {
             window.hasShadow = true
             window.level = .floating
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
 
@@ -6624,7 +6633,7 @@ final class ZonvieCore {
             window.hasShadow = true
             window.level = .floating
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = false
 
@@ -6821,7 +6830,7 @@ final class ZonvieCore {
             window.hasShadow = true
             window.level = .floating
             window.isOpaque = false
-            window.backgroundColor = .clear
+            window.backgroundColor = Self.transparentShadowedWindowBackground
             window.isReleasedWhenClosed = false
             window.hidesOnDeactivate = true  // Hide when app loses focus (like ext-cmdline)
 
