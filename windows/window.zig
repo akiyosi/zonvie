@@ -433,6 +433,57 @@ const IDM_ABOUT: usize = 0x0010;
 // already near the default quota).
 const about_title_w = std.unicode.utf8ToUtf16LeStringLiteral("About zonvie");
 
+// Tray context-menu command ids (TrackPopupMenu TPM_RETURNCMD). Any non-zero
+// values work; 0 is returned when the menu is dismissed without a selection.
+const IDM_TRAY_OPEN: usize = 1;
+const IDM_TRAY_QUIT: usize = 2;
+const tray_open_w = std.unicode.utf8ToUtf16LeStringLiteral("Open Zonvie");
+const tray_quit_w = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
+
+// Restore the main window from the notification area (close_to_tray). The tray
+// icon itself stays registered — it is shared with balloon notifications and
+// re-added at startup, so it is not removed here.
+fn restoreFromTray(hwnd: c.HWND) void {
+    _ = c.ShowWindow(hwnd, c.SW_SHOW);
+    if (c.IsIconic(hwnd) != 0) _ = c.ShowWindow(hwnd, c.SW_RESTORE);
+    _ = c.SetForegroundWindow(hwnd);
+}
+
+// Show the tray context menu ("Open Zonvie" / "Quit") at the cursor. "Quit"
+// sets tray_quit_requested so the subsequent WM_CLOSE runs the real graceful-
+// quit path instead of hiding back to the tray.
+fn showTrayMenu(hwnd: c.HWND, app: *App) void {
+    const menu = c.CreatePopupMenu() orelse return;
+    defer _ = c.DestroyMenu(menu);
+    _ = c.AppendMenuW(menu, c.MF_STRING, IDM_TRAY_OPEN, tray_open_w);
+    _ = c.AppendMenuW(menu, c.MF_STRING, IDM_TRAY_QUIT, tray_quit_w);
+
+    var pt: c.POINT = undefined;
+    _ = c.GetCursorPos(&pt);
+    // TrackPopupMenu needs a foreground window to dismiss correctly; the
+    // trailing WM_NULL is the documented workaround so the menu closes when
+    // the user clicks elsewhere.
+    _ = c.SetForegroundWindow(hwnd);
+    const cmd = c.TrackPopupMenu(
+        menu,
+        c.TPM_RETURNCMD | c.TPM_RIGHTBUTTON,
+        @intCast(pt.x),
+        @intCast(pt.y),
+        0,
+        hwnd,
+        null,
+    );
+    _ = c.PostMessageW(hwnd, c.WM_NULL, 0, 0);
+    switch (@as(usize, @intCast(cmd))) {
+        IDM_TRAY_OPEN => restoreFromTray(hwnd),
+        IDM_TRAY_QUIT => {
+            app.tray_quit_requested = true;
+            _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        },
+        else => {},
+    }
+}
+
 // Timer and timing constants
 const TIMER_MSG_AUTOHIDE = app_mod.TIMER_MSG_AUTOHIDE;
 const TIMER_MINI_AUTOHIDE = app_mod.TIMER_MINI_AUTOHIDE;
@@ -1138,6 +1189,13 @@ pub export fn WndProc(
                         if (gpu_ptr) |g| {
                             g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch {
                                 if (log_enabled) applog.appLog("[win] FATAL: D3D atlas texture recreation failed, skipping frame\n", .{});
+                                // Unrecoverable GPU failure: force a real quit, not
+                                // close-to-tray. Mark Neovim exited (and set the
+                                // exit code) before posting WM_CLOSE so the handler
+                                // takes the terminate path instead of hiding to the
+                                // tray.
+                                app.neovim_exited.store(true, .release);
+                                app_mod.g_exit_code.store(1, .seq_cst);
                                 if (app.hwnd) |h| _ = c.PostMessageW(h, c.WM_CLOSE, 0, 0);
                                 app.mu.unlock(core.clock.io());
                                 return 0;
@@ -2813,6 +2871,22 @@ pub export fn WndProc(
             return 0;
         },
 
+        WM_APP_TRAY => {
+            // Notification-area icon interaction (close_to_tray). With the
+            // default tray version (no NIM_SETVERSION), lParam's low word holds
+            // the mouse message. Left click / double-click restores the window;
+            // right click opens the Open/Quit context menu.
+            if (getApp(hwnd)) |app| {
+                const event = @as(u32, @as(u16, @truncate(@as(usize, @bitCast(lParam)))));
+                switch (event) {
+                    c.WM_LBUTTONUP, c.WM_LBUTTONDBLCLK => restoreFromTray(hwnd),
+                    c.WM_RBUTTONUP => showTrayMenu(hwnd, app),
+                    else => {},
+                }
+            }
+            return 0;
+        },
+
         WM_APP_QUIT_REQUESTED => {
             const has_unsaved: c_int = @intCast(wParam);
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_QUIT_REQUESTED: has_unsaved={d}\n", .{has_unsaved});
@@ -3250,7 +3324,7 @@ pub export fn WndProc(
                 if (getApp(hwnd)) |app| {
                     app.tray_icon = TrayIcon.init(hwnd);
                     if (app.tray_icon) |*tray| {
-                        tray.add();
+                        _ = tray.add();
                     }
                     if (applog.isEnabled()) applog.appLog("[win] TIMER_TRAY_INIT: tray icon initialized\n", .{});
                 }
@@ -4695,10 +4769,10 @@ pub export fn WndProc(
                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
             }
             if (getApp(hwnd)) |app| {
-                // Bring the window to the front (restore if minimized).
+                // Bring the window to the front, also un-hiding it if the
+                // instance was hidden to the tray (close_to_tray) or minimized.
                 if (app.hwnd) |main_hwnd| {
-                    if (c.IsIconic(main_hwnd) != 0) _ = c.ShowWindow(main_hwnd, c.SW_RESTORE);
-                    _ = c.SetForegroundWindow(main_hwnd);
+                    restoreFromTray(main_hwnd);
                 }
                 if (cds.cbData > 0 and cds.lpData != null) {
                     if (app.corep) |corep| {
@@ -4717,6 +4791,31 @@ pub export fn WndProc(
                 if (app.neovim_exited.load(.acquire)) {
                     if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: neovim already exited, proceeding with close\n", .{});
                     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+                }
+                // Close-to-tray ([server] close_to_tray): hide the window to the
+                // notification area instead of quitting; Neovim keeps running and
+                // the tray icon restores it. The tray menu's "Quit" sets
+                // tray_quit_requested to skip this and fall through to the real
+                // graceful quit below. Consume the flag (read once, then reset) so
+                // a cancelled graceful quit does not permanently disable
+                // close-to-tray for the rest of the session.
+                const tray_quit = app.tray_quit_requested;
+                app.tray_quit_requested = false;
+                if (app.config.server.close_to_tray and !tray_quit) {
+                    // Ensure the tray icon is registered BEFORE hiding. It is
+                    // normally created ~50ms after first show (TIMER_TRAY_INIT); if
+                    // the user closes before that fires, create it here. If it
+                    // cannot be added, do NOT hide — fall through to a normal quit
+                    // so the process is never left behind an invisible window with
+                    // no way back.
+                    if (app.tray_icon == null) app.tray_icon = TrayIcon.init(hwnd);
+                    const tray_ready = if (app.tray_icon) |*tray| tray.add() else false;
+                    if (tray_ready) {
+                        _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                        if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: hidden to tray (close_to_tray)\n", .{});
+                        return 0;
+                    }
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: tray icon unavailable, proceeding with quit\n", .{});
                 }
                 // If already waiting for quit, don't send another request
                 if (app.quit_pending) {

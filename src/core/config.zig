@@ -338,6 +338,11 @@ pub const Config = struct {
         /// passed as command-line arguments at startup are opened by Neovim's
         /// own argument handling and are unaffected.
         open_mode: []const u8 = "tab",
+        /// Close button hides the window to the notification area (system
+        /// tray) instead of quitting; Neovim keeps running, so the instance
+        /// stays resident (and reusable via single_instance). Windows-only
+        /// (read directly by the Windows frontend; macOS does not consume it).
+        close_to_tray: bool = false,
     };
 
     const Self = @This();
@@ -614,6 +619,7 @@ pub const Config = struct {
 
         if (cfg.server) |s| {
             if (s.single_instance) |v| self.server.single_instance = v;
+            if (s.close_to_tray) |t| self.server.close_to_tray = t;
             if (s.open_mode) |m| {
                 // Only accept the two known modes; ignore anything else and
                 // keep the default ("tab").
@@ -925,5 +931,6 @@ const TomlInput = struct {
 
 const TomlServer = struct {
     single_instance: ?bool = null,
+    close_to_tray: ?bool = null,
     open_mode: ?[]const u8 = null,
 };

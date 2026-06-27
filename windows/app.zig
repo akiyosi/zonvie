@@ -831,6 +831,12 @@ pub const PendingExternalVertices = struct {
     }
 };
 
+// user32 LoadIconW redeclared with an align-agnostic resource-name pointer and
+// a direct HICON return, so the odd app-icon ordinal (MAKEINTRESOURCE(1)) does
+// not trip the Debug alignment assertion. Same shim as main.zig's; see the
+// MAKEINTRESOURCE alignment gotcha.
+extern "user32" fn LoadIconW(hInstance: c.HINSTANCE, lpIconName: ?*const anyopaque) callconv(.winapi) c.HICON;
+
 /// Tray icon for balloon notifications (OS notification view type)
 pub const TrayIcon = struct {
     nid: c.NOTIFYICONDATAW,
@@ -843,20 +849,29 @@ pub const TrayIcon = struct {
         nid.uID = 1;
         nid.uFlags = c.NIF_ICON | c.NIF_TIP | c.NIF_MESSAGE;
         nid.uCallbackMessage = WM_APP_TRAY;
-        // IDI_APPLICATION = 32512 (0x7F00) - use direct value as MAKEINTRESOURCE macro doesn't translate
-        nid.hIcon = c.LoadIconW(null, @ptrFromInt(32512));
+        // Zonvie app icon (window class icon, resource ordinal 1) rather than the
+        // generic IDI_APPLICATION. Shared HICON (no DestroyIcon needed);
+        // GetModuleHandleW(null) is the exe module that owns the resource.
+        nid.hIcon = LoadIconW(c.GetModuleHandleW(null), @ptrFromInt(@as(usize, 1)));
         // Set tip text "Zonvie"
         const tip = [_]u16{ 'Z', 'o', 'n', 'v', 'i', 'e', 0 };
         @memcpy(nid.szTip[0..tip.len], &tip);
         return .{ .nid = nid };
     }
 
-    pub fn add(self: *TrayIcon) void {
+    /// Register the icon. Returns whether the icon is present afterward
+    /// (true if already added, or NIM_ADD succeeded). Callers that hide the
+    /// window to the tray must check this so they never hide with no icon.
+    pub fn add(self: *TrayIcon) bool {
         if (!self.added) {
-            _ = c.Shell_NotifyIconW(c.NIM_ADD, &self.nid);
+            if (c.Shell_NotifyIconW(c.NIM_ADD, &self.nid) == 0) {
+                if (applog.isEnabled()) applog.appLog("[tray] Shell_NotifyIconW(NIM_ADD) failed\n", .{});
+                return false;
+            }
             self.added = true;
             if (applog.isEnabled()) applog.appLog("[tray] added tray icon\n", .{});
         }
+        return self.added;
     }
 
     pub fn remove(self: *TrayIcon) void {
@@ -2709,6 +2724,9 @@ pub const App = struct {
     quit_pending: bool = false,
     // Flag to ignore delayed quit responses after timeout fired
     quit_timeout_fired: bool = false,
+    // Set by the tray menu's "Quit" so the next WM_CLOSE runs the real
+    // graceful-quit path instead of hiding back to the tray (close_to_tray).
+    tray_quit_requested: bool = false,
 
     // Main surface vertex state (shared structure with external windows).
     // paint_full=false: main window uses explicit dirty tracking; external windows default to true.

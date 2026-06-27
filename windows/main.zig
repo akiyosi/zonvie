@@ -720,12 +720,13 @@ pub fn main() u8 {
     if (applog.isEnabled()) {
         applog.appLog("[TIMING] Config.load: {d}ms\n", .{config_ms});
         applog.appLog("[win] Config path: {s}\n", .{config_result.path orelse "(none)"});
-        applog.appLog("[win] Config loaded: neovim.path={s}, font.family={s}, font.size={d}, cmdline.external={}, log.enabled={}\n", .{
+        applog.appLog("[win] Config loaded: neovim.path={s}, font.family={s}, font.size={d}, cmdline.external={}, log.enabled={}, close_to_tray={}\n", .{
             config.neovim.path,
             config.font.family,
             config.font.size,
             config.cmdline.external,
             config.log.enabled,
+            config.server.close_to_tray,
         });
         applog.appLog("[win] Config messages: external={}, routes_count={d}, routes_allocated={}\n", .{
             config.messages.external,
@@ -1015,5 +1016,6 @@ const default_config_toml =
     \\[server]
     \\# single_instance = false   # route `zonvie <file>` to a running instance (Windows only)
     \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
+    \\# close_to_tray = false     # close button hides to the notification area instead of quitting (Windows only)
     \\
 ;
