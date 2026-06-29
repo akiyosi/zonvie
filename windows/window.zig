@@ -145,6 +145,31 @@ pub fn applyOsTitlebarTheme(hwnd: c.HWND) void {
     );
 }
 
+// Win11 22H2+ system backdrop. Setting an acrylic backdrop makes window
+// transparency show a frosted blur of what's behind, and DWM draws a drop
+// shadow for the window — both of which a plain per-pixel-alpha borderless
+// window cannot get (the shadow trick, DwmExtendFrameIntoClientArea with a
+// real backdrop, otherwise renders an opaque frame behind the client and
+// defeats transparency). HRESULT is ignored: pre-22H2 builds no-op.
+const DWMWA_SYSTEMBACKDROP_TYPE: c.DWORD = 38;
+const DWMSBT_TRANSIENTWINDOW: c_int = 3; // acrylic
+
+// Enable the acrylic backdrop + sheet-of-glass frame extension so the backdrop
+// fills the whole client and the window gets its shadow back. Call when blur is
+// enabled (config [window] blur = true). Idempotent.
+pub fn applyWindowBackdrop(hwnd: c.HWND) void {
+    var backdrop: c_int = DWMSBT_TRANSIENTWINDOW;
+    _ = c.DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_SYSTEMBACKDROP_TYPE,
+        &backdrop,
+        @sizeOf(c_int),
+    );
+    // Sheet of glass: extend the (now acrylic) frame across the entire client.
+    const margins = c.MARGINS{ .cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1 };
+    _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
 // WM_SETTINGCHANGE dispatch helper for any top-level window that wants its
 // DWM titlebar to follow the OS app theme. Returns true if the message was
 // the "ImmersiveColorSet" broadcast and the theme was re-applied.
@@ -679,6 +704,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
     if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
     core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
     core.zonvie_core_set_glyph_cache_size(
         app.corep,
         app.config.performance.glyph_cache_ascii_size,
@@ -3398,6 +3424,7 @@ pub export fn WndProc(
                     if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
                     if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
                     core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+                    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
                     core.zonvie_core_set_glyph_cache_size(
                         app.corep,
                         app.config.performance.glyph_cache_ascii_size,
@@ -4873,16 +4900,24 @@ pub export fn WndProc(
             return 0;
         },
 
-        // DWM custom titlebar: extend frame into client area on activation
+        // DWM custom titlebar: restore the drop shadow on activation. The
+        // mechanism depends on how the window is composited:
+        //   - blur on  -> acrylic system backdrop (sheet-of-glass frame). DWM
+        //     draws the shadow and the frosted blur shows through translucent
+        //     content. This is the only mode where transparency + shadow coexist.
+        //   - opaque    -> the classic 1px frame-extend shadow trick.
+        //   - translucent, no blur -> no frame extend: a real frame backdrop
+        //     would defeat per-pixel alpha and make the window opaque, so this
+        //     mode renders transparent without a shadow.
         c.WM_ACTIVATE => {
             if (getApp(hwnd)) |app| {
                 if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
-                    // Enable DWM shadow for borderless window by extending frame with minimal margins.
-                    // MARGINS.bottom = 1 tricks DWM into thinking there's a frame, which enables the shadow.
-                    // This doesn't cause glass overlay issues because the margin is only 1 pixel.
-                    const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
-                    _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
-                    if (applog.isEnabled()) applog.appLog("[win] WM_ACTIVATE: DwmExtendFrameIntoClientArea applied for shadow\n", .{});
+                    if (app.config.window.blur) {
+                        applyWindowBackdrop(hwnd);
+                    } else if (app.config.window.opacity >= 1.0) {
+                        const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
+                        _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
+                    }
                 }
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
