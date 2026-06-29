@@ -4900,6 +4900,20 @@ pub export fn WndProc(
             return 0;
         },
 
+        // Experiment: when the acrylic backdrop is in use, force DWM to keep
+        // treating the window as active so the backdrop stays blurred after
+        // focus is lost (Win11 renders inactive backdrops without the blur).
+        // The custom titlebar already draws its own caption, so suppressing the
+        // inactive non-client appearance has no visible downside here.
+        c.WM_NCACTIVATE => {
+            if (getApp(hwnd)) |app| {
+                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.config.window.blur) {
+                    return c.DefWindowProcW(hwnd, msg, 1, lParam);
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
+
         // DWM custom titlebar: restore the drop shadow on activation. The
         // mechanism depends on how the window is composited:
         //   - blur on  -> acrylic system backdrop (sheet-of-glass frame). DWM

@@ -1381,6 +1381,16 @@ pub export fn ExternalWndProc(
     lParam: c.LPARAM,
 ) callconv(.winapi) c.LRESULT {
     switch (msg) {
+        // Keep the acrylic backdrop blurred when the window is inactive by
+        // forcing DWM to treat it as active (matches the main window).
+        c.WM_NCACTIVATE => {
+            if (app_mod.getApp(hwnd)) |app| {
+                if (app.config.window.blur) {
+                    return c.DefWindowProcW(hwnd, msg, 1, lParam);
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         c.WM_PAINT => {
             if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_PAINT hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
