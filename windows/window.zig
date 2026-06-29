@@ -4900,38 +4900,37 @@ pub export fn WndProc(
             return 0;
         },
 
-        // Experiment: when the acrylic backdrop is in use, force DWM to keep
-        // treating the window as active so the backdrop stays blurred after
-        // focus is lost (Win11 renders inactive backdrops without the blur).
-        // The custom titlebar already draws its own caption, so suppressing the
-        // inactive non-client appearance has no visible downside here.
+        // When the acrylic backdrop is in use, force DWM to keep treating the
+        // window as active so the backdrop stays blurred after focus is lost
+        // (Win11 renders inactive backdrops without the blur). Gated on blur
+        // alone so it matches the backdrop application and the external windows.
         c.WM_NCACTIVATE => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.config.window.blur) {
+                if (app.config.window.blur) {
                     return c.DefWindowProcW(hwnd, msg, 1, lParam);
                 }
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
-        // DWM custom titlebar: restore the drop shadow on activation. The
-        // mechanism depends on how the window is composited:
-        //   - blur on  -> acrylic system backdrop (sheet-of-glass frame). DWM
+        // Restore the drop shadow / backdrop on activation. Modes:
+        //   - blur on  -> acrylic system backdrop (sheet-of-glass frame); DWM
         //     draws the shadow and the frosted blur shows through translucent
-        //     content. This is the only mode where transparency + shadow coexist.
-        //   - opaque    -> the classic 1px frame-extend shadow trick.
+        //     content. Applied in every tabline mode so it matches the core's
+        //     blur flag and the external windows (the backdrop works on a
+        //     standard-framed window too, as the external floats demonstrate).
+        //   - opaque + custom titlebar -> the classic 1px frame-extend shadow
+        //     trick to restore the shadow the borderless custom frame loses.
         //   - translucent, no blur -> no frame extend: a real frame backdrop
         //     would defeat per-pixel alpha and make the window opaque, so this
         //     mode renders transparent without a shadow.
         c.WM_ACTIVATE => {
             if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
-                    if (app.config.window.blur) {
-                        applyWindowBackdrop(hwnd);
-                    } else if (app.config.window.opacity >= 1.0) {
-                        const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
-                        _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
-                    }
+                if (app.config.window.blur) {
+                    applyWindowBackdrop(hwnd);
+                } else if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.config.window.opacity >= 1.0) {
+                    const margins = c.MARGINS{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 1 };
+                    _ = c.DwmExtendFrameIntoClientArea(hwnd, &margins);
                 }
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
