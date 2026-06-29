@@ -155,7 +155,14 @@ const shadertoy_epilogue =
     \\    vec2 fragCoord = iWindowOffset + vUV * iWindowSize;
     \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     \\    mainImage(color, fragCoord);
+    \\#ifdef ZONVIE_PRESERVE_ALPHA
+    \\    // Preserve the terminal's alpha (window transparency/blur shows through
+    \\    // the shader). Opt-in via [shaders] preserve_alpha; on decorated
+    \\    // surfaces whose backTex alpha is 0 the shader becomes invisible.
+    \\    zonvie_fragColor = vec4(color.rgb, texture(zonvie_iChannel0Tex, vUV).a);
+    \\#else
     \\    zonvie_fragColor = vec4(color.rgb, 1.0);
+    \\#endif
     \\}
     \\
 ;
