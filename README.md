@@ -221,6 +221,7 @@ close_to_tray = false    # close button hides to the notification area instead o
 [shaders]
 enabled = false
 post_process = "after_bloom"  # only "after_bloom" is implemented today
+preserve_alpha = false  # true = keep window transparency/blur showing through the shader
 # Drop-in compatible with Shadertoy / Ghostty GLSL shaders. Multiple
 # entries form a chain: each shader's output feeds the next; the
 # final pass writes to the swapchain. Paths MUST be absolute — they
@@ -352,6 +353,7 @@ Message routing rules are processed in order; first match wins.
 |-----|-------------|
 | `enabled` | Enable user-supplied custom GLSL post-process shaders (true/false) |
 | `post_process` | Where the chain runs: `"after_bloom"` (only implemented mode); `"before_bloom"` / `"replace_bloom"` are accepted but warn + fall back to `after_bloom` |
+| `preserve_alpha` | Keep the terminal's alpha through the shader so window transparency/blur shows through it (true/false, default false). Default false forces opaque output (matching Ghostty). Best for passthrough/tint shaders (CRT, scanline); additive/emissive shaders may over-brighten in transparent regions. |
 | `paths` | Array of GLSL file paths. **Absolute paths only** — entries are opened verbatim, so launches from Finder / Explorer break with relative paths. Multiple entries form a chain: each pass's output feeds the next; the final pass writes to the swapchain. Drop-in compatible with Shadertoy / Ghostty shader source. |
 
 Supported uniforms (Shadertoy + Ghostty 1.1+):

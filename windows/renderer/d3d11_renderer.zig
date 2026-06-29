@@ -3356,7 +3356,7 @@ pub const Renderer = struct {
         const src_for_compile: []const u8 = if (want_define) blk: {
             const prefix = "#define ZONVIE_PRESERVE_ALPHA 1\n";
             const buf = self.alloc.alloc(u8, prefix.len + glsl.len) catch
-                return CustomShaderCompileError.FileReadFailed;
+                return CustomShaderCompileError.OutOfMemory;
             @memcpy(buf[0..prefix.len], prefix);
             @memcpy(buf[prefix.len..], glsl);
             combined = buf;
