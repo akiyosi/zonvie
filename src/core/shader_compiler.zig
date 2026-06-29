@@ -143,19 +143,28 @@ const shadertoy_epilogue =
     \\// fragment on the main window's drawable — so the same shader
     \\// universe shows through every view.
     \\//
-    \\// Decorated surfaces (ext-cmdline, popupmenu, msg windows) paint
-    \\// their backTex with a pre-multiplied alpha of 0 so that the
-    \\// system blur shows through underneath. Shadertoy shaders that
-    \\// preserve `terminalColor.a` (starfield, negative, …) would then
-    \\// produce an output alpha of 0 too and the shader becomes
-    \\// invisible. Force the final alpha to 1 so the shader wins — if
-    \\// you want blur you disable the custom shader, not the other way
-    \\// around.
+    \\// By DEFAULT the final alpha is forced to 1 (the #else branch below).
+    \\// Decorated surfaces (ext-cmdline, popupmenu, msg windows) paint their
+    \\// backTex with a pre-multiplied alpha of 0 so the system blur shows
+    \\// through underneath; a shader preserving that alpha would vanish there,
+    \\// so forcing alpha=1 makes the shader always win. Opt in to
+    \\// [shaders] preserve_alpha (the #ifdef branch) to instead keep the
+    \\// terminal's alpha so window transparency/blur shows through the shader.
     \\void main() {
     \\    vec2 fragCoord = iWindowOffset + vUV * iWindowSize;
     \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     \\    mainImage(color, fragCoord);
+    \\#ifdef ZONVIE_PRESERVE_ALPHA
+    \\    // Preserve the terminal's alpha so window transparency/blur shows
+    \\    // through the shader. backTex is premultiplied, so this matches the
+    \\    // non-shader copy path for passthrough/tint shaders. Caveats: alpha is
+    \\    // sampled at the unwarped vUV, so warped (CRT) shaders can mismatch at
+    \\    // the edge; where backTex alpha is 0 (decorated surfaces) shaders whose
+    \\    // rgb tracks alpha vanish, while additive/emissive output still leaks.
+    \\    zonvie_fragColor = vec4(color.rgb, texture(zonvie_iChannel0Tex, vUV).a);
+    \\#else
     \\    zonvie_fragColor = vec4(color.rgb, 1.0);
+    \\#endif
     \\}
     \\
 ;

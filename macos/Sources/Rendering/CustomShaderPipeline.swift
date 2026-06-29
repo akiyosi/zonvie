@@ -58,7 +58,8 @@ final class CustomShaderPipeline {
         vsCustomPost: MTLFunction,
         copyVertexDescriptor: MTLVertexDescriptor,
         sourcePath: String,
-        pixelFormat: MTLPixelFormat
+        pixelFormat: MTLPixelFormat,
+        preserveAlpha: Bool = false
     ) -> CustomShaderPipeline? {
         let glslSource: String
         do {
@@ -72,7 +73,15 @@ final class CustomShaderPipeline {
             return nil
         }
 
-        guard let mslSource = compileGlslToMsl(glsl: glslSource, label: sourcePath) else {
+        // Opt-in alpha preservation: define a macro the core's Shadertoy bridge
+        // (#ifdef ZONVIE_PRESERVE_ALPHA) reads to keep the terminal's alpha.
+        // Only for Shadertoy-style sources (the bridge is appended only then);
+        // raw shaders manage their own output and require #version first.
+        var sourceForCompile = glslSource
+        if preserveAlpha && glslSource.contains("mainImage") {
+            sourceForCompile = "#define ZONVIE_PRESERVE_ALPHA 1\n" + glslSource
+        }
+        guard let mslSource = compileGlslToMsl(glsl: sourceForCompile, label: sourcePath) else {
             return nil
         }
 

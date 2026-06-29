@@ -1558,6 +1558,7 @@ pub const zonvie_config_values = extern struct {
     // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
     shader_enabled: bool = false,
     shader_post_process: u8 = 0, // 0=after_bloom, 1=before_bloom, 2=replace_bloom
+    shader_preserve_alpha: bool = false, // keep terminal alpha through the shader bridge
     // input
     input_swap_colon_semicolon: bool = false, // swap `:` and `;` on single keypresses
     // server (single-instance file open). single_instance is Windows-only and
@@ -1674,6 +1675,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         // shaders
         .shader_enabled = cfg.shaders.enabled,
         .shader_post_process = @intFromEnum(cfg.shaders.post_process),
+        .shader_preserve_alpha = cfg.shaders.preserve_alpha,
         // input
         .input_swap_colon_semicolon = cfg.input.swap_colon_semicolon,
         // server

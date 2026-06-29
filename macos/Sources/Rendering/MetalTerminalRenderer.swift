@@ -3126,7 +3126,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 vsCustomPost: vsCustomPost,
                 copyVertexDescriptor: copyVertexDesc,
                 sourcePath: expanded,
-                pixelFormat: pixelFormat
+                pixelFormat: pixelFormat,
+                preserveAlpha: config.preserveAlpha
             ) {
                 customShaderPipelines.append(pipeline)
                 if pipeline.needsAnimation {

@@ -3223,7 +3223,7 @@ pub const Renderer = struct {
         self.ensureVsCustomPost(dev);
 
         for (cfg.shaders.paths) |path| {
-            const pipeline = self.compileCustomShader(dev, path) catch |e| {
+            const pipeline = self.compileCustomShader(dev, path, cfg.shaders.preserve_alpha) catch |e| {
                 applog.appLog("[CustomShader] skipped {s}: {any}\n", .{ path, e });
                 continue;
             };
@@ -3332,6 +3332,7 @@ pub const Renderer = struct {
         self: *Renderer,
         dev: *c.ID3D11Device,
         source_path: []const u8,
+        preserve_alpha: bool,
     ) CustomShaderCompileError!CustomShaderPipeline {
         const file = std.Io.Dir.cwd().openFile(core.clock.io(), source_path, .{}) catch |e| {
             applog.appLog("[CustomShader] open failed {s}: {any}\n", .{ source_path, e });
@@ -3346,9 +3347,25 @@ pub const Renderer = struct {
         defer self.alloc.free(glsl);
         if (glsl.len == 0) return CustomShaderCompileError.EmptySource;
 
+        // Opt-in alpha preservation: define a macro the core's Shadertoy bridge
+        // (#ifdef ZONVIE_PRESERVE_ALPHA) reads to keep the terminal's alpha.
+        // Only for Shadertoy-style sources; raw shaders require #version first.
+        const want_define = preserve_alpha and std.mem.indexOf(u8, glsl, "mainImage") != null;
+        var combined: ?[]u8 = null;
+        defer if (combined) |cb| self.alloc.free(cb);
+        const src_for_compile: []const u8 = if (want_define) blk: {
+            const prefix = "#define ZONVIE_PRESERVE_ALPHA 1\n";
+            const buf = self.alloc.alloc(u8, prefix.len + glsl.len) catch
+                return CustomShaderCompileError.OutOfMemory;
+            @memcpy(buf[0..prefix.len], prefix);
+            @memcpy(buf[prefix.len..], glsl);
+            combined = buf;
+            break :blk buf;
+        } else glsl;
+
         var result = core.zonvie_shader_compile_glsl(
-            @ptrCast(glsl.ptr),
-            glsl.len,
+            @ptrCast(src_for_compile.ptr),
+            src_for_compile.len,
             .hlsl,
         );
         defer core.zonvie_shader_result_destroy(&result);

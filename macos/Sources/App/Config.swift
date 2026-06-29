@@ -183,6 +183,9 @@ struct ZonvieConfig {
         var paths: [String] = []
         /// Where the custom shader chain inserts relative to bloom.
         var postProcess: ShaderPostProcess = .afterBloom
+        /// Preserve terminal alpha through the shader bridge (transparency/blur
+        /// shows through a custom shader). Default false = shader-opaque.
+        var preserveAlpha: Bool = false
     }
 
     struct InputConfig {
@@ -312,6 +315,7 @@ struct ZonvieConfig {
         // Shaders
         config.shaders.enabled = v.shader_enabled
         config.shaders.postProcess = ShaderPostProcess(rawValue: v.shader_post_process) ?? .afterBloom
+        config.shaders.preserveAlpha = v.shader_preserve_alpha
         let shaderCount = zonvie_config_get_shader_count(handle)
         if shaderCount > 0 {
             config.shaders.paths.reserveCapacity(Int(shaderCount))

@@ -324,6 +324,10 @@ pub const Config = struct {
         paths: []const []const u8 = &.{},
         /// Where the custom shader chain inserts relative to bloom.
         post_process: ShaderPostProcess = .after_bloom,
+        /// Preserve the terminal's alpha through the shadertoy bridge instead of
+        /// forcing output alpha to 1. Lets window transparency/blur show through
+        /// a custom shader (default false = shader-opaque, matching Ghostty).
+        preserve_alpha: bool = false,
     };
 
     pub const ServerConfig = struct {
@@ -574,6 +578,7 @@ pub const Config = struct {
 
         if (cfg.shaders) |s| {
             if (s.enabled) |e| self.shaders.enabled = e;
+            if (s.preserve_alpha) |pa| self.shaders.preserve_alpha = pa;
             if (s.post_process) |pp| {
                 if (ShaderPostProcess.fromString(pp)) |v| {
                     // Only `after_bloom` is currently wired up in the
@@ -923,6 +928,7 @@ const TomlShaders = struct {
     enabled: ?bool = null,
     paths: ?[]const []const u8 = null,
     post_process: ?[]const u8 = null,
+    preserve_alpha: ?bool = null,
 };
 
 const TomlInput = struct {

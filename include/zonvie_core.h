@@ -1336,6 +1336,7 @@ typedef struct zonvie_config_values {
     // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
     bool shader_enabled;
     uint8_t shader_post_process;  // 0=after_bloom, 1=before_bloom, 2=replace_bloom
+    bool shader_preserve_alpha;   // keep terminal alpha through the shader bridge
     // input
     bool input_swap_colon_semicolon;  // swap `:` and `;` on single keypresses
     // server (single-instance file open). single_instance is Windows-only and
