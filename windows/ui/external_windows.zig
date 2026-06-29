@@ -913,6 +913,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return;
     }
 
+    // Apply the same acrylic backdrop as the main window so external float
+    // windows and ext-cmdline/popupmenu/msg overlays get the frosted blur +
+    // shadow (the backdrop is per-HWND on Windows).
+    if (app.config.window.blur) {
+        window_mod.applyWindowBackdrop(hwnd);
+    }
+
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
