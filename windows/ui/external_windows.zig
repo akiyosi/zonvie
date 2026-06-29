@@ -913,6 +913,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return;
     }
 
+    // Apply the same acrylic backdrop as the main window so external float
+    // windows and ext-cmdline/popupmenu/msg overlays get the frosted blur +
+    // shadow (the backdrop is per-HWND on Windows).
+    if (app.config.window.blur) {
+        window_mod.applyWindowBackdrop(hwnd);
+    }
+
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
@@ -1374,6 +1381,16 @@ pub export fn ExternalWndProc(
     lParam: c.LPARAM,
 ) callconv(.winapi) c.LRESULT {
     switch (msg) {
+        // Keep the acrylic backdrop blurred when the window is inactive by
+        // forcing DWM to treat it as active (matches the main window).
+        c.WM_NCACTIVATE => {
+            if (app_mod.getApp(hwnd)) |app| {
+                if (app.config.window.blur) {
+                    return c.DefWindowProcW(hwnd, msg, 1, lParam);
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         c.WM_PAINT => {
             if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_PAINT hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
