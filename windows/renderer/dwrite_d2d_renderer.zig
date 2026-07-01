@@ -66,6 +66,11 @@ pub const Renderer = struct {
     font_em_size: f32 = 14.0,
     emoji_font_size: f32 = 0, // scaled em size for Segoe UI Emoji (0 = not yet computed)
     base_point_size: f32 = 14.0, // original point size before DPI scaling
+    // Base font weight/slant chosen via the font picker (`:set guifont=*`).
+    // Normally regular; a picked Bold/Italic face sets these so the base font
+    // renders in that style (bold/italic *runs* still come from style_flags).
+    base_bold: bool = false,
+    base_italic: bool = false,
     dpi: u32 = 96,
     ascent_px: f32 = 0.0,
     descent_px: f32 = 0.0,
@@ -2402,10 +2407,20 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     }
 
     pub fn setFontUtf8WithFeatures(self: *Renderer, name_utf8: []const u8, point_size: f32, features_str: []const u8) !void {
+        return self.setFontUtf8WithStyle(name_utf8, point_size, features_str, false, false);
+    }
+
+    /// Like setFontUtf8WithFeatures but with an explicit base weight/slant, used
+    /// when the user picks a Bold/Italic face in the font panel. bold/italic
+    /// map to DWrite weight/style for the base font face and text format.
+    pub fn setFontUtf8WithStyle(self: *Renderer, name_utf8: []const u8, point_size: f32, features_str: []const u8, bold: bool, italic: bool) !void {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
 
         if (self.dwrite_factory == null) return error.NotInitialized;
+
+        const dw_weight: c.DWRITE_FONT_WEIGHT = if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL;
+        const dw_style: c.DWRITE_FONT_STYLE = if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL;
 
         // DPI scaling: scale point size to physical pixels
         const dpi_scale: f32 = @as(f32, @floatFromInt(self.dpi)) / 96.0;
@@ -2415,6 +2430,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         if (self.font_face != null and
             self.base_point_size == point_size and
             self.font_em_size == scaled_size and
+            self.base_bold == bold and self.base_italic == italic and
             features_str.len == 0 and self.font_feature_count == 0 and
             self.font_name_utf8_len == @as(u32, @intCast(name_utf8.len)) and
             std.mem.eql(u8, self.font_name_utf8[0..self.font_name_utf8_len], name_utf8))
@@ -2443,8 +2459,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
             factory,
             @ptrCast(name_w.ptr),
             null,
-            c.DWRITE_FONT_WEIGHT_NORMAL,
-            c.DWRITE_FONT_STYLE_NORMAL,
+            dw_weight,
+            dw_style,
             c.DWRITE_FONT_STRETCH_NORMAL,
             scaled_size,
             @ptrCast(L("en-us")),
@@ -2483,9 +2499,9 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
     
         const hr_font = get_first_fn(
             family.?,
-            c.DWRITE_FONT_WEIGHT_NORMAL,
+            dw_weight,
             c.DWRITE_FONT_STRETCH_NORMAL,
-            c.DWRITE_FONT_STYLE_NORMAL,
+            dw_style,
             &font,
         );
         if (c.FAILED(hr_font) or font == null) return error.DWriteGetFontFailed;
@@ -2533,6 +2549,8 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         self.font_em_size = scaled_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
         self.base_point_size = point_size;
+        self.base_bold = bold;
+        self.base_italic = italic;
         self.ascent_px = new_ascent_px;
         self.descent_px = new_descent_px;
 

@@ -375,6 +375,111 @@ fn handleThemeReread() void {
     _ = c.EnumThreadWindows(c.GetCurrentThreadId(), enumApplyThemeProc, 0);
 }
 
+// UI-thread handler for WM_APP_OPEN_FONT_PICKER (posted from onGuiFont when
+// nvim sends `:set guifont=*`). Opens the modal ChooseFontW dialog and, on
+// confirm, writes the chosen font back to nvim's `guifont` as "Family:hN".
+// The concrete value returns through the normal option_set -> onGuiFont path
+// which applies it (writing "*" would loop; we never write "*").
+fn openFontPicker(hwnd: c.HWND, app: *App) void {
+    var lf: c.LOGFONTW = std.mem.zeroes(c.LOGFONTW);
+    lf.lfCharSet = c.DEFAULT_CHARSET;
+
+    // Seed the dialog with the currently rendered font. Copy under app.mu;
+    // never hold the lock across the modal dialog (it would stall rendering).
+    var seed_pt: f32 = 14.0;
+    {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        if (app.atlas) |*a| {
+            seed_pt = a.base_point_size;
+            // Seed the current weight/slant so re-opening the dialog reflects a
+            // previously-picked Bold/Italic. FW_BOLD == 700, FW_NORMAL == 400.
+            lf.lfWeight = if (a.base_bold) 700 else 400;
+            lf.lfItalic = if (a.base_italic) 1 else 0;
+            var i: usize = 0;
+            while (i < 31 and i < a.font_name.len and a.font_name[i] != 0) : (i += 1) {
+                lf.lfFaceName[i] = a.font_name[i];
+            }
+        }
+    }
+
+    const hdc = c.GetDC(hwnd);
+    const dpi_y: i32 = if (hdc != null) c.GetDeviceCaps(hdc, c.LOGPIXELSY) else 96;
+    if (hdc != null) _ = c.ReleaseDC(hwnd, hdc);
+    const pt_int: i32 = @intFromFloat(@round(seed_pt));
+    lf.lfHeight = -@divTrunc(pt_int * dpi_y, 72);
+
+    var cf: c.CHOOSEFONTW = std.mem.zeroes(c.CHOOSEFONTW);
+    cf.lStructSize = @sizeOf(c.CHOOSEFONTW);
+    cf.hwndOwner = hwnd;
+    cf.lpLogFont = &lf;
+    cf.Flags = c.CF_SCREENFONTS | c.CF_FORCEFONTEXIST | c.CF_INITTOLOGFONTSTRUCT;
+
+    if (c.ChooseFontW(&cf) == 0) return; // cancelled or error
+
+    const pt: i32 = @max(1, @divTrunc(cf.iPointSize, 10));
+
+    var face_len: usize = 0;
+    while (face_len < lf.lfFaceName.len and lf.lfFaceName[face_len] != 0) : (face_len += 1) {}
+    var name_buf: [256]u8 = undefined;
+    const name_len = std.unicode.utf16LeToUtf8(&name_buf, lf.lfFaceName[0..face_len]) catch return;
+
+    var val_buf: [320]u8 = undefined;
+    const val = std.fmt.bufPrint(&val_buf, "{s}:h{d}", .{ name_buf[0..name_len], pt }) catch return;
+
+    if (app.corep) |corep| {
+        // Capture the picked weight/slant so onGuiFont applies it as the base
+        // font (guifont carries only family+size). FW_SEMIBOLD == 600.
+        app.picked_font_bold.store(lf.lfWeight >= 600, .release);
+        app.picked_font_italic.store(lf.lfItalic != 0, .release);
+        // Mark the resulting guifont broadcast as an explicit user choice so it
+        // overrides config.toml [font] precedence in onGuiFont.
+        app.font_picker_selection_pending.store(true, .release);
+        const opt = "guifont";
+        core.zonvie_core_set_option_value(corep, opt.ptr, opt.len, val.ptr, val.len);
+    }
+}
+
+// Rewrite nvim's `guifont` to the font currently rendered, so it is never left
+// as the literal "*". Without this a `:set guifont=*` that doesn't change the
+// value (guifont already "*") sends no option_set, so the picker can never be
+// re-triggered; a leftover "*" on a reused nvim would also re-pop or get stuck.
+// Picking a font in the dialog overwrites this value.
+fn resetGuifontToCurrent(app: *App) void {
+    var name_buf: [256]u8 = undefined;
+    var name_len: usize = 0;
+    var pt: i32 = 14;
+    var cur_bold = false;
+    var cur_italic = false;
+    {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        if (app.atlas) |*a| {
+            pt = @intFromFloat(@round(a.base_point_size));
+            cur_bold = a.base_bold;
+            cur_italic = a.base_italic;
+            var u16_len: usize = 0;
+            while (u16_len < a.font_name.len and a.font_name[u16_len] != 0) : (u16_len += 1) {}
+            name_len = std.unicode.utf16LeToUtf8(&name_buf, a.font_name[0..u16_len]) catch 0;
+        }
+    }
+    if (name_len == 0) return;
+    if (pt < 1) pt = 1;
+    var val_buf: [320]u8 = undefined;
+    const val = std.fmt.bufPrint(&val_buf, "{s}:h{d}", .{ name_buf[0..name_len], pt }) catch return;
+    if (app.corep) |corep| {
+        // guifont carries only family+size, so preserve the current base
+        // weight/slant across this rewrite the same way a pick does: stash it
+        // and mark the resulting broadcast as a picker selection. Otherwise the
+        // round-trip would reset a previously-picked Bold/Italic to regular.
+        app.picked_font_bold.store(cur_bold, .release);
+        app.picked_font_italic.store(cur_italic, .release);
+        app.font_picker_selection_pending.store(true, .release);
+        const opt = "guifont";
+        core.zonvie_core_set_option_value(corep, opt.ptr, opt.len, val.ptr, val.len);
+    }
+}
+
 // WM_THEMECHANGED dispatch helper. WM_THEMECHANGED is a documented Win32
 // message, but the documentation only covers theme enable/disable and
 // classic-vs-themed transitions — it does NOT contract to fire on a pure
@@ -448,6 +553,7 @@ const WM_APP_SWP_FRAMECHANGED = app_mod.WM_APP_SWP_FRAMECHANGED;
 const WM_APP_POST_SHOW_INIT = app_mod.WM_APP_POST_SHOW_INIT;
 const WM_APP_SNAP_MAIN_WINDOW = app_mod.WM_APP_SNAP_MAIN_WINDOW;
 const WM_APP_THEME_REREAD = app_mod.WM_APP_THEME_REREAD;
+const WM_APP_OPEN_FONT_PICKER = app_mod.WM_APP_OPEN_FONT_PICKER;
 
 // System-menu command id for the "About zonvie" item. Must be < 0xF000 and
 // is matched via (wParam & 0xFFF0) in WM_SYSCOMMAND (the OS reserves the low
@@ -2403,6 +2509,21 @@ pub export fn WndProc(
             // AppsUseLightTheme changes. Re-apply to every caption-bearing
             // top-level window on this thread in one pass.
             handleThemeReread();
+            return 0;
+        },
+
+        WM_APP_OPEN_FONT_PICKER => {
+            // Posted from onGuiFont on `:set guifont=*`. Always clear the "*"
+            // by writing the current font back (so guifont is never left as
+            // "*"); open the dialog only if the first frame was already shown
+            // (wParam == 1), i.e. this is an interactive request, not nvim's
+            // initial attach broadcast.
+            if (getApp(hwnd)) |app| {
+                resetGuifontToCurrent(app);
+                if (wParam == 1) {
+                    openFontPicker(hwnd, app);
+                }
+            }
             return 0;
         },
 

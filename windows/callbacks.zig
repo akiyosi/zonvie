@@ -1969,6 +1969,29 @@ pub fn onLog(ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) voi
 pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
+    // `:set guifont=*` is a picker request: defer to the UI thread to open the
+    // native ChooseFontW dialog instead of applying a font. This callback runs
+    // on the core thread (app.mu held by the caller chain); ChooseFontW is
+    // modal and must run on the UI thread, so post and return. The chosen font
+    // is written back to nvim as a concrete "Family:hN", which returns here as
+    // a normal payload and applies through the path below.
+    if (bytes) |b| {
+        if (len == 1 and b[0] == '*') {
+            // Defer to the UI thread. wParam carries whether the first frame
+            // has been shown: only then do we pop the dialog (so nvim's initial
+            // guifont broadcast at attach, which may already be "*", does not
+            // open it at startup). The handler always rewrites guifont back to
+            // the current font so it is never left as "*" (a repeated
+            // `:set guifont=*` would otherwise be a no-op, and a leftover "*"
+            // on a reused nvim would re-pop / get stuck).
+            const shown: c.WPARAM = if (app.window_shown.load(.acquire)) 1 else 0;
+            if (app.hwnd) |hwnd| {
+                _ = c.PostMessageW(hwnd, app_mod.WM_APP_OPEN_FONT_PICKER, shown, 0);
+            }
+            return;
+        }
+    }
+
     // Font priority:
     //   1. config.font.family/size when explicitly set in config.toml
     //   2. guifont payload from nvim
@@ -2019,7 +2042,19 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         // list (parsed from the raw guifont-syntax string in
         // app.config.font.family). Same fallback rule as the nvim
         // payload path below.
-        const skip_guifont = family_explicit;
+        //
+        // Exception: a font the user just picked in ChooseFontW arrives as a
+        // guifont broadcast and must override config precedence. Consume the
+        // one-shot flag so that pick applies.
+        const picker_selection = app.font_picker_selection_pending.swap(false, .acq_rel);
+        const skip_guifont = family_explicit and !picker_selection;
+        // A picked font overrides both family and size precedence, so its size
+        // is honored even when config.toml [font] size is explicit.
+        const eff_size_explicit = size_explicit and !picker_selection;
+        // Base weight/slant for the picked font (regular unless the user picked
+        // a Bold/Italic face). Only meaningful for the picker payload branch.
+        const pick_bold = picker_selection and app.picked_font_bold.load(.acquire);
+        const pick_italic = picker_selection and app.picked_font_italic.load(.acquire);
         if (skip_guifont) {
             const aa = arena.allocator();
             const cands = core.config.splitFontFamilyList(aa, app.config.font.family) catch &.{};
@@ -2063,10 +2098,10 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
                         const size_str = after_name[0..tab2];
                         cand_features = after_name[tab2 + 1 ..];
                         const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
-                        cand_pt = if (size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
+                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
                     } else {
                         const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
-                        cand_pt = if (size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
+                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
                     }
                 } else {
                     continue; // no tab => skip invalid entry
@@ -2074,8 +2109,9 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
                 if (cand_name.len == 0) continue;
 
-                // Try loading this candidate
-                const try_result = a.setFontUtf8WithFeatures(cand_name, cand_pt, cand_features);
+                // Try loading this candidate (with the picked weight/slant when
+                // this payload came from the font picker).
+                const try_result = a.setFontUtf8WithStyle(cand_name, cand_pt, cand_features, pick_bold, pick_italic);
                 if (try_result) |_| {
                     applied_name = cand_name;
                     applied_pt = cand_pt;

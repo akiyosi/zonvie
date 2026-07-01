@@ -26,6 +26,9 @@ final class ZonvieCore {
     private var progressWindow: NSWindow?
     private var isDevcontainerMode: Bool = false
 
+    // Native font picker controller (`:set guifont=*`), created on first use.
+    private var fontPicker: FontPickerController?
+
     // Wire this from ViewController.
     weak var terminalView: MetalTerminalView? {
         didSet {
@@ -73,6 +76,11 @@ final class ZonvieCore {
     private let pendingGuiFontLock = NSLock()
     private var firstPresentDone: Bool = false
     private var pendingGuiFontPayload: (name: String, size: Double, features: String)?
+    // Set when the user picks a font in the panel: the next guifont broadcast
+    // is that explicit choice and must override config.toml [font] precedence
+    // (which otherwise ignores the nvim payload). Consumed once. Guarded by
+    // pendingGuiFontLock.
+    private var fontPickerSelectionPending = false
 
     // Notification posted when Neovim is ready (first vertices received)
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
@@ -1742,6 +1750,66 @@ final class ZonvieCore {
 
     /// Send a command to Neovim via nvim_command RPC (does not show in cmdline).
     /// Prefer this over sendInput for commands that should not appear in the command line.
+    /// Set a global Neovim option (via nvim_set_option_value). Used to write
+    /// the font chosen in the picker back to `guifont`.
+    func setOptionValue(_ name: String, _ value: String) {
+        guard let core else {
+            ZonvieCore.appLog("[setOptionValue] core is nil")
+            return
+        }
+        let nameData = name.data(using: .utf8) ?? Data()
+        let valueData = value.data(using: .utf8) ?? Data()
+        nameData.withUnsafeBytes { nraw in
+            valueData.withUnsafeBytes { vraw in
+                guard let nbase = nraw.bindMemory(to: UInt8.self).baseAddress,
+                      let vbase = vraw.bindMemory(to: UInt8.self).baseAddress else { return }
+                zonvie_core_set_option_value(core, nbase, nameData.count, vbase, valueData.count)
+            }
+        }
+    }
+
+    /// Open the native font panel in response to `:set guifont=*`. Seeds the
+    /// selection with the font currently rendered. Must run on the main thread.
+    private func openFontPicker() {
+        let current: NSFont
+        if let view = terminalView {
+            let atlas = view.renderer.glyphAtlas
+            current = NSFont(name: atlas.currentFontName, size: atlas.currentPointSize)
+                ?? NSFont.userFixedPitchFont(ofSize: atlas.currentPointSize)
+                ?? NSFont.systemFont(ofSize: atlas.currentPointSize)
+        } else {
+            current = NSFont.userFixedPitchFont(ofSize: 14) ?? NSFont.systemFont(ofSize: 14)
+        }
+        if fontPicker == nil { fontPicker = FontPickerController(core: self) }
+        fontPicker?.show(currentFont: current)
+    }
+
+    /// Rewrite nvim's `guifont` to the font currently rendered, so it is never
+    /// left as the literal "*". Without this, a `:set guifont=*` that doesn't
+    /// change the value (because guifont is already "*") sends no option_set,
+    /// so the picker can never be re-triggered, and `:set guifont?` shows "*".
+    /// Called whenever "*" is observed (picker request); picking a font later
+    /// overwrites this value.
+    private func resetGuifontToCurrent() {
+        guard let view = terminalView else { return }
+        let atlas = view.renderer.glyphAtlas
+        let name = atlas.currentFontName
+        guard !name.isEmpty else { return }
+        let size = Int(atlas.currentPointSize.rounded())
+        setOptionValue("guifont", "\(name):h\(size)")
+    }
+
+    /// Set guifont to a font the user explicitly chose in the panel. Marks the
+    /// selection pending so the resulting guifont broadcast overrides config
+    /// precedence, then writes it back to nvim (so it applies and `:set
+    /// guifont?` reflects it).
+    func setGuifontFromPicker(name: String, pointSize: Int) {
+        pendingGuiFontLock.lock()
+        fontPickerSelectionPending = true
+        pendingGuiFontLock.unlock()
+        setOptionValue("guifont", "\(name):h\(pointSize)")
+    }
+
     func sendCommand(_ cmd: String) {
         guard let core else {
             ZonvieCore.appLog("[sendCommand] core is nil")
@@ -2570,6 +2638,31 @@ final class ZonvieCore {
         let data = Data(bytes: bytes, count: max(0, len))
         guard let s = String(data: data, encoding: .utf8) else { return }
 
+        // `:set guifont=*` is a picker request: open the native font panel
+        // instead of applying a font. The chosen font is written back to nvim
+        // as a concrete "Family:hN" (see FontPickerController.changeFont),
+        // which returns here as a normal guifont payload and applies below.
+        // Dispatch to main async: this callback runs on the core thread with
+        // grid_mu held, but opening the panel touches no font state, so the
+        // async hop is safe (unlike async font application).
+        if s == "*" {
+            // Gate the picker on firstPresentDone so nvim's initial guifont
+            // broadcast at attach (which may already be "*") does not pop the
+            // dialog at startup. Either way, always clear the "*" by writing
+            // the current font back to nvim: this unsticks a leftover "*" at
+            // startup and prevents a cancelled picker from leaving guifont="*"
+            // (which would make a repeated `:set guifont=*` a no-op).
+            pendingGuiFontLock.lock()
+            let ready = firstPresentDone
+            pendingGuiFontLock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if ready { self.openFontPicker() }
+                self.resetGuifontToCurrent()
+            }
+            return
+        }
+
         // Font priority:
         //   1. config.font.family/size when explicitly set in config.toml
         //   2. guifont payload from nvim
@@ -2583,9 +2676,18 @@ final class ZonvieCore {
         // out of config.toml.
         let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
-        let familyExplicit = ZonvieConfig.shared.font.familyExplicit
-        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit
         let configCandidates = ZonvieConfig.shared.font.candidates
+
+        // A font the user just chose in the panel must win over config.toml
+        // [font] precedence. Consume the one-shot flag and, when set, treat
+        // this broadcast as a non-explicit payload so the chosen font AND its
+        // size apply (bypass both family and size precedence).
+        pendingGuiFontLock.lock()
+        let pickerSelection = fontPickerSelectionPending
+        fontPickerSelectionPending = false
+        pendingGuiFontLock.unlock()
+        let familyExplicit = ZonvieConfig.shared.font.familyExplicit && !pickerSelection
+        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit && !pickerSelection
 
         // The payload may contain multiple newline-separated candidates
         // (guifont fallback list).  Try each in order; use the first
@@ -7251,6 +7353,53 @@ extension NSColor {
         }
 
         return NSColor(hue: h, saturation: s, brightness: adjustedB, alpha: a)
+    }
+}
+
+// MARK: - Font Picker (`:set guifont=*`)
+
+/// Drives the shared NSFontPanel and writes the chosen font back to nvim's
+/// `guifont`. NSObject so it can be the NSFontManager target/action receiver.
+private final class FontPickerController: NSObject {
+    weak var core: ZonvieCore?
+    private var currentFont: NSFont
+
+    init(core: ZonvieCore) {
+        self.core = core
+        self.currentFont = NSFont.userFixedPitchFont(ofSize: 14) ?? NSFont.systemFont(ofSize: 14)
+        super.init()
+    }
+
+    func show(currentFont: NSFont) {
+        self.currentFont = currentFont
+        let fm = NSFontManager.shared
+        fm.target = self
+        fm.setSelectedFont(currentFont, isMultiple: false)
+        // Bring the app forward so the panel becomes visible even if focus was
+        // elsewhere when nvim broadcast the picker request.
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = fm.fontPanel(true)
+        // The main window may be in native fullscreen (its own Space); without
+        // .fullScreenAuxiliary the panel opens on a different Space and looks
+        // like nothing happened. This lets it float over the fullscreen window.
+        panel?.collectionBehavior.insert(.fullScreenAuxiliary)
+        // macOS restores windows that were open at quit. The shared font panel
+        // would otherwise reappear at the next launch with no `:set guifont=*`
+        // trigger (looks like the dialog opens on its own). Opt it out.
+        panel?.isRestorable = false
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    /// NSFontManager action: fires as the user changes the selection in the
+    /// panel (family, typeface/style, or size), applying it live. Uses the
+    /// PostScript font name so weight/style changes (e.g. Regular -> Bold) are
+    /// captured — familyName alone would drop them and nothing would change.
+    @objc func changeFont(_ sender: NSFontManager?) {
+        let fm = sender ?? NSFontManager.shared
+        let font = fm.convert(currentFont)
+        currentFont = font
+        let size = Int(font.pointSize.rounded())
+        core?.setGuifontFromPicker(name: font.fontName, pointSize: size)
     }
 }
 
