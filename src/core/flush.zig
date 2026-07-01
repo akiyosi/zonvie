@@ -4508,6 +4508,17 @@ pub const FlushCtx = struct {
     }
 
     pub fn onGuifont(ctx: *FlushCtx, font: []const u8) !void {
+        // "*" is a picker request (`:set guifont=*`), not a real font change.
+        // Skip cache/atlas invalidation and dirtying: the frontend only opens
+        // a font dialog and later writes back a concrete "Name:hN" via
+        // nvim_set_option_value, which arrives as a normal guifont option_set
+        // and goes through the full path below. Resetting here would cause a
+        // pointless re-render flash just to show the dialog.
+        if (std.mem.eql(u8, font, "*")) {
+            ctx.core.emitGuiFont(font);
+            return;
+        }
+
         // Invalidate caches BEFORE emitting callback: the callback may
         // trigger vertex generation (e.g., Windows' updateLayoutToCore
         // calls sendExternalGridVertices when cell dimensions change).

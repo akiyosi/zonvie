@@ -159,6 +159,10 @@ pub const WM_APP_SNAP_MAIN_WINDOW: c.UINT = c.WM_APP + 28;
 /// titlebar setting to every caption-bearing top-level window via
 /// EnumThreadWindows.
 pub const WM_APP_THEME_REREAD: c.UINT = c.WM_APP + 29;
+/// Posted from the on_guifont callback when nvim sends `:set guifont=*`.
+/// The UI thread's handler opens the native ChooseFontW dialog (which must
+/// run on the UI thread, not the core thread that fires the callback).
+pub const WM_APP_OPEN_FONT_PICKER: c.UINT = c.WM_APP + 30;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -2979,6 +2983,16 @@ pub const App = struct {
     // Atomic: written by RPC thread (onFlushEnd), read by UI thread
     // (WM_SIZE handler) to gate updateLayoutToCore vs notify_layout_ready.
     window_shown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Atomic: set by the UI thread when the user picks a font in ChooseFontW,
+    // read+cleared by the RPC thread in onGuiFont so that explicit pick wins
+    // over config.toml [font] precedence (which otherwise ignores the payload).
+    font_picker_selection_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Base weight/slant of the picked font (valid while the pending flag above
+    // is set). Written by the UI thread from the ChooseFontW LOGFONT, applied by
+    // onGuiFont so the picked Bold/Italic face becomes the base font.
+    picked_font_bold: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    picked_font_italic: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pending_show_window: bool = false,
 

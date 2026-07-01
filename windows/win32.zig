@@ -8,6 +8,7 @@ pub const c = @cImport({
     @cDefine("COBJMACROS", "1");
 
     @cInclude("windows.h");
+    @cInclude("commdlg.h"); // ChooseFontW font picker (`:set guifont=*`)
     @cInclude("shellapi.h"); // Shell API for tray icon / balloon notification
     @cInclude("dwmapi.h"); // DWM for transparency
     @cInclude("imm.h"); // IME support

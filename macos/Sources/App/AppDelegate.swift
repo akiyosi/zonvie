@@ -49,6 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         NSApp.setActivationPolicy(.regular)
 
+        // macOS state restoration re-opens windows that were visible at quit.
+        // The shared NSFontPanel (font picker for `:set guifont=*`) is one of
+        // them, so it would reappear at startup with no trigger. Close any
+        // restored font panel and opt it out of future restoration. Deferred
+        // so it runs after AppKit's restoration pass.
+        DispatchQueue.main.async {
+            if let panel = NSFontManager.shared.fontPanel(false) {
+                panel.isRestorable = false
+                panel.orderOut(nil)
+            }
+        }
+
         // Setup application menu (includes Tab menu for "menu" tabline style)
         setupApplicationMenu()
 

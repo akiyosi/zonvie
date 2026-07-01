@@ -184,6 +184,9 @@ pub fn build(b: *std.Build) !void {
 
         // --- AlphaBlend (color-emoji tab indicator composite) ---
         win_mod.linkSystemLibrary("msimg32", .{});
+
+        // --- ChooseFontW (`:set guifont=*` font picker) ---
+        win_mod.linkSystemLibrary("comdlg32", .{});
     }
 
     const install_win = b.addInstallArtifact(win_exe, .{
