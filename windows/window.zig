@@ -392,6 +392,10 @@ fn openFontPicker(hwnd: c.HWND, app: *App) void {
         defer app.mu.unlock(core.clock.io());
         if (app.atlas) |*a| {
             seed_pt = a.base_point_size;
+            // Seed the current weight/slant so re-opening the dialog reflects a
+            // previously-picked Bold/Italic. FW_BOLD == 700, FW_NORMAL == 400.
+            lf.lfWeight = if (a.base_bold) 700 else 400;
+            lf.lfItalic = if (a.base_italic) 1 else 0;
             var i: usize = 0;
             while (i < 31 and i < a.font_name.len and a.font_name[i] != 0) : (i += 1) {
                 lf.lfFaceName[i] = a.font_name[i];
@@ -445,11 +449,15 @@ fn resetGuifontToCurrent(app: *App) void {
     var name_buf: [256]u8 = undefined;
     var name_len: usize = 0;
     var pt: i32 = 14;
+    var cur_bold = false;
+    var cur_italic = false;
     {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
         if (app.atlas) |*a| {
             pt = @intFromFloat(@round(a.base_point_size));
+            cur_bold = a.base_bold;
+            cur_italic = a.base_italic;
             var u16_len: usize = 0;
             while (u16_len < a.font_name.len and a.font_name[u16_len] != 0) : (u16_len += 1) {}
             name_len = std.unicode.utf16LeToUtf8(&name_buf, a.font_name[0..u16_len]) catch 0;
@@ -460,6 +468,13 @@ fn resetGuifontToCurrent(app: *App) void {
     var val_buf: [320]u8 = undefined;
     const val = std.fmt.bufPrint(&val_buf, "{s}:h{d}", .{ name_buf[0..name_len], pt }) catch return;
     if (app.corep) |corep| {
+        // guifont carries only family+size, so preserve the current base
+        // weight/slant across this rewrite the same way a pick does: stash it
+        // and mark the resulting broadcast as a picker selection. Otherwise the
+        // round-trip would reset a previously-picked Bold/Italic to regular.
+        app.picked_font_bold.store(cur_bold, .release);
+        app.picked_font_italic.store(cur_italic, .release);
+        app.font_picker_selection_pending.store(true, .release);
         const opt = "guifont";
         core.zonvie_core_set_option_value(corep, opt.ptr, opt.len, val.ptr, val.len);
     }

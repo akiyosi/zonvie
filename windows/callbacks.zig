@@ -2048,6 +2048,9 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
         // one-shot flag so that pick applies.
         const picker_selection = app.font_picker_selection_pending.swap(false, .acq_rel);
         const skip_guifont = family_explicit and !picker_selection;
+        // A picked font overrides both family and size precedence, so its size
+        // is honored even when config.toml [font] size is explicit.
+        const eff_size_explicit = size_explicit and !picker_selection;
         // Base weight/slant for the picked font (regular unless the user picked
         // a Bold/Italic face). Only meaningful for the picker payload branch.
         const pick_bold = picker_selection and app.picked_font_bold.load(.acquire);
@@ -2095,10 +2098,10 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
                         const size_str = after_name[0..tab2];
                         cand_features = after_name[tab2 + 1 ..];
                         const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
-                        cand_pt = if (size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
+                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
                     } else {
                         const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
-                        cand_pt = if (size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
+                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
                     }
                 } else {
                     continue; // no tab => skip invalid entry

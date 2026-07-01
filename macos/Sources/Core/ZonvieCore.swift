@@ -2676,17 +2676,18 @@ final class ZonvieCore {
         // out of config.toml.
         let configFont = ZonvieConfig.shared.font.family.isEmpty ? "Menlo" : ZonvieConfig.shared.font.family
         let configSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
-        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit
         let configCandidates = ZonvieConfig.shared.font.candidates
 
         // A font the user just chose in the panel must win over config.toml
         // [font] precedence. Consume the one-shot flag and, when set, treat
-        // this broadcast as a non-explicit payload so the chosen font applies.
+        // this broadcast as a non-explicit payload so the chosen font AND its
+        // size apply (bypass both family and size precedence).
         pendingGuiFontLock.lock()
         let pickerSelection = fontPickerSelectionPending
         fontPickerSelectionPending = false
         pendingGuiFontLock.unlock()
         let familyExplicit = ZonvieConfig.shared.font.familyExplicit && !pickerSelection
+        let sizeExplicit = ZonvieConfig.shared.font.sizeExplicit && !pickerSelection
 
         // The payload may contain multiple newline-separated candidates
         // (guifont fallback list).  Try each in order; use the first

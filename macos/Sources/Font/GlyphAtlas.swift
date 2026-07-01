@@ -43,10 +43,21 @@ final class GlyphAtlas {
     private var italicFont: CTFont?
     private var boldItalicFont: CTFont?
 
-    /// Current font name (read-only for external use).
-    var currentFontName: String { fontName }
+    /// Current font name (read-only for external use). Locked: `fontName` is
+    /// mutated on the core thread under `mu` by setFont(); these getters are
+    /// read from the main thread (IME preedit, font picker), so an unlocked
+    /// read of the Swift String could tear / corrupt its refcount.
+    var currentFontName: String {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+        return fontName
+    }
     /// Current point size (read-only for external use).
-    var currentPointSize: CGFloat { pointSize }
+    var currentPointSize: CGFloat {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+        return pointSize
+    }
 
     private(set) var ascentPx: Float = 0
     private(set) var descentPx: Float = 0
