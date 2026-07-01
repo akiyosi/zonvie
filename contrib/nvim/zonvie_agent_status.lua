@@ -35,6 +35,7 @@ local STATE_IDLE = 1
 local STATE_WORKING = 3
 
 local last = {} -- tabpage handle -> last reported state (integer)
+local bufstate = {} -- terminal buffer handle -> last working/idle state
 
 local function state_from_title(title)
   if not title or title == "" then return STATE_IDLE end
@@ -64,6 +65,25 @@ local function report(tab, state, title)
   vim.rpcnotify(0, "zonvie_agent_status", { tab = tab, state = state, title = title or "" })
 end
 
+-- The state a tab should show right now, from the terminal buffers currently
+-- displayed in its windows (working wins over idle).
+local function tab_state(tab)
+  local best = STATE_NONE
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    local s = bufstate[vim.api.nvim_win_get_buf(w)]
+    if s and s > best then best = s end
+  end
+  return best
+end
+
+-- Re-derive every tab's indicator from the live window layout, so switching a
+-- window away from the agent terminal drops the tab's stale indicator.
+local function refresh_tabs()
+  for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+    report(t, tab_state(t), nil)
+  end
+end
+
 function M.setup()
   vim.api.nvim_create_autocmd("TermRequest", {
     callback = function(ev)
@@ -74,6 +94,7 @@ function M.setup()
         or seq:match("^\27%]2;(.*)$")
       if not body then return end
       local state = state_from_title(body)
+      bufstate[ev.buf] = state
       for _, tab in ipairs(tabs_for_buf(ev.buf)) do
         report(tab, state, body)
       end
@@ -81,9 +102,17 @@ function M.setup()
   })
   vim.api.nvim_create_autocmd("TermClose", {
     callback = function(ev)
+      bufstate[ev.buf] = nil
       for _, tab in ipairs(tabs_for_buf(ev.buf)) do
         report(tab, STATE_NONE, nil)
       end
+    end,
+  })
+  -- Agent state is latched per buffer but shown per tab, so re-derive a tab's
+  -- indicator whenever its window layout changes.
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinEnter", "WinClosed" }, {
+    callback = function()
+      vim.schedule(refresh_tabs)
     end,
   })
 end

@@ -839,7 +839,7 @@ pub fn setupAgentStatus(self: *Core) void {
     // notification are disabled -- nothing would consume the status updates.
     if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
     const lua_code =
-        \\local present, kind, last = {}, {}, {}
+        \\local present, kind, last, bufstate, buftitle = {}, {}, {}, {}, {}
         \\-- Scrape the terminal tail for a pending decision prompt (permission /
         \\-- yes-no / numbered choice). This is how an agent "waiting for the user"
         \\-- is told apart from "done"; the title alone can't (both look idle).
@@ -891,6 +891,30 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  last[tab] = state
         \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state, title = title or '' })
         \\end
+        \\-- Rank states so a tab with several agent buffers surfaces the most
+        \\-- active one: working (2/3) > waiting (4) > done (1) > none (0).
+        \\local function rank(s) return ({ [2] = 3, [3] = 3, [4] = 2, [1] = 1 })[s] or 0 end
+        \\-- The agent state a tab should show right now, aggregated from the
+        \\-- present terminal buffers currently displayed in its windows.
+        \\local function tab_agent_state(tab)
+        \\  local best, bt = 0, ''
+        \\  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        \\    local b = vim.api.nvim_win_get_buf(w)
+        \\    if present[b] and bufstate[b] and rank(bufstate[b]) > rank(best) then
+        \\      best = bufstate[b]; bt = buftitle[b] or ''
+        \\    end
+        \\  end
+        \\  return best, bt
+        \\end
+        \\-- Re-derive every tab's indicator from the live window layout. Runs on
+        \\-- window/buffer switches so the indicator drops when a tab no longer
+        \\-- shows its agent terminal (e.g. the window switched to a normal buffer).
+        \\local function refresh_tabs()
+        \\  for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+        \\    local s, bt = tab_agent_state(t)
+        \\    report(t, s, bt)
+        \\  end
+        \\end
         \\-- The done-vs-waiting decision is deferred ~0.8s after the spinner stops,
         \\-- so the prompt box has time to render into the buffer before we scrape.
         \\-- pend[buf] is a token that any newer event bumps to cancel a stale decision.
@@ -904,6 +928,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local ok, t = pcall(function() return vim.b[buf].term_title end)
         \\    if ok and spinning(t or '') then return end
         \\    local s = waiting_prompt(buf) and 4 or 1
+        \\    bufstate[buf] = s; buftitle[buf] = title
         \\    for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, s, title) end
         \\  end, 800)
         \\end
@@ -921,6 +946,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      decide_stopped(ev.buf, title)
         \\    else
         \\      pend[ev.buf] = (pend[ev.buf] or 0) + 1
+        \\      bufstate[ev.buf] = s; buftitle[ev.buf] = title
         \\      for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
         \\    end
         \\  end,
@@ -929,9 +955,17 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  group = grp,
         \\  callback = function(ev)
         \\    pend[ev.buf] = (pend[ev.buf] or 0) + 1
-        \\    present[ev.buf] = nil; kind[ev.buf] = nil
+        \\    present[ev.buf] = nil; kind[ev.buf] = nil; bufstate[ev.buf] = nil; buftitle[ev.buf] = nil
         \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
         \\  end,
+        \\})
+        \\-- Agent state is latched per buffer but shown per tab, so a tab's
+        \\-- indicator must be re-derived whenever its window layout changes --
+        \\-- otherwise switching a window away from the agent terminal leaves a
+        \\-- stale indicator on the tab.
+        \\vim.api.nvim_create_autocmd({ 'BufWinEnter', 'BufWinLeave', 'WinEnter', 'WinClosed' }, {
+        \\  group = grp,
+        \\  callback = function() vim.schedule(refresh_tabs) end,
         \\})
         \\-- Agent exit (claude/codex quit while the shell stays open) clears the
         \\-- terminal title to "" but fires NO TermRequest, so poll present
@@ -948,12 +982,12 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      -- longer shows any agent marker (cmd.exe took the title over).
         \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
         \\        pend[buf] = (pend[buf] or 0) + 1
-        \\        present[buf] = nil; kind[buf] = nil
+        \\        present[buf] = nil; kind[buf] = nil; bufstate[buf] = nil; buftitle[buf] = nil
         \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
         \\      end
         \\    else
         \\      pend[buf] = (pend[buf] or 0) + 1
-        \\      present[buf] = nil; kind[buf] = nil
+        \\      present[buf] = nil; kind[buf] = nil; bufstate[buf] = nil; buftitle[buf] = nil
         \\    end
         \\  end
         \\end, { ['repeat'] = -1 })
