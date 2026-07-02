@@ -7122,33 +7122,29 @@ final class ZonvieCore {
     }
 
     // Fired on the core RPC thread when a tab's AI-agent state changes.
-    // Main-thread-only: previous agent state and last-known name per tab handle,
-    // used to fire a per-tab "finished" notification on a working(2/3)->idle(1)
-    // transition (the name map is refreshed from onTablineUpdate).
-    private var agentPrevStates: [Int64: UInt8] = [:]
+    // Main-thread-only: last-known name per tab handle, used for the
+    // notification summary fallback (refreshed from onTablineUpdate).
     private var agentTabNames: [Int64: String] = [:]
 
     nonisolated private func onAgentStatus(tabHandle: Int64, state: UInt8, title: String) {
+        // Low 7 bits = indicator state; bit 7 = "the reporter detected a
+        // completion edge, fire the OS notification now". Edge detection
+        // happens in the Lua reporter (per terminal buffer, which keeps its
+        // identity while hidden) rather than here (per tab, which does not) --
+        // see the on_agent_status doc comment in zonvie_core.h.
+        let base = state & 0x7F
+        let notifyFlag = (state & 0x80) != 0
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let prev = self.agentPrevStates[tabHandle] ?? 0
-            if state == 0 {
-                self.agentPrevStates.removeValue(forKey: tabHandle)
-            } else {
-                self.agentPrevStates[tabHandle] = state
-            }
             // Completion = work just finished -> always notify. Window-level
             // focus suppression doesn't fit this app: the agent runs inside
             // zonvie's own :terminal, so the app is effectively always frontmost
             // and suppression would silence every notification. Include the tab
             // name to identify which agent finished.
-            // A working(2/3) -> idle(1) transition means the agent finished;
-            // working -> waiting(4) means it paused for a decision/input. Notify
-            // with a distinct message for each (done vs needs-action). done-vs-
-            // error can't be told apart from an interactive terminal, so both
-            // land here as "finished".
-            if ZonvieConfig.shared.tabline.agentNotification,
-               (prev == 2 || prev == 3), (state == 1 || state == 4) {
+            // base==1 (idle/done) means the agent finished; base==4 (waiting)
+            // means it paused for a decision/input. done-vs-error can't be told
+            // apart from an interactive terminal, so both land here as "finished".
+            if ZonvieConfig.shared.tabline.agentNotification, notifyFlag {
                 let summary: String
                 if !title.isEmpty {
                     summary = title
@@ -7157,7 +7153,7 @@ final class ZonvieCore {
                     summary = raw.isEmpty ? "" : (raw as NSString).lastPathComponent
                 }
                 let body: String
-                if state == 4 {
+                if base == 4 {
                     body = summary.isEmpty ? "AI agent needs input" : "Needs input: \(summary)"
                 } else {
                     body = summary.isEmpty ? "AI agent finished" : "Finished: \(summary)"
@@ -7166,13 +7162,13 @@ final class ZonvieCore {
             }
 
             // Indicator rendering is driven by this notification; skip it (no icon)
-            // when the indicator is disabled. State is still tracked above so the
-            // completion notification keeps working independently. State 4 (waiting)
-            // renders a distinct pause glyph in the views.
+            // when the indicator is disabled. The completion notification above
+            // is independent of this gate. State 4 (waiting) renders a distinct
+            // pause glyph in the views.
             if ZonvieConfig.shared.tabline.agentIndicator {
                 NotificationCenter.default.post(
                     name: ZonvieCore.agentStatusNotification,
-                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: state)
+                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: base)
                 )
             }
         }

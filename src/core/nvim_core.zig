@@ -248,11 +248,15 @@ pub const Callbacks = struct {
     on_tabline_hide: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
     /// AI-agent work status for a tabpage (from the zonvie_agent_status RPC
-    /// notification). state: 0=none, 1=idle (agent present, done),
+    /// notification). Low 7 bits of state: 0=none, 1=idle (agent present, done),
     /// 2=working/claude, 3=working/braille (codex & generic),
-    /// 4=waiting for user input (a decision prompt is on screen). The frontend
-    /// renders/animates the per-tab indicator from this; fired immediately on
-    /// change (not coupled to redraw, so a background-tab agent still updates).
+    /// 4=waiting for user input (a decision prompt is on screen). Bit 7 (0x80)
+    /// is a "fire the OS notification now" flag (only combined with base 1 or
+    /// 4). The frontend renders/animates the per-tab indicator from
+    /// `state & 0x7F` and must not edge-detect notifications itself (a
+    /// flagged report can target a tab not currently displaying the agent's
+    /// terminal). Fired immediately on change (not coupled to redraw, so a
+    /// background-tab agent still updates).
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 
     /// Called when a grid receives a grid_scroll event.

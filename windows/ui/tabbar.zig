@@ -1822,18 +1822,22 @@ pub fn onTablineUpdate(
 // the spinner timer + paint (drawTablineContent) render the indicator. Fired
 // on the core RPC thread, so update under app.mu then invalidate on the UI
 // thread (the WM_APP_TABLINE_INVALIDATE handler also reconciles the timer).
+//
+// Low 7 bits of `state` = indicator state; bit 7 = "the reporter detected a
+// completion edge, queue the OS notification now". Edge detection happens in
+// the Lua reporter (per terminal buffer, which keeps its identity while
+// hidden) rather than here (per tab, which does not) -- see the
+// on_agent_status doc comment in zonvie_core.h.
 pub fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
+    const base: u8 = state & 0x7f;
     {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        // working(2/3) -> idle(1) = finished; working -> waiting(4) = paused for
-        // input. Queue either (with the title + which kind) for the UI thread.
-        const prev = app.tabline_state.agentState(tab_handle);
-        if (app.config.tabline.agent_notification and (prev == 2 or prev == 3) and (state == 1 or state == 4)) {
-            app.tabline_state.pushCompleted(tab_handle, title[0..title_len], state == 4);
+        if (app.config.tabline.agent_notification and (state & 0x80) != 0) {
+            app.tabline_state.pushCompleted(tab_handle, title[0..title_len], base == 4);
         }
-        app.tabline_state.setAgentState(tab_handle, state);
+        app.tabline_state.setAgentState(tab_handle, base);
     }
     if (app.hwnd) |main_hwnd| {
         _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);

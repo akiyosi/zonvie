@@ -34,6 +34,8 @@ const ResolvedAttrWithStyles = zc.highlight.ResolvedAttrWithStyles;
 
 pub const WaitError = error{ Timeout, NvimExited };
 
+pub const AgentEvent = struct { tab: i64, state: u8, title: []u8 };
+
 pub const Options = struct {
     rows: u32 = 24,
     cols: u32 = 80,
@@ -87,6 +89,12 @@ pub const Harness = struct {
     ext_win_closes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_ext_win_grid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
+    // AI-agent status recording (see on_agent_status doc comment in
+    // zonvie_core.h). Appended in arrival order; `state` is the raw wire
+    // byte (low 7 bits = indicator state, bit 7 = notify flag).
+    agent_events_mu: std.Io.Mutex = .init,
+    agent_events: std.ArrayListUnmanaged(AgentEvent) = .empty,
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -122,6 +130,7 @@ pub const Harness = struct {
             .on_log = if (h.verbose) onLog else null,
             .on_external_window = onExternalWindow,
             .on_external_window_close = onExternalWindowClose,
+            .on_agent_status = onAgentStatus,
         };
         h.core = try alloc.create(Core);
         errdefer alloc.destroy(h.core);
@@ -156,6 +165,8 @@ pub const Harness = struct {
         h.core.stop();
         h.alloc.destroy(h.core);
         h.alloc.free(h.nvim_cmd);
+        for (h.agent_events.items) |e| h.alloc.free(e.title);
+        h.agent_events.deinit(h.alloc);
         h.alloc.destroy(h);
     }
 
@@ -205,6 +216,16 @@ pub const Harness = struct {
         _ = grid_id;
         const h: *Harness = @ptrCast(@alignCast(ctx.?));
         _ = h.ext_win_closes.fetchAdd(1, .seq_cst);
+    }
+
+    // Not coupled to grid/redraw (see zonvie_agent_status handling in
+    // rpc_session.zig), so this does not require grid_mu.
+    fn onAgentStatus(ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        const copy = h.alloc.dupe(u8, title[0..title_len]) catch return;
+        h.agent_events_mu.lockUncancelable(zc.clock.io());
+        defer h.agent_events_mu.unlock(zc.clock.io());
+        h.agent_events.append(h.alloc, .{ .tab = tab_handle, .state = state, .title = copy }) catch h.alloc.free(copy);
     }
 
     // ── Input ──────────────────────────────────────────────────────────
@@ -418,6 +439,28 @@ pub const Harness = struct {
             );
             return e;
         };
+    }
+
+    /// True if any recorded on_agent_status event so far matches `pred`.
+    pub fn hasAgentStatus(h: *Harness, comptime pred: fn (AgentEvent) bool) bool {
+        h.agent_events_mu.lockUncancelable(zc.clock.io());
+        defer h.agent_events_mu.unlock(zc.clock.io());
+        for (h.agent_events.items) |e| {
+            if (pred(e)) return true;
+        }
+        return false;
+    }
+
+    /// Wait until some recorded on_agent_status event matches `pred`.
+    /// Checks the events accumulated so far each poll, so a match that
+    /// arrived before the wait started still succeeds.
+    pub fn waitAgentStatus(h: *Harness, comptime pred: fn (AgentEvent) bool, timeout_ms: u64) WaitError!void {
+        const Wrap = struct {
+            fn check(_: void, hh: *Harness) bool {
+                return hh.hasAgentStatus(pred);
+            }
+        };
+        try h.waitUntil({}, Wrap.check, timeout_ms);
     }
 
     /// Wait until the cursor sits at (row, col) in its current grid.

@@ -833,21 +833,39 @@ pub fn setupClipboard(self: *Core) void {
 /// Agent presence + kind are latched per buffer (claude is recognized by its
 /// '✳' U+2733 idle marker or "Claude" in the title; anything else with a Braille
 /// spinner is treated as codex/generic). The frontend renders/animates from the
-/// state. augroup clear=true keeps re-injection idempotent. Fire-and-forget.
+/// low 7 bits of the wire state.
+/// Bit 7 (0x80) of the wire state is a "fire the OS notification now" flag,
+/// only ever set together with base state 1 (finished) or 4 (needs input).
+/// Completion is edge-detected per BUFFER (prevb[]), not per tab, because a
+/// buffer keeps its identity while hidden but a tab's derived state does not
+/// -- reporting only to tabs currently displaying the buffer (as the
+/// indicator does) would silently drop the notification whenever the agent's
+/// window got switched to something else while it worked. If no tab
+/// currently shows the buffer when a notify-worthy edge fires, buftab[]
+/// (the last tab seen showing it) is used as a fallback delivery target.
+/// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 pub fn setupAgentStatus(self: *Core) void {
     // Skip the reporter entirely when both the indicator and the completion
     // notification are disabled -- nothing would consume the status updates.
     if (!self.msg_config.tabline.agent_indicator and !self.msg_config.tabline.agent_notification) return;
     const lua_code =
         \\local present, kind, last, bufstate, buftitle = {}, {}, {}, {}, {}
+        \\-- prevb: per-buffer previous state, used to edge-detect a completion
+        \\-- worth an OS notification. Per-buffer (not per-tab) because a buffer
+        \\-- keeps its identity while hidden, unlike a tab's derived state.
+        \\-- buftab: last tab observed to display this buffer, used as a fallback
+        \\-- delivery target when a completion happens while the buffer is hidden.
+        \\local prevb, buftab = {}, {}
         \\-- Scrape the terminal tail for a pending decision prompt (permission /
         \\-- yes-no / numbered choice). This is how an agent "waiting for the user"
         \\-- is told apart from "done"; the title alone can't (both look idle).
         \\-- Conservative, English-string patterns -- fragile by nature.
         \\local function waiting_prompt(buf)
-        \\  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, -20, -1, false)
+        \\  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, -60, -1, false)
         \\  if not ok then return false end
-        \\  local t = table.concat(lines, '\n')
+        \\  while #lines > 0 and lines[#lines]:match('^%s*$') do lines[#lines] = nil end
+        \\  if #lines == 0 then return false end
+        \\  local t = table.concat(lines, '\n', math.max(1, #lines - 19), #lines)
         \\  -- Selection-menu footer (AskUserQuestion / ExitPlanMode / permission):
         \\  -- present only while an interactive prompt is on screen, language-agnostic.
         \\  return t:find('Enter to select') ~= nil or t:find('to navigate') ~= nil
@@ -884,12 +902,20 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      if vim.api.nvim_win_get_buf(w) == buf then out[#out+1] = t; break end
         \\    end
         \\  end
+        \\  if #out > 0 then buftab[buf] = out[1] end
         \\  return out
         \\end
-        \\local function report(tab, state, title)
-        \\  if last[tab] == state then return end
+        \\-- notify (bit 7 of the wire state) tells the frontend to fire its OS
+        \\-- notification now, instead of inferring the edge itself from a
+        \\-- per-tab prev-state map (which breaks once the agent's buffer is
+        \\-- hidden -- see deliver() below). A notify report bypasses the
+        \\-- per-tab debounce, since it must fire even if last[tab] already
+        \\-- equals the base state.
+        \\local function report(tab, state, title, notify)
+        \\  if not notify and last[tab] == state then return end
         \\  last[tab] = state
-        \\  vim.rpcnotify(0, 'zonvie_agent_status', { tab = tab, state = state, title = title or '' })
+        \\  vim.rpcnotify(0, 'zonvie_agent_status',
+        \\    { tab = tab, state = notify and (state + 128) or state, title = title or '' })
         \\end
         \\-- Rank states so a tab with several agent buffers surfaces the most
         \\-- active one: working (2/3) > waiting (4) > done (1) > none (0).
@@ -915,6 +941,27 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    report(t, s, bt)
         \\  end
         \\end
+        \\-- Deliver a buffer's state to the tabs currently showing it. If none
+        \\-- show it (the agent's window was switched to something else) and this
+        \\-- is a notify-worthy report, fall back to the last tab known to have
+        \\-- shown the buffer so the OS notification isn't lost -- then re-derive
+        \\-- that tab's indicator from the live layout right after, since the
+        \\-- fallback report otherwise leaves it showing a stale base state.
+        \\local function deliver(buf, s, title, notify)
+        \\  bufstate[buf] = s; buftitle[buf] = title
+        \\  local tabs = tabs_for_buf(buf)
+        \\  if #tabs == 0 then
+        \\    if notify then
+        \\      local t = buftab[buf]
+        \\      if t and vim.api.nvim_tabpage_is_valid(t) then
+        \\        report(t, s, title, true)
+        \\        vim.schedule(refresh_tabs)
+        \\      end
+        \\    end
+        \\    return
+        \\  end
+        \\  for _, tab in ipairs(tabs) do report(tab, s, title, notify) end
+        \\end
         \\-- The done-vs-waiting decision is deferred ~0.8s after the spinner stops,
         \\-- so the prompt box has time to render into the buffer before we scrape.
         \\-- pend[buf] is a token that any newer event bumps to cancel a stale decision.
@@ -928,8 +975,28 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local ok, t = pcall(function() return vim.b[buf].term_title end)
         \\    if ok and spinning(t or '') then return end
         \\    local s = waiting_prompt(buf) and 4 or 1
-        \\    bufstate[buf] = s; buftitle[buf] = title
-        \\    for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, s, title) end
+        \\    local p = prevb[buf]
+        \\    prevb[buf] = s
+        \\    -- Completion edge worth an OS notification: agent was working and
+        \\    -- stopped (done or waiting), or a waiting agent's turn ended
+        \\    -- without another working title in between (answered and done).
+        \\    local notify = ((p == 2 or p == 3) and (s == 1 or s == 4)) or (p == 4 and s == 1)
+        \\    deliver(buf, s, title, notify)
+        \\    -- Second chance: the prompt box can render later than 800ms after
+        \\    -- the spinner stops. Re-scrape once more; upgrade 1 -> 4 only
+        \\    -- (never downgrade an already-decided 4 back to 1).
+        \\    if s == 1 then
+        \\      vim.defer_fn(function()
+        \\        if pend[buf] ~= tok then return end
+        \\        if not (vim.api.nvim_buf_is_valid(buf) and present[buf]) then return end
+        \\        local ok2, t2 = pcall(function() return vim.b[buf].term_title end)
+        \\        if ok2 and spinning(t2 or '') then return end
+        \\        if waiting_prompt(buf) then
+        \\          prevb[buf] = 4
+        \\          deliver(buf, 4, title, true)
+        \\        end
+        \\      end, 1700)
+        \\    end
         \\  end, 800)
         \\end
         \\local grp = vim.api.nvim_create_augroup('zonvie_agent_status', { clear = true })
@@ -946,8 +1013,8 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      decide_stopped(ev.buf, title)
         \\    else
         \\      pend[ev.buf] = (pend[ev.buf] or 0) + 1
-        \\      bufstate[ev.buf] = s; buftitle[ev.buf] = title
-        \\      for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, s, title) end
+        \\      prevb[ev.buf] = (s ~= 0) and s or nil
+        \\      deliver(ev.buf, s, title, false)
         \\    end
         \\  end,
         \\})
@@ -956,6 +1023,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\  callback = function(ev)
         \\    pend[ev.buf] = (pend[ev.buf] or 0) + 1
         \\    present[ev.buf] = nil; kind[ev.buf] = nil; bufstate[ev.buf] = nil; buftitle[ev.buf] = nil
+        \\    prevb[ev.buf] = nil; buftab[ev.buf] = nil
         \\    for _, tab in ipairs(tabs_for_buf(ev.buf)) do report(tab, 0) end
         \\  end,
         \\})
@@ -983,11 +1051,13 @@ pub fn setupAgentStatus(self: *Core) void {
         \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
         \\        pend[buf] = (pend[buf] or 0) + 1
         \\        present[buf] = nil; kind[buf] = nil; bufstate[buf] = nil; buftitle[buf] = nil
+        \\        prevb[buf] = nil; buftab[buf] = nil
         \\        for _, tab in ipairs(tabs_for_buf(buf)) do report(tab, 0) end
         \\      end
         \\    else
         \\      pend[buf] = (pend[buf] or 0) + 1
         \\      present[buf] = nil; kind[buf] = nil; bufstate[buf] = nil; buftitle[buf] = nil
+        \\      prevb[buf] = nil; buftab[buf] = nil
         \\    end
         \\  end
         \\end, { ['repeat'] = -1 })
@@ -1375,9 +1445,15 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
-        // params[0] = { tab, state: Integer 0..4, title: String }
-        //   0=none, 1=idle (agent present, done), 2=working/claude,
+        // params[0] = { tab, state: Integer 0..4 | 0x80|(1 or 4), title: String }
+        //   Low 7 bits: 0=none, 1=idle (agent present, done), 2=working/claude,
         //   3=working/braille, 4=waiting for user input (decision prompt on screen).
+        //   Bit 7 (0x80): the reporter detected a completion edge and the
+        //   frontend should fire its OS notification now (only set with base
+        //   1 or 4). The frontend must render the indicator from the low 7
+        //   bits alone and must not edge-detect notifications itself -- a
+        //   flagged report may target a tab that isn't currently displaying
+        //   the agent's terminal (see setupAgentStatus doc comment).
         // Emitted (debounced) by the auto-injected reporter. Forwarded straight
         // to the frontend, which owns the per-tab indicator + spinner animation.
         // Not coupled to grid/redraw, so a background-tab agent still updates.
@@ -1395,7 +1471,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                         have_tab = true;
                     }
                 } else if (std.mem.eql(u8, pair.key.str, "state")) {
-                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 4) {
+                    if (pair.val == .int and pair.val.int >= 0 and pair.val.int <= 0x84 and (pair.val.int & 0x7f) <= 4) {
                         state = @intCast(pair.val.int);
                         have_state = true;
                     }

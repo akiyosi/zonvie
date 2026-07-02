@@ -614,11 +614,16 @@ typedef void (*zonvie_on_tabline_update_fn)(
 typedef void (*zonvie_on_tabline_hide_fn)(void* ctx);
 
 /* AI-agent work state for a tabpage (from the zonvie_agent_status RPC
-   notification). state: 0=none, 1=idle (agent present, done), 2=working/claude,
-   3=working/braille (codex & generic), 4=waiting for user input (a decision
-   prompt is on screen). The frontend renders/animates the per-tab indicator
-   from this; fired immediately on change (not coupled to redraw, so a
-   background-tab agent still updates). */
+   notification). Low 7 bits of state: 0=none, 1=idle (agent present, done),
+   2=working/claude, 3=working/braille (codex & generic), 4=waiting for user
+   input (a decision prompt is on screen). Bit 7 (0x80) is a "fire the OS
+   notification now" flag set by the core when it detects a completion edge
+   (only ever combined with base 1 or 4: 1="finished", 4="needs input").
+   The frontend must render/animate the per-tab indicator from `state & 0x7F`
+   only, and must NOT edge-detect notifications itself from successive calls
+   -- a flagged report can target a tab that is not currently displaying the
+   agent's terminal (the agent's buffer may be hidden). Fired immediately on
+   change (not coupled to redraw, so a background-tab agent still updates). */
 typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t state, const char* title, size_t title_len);
 
 /* --- Clipboard callbacks --- */

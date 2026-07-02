@@ -12,8 +12,11 @@
 --
 -- Payload contract (must match include/zonvie_core.h on_agent_status):
 --   vim.rpcnotify(0, 'zonvie_agent_status', { tab = <int>, state = <int>, title = <str> })
---   state: 0=none, 1=idle (agent present, done), 2=working/claude,
+--   Low 7 bits of state: 0=none, 1=idle (agent present, done), 2=working/claude,
 --          3=working/braille (codex & generic), 4=waiting for user input.
+--   Bit 7 (0x80) is a "fire the OS notification now" flag, set on a
+--   working(3) -> idle(1) edge; zonvie renders the indicator from
+--   `state & 0x7F` and requires the flag to fire a completion notification.
 --
 -- This is a readable, intentionally minimal reference. It reports only
 -- 0/1/3 (none / idle / working). The auto-injected reporter that ships in the
@@ -24,6 +27,9 @@
 --     (state 4) looks identical to idle here (the spinner stops), so this
 --     reference reports it as idle.
 --   * The tabline must be visible to see the glyph (e.g. `set showtabline=2`).
+--   * Completion is edge-detected per buffer (not per tab, since a hidden
+--     buffer keeps its identity); only the working(3) -> idle(1) edge is
+--     flagged for a notification here (no waiting-for-input distinction).
 --
 -- Install: place on your runtimepath and call:
 --   require("zonvie_agent_status").setup()
@@ -36,6 +42,9 @@ local STATE_WORKING = 3
 
 local last = {} -- tabpage handle -> last reported state (integer)
 local bufstate = {} -- terminal buffer handle -> last working/idle state
+local prevb = {} -- terminal buffer handle -> previous state, for the
+-- working(3) -> idle(1) completion edge (per buffer, not per tab, since a
+-- hidden buffer keeps its identity across tab/window switches).
 
 local function state_from_title(title)
   if not title or title == "" then return STATE_IDLE end
@@ -58,11 +67,16 @@ local function tabs_for_buf(buf)
   return out
 end
 
-local function report(tab, state, title)
-  if last[tab] == state then return end -- debounce spinner-frame churn
+-- notify (bit 7 of the wire state) tells zonvie to fire its OS notification
+-- now; it bypasses the debounce below since it must fire even if last[tab]
+-- already equals state (e.g. the tab has been showing idle(1) since before
+-- this buffer's own completion edge).
+local function report(tab, state, title, notify)
+  if not notify and last[tab] == state then return end -- debounce spinner-frame churn
   last[tab] = state
   -- Broadcast to all RPC channels; zonvie's UI channel handles it.
-  vim.rpcnotify(0, "zonvie_agent_status", { tab = tab, state = state, title = title or "" })
+  vim.rpcnotify(0, "zonvie_agent_status",
+    { tab = tab, state = notify and (state + 128) or state, title = title or "" })
 end
 
 -- The state a tab should show right now, from the terminal buffers currently
@@ -95,14 +109,17 @@ function M.setup()
       if not body then return end
       local state = state_from_title(body)
       bufstate[ev.buf] = state
+      local notify = prevb[ev.buf] == STATE_WORKING and state == STATE_IDLE
+      prevb[ev.buf] = state
       for _, tab in ipairs(tabs_for_buf(ev.buf)) do
-        report(tab, state, body)
+        report(tab, state, body, notify)
       end
     end,
   })
   vim.api.nvim_create_autocmd("TermClose", {
     callback = function(ev)
       bufstate[ev.buf] = nil
+      prevb[ev.buf] = nil
       for _, tab in ipairs(tabs_for_buf(ev.buf)) do
         report(tab, STATE_NONE, nil)
       end

@@ -531,9 +531,12 @@ pub const Callbacks = extern struct {
     on_connect: ?*const fn (ctx: ?*anyopaque, server_addr: [*]const u8, server_addr_len: usize) callconv(.c) void = null,
 
     // AI-agent work status per tab. Appended at the end for ABI compat (see
-    // on_restart note). state: 0=none, 1=idle (agent present, done),
-    // 2=working/claude, 3=working/braille (codex & generic),
-    // 4=waiting for user input (a decision prompt is on screen).
+    // on_restart note). Low 7 bits of state: 0=none, 1=idle (agent present,
+    // done), 2=working/claude, 3=working/braille (codex & generic),
+    // 4=waiting for user input (a decision prompt is on screen). Bit 7 (0x80)
+    // is a "fire the OS notification now" flag (only combined with base 1 or
+    // 4); frontends render the indicator from state & 0x7F and must not
+    // edge-detect notifications themselves.
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 };
 
