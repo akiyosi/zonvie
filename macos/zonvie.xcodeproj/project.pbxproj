@@ -28,6 +28,9 @@
 		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
 		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
 		ABCA11BA2EFB01020072639A /* CustomShaderPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */; };
+		ABCC10022F10000000000002 /* ConnectionMenuViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10012F10000000000001 /* ConnectionMenuViewController.swift */; };
+		ABCC10042F10000000000004 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10032F10000000000003 /* SessionManager.swift */; };
+		ABCC10062F10000000000006 /* SessionMenuController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10052F10000000000005 /* SessionMenuController.swift */; };
 
 /* End PBXBuildFile section */
 
@@ -55,6 +58,9 @@
 		AB9AE9D02EF900000072639A /* ExternalGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalGridView.swift; sourceTree = "<group>"; };
 		AB9AE9D22F0000010072639A /* zonvie.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = zonvie.icns; sourceTree = "<group>"; };
 		ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomShaderPipeline.swift; sourceTree = "<group>"; };
+		ABCC10012F10000000000001 /* ConnectionMenuViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMenuViewController.swift; sourceTree = "<group>"; };
+		ABCC10032F10000000000003 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
+		ABCC10052F10000000000005 /* SessionMenuController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionMenuController.swift; sourceTree = "<group>"; };
 
 /* End PBXFileReference section */
 
@@ -109,6 +115,7 @@
 				AB9AE9C92EF2A2130072639A /* main.swift */,
 				AB9AE9A72EF1B8320072639A /* AppDelegate.swift */,
 				AB9AE9AB2EF1B8320072639A /* ViewController.swift */,
+				ABCC10032F10000000000003 /* SessionManager.swift */,
 				AB79DAFE2F1621F7005729E6 /* Config.swift */,
 			);
 			path = App;
@@ -148,6 +155,8 @@
 			isa = PBXGroup;
 			children = (
 				AB9AE9D02EF900000072639A /* ExternalGridView.swift */,
+				ABCC10012F10000000000001 /* ConnectionMenuViewController.swift */,
+				ABCC10052F10000000000005 /* SessionMenuController.swift */,
 				AB79DB002F1621F8005729E6 /* TabBarView.swift */,
 				AB79DB022F1621F9005729E6 /* TabSidebarView.swift */,
 				AB79DB042F1621FA005729E6 /* TabMenuManager.swift */,
@@ -271,6 +280,9 @@
 				AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */,
 				AB9AE9AD2EF1B8320072639A /* AppDelegate.swift in Sources */,
 				AB9AE9AE2EF1B8320072639A /* ViewController.swift in Sources */,
+				ABCC10022F10000000000002 /* ConnectionMenuViewController.swift in Sources */,
+				ABCC10042F10000000000004 /* SessionManager.swift in Sources */,
+				ABCC10062F10000000000006 /* SessionMenuController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

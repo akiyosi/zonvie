@@ -20,6 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Tab menu manager (for "menu" tabline style)
     private var tabMenuManager: TabMenuManager?
 
+    // Per-session top-level menu-bar menus (multi-session)
+    private var sessionMenuController: SessionMenuController?
+
     // Notification observer token (stored so it can be removed on deinit)
     private var neovimReadyObserver: Any?
 
@@ -77,6 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About zonvie", action: #selector(showAboutPanel), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        // New Session: opens a fresh session in its own window (shared menu bar).
+        let newSessionItem = NSMenuItem(title: "New Session", action: #selector(newSession(_:)), keyEquivalent: "n")
+        newSessionItem.target = self
+        appMenu.addItem(newSessionItem)
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit zonvie", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
@@ -95,6 +103,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         NSApp.mainMenu = mainMenu
+
+        // Per-session top-level menu-bar menus (independent of window/VC).
+        sessionMenuController = SessionMenuController(mainMenu: mainMenu)
     }
 
     // Show the standard About panel, but source the version from the Zig core
@@ -111,16 +122,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var deferredTabMenu: NSMenu?
 
     private func finalizeTabMenuSetup() {
-        guard let tabMenu = deferredTabMenu,
-              let vc = window?.contentViewController as? ViewController else {
-            return
-        }
+        guard let vc = window?.contentViewController as? ViewController else { return }
+
+        guard let tabMenu = deferredTabMenu else { return }
         tabMenuManager = TabMenuManager(menu: tabMenu, viewController: vc)
         deferredTabMenu = nil
     }
 
-    private func createAndShowWindow() {
-        ZonvieCore.appLog("zonvie: creating window")
+    /// Create a session window. `forceDialog` makes it a New Session window that
+    /// shows the connection dialog on appear (and, on Cancel, closes just this
+    /// window). Each window owns its own ViewController + ZonvieCore and is
+    /// registered in SessionManager so it appears in the shared menu bar.
+    @discardableResult
+    private func createAndShowWindow(forceDialog: Bool = false) -> NSWindow {
+        ZonvieCore.appLog("zonvie: creating window (forceDialog=\(forceDialog))")
 
         // Prefer visibleFrame; fall back to a sane default if it looks invalid.
         var screenFrame = NSScreen.main?.visibleFrame
@@ -205,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // the view controller's view contentSize (~400x300 default), which
         // would otherwise overwrite a restored autosave frame.
         let vc = ViewController()
+        vc.forceConnectDialog = forceDialog
         win.contentViewController = vc
 
         // Persist/restore window geometry (AppKit feature).
@@ -219,12 +235,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         self.window = win
         win.delegate = self  // Handle window close with unsaved buffer check
 
+        // Register this session window in the shared registry so it appears as a
+        // top-level menu-bar menu. Renamed from its connection on Connect.
+        let sessionName = forceDialog ? "New Session" : Self.defaultSessionName()
+        SessionManager.shared.register(window: win, viewController: vc, name: sessionName)
+
         // Finalize tab menu setup now that ViewController exists
         finalizeTabMenuSetup()
 
         // SSH/devcontainer mode: hide window until auth completes (neovimReadyNotification)
-        // Normal mode: show window immediately
-        if sshModeEnabled || devcontainerModeEnabled {
+        // Normal mode: show window immediately.
+        // A dialog window (`--dialog` startup or New Session) always shows: the
+        // connection dialog is a sheet that needs a visible host window, and no
+        // nvim spawns until Connect, so there is nothing to hide for.
+        if (sshModeEnabled || devcontainerModeEnabled) && !connectDialogEnabled && !forceDialog {
             // Don't show window yet - it will be shown when neovimReadyNotification fires
             ZonvieCore.appLog("zonvie: window created but hidden (waiting for auth)")
         } else {
@@ -238,6 +262,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             applyWindowBlur(window: win, radius: config.window.blurRadius)
             // Shadow invalidation is now handled in MetalTerminalRenderer after first present
         }
+
+        return win
+    }
+
+    /// Default menu-bar label for the CLI-launched session window.
+    static func defaultSessionName() -> String {
+        if sshModeEnabled || ZonvieConfig.shared.neovim.ssh { return "SSH" }
+        if devcontainerModeEnabled { return "Devcontainer" }
+        return "Local"
+    }
+
+    /// App menu "New Session" target: open a fresh session in its own window.
+    @objc func newSession(_ sender: Any?) {
+        createAndShowWindow(forceDialog: true)
     }
 
     /// Apply blur effect to window using private macOS API (CGSSetWindowBackgroundBlurRadius)
@@ -269,6 +307,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         // If no core, allow normal close
         return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow else { return }
+        SessionManager.shared.unregister(window: win)
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        // Track the frontmost session window so single-window-oriented code
+        // (and the menu bar's active marking) follows focus across sessions.
+        if let win = notification.object as? NSWindow, win.contentViewController is ViewController {
+            self.window = win
+        }
     }
 
     func windowDidMiniaturize(_ notification: Notification) {

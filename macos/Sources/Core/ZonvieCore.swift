@@ -22,12 +22,23 @@ final class ZonvieCore {
     // SSH_ASKPASS script path for cleanup
     private var sshAskpassPath: String?
 
+    // Set by the `--dialog` startup dialog before start(). When present, its
+    // fields take priority over CLI flags / config.toml when start() resolves
+    // the connection mode (SSH / devcontainer / local) and ext_* options.
+    var connectionConfig: ConnectionConfig?
+
     // Devcontainer progress dialog
     private var progressWindow: NSWindow?
     private var isDevcontainerMode: Bool = false
 
     // Native font picker controller (`:set guifont=*`), created on first use.
     private var fontPicker: FontPickerController?
+
+    // Monotonic per-instance id, used for logging and session identity in the
+    // multi-session model (one ZonvieCore per session window).
+    let instanceId = ZonvieCore.nextInstanceId()
+    private static var instanceCounter = 0
+    private static func nextInstanceId() -> Int { instanceCounter += 1; return instanceCounter }
 
     // Wire this from ViewController.
     weak var terminalView: MetalTerminalView? {
@@ -1039,8 +1050,8 @@ final class ZonvieCore {
         let args = CommandLine.arguments
         ZonvieCore.appLog("[start] CommandLine.arguments = \(args)")
 
-        // ext_cmdline: CLI flag or config file
-        let hasExtCmdline = args.contains("--extcmdline") || ZonvieConfig.shared.cmdline.external
+        // ext_cmdline: connection dialog (if any) > CLI flag > config file
+        let hasExtCmdline = connectionConfig?.extCmdline ?? (args.contains("--extcmdline") || ZonvieConfig.shared.cmdline.external)
         ZonvieCore.appLog("[start] hasExtCmdline = \(hasExtCmdline) (cli=\(args.contains("--extcmdline")), config=\(ZonvieConfig.shared.cmdline.external))")
 
         if hasExtCmdline {
@@ -1048,8 +1059,8 @@ final class ZonvieCore {
             setExtCmdline(true)
         }
 
-        // ext_popupmenu: CLI flag or config file
-        let hasExtPopup = args.contains("--extpopup") || ZonvieConfig.shared.popup.external
+        // ext_popupmenu: connection dialog (if any) > CLI flag > config file
+        let hasExtPopup = connectionConfig?.extPopupmenu ?? (args.contains("--extpopup") || ZonvieConfig.shared.popup.external)
         ZonvieCore.appLog("[start] hasExtPopup = \(hasExtPopup) (cli=\(args.contains("--extpopup")), config=\(ZonvieConfig.shared.popup.external))")
 
         if hasExtPopup {
@@ -1057,8 +1068,8 @@ final class ZonvieCore {
             setExtPopupmenu(true)
         }
 
-        // ext_messages: CLI flag or config file
-        let hasExtMessages = args.contains("--extmessages") || ZonvieConfig.shared.messages.external
+        // ext_messages: connection dialog (if any) > CLI flag > config file
+        let hasExtMessages = connectionConfig?.extMessages ?? (args.contains("--extmessages") || ZonvieConfig.shared.messages.external)
         ZonvieCore.appLog("[start] hasExtMessages = \(hasExtMessages) (cli=\(args.contains("--extmessages")), config=\(ZonvieConfig.shared.messages.external))")
 
         if hasExtMessages {
@@ -1066,8 +1077,8 @@ final class ZonvieCore {
             setExtMessages(true)
         }
 
-        // ext_tabline: CLI flag or config file
-        let hasExtTabline = args.contains("--exttabline") || ZonvieConfig.shared.tabline.external
+        // ext_tabline: connection dialog (if any) > CLI flag > config file
+        let hasExtTabline = connectionConfig?.extTabline ?? (args.contains("--exttabline") || ZonvieConfig.shared.tabline.external)
         ZonvieCore.appLog("[start] hasExtTabline = \(hasExtTabline) (cli=\(args.contains("--exttabline")), config=\(ZonvieConfig.shared.tabline.external))")
 
         if hasExtTabline {
@@ -1183,6 +1194,44 @@ final class ZonvieCore {
             sshPort = sshPort ?? config.neovim.sshPort
             sshIdentity = sshIdentity ?? config.neovim.sshIdentity
         }
+
+        // `--dialog` dialog selection has the final say over CLI flags and
+        // config.toml. The three modes are mutually exclusive, so selecting one
+        // clears the others (guarding against any CLI/config-derived leftovers).
+        if let cc = connectionConfig {
+            if cc.isSSH {
+                sshHost = cc.sshHost
+                sshPort = Int(cc.sshPort)   // "" -> nil (default port)
+                sshIdentity = cc.sshIdentity.isEmpty ? nil : cc.sshIdentity
+                devcontainerWorkspace = nil
+                devcontainerConfig = nil
+                devcontainerRebuild = false
+            } else if cc.isDevcontainer {
+                devcontainerWorkspace = cc.devcontainerWorkspace
+                devcontainerConfig = cc.devcontainerConfig.isEmpty ? nil : cc.devcontainerConfig
+                devcontainerRebuild = cc.devcontainerRebuild
+                sshHost = nil
+                sshPort = nil
+                sshIdentity = nil
+            } else {
+                // Local connection: clear any remote mode.
+                sshHost = nil
+                sshPort = nil
+                sshIdentity = nil
+                devcontainerWorkspace = nil
+                devcontainerConfig = nil
+                devcontainerRebuild = false
+            }
+        }
+
+        // Expand a leading `~` in filesystem paths (the CLI / dialog may pass
+        // "~/..."). Without this, `devcontainer exec --workspace-folder "~/..."`
+        // resolves the tilde against cwd → "/Users/x/~/..." and fails with
+        // "Dev container config not found". expandingTildeInPath leaves
+        // already-absolute paths untouched.
+        devcontainerWorkspace = devcontainerWorkspace.map { ($0 as NSString).expandingTildeInPath }
+        devcontainerConfig = devcontainerConfig.map { ($0 as NSString).expandingTildeInPath }
+        sshIdentity = sshIdentity.map { ($0 as NSString).expandingTildeInPath }
 
         ZonvieCore.appLog("[start] SSH config: host=\(sshHost ?? "nil"), port=\(sshPort ?? -1), identity=\(sshIdentity ?? "nil")")
 
@@ -1311,16 +1360,23 @@ final class ZonvieCore {
             let configArg = devcontainerConfig
 
             if devcontainerRebuild {
-                // Rebuild mode: run 'devcontainer up' first, then 'devcontainer exec'
+                // Rebuild: 'devcontainer up' (with --remove-existing-container)
+                // rebuilds the container — installing nvim via the injected
+                // feature — then execs into it.
                 DispatchQueue.main.async { [weak self] in
                     self?.showDevcontainerProgress()
-                    self?.updateProgressLabel("Building devcontainer...")
+                    self?.updateProgressLabel("Rebuilding devcontainer...")
                     self?.runDevcontainerUp(workspace: workspace, configPath: configArg, rebuild: true, rows: rows, cols: cols)
                 }
-                // Return early - Zig core will be started after devcontainer up completes
+                // Return early - core is started after devcontainer up completes.
                 return 0
             } else {
-                // Normal mode: connect directly with 'devcontainer exec'
+                // Normal: exec directly into the (already running) container.
+                // We do NOT run `devcontainer up` here: `up --additional-features`
+                // would force a rebuild whenever the effective config differs from
+                // how the container was built (e.g. a devpod-managed container),
+                // which is slow and can fail. Use "Rebuild on start" to build /
+                // (re)start a container that isn't up yet.
                 DispatchQueue.main.async { [weak self] in
                     self?.showDevcontainerProgress()
                     self?.updateProgressLabel("Connecting...")
@@ -1531,7 +1587,13 @@ final class ZonvieCore {
     }
 
     private func runDevcontainerUp(workspace: String, configPath: String?, rebuild: Bool, rows: UInt32, cols: UInt32) {
-        let neovimFeature = #"{"ghcr.io/duduribeiro/devcontainer-features/neovim:1":{}}"#
+        // Pin the stable release. The feature builds tagged/stable versions with
+        // CMAKE_BUILD_TYPE=Release (assertions OFF); "nightly" builds with
+        // assertions ON, which abort (SIGABRT) on nvim's internal
+        // msg_scroll_flush `row >= 0` edge case. Pinning also changes the feature
+        // config hash, busting any stale/nightly nvim layer cached in the image
+        // so a Rebuild reinstalls a fresh Release nvim.
+        let neovimFeature = #"{"ghcr.io/duduribeiro/devcontainer-features/neovim:1":{"version":"stable"}}"#
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
         let nvimConfigPath = "\(homeDir)/.config/nvim"
 
@@ -1573,10 +1635,14 @@ final class ZonvieCore {
             let tempDir = FileManager.default.temporaryDirectory.path
             let doneFile = "\(tempDir)/devcontainer_done_\(ProcessInfo.processInfo.processIdentifier)"
             let failFile = "\(tempDir)/devcontainer_fail_\(ProcessInfo.processInfo.processIdentifier)"
+            // Capture `devcontainer up` output so a failure reason is visible
+            // (it used to be discarded to /dev/null, which made failures opaque).
+            let upLogFile = "\(tempDir)/devcontainer_up_\(ProcessInfo.processInfo.processIdentifier).log"
 
             // Clean up any previous marker files
             try? FileManager.default.removeItem(atPath: doneFile)
             try? FileManager.default.removeItem(atPath: failFile)
+            try? FileManager.default.removeItem(atPath: upLogFile)
 
             // Use environment variables to pass arguments (avoids shell escaping issues)
             var env = ProcessInfo.processInfo.environment
@@ -1585,6 +1651,7 @@ final class ZonvieCore {
             env["DC_MOUNT"] = "type=bind,source=\(nvimConfigPath),target=/nvim-config/nvim"
             env["DC_DONE"] = doneFile
             env["DC_FAIL"] = failFile
+            env["DC_LOG"] = upLogFile
             if let config = configPath {
                 env["DC_CONFIG"] = config
             }
@@ -1598,7 +1665,7 @@ final class ZonvieCore {
             if rebuild {
                 shellCmd += " --remove-existing-container"
             }
-            shellCmd += " && touch \"$DC_DONE\" || touch \"$DC_FAIL\"' > /dev/null 2>&1 &"
+            shellCmd += " && touch \"$DC_DONE\" || touch \"$DC_FAIL\"' > \"$DC_LOG\" 2>&1 &"
 
             ZonvieCore.appLog("[devcontainer] Running: \(shellCmd)")
 
@@ -1639,11 +1706,27 @@ final class ZonvieCore {
 
                 if FileManager.default.fileExists(atPath: failFile) {
                     try? FileManager.default.removeItem(atPath: failFile)
-                    ZonvieCore.appLog("[devcontainer] up failed")
+
+                    // Surface the failure reason (up output was captured to
+                    // upLogFile) into the app log, and show the tail to the user.
+                    let fullLog = (try? String(contentsOfFile: upLogFile, encoding: .utf8)) ?? ""
+                    let tail = fullLog.split(separator: "\n").suffix(20).joined(separator: "\n")
+                    ZonvieCore.appLog("[devcontainer] up failed. Output tail:\n\(tail)")
 
                     DispatchQueue.main.async { [weak self] in
-                        self?.updateProgressLabel("devcontainer up failed")
-                        self?.progressSpinner?.stopAnimation(nil)
+                        guard let self = self else { return }
+                        self.hideDevcontainerProgress()
+                        let alert = NSAlert()
+                        alert.messageText = "Devcontainer failed to start"
+                        alert.informativeText = tail.isEmpty
+                            ? "`devcontainer up` failed. See the log for details."
+                            : String(tail.suffix(800))
+                        alert.alertStyle = .critical
+                        alert.addButton(withTitle: "Close")
+                        alert.runModal()
+                        // No nvim in this window — close the session so the user
+                        // isn't stuck on a blank window (quits if it was the last).
+                        self.terminalView?.window?.close()
                     }
                     break
                 }
@@ -3111,23 +3194,31 @@ final class ZonvieCore {
 
     private func onExitFromNvim(exitCode: Int32) {
         ZonvieCore.exitCode = exitCode
-        Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode), exiting now")
-        // Use NSApp.stop() to break the run loop so app.run() returns to
-        // main.swift, where Darwin.exit(exitCode) preserves the exit code.
-        // NSApp.terminate() would call exit(0) internally, losing the code.
-        // Darwin.exit() directly would skip AppKit teardown and crash when
-        // DispatchSemaphore is disposed mid-wait (MTKView inflightSemaphore).
+        Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode) instance#\(instanceId)")
         DispatchQueue.main.async { [weak self] in
-            // Force-flush the main window's frame to UserDefaults before the
-            // run loop stops. setFrameAutosaveName auto-saves on resize but
-            // those writes are in-memory; the main.swift Darwin.exit path
-            // bypasses AppKit's natural shutdown flush, so an explicit save
-            // here is needed to persist the most recent geometry.
-            if let win = self?.terminalView?.window, !win.frameAutosaveName.isEmpty {
+            guard let self = self else { return }
+
+            // Force-flush this window's frame to UserDefaults (setFrameAutosaveName
+            // writes are in-memory; shutdown may bypass AppKit's natural flush).
+            if let win = self.terminalView?.window, !win.frameAutosaveName.isEmpty {
                 win.saveFrame(usingName: win.frameAutosaveName)
             }
+
+            // Multi-session: if other sessions remain, close ONLY this session's
+            // window (close() bypasses windowShouldClose — nvim already exited,
+            // so we must not re-trigger requestQuit). The last session instead
+            // stops the run loop so app.run() returns to main.swift's
+            // Darwin.exit(exitCode), preserving nvim's exit code (matters in
+            // --nofork mode); NSApp.terminate would exit(0) and lose it.
+            let isLastSession = SessionManager.shared.sessions.count <= 1
+            if let win = self.terminalView?.window, !isLastSession {
+                win.close()
+                return
+            }
+
+            // Last session (or headless): stop the run loop directly so
+            // app.run() returns to main.swift for Darwin.exit(exitCode).
             NSApp.stop(nil)
-            // NSApp.stop requires a pending event to actually break the loop
             let event = NSEvent.otherEvent(
                 with: .applicationDefined,
                 location: .zero,

@@ -26,6 +26,12 @@ let noforkMode = zonvieArgs.contains("--nofork")
 let sshModeEnabled = zonvieArgs.contains { $0.hasPrefix("--ssh=") || $0 == "--ssh" }
 let devcontainerModeEnabled = zonvieArgs.contains { $0.hasPrefix("--devcontainer=") || $0 == "--devcontainer" }
 
+// `--dialog` shows the interactive connection dialog at startup (Local / SSH /
+// Devcontainer) instead of immediately spawning nvim. Distinct from
+// `--connect-nvim=<addr>` (attach to a running server); matched exactly so the
+// two never collide.
+let connectDialogEnabled = zonvieArgs.contains("--dialog")
+
 // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
 // zonvie-specific arguments:
 //   --nofork, --nvim <path>, --log <path>, --extcmdline, --extpopup, --extpopupmenu,
@@ -59,7 +65,8 @@ do {
         if arg == "--nofork" || arg == "--help" || arg == "-h" ||
            arg == "--extcmdline" || arg == "--extpopup" || arg == "--extpopupmenu" ||
            arg == "--extmessages" || arg == "--exttabline" || arg == "--extwindows" ||
-           arg == "--devcontainer-rebuild" || arg == "--install" || arg == "--version" {
+           arg == "--devcontainer-rebuild" || arg == "--install" || arg == "--version" ||
+           arg == "--dialog" {
             // Skip this argument (it's zonvie-specific)
             i += 1
         } else if arg == "--nvim" {
@@ -177,6 +184,8 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
                                             Address: TCP "host:port" or Unix socket path.
                                             Mutually exclusive with --ssh / --devcontainer.
             --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
+            --dialog                      Show a dialog at startup to choose the connection
+                                            (Local / SSH / Devcontainer) before launching nvim.
             --install                     Create default config file and exit
             --version                     Show version information and exit
             --help, -h                    Show this help message and exit
@@ -394,6 +403,89 @@ if connectModeEnabled {
             _ = alert.runModal()
         }
         Darwin.exit(1)
+    }
+}
+
+// `--dialog` picks the connection mode interactively. `--ssh` / `--devcontainer`
+// are NOT conflicts — they pre-select the matching tab and seed its fields (see
+// dialogInitialTab below and ConnectionMenuViewController). But `--connect-nvim`
+// (attach to a running server) has no dialog representation, so reject that
+// combination up front, mirroring the connect-nvim exclusivity check above.
+if connectDialogEnabled {
+    var conflictParts: [String] = []
+    if connectModeEnabled { conflictParts.append("--connect-nvim / --remote-ui") }
+    if !conflictParts.isEmpty {
+        let conflictDesc = conflictParts.joined(separator: " and ")
+        let stderrMsg = "zonvie: --dialog is mutually exclusive with \(conflictDesc).\nRemove the conflicting option(s) and retry.\n"
+        fputs(stderrMsg, stderr)
+        if launchedFromFinder {
+            _ = NSApplication.shared
+            let alert = NSAlert()
+            alert.messageText = "zonvie: invalid options"
+            alert.informativeText = "--dialog opens a dialog to choose the connection, so it cannot be combined with \(conflictDesc). Remove the conflicting option(s) and retry."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            _ = alert.runModal()
+        }
+        Darwin.exit(1)
+    }
+}
+
+// When `--ssh` / `--devcontainer` accompany `--dialog`, pre-select that tab and
+// seed its fields from the CLI (the user can still edit or switch tabs). Parsed
+// here so ViewController can hand them to ConnectionMenuViewController. Values
+// mirror ZonvieCore.start's own CLI parsing.
+var dialogInitialTab = "local"
+var dialogSeedConfig = ConnectionConfig()
+if connectDialogEnabled {
+    if sshModeEnabled || ZonvieConfig.shared.neovim.ssh {
+        dialogInitialTab = "ssh"
+        // The space-separated forms (`--ssh host`) only consume the next token
+        // when it is a value, not another flag — otherwise `--ssh --dialog`
+        // would grab "--dialog" as the host.
+        for (idx, arg) in zonvieArgs.enumerated() {
+            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            if arg.hasPrefix("--ssh=") || (arg == "--ssh" && nextIsValue) {
+                let value = arg.hasPrefix("--ssh=") ? String(arg.dropFirst("--ssh=".count)) : zonvieArgs[idx + 1]
+                if let lastColon = value.lastIndex(of: ":"),
+                   let portPart = Int(value[value.index(after: lastColon)...]) {
+                    dialogSeedConfig.sshHost = String(value[..<lastColon])
+                    dialogSeedConfig.sshPort = String(portPart)
+                } else {
+                    dialogSeedConfig.sshHost = value
+                }
+            } else if arg.hasPrefix("--ssh-identity=") {
+                dialogSeedConfig.sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
+            } else if arg == "--ssh-identity" && nextIsValue {
+                dialogSeedConfig.sshIdentity = zonvieArgs[idx + 1]
+            }
+        }
+        // Fall back to config.toml when the CLI supplied no host.
+        if dialogSeedConfig.sshHost.isEmpty && ZonvieConfig.shared.neovim.ssh {
+            dialogSeedConfig.sshHost = ZonvieConfig.shared.neovim.sshHost ?? ""
+            if dialogSeedConfig.sshPort.isEmpty, let port = ZonvieConfig.shared.neovim.sshPort, port > 0 {
+                dialogSeedConfig.sshPort = String(port)
+            }
+            if dialogSeedConfig.sshIdentity.isEmpty {
+                dialogSeedConfig.sshIdentity = ZonvieConfig.shared.neovim.sshIdentity ?? ""
+            }
+        }
+    } else if devcontainerModeEnabled {
+        dialogInitialTab = "devcontainer"
+        for (idx, arg) in zonvieArgs.enumerated() {
+            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            if arg.hasPrefix("--devcontainer=") {
+                dialogSeedConfig.devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
+            } else if arg == "--devcontainer" && nextIsValue {
+                dialogSeedConfig.devcontainerWorkspace = zonvieArgs[idx + 1]
+            } else if arg.hasPrefix("--devcontainer-config=") {
+                dialogSeedConfig.devcontainerConfig = String(arg.dropFirst("--devcontainer-config=".count))
+            } else if arg == "--devcontainer-config" && nextIsValue {
+                dialogSeedConfig.devcontainerConfig = zonvieArgs[idx + 1]
+            } else if arg == "--devcontainer-rebuild" {
+                dialogSeedConfig.devcontainerRebuild = true
+            }
+        }
     }
 }
 
