@@ -163,6 +163,9 @@ pub const WM_APP_THEME_REREAD: c.UINT = c.WM_APP + 29;
 /// The UI thread's handler opens the native ChooseFontW dialog (which must
 /// run on the UI thread, not the core thread that fires the callback).
 pub const WM_APP_OPEN_FONT_PICKER: c.UINT = c.WM_APP + 30;
+/// Posted from WM_CREATE when launched with `--dialog`; the handler shows the
+/// startup connection dialog once the main window exists (see dialogs.zig).
+pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 31;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -2970,6 +2973,15 @@ pub const App = struct {
     // calls zonvie_core_start_connect with this address. Mutually exclusive
     // with wsl/ssh/devcontainer modes (CLI parsing rejects mixed use).
     connect_addr: ?[]const u8 = null,
+
+    // `--dialog`: show the interactive connection dialog (Local / SSH /
+    // Devcontainer) at startup instead of spawning immediately. When set,
+    // WM_CREATE skips the normal start path and defers WM_APP_DEFERRED_INIT
+    // until the dialog resolves; the dialog's Connect populates the ssh_*/
+    // devcontainer_*/ext_* fields below, which the deferred-init full path then
+    // consumes exactly as if they had come from CLI flags. Distinct from
+    // --connect-nvim (attach to a running server).
+    connect_dialog: bool = false,
 
     // Extra arguments to pass to nvim (not recognized as zonvie arguments)
     nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty,

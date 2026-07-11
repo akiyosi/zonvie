@@ -376,6 +376,12 @@ pub fn main() u8 {
     // before the App is constructed; see the validation block right after
     // argv parsing.
     var connect_addr: ?[]const u8 = null;
+
+    // `--dialog` (no value): show the interactive connection dialog at startup
+    // (Local / SSH / Devcontainer) before spawning nvim. Distinct from
+    // --connect-nvim=<addr>; matched exactly below so the two never collide.
+    // Mutually exclusive with the mode-fixing flags, rejected up-front below.
+    var connect_dialog: bool = false;
     // 0.16: std.process.argsAlloc/argsFree were removed. Obtain the current
     // process command line from the Windows PEB (GetCommandLineW) and parse it
     // via std.process.Args.toSlice, which requires an arena that must outlive
@@ -425,6 +431,8 @@ pub fn main() u8 {
                     \\                                    (TCP / Unix sockets: not yet supported on Windows.)
                     \\                                    Mutually exclusive with --ssh / --devcontainer / --wsl.
                     \\    --remote-ui=<addr>            Alias of --connect-nvim, mirrors `nvim --remote-ui`.
+                    \\    --dialog                      Show a dialog at startup to choose the connection
+                    \\                                    (Local / SSH / Devcontainer) before launching nvim.
                     \\    --install                     First-launch setup (icon + default config) and exit
                     \\    --version                     Show version information and exit
                     \\    --help, -h                    Show this help message and exit
@@ -612,7 +620,9 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
         } else if (std.mem.eql(u8, arg, "--ssh")) {
             ssh_mode = true;
-            if (i + 1 < args.len) {
+            // Only consume the next token as the host when it is a value, not
+            // another flag — otherwise `--ssh --dialog` grabs "--dialog".
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 const value = args[i + 1];
                 i += 1;
                 if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
@@ -632,7 +642,7 @@ pub fn main() u8 {
             ssh_identity = arg[15..]; // after "--ssh-identity="
             if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
-            if (i + 1 < args.len) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 ssh_identity = args[i + 1];
                 i += 1;
             }
@@ -643,7 +653,7 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
         } else if (std.mem.eql(u8, arg, "--devcontainer")) {
             devcontainer_mode = true;
-            if (i + 1 < args.len) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 devcontainer_workspace = args[i + 1];
                 i += 1;
             }
@@ -652,7 +662,7 @@ pub fn main() u8 {
             devcontainer_config = arg[22..]; // after "--devcontainer-config="
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--devcontainer-config")) {
-            if (i + 1 < args.len) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 devcontainer_config = args[i + 1];
                 i += 1;
             }
@@ -688,6 +698,9 @@ pub fn main() u8 {
                 connect_addr = "";
                 if (applog.isEnabled()) applog.appLog("[win] --remote-ui flag detected without value\n", .{});
             }
+        } else if (std.mem.eql(u8, arg, "--dialog")) {
+            connect_dialog = true;
+            if (applog.isEnabled()) applog.appLog("[win] --dialog flag detected (startup connection dialog)\n", .{});
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             // Already handled above, skip
         } else {
@@ -887,6 +900,47 @@ pub fn main() u8 {
         return 1;
     }
 
+    // `--dialog` picks the connection mode interactively. `--ssh` / `--devcontainer`
+    // are NOT conflicts — they pre-select the matching tab and seed its fields
+    // (see windows/ui/dialogs.zig). But `--connect-nvim` (attach to a running
+    // server) and `--wsl` (no dialog tab) have no dialog representation, so
+    // reject those combinations up-front, mirroring the macOS main.swift check.
+    if (connect_dialog and (connect_addr != null or wsl_mode)) {
+        _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
+        const stderr = c.GetStdHandle(c.STD_ERROR_HANDLE);
+        if (stderr != c.INVALID_HANDLE_VALUE) {
+            var written: c.DWORD = 0;
+            const m1 = "zonvie: --dialog is mutually exclusive with";
+            _ = c.WriteFile(stderr, m1.ptr, @intCast(m1.len), &written, null);
+            if (connect_addr != null) {
+                const m = " --connect-nvim / --remote-ui";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            if (wsl_mode) {
+                const m = " --wsl";
+                _ = c.WriteFile(stderr, m.ptr, @intCast(m.len), &written, null);
+            }
+            const m2 = " (or [neovim].wsl in config.toml).\r\nRemove the conflicting option(s) and retry.\r\n";
+            _ = c.WriteFile(stderr, m2.ptr, @intCast(m2.len), &written, null);
+        }
+        const wide_title = comptime blk: {
+            const t = "zonvie: invalid options";
+            var buf: [t.len + 1]u16 = undefined;
+            for (t, 0..) |ch, idx| buf[idx] = ch;
+            buf[t.len] = 0;
+            break :blk buf;
+        };
+        const wide_msg = comptime blk: {
+            const m = "--dialog opens a dialog to choose the connection. --ssh / --devcontainer pre-select the matching tab, but it cannot be combined with --connect-nvim / --wsl (or [neovim].wsl in config.toml). Remove the conflicting option(s) and retry.";
+            var buf: [m.len + 1]u16 = undefined;
+            for (m, 0..) |ch, idx| buf[idx] = ch;
+            buf[m.len] = 0;
+            break :blk buf;
+        };
+        _ = c.MessageBoxW(null, &wide_msg, &wide_title, c.MB_OK | c.MB_ICONERROR);
+        return 1;
+    }
+
     const app = alloc.create(App) catch return 1;
     // errdefer alloc.destroy(app); // ← Remove this (causes double-free)
 
@@ -912,6 +966,7 @@ pub fn main() u8 {
         .devcontainer_config = devcontainer_config,
         .devcontainer_rebuild = devcontainer_rebuild,
         .connect_addr = connect_addr,
+        .connect_dialog = connect_dialog,
         .nvim_extra_args = nvim_extra_args,
         .cli_nvim_path = cli_nvim_path,
     };
@@ -954,6 +1009,9 @@ pub fn main() u8 {
 
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
+        // Route TAB / ENTER / ESC to the startup connection dialog while it is
+        // open (`--dialog`), so it navigates like a real dialog.
+        if (dialogs.connectionDialogPreTranslate(&msg)) continue;
         _ = c.TranslateMessage(&msg);
         _ = c.DispatchMessageW(&msg);
     }

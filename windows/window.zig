@@ -529,6 +529,7 @@ const WM_APP_CREATE_EXTERNAL_WINDOW = app_mod.WM_APP_CREATE_EXTERNAL_WINDOW;
 const WM_APP_CURSOR_GRID_CHANGED = app_mod.WM_APP_CURSOR_GRID_CHANGED;
 const WM_APP_CLOSE_EXTERNAL_WINDOW = app_mod.WM_APP_CLOSE_EXTERNAL_WINDOW;
 const WM_APP_DEFERRED_INIT = app_mod.WM_APP_DEFERRED_INIT;
+const WM_APP_SHOW_CONNECT_DIALOG = app_mod.WM_APP_SHOW_CONNECT_DIALOG;
 const WM_APP_UPDATE_IME_POSITION = app_mod.WM_APP_UPDATE_IME_POSITION;
 const WM_APP_MSG_SHOW = app_mod.WM_APP_MSG_SHOW;
 const WM_APP_MSG_CLEAR = app_mod.WM_APP_MSG_CLEAR;
@@ -1140,19 +1141,29 @@ pub export fn WndProc(
                 // taken while Zonvie is running are picked up live.
                 startThemeWatcher(hwnd);
 
-                // Native mode: perform early core init (before deferred init)
-                // WSL/SSH/devcontainer modes use the traditional WM_APP_DEFERRED_INIT path
-                const is_remote = app.wsl_mode or app.ssh_mode or app.devcontainer_mode;
-                if (!is_remote) {
-                    doEarlyCoreInit(hwnd, app) catch |e| {
-                        if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: doEarlyCoreInit failed: {any}\n", .{e});
-                    };
+                if (app.connect_dialog) {
+                    // `--connect-dialog`: the connection mode is unknown until the
+                    // user chooses it, so defer everything. Show the dialog once
+                    // the window exists (WM_APP_SHOW_CONNECT_DIALOG); its Connect
+                    // handler populates ssh_*/devcontainer_*/ext_* and posts
+                    // WM_APP_DEFERRED_INIT, which then takes the full-init path.
+                    _ = c.PostMessageW(hwnd, WM_APP_SHOW_CONNECT_DIALOG, 0, 0);
+                    if (applog.isEnabled()) applog.appLog("WM_CREATE: end (--connect-dialog: deferring start until dialog resolves)", .{});
+                } else {
+                    // Native mode: perform early core init (before deferred init)
+                    // WSL/SSH/devcontainer modes use the traditional WM_APP_DEFERRED_INIT path
+                    const is_remote = app.wsl_mode or app.ssh_mode or app.devcontainer_mode;
+                    if (!is_remote) {
+                        doEarlyCoreInit(hwnd, app) catch |e| {
+                            if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: doEarlyCoreInit failed: {any}\n", .{e});
+                        };
+                    }
+
+                    // Post deferred init message - renderer initialization happens after window is shown
+                    _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
+
+                    if (applog.isEnabled()) applog.appLog("WM_CREATE: end (posted deferred init)", .{});
                 }
-
-                // Post deferred init message - renderer initialization happens after window is shown
-                _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
-
-                if (applog.isEnabled()) applog.appLog("WM_CREATE: end (posted deferred init)", .{});
             }
             return 0;
         },
@@ -3491,6 +3502,15 @@ pub export fn WndProc(
             return 0;
         },
 
+        WM_APP_SHOW_CONNECT_DIALOG => {
+            // `--connect-dialog`: present the startup connection chooser now that
+            // the window exists. On Connect it populates the app's mode/ext
+            // fields and posts WM_APP_DEFERRED_INIT; on Cancel it quits.
+            if (getApp(hwnd)) |app| {
+                dialogs.showConnectionDialog(app, hwnd);
+            }
+            return 0;
+        },
         WM_APP_DEFERRED_INIT => {
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_DEFERRED_INIT: begin", .{});
 
