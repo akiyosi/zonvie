@@ -15,15 +15,25 @@ pub const guifont = switch (builtin.os.tag) {
     else => "Menlo:h13",
 };
 
-/// Launch the app ready for visual capture, or skip when screen capture is
-/// unavailable. Caller owns the returned Gui (defer g.deinit()).
-pub fn open(alloc: std.mem.Allocator) !*Gui {
-    // Capturing another process's window needs Screen Recording permission
-    // on macOS (System Settings > Privacy & Security > Screen Recording).
+/// Skip the calling test unless this host can capture another process's
+/// window. Every scenario that captures must call this (open() does it for
+/// you): without it, a host lacking permission reports a hard failure from
+/// deep inside captureStable instead of an honest skip.
+///
+/// Capturing needs Screen Recording permission on macOS (System Settings >
+/// Privacy & Security > Screen Recording), granted to the terminal app that
+/// spawns the test, not to the test binary.
+pub fn requireScreenAccess() !void {
     if (!driver.capture.hasScreenAccess()) {
         std.debug.print("[gui] skipped: screen capture unavailable on this host\n", .{});
         return error.SkipZigTest;
     }
+}
+
+/// Launch the app ready for visual capture, or skip when screen capture is
+/// unavailable. Caller owns the returned Gui (defer g.deinit()).
+pub fn open(alloc: std.mem.Allocator) !*Gui {
+    try requireScreenAccess();
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", "tmp/gui_app.log" } });
     errdefer g.deinit();
     // Pin the window to a fixed screen position so subpixel (ClearType)

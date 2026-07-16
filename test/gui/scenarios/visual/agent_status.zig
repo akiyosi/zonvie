@@ -8,10 +8,15 @@
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
+const fixture = @import("fixture.zig");
 const capture = driver.capture;
 const Gui = driver.Gui;
 
 pub fn run(alloc: std.mem.Allocator) !void {
+    // This scenario needs its own config_dir, so it builds the Gui itself
+    // instead of going through fixture.open() — but it captures just the same
+    // and must skip on a host without Screen Recording permission.
+    try fixture.requireScreenAccess();
     var g = try Gui.init(alloc, .{
         .config_dir = "test/gui/fixtures/config_tabline",
         .app_args = &.{ "--log", "tmp/gui_agent.log" },
