@@ -176,6 +176,15 @@ test "gui:visual_cmdline_cursor_animation" {
     }
 }
 
+test "gui:visual_scroll_then_cursor_move" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/scroll_then_cursor_move.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_proportional_font_support" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();

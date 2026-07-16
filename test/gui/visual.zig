@@ -101,6 +101,80 @@ pub fn assertMatch(alloc: std.mem.Allocator, name: []const u8, captured: capture
     }
 }
 
+/// A sub-rectangle of an image, expressed as fractions of its size so the
+/// caller does not need to know the DPI or the cell metrics.
+pub const Region = struct {
+    x0: f64 = 0.0,
+    y0: f64 = 0.0,
+    x1: f64 = 1.0,
+    y1: f64 = 1.0,
+};
+
+/// Fraction of pixels inside `region` that differ between two same-sized
+/// captures. The primitive behind assertRegionUnchanged; exposed so a
+/// scenario can also assert that something DID change (a visual test that
+/// silently observes a blank or unchanged screen is worse than no test).
+pub fn regionDiffRatio(a: capture.Image, b: capture.Image, region: Region, tol: u8) f64 {
+    const x0 = fracToPx(region.x0, a.w);
+    const x1 = fracToPx(region.x1, a.w);
+    const y0 = fracToPx(region.y0, a.h);
+    const y1 = fracToPx(region.y1, a.h);
+    if (x1 <= x0 or y1 <= y0) return 0;
+
+    var diff_count: usize = 0;
+    var y: u32 = y0;
+    while (y < y1) : (y += 1) {
+        var x: u32 = x0;
+        while (x < x1) : (x += 1) {
+            const o = (@as(usize, y) * @as(usize, a.w) + @as(usize, x)) * 4;
+            if (pixelDiffers(a, b, o, tol)) diff_count += 1;
+        }
+    }
+    const total = @as(usize, x1 - x0) * @as(usize, y1 - y0);
+    return @as(f64, @floatFromInt(diff_count)) / @as(f64, @floatFromInt(total));
+}
+
+fn fracToPx(f: f64, extent: u32) u32 {
+    const clamped = @max(0.0, @min(1.0, f));
+    const v: u32 = @intFromFloat(@floor(clamped * @as(f64, @floatFromInt(extent))));
+    return @min(v, extent);
+}
+
+/// Assert two captures FROM THE SAME RUN are identical inside `region`.
+///
+/// Unlike assertMatch this needs no golden, so it runs meaningfully on a
+/// fresh checkout and is immune to the per-environment font/DPI drift that
+/// forces goldens to be regenerated. Use it for invariants that are
+/// relational ("this must not change when X happens") rather than absolute.
+pub fn assertRegionUnchanged(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    before: capture.Image,
+    after: capture.Image,
+    region: Region,
+    opts: Options,
+) !void {
+    if (before.w != after.w or before.h != after.h) {
+        std.debug.print(
+            "[gui] size mismatch for {s}: before {d}x{d} vs after {d}x{d}\n",
+            .{ name, before.w, before.h, after.w, after.h },
+        );
+        return error.VisualSizeMismatch;
+    }
+
+    const ratio = regionDiffRatio(before, after, region, opts.tol_per_channel);
+    if (ratio > opts.max_diff_ratio) {
+        std.debug.print(
+            "[gui] region changed but must not for {s}: {d:.4} > {d:.4} of pixels in x[{d:.2},{d:.2}] y[{d:.2},{d:.2}]\n",
+            .{ name, ratio, opts.max_diff_ratio, region.x0, region.x1, region.y0, region.y1 },
+        );
+        printDiffHeatmap(before, after, opts.tol_per_channel);
+        try dumpActual(alloc, name, after);
+        try dumpDiff(alloc, name, before, after, opts.tol_per_channel);
+        return error.VisualMismatch;
+    }
+}
+
 fn absDiff(a: u8, b: u8) u8 {
     return if (a > b) a - b else b - a;
 }
