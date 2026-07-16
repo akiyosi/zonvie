@@ -15,8 +15,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try fixture.open(alloc);
     defer g.deinit();
 
-    // Set guicursor to vertical line (ver25 = 2.5 width, usually rendered as 2px)
+    // Set guicursor to vertical line (ver25 = 2.5 width, usually rendered as 2px).
+    // This REPLACES the option, dropping the blinkon0 fixture.open set for
+    // capture determinism, so put it back.
     try g.exec("execute('set guicursor=n-v-c:ver25')");
+    try g.exec("execute('set guicursor+=a:blinkon0')");
 
     // Create a buffer with mixed ASCII + CJK text on the same line
     // Using ASCII 'a' followed by CJK character '中' (2-cell wide)
