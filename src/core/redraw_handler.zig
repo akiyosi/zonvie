@@ -153,6 +153,26 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Apply mode_infos[idx] to the grid's live cursor style fields.
+///
+/// Both mode_info_set and mode_change need this. The live fields are a
+/// snapshot of a table entry, so a table rebuilt by `:set guicursor` must be
+/// re-applied to the CURRENT mode right away: Neovim does not re-send
+/// mode_change after mode_info_set, so resolving the style only on
+/// mode_change leaves the previous shape on screen until the user happens to
+/// switch modes.
+fn applyModeInfo(grid: *Grid, idx: usize) void {
+    if (!grid.cursor_style_enabled) return;
+    if (idx >= grid.mode_infos.items.len) return;
+    const mi = grid.mode_infos.items[idx];
+    grid.cursor_shape = mi.shape;
+    grid.cursor_cell_percentage = mi.cell_percentage;
+    grid.cursor_attr_id = mi.attr_id;
+    grid.cursor_blink_wait_ms = mi.blink_wait_ms;
+    grid.cursor_blink_on_ms = mi.blink_on_ms;
+    grid.cursor_blink_off_ms = mi.blink_off_ms;
+}
+
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     for (m) |p| {
         if (p.key == .str and std.mem.eql(u8, p.key.str, key) and p.val == .bool) {
@@ -1812,6 +1832,10 @@ pub fn handleRedraw(
                     }
                 }
             }
+            // The table just changed under the current mode (`:set guicursor`).
+            // Neovim sends no mode_change for it, so re-resolve the live style
+            // here or the cursor keeps its old shape until the mode changes.
+            applyModeInfo(grid, grid.current_mode_idx);
             grid.cursor_rev +%= 1;
 
 
@@ -1829,16 +1853,7 @@ pub fn handleRedraw(
 
                 grid.current_mode_idx = idx;
 
-                if (grid.cursor_style_enabled and idx < grid.mode_infos.items.len) {
-                    const mi = grid.mode_infos.items[idx];
-                    // Reflect current cursor style in Grid
-                    grid.cursor_shape = mi.shape;
-                    grid.cursor_cell_percentage = mi.cell_percentage;
-                    grid.cursor_attr_id = mi.attr_id;
-                    grid.cursor_blink_wait_ms = mi.blink_wait_ms;
-                    grid.cursor_blink_on_ms = mi.blink_on_ms;
-                    grid.cursor_blink_off_ms = mi.blink_off_ms;
-                }
+                applyModeInfo(grid, idx);
 
                 // Debug log: mode_change processed
                 if (log.cb != null) {

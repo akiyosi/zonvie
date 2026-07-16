@@ -282,6 +282,21 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(redraw_parity_tests).step);
 
+    // Cursor style tests: mode_info_set must re-resolve the current mode.
+    const cursor_style_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("test/cursor_style_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    const cursor_style_tests = b.addTest(.{
+        .root_module = cursor_style_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(cursor_style_tests).step);
+
     // Scroll fast path tests
     const scroll_test_mod = b.createModule(.{
         .target = target,
