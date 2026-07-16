@@ -52,6 +52,8 @@ extern "kernel32" fn GetProcessId(h: std.os.windows.HANDLE) callconv(.winapi) u3
 // std.os.windows.WaitForSingleObject was removed in 0.16; declare the raw call.
 extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
 const WAIT_TIMEOUT: u32 = 0x00000102;
+// std.posix.W.NOHANG went with std.posix.waitpid in 0.16 (see appAlive).
+const W_NOHANG: c_int = 1;
 
 /// Per-process sequence so each Gui gets a unique listen address even
 /// though all scenarios share the test process PID.
@@ -393,8 +395,11 @@ pub const Gui = struct {
             // the prior std wrapper, which returned an error in those cases).
             if (WaitForSingleObject(g.app_child.id.?, 0) != 0) return true;
         } else {
-            const res = std.posix.waitpid(@intCast(g.app_pid), std.posix.W.NOHANG);
-            if (res.pid == 0) return true;
+            // Zig 0.16 removed std.posix.waitpid, and process.Child exposes
+            // only a BLOCKING wait() — which would hang this liveness probe.
+            // Call libc directly (this module links libc). A 0 return means
+            // the child exists but has not exited.
+            if (std.c.waitpid(@intCast(g.app_pid), null, W_NOHANG) == 0) return true;
         }
         g.app_exited = true;
         std.debug.print("[gui] zonvie app exited unexpectedly (pid={d})\n", .{g.app_pid});
