@@ -201,7 +201,7 @@ final class ConnectionMenuViewController: NSViewController {
 
     private func layoutSSHTab(in parent: NSView, width: CGFloat) {
         let x: CGFloat = 10
-        var y = parent.bounds.height - 10
+        var y = parent.bounds.height - 26
 
         let hostLabel = NSTextField(labelWithString: "Host:")
         hostLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
@@ -237,7 +237,7 @@ final class ConnectionMenuViewController: NSViewController {
 
     private func layoutDevcontainerTab(in parent: NSView, width: CGFloat) {
         let x: CGFloat = 10
-        var y = parent.bounds.height - 10
+        var y = parent.bounds.height - 26
 
         let wsLabel = NSTextField(labelWithString: "Workspace:")
         wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
