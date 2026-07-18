@@ -228,6 +228,32 @@ fn envVarOwned(alloc: std.mem.Allocator, name: [*:0]const u8) error{ Environment
     return alloc.dupe(u8, std.mem.span(val));
 }
 
+/// Build a child-process environment map from the LIVE libc `environ` at call
+/// time (POSIX only). Returns null on Windows and on allocation failure.
+///
+/// Why this exists: `std.process.spawn` uses the shared Io's environ, which is
+/// a snapshot taken once when the Io is first initialized (see clock.zig). The
+/// frontend sets variables like SSH_ASKPASS / DISPLAY via libc `setenv` at
+/// connection time — long after Io init — and `setenv` typically reallocates
+/// the `environ` array, so the snapshot never sees them and the spawned SSH
+/// child loses its askpass hook (silent SSH auth failure). Passing a freshly
+/// scanned environ_map at spawn restores the pre-0.16 `std.process.Child`
+/// behavior of inheriting the live environment. Windows is unaffected: its Io
+/// environ is a GlobalBlock that reads the live PEB.
+fn liveEnvironMap(alloc: std.mem.Allocator) ?std.process.Environ.Map {
+    if (builtin.os.tag == .windows) return null;
+    const c_env = std.c.environ;
+    var n: usize = 0;
+    while (c_env[n] != null) : (n += 1) {}
+    const block: std.process.Environ.PosixBlock = .{ .slice = @ptrCast(c_env[0..n :null]) };
+    var map = std.process.Environ.Map.init(alloc);
+    map.putPosixBlock(block.view()) catch {
+        map.deinit();
+        return null;
+    };
+    return map;
+}
+
 /// Heap-allocated stderr pump state, refcount-managed so Core and the
 /// pump thread can release their references independently. This
 /// matters for the `:connect` orphan path: the old nvim keeps its
@@ -1793,6 +1819,12 @@ pub fn runLoop(self: *Core) void {
                 logfn(self.ctx, msg1.ptr, msg1.len);
             }
             const spawn_start_ns = clock.nowNs();
+            // Inherit the LIVE environment (incl. frontend setenv like
+            // SSH_ASKPASS) instead of the Io's init-time snapshot. See
+            // liveEnvironMap. Null on Windows / OOM → falls back to the Io
+            // environ, which is correct for native spawns.
+            var child_env = liveEnvironMap(self.alloc);
+            defer if (child_env) |*m| m.deinit();
             child = std.process.spawn(clock.io(), .{
                 .argv = argv_buf[0..argc],
                 .stdin = .pipe,
@@ -1801,6 +1833,7 @@ pub fn runLoop(self: *Core) void {
                 .create_no_window = true,
                 .cwd = child_cwd,
                 .expand_arg0 = if (has_slash) .no_expand else .expand,
+                .environ_map = if (child_env) |*m| m else null,
             }) catch |e| {
                 self.log.write("spawn failed: {any}\n", .{e});
                 if (self.cb.on_log) |logfn| {

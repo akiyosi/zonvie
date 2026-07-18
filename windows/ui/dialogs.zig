@@ -942,3 +942,425 @@ pub fn handleClipboardSetOnUIThread(app: *App) void {
     app.clipboard_result = 1;
     _ = c.SetEvent(app.clipboard_event);
 }
+
+// ============================================================
+// Startup Connection Dialog (`--connect-dialog`)
+//
+// Shown at startup when launched with `--connect-dialog`. Lets the user pick
+// the connection (Local / SSH / Devcontainer), the nvim path, ext-* UI options
+// and per-connection environment variables before nvim is spawned. On Connect
+// the selections are written back onto the App — the same ssh_*/devcontainer_*/
+// ext_*_enabled fields the CLI flags populate — and WM_APP_DEFERRED_INIT is
+// posted so the normal deferred-init full path builds the command and starts
+// nvim. On Cancel the app quits. Mirrors the macOS ConnectionMenuViewController.
+// ============================================================
+
+var g_connection_dialog_hwnd: ?c.HWND = null;
+var g_conn_font: ?c.HFONT = null;
+
+var g_conn_name_hwnd: ?c.HWND = null;
+var g_conn_nvim_hwnd: ?c.HWND = null;
+var g_conn_local_hwnd: ?c.HWND = null;
+var g_conn_ssh_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_hwnd: ?c.HWND = null;
+var g_conn_ssh_host_hwnd: ?c.HWND = null;
+var g_conn_ssh_port_hwnd: ?c.HWND = null;
+var g_conn_ssh_identity_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_workspace_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_config_hwnd: ?c.HWND = null;
+var g_conn_devcontainer_rebuild_hwnd: ?c.HWND = null;
+var g_conn_env_hwnd: ?c.HWND = null;
+var g_conn_ext_cmdline_hwnd: ?c.HWND = null;
+var g_conn_ext_popup_hwnd: ?c.HWND = null;
+var g_conn_ext_messages_hwnd: ?c.HWND = null;
+var g_conn_ext_tabline_hwnd: ?c.HWND = null;
+var g_conn_ext_windows_hwnd: ?c.HWND = null;
+var g_conn_connect_hwnd: ?c.HWND = null;
+var g_conn_cancel_hwnd: ?c.HWND = null;
+
+/// TAB / ENTER / ESC handling for the connection dialog. Called from the main
+/// message loop before TranslateMessage; returns true when the message was
+/// consumed by the dialog (the loop then skips normal dispatch).
+pub fn connectionDialogPreTranslate(msg: *c.MSG) bool {
+    const hwnd = g_connection_dialog_hwnd orelse return false;
+    return c.IsDialogMessageW(hwnd, msg) != 0;
+}
+
+pub fn showConnectionDialog(app: *App, owner: c.HWND) void {
+    if (g_connection_dialog_hwnd) |hwnd| {
+        _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+        _ = c.SetForegroundWindow(hwnd);
+        return;
+    }
+
+    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
+    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
+    wc.lpfnWndProc = connectionDialogProc;
+    wc.hInstance = c.GetModuleHandleW(null);
+    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512));
+    wc.hbrBackground = c.GetSysColorBrush(c.COLOR_BTNFACE);
+    wc.lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectDialogWin");
+    _ = c.RegisterClassExW(&wc);
+
+    const hwnd = c.CreateWindowExW(
+        c.WS_EX_DLGMODALFRAME,
+        wc.lpszClassName,
+        std.unicode.utf8ToUtf16LeStringLiteral("Connect"),
+        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        546,
+        640,
+        owner,
+        null,
+        wc.hInstance,
+        app,
+    );
+    if (hwnd == null) return;
+    g_connection_dialog_hwnd = hwnd;
+    _ = c.ShowWindow(hwnd, c.SW_SHOWNORMAL);
+    _ = c.SetForegroundWindow(hwnd);
+    _ = c.UpdateWindow(hwnd);
+}
+
+fn connectionFont() ?c.HFONT {
+    if (g_conn_font) |f| return f;
+    // Negative height = character height in device units; -14 ≈ 10.5pt @96dpi.
+    g_conn_font = c.CreateFontW(
+        -14,
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.CLEARTYPE_QUALITY,
+        c.DEFAULT_PITCH | c.FF_DONTCARE,
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+    );
+    return g_conn_font;
+}
+
+fn applyFont(hwnd: ?c.HWND) void {
+    const h = hwnd orelse return;
+    const f = connectionFont() orelse return;
+    _ = c.SendMessageW(h, c.WM_SETFONT, @intFromPtr(f), 1);
+}
+
+fn createLabel(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_int) void {
+    const h = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), text, c.WS_CHILD | c.WS_VISIBLE, x, y, w, 18, parent, null, c.GetModuleHandleW(null), null);
+    applyFont(h);
+}
+
+fn createEdit(parent: c.HWND, x: c_int, y: c_int, w: c_int) ?c.HWND {
+    const h = c.CreateWindowExW(c.WS_EX_CLIENTEDGE, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), null, c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.ES_AUTOHSCROLL, x, y, w, 24, parent, null, c.GetModuleHandleW(null), null);
+    applyFont(h);
+    return h;
+}
+
+// `group` marks the first radio of a group (WS_GROUP defines the auto-radio
+// mutual-exclusion boundary) — it must sit on the first radio regardless of
+// which one starts checked. `checked` sets the initial selection.
+fn createRadio(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_int, group: bool, checked: bool) ?c.HWND {
+    const style: c.DWORD =
+        @as(c.DWORD, @intCast(c.WS_CHILD)) |
+        @as(c.DWORD, @intCast(c.WS_VISIBLE)) |
+        @as(c.DWORD, @intCast(c.WS_TABSTOP)) |
+        @as(c.DWORD, @intCast(c.BS_AUTORADIOBUTTON)) |
+        if (group) @as(c.DWORD, @intCast(c.WS_GROUP)) else 0;
+    const h = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), text, style, x, y, w, 20, parent, null, c.GetModuleHandleW(null), null);
+    applyFont(h);
+    if (checked and h != null) _ = c.SendMessageW(h, c.BM_SETCHECK, c.BST_CHECKED, 0);
+    return h;
+}
+
+/// Set an EDIT control's text from a UTF-8 slice. Used to seed SSH/devcontainer
+/// fields from the CLI values when `--ssh` / `--devcontainer` accompany `--dialog`.
+fn setEditTextUtf8(hwnd_opt: ?c.HWND, text: []const u8) void {
+    const hwnd = hwnd_opt orelse return;
+    if (text.len == 0) return;
+    var wide: [1024]u16 = std.mem.zeroes([1024]u16);
+    const wl = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
+    wide[@min(wl, wide.len - 1)] = 0;
+    _ = c.SetWindowTextW(hwnd, &wide);
+}
+
+fn createCheck(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_int, checked: bool) ?c.HWND {
+    const h = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), text, c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.BS_AUTOCHECKBOX, x, y, w, 20, parent, null, c.GetModuleHandleW(null), null);
+    applyFont(h);
+    if (checked and h != null) _ = c.SendMessageW(h, c.BM_SETCHECK, c.BST_CHECKED, 0);
+    return h;
+}
+
+fn createButton(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_int, default: bool) ?c.HWND {
+    const base: c.DWORD = @as(c.DWORD, @intCast(c.WS_CHILD)) | @as(c.DWORD, @intCast(c.WS_VISIBLE)) | @as(c.DWORD, @intCast(c.WS_TABSTOP));
+    const style: c.DWORD = base | if (default) @as(c.DWORD, @intCast(c.BS_DEFPUSHBUTTON)) else @as(c.DWORD, @intCast(c.BS_PUSHBUTTON));
+    const h = c.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"), text, style, x, y, w, 28, parent, null, c.GetModuleHandleW(null), null);
+    applyFont(h);
+    return h;
+}
+
+fn createConnectionControls(hwnd: c.HWND, app: *App) void {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    createLabel(hwnd, L("Name"), 14, 12, 200);
+    g_conn_name_hwnd = createEdit(hwnd, 14, 32, 500);
+    createLabel(hwnd, L("Nvim Path (empty = default)"), 14, 62, 300);
+    g_conn_nvim_hwnd = createEdit(hwnd, 14, 82, 500);
+
+    // Pre-select the tab from the CLI: `--ssh` / `--devcontainer` accompanying
+    // `--dialog` focus that mode (fields seeded below); otherwise Local.
+    const init_ssh = app.ssh_mode;
+    const init_devcontainer = app.devcontainer_mode and !app.ssh_mode;
+    const init_local = !init_ssh and !init_devcontainer;
+    g_conn_local_hwnd = createRadio(hwnd, L("Local"), 14, 116, 70, true, init_local);
+    g_conn_ssh_hwnd = createRadio(hwnd, L("SSH"), 92, 116, 60, false, init_ssh);
+    g_conn_devcontainer_hwnd = createRadio(hwnd, L("Devcontainer"), 160, 116, 130, false, init_devcontainer);
+
+    createLabel(hwnd, L("SSH Host"), 14, 150, 120);
+    g_conn_ssh_host_hwnd = createEdit(hwnd, 14, 170, 240);
+    createLabel(hwnd, L("SSH Port"), 270, 150, 80);
+    g_conn_ssh_port_hwnd = createEdit(hwnd, 270, 170, 70);
+    createLabel(hwnd, L("SSH Identity"), 14, 202, 120);
+    g_conn_ssh_identity_hwnd = createEdit(hwnd, 14, 222, 500);
+
+    createLabel(hwnd, L("Devcontainer Workspace"), 14, 254, 200);
+    g_conn_devcontainer_workspace_hwnd = createEdit(hwnd, 14, 274, 500);
+    createLabel(hwnd, L("Devcontainer Config"), 14, 304, 200);
+    g_conn_devcontainer_config_hwnd = createEdit(hwnd, 14, 324, 500);
+    g_conn_devcontainer_rebuild_hwnd = createCheck(hwnd, L("Rebuild on start"), 14, 354, 200, app.devcontainer_rebuild);
+
+    // Seed the mode-specific fields from the CLI values (if any).
+    if (app.ssh_host) |host| setEditTextUtf8(g_conn_ssh_host_hwnd, host);
+    if (app.ssh_port) |port| {
+        var pbuf: [8]u8 = undefined;
+        const s = std.fmt.bufPrint(&pbuf, "{d}", .{port}) catch "";
+        setEditTextUtf8(g_conn_ssh_port_hwnd, s);
+    }
+    if (app.ssh_identity) |identity| setEditTextUtf8(g_conn_ssh_identity_hwnd, identity);
+    if (app.devcontainer_workspace) |ws| setEditTextUtf8(g_conn_devcontainer_workspace_hwnd, ws);
+    if (app.devcontainer_config) |cfg| setEditTextUtf8(g_conn_devcontainer_config_hwnd, cfg);
+
+    createLabel(hwnd, L("Options"), 14, 386, 200);
+    g_conn_ext_cmdline_hwnd = createCheck(hwnd, L("ext-cmdline"), 14, 408, 120, app.ext_cmdline_enabled);
+    g_conn_ext_popup_hwnd = createCheck(hwnd, L("ext-popupmenu"), 150, 408, 140, app.config.popup.external);
+    g_conn_ext_messages_hwnd = createCheck(hwnd, L("ext-messages"), 300, 408, 130, app.ext_messages_enabled);
+    g_conn_ext_tabline_hwnd = createCheck(hwnd, L("ext-tabline"), 14, 432, 120, app.ext_tabline_enabled);
+    g_conn_ext_windows_hwnd = createCheck(hwnd, L("ext-windows"), 150, 432, 130, app.ext_windows_enabled);
+
+    createLabel(hwnd, L("Environment Variables (KEY=VALUE per line)"), 14, 462, 400);
+    g_conn_env_hwnd = c.CreateWindowExW(
+        c.WS_EX_CLIENTEDGE,
+        L("EDIT"),
+        null,
+        c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.WS_VSCROLL | c.ES_MULTILINE | c.ES_AUTOVSCROLL | c.ES_WANTRETURN,
+        14,
+        482,
+        500,
+        62,
+        hwnd,
+        null,
+        c.GetModuleHandleW(null),
+        null,
+    );
+    applyFont(g_conn_env_hwnd);
+
+    g_conn_connect_hwnd = createButton(hwnd, L("Connect"), 340, 556, 86, true);
+    g_conn_cancel_hwnd = createButton(hwnd, L("Cancel"), 434, 556, 86, false);
+}
+
+fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    switch (msg) {
+        c.WM_CREATE => {
+            const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            const app: *App = @ptrCast(@alignCast(cs.lpCreateParams.?));
+            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
+            createConnectionControls(hwnd, app);
+            return 0;
+        },
+        c.WM_COMMAND => {
+            // Button HWND values arriving in lParam have no alignment guarantee;
+            // compare raw addresses instead of going through @ptrFromInt (which
+            // would trip Zig's Debug alignment check on low-bit-set handles).
+            const id: usize = wParam & 0xFFFF;
+            const source_addr: usize = if (lParam == 0) 0 else @bitCast(lParam);
+            const cancel_addr: usize = if (g_conn_cancel_hwnd) |h| @intFromPtr(h) else 0;
+            const connect_addr: usize = if (g_conn_connect_hwnd) |h| @intFromPtr(h) else 0;
+
+            // ESC routed by IsDialogMessageW arrives as WM_COMMAND / IDCANCEL
+            // with no source control (lParam == 0).
+            if (id == c.IDCANCEL and lParam == 0) {
+                cancelConnectionDialog(hwnd);
+                return 0;
+            }
+            if (source_addr == cancel_addr and cancel_addr != 0) {
+                cancelConnectionDialog(hwnd);
+                return 0;
+            }
+            if (source_addr == connect_addr and connect_addr != 0) {
+                if (applog.isEnabled()) applog.appLog("[win] connection dialog: Connect clicked\n", .{});
+                const owner = c.GetWindow(hwnd, c.GW_OWNER) orelse hwnd;
+                const app_opt: ?*App = blk: {
+                    const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
+                    if (v == 0) break :blk null;
+                    break :blk @ptrFromInt(@as(usize, @bitCast(v)));
+                };
+                if (app_opt) |app| {
+                    applyConnectionAndStart(app, owner);
+                    _ = c.DestroyWindow(hwnd);
+                } else if (applog.isEnabled()) {
+                    applog.appLog("[win] connection dialog: GWLP_USERDATA missing, leaving dialog open\n", .{});
+                }
+                return 0;
+            }
+        },
+        c.WM_CLOSE => {
+            cancelConnectionDialog(hwnd);
+            return 0;
+        },
+        c.WM_DESTROY => {
+            g_connection_dialog_hwnd = null;
+            g_conn_name_hwnd = null;
+            g_conn_nvim_hwnd = null;
+            g_conn_local_hwnd = null;
+            g_conn_ssh_hwnd = null;
+            g_conn_devcontainer_hwnd = null;
+            g_conn_ssh_host_hwnd = null;
+            g_conn_ssh_port_hwnd = null;
+            g_conn_ssh_identity_hwnd = null;
+            g_conn_devcontainer_workspace_hwnd = null;
+            g_conn_devcontainer_config_hwnd = null;
+            g_conn_devcontainer_rebuild_hwnd = null;
+            g_conn_env_hwnd = null;
+            g_conn_ext_cmdline_hwnd = null;
+            g_conn_ext_popup_hwnd = null;
+            g_conn_ext_messages_hwnd = null;
+            g_conn_ext_tabline_hwnd = null;
+            g_conn_ext_windows_hwnd = null;
+            g_conn_connect_hwnd = null;
+            g_conn_cancel_hwnd = null;
+            return 0;
+        },
+        else => {},
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/// Cancel = quit the app. No connection was chosen and, unlike the start-
+/// failure path, the core was never created (WM_APP_DEFERRED_INIT was never
+/// posted), so there is nothing to tear down — exit the message loop directly.
+fn cancelConnectionDialog(hwnd: c.HWND) void {
+    if (applog.isEnabled()) applog.appLog("[win] connection dialog: cancelled, quitting\n", .{});
+    _ = c.DestroyWindow(hwnd);
+    c.PostQuitMessage(0);
+}
+
+/// Write the dialog's selections back onto the App (mirroring how CLI flags
+/// populate these fields) and kick off the normal deferred-init full path,
+/// which builds the nvim command from ssh_mode/devcontainer_mode/ext_* and
+/// starts nvim. Dialog-provided strings are duped from app.alloc; they live
+/// for the process lifetime (single startup, freed on exit).
+fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
+    var nvim_buf: [512]u8 = undefined;
+    const nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
+    if (nvim_path.len != 0) {
+        if (app.alloc.dupe(u8, nvim_path)) |p| {
+            app.cli_nvim_path = p;
+        } else |_| {}
+    }
+
+    const is_ssh = isChecked(g_conn_ssh_hwnd);
+    const is_devcontainer = isChecked(g_conn_devcontainer_hwnd);
+
+    if (is_ssh) {
+        app.ssh_mode = true;
+        app.devcontainer_mode = false;
+        var host_buf: [256]u8 = undefined;
+        const host = readWindowTextUtf8(g_conn_ssh_host_hwnd, &host_buf);
+        app.ssh_host = if (host.len != 0) (app.alloc.dupe(u8, host) catch null) else null;
+        var port_buf: [32]u8 = undefined;
+        const port_text = readWindowTextUtf8(g_conn_ssh_port_hwnd, &port_buf);
+        app.ssh_port = if (port_text.len != 0) (std.fmt.parseInt(u16, port_text, 10) catch null) else null;
+        var id_buf: [512]u8 = undefined;
+        const identity = readWindowTextUtf8(g_conn_ssh_identity_hwnd, &id_buf);
+        app.ssh_identity = if (identity.len != 0) (app.alloc.dupe(u8, identity) catch null) else null;
+    } else if (is_devcontainer) {
+        app.devcontainer_mode = true;
+        app.ssh_mode = false;
+        var ws_buf: [512]u8 = undefined;
+        const ws = readWindowTextUtf8(g_conn_devcontainer_workspace_hwnd, &ws_buf);
+        app.devcontainer_workspace = if (ws.len != 0) (app.alloc.dupe(u8, ws) catch null) else null;
+        var cfg_buf: [512]u8 = undefined;
+        const cfg = readWindowTextUtf8(g_conn_devcontainer_config_hwnd, &cfg_buf);
+        app.devcontainer_config = if (cfg.len != 0) (app.alloc.dupe(u8, cfg) catch null) else null;
+        app.devcontainer_rebuild = isChecked(g_conn_devcontainer_rebuild_hwnd);
+    } else {
+        // Local: clear any config-derived remote mode.
+        app.ssh_mode = false;
+        app.devcontainer_mode = false;
+    }
+
+    // ext-* options. popup has no dedicated app field; it is read from
+    // app.config.popup.external at start, so override that directly.
+    app.ext_cmdline_enabled = isChecked(g_conn_ext_cmdline_hwnd);
+    app.config.popup.external = isChecked(g_conn_ext_popup_hwnd);
+    app.ext_messages_enabled = isChecked(g_conn_ext_messages_hwnd);
+    app.ext_tabline_enabled = isChecked(g_conn_ext_tabline_hwnd);
+    app.ext_windows_enabled = isChecked(g_conn_ext_windows_hwnd);
+
+    applyConnectionEnvVars();
+
+    if (applog.isEnabled()) applog.appLog("[win] connection dialog: connect ssh={} devcontainer={}\n", .{ app.ssh_mode, app.devcontainer_mode });
+
+    // Resolve the connection in-process: run the deferred-init full path
+    // against the now-populated app fields (early_core_init_done is false, so
+    // it takes the ssh/devcontainer/native branch).
+    _ = c.PostMessageW(owner, app_mod.WM_APP_DEFERRED_INIT, 0, 0);
+}
+
+/// Parse the env-vars edit (KEY=VALUE per line) and apply to the process
+/// environment so the spawned nvim inherits them. Mirrors the macOS setenv
+/// loop; SetEnvironmentVariableW is process-wide (startup one-shot).
+fn applyConnectionEnvVars() void {
+    const hwnd = g_conn_env_hwnd orelse return;
+    var wide: [4096]u16 = std.mem.zeroes([4096]u16);
+    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    if (len <= 0) return;
+    var utf8_buf: [8192]u8 = undefined;
+    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wide[0..@intCast(len)]) catch return;
+    var it = std.mem.splitScalar(u8, utf8_buf[0..utf8_len], '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        if (key.len == 0) continue;
+        const val = line[eq + 1 ..];
+        var key_w: [256]u16 = std.mem.zeroes([256]u16);
+        var val_w: [1024]u16 = std.mem.zeroes([1024]u16);
+        const kl = std.unicode.utf8ToUtf16Le(&key_w, key) catch continue;
+        key_w[@min(kl, key_w.len - 1)] = 0;
+        const vl = std.unicode.utf8ToUtf16Le(&val_w, val) catch continue;
+        val_w[@min(vl, val_w.len - 1)] = 0;
+        _ = c.SetEnvironmentVariableW(&key_w, &val_w);
+    }
+}
+
+fn readWindowTextUtf8(hwnd_opt: ?c.HWND, dest: []u8) []const u8 {
+    const hwnd = hwnd_opt orelse return "";
+    var wide: [512]u16 = std.mem.zeroes([512]u16);
+    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    if (len <= 0) return "";
+    const slice = wide[0..@intCast(len)];
+    const utf8_len = std.unicode.utf16LeToUtf8(dest, slice) catch return "";
+    return dest[0..utf8_len];
+}
+
+fn isChecked(hwnd_opt: ?c.HWND) bool {
+    const hwnd = hwnd_opt orelse return false;
+    return c.SendMessageW(hwnd, c.BM_GETCHECK, 0, 0) == c.BST_CHECKED;
+}

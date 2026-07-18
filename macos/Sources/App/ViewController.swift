@@ -4,6 +4,11 @@ import MetalKit
 final class ViewController: NSViewController {
     private var terminalView: MetalTerminalView!
     private(set) var core: ZonvieCore!
+
+    /// Set by AppDelegate when this window hosts a "New Session": show the
+    /// connection dialog on appear (regardless of the global `--dialog` flag)
+    /// and, on Cancel, close this window rather than quitting the app.
+    var forceConnectDialog = false
     private var tabBarView: TabBarView?
     private var sidebarView: TabSidebarView?
 
@@ -17,6 +22,13 @@ final class ViewController: NSViewController {
 
     // Current tab list for lookup
     private var currentTabs: [(handle: Int64, name: String)] = []
+
+    // `--dialog` startup dialog: deferred to viewDidAppear (needs a window to
+    // host the sheet). `pendingConnectDialog` is armed in viewDidLoad when the
+    // flag is set; `connectDialogShown` guards against a second presentation on
+    // repeated viewDidAppear calls.
+    private var pendingConnectDialog = false
+    private var connectDialogShown = false
 
     override func loadView() {
         self.view = NSView()
@@ -88,6 +100,16 @@ final class ViewController: NSViewController {
         core.terminalView = terminalView
         terminalView.core = core
 
+        // `--dialog` (startup) or a New Session window: defer nvim launch until
+        // the user chooses a connection in the dialog (presented from
+        // viewDidAppear). Skip the config-driven ext pre-apply and start below —
+        // the chosen ConnectionConfig drives ext_* and the connection mode.
+        if connectDialogEnabled || forceConnectDialog {
+            pendingConnectDialog = true
+            ZonvieCore.appLog("[ViewController] dialog: deferring start until connection dialog is dismissed")
+            return
+        }
+
         // Enable ext_popupmenu if configured (must be before start())
         if config.popup.external {
             core.setExtPopupmenu(true)
@@ -129,6 +151,87 @@ final class ViewController: NSViewController {
                 if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "native") }
             }
         }
+    }
+
+    /// Present the interactive connection chooser (`--dialog`). On Connect the
+    /// chosen ConnectionConfig drives `core.start()`; on Cancel the app quits
+    /// (the user launched the picker deliberately and declined to connect).
+    private func presentConnectionDialog() {
+        let menu = ConnectionMenuViewController()
+        // `--ssh --dialog` / `--devcontainer --dialog`: seed the CLI startup
+        // dialog. New Session windows (forceConnectDialog) start blank/local.
+        if !forceConnectDialog {
+            menu.initialTab = dialogInitialTab
+            menu.seedConfig = dialogSeedConfig
+        }
+        menu.onConnect = { [weak self] cfg in
+            self?.startWithConnection(cfg)
+        }
+        menu.onCancel = { [weak self] in
+            guard let self = self else { return }
+            if self.forceConnectDialog {
+                // New Session window cancelled: close just this window.
+                ZonvieCore.appLog("[ViewController] New Session cancelled: closing window")
+                self.view.window?.close()
+            } else {
+                // The user launched the picker deliberately and declined: quit.
+                ZonvieCore.appLog("[ViewController] --dialog: dialog cancelled, terminating")
+                NSApp.terminate(nil)
+            }
+        }
+        presentAsSheet(menu)
+    }
+
+    /// Launch nvim for the tile's current window using an explicit
+    /// ConnectionConfig chosen in the `--dialog` dialog. Mirrors viewDidLoad's
+    /// start dispatch, but feeds the connection through `core.connectionConfig`
+    /// (which takes priority over CLI flags / config.toml inside start()).
+    private func startWithConnection(_ cfg: ConnectionConfig) {
+        // Apply per-connection environment variables (KEY=VALUE per line) before
+        // the core spawns nvim, so the child inherits them.
+        for line in cfg.envVars.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || !trimmed.contains("=") { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            if parts.count == 2 {
+                setenv(String(parts[0]), String(parts[1]), 1)
+            }
+        }
+
+        core.connectionConfig = cfg
+
+        // Label this session window from the chosen connection (menu-bar title).
+        SessionManager.shared.rename(self, to: Self.sessionName(for: cfg))
+
+        let nvimPath = cfg.nvimPath.isEmpty
+            ? (cliNvimPath ?? ZonvieConfig.shared.neovim.path)
+            : cfg.nvimPath
+
+        ZonvieCore.appLog("[ViewController] --dialog: starting core name=\(cfg.name) isSSH=\(cfg.isSSH) isDevcontainer=\(cfg.isDevcontainer)")
+
+        // SSH/devcontainer modes need the main RunLoop for their auth dialogs
+        // (same rationale as viewDidLoad); local connections start off-main.
+        if cfg.isSSH || cfg.isDevcontainer {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog ssh/devcontainer") }
+            }
+        } else {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog native") }
+            }
+        }
+    }
+
+    /// Menu-bar label for a session's connection config.
+    static func sessionName(for cfg: ConnectionConfig) -> String {
+        if !cfg.name.isEmpty { return cfg.name }
+        if cfg.isSSH { return cfg.sshHost.isEmpty ? "SSH" : "SSH: \(cfg.sshHost)" }
+        if cfg.isDevcontainer { return "Devcontainer" }
+        return "Local"
     }
 
     /// Surface a synchronous start() / start_connect() failure to the user
@@ -212,6 +315,12 @@ final class ViewController: NSViewController {
         // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
         if tablineUpdateObserver == nil {
             setupTablineNotificationObservers()
+        }
+        // Present the `--dialog` dialog once, after the window exists so it can
+        // host the sheet.
+        if pendingConnectDialog && !connectDialogShown {
+            connectDialogShown = true
+            presentConnectionDialog()
         }
     }
 
