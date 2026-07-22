@@ -38,6 +38,17 @@ const GsubCacheEntry = struct {
     valid: bool = false,
 };
 
+/// Convert a `guifont` point size to the em size in device pixels.
+///
+/// A point is 1/72 inch. DWrite's font size parameter is in DIPs (1/96
+/// inch), so a point size must be scaled by 96/72 before it is handed to
+/// DWrite, and by dpi/96 to reach device pixels -- the two collapse into
+/// dpi/72. Treating `:hN` as DIPs instead rendered text at 72/96 = 0.75x
+/// the size every other Neovim GUI shows for the same `guifont`.
+fn emSizePxForPointSize(dpi: u32, point_size: f32) f32 {
+    return point_size * @as(f32, @floatFromInt(dpi)) / 72.0;
+}
+
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
@@ -2423,8 +2434,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const dw_style: c.DWRITE_FONT_STYLE = if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL;
 
         // DPI scaling: scale point size to physical pixels
-        const dpi_scale: f32 = @as(f32, @floatFromInt(self.dpi)) / 96.0;
-        const scaled_size: f32 = point_size * dpi_scale;
+        const scaled_size: f32 = emSizePxForPointSize(self.dpi, point_size);
 
         // Early return if font is unchanged - preserve pre-warmed caches
         if (self.font_face != null and
@@ -2916,8 +2926,7 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
             const factory = self.dwrite_factory.?;
             const vtbl = factory.lpVtbl.*;
             if (vtbl.CreateTextFormat) |create_fn| {
-                const dpi_scale: f32 = @as(f32, @floatFromInt(new_dpi)) / 96.0;
-                const new_font_size: f32 = self.base_point_size * dpi_scale;
+                const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
                 var new_fmt: ?*c.IDWriteTextFormat = null;
                 const hr = create_fn(
                     factory,
