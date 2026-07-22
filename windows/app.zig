@@ -962,6 +962,15 @@ pub const TripleBufferedSurface = struct {
                 }
             }
 
+            // A spare set that never saw this layout (e.g. a surface whose
+            // committed set was seeded directly, so the spare row_maps are
+            // still empty) cannot be caught up by row indices: sparse sync
+            // indexes both maps by the same row. Force the full copy path,
+            // matching the guard syncVertexSetForWrite already applies.
+            if (self.sets[idx].row_map.items.len != new_set.row_map.items.len) {
+                self.sparse_sync.row_sync_full[i] = true;
+            }
+
             if (self.ui_read_refcount[i] == 0) {
                 if (self.sparse_sync.row_sync_full[i]) {
                     if (self.shallowCopyVertexSet(alloc, idx, new_committed)) {
