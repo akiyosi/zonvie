@@ -5455,12 +5455,23 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
     sendExternalGridVerticesFiltered(self, force_render, null);
 }
 
+fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
+    // Synthetic grid builders run inside the frontend flush bracket. They
+    // retain their source dirty flag on failure; aborting prevents the
+    // partially rebuilt grid from being committed before that retry.
+    self.flush_aborted = true;
+    self.log.write("[{s}] overflow map update failed: {any}\n", .{ scope, err });
+}
+
 /// Check for cmdline state changes and create/update/close external float window via Neovim API.
 /// The cmdline is rendered by Neovim in an external float window.
 pub fn notifyCmdlineChanges(self: *Core) void {
     if (!self.grid.cmdline_dirty) return;
     if (!self.ext_cmdline_enabled) return;
-    defer self.grid.clearCmdlineDirty();
+    // NOTE: dirty is cleared explicitly at each success-return path below, NOT
+    // via defer — on resizeGrid/setWinExternalPos failure (OOM only) we must
+    // leave cmdline_dirty set so the next flush retries, per the "clear dirty
+    // only after successful submission" rule.
 
     // Check if any cmdline is visible, find the highest level (most recent)
     var any_visible = false;
@@ -5481,12 +5492,19 @@ pub fn notifyCmdlineChanges(self: *Core) void {
 
     // Handle cmdline_block mode (multi-line input like :lua <<EOF)
     if (block_visible and block_line_count > 0) {
-        sendCmdlineBlockShow(self, any_visible, visible_level);
+        if (sendCmdlineBlockShow(self, any_visible, visible_level)) {
+            self.grid.clearCmdlineDirty();
+        }
         return;
     }
 
     if (any_visible) {
-        const state = self.grid.cmdline_states.getPtr(visible_level) orelse return;
+        const state = self.grid.cmdline_states.getPtr(visible_level) orelse {
+            // No state for this level: nothing to show, and no future retry
+            // makes this succeed for the same dirty state — clear it now.
+            self.grid.clearCmdlineDirty();
+            return;
+        };
         const cmdline_grid_id = grid_mod.CMDLINE_GRID_ID;
 
         // Record command content for split view label
@@ -5620,7 +5638,7 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         // Create or resize cmdline grid
         self.grid.resizeGrid(cmdline_grid_id, 1, width) catch |e| {
             self.log.write("[cmdline] resizeGrid failed: {any}\n", .{e});
-            return;
+            return; // cmdline_dirty stays set; retry next flush
         };
         self.grid.clearGrid(cmdline_grid_id);
 
@@ -5641,6 +5659,16 @@ pub fn notifyCmdlineChanges(self: *Core) void {
                 if (s.logical_col.* >= s.scroll_offset) {
                     if (s.grid_col.* >= s.width) return false;
                     s.grid.putCellGrid(s.grid_id, 0, s.grid_col.*, cp, hl_id);
+                    s.grid_col.* += 1;
+                }
+                s.logical_col.* += 1;
+                return true;
+            }
+
+            fn writeCluster(s: @This(), cp: u32, hl_id: u32, extras: []const u32) !bool {
+                if (s.logical_col.* >= s.scroll_offset) {
+                    if (s.grid_col.* >= s.width) return false;
+                    try s.grid.putCellGridCluster(s.grid_id, 0, s.grid_col.*, cp, hl_id, extras);
                     s.grid_col.* += 1;
                 }
                 s.logical_col.* += 1;
@@ -5668,14 +5696,17 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             while (pbyte_i < state.prompt.len) {
                 const pc = scanEmojiCluster(state.prompt, pbyte_i);
                 if (pc.codepoint_count == 0) break;
-                const pre_col = grid_col;
-                if (!writer.writeCell(pc.first_cp, state.prompt_hl_id)) break;
-                const written = grid_col > pre_col;
+                const wrote_base = writer.writeCluster(
+                    pc.first_cp,
+                    state.prompt_hl_id,
+                    pc.extras[0..pc.extras_len],
+                ) catch |e| {
+                    abortClusterUpdate(self, "cmdline", e);
+                    return;
+                };
+                if (!wrote_base) break;
                 if (pc.display_width >= 2) {
                     if (!writer.writeCell(0, state.prompt_hl_id)) break;
-                }
-                if (pc.extras_len > 0 and written) {
-                    self.grid.putOverflow(cmdline_grid_id, 0, pre_col, pc.extras[0..pc.extras_len]);
                 }
                 pbyte_i = pc.end_byte;
             }
@@ -5712,19 +5743,19 @@ pub fn notifyCmdlineChanges(self: *Core) void {
 
                 // Write the base cell. Track whether it was actually written
                 // (scrolled-off cells are skipped by writeCell).
-                const pre_grid_col = grid_col;
-                if (!writer.writeCell(cluster.first_cp, chunk.hl_id)) break;
-                const cell_was_written = grid_col > pre_grid_col;
+                const wrote_base = writer.writeCluster(
+                    cluster.first_cp,
+                    chunk.hl_id,
+                    cluster.extras[0..cluster.extras_len],
+                ) catch |e| {
+                    abortClusterUpdate(self, "cmdline", e);
+                    return;
+                };
+                if (!wrote_base) break;
 
                 // Continuation cell only for double-width characters
                 if (cluster.display_width >= 2) {
                     if (!writer.writeCell(0, chunk.hl_id)) break;
-                }
-
-                // Store extras in overflow map only if the cell was actually
-                // written to the grid (not scrolled off the left edge).
-                if (cluster.extras_len > 0 and cell_was_written) {
-                    self.grid.putOverflow(cmdline_grid_id, 0, pre_grid_col, cluster.extras[0..cluster.extras_len]);
                 }
 
                 byte_i = cluster.end_byte;
@@ -5737,14 +5768,17 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             while (sbyte_i < special.len) {
                 const sc = scanEmojiCluster(special, sbyte_i);
                 if (sc.codepoint_count == 0) break;
-                const pre_col = grid_col;
-                if (!writer.writeCell(sc.first_cp, 0)) break;
-                const written = grid_col > pre_col;
+                const wrote_base = writer.writeCluster(
+                    sc.first_cp,
+                    0,
+                    sc.extras[0..sc.extras_len],
+                ) catch |e| {
+                    abortClusterUpdate(self, "cmdline", e);
+                    return;
+                };
+                if (!wrote_base) break;
                 if (sc.display_width >= 2) {
                     if (!writer.writeCell(0, 0)) break;
-                }
-                if (sc.extras_len > 0 and written) {
-                    self.grid.putOverflow(cmdline_grid_id, 0, pre_col, sc.extras[0..sc.extras_len]);
                 }
                 sbyte_i = sc.end_byte;
             }
@@ -5757,7 +5791,7 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         // Mark as external grid
         _ = self.grid.setWinExternalPos(cmdline_grid_id, 0) catch |e| {
             self.log.write("[cmdline] setWinExternalPos failed: {any}\n", .{e});
-            return;
+            return; // cmdline_dirty stays set; retry next flush
         };
 
         // Save current cursor position before switching to cmdline (only if not already on cmdline)
@@ -5777,15 +5811,23 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         self.grid.cursor_valid = true;
 
         self.log.write("[cmdline] show: width={d} cursor={d} display_width={d}\n", .{ width, cursor_col, display_width });
+        self.grid.clearCmdlineDirty();
     } else if (!block_visible) {
         // No cmdline visible and no block visible - close the external float window
         sendCmdlineHide(self);
+        self.grid.clearCmdlineDirty();
+    } else {
+        // block_visible with zero block lines and no visible cmdline level:
+        // nothing to show or hide. No retry makes this same dirty state
+        // succeed, so clear it (the removed blanket defer also cleared here);
+        // otherwise cmdline_dirty stays set and this scan re-runs every flush.
+        self.grid.clearCmdlineDirty();
     }
 }
 
 /// Handle cmdline_block mode (multi-line input).
 /// Shows all block lines + current cmdline line in a multi-row grid.
-pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_level: u32) void {
+pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_level: u32) bool {
     const cmdline_grid_id = grid_mod.CMDLINE_GRID_ID;
     const block_lines = self.grid.cmdline_block.lines.items;
     const block_line_count: u32 = @intCast(block_lines.len);
@@ -5880,7 +5922,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     // Create or resize cmdline grid
     self.grid.resizeGrid(cmdline_grid_id, total_rows, max_width) catch |e| {
         self.log.write("[cmdline_block] resizeGrid failed: {any}\n", .{e});
-        return;
+        return false;
     };
 
     // Clear the grid first
@@ -5901,23 +5943,39 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                 if (cluster.first_cp < 0x20) {
                     self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
                     col += 1;
-                    if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                    if (col >= max_width) {
+                        byte_i = cluster.end_byte;
+                        break;
+                    }
                     self.grid.putCellGrid(cmdline_grid_id, row, col, '@' + cluster.first_cp, chunk.hl_id);
                     col += 1;
                 } else if (cluster.first_cp == 0x7F) {
                     self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
                     col += 1;
-                    if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                    if (col >= max_width) {
+                        byte_i = cluster.end_byte;
+                        break;
+                    }
                     self.grid.putCellGrid(cmdline_grid_id, row, col, '?', chunk.hl_id);
                     col += 1;
                 } else {
-                    self.grid.putCellGrid(cmdline_grid_id, row, col, cluster.first_cp, chunk.hl_id);
-                    if (cluster.extras_len > 0) {
-                        self.grid.putOverflow(cmdline_grid_id, row, col, cluster.extras[0..cluster.extras_len]);
-                    }
+                    self.grid.putCellGridCluster(
+                        cmdline_grid_id,
+                        row,
+                        col,
+                        cluster.first_cp,
+                        chunk.hl_id,
+                        cluster.extras[0..cluster.extras_len],
+                    ) catch |e| {
+                        abortClusterUpdate(self, "cmdline_block", e);
+                        return false;
+                    };
                     col += 1;
                     if (cluster.display_width >= 2) {
-                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                        if (col >= max_width) {
+                            byte_i = cluster.end_byte;
+                            break;
+                        }
                         self.grid.putCellGrid(cmdline_grid_id, row, col, 0, chunk.hl_id);
                         col += 1;
                     }
@@ -5946,13 +6004,23 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                     if (col >= max_width) break;
                     const pc = scanEmojiCluster(state.prompt, pbyte_i);
                     if (pc.codepoint_count == 0) break;
-                    self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, pc.first_cp, state.prompt_hl_id);
-                    if (pc.extras_len > 0) {
-                        self.grid.putOverflow(cmdline_grid_id, block_line_count, col, pc.extras[0..pc.extras_len]);
-                    }
+                    self.grid.putCellGridCluster(
+                        cmdline_grid_id,
+                        block_line_count,
+                        col,
+                        pc.first_cp,
+                        state.prompt_hl_id,
+                        pc.extras[0..pc.extras_len],
+                    ) catch |e| {
+                        abortClusterUpdate(self, "cmdline_block", e);
+                        return false;
+                    };
                     col += 1;
                     if (pc.display_width >= 2) {
-                        if (col >= max_width) { pbyte_i = pc.end_byte; break; }
+                        if (col >= max_width) {
+                            pbyte_i = pc.end_byte;
+                            break;
+                        }
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, state.prompt_hl_id);
                         col += 1;
                     }
@@ -5979,23 +6047,39 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                     if (cluster.first_cp < 0x20) {
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
                         col += 1;
-                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                        if (col >= max_width) {
+                            byte_i = cluster.end_byte;
+                            break;
+                        }
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '@' + cluster.first_cp, chunk.hl_id);
                         col += 1;
                     } else if (cluster.first_cp == 0x7F) {
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
                         col += 1;
-                        if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                        if (col >= max_width) {
+                            byte_i = cluster.end_byte;
+                            break;
+                        }
                         self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '?', chunk.hl_id);
                         col += 1;
                     } else {
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, cluster.first_cp, chunk.hl_id);
-                        if (cluster.extras_len > 0) {
-                            self.grid.putOverflow(cmdline_grid_id, block_line_count, col, cluster.extras[0..cluster.extras_len]);
-                        }
+                        self.grid.putCellGridCluster(
+                            cmdline_grid_id,
+                            block_line_count,
+                            col,
+                            cluster.first_cp,
+                            chunk.hl_id,
+                            cluster.extras[0..cluster.extras_len],
+                        ) catch |e| {
+                            abortClusterUpdate(self, "cmdline_block", e);
+                            return false;
+                        };
                         col += 1;
                         if (cluster.display_width >= 2) {
-                            if (col >= max_width) { byte_i = cluster.end_byte; break; }
+                            if (col >= max_width) {
+                                byte_i = cluster.end_byte;
+                                break;
+                            }
                             self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, chunk.hl_id);
                             col += 1;
                         }
@@ -6014,13 +6098,23 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
                         if (col >= max_width) break;
                         const sc = scanEmojiCluster(special, sbyte_i);
                         if (sc.codepoint_count == 0) break;
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, sc.first_cp, 0);
-                        if (sc.extras_len > 0) {
-                            self.grid.putOverflow(cmdline_grid_id, block_line_count, col, sc.extras[0..sc.extras_len]);
-                        }
+                        self.grid.putCellGridCluster(
+                            cmdline_grid_id,
+                            block_line_count,
+                            col,
+                            sc.first_cp,
+                            0,
+                            sc.extras[0..sc.extras_len],
+                        ) catch |e| {
+                            abortClusterUpdate(self, "cmdline_block", e);
+                            return false;
+                        };
                         col += 1;
                         if (sc.display_width >= 2) {
-                            if (col >= max_width) { sbyte_i = sc.end_byte; break; }
+                            if (col >= max_width) {
+                                sbyte_i = sc.end_byte;
+                                break;
+                            }
                             self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, 0);
                             col += 1;
                         }
@@ -6034,7 +6128,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     // Mark as external grid
     _ = self.grid.setWinExternalPos(cmdline_grid_id, 0) catch |e| {
         self.log.write("[cmdline_block] setWinExternalPos failed: {any}\n", .{e});
-        return;
+        return false;
     };
 
     // Set cursor position (on the last row - current cmdline line)
@@ -6044,6 +6138,7 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     self.grid.cursor_valid = true;
 
     self.log.write("[cmdline_block] show: rows={d} cols={d} cursor_row={d} cursor_col={d}\n", .{ total_rows, max_width, self.grid.cursor_row, cursor_col });
+    return true;
 }
 
 /// Hide cmdline external window by removing from external grids
@@ -6054,7 +6149,7 @@ pub fn sendCmdlineHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.external_grids.fetchRemove(cmdline_grid_id);
+    _ = self.grid.removeSyntheticExternal(cmdline_grid_id);
 
     // Fallback: restore cursor to pre-cmdline position if Neovim doesn't send grid_cursor_goto
     // (This is a workaround for possible Neovim bug where cursor position isn't updated after cmdline closes)
@@ -6083,7 +6178,6 @@ pub fn sendCmdlineHide(self: *Core) void {
 pub fn notifyPopupmenuChanges(self: *Core) void {
     if (!self.grid.popupmenu.changed) return;
     if (!self.ext_popupmenu_enabled) return;
-    defer self.grid.clearPopupmenuChanged();
 
     // Verbose logging disabled for performance
     // self.log.write("[popupmenu] notifyPopupmenuChanges visible={} items={d}\n", .{
@@ -6092,9 +6186,16 @@ pub fn notifyPopupmenuChanges(self: *Core) void {
     // });
 
     if (self.grid.popupmenu.visible) {
-        sendPopupmenuShow(self);
+        // Only clear popupmenu.changed on success (OOM only) so a failed
+        // resize/registration retries on the next flush instead of silently
+        // dropping the update. See CLAUDE.md: "flush must only clear dirty
+        // state after successful submission."
+        if (sendPopupmenuShow(self)) {
+            self.grid.clearPopupmenuChanged();
+        }
     } else {
         sendPopupmenuHide(self);
+        self.grid.clearPopupmenuChanged();
     }
 }
 
@@ -6102,8 +6203,6 @@ pub fn notifyPopupmenuChanges(self: *Core) void {
 pub fn notifyTablineChanges(self: *Core) void {
     if (!self.grid.tabline_state.dirty) return;
     if (!self.ext_tabline_enabled) return;
-    defer self.grid.clearTablineDirty();
-
     const state = &self.grid.tabline_state;
 
     if (state.visible and state.tabs.items.len > 0) {
@@ -6112,25 +6211,27 @@ pub fn notifyTablineChanges(self: *Core) void {
         // Build C-compatible tab array
         var c_tabs: std.ArrayListUnmanaged(c_api.TabEntry) = .empty;
         defer c_tabs.deinit(self.alloc);
+        c_tabs.ensureTotalCapacity(self.alloc, state.tabs.items.len) catch return;
 
         for (state.tabs.items) |tab| {
-            c_tabs.append(self.alloc, .{
+            c_tabs.appendAssumeCapacity(.{
                 .tab_handle = tab.tab_handle,
                 .name = tab.name.ptr,
                 .name_len = tab.name.len,
-            }) catch continue;
+            });
         }
 
         // Build C-compatible buffer array
         var c_buffers: std.ArrayListUnmanaged(c_api.BufferEntry) = .empty;
         defer c_buffers.deinit(self.alloc);
+        c_buffers.ensureTotalCapacity(self.alloc, state.buffers.items.len) catch return;
 
         for (state.buffers.items) |buf| {
-            c_buffers.append(self.alloc, .{
+            c_buffers.appendAssumeCapacity(.{
                 .buffer_handle = buf.buffer_handle,
                 .name = buf.name.ptr,
                 .name_len = buf.name.len,
-            }) catch continue;
+            });
         }
 
         if (self.cb.on_tabline_update) |cb| {
@@ -6150,13 +6251,14 @@ pub fn notifyTablineChanges(self: *Core) void {
             cb(self.ctx);
         }
     }
+    self.grid.clearTablineDirty();
 }
 
 /// Show popupmenu as external window by creating a grid.
 /// Grid content is rendered from the structured Neovim data (word, kind, menu).
 /// The on_popupmenu_show callback delivers resolved Pmenu/PmenuSel colors so
 /// the frontend can style the container background without inspecting vertices.
-pub fn sendPopupmenuShow(self: *Core) void {
+pub fn sendPopupmenuShow(self: *Core) bool {
     const pum_grid_id = grid_mod.POPUPMENU_GRID_ID;
     const items = self.grid.popupmenu.items.items;
     const selected = self.grid.popupmenu.selected;
@@ -6164,7 +6266,9 @@ pub fn sendPopupmenuShow(self: *Core) void {
     const anchor_col = self.grid.popupmenu.col;
     const anchor_grid = self.grid.popupmenu.grid_id;
 
-    if (items.len == 0) return;
+    // Nothing to show: legitimate no-op, not a failure -- report success so
+    // the caller clears popupmenu.changed instead of retrying indefinitely.
+    if (items.len == 0) return true;
 
     self.log.write("[popupmenu] show: anchor_grid={d} anchor_row={d} anchor_col={d} items={d}\n", .{ anchor_grid, anchor_row, anchor_col, items.len });
 
@@ -6227,7 +6331,7 @@ pub fn sendPopupmenuShow(self: *Core) void {
     // Create or resize popupmenu grid
     self.grid.resizeGrid(pum_grid_id, height, width) catch |e| {
         self.log.write("[popupmenu] resizeGrid failed: {any}\n", .{e});
-        return;
+        return false;
     };
     self.grid.clearGrid(pum_grid_id);
 
@@ -6248,16 +6352,25 @@ pub fn sendPopupmenuShow(self: *Core) void {
 
         // Column layout: | 1 pad | word (max_word_w) | 1 gap | kind (max_kind_w) | 1 gap | menu (max_menu_w) | 1 pad |
         var col: u32 = 1; // left padding
-        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id);
+        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id) catch |e| {
+            abortClusterUpdate(self, "popupmenu", e);
+            return false;
+        };
 
         if (max_kind_w > 0) {
             col = 1 + max_word_w + 1; // jump to kind column start
-            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id);
+            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id) catch |e| {
+                abortClusterUpdate(self, "popupmenu", e);
+                return false;
+            };
         }
 
         if (max_menu_w > 0) {
             col = 1 + max_word_w + (if (max_kind_w > 0) 1 + max_kind_w else @as(u32, 0)) + 1; // jump to menu column start
-            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id);
+            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id) catch |e| {
+                abortClusterUpdate(self, "popupmenu", e);
+                return false;
+            };
         }
     }
 
@@ -6273,8 +6386,8 @@ pub fn sendPopupmenuShow(self: *Core) void {
         start_col = anchor_col;
     } else if (anchor_grid != 1) {
         if (self.grid.win_pos.get(anchor_grid)) |pos| {
-            start_row = anchor_row + @as(i32, @intCast(pos.row));
-            start_col = anchor_col + @as(i32, @intCast(pos.col));
+            start_row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row);
+            start_col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col);
         } else {
             start_row = anchor_row;
             start_col = anchor_col;
@@ -6284,15 +6397,16 @@ pub fn sendPopupmenuShow(self: *Core) void {
         start_col = anchor_col;
     }
 
-    self.grid.external_grids.put(self.alloc, pum_grid_id, .{
+    self.grid.putSyntheticExternal(pum_grid_id, .{
         .win = anchor_grid,
         .start_row = start_row,
         .start_col = start_col,
     }) catch |e| {
         self.log.write("[popupmenu] external_grids.put failed: {any}\n", .{e});
-        return;
+        return false;
     };
 
+    return true;
 }
 
 /// Write a UTF-8 string to grid cells starting at (row, start_col).
@@ -6301,7 +6415,7 @@ pub fn sendPopupmenuShow(self: *Core) void {
 /// NFD combining kana voicing marks are composed to NFC so the rasterizer
 /// receives a single precomposed codepoint (e.g., U+3070 ば, not U+306F は).
 /// Returns the column after the last written cell.
-fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) u32 {
+fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32) !u32 {
     if (text.len == 0) return start_col;
     var col = start_col;
     var byte_i: usize = 0;
@@ -6319,15 +6433,16 @@ fn writeUtf8ToGrid(self: *Core, grid_id: i32, row: u32, start_col: u32, text: []
         else
             cluster.first_cp;
 
-        self.grid.putCellGrid(grid_id, row, col, cp, hl_id);
-
         // If NFC composition consumed the extras (cp != base), no overflow
-        // needed. Otherwise store extras in overflow map so the vertex
-        // generation glyph path can pass them to the rasterizer (same as
-        // the cmdline path at sendCmdlineShow).
-        if (cluster.extras_len > 0 and cp == cluster.first_cp) {
-            self.grid.putOverflow(grid_id, row, col, cluster.extras[0..cluster.extras_len]);
-        }
+        // is needed. Otherwise publish the complete cluster transactionally.
+        try self.grid.putCellGridCluster(
+            grid_id,
+            row,
+            col,
+            cp,
+            hl_id,
+            if (cp == cluster.first_cp) cluster.extras[0..cluster.extras_len] else &.{},
+        );
 
         col += 1;
         // Fill remaining cells with placeholder (cp=0) for wide characters

@@ -35,7 +35,7 @@ fn readIntBig(r: anytype, comptime T: type) anyerror!T {
     return std.mem.readInt(T, tmp[0..], .big);
 }
 
-fn decodeInt(r: anytype, b0: u8) anyerror!i64 {
+pub fn decodeInt(r: anytype, b0: u8) anyerror!i64 {
     // Positive fixint
     if ((b0 & 0x80) == 0) return @as(i64, b0);
 
@@ -49,7 +49,10 @@ fn decodeInt(r: anytype, b0: u8) anyerror!i64 {
         0xcc => @as(i64, try readIntBig(r, u8)),
         0xcd => @as(i64, try readIntBig(r, u16)),
         0xce => @as(i64, try readIntBig(r, u32)),
-        0xcf => @as(i64, @intCast(try readIntBig(r, u64))),
+        0xcf => blk: {
+            const uv = try readIntBig(r, u64);
+            break :blk if (uv > std.math.maxInt(i64)) error.UnsupportedType else @as(i64, @intCast(uv));
+        },
         0xd0 => @as(i64, @as(i8, @bitCast(try readIntBig(r, u8)))),
         0xd1 => @as(i64, try readIntBig(r, i16)),
         0xd2 => @as(i64, try readIntBig(r, i32)),
@@ -124,11 +127,11 @@ fn decodeExtLen(r: anytype, b0: u8) anyerror!usize {
     };
 }
 
-const SliceReader = struct {
+pub const SliceReader = struct {
     data: []const u8,
     i: usize = 0,
 
-    fn readByte(self: *SliceReader) anyerror!u8 {
+    pub fn readByte(self: *SliceReader) anyerror!u8 {
         if (self.i >= self.data.len) return error.EndOfStream;
         const b = self.data[self.i];
         self.i += 1;
@@ -142,7 +145,22 @@ const SliceReader = struct {
     }
 };
 
+/// Maximum nesting depth accepted by `decode` for arrays/maps. Bounds
+/// recursion so a crafted frame with many nested single-element containers
+/// (e.g. thousands of `0x91` fixarray-of-1 bytes) cannot exhaust the RPC
+/// thread's stack. 512 is far above any real Neovim redraw payload's
+/// nesting (typically well under 10 levels: event array -> tuple array ->
+/// cells array -> cell array -> map) while staying far below stack-overflow
+/// risk on any supported target.
+const max_decode_depth: u32 = 512;
+
 pub fn decode(alloc: std.mem.Allocator, r: anytype) anyerror!Value {
+    return decodeDepth(alloc, r, 0);
+}
+
+fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value {
+    if (depth > max_decode_depth) return error.TooDeeplyNested;
+
     const b0 = try readU8(r);
 
     // nil
@@ -179,7 +197,7 @@ pub fn decode(alloc: std.mem.Allocator, r: anytype) anyerror!Value {
         const items = try alloc.alloc(Value, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            items[i] = try decode(alloc, r);
+            items[i] = try decodeDepth(alloc, r, depth + 1);
         }
         return .{ .arr = items };
     }
@@ -191,8 +209,8 @@ pub fn decode(alloc: std.mem.Allocator, r: anytype) anyerror!Value {
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const k = try decode(alloc, r);
-            const v = try decode(alloc, r);
+            const k = try decodeDepth(alloc, r, depth + 1);
+            const v = try decodeDepth(alloc, r, depth + 1);
             pairs[i] = .{ .key = k, .val = v };
         }
         return .{ .map = pairs };

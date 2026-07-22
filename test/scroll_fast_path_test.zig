@@ -340,7 +340,7 @@ test "eligible: partial region bot < target_rows" {
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
 }
 
-test "ineligible: bot > target_rows" {
+test "oversized scroll bounds are normalized to target dimensions" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
     defer g.deinit();
@@ -348,8 +348,22 @@ test "ineligible: bot > target_rows" {
 
     const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
+    try std.testing.expect(result.eligible);
+    try std.testing.expectEqual(@as(u32, 42), result.scroll_op.?.bot);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
+}
+
+test "nonzero reserved cols remains a fail-closed fast path rejection" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 7);
+
+    const sgs = [_]flush_mod.CachedSubgrid{scrollingSubgrid()};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(!result.eligible);
-    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.not_full_region, result.reason);
+    try std.testing.expectEqual(@as(i32, 7), result.scroll_op.?.cols);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.horizontal_scroll, result.reason);
 }
 
 test "ineligible: partial width" {
