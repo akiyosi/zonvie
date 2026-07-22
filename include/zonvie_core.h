@@ -847,16 +847,23 @@ void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
-/* Check if msg_show throttle timeout has expired and process pending messages.
- * Frontend should call this periodically (e.g., every frame or 16ms) to ensure
- * messages are displayed even when Neovim is waiting for user input. */
+/* Process due message timeouts and render-maintenance retries. Frontends
+ * normally drive this from the one-shot deadline returned below so messages
+ * and transient glyph failures recover while Neovim is idle. */
 void zonvie_core_tick_msg_throttle(zonvie_core *core);
 
-/* Returns milliseconds until the earliest pending msg_show/msg_history timeout
- * (throttle or auto-hide), clamped to >= 0. Returns -1 if no timeout is armed.
- * Lets the frontend schedule a single one-shot timer instead of calling
- * zonvie_core_tick_msg_throttle every frame. */
+/* Returns milliseconds until the earliest pending message or render-
+ * maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
+ * Lets the frontend schedule a single one-shot timer instead of calling the
+ * tick function every frame. */
 int64_t zonvie_core_next_msg_timeout_ms(zonvie_core *core);
+
+/* Non-blocking version of zonvie_core_next_msg_timeout_ms.
+ * Returns the same values on success, or -2 if the core's grid lock could
+ * not be acquired without blocking. -2 must NOT be treated as "nothing
+ * pending" (that is -1, a real answer) -- on -2 the caller should re-arm
+ * its timer for a short fixed retry instead of trusting a stale value. */
+int64_t zonvie_core_try_next_msg_timeout_ms(zonvie_core *core);
 
 /* Enable blur transparency for background (macOS only).
  * When enabled, default background uses semi-transparent alpha for blur effect.
@@ -954,6 +961,17 @@ ZONVIE_API const char *zonvie_version(void);
 
 /* Record the latest frontend input trace marker for redraw/flush correlation. */
 ZONVIE_API void zonvie_core_note_input_trace(
+    zonvie_core *core,
+    uint64_t seq,
+    int64_t sent_ns
+);
+
+/* Non-blocking version of zonvie_core_note_input_trace. Drops the sample
+   (no [perf_input] trace line for this seq) if the core's grid lock could
+   not be acquired without blocking, rather than blocking the input-send
+   path with the very lock this trace exists to measure contention on.
+   Returns true if the sample was recorded. */
+ZONVIE_API bool zonvie_core_try_note_input_trace(
     zonvie_core *core,
     uint64_t seq,
     int64_t sent_ns
@@ -1101,10 +1119,40 @@ ZONVIE_API int32_t zonvie_core_try_get_visible_grids(
     size_t max_count
 );
 
+/* Non-blocking complete visible-grid snapshot for fixed-capacity caches.
+   On success, returns the number of initialized entries in out_grids and
+   writes the total visible-grid count from the same grid-lock snapshot to
+   out_total_count. A return value smaller than *out_total_count means the
+   output was truncated. max_count may be zero with out_grids=NULL for a
+   count-only query, and must not exceed INT32_MAX.
+
+   Returns -1 when the grid lock is busy or any argument is invalid. On -1,
+   out_grids and *out_total_count are left unchanged. There is deliberately no
+   blocking counterpart: render/input callers should retain their last complete
+   cache rather than stall behind redraw. */
+ZONVIE_API int32_t zonvie_core_try_get_visible_grids_complete(
+    zonvie_core *core,
+    zonvie_grid_info *out_grids,
+    size_t max_count,
+    size_t *out_total_count
+);
+
 /* Get current cursor position.
    Returns cursor row and column (0-based) in out_row and out_col.
    Returns the grid_id of the cursor (1 = global grid). */
 ZONVIE_API int64_t zonvie_core_get_cursor_position(
+    zonvie_core *core,
+    int32_t *out_row,
+    int32_t *out_col
+);
+
+/* Non-blocking version of zonvie_core_get_cursor_position.
+   Returns the grid_id of the cursor on success, or -2 if the core's grid
+   lock could not be acquired without blocking, or if core is null
+   (grid_id is always >= 1, so -2 is unambiguous either way). Note this
+   differs from the blocking zonvie_core_get_cursor_position above, which
+   reserves -1 specifically for a null core. */
+ZONVIE_API int64_t zonvie_core_try_get_cursor_position(
     zonvie_core *core,
     int32_t *out_row,
     int32_t *out_col
@@ -1129,12 +1177,44 @@ ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value)
    Returns false during busy_start, true after busy_stop. */
 ZONVIE_API bool zonvie_core_is_cursor_visible(zonvie_core *core);
 
+/* Non-blocking combined read of current mode name + cursor visibility.
+   Copies the null-terminated mode name into out_mode_buf (truncated to fit
+   buf_len, including the terminator) and writes cursor visibility to
+   *out_cursor_visible. Unlike zonvie_core_get_current_mode, the string is
+   copied while the lock is held rather than returning a pointer into core
+   memory that could be concurrently rewritten after unlock.
+   Returns 1 on success, -1 if the core's grid lock could not be acquired
+   without blocking (caller should keep using its last-known cached
+   mode/visibility in that case). -1 is also returned for invalid arguments
+   (null core, null out_mode_buf, buf_len == 0, or null out_cursor_visible)
+   -- these share the busy sentinel rather than a distinct value since no
+   caller is expected to pass invalid arguments in practice. */
+ZONVIE_API int32_t zonvie_core_try_get_mode_state(
+    zonvie_core *core,
+    char *out_mode_buf,
+    size_t buf_len,
+    bool *out_cursor_visible
+);
+
 /* Get current cursor blink parameters (in milliseconds).
    Returns 0 for all values if blinking is disabled.
    blink_wait: time before blink starts (0 = no blink)
    blink_on: cursor visible time during blink cycle
    blink_off: cursor hidden time during blink cycle */
 ZONVIE_API void zonvie_core_get_cursor_blink(
+    zonvie_core *core,
+    uint32_t *out_blink_wait_ms,
+    uint32_t *out_blink_on_ms,
+    uint32_t *out_blink_off_ms
+);
+
+/* Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
+   all three out params and returns true. On busy, leaves every out param
+   UNTOUCHED (no "safe default" is written) -- callers should pre-seed the
+   out params with their own last-known values before calling, so an
+   untouched param naturally means "serve the cached value". Returns false
+   if the lock could not be acquired without blocking, or core is null. */
+ZONVIE_API bool zonvie_core_try_get_cursor_blink(
     zonvie_core *core,
     uint32_t *out_blink_wait_ms,
     uint32_t *out_blink_on_ms,
@@ -1217,6 +1297,20 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
     const char* name,
     uint32_t* fg_rgb,
     uint32_t* bg_rgb
+);
+
+// Batched version of zonvie_core_get_hl_by_name: looks up `count` group
+// names under a single grid_mu acquisition instead of one lock round-trip
+// per name. names/out_fg_rgb/out_bg_rgb/out_found must each have length
+// count. A null entry in names is skipped (its out slots are left
+// untouched). Returns 1 on success, 0 if core/arrays are null.
+ZONVIE_API int zonvie_core_get_hl_by_names_batch(
+    zonvie_core *core,
+    const char *const *names,
+    uint32_t *out_fg_rgb,
+    uint32_t *out_bg_rgb,
+    int *out_found,
+    size_t count
 );
 
 // Return Neovim default background color as 0x00RRGGBB.

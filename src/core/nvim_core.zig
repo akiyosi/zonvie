@@ -1101,7 +1101,7 @@ pub const Core = struct {
     ///     The new server never sends grid_destroy for grid_ids it does
     ///     not know about, so leftover entries would be rendered as
     ///     stale floats (flush.zig:rebuildMain) and reported as visible
-    ///     by getVisibleGridsLocked (hit-testing).
+    ///     by getVisibleGridsSnapshotLocked (hit-testing).
     ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
     ///     tabline_state / message_state / msg_history_state. The new
     ///     server does not send hide events for overlays it never
@@ -2588,6 +2588,24 @@ pub const Core = struct {
     pub fn noteInputTrace(self: *Core, seq: u64, sent_ns: i64) void {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        self.noteInputTraceLocked(seq, sent_ns);
+    }
+
+    /// Non-blocking version of noteInputTrace. Drops the sample (this seq's
+    /// [perf_input] trace line simply won't appear) if grid_mu could not be
+    /// acquired, rather than blocking the input-send path -- this trace
+    /// exists only to measure input latency and must not itself add to it.
+    /// Returns true if the sample was recorded.
+    pub fn tryNoteInputTrace(self: *Core, seq: u64, sent_ns: i64) bool {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_input_trace.record(acquired);
+        if (!acquired) return false;
+        defer self.grid_mu.unlock(clock.io());
+        self.noteInputTraceLocked(seq, sent_ns);
+        return true;
+    }
+
+    fn noteInputTraceLocked(self: *Core, seq: u64, sent_ns: i64) void {
         self.grid.noteInputTrace(seq, sent_ns);
         if (self.log.cb != null) {
             self.log.write("[perf_input] seq={d} stage=input_send sent_ns={d}\n", .{ seq, sent_ns });
@@ -2668,7 +2686,7 @@ pub const Core = struct {
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
-        return self.getVisibleGridsLocked(out);
+        return self.getVisibleGridsSnapshotLocked(out, false).written;
     }
 
     /// Non-blocking version of getVisibleGrids.
@@ -2676,100 +2694,123 @@ pub const Core = struct {
     pub fn tryGetVisibleGrids(self: *Core, out: []c_api.GridInfo) ?usize {
         if (!self.grid_mu.tryLock()) return null;
         defer self.grid_mu.unlock(clock.io());
-        return self.getVisibleGridsLocked(out);
+        return self.getVisibleGridsSnapshotLocked(out, false).written;
     }
 
-    /// Internal: get visible grids assuming grid_mu is already held.
-    fn getVisibleGridsLocked(self: *Core, out: []c_api.GridInfo) usize {
-        var count: usize = 0;
+    pub const VisibleGridsSnapshot = struct {
+        written: usize,
+        total: usize,
+    };
+
+    /// Non-blocking complete snapshot. `total` counts every visible grid from
+    /// the same locked state even when `out` is too small; `written` is the
+    /// initialized prefix of out.
+    pub fn tryGetVisibleGridsComplete(self: *Core, out: []c_api.GridInfo) ?VisibleGridsSnapshot {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock(clock.io());
+        return self.getVisibleGridsSnapshotLocked(out, true);
+    }
+
+    /// Internal: snapshot visible grids assuming grid_mu is already held.
+    /// `count_all` preserves the legacy APIs' stop-at-capacity hot path while
+    /// the complete API scans the same locked state to detect truncation.
+    fn getVisibleGridsSnapshotLocked(self: *Core, out: []c_api.GridInfo, count_all: bool) VisibleGridsSnapshot {
+        var written: usize = 0;
+        var total: usize = 0;
 
         // Always include global grid first
-        if (count < out.len) {
+        if (written < out.len) {
             const m1 = self.grid.getViewportMargins(1);
-            out[count] = .{
+            out[written] = .{
                 .grid_id = 1,
                 .zindex = 0, // global grid has lowest zindex
                 .start_row = 0,
                 .start_col = 0,
-                .rows = @intCast(self.grid.rows),
-                .cols = @intCast(self.grid.cols),
-                .margin_top = @intCast(m1.top),
-                .margin_bottom = @intCast(m1.bottom),
-                .margin_left = @intCast(m1.left),
-                .margin_right = @intCast(m1.right),
+                .rows = grid_mod.saturatingI32FromU32(self.grid.rows),
+                .cols = grid_mod.saturatingI32FromU32(self.grid.cols),
+                .margin_top = grid_mod.saturatingI32FromU32(m1.top),
+                .margin_bottom = grid_mod.saturatingI32FromU32(m1.bottom),
+                .margin_left = grid_mod.saturatingI32FromU32(m1.left),
+                .margin_right = grid_mod.saturatingI32FromU32(m1.right),
                 .line_count = if (self.grid.getViewport(1)) |vp| vp.line_count else 0,
                 .anchor_grid = 1,
                 .follows_scroll = 0,
                 .is_external = 0,
             };
-            count += 1;
+            written += 1;
         }
+        total += 1;
+        if (!count_all and written == out.len) return .{ .written = written, .total = total };
 
         // Add sub-grids (floating windows)
         var it = self.grid.win_pos.iterator();
         while (it.next()) |entry| {
-            if (count >= out.len) break;
-
             const gid = entry.key_ptr.*;
             if (gid == 1) continue; // skip global grid (already added)
 
             const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
-            const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
-                .zindex = 0,
-                .compindex = 0,
-                .order = 0,
-            };
-            const margins = self.grid.getViewportMargins(gid);
+            if (written < out.len) {
+                const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
+                    .zindex = 0,
+                    .compindex = 0,
+                    .order = 0,
+                };
+                const margins = self.grid.getViewportMargins(gid);
 
-            out[count] = .{
-                .grid_id = gid,
-                .zindex = layer.zindex,
-                .start_row = @intCast(pos.row),
-                .start_col = @intCast(pos.col),
-                .rows = @intCast(sg.rows),
-                .cols = @intCast(sg.cols),
-                .margin_top = @intCast(margins.top),
-                .margin_bottom = @intCast(margins.bottom),
-                .margin_left = @intCast(margins.left),
-                .margin_right = @intCast(margins.right),
-                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                .anchor_grid = pos.anchor_grid,
-                .follows_scroll = if (pos.follows_scroll) 1 else 0,
-                .is_external = 0,
-            };
-            count += 1;
+                out[written] = .{
+                    .grid_id = gid,
+                    .zindex = layer.zindex,
+                    .start_row = grid_mod.saturatingI32FromU32(pos.row),
+                    .start_col = grid_mod.saturatingI32FromU32(pos.col),
+                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
+                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
+                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
+                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
+                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
+                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
+                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                    .anchor_grid = pos.anchor_grid,
+                    .follows_scroll = if (pos.follows_scroll) 1 else 0,
+                    .is_external = 0,
+                };
+                written += 1;
+            }
+            total += 1;
+            if (!count_all and written == out.len) return .{ .written = written, .total = total };
         }
 
         // Add external grids (separate top-level windows)
         var ext_it = self.grid.external_grids.keyIterator();
         while (ext_it.next()) |key_ptr| {
-            if (count >= out.len) break;
-
             const gid = key_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
-            const margins = self.grid.getViewportMargins(gid);
+            if (written < out.len) {
+                const margins = self.grid.getViewportMargins(gid);
 
-            out[count] = .{
-                .grid_id = gid,
-                .zindex = 0, // External grids have their own window, zindex doesn't apply
-                .start_row = 0, // External grids start at (0,0) in their own window
-                .start_col = 0,
-                .rows = @intCast(sg.rows),
-                .cols = @intCast(sg.cols),
-                .margin_top = @intCast(margins.top),
-                .margin_bottom = @intCast(margins.bottom),
-                .margin_left = @intCast(margins.left),
-                .margin_right = @intCast(margins.right),
-                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                .anchor_grid = 1,
-                .follows_scroll = 0,
-                .is_external = 1,
-            };
-            count += 1;
+                out[written] = .{
+                    .grid_id = gid,
+                    .zindex = 0, // External grids have their own window, zindex doesn't apply
+                    .start_row = 0, // External grids start at (0,0) in their own window
+                    .start_col = 0,
+                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
+                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
+                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
+                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
+                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
+                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
+                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                    .anchor_grid = 1,
+                    .follows_scroll = 0,
+                    .is_external = 1,
+                };
+                written += 1;
+            }
+            total += 1;
+            if (!count_all and written == out.len) return .{ .written = written, .total = total };
         }
 
-        return count;
+        return .{ .written = written, .total = total };
     }
 
     pub const CursorPosition = struct {
@@ -2782,12 +2823,50 @@ pub const Core = struct {
         // Lock grid_mu to prevent concurrent modification from RPC thread.
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        return self.getCursorPositionLocked();
+    }
 
+    /// Non-blocking version of getCursorPosition.
+    /// Returns null if grid_mu could not be acquired (another thread holds it).
+    pub fn tryGetCursorPosition(self: *Core) ?CursorPosition {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_cursor_pos.record(acquired);
+        if (!acquired) return null;
+        defer self.grid_mu.unlock(clock.io());
+        return self.getCursorPositionLocked();
+    }
+
+    /// Internal: get cursor position assuming grid_mu is already held.
+    fn getCursorPositionLocked(self: *Core) CursorPosition {
         return .{
             .grid_id = self.grid.cursor_grid,
-            .row = @intCast(self.grid.cursor_row),
-            .col = @intCast(self.grid.cursor_col),
+            .row = grid_mod.saturatingI32FromU32(self.grid.cursor_row),
+            .col = grid_mod.saturatingI32FromU32(self.grid.cursor_col),
         };
+    }
+
+    /// Internal: copy the current mode name into a caller-provided buffer
+    /// (truncated + null-terminated to fit) and read cursor visibility,
+    /// assuming grid_mu is already held.
+    fn getModeStateLocked(self: *Core, out_mode_buf: [*]u8, buf_len: usize, out_cursor_visible: *bool) void {
+        const name = &self.grid.current_mode_name;
+        const raw_len = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+        const n = @min(buf_len -| 1, raw_len);
+        @memcpy(out_mode_buf[0..n], name[0..n]);
+        out_mode_buf[n] = 0;
+        out_cursor_visible.* = self.grid.cursor_visible;
+    }
+
+    /// Non-blocking combined read of current mode name + cursor visibility.
+    /// Returns false if grid_mu could not be acquired (another thread holds
+    /// it) -- caller should keep its last-known cached values in that case.
+    pub fn tryGetModeState(self: *Core, out_mode_buf: [*]u8, buf_len: usize, out_cursor_visible: *bool) bool {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_mode_state.record(acquired);
+        if (!acquired) return false;
+        defer self.grid_mu.unlock(clock.io());
+        self.getModeStateLocked(out_mode_buf, buf_len, out_cursor_visible);
+        return true;
     }
 
     /// Get viewport info for a specific grid (for scrollbar rendering).
@@ -2836,7 +2915,13 @@ pub const Core = struct {
     pub fn getHlByName(self: *Core, name: []const u8) HlColors {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        return self.getHlByNameLocked(name);
+    }
 
+    /// Internal: look up a highlight group by name assuming grid_mu is
+    /// already held. Lets a caller batch several lookups under one lock
+    /// acquisition instead of one lockUncancelable per name.
+    pub fn getHlByNameLocked(self: *Core, name: []const u8) HlColors {
         // Look up hl_id from group name
         const hl_id = self.hl.groups.get(name) orelse {
             // Not found - return default colors

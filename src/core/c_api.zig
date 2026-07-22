@@ -791,6 +791,16 @@ pub export fn zonvie_core_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: 
     box.core.noteInputTrace(seq, sent_ns);
 }
 
+/// Non-blocking version of zonvie_core_note_input_trace. Drops the sample
+/// (no [perf_input] line for this seq) if grid_mu could not be acquired,
+/// rather than blocking the input-send path with the very lock this trace
+/// exists to measure contention on. Returns true if the sample was recorded.
+pub export fn zonvie_core_try_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: i64) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    return box.core.tryNoteInputTrace(seq, sent_ns);
+}
+
 /// Notify Neovim of window focus change (triggers FocusGained/FocusLost autocmds).
 pub export fn zonvie_core_set_focus(p: ?*zonvie_core, gained: bool) callconv(.c) void {
     if (p == null) return;
@@ -1078,7 +1088,30 @@ pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64
     const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
     const now = clock.nowNs();
     if (deadline <= now) return 0;
-    const remaining_ms = @divTrunc(deadline - now, std.time.ns_per_ms);
+    const remaining_ns = deadline - now;
+    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
+    return @intCast(remaining_ms);
+}
+
+/// Non-blocking version of zonvie_core_next_msg_timeout_ms.
+/// Returns the same values on success, or -2 if the lock could not be
+/// acquired. -2 is distinct from -1 ("no timeout pending" -- a real,
+/// actionable answer) because the caller must NOT treat a busy lock as
+/// "nothing pending": doing so could silently drop an armed msg_show/
+/// msg_history/atlas maintenance deadline. On -2 the caller should re-arm its
+/// timer for a short fixed retry instead of trusting a stale/absent value.
+pub export fn zonvie_core_try_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64 {
+    if (p == null) return -2;
+    const box = asBox(p.?);
+    const acquired = box.core.grid_mu.tryLock();
+    box.core.perf_lock_msg_timeout.record(acquired);
+    if (!acquired) return -2;
+    defer box.core.grid_mu.unlock(clock.io());
+    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
+    const now = clock.nowNs();
+    if (deadline <= now) return 0;
+    const remaining_ns = deadline - now;
+    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
     return @intCast(remaining_ms);
 }
 
@@ -1130,6 +1163,31 @@ pub export fn zonvie_core_try_get_visible_grids(
     return -1;
 }
 
+/// Non-blocking visible-grid snapshot with truncation detection.
+/// On success, returns the initialized prefix length and publishes the total
+/// visible-grid count from the same grid lock acquisition. A zero-capacity
+/// output is a valid count-only query. Busy or invalid calls return -1 without
+/// changing either output.
+pub export fn zonvie_core_try_get_visible_grids_complete(
+    p: ?*zonvie_core,
+    out_grids: ?[*]GridInfo,
+    max_count: usize,
+    out_total_count: ?*usize,
+) callconv(.c) i32 {
+    if (p == null or out_total_count == null or max_count > std.math.maxInt(i32)) return -1;
+    if (max_count != 0 and out_grids == null) return -1;
+
+    var empty: [0]GridInfo = .{};
+    const out: []GridInfo = if (max_count == 0)
+        empty[0..]
+    else
+        out_grids.?[0..max_count];
+    const box = asBox(p.?);
+    const snapshot = box.core.tryGetVisibleGridsComplete(out) orelse return -1;
+    out_total_count.?.* = snapshot.total;
+    return @intCast(snapshot.written);
+}
+
 /// Get viewport info for a specific grid (for scrollbar rendering).
 /// Returns 1 if found, 0 if not found.
 pub export fn zonvie_core_get_viewport(
@@ -1170,6 +1228,24 @@ pub export fn zonvie_core_get_cursor_position(
     return cursor.grid_id;
 }
 
+/// Non-blocking version of zonvie_core_get_cursor_position.
+/// Returns the grid_id of the cursor on success, or -2 if the lock could
+/// not be acquired, or if core is null (grid_id is always >= 1, so -2 is
+/// unambiguous either way). Note this differs from the blocking
+/// zonvie_core_get_cursor_position above, which reserves -1 for null core.
+pub export fn zonvie_core_try_get_cursor_position(
+    p: ?*zonvie_core,
+    out_row: ?*i32,
+    out_col: ?*i32,
+) callconv(.c) i64 {
+    if (p == null) return -2;
+    const box = asBox(p.?);
+    const cursor = box.core.tryGetCursorPosition() orelse return -2;
+    if (out_row) |r| r.* = cursor.row;
+    if (out_col) |c| c.* = cursor.col;
+    return cursor.grid_id;
+}
+
 /// Get Neovim window handle (winid) for a grid.
 /// Pass grid_id=-1 to get the winid for the cursor's current grid.
 /// Returns 0 if the mapping is not available.
@@ -1200,6 +1276,30 @@ pub export fn zonvie_core_is_cursor_visible(p: ?*zonvie_core) callconv(.c) bool 
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
     return box.core.grid.cursor_visible;
+}
+
+/// Non-blocking combined read of current mode name + cursor visibility.
+/// Copies the null-terminated mode name into out_mode_buf (truncated to fit
+/// buf_len, including the terminator) and writes cursor visibility to
+/// out_cursor_visible. Unlike zonvie_core_get_current_mode, the string is
+/// copied while the lock is held rather than returning a pointer into core
+/// memory that could be concurrently rewritten after unlock.
+/// Returns 1 on success, -1 if the lock could not be acquired (caller
+/// should keep using its last-known cached mode/visibility in that case).
+/// -1 is also returned for invalid arguments (null core, null out_mode_buf,
+/// buf_len == 0, or null out_cursor_visible) -- these share the busy
+/// sentinel rather than a distinct value since no caller is expected to
+/// pass invalid arguments in practice.
+pub export fn zonvie_core_try_get_mode_state(
+    p: ?*zonvie_core,
+    out_mode_buf: ?[*]u8,
+    buf_len: usize,
+    out_cursor_visible: ?*bool,
+) callconv(.c) i32 {
+    if (p == null or out_mode_buf == null or buf_len == 0 or out_cursor_visible == null) return -1;
+    const box = asBox(p.?);
+    if (box.core.tryGetModeState(out_mode_buf.?, buf_len, out_cursor_visible.?)) return 1;
+    return -1;
 }
 
 /// Get option_as_meta value (0=both, 1=none, 2=only_left, 3=only_right).
@@ -1238,7 +1338,42 @@ pub export fn zonvie_core_get_cursor_blink(
     if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
 }
 
+/// Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
+/// all three out params and returns true. On busy, leaves every out param
+/// UNTOUCHED (does not write a "safe default") -- the intended usage is
+/// for the caller to pre-seed the out params with its own last-known
+/// values, so an untouched param is automatically "serve cached value".
+/// Returns false if the lock could not be acquired or core is null.
+pub export fn zonvie_core_try_get_cursor_blink(
+    p: ?*zonvie_core,
+    out_wait_ms: ?*u32,
+    out_on_ms: ?*u32,
+    out_off_ms: ?*u32,
+) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    const acquired = box.core.grid_mu.tryLock();
+    box.core.perf_lock_cursor_blink.record(acquired);
+    if (!acquired) return false;
+    defer box.core.grid_mu.unlock(clock.io());
+    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
+    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
+    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+    return true;
+}
+
 /// Send mouse scroll event to Neovim.
+///
+/// Acquires grid_mu: sendMouseScroll's message-grid branch
+/// (handleMsgGridScroll) mutates Grid/vertex/atlas-scratch state directly
+/// and can invoke frontend callbacks (row_cb via sendExternalGridVerticesFiltered)
+/// — the SAME state handleRedraw mutates under grid_mu on the RPC thread.
+/// This is called directly from a mouse-wheel event on the UI thread, so
+/// without this lock the two threads race HashMap/ArrayList/atlas-scratch
+/// mutations. redraw_thread_id follows the same lock-then-set ordering as
+/// zonvie_core_retry_flush (see its doc comment) so a re-entrant callback
+/// from within sendExternalGridVerticesFiltered recognizes this thread as
+/// the current owner instead of self-deadlocking on grid_mu.
 pub export fn zonvie_core_send_mouse_scroll(
     p: ?*zonvie_core,
     grid_id: i64,
@@ -1322,6 +1457,33 @@ pub export fn zonvie_core_get_hl_by_name(
     if (fg_rgb) |fg| fg.* = result.fg;
     if (bg_rgb) |bg| bg.* = result.bg;
     return if (result.found) 1 else 0;
+}
+
+/// Batched version of zonvie_core_get_hl_by_name: looks up `count` group
+/// names under a single grid_mu acquisition instead of one lock round-trip
+/// per name. names/out_fg_rgb/out_bg_rgb/out_found must each have length
+/// count. A null entry in names is skipped (its out slots are left
+/// untouched). Returns 1 on success, 0 if core/arrays are null.
+pub export fn zonvie_core_get_hl_by_names_batch(
+    p: ?*zonvie_core,
+    names: ?[*]const ?[*:0]const u8,
+    out_fg_rgb: ?[*]u32,
+    out_bg_rgb: ?[*]u32,
+    out_found: ?[*]i32,
+    count: usize,
+) callconv(.c) i32 {
+    if (p == null or names == null or out_fg_rgb == null or out_bg_rgb == null or out_found == null) return 0;
+    const box = asBox(p.?);
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
+    for (0..count) |i| {
+        const name_ptr = names.?[i] orelse continue;
+        const result = box.core.getHlByNameLocked(std.mem.span(name_ptr));
+        out_fg_rgb.?[i] = result.fg;
+        out_bg_rgb.?[i] = result.bg;
+        out_found.?[i] = if (result.found) 1 else 0;
+    }
+    return 1;
 }
 
 /// Return the Neovim default background color as 0x00RRGGBB.
