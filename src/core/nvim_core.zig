@@ -27,6 +27,38 @@ pub const Stream = rpc_transport.Stream;
 /// on_external_window so the frontend can update window position.
 pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
 
+pub const GLYPH_CACHE_INVALID_KEY: u64 = std.math.maxInt(u64);
+const TRANSIENT_GLYPH_RETRY_INITIAL_NS: i128 = 250 * std.time.ns_per_ms;
+const TRANSIENT_GLYPH_RETRY_MAX_NS: i128 = 4 * std.time.ns_per_s;
+const TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS: u8 = 5;
+
+pub const GlyphCacheProbe = struct {
+    hit: ?usize,
+    insert: usize,
+};
+
+/// Two-choice, allocation-free probe for the fixed-size glyph caches. Two
+/// keys that collide at the primary index can coexist at independent secondary
+/// indices; when both are occupied a stable hash bit selects the victim.
+pub fn glyphCacheProbe(keys: []const u64, key: u64, hash: u64) GlyphCacheProbe {
+    std.debug.assert(keys.len > 0);
+    const primary: usize = @intCast(hash % keys.len);
+    var mixed = hash ^ key ^ 0x9E3779B97F4A7C15;
+    mixed ^= mixed >> 30;
+    mixed *%= 0xBF58476D1CE4E5B9;
+    mixed ^= mixed >> 27;
+    mixed *%= 0x94D049BB133111EB;
+    mixed ^= mixed >> 31;
+    var secondary: usize = @intCast(mixed % keys.len);
+    if (secondary == primary and keys.len > 1) secondary = (secondary + 1) % keys.len;
+
+    if (keys[primary] == key) return .{ .hit = primary, .insert = primary };
+    if (keys[secondary] == key) return .{ .hit = secondary, .insert = secondary };
+    if (keys[primary] == GLYPH_CACHE_INVALID_KEY) return .{ .hit = null, .insert = primary };
+    if (keys[secondary] == GLYPH_CACHE_INVALID_KEY) return .{ .hit = null, .insert = secondary };
+    return .{ .hit = null, .insert = if ((mixed >> 63) == 0) primary else secondary };
+}
+
 /// Backing transport for the current RPC session.
 pub const TransportKind = enum {
     /// Spawned nvim child process; stdin/stdout/stderr are 3 separate pipes.
@@ -705,6 +737,34 @@ pub const Core = struct {
     perf_upload_calls: u32 = 0,
     perf_atlas_create_calls: u32 = 0,
     perf_atlas_create_ns_total: u64 = 0,
+    // Cumulative (never reset per-flush, unlike the counters above) count of
+    // atlas-full resets specifically -- i.e. packAndUploadBitmap's shelf
+    // packer running out of room mid-flush, as opposed to a reset caused by
+    // font/scale change. Incremented unconditionally (cheap integer add) so
+    // it's accurate even if logging is later enabled after resets already
+    // happened; only emitting it in the [perf] atlas line is log-gated.
+    perf_atlas_full_reset_count: u64 = 0,
+    // Bumped by EVERY resetCoreAtlas() call, regardless of why (packer-full
+    // during packAndUploadBitmap, explicit zonvie_core_invalidate_glyph_cache,
+    // onGuifont, DPI/backing-scale change). perf_atlas_full_reset_count only
+    // covers the packer-full case — callers that need to detect "did the
+    // atlas get reset at all" (e.g. runMsgGridScrollFlush's abort check) must
+    // use this instead, or they silently miss the other reset paths.
+    atlas_reset_seq: u64 = 0,
+
+    // Cumulative contention stats for the 5 grid_mu tryLock conversions on
+    // the input path (mode/cursor-visible, cursor position, msg timeout,
+    // note_input_trace, cursor blink). Atomic: these are updated from the
+    // UI thread, including on the busy branch where grid_mu itself is NOT
+    // held, so an unsynchronized field would race against the core thread's
+    // periodic log read below. Read via .load(.monotonic) when emitting the
+    // log line; never reset, so the log shows contention rate since app start.
+    perf_lock_mode_state: LockContentionStat = .{},
+    perf_lock_cursor_pos: LockContentionStat = .{},
+    perf_lock_msg_timeout: LockContentionStat = .{},
+    perf_lock_input_trace: LockContentionStat = .{},
+    perf_lock_cursor_blink: LockContentionStat = .{},
+    perf_lock_viewport: LockContentionStat = .{},
     // ensureGlyphPhase2 / ensureGlyphByID wall time, including dispatch
     // overhead, cache check, and the rasterize/upload/pack subset already
     // accounted for above. (atlas_total_ns - rasterize_ns - upload_ns -
@@ -752,9 +812,15 @@ pub const Core = struct {
     msg_cached_max_width: u32 = 0, // Cached max line width for grid sizing
     msg_scroll_pending: bool = false, // Pending scroll update (for throttling)
     msg_scroll_last_send: i128 = 0, // Last vertex send time (nanos)
+    // Allocation-free latency samples for the full message-scroll
+    // transaction (core regeneration + all frontend flush callbacks).
+    msg_scroll_perf_us: [256]u32 = .{0} ** 256,
+    msg_scroll_perf_count: u16 = 0,
+    msg_scroll_perf_aborted: u16 = 0,
 
     // Cached line data for msg_show scrolling (avoids re-parsing on every scroll)
     msg_line_cache: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
+    msg_line_cache_build: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_cache_valid: bool = false,
 
     // Track last executed command for split view label
@@ -781,7 +847,7 @@ pub const Core = struct {
     // ASCII cache: 128 * 4 = 512 entries (codepoint 0-127 × 4 style combinations)
     // Non-ASCII cache: hash table for Unicode chars >= 128
     glyph_cache_ascii_size: u32 = 512, // default: 128 ASCII × 4 styles
-    glyph_cache_non_ascii_size: u32 = 256, // default: 256 entries hash table
+    glyph_cache_non_ascii_size: u32 = 512, // default: 512 entries (reduces preRasterizeAscii collisions; was guaranteed >=124 evictions at 256)
 
     // Highlight cache size for flush vertex generation (configurable via [performance] in config.toml)
     hl_cache_size: u32 = 2048, // NOTE: default must match config.zig PerformanceConfig.hl_cache_size
@@ -840,6 +906,31 @@ pub const Core = struct {
     atlas_h: u32 = 2048,
     atlas_initialized: bool = false,
     atlas_reset_during_flush: bool = false,
+    // At the maximum texture size, permit one same-size repack for a fresh
+    // capacity observation or an armed delayed recovery. A second full
+    // condition in the same transaction is negative-cached to converge.
+    atlas_full_resets_this_flush: u8 = 0,
+    // A blank GlyphEntry was cached because the maximum-size atlas could not
+    // hold it. While that capacity-negative episode is pending, new glyph
+    // misses must remain stable until its scheduled recovery deadline. Do not
+    // reset eagerly from coarse content revisions: cursor movement, color-only
+    // edits, and scrolls would otherwise recreate a maximum atlas every frame.
+    atlas_has_capacity_negative: bool = false,
+    atlas_negative_retry_grid_rev: u64 = 0,
+    atlas_negative_retry_style_rev: u64 = 0,
+    atlas_negative_retry_at: ?i128 = null,
+    atlas_negative_retry_delay_ns: i128 = 250 * std.time.ns_per_ms,
+    atlas_negative_recovery_armed: bool = false,
+    // Rasterizer callback failures are independent from atlas capacity. They
+    // receive a bounded sequence of idle retries so a temporarily busy
+    // frontend recovers, while a permanently unsupported glyph converges.
+    transient_glyph_has_negative: bool = false,
+    transient_glyph_retry_grid_rev: u64 = 0,
+    transient_glyph_retry_style_rev: u64 = 0,
+    transient_glyph_retry_at: ?i128 = null,
+    transient_glyph_retry_delay_ns: i128 = TRANSIENT_GLYPH_RETRY_INITIAL_NS,
+    transient_glyph_retry_attempts: u8 = 0,
+    transient_glyph_recovery_armed: bool = false,
 
     // Set to true after successful start(); prevents post-start setter calls
     started: bool = false,
@@ -1238,6 +1329,8 @@ pub const Core = struct {
         self.msg_cache_valid = false;
         // MsgCachedLine has only fixed-size buffers (no heap-owned strings).
         self.msg_line_cache.clearRetainingCapacity();
+        self.msg_line_cache_build.clearRetainingCapacity();
+        self.resetAtlasMaintenanceBackoff();
 
         // Last command tracking for the split-view label was a snapshot
         // of the old session's :commands.
@@ -1548,6 +1641,8 @@ pub const Core = struct {
         self.known_external_grids = .{};
         self.msg_line_cache.deinit(self.alloc);
         self.msg_line_cache = .empty;
+        self.msg_line_cache_build.deinit(self.alloc);
+        self.msg_line_cache_build = .empty;
         self.msg_config.deinit();
         self.msg_config = .{};
 
@@ -1668,7 +1763,7 @@ pub const Core = struct {
         // Initialize valid flags to false
         @memset(self.glyph_valid_ascii.?, false);
         // Initialize keys to invalid sentinel
-        const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
+        const INVALID_KEY = GLYPH_CACHE_INVALID_KEY;
         @memset(self.glyph_keys_non_ascii.?, INVALID_KEY);
 
         // Phase B: glyph-ID cache (same size as non-ASCII cache)
@@ -1737,14 +1832,18 @@ pub const Core = struct {
                 &self.ascii_lig_triggers[i],
             );
             if (ok == 0) all_ok = false;
+            if (self.flush_aborted) {
+                all_ok = false;
+                break;
+            }
         }
 
         const t1: i128 = if (log_active) clock.nowNs() else 0;
 
-        self.ascii_tables_valid = all_ok;
         if (all_ok) {
-            self.preRasterizeAscii();
+            all_ok = self.preRasterizeAscii();
         }
+        self.ascii_tables_valid = all_ok;
 
         if (log_active) {
             const t2 = clock.nowNs();
@@ -1810,45 +1909,383 @@ pub const Core = struct {
             self.cb.on_atlas_create != null;
     }
 
-    /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
-    /// Handles whitespace, oversized glyphs, atlas-full reset, UV computation.
-    /// Returns null only if the glyph cannot fit even after atlas reset.
-    fn packAndUploadBitmap(self: *Core, bm: *const c_api.GlyphBitmap) ?c_api.GlyphEntry {
-        // Whitespace / zero-size glyph → return entry with zero UVs
-        if (bm.width == 0 or bm.height == 0) {
-            const adv: f32 = @as(f32, @floatFromInt(bm.advance_26_6)) / 64.0;
-            return c_api.GlyphEntry{
-                .uv_min = .{ 0, 0 },
-                .uv_max = .{ 0, 0 },
-                .bbox_origin_px = .{ 0, 0 },
-                .bbox_size_px = .{ 0, 0 },
-                .advance_px = adv,
-                .ascent_px = bm.ascent_px,
-                .descent_px = bm.descent_px,
-                .bytes_per_pixel = bm.bytes_per_pixel,
-            };
+    fn recordAtlasCapacityNegative(self: *Core) void {
+        if (!self.atlas_has_capacity_negative) {
+            if (self.atlas_negative_recovery_armed) {
+                // The delayed reprobe still could not fit the visible working
+                // set. Do not poll an unchanged impossible set; retain a larger
+                // delay for the next genuine working-set/style change.
+                self.atlas_negative_retry_delay_ns = @min(
+                    self.atlas_negative_retry_delay_ns * 2,
+                    30 * std.time.ns_per_s,
+                );
+                self.atlas_negative_recovery_armed = false;
+            }
+            self.atlas_negative_retry_at = null;
+            self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+        }
+        self.atlas_has_capacity_negative = true;
+    }
+
+    fn retryDeadline(now: i128, delay_ns: i128) i128 {
+        return std.math.add(i128, now, delay_ns) catch std.math.maxInt(i128);
+    }
+
+    fn transientGlyphWorkingSetChanged(self: *const Core) bool {
+        return self.transient_glyph_retry_grid_rev != self.grid.glyph_working_set_rev or
+            self.transient_glyph_retry_style_rev != self.hl.glyph_style_rev;
+    }
+
+    fn resetTransientGlyphRetryBackoff(self: *Core) void {
+        self.transient_glyph_has_negative = false;
+        self.transient_glyph_retry_at = null;
+        self.transient_glyph_retry_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_retry_attempts = 0;
+        self.transient_glyph_recovery_armed = false;
+        self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+    }
+
+    fn startTransientGlyphRetryEpisode(self: *Core, now: i128) void {
+        self.transient_glyph_has_negative = true;
+        self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+        self.transient_glyph_retry_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_retry_attempts = 1;
+        self.transient_glyph_retry_at = retryDeadline(now, self.transient_glyph_retry_delay_ns);
+    }
+
+    /// Record a rasterizer miss that may be transient (for example while the
+    /// frontend is temporarily unable to produce the glyph). The callback ABI
+    /// reports both unsupported glyphs and temporary busy states as zero, so a
+    /// finite exponential sequence recovers the latter without polling the
+    /// former forever. Capacity misses have separate state: neither retry
+    /// budget can suppress the other.
+    pub fn recordTransientGlyphNegativeAt(self: *Core, now: i128) void {
+        if (self.transient_glyph_recovery_armed) {
+            self.transient_glyph_recovery_armed = false;
+            self.transient_glyph_has_negative = true;
+            self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+
+            // The fifth delayed reprobe is the bounded final attempt. Leave
+            // the blank cached with no timer until a genuinely different
+            // working set encounters another rasterizer miss.
+            if (self.transient_glyph_retry_attempts >= TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS) {
+                self.transient_glyph_retry_at = null;
+                return;
+            }
+
+            self.transient_glyph_retry_delay_ns = @min(
+                self.transient_glyph_retry_delay_ns * 2,
+                TRANSIENT_GLYPH_RETRY_MAX_NS,
+            );
+            self.transient_glyph_retry_attempts += 1;
+            self.transient_glyph_retry_at = retryDeadline(now, self.transient_glyph_retry_delay_ns);
+            return;
         }
 
-        // Reject glyphs larger than the atlas (can never fit)
+        if (self.transient_glyph_has_negative) {
+            // Before an armed deadline, additional misses belong to the same
+            // transaction and must not push it out. After the bounded final
+            // failure, only a new working set starts a fresh retry budget.
+            if (self.transient_glyph_retry_at != null or
+                !self.transientGlyphWorkingSetChanged()) return;
+            self.resetTransientGlyphRetryBackoff();
+        }
+
+        self.startTransientGlyphRetryEpisode(now);
+    }
+
+    pub fn recordTransientGlyphNegative(self: *Core) void {
+        self.recordTransientGlyphNegativeAt(clock.nowNs());
+    }
+
+    fn invalidateNegativeGlyphCacheEntries(self: *Core) void {
+        if (self.glyph_cache_ascii) |cache| {
+            if (self.glyph_valid_ascii) |valid| {
+                const len = @min(cache.len, valid.len);
+                for (cache[0..len], valid[0..len]) |entry, *is_valid| {
+                    if (is_valid.* and (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0)) {
+                        is_valid.* = false;
+                    }
+                }
+            }
+        }
+        if (self.glyph_cache_non_ascii) |cache| {
+            if (self.glyph_keys_non_ascii) |keys| {
+                const len = @min(cache.len, keys.len);
+                for (cache[0..len], keys[0..len]) |entry, *key| {
+                    if (key.* != GLYPH_CACHE_INVALID_KEY and
+                        (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0))
+                    {
+                        key.* = GLYPH_CACHE_INVALID_KEY;
+                    }
+                }
+            }
+        }
+        if (self.glyph_cache_by_id) |cache| {
+            if (self.glyph_keys_by_id) |keys| {
+                const len = @min(cache.len, keys.len);
+                for (cache[0..len], keys[0..len]) |entry, *key| {
+                    if (key.* != GLYPH_CACHE_INVALID_KEY and
+                        (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0))
+                    {
+                        key.* = GLYPH_CACHE_INVALID_KEY;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn resetAtlasCapacityRetryBackoff(self: *Core) void {
+        self.atlas_has_capacity_negative = false;
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+        self.atlas_negative_recovery_armed = false;
+        self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+    }
+
+    pub fn resetAtlasMaintenanceBackoff(self: *Core) void {
+        self.resetAtlasCapacityRetryBackoff();
+        self.resetTransientGlyphRetryBackoff();
+    }
+
+    /// Complete a reprobe after every frontend consumer accepted the flush.
+    /// Absence of a renewed capacity-negative means the old missing glyph left
+    /// the visible set (or the repack succeeded), so future episodes start at
+    /// the minimum delay.
+    pub fn finishAtlasCapacityRetry(self: *Core) void {
+        if (!self.atlas_negative_recovery_armed or self.atlas_has_capacity_negative) return;
+        self.atlas_negative_recovery_armed = false;
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+    }
+
+    fn finishTransientGlyphRetry(self: *Core) void {
+        if (!self.transient_glyph_recovery_armed or self.transient_glyph_has_negative) return;
+        self.resetTransientGlyphRetryBackoff();
+    }
+
+    pub fn finishAtlasMaintenance(self: *Core) void {
+        self.finishAtlasCapacityRetry();
+        self.finishTransientGlyphRetry();
+    }
+
+    fn beginNegativeGlyphReprobe(self: *Core) void {
+        self.invalidateNegativeGlyphCacheEntries();
+        self.invalidateScrollCache();
+        self.grid.markAllDirty();
+        self.grid.scroll_fast_path_blocked = true;
+        var sg_it = self.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| {
+            sg.markAllDirty();
+            sg.scroll_fast_path_blocked = true;
+        }
+        self.grid.cursor_rev +%= 1;
+    }
+
+    /// Schedule/execute a selective retry for cached capacity misses. One real
+    /// working-set or glyph-style change arms an absolute deadline, allowing the
+    /// existing frontend one-shot timer to drive a reprobe even when Neovim is
+    /// otherwise idle. An unchanged impossible set has no deadline and therefore
+    /// causes no atlas churn.
+    fn armAtlasCapacityRetryAt(self: *Core, now: i128) bool {
+        if (!self.atlas_has_capacity_negative) {
+            return false;
+        }
+
+        if (self.atlas_negative_retry_grid_rev != self.grid.glyph_working_set_rev or
+            self.atlas_negative_retry_style_rev != self.hl.glyph_style_rev)
+        {
+            self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+            if (self.atlas_negative_retry_at == null) {
+                self.atlas_negative_retry_at = retryDeadline(now, self.atlas_negative_retry_delay_ns);
+            }
+        }
+
+        const retry_at = self.atlas_negative_retry_at orelse return false;
+        if (now < retry_at) return false;
+
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_recovery_armed = true;
+        // Start a fresh observation window. markAllDirty below guarantees that
+        // every visible invalidated negative is reprobed. If none recur, the
+        // old missing glyph left the working set and the next flush can retire
+        // the episode instead of forcing another full redraw on every edit.
+        self.atlas_has_capacity_negative = false;
+        return true;
+    }
+
+    pub fn prepareAtlasCapacityRetryAt(self: *Core, now: i128) bool {
+        if (!self.armAtlasCapacityRetryAt(now)) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasCapacityRetry(self: *Core) bool {
+        return self.prepareAtlasCapacityRetryAt(clock.nowNs());
+    }
+
+    fn armTransientGlyphRetryAt(self: *Core, now: i128) bool {
+        if (!self.transient_glyph_has_negative) return false;
+        if (self.transient_glyph_retry_at == null and
+            self.transient_glyph_retry_attempts >= TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS and
+            self.transientGlyphWorkingSetChanged())
+        {
+            // Exhausted blanks are still cached, so a changed working set may
+            // never call the rasterizer and cannot rely on record...() to
+            // restart the budget. Schedule the fresh episode here.
+            self.resetTransientGlyphRetryBackoff();
+            self.startTransientGlyphRetryEpisode(now);
+        }
+        const retry_at = self.transient_glyph_retry_at orelse return false;
+        if (now < retry_at) return false;
+
+        self.transient_glyph_retry_at = null;
+        self.transient_glyph_recovery_armed = true;
+        self.transient_glyph_has_negative = false;
+        return true;
+    }
+
+    pub fn prepareTransientGlyphRetryAt(self: *Core, now: i128) bool {
+        if (!self.armTransientGlyphRetryAt(now)) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasMaintenanceAt(self: *Core, now: i128) bool {
+        const capacity_due = self.armAtlasCapacityRetryAt(now);
+        const transient_due = self.armTransientGlyphRetryAt(now);
+        if (!capacity_due and !transient_due) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasMaintenance(self: *Core) bool {
+        return self.prepareAtlasMaintenanceAt(clock.nowNs());
+    }
+
+    /// Restore a due reprobe after a frontend consumer rejected the flush.
+    /// The attempt did not complete, so neither retry budget is consumed.
+    pub fn rearmAtlasMaintenanceAfterAbort(self: *Core, retry_at: i128) void {
+        if (self.atlas_negative_recovery_armed and self.atlas_negative_retry_at == null) {
+            self.atlas_negative_recovery_armed = false;
+            self.atlas_has_capacity_negative = true;
+            self.atlas_negative_retry_at = retry_at;
+        }
+        if (self.transient_glyph_recovery_armed and self.transient_glyph_retry_at == null) {
+            self.transient_glyph_recovery_armed = false;
+            self.transient_glyph_has_negative = true;
+            self.transient_glyph_retry_at = retry_at;
+        }
+    }
+
+    fn blankGlyphEntry(bitmap: *const c_api.GlyphBitmap) c_api.GlyphEntry {
+        const adv: f32 = @as(f32, @floatFromInt(bitmap.advance_26_6)) / 64.0;
+        return c_api.GlyphEntry{
+            .uv_min = .{ 0, 0 },
+            .uv_max = .{ 0, 0 },
+            .bbox_origin_px = .{ 0, 0 },
+            .bbox_size_px = .{ 0, 0 },
+            .advance_px = adv,
+            .ascent_px = bitmap.ascent_px,
+            .descent_px = bitmap.descent_px,
+            .bytes_per_pixel = bitmap.bytes_per_pixel,
+        };
+    }
+
+    /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
+    /// Handles whitespace, oversized glyphs, bounded atlas growth, UV computation.
+    /// A glyph that cannot fit at the maximum atlas size returns a zero-bbox
+    /// entry so callers can negative-cache it instead of forcing a full-screen
+    /// retry on every flush.
+    fn packAndUploadBitmap(self: *Core, bm: *const c_api.GlyphBitmap) ?c_api.GlyphEntry {
+        // Whitespace / zero-size glyph → return entry with zero UVs.
+        if (bm.width == 0 or bm.height == 0) {
+            return blankGlyphEntry(bm);
+        }
+
         const pad2 = self.atlas_packer.?.padding * 2;
-        if (bm.width + pad2 > self.atlas_w or bm.height + pad2 > self.atlas_h) {
-            return null;
+        // Dimensions cross the C ABI and are therefore hostile input. Check
+        // every addition before ShelfPacker.alloc performs the same arithmetic
+        // with ordinary u32 operators. An unrepresentable bitmap can never fit
+        // a frontend texture, so it is a stable blank rather than an upload.
+        const packed_w = std.math.add(u32, bm.width, pad2) catch return blankGlyphEntry(bm);
+        const packed_h = std.math.add(u32, bm.height, pad2) catch return blankGlyphEntry(bm);
+        const packed_h_with_border = std.math.add(u32, packed_h, 1) catch return blankGlyphEntry(bm);
+
+        // Grow before packing when a single glyph cannot fit the current
+        // texture. Growth invalidates every old UV, exactly like a reset.
+        while ((packed_w > self.atlas_w or packed_h_with_border > self.atlas_h) and
+            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
+        {
+            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
+            self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
+            self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
+        }
+
+        // Still oversized at the frontend-supported maximum: preserve the
+        // existing texture and cache a permanent miss for this atlas/font
+        // generation.
+        if (packed_w > self.atlas_w or packed_h_with_border > self.atlas_h) {
+            return blankGlyphEntry(bm);
         }
 
         const log_on = self.log.cb != null;
 
-        // Try to pack
+        // Try to pack.
         var packer = &(self.atlas_packer.?);
         const t_pack: i128 = if (log_on) clock.nowNs() else 0;
+        var packer_before_alloc = packer.*;
+        var alloc_reset_seq = self.atlas_reset_seq;
         var rect = packer.alloc(bm.width, bm.height);
+        if (rect == null) packer.* = packer_before_alloc;
 
-        // Atlas full → reset and retry once.
-        if (rect == null) {
+        // A full atlas grows geometrically up to the configured/frontend-safe
+        // maximum. At the maximum, permit one same-size reset for a fresh
+        // capacity observation or an armed delayed recovery. Once a capacity
+        // miss is negative-cached, ordinary flushes must wait for that
+        // episode's deadline instead of recreating the texture for every new
+        // glyph edit. If an allowed repack also fills, subsequent misses in
+        // this flush become negative entries and the row retry converges.
+        if (rect == null and
+            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
+        {
+            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
             self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
             self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
             packer = &(self.atlas_packer.?);
+            packer_before_alloc = packer.*;
+            alloc_reset_seq = self.atlas_reset_seq;
             rect = packer.alloc(bm.width, bm.height);
-            if (rect == null) return null;
+        } else if (rect == null and
+            self.atlas_full_resets_this_flush == 0 and
+            (!self.atlas_has_capacity_negative or self.atlas_negative_recovery_armed))
+        {
+            self.atlas_full_resets_this_flush = 1;
+            self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
+            self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
+            packer = &(self.atlas_packer.?);
+            packer_before_alloc = packer.*;
+            alloc_reset_seq = self.atlas_reset_seq;
+            rect = packer.alloc(bm.width, bm.height);
+        }
+        if (rect == null) {
+            packer.* = packer_before_alloc;
+            self.recordAtlasCapacityNegative();
+            return blankGlyphEntry(bm);
         }
         if (log_on) {
             const dt: u64 = @intCast(@max(0, clock.nowNs() - t_pack));
@@ -1891,7 +2328,7 @@ pub const Core = struct {
     }
 
     /// Ensure atlas is lazily initialized.
-    fn ensureAtlasInit(self: *Core) void {
+    fn ensureAtlasInit(self: *Core) bool {
         if (!self.atlas_initialized) {
             self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
             if (self.cb.on_atlas_create) |f| {
@@ -1904,63 +2341,119 @@ pub const Core = struct {
                     self.perf_atlas_create_calls +%= 1;
                 }
             }
+            if (self.flush_aborted) {
+                self.atlas_packer = null;
+                return false;
+            }
             self.atlas_initialized = true;
         }
+        return true;
     }
 
     /// Pre-rasterize printable ASCII (0x20-0x7E) for all style combos
     /// to eliminate cold-cache DWrite spikes on first flush.
     /// Called once after loadAsciiTables() succeeds (on font init).
-    pub fn preRasterizeAscii(self: *Core) void {
+    pub fn preRasterizeAscii(self: *Core) bool {
+        if (self.flush_aborted) return false;
         // Guard: required callbacks must be set (ensureGlyphByID unwraps .?)
-        if (self.cb.on_rasterize_glyph_by_id == null) return;
-        if (self.cb.on_atlas_upload == null) return;
-        if (self.cb.on_atlas_create == null) return;
+        if (self.cb.on_rasterize_glyph_by_id == null) return true;
+        if (self.cb.on_atlas_upload == null) return true;
+        if (self.cb.on_atlas_create == null) return true;
 
-        self.initGlyphCache() catch return;
-        const cache = self.glyph_cache_by_id orelse return;
-        const keys = self.glyph_keys_by_id orelse return;
-        const CACHE_SIZE = self.glyph_cache_non_ascii_size;
-        if (CACHE_SIZE == 0) return;
+        self.initGlyphCache() catch return false;
+        const cache = self.glyph_cache_by_id orelse return false;
+        const keys = self.glyph_keys_by_id orelse return false;
+        const scalar_cache = self.glyph_cache_ascii orelse return false;
+        const scalar_valid = self.glyph_valid_ascii orelse return false;
+        // Modulus MUST be the physical hash-table length, not the mutable size field.
+        // glyph_cache_non_ascii_size can drift from the allocated arrays (a concurrent
+        // setGlyphCacheSize updates the size field before the arrays are reallocated),
+        // and hashing with a larger modulus then indexes past the end of `keys`/`cache`
+        // -> "index out of bounds". Deriving the modulus from keys.len can never do that.
+        const CACHE_SIZE = @as(u32, @intCast(keys.len));
+        if (CACHE_SIZE == 0) return false;
 
-        const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
         const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
 
         var rasterized: u32 = 0;
         var skipped: u32 = 0;
 
         for (0..4) |si| {
+            if (self.flush_aborted) return false;
             const gids = &self.ascii_glyph_ids[si];
             const c_style = style_combos[si];
 
             for (0x20..0x7F) |scalar| {
+                if (self.flush_aborted) return false;
                 const gid = gids[scalar];
                 if (gid == 0) continue; // .notdef
 
                 const key = (@as(u64, gid) << 2) | @as(u64, si);
                 const hash_val = (gid *% 2654435761) ^ @as(u32, @intCast(si));
-                const hash_idx = @as(usize, hash_val % CACHE_SIZE);
+                const probe = glyphCacheProbe(keys, key, hash_val);
+                const scalar_index = scalar * 4 + si;
 
-                // Already cached → skip
-                if (keys[hash_idx] != INVALID_KEY and keys[hash_idx] == key) {
+                // Already cached by glyph ID. Mirror it into the canonical
+                // scalar*4+style slot used by both row and cursor fast paths.
+                // A blank by-ID entry may be a normal primary-face miss, so
+                // resolve the scalar fallback before publishing that slot.
+                if (probe.hit) |hit| {
+                    var scalar_entry = cache[hit];
+                    var can_mirror = scalar_entry.bbox_size_px[0] > 0 and scalar_entry.bbox_size_px[1] > 0;
+                    if ((scalar_entry.bbox_size_px[0] <= 0 or scalar_entry.bbox_size_px[1] <= 0) and
+                        self.cb.on_rasterize_glyph != null)
+                    {
+                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                            if (self.flush_aborted) return false;
+                            skipped += 1;
+                            continue;
+                        };
+                        can_mirror = true;
+                    }
+                    if (can_mirror and scalar_index < scalar_cache.len and scalar_index < scalar_valid.len) {
+                        scalar_cache[scalar_index] = scalar_entry;
+                        scalar_valid[scalar_index] = true;
+                    }
                     skipped += 1;
                     continue;
                 }
 
                 // Rasterize + pack + upload
                 if (self.ensureGlyphByID(gid, c_style)) |entry| {
-                    cache[hash_idx] = entry;
-                    keys[hash_idx] = key;
+                    cache[probe.insert] = entry;
+                    keys[probe.insert] = key;
+                    var scalar_entry = entry;
+                    var can_mirror = entry.bbox_size_px[0] > 0 and entry.bbox_size_px[1] > 0;
+                    if ((entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) and
+                        self.cb.on_rasterize_glyph != null)
+                    {
+                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                            if (self.flush_aborted) return false;
+                            rasterized += 1;
+                            continue;
+                        };
+                        can_mirror = true;
+                    }
+                    if (can_mirror and scalar_index < scalar_cache.len and scalar_index < scalar_valid.len) {
+                        scalar_cache[scalar_index] = scalar_entry;
+                        scalar_valid[scalar_index] = true;
+                    }
                     rasterized += 1;
+                } else if (self.flush_aborted) {
+                    return false;
                 }
             }
         }
 
         self.log.write("[perf] preRasterizeAscii rasterized={d} skipped={d}\n", .{ rasterized, skipped });
+        return true;
     }
 
     /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
-    /// Returns null on unrecoverable failure (rasterize callback returned 0).
+    /// A non-aborting rasterizer miss returns a blank negative-cache entry and
+    /// arms bounded maintenance retries. Upload/create failures use
+    /// flush_aborted and still return null, immediately rejecting the whole
+    /// transaction rather than publishing a blank.
     pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
@@ -1970,7 +2463,7 @@ pub const Core = struct {
             self.perf_atlas_total_calls +%= 1;
         };
 
-        self.ensureAtlasInit();
+        if (!self.ensureAtlasInit()) return null;
 
         // Ask frontend to rasterize (no packing / UV)
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
@@ -1981,13 +2474,20 @@ pub const Core = struct {
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
-        if (ok == 0) return null;
+        if (self.flush_aborted) return null;
+        if (ok == 0) {
+            self.recordTransientGlyphNegative();
+            return blankGlyphEntry(&bm);
+        }
 
         return self.packAndUploadBitmap(&bm);
     }
 
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
     /// Similar to ensureGlyphPhase2 but uses on_rasterize_glyph_by_id callback.
+    /// A zero result is a cacheable blank but does not itself arm maintenance:
+    /// primary-face misses commonly succeed through the caller's scalar/fallback
+    /// font path. Only a final scalar miss starts the bounded retry episode.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
@@ -1997,7 +2497,7 @@ pub const Core = struct {
             self.perf_atlas_total_calls +%= 1;
         };
 
-        self.ensureAtlasInit();
+        if (!self.ensureAtlasInit()) return null;
 
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
@@ -2007,20 +2507,27 @@ pub const Core = struct {
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
-        if (ok == 0) return null;
+        if (self.flush_aborted) return null;
+        if (ok == 0) {
+            return blankGlyphEntry(&bm);
+        }
 
         return self.packAndUploadBitmap(&bm);
     }
 
     /// Reset core atlas: clear packer, invalidate cache, recreate texture.
     pub fn resetCoreAtlas(self: *Core) void {
-        if (self.atlas_packer) |*p| {
-            p.reset();
-        } else {
-            // Packer not yet created (e.g. onGuifont before first glyph render).
-            // Create it now so atlas_initialized=true is safe.
-            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
+        const capacity_reprobe_in_progress = self.atlas_negative_recovery_armed;
+        self.atlas_reset_seq +%= 1;
+        self.atlas_has_capacity_negative = false;
+        self.atlas_negative_retry_at = null;
+        if (!capacity_reprobe_in_progress) {
+            self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+            self.atlas_negative_recovery_armed = false;
         }
+        // Reinitialize rather than merely reset: atlas_w/h can grow when a
+        // full atlas is encountered.
+        self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
         self.resetGlyphCacheFlags();
         self.atlas_initialized = true;
         if (self.cb.on_atlas_create) |f| {

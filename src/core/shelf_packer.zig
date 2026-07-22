@@ -36,6 +36,17 @@ pub const ShelfPacker = struct {
 
         // Atlas full: no more vertical space.
         if (self.next_y + packed_h > self.height) return null;
+        // Glyph too wide to ever fit on a fresh shelf row: reject only if the
+        // actual written glyph region (next_x + padding + glyph_w, i.e.
+        // next_x + packed_w - padding) would extend past the buffer's right
+        // edge. Deliberately NOT `next_x + packed_w > self.width`: that
+        // would also reject the packed_w == width boundary at next_x == 1,
+        // which is the current caller's normal (safe) upper bound — see
+        // fix-plan Item 2/3 write-region analysis. At next_x = 1,
+        // packed_w = width: 1 + width - 1 = width > width is false, so the
+        // boundary is still admitted; a glyph that is genuinely too wide
+        // (packed_w > width) is still rejected.
+        if (self.next_x + packed_w - self.padding > self.width) return null;
 
         const rect = Rect{
             .x = self.next_x,
