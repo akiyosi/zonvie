@@ -1505,6 +1505,68 @@ ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
    The aborted flush's dirty state is preserved — next flush retries everything. */
 ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
 
+/* Returns true when the flush that JUST ran detected an atlas reset during
+   the deferred external-grid pass, after main vertices for this same flush
+   were already dispatched with pre-reset UVs. Call from on_flush_end,
+   BEFORE committing, while grid_mu is still held. When true, the frontend
+   must cancel this flush's commit entirely (same handling as an allocation
+   failure: cancel brackets instead of publishing) — committing would
+   present main-grid vertices sampling the wrong (freshly repacked) atlas
+   for one frame. The core has already scheduled a corrected full resend for
+   the next flush; cancelling here only prevents showing the corrupted
+   frame, no data is lost. */
+ZONVIE_API bool zonvie_core_flush_had_atlas_corruption(zonvie_core *core);
+
+/* Returns true when the flush that JUST ran was aborted — either by an
+   explicit frontend zonvie_core_abort_flush() call, or by an internal Zig
+   error (e.g. OOM growing a persistent composition buffer) caught inside
+   onFlush itself. Call from on_flush_end, BEFORE committing, while grid_mu
+   is still held. When true, the frontend must cancel this flush's commit —
+   whatever partial write-set was composed before the abort is incomplete
+   and must not be presented as a full frame. Dirty state is preserved
+   either way, so cancelling loses no data; call zonvie_core_retry_flush
+   once frontend capacity recovers (or after an internal-error backoff) to
+   resend it. */
+ZONVIE_API bool zonvie_core_flush_was_aborted(zonvie_core *core);
+
+/* Retry a flush that was previously aborted via zonvie_core_abort_flush.
+   Flushes are normally driven by incoming Neovim redraw batches; an abort
+   preserves dirty state but does NOT by itself cause another flush attempt.
+   If the condition that caused the abort (no free buffer set, OOM) clears
+   with no further redraw event arriving, content would stay unflushed
+   forever without this. Call once frontend capacity is recovered — a
+   one-shot retry timer armed right after the abort (matching the existing
+   grid_mu-contention retry idiom) is the expected usage pattern.
+   Calls onFlush() unconditionally — it already short-circuits into
+   near-zero work when nothing is actually dirty (main, cursor, or any
+   subgrid/external state), same as any no-op Neovim redraw batch. */
+ZONVIE_API void zonvie_core_retry_flush(zonvie_core *core);
+
+/* Same effect as zonvie_core_retry_flush, for a caller that ALREADY holds
+   grid_mu via zonvie_core_lock_grid. This allows a frontend retry timer to
+   acquire grid_mu, revalidate that its retry generation is still current,
+   and execute the flush without reopening a race against a normal redraw.
+   The caller must release grid_mu with zonvie_core_unlock_grid afterward. */
+ZONVIE_API void zonvie_core_retry_flush_locked(zonvie_core *core);
+
+/* Force every grid to be treated as dirty on the next flush attempt.
+   For frontend failures only discoverable AFTER onFlush already cleared
+   its dirty state this flush (e.g. a macOS MTLBuffer allocation failing
+   while writing the committed frame) — too late for zonvie_core_abort_flush,
+   whose flag is only consulted during onFlush's own execution. Call
+   zonvie_core_retry_flush afterward (or rely on the next Neovim redraw) to
+   actually drive the next attempt.
+   Takes grid_mu itself — call ONLY from a context that does not already
+   hold it (e.g. a main-thread retry timer). Do NOT call from
+   on_flush_begin/on_flush_end (core/RPC thread, grid_mu held for the
+   entire handleRedraw duration) — use zonvie_core_force_resend_locked
+   there instead, or this self-deadlocks on the non-recursive grid_mu. */
+ZONVIE_API void zonvie_core_force_resend(zonvie_core *core);
+
+/* Same effect as zonvie_core_force_resend, for callers that ALREADY hold
+   grid_mu — specifically on_flush_begin/on_flush_end. */
+ZONVIE_API void zonvie_core_force_resend_locked(zonvie_core *core);
+
 /* ========================================================================
    Custom shader cross-compilation (Shadertoy / Ghostty compatible GLSL)
    ======================================================================== */

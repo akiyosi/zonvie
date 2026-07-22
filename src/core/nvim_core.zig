@@ -697,6 +697,21 @@ pub const Core = struct {
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
 
+    /// Set when an atlas reset is detected during the DEFERRED external-grid
+    /// pass (sendExternalGridVertices, runs after on_flush_end's LIFO defer
+    /// ordering puts it before the callback but after the main row-mode loop
+    /// already dispatched this flush's main vertices with pre-reset UVs).
+    /// markAllDirty() alone only schedules a correct resend for the NEXT
+    /// flush — it cannot undo already-dispatched on_vertices_row calls for
+    /// THIS flush, whose vertices would otherwise be committed alongside the
+    /// just-reset (differently-packed) atlas texture: one frame of visible
+    /// glyph corruption. Read by frontends via
+    /// zonvie_core_flush_had_atlas_corruption() (while grid_mu is still
+    /// held, from on_flush_end) to cancel the current flush's commit
+    /// entirely instead of presenting it. Reset at the start of each flush
+    /// cycle, same as flush_aborted.
+    flush_atlas_corrupted: bool = false,
+
     init_rows: u32 = 24,
     init_cols: u32 = 80,
 
@@ -1815,6 +1830,7 @@ pub const Core = struct {
     /// Called once after font change. No-op if callback is not registered.
     /// Returns true if tables were loaded (or already valid).
     pub fn loadAsciiTables(self: *Core) bool {
+        if (self.flush_aborted) return false;
         if (self.ascii_tables_valid) return true;
         const cb = self.cb.on_get_ascii_table orelse return false;
 
@@ -2305,6 +2321,29 @@ pub const Core = struct {
             }
         }
 
+        // on_atlas_upload's C ABI is void, so a frontend that discovers the
+        // upload didn't actually land (e.g. macOS GlyphAtlas dropping it on
+        // a reader-gate timeout or a failed pending blit) has no return
+        // value to report that through -- it signals failure by calling
+        // zonvie_core_abort_flush (and zonvie_core_invalidate_glyph_cache)
+        // synchronously from inside the callback above instead. Checking
+        // flush_aborted here and returning null (skipping the UV
+        // computation and GlyphEntry below) is what actually stops the
+        // caller from re-caching a bad entry: the cache invalidation the
+        // callback already did happens BEFORE this point, so without this
+        // check the entry built below would be written right back into the
+        // just-cleared glyph_cache_by_id/glyph_cache_non_ascii, undoing it.
+        if (self.flush_aborted or self.atlas_reset_seq != alloc_reset_seq) {
+            // A rejected upload did not consume texture space. Restore the
+            // shelf cursor only while it still names the same atlas generation;
+            // an invalidate callback may already have replaced the packer.
+            if (self.atlas_reset_seq == alloc_reset_seq and self.atlas_packer != null) {
+                self.atlas_packer.? = packer_before_alloc;
+            }
+            if (self.atlas_reset_seq != alloc_reset_seq) self.flush_aborted = true;
+            return null;
+        }
+
         // Compute UVs (excluding padding)
         const uvs = packer.computeUV(r.x, r.y, bm.width, bm.height);
 
@@ -2539,6 +2578,10 @@ pub const Core = struct {
                 self.perf_atlas_create_ns_total +%= dt;
                 self.perf_atlas_create_calls +%= 1;
             }
+        }
+        if (self.flush_aborted) {
+            self.atlas_packer = null;
+            self.atlas_initialized = false;
         }
     }
 
@@ -2941,21 +2984,29 @@ pub const Core = struct {
         };
     }
 
-    pub fn resize(self: *Core, rows: u32, cols: u32) void {
-        self.requestTryResize(rows, cols) catch |e| {
-            self.pending_resize_rows = rows;
-            self.pending_resize_cols = cols;
-            self.pending_resize_valid = true;
-            self.log.write(
-                "resize err: {any} -> pending_resize rows={d} cols={d}\n",
-                .{ e, rows, cols },
-            );
-            return;
-        };
+    pub fn resize(self: *Core, rows: u32, cols: u32) bool {
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        defer self.pending_resize_mu.unlock(clock.io());
 
-        if (self.pending_resize_valid and self.pending_resize_rows == rows and self.pending_resize_cols == cols) {
-            self.pending_resize_valid = false;
+        // Retain the desired dimensions independently of delivery. An enqueue
+        // to the old writer can succeed immediately before reconnect cleanup
+        // drops that queue; resetSessionState republishes this latest value.
+        self.desired_resize_rows = rows;
+        self.desired_resize_cols = cols;
+        const sequence = self.nextPendingUiStateSequenceLocked();
+        self.pending_resize_rows = rows;
+        self.pending_resize_cols = cols;
+        self.pending_resize_valid = true;
+        self.pending_resize_sequence = sequence;
+
+        // nvim_ui_try_resize is invalid before nvim_ui_attach. Publish the
+        // newest layout for the attach thread to drain atomically instead.
+        if (!self.ui_attached.load(.acquire)) {
+            return false;
         }
+
+        self.flushPendingUiStateLocked();
+        return !self.pending_resize_valid or self.pending_resize_sequence != sequence;
     }
 
     pub fn updateLayoutPx(
@@ -2964,7 +3015,7 @@ pub const Core = struct {
         drawable_h_px: u32,
         cell_w_px: u32,
         cell_h_px: u32,
-    ) void {
+    ) bool {
         // If called from within handleRedraw (via callback) on the SAME thread,
         // grid_mu is already held, so we can call the locked version directly.
         // This ensures cell dimensions are updated BEFORE the flush generates vertices.
@@ -2973,15 +3024,15 @@ pub const Core = struct {
         const current_tid: usize = @intCast(std.Thread.getCurrentId());
         const redraw_tid = self.redraw_thread_id.load(.seq_cst);
         if (redraw_tid != 0 and redraw_tid == current_tid) {
-            self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
-            return;
+            _ = self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+            return false;
         }
 
         // Called from UI thread - acquire grid_mu to protect grid state access.
         self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-
-        self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+        const changed = self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+        self.grid_mu.unlock(clock.io());
+        return changed;
     }
 
     // Internal implementation: assumes grid_mu is already held or we're in a safe context.
@@ -2993,7 +3044,7 @@ pub const Core = struct {
         drawable_h_px: u32,
         cell_w_px: u32,
         cell_h_px: u32,
-    ) void {
+    ) bool {
         // All inputs are already integer pixels (UI measured & rounded).
         // Keep core logic deterministic across macOS/Windows.
         const cw = if (cell_w_px == 0) 1 else cell_w_px;
@@ -3001,11 +3052,14 @@ pub const Core = struct {
         const dw = if (drawable_w_px == 0) 1 else drawable_w_px;
         const dh = if (drawable_h_px == 0) 1 else drawable_h_px;
 
-        // Track whether cell dimensions changed (affects vertex positions).
+        // NDC positions depend on both cell and drawable dimensions.
+        const drawable_dims_changed = (dw != self.drawable_w_px or dh != self.drawable_h_px);
         const cell_dims_changed = (cw != self.cell_w_px or ch != self.cell_h_px);
 
         const cols = @max(@as(u32, 1), dw / cw);
         const rows = @max(@as(u32, 1), dh / ch);
+        const grid_dims_changed = (rows != self.last_layout_rows or cols != self.last_layout_cols);
+        const vertex_geometry_changed = drawable_dims_changed or cell_dims_changed or grid_dims_changed;
 
         self.drawable_w_px = dw;
         self.drawable_h_px = dh;
@@ -3019,26 +3073,32 @@ pub const Core = struct {
         // This is done here to avoid a separate lock acquisition in setScreenCols.
         self.grid.screen_cols = cols;
 
-        // If cell dimensions changed, mark grid dirty to force vertex regeneration.
-        // This handles linespace changes where rows/cols may not change but
-        // vertex positions need recalculation.
-        if (cell_dims_changed) {
+        // Any geometry input change invalidates baked NDC positions, including
+        // drawable-only resizes and row/column changes at the same cell size.
+        if (vertex_geometry_changed) {
             self.grid.markAllDirty();
-            // Also mark all external grids dirty so they get regenerated with new cell size
-            var sg_it = self.grid.sub_grids.valueIterator();
-            while (sg_it.next()) |sg| {
-                sg.dirty = true;
+            // Cursor geometry is submitted independently of row vertices.
+            self.grid.cursor_rev +%= 1;
+            // External-grid NDC uses each external drawable/viewport, not the
+            // main drawable dimensions. Regenerate them only when shared cell
+            // metrics change; a one-pixel main live-resize must stay O(main).
+            if (cell_dims_changed) {
+                var sg_it = self.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| {
+                    sg.markAllDirty();
+                }
             }
-            // Immediately send external grid vertices with new cell size
-            // (don't wait for next flush from Neovim)
-            self.sendExternalGridVertices(true);
         }
 
-        if (rows == self.last_layout_rows and cols == self.last_layout_cols) return;
-        self.last_layout_rows = rows;
-        self.last_layout_cols = cols;
-        // Use existing resize path (already catches/logs errors).
-        self.resize(rows, cols);
+        if (!grid_dims_changed) return vertex_geometry_changed;
+
+        // Only suppress a future resize after the RPC was accepted. A failed
+        // send remains pending and the same dimensions must be retried.
+        if (self.resize(rows, cols)) {
+            self.last_layout_rows = rows;
+            self.last_layout_cols = cols;
+        }
+        return vertex_geometry_changed;
     }
 
     /// Set screen width in cells (for cmdline max width).
@@ -3071,8 +3131,12 @@ pub const Core = struct {
     fn firstCodepointUtf8(s: []const u8) ?u32 {
         if (s.len == 0) return null;
         var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
-        if (it.nextCodepoint()) |cp| return @as(u32, cp);
-        return null;
+        // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
+        // UTF-8 (it uses utf8Decode(slice) catch unreachable) — see the same
+        // hazard documented in redraw_handler.zig's firstCodepoint().
+        const slice = it.nextCodepointSlice() orelse return null;
+        const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
+        return @as(u32, cp);
     }
 
     fn appendModPrefix(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, mods: u32) !void {
@@ -3106,19 +3170,19 @@ pub const Core = struct {
     pub fn winSpecialName(vk: u32) ?[]const u8 {
         // Win32 Virtual-Key mapping -> Neovim special key names.
         return switch (vk) {
-            0x25 => "Left",    // VK_LEFT
-            0x26 => "Up",      // VK_UP
-            0x27 => "Right",   // VK_RIGHT
-            0x28 => "Down",    // VK_DOWN
-            0x24 => "Home",    // VK_HOME
-            0x23 => "End",     // VK_END
-            0x21 => "PageUp",  // VK_PRIOR
-            0x22 => "PageDown",// VK_NEXT
-            0x08 => "BS",      // VK_BACK
-            0x2E => "Del",     // VK_DELETE
-            0x0D => "CR",      // VK_RETURN
-            0x09 => "Tab",     // VK_TAB
-            0x1B => "Esc",     // VK_ESCAPE
+            0x25 => "Left", // VK_LEFT
+            0x26 => "Up", // VK_UP
+            0x27 => "Right", // VK_RIGHT
+            0x28 => "Down", // VK_DOWN
+            0x24 => "Home", // VK_HOME
+            0x23 => "End", // VK_END
+            0x21 => "PageUp", // VK_PRIOR
+            0x22 => "PageDown", // VK_NEXT
+            0x08 => "BS", // VK_BACK
+            0x2E => "Del", // VK_DELETE
+            0x0D => "CR", // VK_RETURN
+            0x09 => "Tab", // VK_TAB
+            0x1B => "Esc", // VK_ESCAPE
             else => null,
         };
     }

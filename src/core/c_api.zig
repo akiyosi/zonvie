@@ -557,6 +557,10 @@ const CoreBox = struct {
 
     // Config for message routing
     msg_config: config.Config = .{},
+    // A safe lifecycle-thread destroy is a one-shot ownership transfer.
+    // Callback-thread destroy requests shutdown without claiming ownership so
+    // the lifecycle thread can still release the retained box afterwards.
+    destroy_claimed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn allocator(self: *CoreBox) std.mem.Allocator {
         return self.gpa.allocator();
@@ -703,9 +707,58 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 pub export fn zonvie_core_destroy(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
+
+    // The RPC/redraw thread may be inside a frontend callback. Joining that
+    // stack here self-deadlocks, while asynchronously freeing the box would
+    // invalidate callback context/local handle copies. Request shutdown but do
+    // not claim destruction: the frontend must finish it later from its
+    // lifecycle thread.
+    if (box.core.isCurrentThreadUnsafeForTeardown()) {
+        box.core.stop();
+        return;
+    }
+
+    if (box.destroy_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+
     box.core.stop();
+    // stop() is idempotent and non-blocking for a concurrent teardown owner;
+    // the allocator and CoreBox must outlive that owner.
+    if (!box.core.waitUntilStopped()) return;
     _ = box.gpa.deinit();
     std.heap.c_allocator.destroy(box);
+}
+
+test "callback destroy can be completed after enclosing API returns" {
+    const State = struct {
+        core: ?*zonvie_core = null,
+        callback_count: u32 = 0,
+
+        fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.callback_count += 1;
+            zonvie_core_destroy(self.core);
+        }
+    };
+
+    var state = State{};
+    var callbacks: Callbacks = .{ .on_flush_begin = State.onFlushBegin };
+    const p = zonvie_core_create(&callbacks, @sizeOf(Callbacks), &state) orelse return error.OutOfMemory;
+    state.core = p;
+    const box = asBox(p);
+    try box.core.grid.resizeGrid(1, 1, 1);
+
+    // retry_flush models a UI-thread Core API that invokes a synchronous
+    // callback. The callback's destroy request must not claim or free the box
+    // while retry_flush still has grid_mu/redraw-thread state to unwind.
+    zonvie_core_retry_flush(p);
+    try std.testing.expectEqual(@as(u32, 1), state.callback_count);
+    try std.testing.expect(!box.destroy_claimed.load(.acquire));
+    try std.testing.expect(box.core.stop_flag.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), box.core.stop_state.load(.acquire));
+
+    // Once the callback and enclosing API have both returned, the serialized
+    // lifecycle owner can join teardown and release the retained handle.
+    zonvie_core_destroy(p);
 }
 
 pub export fn zonvie_core_start(p: ?*zonvie_core, nvim_path_c: ?[*:0]const u8, rows: u32, cols: u32) callconv(.c) i32 {
@@ -909,7 +962,7 @@ pub export fn zonvie_core_send_key_event(
 pub export fn zonvie_core_resize(p: ?*zonvie_core, rows: u32, cols: u32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.resize(rows, cols);
+    _ = box.core.resize(rows, cols);
 }
 
 /// Request resize of a specific grid (for external windows).
@@ -928,7 +981,11 @@ pub export fn zonvie_core_update_layout_px(
 ) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.updateLayoutPx(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+    if (box.core.updateLayoutPx(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px)) {
+        // Standalone layout changes must publish main and external vertices
+        // together. Re-entrant redraw callbacks are flushed by their batch.
+        zonvie_core_retry_flush(p);
+    }
 }
 
 /// Set screen width in cells (for cmdline max width).
@@ -1979,6 +2036,182 @@ pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     box.core.flush_aborted = true;
 }
 
+// Mark every grid (main + all sub_grids/external grids) and the cursor
+// dirty. Shared by zonvie_core_force_resend/_locked below.
+//
+// markAllDirty() alone only covers the MAIN grid (dirty_all). A frontend
+// failure discovered after onFlush already consumed dirty state can affect
+// ANY of: external grid rows, main cursor, external cursor, or the vacated
+// area of an external grid's cursor after it moved — main-grid-only
+// resend leaves those stale, since each sub_grid tracks its own
+// dirty/dirty_rows independently and cursor_rev is a separate revision
+// counter entirely. Cursor is bumped once (not per-grid): Neovim has a
+// single active cursor at a time (tracked via cursor_grid/cursor_row/
+// cursor_col), so one cursor_rev bump covers whichever grid currently
+// owns it, main or external.
+fn forceResendAll(cp: *core.Core) void {
+    cp.grid.markAllDirty();
+    var sub_it = cp.grid.sub_grids.iterator();
+    while (sub_it.next()) |entry| {
+        entry.value_ptr.markAllDirty();
+    }
+    cp.grid.cursor_rev +%= 1;
+    // A prior failed flush may have moved the cursor between external
+    // grids without the old grid ever actually receiving its empty-cursor
+    // update (see force_ext_cursor_recheck's doc comment) — force every
+    // external grid to re-check its cursor state once rather than relying
+    // on last_ext_cursor_grid, which cannot be trusted to still name the
+    // right stale grid in that scenario.
+    cp.force_ext_cursor_recheck = true;
+}
+
+// Force every grid to be treated as dirty on the next flush attempt.
+// For a class of frontend failure (e.g. a macOS MTLBuffer allocation
+// failing) that is only discoverable AFTER onFlush already ran its normal
+// dirty-clearing for this flush — too late for zonvie_core_abort_flush,
+// whose flag is only consulted DURING onFlush's own execution — this is the
+// recovery: content the frontend failed to actually store gets regenerated
+// and resent on the next attempt instead of silently staying missing/stale.
+// Call zonvie_core_retry_flush afterward (or rely on the next Neovim
+// redraw) to actually drive that next attempt.
+//
+// Takes grid_mu itself — call ONLY from a context that does not already
+// hold it (e.g. a main-thread timer). on_flush_begin/on_flush_end run on
+// the core/RPC thread with grid_mu held for the ENTIRE handleRedraw
+// duration (rpc_session.zig); calling this from there would self-deadlock
+// on the non-recursive std.Io.Mutex. Those callbacks must use
+// zonvie_core_force_resend_locked instead.
+pub export fn zonvie_core_force_resend(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const cp = &box.core;
+    cp.grid_mu.lockUncancelable(clock.io());
+    defer cp.grid_mu.unlock(clock.io());
+    forceResendAll(cp);
+}
+
+// Same effect as zonvie_core_force_resend, but for callers that ALREADY
+// hold grid_mu — specifically on_flush_begin/on_flush_end, which run on the
+// core/RPC thread for the entire handleRedraw duration. Calling the
+// locking variant from there deadlocks on the non-recursive grid_mu.
+pub export fn zonvie_core_force_resend_locked(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    forceResendAll(&box.core);
+}
+
+// Returns true when the flush that JUST ran (i.e. inside the current
+// on_flush_begin/on_flush_end pair) detected an atlas reset during the
+// deferred external-grid pass, after main vertices for this same flush were
+// already dispatched with pre-reset UVs. Call from on_flush_end, BEFORE
+// committing, while grid_mu is still held (no locking needed here — this is
+// a plain field read, safe under the caller's existing grid_mu hold, same
+// as flush_aborted's internal-only reads). When true, the frontend must
+// cancel this flush's commit entirely (treat exactly like an allocation
+// failure: cancel brackets instead of publishing them) — committing would
+// present main-grid vertices sampling the wrong (freshly repacked) atlas
+// for one frame. The core has already scheduled a corrected full resend for
+// the next flush (markAllDirty), so cancelling here is purely about not
+// showing the corrupted frame; no data is lost.
+pub export fn zonvie_core_flush_had_atlas_corruption(p: ?*zonvie_core) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    return box.core.flush_atlas_corrupted;
+}
+
+// Returns true when the flush that JUST ran was aborted — either by an
+// explicit frontend zonvie_core_abort_flush() call, or by an internal Zig
+// error (e.g. OOM growing a persistent composition buffer) caught inside
+// onFlush itself. Call from on_flush_end, BEFORE committing, while grid_mu
+// is still held (plain field read, same as flush_had_atlas_corruption).
+// When true, the frontend must cancel this flush's commit — whatever
+// partial write-set was composed before the abort is incomplete and must
+// not be presented as a full frame. Dirty state is preserved either way, so
+// cancelling loses no data; call zonvie_core_retry_flush once frontend
+// capacity recovers (or after an internal-error backoff) to resend it.
+pub export fn zonvie_core_flush_was_aborted(p: ?*zonvie_core) callconv(.c) bool {
+    if (p == null) return false;
+    const box = asBox(p.?);
+    return box.core.flush_aborted;
+}
+
+// Retry a flush that was previously aborted by the frontend (backpressure —
+// no free triple-buffer set, all GPU-in-flight — or a mid-flush frontend
+// OOM). Aborting preserves the core's dirty state, but flushes are
+// otherwise only driven by incoming Neovim redraw batches (handleRedraw ->
+// onFlush): if the buggy/busy condition clears (a GPU frame completes,
+// memory pressure eases) with no further redraw event arriving, the
+// pending content would sit unflushed forever with a stale screen.
+// Frontends should call this once they recover capacity (e.g. a one-shot
+// retry timer armed right after the abort, mirroring the existing
+// TIMER_CURSOR_BLINK_RETRY / TIMER_SCROLLBAR_RETRY idiom).
+//
+// Calls onFlush() UNCONDITIONALLY rather than gating on a "something is
+// pending" check. An earlier version only checked main content_rev/
+// dirty_all, which silently dropped retries for cursor-only updates
+// (cursor_rev vs last_sent_cursor_rev is a separate predicate — and the
+// row-mode cursor path syncs last_sent_cursor_rev before any abort check
+// can run) and external/subgrid-only updates (each sub_grid tracks its own
+// dirty flag, not reflected in the main grid's content_rev at all). Rather
+// than growing this into a predicate that has to enumerate every kind of
+// pending state (main/cursor/subgrid/external — and stay in sync with
+// every future addition), just run the real flush: onFlush already
+// short-circuits internally into near-zero work when nothing is actually
+// dirty (the same path every no-op Neovim redraw batch already takes,
+// e.g. a msg_showcmd-only flush), so the cost of an unconditional call
+// when nothing was pending is one wasted triple-buffer bracket open/close
+// — bounded, since this only runs once per one-shot retry timer fire, not
+// as a repeating poll.
+fn retryFlushLocked(cp: *nvim_core.Core) void {
+    cp.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    defer {
+        // Clear the owner id while grid_mu is still held. Both callers keep
+        // the lock through this helper, so another thread cannot acquire the
+        // mutex and publish its own redraw_thread_id before this store.
+        cp.redraw_thread_id.store(0, .seq_cst);
+    }
+
+    var fctx = flush_mod.FlushCtx{ .core = cp };
+    flush_mod.FlushCtx.onFlush(&fctx, cp.grid.rows, cp.grid.cols) catch {};
+}
+
+pub export fn zonvie_core_retry_flush(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const cp = &box.core;
+
+    // Acquire grid_mu FIRST, then record the calling thread (here, whatever
+    // thread the frontend's retry timer fires on — main/UI, not the usual
+    // core/RPC thread) as the current handleRedraw-equivalent owner.
+    //
+    // Storing BEFORE the lock (as forceGlowFlush in rpc_session.zig does —
+    // safe there because it always runs on the single RPC thread that also
+    // owns redraw_thread_id) would race here: if the RPC thread is
+    // concurrently mid-handleRedraw (grid_mu held, its OWN tid already in
+    // redraw_thread_id) when this UI-thread call overwrites
+    // redraw_thread_id with the UI tid before blocking on the lock, a
+    // re-entrant zonvie_core_update_layout_px() call ON THE RPC THREAD
+    // (e.g. row_cb -> update_layout_px, a documented re-entrant path) would
+    // no longer see redraw_thread_id == its own tid, conclude it must
+    // acquire grid_mu itself, and self-deadlock on the lock it already
+    // holds. Storing only after this call's own lockUncancelable() returns
+    // guarantees the RPC thread is no longer inside handleRedraw (mutual
+    // exclusion via grid_mu already ensures that), so this store can never
+    // clobber a live owner's id.
+    cp.grid_mu.lockUncancelable(clock.io());
+    defer cp.grid_mu.unlock(clock.io());
+    retryFlushLocked(cp);
+}
+
+// Variant for a frontend that already holds grid_mu. This lets a retry timer
+// acquire grid_mu, revalidate its own generation against a just-completed
+// normal redraw, and only then execute the retry without an unlock/relock race.
+pub export fn zonvie_core_retry_flush_locked(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    retryFlushLocked(&box.core);
+}
+
 // Acquire grid_mu from a frontend (UI) thread.
 //
 // Lets a frontend run a multi-step state mutation (e.g. atlas rebuild +
@@ -2011,7 +2244,7 @@ pub export fn zonvie_core_update_layout_px_locked(
 ) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+    _ = box.core.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
 }
 
 // ========================================================================
