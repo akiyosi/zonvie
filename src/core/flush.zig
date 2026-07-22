@@ -16,6 +16,7 @@ const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
 const block_elements = @import("block_elements.zig");
+const shelf_packer = @import("shelf_packer.zig");
 
 // Emoji cluster context: set before ensureGlyphPhase2 so the frontend
 // emoji_cluster_buf / emoji_cluster_len are now per-instance fields on Core
@@ -29,7 +30,7 @@ pub const FloatOverlayKey = packed struct { row: u32, col: u32 };
 /// Maps (row, col) → optional extras. null extras means "float occupies this cell
 /// but has no overflow" (shadows the base grid's overflow).
 /// Using a HashMap gives O(1) lookup and last-write-wins when multiple floats
-/// overlap the same cell (matching composite_cells overwrite semantics).
+/// overlap the same cell (matching row-cell overlay semantics).
 pub const FloatOverlayMap = std.AutoHashMapUnmanaged(FloatOverlayKey, ?[]const u32);
 
 pub const GridEntry = struct {
@@ -52,15 +53,8 @@ pub const ExternalFloatAnchorEntry = struct {
     }
 };
 
-pub const MainSubgridRowLayout = struct {
-    grid_id: i64,
-    row_start: u32,
-    row_end: u32,
-};
-
 // Pre-computed subgrid info for row-mode compose optimization.
 // Caches win_pos/sub_grids lookups to avoid per-row hash map access.
-pub const MAX_CACHED_SUBGRIDS = 32;
 /// Lightweight snapshot of a composited subgrid's identity and row range.
 /// Stored across flushes to detect layout changes (move/add/remove) that
 /// invalidate cached row vertices inside the scroll region.
@@ -93,6 +87,183 @@ pub const CachedSubgrid = struct {
     margin_left: u32 = 0, // viewport margin columns at left (not scrollable)
     margin_right: u32 = 0, // viewport margin columns at right (not scrollable)
 };
+
+pub const MainSubgridRowLayout = struct {
+    grid_id: i64,
+    row_start: u32,
+    row_end: u32,
+};
+
+// Keep the persistent materialized row index bounded. Layouts whose total
+// row coverage exceeds this fall back to the allocation-free full subgrid
+// scan; this avoids a hostile collection of tall/narrow (or zero-column)
+// grids retaining hundreds of MiB under grid_mu.
+const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = 8 * 1024 * 1024;
+// All persistent external-float composition scratch shares one aggregate
+// 8 MiB budget. Fixed partitions keep the guarantee local and deterministic:
+// no build order or previous high-water capacity can borrow from another
+// buffer and push the simultaneous retained total over the cap.
+const MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES: usize = 3 * 1024 * 1024;
+const MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES: usize = MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES -
+    MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES -
+    MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES;
+
+comptime {
+    std.debug.assert(
+        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(ExternalFloatAnchorEntry) <=
+            MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
+    );
+    std.debug.assert(
+        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(GridEntry) <=
+            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
+    );
+}
+
+fn mainSubgridRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize, layouts: usize) ?usize {
+    const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
+    const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
+    const usize_bytes = std.math.mul(usize, usize_count, @sizeOf(usize)) catch return null;
+    const layout_bytes = std.math.mul(usize, layouts, @sizeOf(MainSubgridRowLayout)) catch return null;
+    return std.math.add(usize, usize_bytes, layout_bytes) catch null;
+}
+
+fn mainSubgridRowIndexByteSize(rows: usize, refs: usize, layouts: usize) ?usize {
+    const offset_count = std.math.add(usize, rows, 1) catch return null;
+    return mainSubgridRowIndexStorageByteSize(offset_count, rows, refs, layouts);
+}
+
+/// Build persistent per-row buckets in layer order. An exact layout snapshot
+/// lets content-only flushes reuse the buckets, so dirty-row composition is
+/// O(G + C) instead of O(D * G + C). Returns false when materializing the
+/// index would exceed max_bytes; callers then use the old full-scan path.
+fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid, rows: u32, max_bytes: usize) !bool {
+    const row_count: usize = rows;
+    if (core.main_subgrid_row_index_valid and
+        core.main_subgrid_row_index_rows == rows and
+        core.main_subgrid_row_layout.items.len == cached.len)
+    {
+        if (mainSubgridRowIndexStorageByteSize(
+            core.main_subgrid_row_offsets.capacity,
+            core.main_subgrid_row_write_offsets.capacity,
+            core.main_subgrid_row_indices.capacity,
+            core.main_subgrid_row_layout.capacity,
+        )) |index_bytes| {
+            if (index_bytes <= max_bytes) {
+                var matches = true;
+                for (cached, core.main_subgrid_row_layout.items) |csg, old| {
+                    if (csg.grid_id != old.grid_id or csg.row_start != old.row_start or csg.row_end != old.row_end) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) return true;
+            }
+        }
+    }
+
+    core.main_subgrid_row_index_valid = false;
+
+    var ref_count: usize = 0;
+    for (cached) |csg| {
+        const start: usize = @min(@as(usize, csg.row_start), row_count);
+        const end: usize = @min(@as(usize, csg.row_end), row_count);
+        if (start >= end) continue;
+        const coverage = end - start;
+        ref_count = std.math.add(usize, ref_count, coverage) catch return false;
+    }
+    const index_bytes = mainSubgridRowIndexByteSize(row_count, ref_count, cached.len) orelse return false;
+    if (index_bytes > max_bytes) return false;
+    const offset_count = std.math.add(usize, row_count, 1) catch return false;
+    const retained_bytes = mainSubgridRowIndexStorageByteSize(
+        @max(core.main_subgrid_row_offsets.capacity, offset_count),
+        @max(core.main_subgrid_row_write_offsets.capacity, row_count),
+        @max(core.main_subgrid_row_indices.capacity, ref_count),
+        @max(core.main_subgrid_row_layout.capacity, cached.len),
+    ) orelse return false;
+    if (retained_bytes > max_bytes) return false;
+
+    core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count) catch return false;
+    core.main_subgrid_row_offsets.items.len = offset_count;
+    @memset(core.main_subgrid_row_offsets.items, 0);
+
+    for (cached) |csg| {
+        const start: usize = @min(@as(usize, csg.row_start), row_count);
+        const end: usize = @min(@as(usize, csg.row_end), row_count);
+        if (start >= end) continue;
+        for (start..end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
+    }
+    for (1..core.main_subgrid_row_offsets.items.len) |i| {
+        core.main_subgrid_row_offsets.items[i] += core.main_subgrid_row_offsets.items[i - 1];
+    }
+
+    std.debug.assert(ref_count == core.main_subgrid_row_offsets.items[row_count]);
+    core.main_subgrid_row_indices.ensureTotalCapacityPrecise(core.alloc, ref_count) catch return false;
+    core.main_subgrid_row_indices.items.len = ref_count;
+    core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count) catch return false;
+    core.main_subgrid_row_write_offsets.items.len = row_count;
+    @memcpy(
+        core.main_subgrid_row_write_offsets.items,
+        core.main_subgrid_row_offsets.items[0..row_count],
+    );
+
+    // cached is already sorted back-to-front, so inserting each entry into
+    // every covered row preserves composition order without per-row sorting.
+    for (cached, 0..) |csg, csg_index| {
+        const start: usize = @min(@as(usize, csg.row_start), row_count);
+        const end: usize = @min(@as(usize, csg.row_end), row_count);
+        if (start >= end) continue;
+        for (start..end) |row| {
+            const dst = core.main_subgrid_row_write_offsets.items[row];
+            core.main_subgrid_row_indices.items[dst] = csg_index;
+            core.main_subgrid_row_write_offsets.items[row] = dst + 1;
+        }
+    }
+
+    core.main_subgrid_row_layout.ensureTotalCapacityPrecise(core.alloc, cached.len) catch return false;
+    core.main_subgrid_row_layout.items.len = cached.len;
+    for (cached, core.main_subgrid_row_layout.items) |csg, *layout| {
+        layout.* = .{ .grid_id = csg.grid_id, .row_start = csg.row_start, .row_end = csg.row_end };
+    }
+    core.main_subgrid_row_index_rows = rows;
+    core.main_subgrid_row_index_valid = true;
+    return true;
+}
+
+fn ensureMainSubgridRowIndex(core: *Core, cached: []const CachedSubgrid, rows: u32) !bool {
+    return ensureMainSubgridRowIndexWithLimit(
+        core,
+        cached,
+        rows,
+        MAX_MAIN_SUBGRID_ROW_INDEX_BYTES,
+    );
+}
+
+fn viewportCellScrollable(
+    row: u32,
+    col: u32,
+    rows: u32,
+    cols: u32,
+    margins: grid_mod.ViewportMargins,
+) bool {
+    return row >= margins.top and row < rows -| margins.bottom and
+        col >= margins.left and col < cols -| margins.right;
+}
+
+fn setViewportRowDecoFlags(
+    flags: []u32,
+    row: u32,
+    rows: u32,
+    cols: u32,
+    margins: grid_mod.ViewportMargins,
+) void {
+    @memset(flags, 0);
+    if (row < margins.top or row >= rows -| margins.bottom) return;
+    const start: usize = @intCast(@min(margins.left, cols));
+    const end: usize = @intCast(cols -| margins.right);
+    if (start < end) @memset(flags[start..end], c_api.DECO_SCROLLABLE);
+}
 
 // Style flags for RenderCell (bit positions)
 pub const STYLE_BOLD: u8 = 1 << 0;
@@ -314,17 +485,18 @@ pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usiz
     return i;
 }
 
-/// Fused run-end scan over up to 5 SoA attribute arrays in a single pass.
+/// Fused run-end scan over up to 6 SoA attribute arrays in a single pass.
 /// Returns the first index in [start, limit) where ANY of the enabled arrays
 /// differs from its target. Equivalent to:
 ///     min(
 ///       simdFindRunEndU32(fg, ..., fg_t),
 ///       simdFindRunEndU32(bg, ..., bg_t),
 ///       simdFindRunEndI64(grid, ..., grid_t),
+///       simdFindRunEndU32(deco, ..., deco_t),
 ///       has_style ? findStyleMaskEnd(style, ..., style_mask, style_val) : limit,
 ///       has_glow  ? simdFindRunEndU8(glow, ..., glow_t)                  : limit,
 ///     )
-/// but reads each cache line once instead of 3–5 separate passes.
+/// but reads each cache line once instead of 4–6 separate passes.
 ///
 /// Stride is 8 cells per outer iteration. `inline fn` lets the compiler
 /// constant-propagate `has_style` and `has_glow` at the call site, eliminating
@@ -332,17 +504,28 @@ pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usiz
 pub inline fn simdFindRunEndMulti(
     start: usize,
     limit: usize,
-    fg: []const u32, fg_t: u32,
-    bg: []const u32, bg_t: u32,
-    grid: []const i64, grid_t: i64,
-    style: []const u8, style_mask: u8, style_val: u8, has_style: bool,
-    glow: []const u8, glow_t: u8, has_glow: bool,
+    fg: []const u32,
+    fg_t: u32,
+    bg: []const u32,
+    bg_t: u32,
+    grid: []const i64,
+    grid_t: i64,
+    deco: []const u32,
+    deco_t: u32,
+    style: []const u8,
+    style_mask: u8,
+    style_val: u8,
+    has_style: bool,
+    glow: []const u8,
+    glow_t: u8,
+    has_glow: bool,
 ) usize {
     const N = 8;
     var i = start;
     const fg_tv: @Vector(N, u32) = @splat(fg_t);
     const bg_tv: @Vector(N, u32) = @splat(bg_t);
     const grid_tv: @Vector(N, i64) = @splat(grid_t);
+    const deco_tv: @Vector(N, u32) = @splat(deco_t);
     const style_mv: @Vector(N, u8) = @splat(style_mask);
     const style_vv: @Vector(N, u8) = @splat(style_val);
     const glow_tv: @Vector(N, u8) = @splat(glow_t);
@@ -351,9 +534,11 @@ pub inline fn simdFindRunEndMulti(
         const fg_c: @Vector(N, u32) = fg[i..][0..N].*;
         const bg_c: @Vector(N, u32) = bg[i..][0..N].*;
         const grid_c: @Vector(N, i64) = grid[i..][0..N].*;
+        const deco_c: @Vector(N, u32) = deco[i..][0..N].*;
         var match: @Vector(N, bool) = (fg_c == fg_tv);
         match = @select(bool, match, bg_c == bg_tv, match);
         match = @select(bool, match, grid_c == grid_tv, match);
+        match = @select(bool, match, deco_c == deco_tv, match);
         if (has_style) {
             const s_c: @Vector(N, u8) = style[i..][0..N].*;
             match = @select(bool, match, (s_c & style_mv) == style_vv, match);
@@ -378,6 +563,7 @@ pub inline fn simdFindRunEndMulti(
         if (fg[i] != fg_t) return i;
         if (bg[i] != bg_t) return i;
         if (grid[i] != grid_t) return i;
+        if (deco[i] != deco_t) return i;
         if (has_style and (style[i] & style_mask) != style_val) return i;
         if (has_glow and glow[i] != glow_t) return i;
     }
@@ -575,7 +761,9 @@ pub const ScrollFastPathResult = struct {
 ///   - grid_id >= 2 (multigrid content grid, not base grid)
 ///   - abs(rows) <= region_height/2 (not too many vacated rows)
 ///   - cols == 0 (no horizontal scroll)
-///   - full width (left == 0, right == target_cols)
+///   - scrolling CachedSubgrid still matches pending-scroll geometry
+///   - scrolling grid covers the full main width at column zero
+///   - full local width (left == 0, right == target_cols)
 ///   - bot <= target_rows (valid region bounds)
 ///   - no rebuild_all, no atlas retry
 ///   - no non-scrolling subgrid overlaps the scroll region
@@ -599,6 +787,26 @@ pub fn checkScrollFastPath(
     // grid_id == 1 is the base grid and has different composition rules.
     if (ps.grid_id < 2)
         return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+    const scrolling_subgrid = blk: {
+        for (cached_subgrids) |csg| {
+            if (csg.grid_id == ps.grid_id) break :blk csg;
+        }
+        break :blk null;
+    } orelse return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+    // pending_scroll is recorded before later win_pos/resize events in the
+    // same redraw batch. Reusing row caches after that geometry changed would
+    // shift a different main-grid region than the one represented by ps.
+    if (scrolling_subgrid.row_start != ps.win_pos_row or
+        scrolling_subgrid.sg_rows != ps.target_rows or
+        scrolling_subgrid.sg_cols != ps.target_cols)
+    {
+        return .{ .eligible = false, .reason = .no_subgrid, .scroll_op = ps };
+    }
+    // The frontend callback shifts whole main-surface row buffers. A local
+    // full-width scroll in a narrower or offset split cannot use that contract:
+    // content outside the split must remain stationary.
+    if (scrolling_subgrid.col_start != 0 or scrolling_subgrid.sg_cols != grid.cols)
+        return .{ .eligible = false, .reason = .partial_width, .scroll_op = ps };
     const region_height: u32 = ps.bot -| ps.top;
     const abs_rows: u32 = blk: {
         if (ps.rows == std.math.minInt(i32)) break :blk region_height;
@@ -621,9 +829,12 @@ pub fn checkScrollFastPath(
 
     // Verify scroll region in global grid coordinates stays within bounds.
     // shiftScrollCacheAndValidate indexes scroll_cache with these values,
-    // so out-of-range would cause an out-of-bounds access.
-    const scroll_row_start = ps.top + ps.win_pos_row;
-    const scroll_row_end = ps.bot + ps.win_pos_row;
+    // so out-of-range would cause an out-of-bounds access. Saturating: a
+    // hostile/malformed win_pos_row near maxInt(u32) must not
+    // overflow-panic (Safe builds) or wrap into a bogus in-range value
+    // (ReleaseFast) — a saturated value simply fails the bounds check below.
+    const scroll_row_start = ps.top +| ps.win_pos_row;
+    const scroll_row_end = ps.bot +| ps.win_pos_row;
     if (scroll_row_end > grid.rows)
         return .{ .eligible = false, .reason = .not_full_region, .scroll_op = ps };
 
@@ -795,7 +1006,7 @@ pub const ScrollCacheShiftResult = struct {
     empty_emit_count: u32,
 };
 
-/// Perform scroll cache shift + y-adjust + validity check.
+/// Perform scroll cache shift + optional y-adjust + validity check.
 /// Extracted from onFlush for testability.
 ///
 /// Operates directly on core.scroll_cache / scroll_cache_valid.
@@ -809,6 +1020,7 @@ pub fn shiftScrollCacheAndValidate(
     delta_y: f32,
     total_rows: u32,
     regen_rows: []const u32,
+    adjust_vertices: bool,
 ) ScrollCacheShiftResult {
     if (core.scroll_cache_rows != total_rows) {
         return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
@@ -833,8 +1045,10 @@ pub fn shiftScrollCacheAndValidate(
         var i: usize = scroll_top;
         while (i + shift < scroll_bot) : (i += 1) {
             core.scroll_cache.items[i] = core.scroll_cache.items[i + shift];
-            for (core.scroll_cache.items[i].items) |*v| {
-                v.position[1] += delta_y;
+            if (adjust_vertices) {
+                for (core.scroll_cache.items[i].items) |*v| {
+                    v.position[1] += delta_y;
+                }
             }
             if (core.scroll_cache_valid.isSet(i + shift)) {
                 core.scroll_cache_valid.set(i);
@@ -865,8 +1079,10 @@ pub fn shiftScrollCacheAndValidate(
         var i: usize = scroll_bot - 1;
         while (i >= scroll_top + shift) : (i -= 1) {
             core.scroll_cache.items[i] = core.scroll_cache.items[i - shift];
-            for (core.scroll_cache.items[i].items) |*v| {
-                v.position[1] += delta_y;
+            if (adjust_vertices) {
+                for (core.scroll_cache.items[i].items) |*v| {
+                    v.position[1] += delta_y;
+                }
             }
             if (core.scroll_cache_valid.isSet(i - shift)) {
                 core.scroll_cache_valid.set(i);
@@ -976,14 +1192,21 @@ pub const VH = struct {
     fn pushSolidQuad(
         out: *std.ArrayListUnmanaged(c_api.Vertex),
         alloc: std.mem.Allocator,
-        x0: f32, y0: f32, x1: f32, y1: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
         col: [4]f32,
-        vw: f32, vh: f32,
+        vw: f32,
+        vh: f32,
         grid_id: i64,
         base_deco_flags: u32,
     ) !void {
         const pts = ndc4(x0, y0, x1, y1, vw, vh);
-        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
 
         try out.ensureUnusedCapacity(alloc, 6);
         const v = out.addManyAsSliceAssumeCapacity(6);
@@ -1000,14 +1223,21 @@ pub const VH = struct {
     /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
     fn pushSolidQuadAssumeCapacity(
         out: *std.ArrayListUnmanaged(c_api.Vertex),
-        x0: f32, y0: f32, x1: f32, y1: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
         col: [4]f32,
-        vw: f32, vh: f32,
+        vw: f32,
+        vh: f32,
         grid_id: i64,
         base_deco_flags: u32,
     ) void {
         const pts = ndc4(x0, y0, x1, y1, vw, vh);
-        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
 
         const v = out.addManyAsSliceAssumeCapacity(6);
 
@@ -1022,15 +1252,25 @@ pub const VH = struct {
 
     fn pushGlyphQuadAssumeCapacity(
         out: *std.ArrayListUnmanaged(c_api.Vertex),
-        x0: f32, y0: f32, x1: f32, y1: f32,
-        uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+        uv2: [2]f32,
+        uv3: [2]f32,
         col: [4]f32,
-        vw: f32, vh: f32,
+        vw: f32,
+        vh: f32,
         grid_id: i64,
         base_deco_flags: u32,
     ) void {
         const pts = ndc4(x0, y0, x1, y1, vw, vh);
-        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
 
         const v = out.addManyAsSliceAssumeCapacity(6);
 
@@ -1046,15 +1286,22 @@ pub const VH = struct {
     fn pushDecoQuad(
         out: *std.ArrayListUnmanaged(c_api.Vertex),
         alloc: std.mem.Allocator,
-        x0: f32, y0: f32, x1: f32, y1: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
         col: [4]f32,
-        vw: f32, vh: f32,
+        vw: f32,
+        vh: f32,
         grid_id: i64,
         deco_flags: u32,
         deco_phase: f32,
     ) !void {
         const pts = ndc4(x0, y0, x1, y1, vw, vh);
-        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
 
         // UV coordinates for decorations:
         // - UV.x = -1 (sentinel for solid/decoration)
@@ -1076,15 +1323,22 @@ pub const VH = struct {
 
     fn pushDecoQuadAssumeCapacity(
         out: *std.ArrayListUnmanaged(c_api.Vertex),
-        x0: f32, y0: f32, x1: f32, y1: f32,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
         col: [4]f32,
-        vw: f32, vh: f32,
+        vw: f32,
+        vh: f32,
         grid_id: i64,
         deco_flags: u32,
         deco_phase: f32,
     ) void {
         const pts = ndc4(x0, y0, x1, y1, vw, vh);
-        const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
 
         const uv_top: [2]f32 = .{ -1.0, 0.0 };
         const uv_bottom: [2]f32 = .{ -1.0, 1.0 };
@@ -1120,6 +1374,10 @@ pub const RowGenParams = struct {
 /// Stats returned from generateRowVertices for performance tracking.
 pub const RowGenStats = struct {
     had_glyph_miss: bool = false,
+    // Vertex counts relative to the output length on entry, after each of the
+    // five passes. Partial-only submission uses these boundaries to preserve
+    // global layer order across rows without duplicating vertex generation.
+    pass_ends: [5]usize = .{0} ** 5,
     shape_cache_hits: u32 = 0,
     shape_cache_misses: u32 = 0,
     ascii_fast_path_runs: u32 = 0,
@@ -1135,8 +1393,48 @@ pub const RowGenStats = struct {
     // Pass 3 sub-instrumentation. cache_lookup_ns is derivable as
     // glyph_ns - shape_us*1000 - atlas_ensure_ns - quad_emit_ns.
     atlas_ensure_ns: i64 = 0, // ensureGlyphPhase2 / ensureGlyphByID / ensure_styled / ensure_base
-    quad_emit_ns: i64 = 0,    // pushGlyphQuadAssumeCapacity
+    quad_emit_ns: i64 = 0, // pushGlyphQuadAssumeCapacity
 };
+
+fn ensureShapingScratch(core: *Core, run_len: usize) !void {
+    try core.shaping_scalars.ensureTotalCapacity(core.alloc, run_len);
+    try core.shaping_col_widths.ensureTotalCapacity(core.alloc, run_len);
+    try core.shaping_src_cols.ensureTotalCapacity(core.alloc, run_len);
+}
+
+/// Convert a failed shape callback into the existing per-scalar fallback path.
+/// gid=0 deliberately selects the .notdef branch below, which resolves every
+/// scalar through ensureGlyphPhase2 while preserving wide-cell column widths.
+fn setShapingScalarFallback(bufs: *vertexgen.ShapingBuffers, col_widths: []const u32) usize {
+    var glyph_count: usize = 0;
+    for (col_widths, 0..) |width, scalar_index| {
+        // Overflow scalars belong to the preceding cell and have zero width.
+        // Emit one fallback cluster per base cell so combining tails remain in
+        // that cluster rather than becoming independent grid cells.
+        if (width == 0) continue;
+        bufs.glyph_ids.items[glyph_count] = 0;
+        bufs.clusters.items[glyph_count] = @intCast(scalar_index);
+        bufs.x_adv.items[glyph_count] = 0;
+        bufs.x_off.items[glyph_count] = 0;
+        bufs.y_off.items[glyph_count] = 0;
+        glyph_count += 1;
+    }
+    bufs.setLen(glyph_count);
+    return glyph_count;
+}
+
+fn shapeClustersValid(clusters: []const u32, glyph_count: usize, scalar_count: usize) bool {
+    if (glyph_count == 0 or scalar_count == 0) return false;
+    if (clusters[0] != 0) return false;
+
+    var previous: u32 = 0;
+    for (clusters[0..glyph_count], 0..) |cluster, i| {
+        if (cluster >= scalar_count) return false;
+        if (i != 0 and cluster < previous) return false;
+        previous = cluster;
+    }
+    return true;
+}
 
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
@@ -1147,6 +1445,7 @@ pub fn generateRowVertices(
     out: *std.ArrayListUnmanaged(c_api.Vertex),
 ) !RowGenStats {
     const rc = &core.row_cells;
+    const out_start = out.items.len;
     const r = p.row;
     const cols = p.cols;
     const cellW = p.cell_w;
@@ -1167,11 +1466,15 @@ pub fn generateRowVertices(
         while (c < cols) {
             const run_bg = rc.bg_rgbs.items[@intCast(c)];
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_deco = rc.deco_base_flags.items[@intCast(c)];
             const run_start = c;
 
             const end: u32 = @intCast(@min(
                 simdFindRunEndU32(rc.bg_rgbs.items, @intCast(c), @intCast(cols), run_bg),
-                simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+                @min(
+                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c), @intCast(cols), run_grid_id),
+                    simdFindRunEndU32(rc.deco_base_flags.items, @intCast(c), @intCast(cols), run_deco),
+                ),
             ));
 
             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
@@ -1183,12 +1486,12 @@ pub fn generateRowVertices(
                 (if (p.blur_enabled) (if (p.is_cmdline) 0.0 else 0.5) else p.background_opacity)
             else
                 1.0;
-            const scroll_flag = rc.deco_base_flags.items[@intCast(c)];
-            try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), vw, vh, run_grid_id, scroll_flag);
+            try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), vw, vh, run_grid_id, run_deco);
             c = end;
         }
         if (log_enabled) stats.bg_ns = @intCast(@max(0, clock.nowNs() - t_bg_start));
     }
+    stats.pass_ends[0] = out.items.len - out_start;
 
     // ── Pass 2: Under-decorations (underline, underdouble, undercurl, underdotted, underdashed) ──
     {
@@ -1207,17 +1510,32 @@ pub fn generateRowVertices(
             const run_sp = rc.sp_rgbs.items[@intCast(c)];
             const run_fg = rc.fg_rgbs.items[@intCast(c)];
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_deco = rc.deco_base_flags.items[@intCast(c)];
+
+            // fg must also match when sp is unset (deco_color falls back to fg in
+            // that case); when sp IS set, fg is irrelevant to the run so don't
+            // constrain on it (avoids splitting runs unnecessarily).
+            const fg_run_end: u32 = if (run_sp == highlight.Highlights.SP_NOT_SET)
+                @intCast(simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c + 1), @intCast(cols), run_fg))
+            else
+                cols;
 
             const run_end: u32 = @intCast(@min(
                 simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
                 @min(
                     simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                    @min(
+                        simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                        @min(
+                            simdFindRunEndU32(rc.deco_base_flags.items, @intCast(c + 1), @intCast(cols), run_deco),
+                            fg_run_end,
+                        ),
+                    ),
                 ),
             ));
 
             const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
-            const deco_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+            const deco_scroll_flag: u32 = run_deco;
 
             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
             const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
@@ -1261,6 +1579,7 @@ pub fn generateRowVertices(
         }
         if (log_enabled) stats.under_ns = @intCast(@max(0, clock.nowNs() - t_under_start));
     }
+    stats.pass_ends[1] = out.items.len - out_start;
 
     // ── Pass 3: Glyphs ──────────────────────────────────────────────
     const ensure_base = core.cb.on_atlas_ensure_glyph;
@@ -1274,19 +1593,36 @@ pub fn generateRowVertices(
     const glyph_cache_non_ascii = core.glyph_cache_non_ascii;
     const glyph_keys_non_ascii = core.glyph_keys_non_ascii;
     const GLYPH_CACHE_ASCII_SIZE = core.glyph_cache_ascii_size;
-    const GLYPH_CACHE_NON_ASCII_SIZE = core.glyph_cache_non_ascii_size;
+    // Hash modulus = physical array length, NOT core.glyph_cache_non_ascii_size. The
+    // size field can drift from the allocated arrays (e.g. a concurrent setGlyphCacheSize
+    // bumps the field before the arrays are reallocated); hashing with the larger field
+    // would then index past the end of these caches (out-of-bounds panic). Both cache
+    // families (non_ascii + by_id) are allocated together at the same length, so either
+    // array's len is the correct, always-in-bounds modulus.
+    const GLYPH_CACHE_NON_ASCII_SIZE: u32 = if (core.glyph_keys_non_ascii) |k|
+        @intCast(k.len)
+    else if (core.glyph_keys_by_id) |k|
+        @intCast(k.len)
+    else
+        0;
     const glyph_cache_id = core.glyph_cache_by_id;
     const glyph_keys_id = core.glyph_keys_by_id;
 
     const t_glyph_start: i128 = if (log_enabled) clock.nowNs() else 0;
     if (has_shaping or ensure_base != null or ensure_styled != null or core.isPhase2Atlas()) {
-        // Pre-allocate vertex capacity for entire row (worst case: 1 glyph quad per column)
-        try out.ensureUnusedCapacity(core.alloc, cols * 6);
+        // Pre-allocate vertex capacity for entire row. Worst case is not 1 glyph
+        // quad per column: a block-drawing / legacy-computing glyph (quadrants,
+        // sextants, octants) can emit up to MAX_BLOCK_QUADS sub-rectangles per
+        // cell (block_elements.zig). Reserve for that worst case unconditionally
+        // — the memory cost is small and this is a growth-only ensureCapacity
+        // call, not a per-cell allocation.
+        try out.ensureUnusedCapacity(core.alloc, cols * block_elements.MAX_BLOCK_QUADS * 6);
         var c: u32 = 0;
         while (c < cols) {
             const run_fg = rc.fg_rgbs.items[@intCast(c)];
             const run_bg = rc.bg_rgbs.items[@intCast(c)];
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_deco = rc.deco_base_flags.items[@intCast(c)];
             const run_start = c;
 
             // Fused run-end: single SIMD pass over fg/bg/grid + optional
@@ -1296,20 +1632,43 @@ pub fn generateRowVertices(
             const run_style_bi: u8 = rc.style_flags_arr.items[@intCast(c)] & shaping_style_mask;
             const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
             const end: u32 = @intCast(simdFindRunEndMulti(
-                @intCast(c), @intCast(cols),
-                rc.fg_rgbs.items, run_fg,
-                rc.bg_rgbs.items, run_bg,
-                rc.grid_ids.items, run_grid_id,
-                rc.style_flags_arr.items, shaping_style_mask, run_style_bi, has_shaping,
-                rc.glow_arr.items, run_glow, p.glow_enabled,
+                @intCast(c),
+                @intCast(cols),
+                rc.fg_rgbs.items,
+                run_fg,
+                rc.bg_rgbs.items,
+                run_bg,
+                rc.grid_ids.items,
+                run_grid_id,
+                rc.deco_base_flags.items,
+                run_deco,
+                rc.style_flags_arr.items,
+                shaping_style_mask,
+                run_style_bi,
+                has_shaping,
+                rc.glow_arr.items,
+                run_glow,
+                p.glow_enabled,
             ));
-            const has_ink = simdHasInkInRange(rc.scalars.items, @intCast(c), @intCast(end));
+            const may_have_overflow = core.grid.overflowCountForGrid(run_grid_id) != 0 or core.flush_float_overlay != null;
+            var has_ink = simdHasInkInRange(rc.scalars.items, @intCast(c), @intCast(end));
+            if (!has_ink and may_have_overflow) {
+                var ink_col: u32 = run_start;
+                while (ink_col < end) : (ink_col += 1) {
+                    if (getOverflowForCell(core, rc, r, ink_col)) |extras| {
+                        if (extras.len != 0) {
+                            has_ink = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             if (has_ink) {
                 const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
                 const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
                 const fg = VH.rgb(run_fg);
-                const glyph_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+                const glyph_scroll_flag: u32 = run_deco;
                 const run_has_glow = run_glow != 0;
 
                 if (has_shaping) {
@@ -1327,20 +1686,23 @@ pub fn generateRowVertices(
                     core.shaping_scalars.clearRetainingCapacity();
                     core.shaping_col_widths.clearRetainingCapacity();
                     core.shaping_src_cols.clearRetainingCapacity();
-                    core.shaping_scalars.ensureTotalCapacity(core.alloc, run_len) catch {
-                        c = end;
-                        continue;
-                    };
-                    core.shaping_col_widths.ensureTotalCapacity(core.alloc, run_len) catch {
-                        c = end;
-                        continue;
-                    };
-                    core.shaping_src_cols.ensureTotalCapacity(core.alloc, run_len) catch {
-                        c = end;
-                        continue;
-                    };
-                    // SIMD fast path: if no wide chars (no zero scalars), bulk copy
-                    if (simdAllNonZero(rc.scalars.items, @intCast(run_start), @intCast(end))) {
+                    var shaping_scalar_capacity: usize = run_len;
+                    if (may_have_overflow) {
+                        const persistent_clusters = core.grid.overflowCountForGrid(run_grid_id);
+                        const overlay_cells = if (core.flush_float_overlay) |overlay| overlay.count() else 0;
+                        const possible_clusters = @min(run_len, persistent_clusters +| overlay_cells);
+                        shaping_scalar_capacity +|= possible_clusters *| 15;
+                    }
+                    try ensureShapingScratch(core, shaping_scalar_capacity);
+                    // SIMD fast path: no continuation cells and no cluster
+                    // tails. A zero immediately after this style/color run is
+                    // still the wide continuation of its final scalar, so the
+                    // row-aware collector below must assign that scalar width 2.
+                    const run_ends_at_wide_continuation = end < cols and
+                        rc.scalars.items[@intCast(end)] == 0;
+                    if (!may_have_overflow and !run_ends_at_wide_continuation and
+                        simdAllNonZero(rc.scalars.items, @intCast(run_start), @intCast(end)))
+                    {
                         @memcpy(core.shaping_scalars.items.ptr[0..run_len], rc.scalars.items[@intCast(run_start)..@intCast(end)]);
                         core.shaping_scalars.items.len = run_len;
                         @memset(core.shaping_col_widths.items.ptr[0..run_len], 1);
@@ -1356,9 +1718,21 @@ pub fn generateRowVertices(
                                 continue;
                             }
                             core.shaping_scalars.appendAssumeCapacity(s);
-                            const col_w: u32 = if (si + 1 < end and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
+                            // A continuation can begin a different style/color
+                            // run. Cell width is row geometry, so inspect the
+                            // complete row rather than truncating at this run.
+                            const col_w: u32 = if (si + 1 < cols and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
                             core.shaping_col_widths.appendAssumeCapacity(col_w);
                             core.shaping_src_cols.appendAssumeCapacity(si);
+                            if (may_have_overflow) {
+                                if (getOverflowForCell(core, rc, r, si)) |extras| {
+                                    for (extras) |extra| {
+                                        core.shaping_scalars.appendAssumeCapacity(extra);
+                                        core.shaping_col_widths.appendAssumeCapacity(0);
+                                        core.shaping_src_cols.appendAssumeCapacity(si);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1372,8 +1746,11 @@ pub fn generateRowVertices(
                     const bufs = &core.shaping_bufs;
                     var final_glyph_count: usize = 0;
                     var used_ascii_fast_path = false;
+                    var shape_callback_fallback = false;
 
-                    if (core.loadAsciiTables()) {
+                    const ascii_tables_loaded = core.loadAsciiTables();
+                    if (core.flush_aborted) return error.FlushAborted;
+                    if (ascii_tables_loaded) {
                         const is_ascii_safe = ascii_chk: {
                             const scalars = core.shaping_scalars.items[0..scalar_count];
                             if (!simdAllAsciiPrintable(scalars, scalar_count)) break :ascii_chk false;
@@ -1391,10 +1768,7 @@ pub fn generateRowVertices(
                             break :ascii_chk true;
                         };
                         if (is_ascii_safe) {
-                            bufs.ensureCapacity(core.alloc, scalar_count) catch {
-                                c = end;
-                                continue;
-                            };
+                            try bufs.ensureCapacity(core.alloc, scalar_count);
                             bufs.setLen(scalar_count);
                             const gids = &core.ascii_glyph_ids[style_index];
                             const xadvs = &core.ascii_x_advances[style_index];
@@ -1413,138 +1787,148 @@ pub fn generateRowVertices(
                     }
 
                     if (!used_ascii_fast_path) {
-                    // Shape cache lookup / callback
-                    const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], c_style);
-                    const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], c_style);
-                    const sc_set_base = (sc_hash1 & (@as(u64, core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
-                    const sc_font_gen = core.font_generation;
+                        // Shape cache lookup / callback
+                        const sc_hash1 = nvim_core.shapeCacheHash(core.shaping_scalars.items[0..scalar_count], c_style);
+                        const sc_hash2 = nvim_core.shapeCacheHash2(core.shaping_scalars.items[0..scalar_count], c_style);
+                        const sc_set_base = (sc_hash1 & (@as(u64, core.shape_cache_sets) - 1)) * nvim_core.SHAPE_CACHE_WAYS;
+                        const sc_font_gen = core.font_generation;
 
-                    var sc_cache_hit = false;
+                        var sc_cache_hit = false;
 
-                    if (core.shape_cache) |sc_cache| {
-                        for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
-                            const sc_entry = &sc_cache[sc_set_base + sc_way];
-                            if (sc_entry.key_hash == sc_hash1 and
-                                sc_entry.key_hash2 == sc_hash2 and
-                                sc_entry.font_gen == sc_font_gen and
-                                sc_entry.scalar_count == @as(u32, @intCast(scalar_count)) and
-                                sc_entry.glyph_count > 0 and
-                                sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
-                            {
-                                final_glyph_count = sc_entry.glyph_count;
-                                bufs.ensureCapacity(core.alloc, final_glyph_count) catch {
-                                    c = end;
-                                    continue;
-                                };
-                                bufs.setLen(final_glyph_count);
-                                @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
-                                @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
-                                @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
-                                @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
-                                @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
-                                sc_cache_hit = true;
-                                stats.shape_cache_hits += 1;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!sc_cache_hit) {
-                        stats.shape_cache_misses += 1;
-                        bufs.ensureCapacity(core.alloc, scalar_count) catch {
-                            c = end;
-                            continue;
-                        };
-                        bufs.setLen(scalar_count);
-
-                        const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                        const glyph_count = shape_text_run.?(
-                            core.ctx,
-                            core.shaping_scalars.items.ptr,
-                            scalar_count,
-                            c_style,
-                            bufs.glyph_ids.items.ptr,
-                            bufs.clusters.items.ptr,
-                            bufs.x_adv.items.ptr,
-                            bufs.x_off.items.ptr,
-                            bufs.y_off.items.ptr,
-                            scalar_count,
-                        );
-                        if (log_enabled) {
-                            const t_shape_end = clock.nowNs();
-                            stats.shape_us += @intCast(@divTrunc(@max(0, t_shape_end - t_shape_start), 1000));
-                            stats.shape_calls += 1;
-                        }
-
-                        if (glyph_count == 0) {
-                            c = end;
-                            continue;
-                        }
-
-                        final_glyph_count = glyph_count;
-                        if (glyph_count > scalar_count) {
-                            bufs.ensureCapacity(core.alloc, glyph_count) catch {
-                                c = end;
-                                continue;
-                            };
-                            bufs.setLen(glyph_count);
-                            {
-                                const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
-                                final_glyph_count = shape_text_run.?(
-                                    core.ctx,
-                                    core.shaping_scalars.items.ptr,
-                                    scalar_count,
-                                    c_style,
-                                    bufs.glyph_ids.items.ptr,
-                                    bufs.clusters.items.ptr,
-                                    bufs.x_adv.items.ptr,
-                                    bufs.x_off.items.ptr,
-                                    bufs.y_off.items.ptr,
-                                    glyph_count,
-                                );
-                                if (log_enabled) {
-                                    const t_shape2_end = clock.nowNs();
-                                    stats.shape_us += @intCast(@divTrunc(@max(0, t_shape2_end - t_shape2_start), 1000));
-                                    stats.shape_calls += 1;
+                        if (core.shape_cache) |sc_cache| {
+                            for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                                const sc_entry = &sc_cache[sc_set_base + sc_way];
+                                if (sc_entry.key_hash == sc_hash1 and
+                                    sc_entry.key_hash2 == sc_hash2 and
+                                    sc_entry.font_gen == sc_font_gen and
+                                    sc_entry.scalar_count == @as(u32, @intCast(scalar_count)) and
+                                    sc_entry.glyph_count > 0 and
+                                    sc_entry.glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS)
+                                {
+                                    final_glyph_count = sc_entry.glyph_count;
+                                    try bufs.ensureCapacity(core.alloc, final_glyph_count);
+                                    bufs.setLen(final_glyph_count);
+                                    @memcpy(bufs.glyph_ids.items[0..final_glyph_count], sc_entry.glyph_ids[0..final_glyph_count]);
+                                    @memcpy(bufs.clusters.items[0..final_glyph_count], sc_entry.clusters[0..final_glyph_count]);
+                                    @memcpy(bufs.x_adv.items[0..final_glyph_count], sc_entry.x_adv[0..final_glyph_count]);
+                                    @memcpy(bufs.x_off.items[0..final_glyph_count], sc_entry.x_off[0..final_glyph_count]);
+                                    @memcpy(bufs.y_off.items[0..final_glyph_count], sc_entry.y_off[0..final_glyph_count]);
+                                    sc_cache_hit = true;
+                                    stats.shape_cache_hits += 1;
+                                    break;
                                 }
                             }
-                            if (final_glyph_count == 0) {
-                                c = end;
-                                continue;
-                            }
                         }
 
-                        // Store in cache if result fits
-                        if (final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
-                            if (core.shape_cache) |sc_cache| {
-                                var sc_store_way: usize = 0;
-                                for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
-                                    if (sc_cache[sc_set_base + sc_way].key_hash == 0) {
-                                        sc_store_way = sc_way;
-                                        break;
+                        if (!sc_cache_hit) {
+                            stats.shape_cache_misses += 1;
+                            try bufs.ensureCapacity(core.alloc, scalar_count);
+                            bufs.setLen(scalar_count);
+
+                            const t_shape_start: i128 = if (log_enabled) clock.nowNs() else 0;
+                            const glyph_count = shape_text_run.?(
+                                core.ctx,
+                                core.shaping_scalars.items.ptr,
+                                scalar_count,
+                                c_style,
+                                bufs.glyph_ids.items.ptr,
+                                bufs.clusters.items.ptr,
+                                bufs.x_adv.items.ptr,
+                                bufs.x_off.items.ptr,
+                                bufs.y_off.items.ptr,
+                                scalar_count,
+                            );
+                            if (log_enabled) {
+                                const t_shape_end = clock.nowNs();
+                                stats.shape_us += @intCast(@divTrunc(@max(0, t_shape_end - t_shape_start), 1000));
+                                stats.shape_calls += 1;
+                            }
+                            if (core.flush_aborted) return error.FlushAborted;
+
+                            if (glyph_count == 0) {
+                                final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                shape_callback_fallback = true;
+                            } else if (glyph_count > scalar_count) {
+                                final_glyph_count = glyph_count;
+                                try bufs.ensureCapacity(core.alloc, glyph_count);
+                                bufs.setLen(glyph_count);
+                                {
+                                    const t_shape2_start: i128 = if (log_enabled) clock.nowNs() else 0;
+                                    final_glyph_count = shape_text_run.?(
+                                        core.ctx,
+                                        core.shaping_scalars.items.ptr,
+                                        scalar_count,
+                                        c_style,
+                                        bufs.glyph_ids.items.ptr,
+                                        bufs.clusters.items.ptr,
+                                        bufs.x_adv.items.ptr,
+                                        bufs.x_off.items.ptr,
+                                        bufs.y_off.items.ptr,
+                                        glyph_count,
+                                    );
+                                    if (log_enabled) {
+                                        const t_shape2_end = clock.nowNs();
+                                        stats.shape_us += @intCast(@divTrunc(@max(0, t_shape2_end - t_shape2_start), 1000));
+                                        stats.shape_calls += 1;
                                     }
                                 }
-                                const sc_store = &sc_cache[sc_set_base + sc_store_way];
-                                sc_store.key_hash = sc_hash1;
-                                sc_store.key_hash2 = sc_hash2;
-                                sc_store.font_gen = sc_font_gen;
-                                sc_store.scalar_count = @intCast(scalar_count);
-                                sc_store.glyph_count = @intCast(final_glyph_count);
-                                @memcpy(sc_store.glyph_ids[0..final_glyph_count], bufs.glyph_ids.items[0..final_glyph_count]);
-                                @memcpy(sc_store.clusters[0..final_glyph_count], bufs.clusters.items[0..final_glyph_count]);
-                                @memcpy(sc_store.x_adv[0..final_glyph_count], bufs.x_adv.items[0..final_glyph_count]);
-                                @memcpy(sc_store.x_off[0..final_glyph_count], bufs.x_off.items[0..final_glyph_count]);
-                                @memcpy(sc_store.y_off[0..final_glyph_count], bufs.y_off.items[0..final_glyph_count]);
+                                if (core.flush_aborted) return error.FlushAborted;
+                                if (final_glyph_count == 0) {
+                                    final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                    shape_callback_fallback = true;
+                                } else if (final_glyph_count > glyph_count) {
+                                    // The second call was given the exact capacity
+                                    // it requested. Truncation would publish
+                                    // malformed clusters and hide a contract bug.
+                                    return error.ShapeCallbackInvalidCount;
+                                }
+                            } else {
+                                final_glyph_count = glyph_count;
+                            }
+
+                            if (!shape_callback_fallback and
+                                !shapeClustersValid(bufs.clusters.items, final_glyph_count, scalar_count))
+                            {
+                                final_glyph_count = setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count]);
+                                shape_callback_fallback = true;
+                            }
+
+                            // Store in cache if result fits
+                            if (!shape_callback_fallback and final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
+                                if (core.shape_cache) |sc_cache| {
+                                    // Victim selection when the set is full: derive
+                                    // the way from the key hash instead of always
+                                    // evicting way 0 — a fixed victim degrades the
+                                    // N-way set to direct-mapped under conflict
+                                    // (ways 1..N-1 pinned with stale entries).
+                                    var sc_store_way: usize = @intCast(sc_hash1 % nvim_core.SHAPE_CACHE_WAYS);
+                                    for (0..nvim_core.SHAPE_CACHE_WAYS) |sc_way| {
+                                        if (sc_cache[sc_set_base + sc_way].key_hash == 0) {
+                                            sc_store_way = sc_way;
+                                            break;
+                                        }
+                                    }
+                                    const sc_store = &sc_cache[sc_set_base + sc_store_way];
+                                    sc_store.key_hash = sc_hash1;
+                                    sc_store.key_hash2 = sc_hash2;
+                                    sc_store.font_gen = sc_font_gen;
+                                    sc_store.scalar_count = @intCast(scalar_count);
+                                    sc_store.glyph_count = @intCast(final_glyph_count);
+                                    @memcpy(sc_store.glyph_ids[0..final_glyph_count], bufs.glyph_ids.items[0..final_glyph_count]);
+                                    @memcpy(sc_store.clusters[0..final_glyph_count], bufs.clusters.items[0..final_glyph_count]);
+                                    @memcpy(sc_store.x_adv[0..final_glyph_count], bufs.x_adv.items[0..final_glyph_count]);
+                                    @memcpy(sc_store.x_off[0..final_glyph_count], bufs.x_off.items[0..final_glyph_count]);
+                                    @memcpy(sc_store.y_off[0..final_glyph_count], bufs.y_off.items[0..final_glyph_count]);
+                                }
                             }
                         }
-                    }
                     } // end !used_ascii_fast_path
 
-                    // Iterate shaped glyphs — ensure capacity for .notdef expansion
-                    out.ensureUnusedCapacity(core.alloc, (final_glyph_count + scalar_count) * 6) catch {
-                        c = end;
-                        continue;
-                    };
+                    // Iterate shaped glyphs — ensure capacity for .notdef expansion.
+                    // Reserve MAX_BLOCK_QUADS*6 per scalar (not just 6) because the
+                    // .notdef fallback path (below) can emit multi-rect block-drawing
+                    // glyphs per scalar, same reasoning as the outer per-row budget.
+                    try out.ensureUnusedCapacity(core.alloc, (final_glyph_count + scalar_count) * block_elements.MAX_BLOCK_QUADS * 6);
                     var penX: f32 = baseX;
 
                     // ── ASCII fast emit path ───────────────────────────────────
@@ -1564,10 +1948,7 @@ pub fn generateRowVertices(
                     // Requires: glyph_cache_ascii sized >= 512 (default 512 covers
                     // 128 codepoints × 4 styles). For smaller caches we fall back
                     // to the existing emit loop, which preserves correctness.
-                    if (used_ascii_fast_path
-                        and glyph_cache_ascii != null and glyph_valid_ascii != null
-                        and GLYPH_CACHE_ASCII_SIZE >= 512)
-                    {
+                    if (used_ascii_fast_path and glyph_cache_ascii != null and glyph_valid_ascii != null and GLYPH_CACHE_ASCII_SIZE >= 512) {
                         const ge_cache = glyph_cache_ascii.?;
                         const ge_valid = glyph_valid_ascii.?;
                         var gi: u32 = 0;
@@ -1607,6 +1988,7 @@ pub fn generateRowVertices(
                                     ge_cache[cache_key] = entry;
                                     ge_valid[cache_key] = true;
                                 } else {
+                                    if (core.flush_aborted) return error.FlushAborted;
                                     stats.had_glyph_miss = true;
                                     if (core.missing_glyph_log_count < 16) {
                                         core.log.write(
@@ -1704,15 +2086,19 @@ pub fn generateRowVertices(
                     var gi: usize = 0;
                     while (gi < final_glyph_count) : (gi += 1) {
                         const gid = bufs.glyph_ids.items[gi];
+                        // Callback clusters were validated before cache storage.
+                        const scalar_count_u32: u32 = @intCast(scalar_count);
                         const this_cluster = bufs.clusters.items[gi];
-                        const next_cluster = if (gi + 1 < final_glyph_count) bufs.clusters.items[gi + 1] else @as(u32, @intCast(scalar_count));
+                        const next_cluster = if (gi + 1 < final_glyph_count) bufs.clusters.items[gi + 1] else scalar_count_u32;
 
                         if (gid == 0) {
                             // .notdef glyph — per-scalar fallback
                             var ci: u32 = this_cluster;
+                            var fallback_base_x = penX;
                             while (ci < next_cluster) : (ci += 1) {
                                 const fb_scalar = core.shaping_scalars.items[@intCast(ci)];
                                 const fb_col_w = core.shaping_col_widths.items[@intCast(ci)];
+                                if (fb_col_w != 0) fallback_base_x = penX;
                                 if (fb_scalar == 32) {
                                     penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
                                     continue;
@@ -1722,10 +2108,7 @@ pub fn generateRowVertices(
                                     const blk_geo = block_elements.getBlockGeometry(fb_scalar);
                                     if (blk_geo.count > 0) {
                                         const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                        out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                            penX += blk_w;
-                                            continue;
-                                        };
+                                        try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
                                         for (blk_geo.rects[0..blk_geo.count]) |rect| {
                                             VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
                                         }
@@ -1748,7 +2131,7 @@ pub fn generateRowVertices(
                                 if (fb_ge_opt) |fb_ge| {
                                     if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
                                         const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
-                                        const fb_gx0: f32 = penX + fb_ge.bbox_origin_px[0];
+                                        const fb_gx0: f32 = fallback_base_x + fb_ge.bbox_origin_px[0];
                                         const fb_gx1: f32 = fb_gx0 + fb_ge.bbox_size_px[0];
                                         const fb_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
                                         const fb_gy1: f32 = fb_gy0 + fb_ge.bbox_size_px[1];
@@ -1763,6 +2146,9 @@ pub fn generateRowVertices(
                                         VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
                                         if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
                                     }
+                                } else {
+                                    if (core.flush_aborted) return error.FlushAborted;
+                                    stats.had_glyph_miss = true;
                                 }
                                 penX += @as(f32, @floatFromInt(fb_col_w)) * cellW;
                             }
@@ -1782,10 +2168,7 @@ pub fn generateRowVertices(
                                 const blk_geo = block_elements.getBlockGeometry(sp_scalar);
                                 if (blk_geo.count > 0) {
                                     const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                    out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                        penX += blk_w;
-                                        continue;
-                                    };
+                                    try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
                                         VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
                                     }
@@ -1813,9 +2196,9 @@ pub fn generateRowVertices(
                             if (glyph_cache_id != null and glyph_keys_id != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
                                 const key = (@as(u64, gid) << 2) | @as(u64, style_index);
                                 const hash_val = (gid *% 2654435761) ^ style_index;
-                                const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                                if (glyph_keys_id.?[hash_idx] == key) {
-                                    ge = glyph_cache_id.?[hash_idx];
+                                const probe = nvim_core.glyphCacheProbe(glyph_keys_id.?, key, hash_val);
+                                if (probe.hit) |hit_idx| {
+                                    ge = glyph_cache_id.?[hit_idx];
                                     break :gid_blk true;
                                 }
                                 const t_ens_gid1: i128 = if (log_enabled) clock.nowNs() else 0;
@@ -1823,10 +2206,11 @@ pub fn generateRowVertices(
                                 if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid1));
                                 if (ent1_opt) |entry| {
                                     ge = entry;
-                                    glyph_cache_id.?[hash_idx] = entry;
-                                    glyph_keys_id.?[hash_idx] = key;
+                                    glyph_cache_id.?[probe.insert] = entry;
+                                    glyph_keys_id.?[probe.insert] = key;
                                     break :gid_blk true;
                                 }
+                                if (core.flush_aborted) return error.FlushAborted;
                                 break :gid_blk false;
                             }
                             const t_ens_gid2: i128 = if (log_enabled) clock.nowNs() else 0;
@@ -1836,6 +2220,7 @@ pub fn generateRowVertices(
                                 ge = entry;
                                 break :gid_blk true;
                             }
+                            if (core.flush_aborted) return error.FlushAborted;
                             break :gid_blk false;
                         };
 
@@ -1856,9 +2241,9 @@ pub fn generateRowVertices(
                                 const fb_hash = clusterCacheHash(first_scalar, style_index, overflow_extras);
 
                                 const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) blk: {
-                                    const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
-                                    if (glyph_keys_non_ascii.?[fb_idx] == fb_key) {
-                                        ge = glyph_cache_non_ascii.?[fb_idx];
+                                    const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
+                                    if (probe.hit) |hit_idx| {
+                                        ge = glyph_cache_non_ascii.?[hit_idx];
                                         break :blk true;
                                     }
                                     break :blk false;
@@ -1879,23 +2264,34 @@ pub fn generateRowVertices(
                                         glyph_ok = true;
                                         // Store in non-ASCII cache for subsequent rows
                                         if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) {
-                                            const fb_idx = @as(usize, fb_hash % GLYPH_CACHE_NON_ASCII_SIZE);
-                                            glyph_cache_non_ascii.?[fb_idx] = fb_ge;
-                                            glyph_keys_non_ascii.?[fb_idx] = fb_key;
+                                            const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
+                                            glyph_cache_non_ascii.?[probe.insert] = fb_ge;
+                                            glyph_keys_non_ascii.?[probe.insert] = fb_key;
                                         }
+                                    } else if (core.flush_aborted) {
+                                        return error.FlushAborted;
                                     }
                                 }
                             }
                         }
 
-                        // Multi-scalar non-emoji fallback: if glyph-by-ID failed for a
-                        // ligature cluster, render each scalar individually to prevent
-                        // invisible glyphs where the ligature should appear.
-                        if (!glyph_ok and next_cluster > this_cluster + 1 and !cluster_is_emoji) {
+                        // Multi-scalar non-emoji fallback: if glyph-by-ID failed OR
+                        // returned an empty (0x0) bitmap for a ligature cluster, render
+                        // each scalar individually to prevent invisible glyphs where the
+                        // ligature should appear. Checking glyph_empty too (not just
+                        // !glyph_ok) matches the single-scalar/emoji branch above —
+                        // without it, a ligature glyph ID that resolves but rasterizes
+                        // to nothing silently renders as blank instead of falling back.
+                        if ((!glyph_ok or glyph_empty) and next_cluster > this_cluster + 1 and !cluster_is_emoji) {
                             var mci: u32 = this_cluster;
+                            var mc_base_x = penX;
                             while (mci < next_cluster) : (mci += 1) {
                                 const mc_scalar = core.shaping_scalars.items[@intCast(mci)];
                                 const mc_col_w = core.shaping_col_widths.items[@intCast(mci)];
+                                // Zero-width overflow scalars (combining marks,
+                                // VS selectors) belong at the preceding base
+                                // cell origin even after that base advanced penX.
+                                if (mc_col_w != 0) mc_base_x = penX;
                                 if (mc_scalar == 32 or mc_scalar == 0) {
                                     penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
                                     continue;
@@ -1906,7 +2302,7 @@ pub fn generateRowVertices(
                                 if (mc_ge_opt) |mc_ge| {
                                     if (mc_ge.bbox_size_px[0] > 0 and mc_ge.bbox_size_px[1] > 0) {
                                         const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
-                                        const mc_gx0: f32 = penX + mc_ge.bbox_origin_px[0];
+                                        const mc_gx0: f32 = mc_base_x + mc_ge.bbox_origin_px[0];
                                         const mc_gx1: f32 = mc_gx0 + mc_ge.bbox_size_px[0];
                                         const mc_gy0: f32 = mc_baselineY - (mc_ge.bbox_origin_px[1] + mc_ge.bbox_size_px[1]);
                                         const mc_gy1: f32 = mc_gy0 + mc_ge.bbox_size_px[1];
@@ -1919,11 +2315,16 @@ pub fn generateRowVertices(
                                         VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, vw, vh, run_grid_id, mc_deco);
                                         if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
                                     }
+                                } else {
+                                    if (core.flush_aborted) return error.FlushAborted;
+                                    stats.had_glyph_miss = true;
                                 }
                                 penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
                             }
                             continue;
                         }
+
+                        if (!glyph_ok) stats.had_glyph_miss = true;
 
                         // Advance pen using column widths
                         const cl_span = next_cluster - this_cluster;
@@ -2027,20 +2428,29 @@ pub fn generateRowVertices(
                         const cell_scalar = rc.scalars.items[@intCast(col_i)];
                         const cell_style_flags = rc.style_flags_arr.items[@intCast(col_i)];
                         const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
-                        if (scalar == 32) {
+                        const overflow = getOverflowForCell(core, rc, r, col_i);
+                        const has_overflow = if (overflow) |extras| extras.len != 0 else false;
+                        if (scalar == 32 and !has_overflow) {
                             penX += cellW;
                             continue;
                         }
-                        if (block_elements.isBlockElement(scalar)) {
+                        if (!has_overflow and block_elements.isBlockElement(scalar)) {
+                            // Neovim represents a double-width cell as its base
+                            // scalar followed by a zero continuation. Geometry
+                            // spans both cells even when the continuation starts
+                            // a different style/color run; its own iteration
+                            // still advances penX by the second cell below.
+                            const blk_cell_w = if (col_i + 1 < cols and
+                                rc.scalars.items[@intCast(col_i + 1)] == 0)
+                                cellW * 2
+                            else
+                                cellW;
                             const blk_geo = block_elements.getBlockGeometry(scalar);
                             if (blk_geo.count > 0) {
                                 const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                    penX += cellW;
-                                    continue;
-                                };
+                                try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
                                 for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
+                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
                                 }
                             }
                             penX += cellW;
@@ -2052,6 +2462,20 @@ pub fn generateRowVertices(
                         const style_index: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
                             @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
                         const glyph_ok = blk: {
+                            // Phase 2 must key and rasterize the complete cell
+                            // cluster even when shaping callbacks are absent.
+                            // Otherwise VS16/ZWJ variants sharing a base scalar
+                            // alias in the scalar-only cache.
+                            if (core.isPhase2Atlas()) {
+                                const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                defer core.emoji_cluster_len = 0;
+                                if (try ensureCachedPhase2Glyph(core, scalar, cs, overflow)) |entry| {
+                                    ge = entry;
+                                    break :blk true;
+                                }
+                                break :blk false;
+                            }
                             if (scalar < 128 and glyph_cache_ascii != null and glyph_valid_ascii != null) {
                                 const cache_key: usize = scalar * 4 + style_index;
                                 if (cache_key < GLYPH_CACHE_ASCII_SIZE) {
@@ -2060,15 +2484,7 @@ pub fn generateRowVertices(
                                         break :blk true;
                                     }
                                     const a_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
-                                    const ok = if (core.isPhase2Atlas()) cb: {
-                                        const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                        if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
-                                            ge = entry;
-                                            break :cb true;
-                                        }
-                                        break :cb false;
-                                    } else if (style_mask != 0 and ensure_styled != null) cb: {
+                                    const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                         const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                             @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                         break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
@@ -2086,21 +2502,13 @@ pub fn generateRowVertices(
                             if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
                                 const key = (@as(u64, scalar) << 2) | @as(u64, style_index);
                                 const hash_val = (scalar *% 2654435761) ^ style_index;
-                                const hash_idx = @as(usize, hash_val % GLYPH_CACHE_NON_ASCII_SIZE);
-                                if (glyph_keys_non_ascii.?[hash_idx] == key) {
-                                    ge = glyph_cache_non_ascii.?[hash_idx];
+                                const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, key, hash_val);
+                                if (probe.hit) |hit_idx| {
+                                    ge = glyph_cache_non_ascii.?[hit_idx];
                                     break :blk true;
                                 }
                                 const na_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
-                                const ok = if (core.isPhase2Atlas()) cb: {
-                                    const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                    if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
-                                        ge = entry;
-                                        break :cb true;
-                                    }
-                                    break :cb false;
-                                } else if (style_mask != 0 and ensure_styled != null) cb: {
+                                const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                     const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                         @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                     break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
@@ -2109,21 +2517,13 @@ pub fn generateRowVertices(
                                 } else false;
                                 if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - na_t_ens));
                                 if (ok) {
-                                    glyph_cache_non_ascii.?[hash_idx] = ge;
-                                    glyph_keys_non_ascii.?[hash_idx] = key;
+                                    glyph_cache_non_ascii.?[probe.insert] = ge;
+                                    glyph_keys_non_ascii.?[probe.insert] = key;
                                 }
                                 break :blk ok;
                             }
                             const lf_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
-                            const ok = if (core.isPhase2Atlas()) cb: {
-                                const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                if (core.ensureGlyphPhase2(scalar, cs)) |entry| {
-                                    ge = entry;
-                                    break :cb true;
-                                }
-                                break :cb false;
-                            } else if (style_mask != 0 and ensure_styled != null) cb: {
+                            const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                 const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                                 break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
@@ -2134,6 +2534,7 @@ pub fn generateRowVertices(
                             break :blk ok;
                         };
                         if (!glyph_ok) {
+                            if (core.flush_aborted) return error.FlushAborted;
                             stats.had_glyph_miss = true;
                             if (core.missing_glyph_log_count < 16) {
                                 core.log.write(
@@ -2173,6 +2574,7 @@ pub fn generateRowVertices(
         }
     }
     if (log_enabled) stats.glyph_ns = @intCast(@max(0, clock.nowNs() - t_glyph_start));
+    stats.pass_ends[2] = out.items.len - out_start;
 
     // ── Pass 4: Strikethrough ───────────────────────────────────────
     {
@@ -2190,17 +2592,29 @@ pub fn generateRowVertices(
             const run_sp = rc.sp_rgbs.items[@intCast(c)];
             const run_fg = rc.fg_rgbs.items[@intCast(c)];
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_deco = rc.deco_base_flags.items[@intCast(c)];
+
+            const fg_run_end: u32 = if (run_sp == highlight.Highlights.SP_NOT_SET)
+                @intCast(simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c + 1), @intCast(cols), run_fg))
+            else
+                cols;
 
             const run_end: u32 = @intCast(@min(
                 simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
                 @min(
                     simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                    simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                    @min(
+                        simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
+                        @min(
+                            simdFindRunEndU32(rc.deco_base_flags.items, @intCast(c + 1), @intCast(cols), run_deco),
+                            fg_run_end,
+                        ),
+                    ),
                 ),
             ));
 
             const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
-            const strike_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+            const strike_scroll_flag: u32 = run_deco;
             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
             const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
             const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
@@ -2213,6 +2627,7 @@ pub fn generateRowVertices(
         }
         if (log_enabled) stats.strike_ns = @intCast(@max(0, clock.nowNs() - t_strike_start));
     }
+    stats.pass_ends[3] = out.items.len - out_start;
 
     // ── Pass 5: Overline ────────────────────────────────────────────
     {
@@ -2228,18 +2643,20 @@ pub fn generateRowVertices(
             const run_sp = rc.sp_rgbs.items[@intCast(c)];
             const run_fg = rc.fg_rgbs.items[@intCast(c)];
             const run_grid_id = rc.grid_ids.items[@intCast(c)];
+            const run_deco = rc.deco_base_flags.items[@intCast(c)];
 
             var run_end: u32 = c + 1;
             while (run_end < cols) : (run_end += 1) {
                 if (rc.overline_arr.items[@intCast(run_end)] == 0) break;
                 if (rc.sp_rgbs.items[@intCast(run_end)] != run_sp) break;
                 if (rc.grid_ids.items[@intCast(run_end)] != run_grid_id) break;
+                if (rc.deco_base_flags.items[@intCast(run_end)] != run_deco) break;
                 if (run_sp == highlight.Highlights.SP_NOT_SET and
                     rc.fg_rgbs.items[@intCast(run_end)] != run_fg) break;
             }
 
             const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
-            const ol_scroll_flag: u32 = rc.deco_base_flags.items[@intCast(c)];
+            const ol_scroll_flag: u32 = run_deco;
             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
             const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
             const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
@@ -2252,6 +2669,7 @@ pub fn generateRowVertices(
         }
         if (log_enabled) stats.overline_ns = @intCast(@max(0, clock.nowNs() - t_overline_start));
     }
+    stats.pass_ends[4] = out.items.len - out_start;
 
     if (log_enabled) {
         stats.atlas_ensure_ns = atlas_ensure_ns_acc;
@@ -2260,12 +2678,110 @@ pub fn generateRowVertices(
     return stats;
 }
 
+const GridRowScrollCallback = *const fn (
+    ctx: ?*anyopaque,
+    grid_id: i64,
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    col_end: u32,
+    rows_delta: i32,
+    total_rows: u32,
+    total_cols: u32,
+) callconv(.c) void;
+
+const ExternalScrollFastPathRegion = struct {
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    col_end: u32,
+};
+
+fn externalFloatAnchorEntries(
+    entries: []const ExternalFloatAnchorEntry,
+    anchor_grid_id: i64,
+) []const ExternalFloatAnchorEntry {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (entries[mid].anchor_grid_id < anchor_grid_id) lo = mid + 1 else hi = mid;
+    }
+    const start = lo;
+    hi = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (entries[mid].anchor_grid_id <= anchor_grid_id) lo = mid + 1 else hi = mid;
+    }
+    return entries[start..lo];
+}
+
+fn externalScrollFastPathRegion(
+    op: grid_mod.ScrollDelta,
+    grid_rows: u32,
+    grid_cols: u32,
+    viewport_rows: u32,
+    viewport_cols: u32,
+) ?ExternalScrollFastPathRegion {
+    // The callback ABI carries only a vertical delta. Reject horizontal,
+    // multi-row, and hostile geometry instead of asking frontends to infer
+    // whether the core omitted reusable rows.
+    if ((op.rows != 1 and op.rows != -1) or op.cols != 0) return null;
+    if (viewport_rows == 0 or viewport_cols == 0) return null;
+    if (viewport_rows > grid_rows or viewport_cols > grid_cols) return null;
+    if (op.top >= op.bot or op.bot > grid_rows) return null;
+    if (op.left >= op.right or op.right > grid_cols) return null;
+
+    const row_end = @min(op.bot, viewport_rows);
+    if (row_end <= op.top or row_end - op.top <= 1) return null;
+    const col_start = @min(op.left, viewport_cols);
+    const col_end = @min(op.right, viewport_cols);
+    if (col_start != 0 or col_end != viewport_cols) return null;
+
+    return .{
+        .row_start = op.top,
+        .row_end = row_end,
+        .col_start = col_start,
+        .col_end = col_end,
+    };
+}
+
+fn dispatchGridRowScroll(
+    core: *Core,
+    scroll_cb: GridRowScrollCallback,
+    grid_id: i64,
+    anchor_entries: []const ExternalFloatAnchorEntry,
+) bool {
+    if (grid_id < 2) return false;
+    if (!core.grid.external_grids.contains(grid_id)) return false;
+    // The frontend cannot remap retained row slots until the external window
+    // open callback has seeded a committed surface. Keep dispatch eligibility
+    // identical to sendExternalGridVertices' generation-side fast path.
+    if (!core.known_external_grids.contains(grid_id)) return false;
+    const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
+    if (sg.scroll_fast_path_blocked) return false;
+
+    // A float composited into this external grid cannot be pixel-shifted with
+    // the base rows because its old overlay pixels would move too.
+    if (externalFloatAnchorEntries(anchor_entries, grid_id).len != 0) return false;
+
+    const op = sg.last_scroll_op orelse return false;
+    const ext_target = core.grid.external_grid_target_sizes.get(grid_id);
+    const vp_rows = if (ext_target) |t| t.rows else sg.rows;
+    const vp_cols = if (ext_target) |t| t.cols else sg.cols;
+    const region = externalScrollFastPathRegion(op, sg.rows, sg.cols, vp_rows, vp_cols) orelse return false;
+    scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, vp_rows, vp_cols);
+    return true;
+}
+
 pub const FlushCtx = struct {
     core: *Core,
 
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         if (n_cells == 0) return;
+        const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
+        const last_sent_cursor_rev_before = ctx.core.last_sent_cursor_rev;
 
         // === PERF LOG: flush開始 ===
         const perf_enabled = ctx.core.log.cb != null;
@@ -2292,20 +2808,48 @@ pub const FlushCtx = struct {
                 ctx.core.log.write("[perf] flush_total rows={d} cols={d} us={d}\n", .{ rows, cols, flush_us });
                 // Per-flush atlas aggregate. Always emitted (even when zero) so
                 // a downstream analyzer can pair it 1:1 with flush_total.
+                // full_reset_count is cumulative (not reset above) so it can
+                // be diffed across flushes to see how often the atlas-full
+                // path (packAndUploadBitmap's shelf packer running out of
+                // room) actually fires in real usage.
                 ctx.core.log.write(
-                    "[perf] atlas raster_calls={d} raster_ns={d} upload_calls={d} upload_ns={d} pack_ns={d} create_calls={d} create_ns={d} total_calls={d} total_ns={d}\n",
+                    "[perf] atlas raster_calls={d} raster_ns={d} upload_calls={d} upload_ns={d} pack_ns={d} create_calls={d} create_ns={d} total_calls={d} total_ns={d} full_reset_count={d}\n",
                     .{
-                        ctx.core.perf_rasterize_calls, ctx.core.perf_rasterize_ns_total,
-                        ctx.core.perf_upload_calls,    ctx.core.perf_upload_ns_total,
-                        ctx.core.perf_pack_ns_total,
-                        ctx.core.perf_atlas_create_calls, ctx.core.perf_atlas_create_ns_total,
-                        ctx.core.perf_atlas_total_calls, ctx.core.perf_atlas_total_ns_total,
+                        ctx.core.perf_rasterize_calls,       ctx.core.perf_rasterize_ns_total,
+                        ctx.core.perf_upload_calls,          ctx.core.perf_upload_ns_total,
+                        ctx.core.perf_pack_ns_total,         ctx.core.perf_atlas_create_calls,
+                        ctx.core.perf_atlas_create_ns_total, ctx.core.perf_atlas_total_calls,
+                        ctx.core.perf_atlas_total_ns_total,  ctx.core.perf_atlas_full_reset_count,
+                    },
+                );
+                // Cumulative (never reset) grid_mu tryLock contention for the
+                // 6 UI-thread call sites converted from blocking to tryLock+
+                // cache. attempts/busy let a downstream analyzer compute a
+                // contention rate since app start; loaded atomically since
+                // these are written from the UI thread, including on the
+                // busy branch where grid_mu itself is NOT held.
+                ctx.core.log.write(
+                    "[perf] grid_lock_contention mode_state_attempts={d} mode_state_busy={d} cursor_pos_attempts={d} cursor_pos_busy={d} msg_timeout_attempts={d} msg_timeout_busy={d} input_trace_attempts={d} input_trace_busy={d} cursor_blink_attempts={d} cursor_blink_busy={d} viewport_attempts={d} viewport_busy={d}\n",
+                    .{
+                        ctx.core.perf_lock_mode_state.attempts.load(.monotonic),
+                        ctx.core.perf_lock_mode_state.busy.load(.monotonic),
+                        ctx.core.perf_lock_cursor_pos.attempts.load(.monotonic),
+                        ctx.core.perf_lock_cursor_pos.busy.load(.monotonic),
+                        ctx.core.perf_lock_msg_timeout.attempts.load(.monotonic),
+                        ctx.core.perf_lock_msg_timeout.busy.load(.monotonic),
+                        ctx.core.perf_lock_input_trace.attempts.load(.monotonic),
+                        ctx.core.perf_lock_input_trace.busy.load(.monotonic),
+                        ctx.core.perf_lock_cursor_blink.attempts.load(.monotonic),
+                        ctx.core.perf_lock_cursor_blink.busy.load(.monotonic),
+                        ctx.core.perf_lock_viewport.attempts.load(.monotonic),
+                        ctx.core.perf_lock_viewport.busy.load(.monotonic),
                     },
                 );
             }
         }
 
         ctx.core.missing_glyph_log_count = 0;
+        ctx.core.atlas_full_resets_this_flush = 0;
 
         // Snapshot dirty bookkeeping at flush entry. Compares against
         // grid_line_stats from the redraw_batch to tell apart:
@@ -2332,19 +2876,16 @@ pub const FlushCtx = struct {
         // This allows Swift to clear pixel offsets before new vertices are rendered,
         // preventing double-shift glitches in split windows.
         const scrolled_count = ctx.core.grid.scrolled_grid_count;
-        // Snapshot scrolled grid IDs before clearScrolledGrids() zeroes the array
-        var scrolled_ids_snapshot: [16]i64 = undefined;
-        if (scrolled_count > 0) {
-            @memcpy(scrolled_ids_snapshot[0..scrolled_count], ctx.core.grid.scrolled_grid_ids[0..scrolled_count]);
-        }
-        if (perf_enabled and scrolled_count > 0) {
-            ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} content_rev={d} dirty_all={any}\n", .{
-                scrolled_count, ctx.core.grid.content_rev, ctx.core.grid.dirty_all,
+        const scrolled_overflow = ctx.core.grid.scrolled_grid_overflow;
+        if (perf_enabled and (scrolled_count > 0 or scrolled_overflow)) {
+            ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} overflow={any} content_rev={d} dirty_all={any}\n", .{
+                scrolled_count, scrolled_overflow, ctx.core.grid.content_rev, ctx.core.grid.dirty_all,
             });
         }
         // Reset flush_aborted BEFORE calling on_flush_begin
         // (the callback may set it via zonvie_core_abort_flush)
         ctx.core.flush_aborted = false;
+        ctx.core.flush_atlas_corrupted = false;
 
         // Notify frontend: flush begins (for triple buffer write-set preparation)
         if (ctx.core.cb.on_flush_begin) |cb| {
@@ -2357,10 +2898,56 @@ pub const FlushCtx = struct {
         }
         // pre_row "blackhole" bracket start. Surfaces the untimed gap between
         // cb_flush_begin and the row loop entry: scrolled-grid dispatch,
-        // clearScrolledGrids, msg_show throttle check, notifyCmdlineChanges,
+        // deferred-scroll dispatch, msg_show throttle check, notifyCmdlineChanges,
         // notifyPopupmenuChanges, cursor resolve. Closed inside the row_mode
         // branch where t_rows_start_ns is established (search "pre_row_us").
         const t_pre_row_start: i128 = if (perf_enabled) clock.nowNs() else 0;
+        // Commit scroll provenance only after every deferred external-grid
+        // callback and on_flush_end accepted the transaction. Registration
+        // order is intentional: this defer runs after the two defers below.
+        defer {
+            ctx.core.ext_float_anchor_index_valid = false;
+            if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
+                ctx.core.finishAtlasMaintenance();
+                ctx.core.grid.clearScrolledGrids();
+                ctx.core.grid.clearScrollState();
+                var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| sg.clearScrollState();
+            } else {
+                // This is a transaction-local edge, not persistent atlas
+                // state. A callback abort can return before the normal
+                // row/cursor reset checks consume it; dirty-all below replaces
+                // that notification for the retry transaction.
+                ctx.core.atlas_reset_during_flush = false;
+                // on_flush_end itself may reject the transaction after main
+                // and external generation already cleared dirty flags. Restore
+                // a complete resend. Successfully invoked on_grid_scroll IDs
+                // are consumed at the call site; any unvisited IDs remain in
+                // the compact prefix/per-grid bits for retry. Row-shift state
+                // is never replayed after abort because the full redraw below
+                // supersedes it.
+                ctx.core.grid.markAllDirty();
+                var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| sg.markAllDirty();
+                ctx.core.last_sent_content_rev = last_sent_content_rev_before;
+                ctx.core.last_sent_cursor_rev = last_sent_cursor_rev_before;
+                ctx.core.force_ext_cursor_recheck = true;
+                // A due maintenance reprobe may already have invalidated its
+                // negative entries before a later consumer rejected the flush.
+                // Re-arm the shared one-shot timer so idle Neovim cannot leave
+                // those now-uncached visible cells waiting forever.
+                if ((ctx.core.atlas_negative_recovery_armed and ctx.core.atlas_negative_retry_at == null) or
+                    (ctx.core.transient_glyph_recovery_armed and ctx.core.transient_glyph_retry_at == null))
+                {
+                    const retry_at = scheduleMsgRetryDeadline(ctx.core, clock.nowNs());
+                    ctx.core.rearmAtlasMaintenanceAfterAbort(retry_at);
+                }
+                ctx.core.grid.clearScrollState();
+                sg_it = ctx.core.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| sg.clearScrollState();
+            }
+        }
+
         // Ensure on_flush_end is called on all exit paths (atomic commit point)
         defer {
             if (ctx.core.cb.on_flush_end) |cb| {
@@ -2377,27 +2964,131 @@ pub const FlushCtx = struct {
         // before commitFlush, preventing draw() from rendering remapped slots
         // with stale vertex content.
         defer {
-            if (!ctx.core.flush_aborted) {
+            if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                 const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
                 sendExternalGridVertices(ctx.core, false);
                 if (perf_enabled) {
                     const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
                     ctx.core.log.write("[perf] send_external_grids us={d} known={d}\n", .{ ext_us, ctx.core.known_external_grids.count() });
                 }
+                // Complete external-window lifecycle notification before
+                // on_flush_end commits the frontend transaction. This is
+                // required for timer/retry-driven flushes, which have no
+                // redraw-batch post-processing phase, and lets an allocation
+                // failure here cancel/retry the same transaction.
+                if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
+                    _ = notifyExternalWindowChanges(ctx.core);
+                }
+                // sendExternalGridVertices can itself call
+                // zonvie_core_abort_flush (e.g. Windows external row-buffer
+                // OOM), AFTER the main grid already ran clearDirty() /
+                // saveSubgridSnapshots() earlier in this function on the
+                // assumption of a successful commit. But the frontend's
+                // on_flush_end abort handling cancels ALL brackets for this
+                // flush, main included — so an abort discovered only here
+                // would otherwise drop the main-grid update permanently
+                // (core thinks it already sent it; frontend never commits
+                // it). Force a full resend next flush to recover.
+                if (ctx.core.flush_aborted) {
+                    ctx.core.grid.markAllDirty();
+                    var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                    while (sg_it.next()) |sg| {
+                        sg.markAllDirty();
+                    }
+                    ctx.core.force_ext_cursor_recheck = true;
+                    // last_sent_cursor_rev was already synced to the current
+                    // cursor_rev earlier in this same onFlush() call (the
+                    // on_vertices_partial fast path above), before this
+                    // late-discovered abort was known. The cancelled
+                    // bracket includes the main cursor too, so force a
+                    // mismatch (wrapping, matching cursor_rev's own +%=
+                    // idiom) so the next flush's need_cursor check resends
+                    // it instead of assuming it was already delivered.
+                    ctx.core.last_sent_cursor_rev -%= 1;
+                }
             }
         }
+
+        // A composition step below (vertex buffer growth, glyph push, etc.)
+        // can fail with an internal Zig error (OOM) rather than an explicit
+        // frontend-signaled zonvie_core_abort_flush() call. Without this,
+        // such an error would propagate straight out of onFlush and be
+        // silently swallowed by callers (`catch {}` / logged and dropped),
+        // while the on_flush_end/sendExternalGridVertices defers above still
+        // run as if nothing happened — frontends would commit whatever
+        // partial write-set was composed before the failure as a complete,
+        // successful frame. Registered AFTER those two defers so it runs
+        // FIRST during unwind (LIFO), setting flush_aborted before they see
+        // it — sendExternalGridVertices's defer already skips on
+        // flush_aborted, and zonvie_core_flush_was_aborted() lets both
+        // frontends' on_flush_end handlers detect this and cancel their
+        // bracket instead of committing.
+        errdefer ctx.core.flush_aborted = true;
 
         // If frontend aborted, skip all vertex/atlas work.
         // Grid scroll events are NOT dispatched or cleared — they are preserved
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
-        if (ctx.core.flush_aborted) return;
+        if (ctx.core.flush_aborted) {
+            // The message timeout checks below are unreachable when beginFlush
+            // rejects the transaction. Move every elapsed deadline onto one
+            // bounded retry deadline so the frontend timer does not immediately
+            // drive another full flush under sustained backpressure/OOM.
+            const now = clock.nowNs();
+            var throttle_due = false;
+            if (ctx.core.msg_show_pending_since) |pending_since| {
+                throttle_due = now - pending_since >= ctx.core.msg_show_throttle_ns;
+                const retry_due = if (ctx.core.msg_show_retry_at) |retry_at| now >= retry_at else true;
+                throttle_due = throttle_due and retry_due;
+            }
+            const show_hide_due = if (ctx.core.msg_show_auto_hide_at) |hide_at| now >= hide_at else false;
+            const history_hide_due = if (ctx.core.msg_history_auto_hide_at) |hide_at| now >= hide_at else false;
+            const atlas_retry_due = if (ctx.core.atlas_negative_retry_at) |retry_at| now >= retry_at else false;
+            const transient_retry_due = if (ctx.core.transient_glyph_retry_at) |retry_at| now >= retry_at else false;
+            if (throttle_due or show_hide_due or history_hide_due or atlas_retry_due or transient_retry_due) {
+                const retry_at = scheduleMsgRetryDeadline(ctx.core, now);
+                if (throttle_due) ctx.core.msg_show_retry_at = retry_at;
+                if (show_hide_due) ctx.core.msg_show_auto_hide_at = retry_at;
+                if (history_hide_due) ctx.core.msg_history_auto_hide_at = retry_at;
+                if (atlas_retry_due) ctx.core.atlas_negative_retry_at = retry_at;
+                if (transient_retry_due) ctx.core.transient_glyph_retry_at = retry_at;
+            }
+            return;
+        }
+
+        // Capacity-negative glyphs are retried selectively only after the
+        // frontend accepted the flush bracket. This invalidates cached blank
+        // entries but does not recreate the atlas; an actually-visible miss
+        // takes the bounded reactive reset path during generation.
+        _ = ctx.core.prepareAtlasMaintenance();
 
         // Dispatch grid_scroll events AFTER abort check so they are preserved on retry.
         if (ctx.core.cb.on_grid_scroll) |cb| {
-            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
-                cb(ctx.core.ctx, grid_id);
+            if (scrolled_overflow) {
+                if (ctx.core.grid.main_scroll_notify_pending) {
+                    cb(ctx.core.ctx, 1);
+                    ctx.core.grid.consumeScrolledGridNotification(1);
+                }
+                if (!ctx.core.flush_aborted) {
+                    var sg_it = ctx.core.grid.sub_grids.iterator();
+                    while (sg_it.next()) |entry| {
+                        if (entry.value_ptr.scroll_notify_pending) {
+                            const grid_id = entry.key_ptr.*;
+                            cb(ctx.core.ctx, grid_id);
+                            ctx.core.grid.consumeScrolledGridNotification(grid_id);
+                            if (ctx.core.flush_aborted) break;
+                        }
+                    }
+                }
+            } else {
+                while (ctx.core.grid.scrolled_grid_count != 0) {
+                    const grid_id = ctx.core.grid.scrolled_grid_ids[0];
+                    cb(ctx.core.ctx, grid_id);
+                    ctx.core.grid.consumeScrolledGridNotification(grid_id);
+                    if (ctx.core.flush_aborted) break;
+                }
             }
         }
+        if (ctx.core.flush_aborted) return;
 
         // Dispatch per-grid row scroll notifications for external grids.
         // Fires at the same dispatch point as on_grid_scroll (after abort check).
@@ -2405,45 +3096,35 @@ pub const FlushCtx = struct {
         // Also skipped when float windows are anchored to the grid, because the core
         // composites float content into the grid's row vertices — GPU-blitting old pixels
         // would shift stale overlay content to wrong positions.
-        // last_scroll_op is cleared later by sg.clearDirty(), not here.
+        // last_scroll_op is committed by the transaction-final defer, not here.
         if (ctx.core.cb.on_grid_row_scroll) |scroll_cb| {
-            for (ctx.core.grid.scrolled_grid_ids[0..scrolled_count]) |grid_id| {
-                if (grid_id < 2) continue;
-                if (ctx.core.grid.sub_grids.getPtr(grid_id)) |sg| {
-                    if (sg.scroll_fast_path_blocked) continue;
+            var has_pending_external_scroll = false;
+            var pending_it = ctx.core.grid.sub_grids.iterator();
+            while (pending_it.next()) |entry| {
+                if (entry.value_ptr.row_scroll_notify_pending and
+                    ctx.core.grid.external_grids.contains(entry.key_ptr.*))
+                {
+                    has_pending_external_scroll = true;
+                    break;
+                }
+            }
+            if (has_pending_external_scroll) try buildExternalFloatAnchorIndex(ctx.core);
 
-                    // Check for float windows anchored to this grid
-                    var has_float_overlay = false;
-                    var wp_it = ctx.core.grid.win_pos.iterator();
-                    while (wp_it.next()) |wp_entry| {
-                        if (wp_entry.value_ptr.anchor_grid == grid_id) {
-                            has_float_overlay = true;
-                            break;
-                        }
-                    }
-                    if (has_float_overlay) continue;
-
-                    if (sg.last_scroll_op) |op| {
-                        // Clamp scroll region to viewport dimensions.
-                        // External grids may have sg.rows > viewport_rows due to
-                        // margin rows (e.g. winbar). The frontend's texture and blit
-                        // only cover viewport_rows, so unclamped parameters would cause
-                        // out-of-bounds blit reads and wrong vacated rows.
-                        const ext_target = ctx.core.grid.external_grid_target_sizes.get(grid_id);
-                        const vp_rows = if (ext_target) |t| t.rows else sg.rows;
-                        const vp_cols = if (ext_target) |t| t.cols else sg.cols;
-                        const clamped_bot = @min(op.bot, vp_rows);
-                        if (clamped_bot > op.top) {
-                            scroll_cb(ctx.core.ctx, grid_id,
-                                op.top, clamped_bot, op.left, op.right,
-                                op.rows, vp_rows, vp_cols);
-                        }
-                    }
+            var sg_it = ctx.core.grid.sub_grids.iterator();
+            while (sg_it.next()) |entry| {
+                if (entry.value_ptr.row_scroll_notify_pending) {
+                    _ = dispatchGridRowScroll(
+                        ctx.core,
+                        scroll_cb,
+                        entry.key_ptr.*,
+                        ctx.core.ext_float_anchor_entries.items,
+                    );
+                    entry.value_ptr.row_scroll_notify_pending = false;
+                    if (ctx.core.flush_aborted) break;
                 }
             }
         }
-
-        ctx.core.grid.clearScrolledGrids();
+        if (ctx.core.flush_aborted) return;
 
         // Check msg_show throttle timeout for external commands
         ctx.core.checkMsgShowThrottleTimeout();
@@ -2479,7 +3160,7 @@ pub const FlushCtx = struct {
             .blink_on_ms = 0,
             .blink_off_ms = 0,
         };
-        
+
         // NOTE: cursor row/col are relative to cursor_grid.
         // Convert them to screen(grid 1) coordinates using win_pos,
         // because we already flattened sub-grids into tmp[] in screen space.
@@ -2543,17 +3224,24 @@ pub const FlushCtx = struct {
         }
 
         // --- fast path: build vertices directly (skip bg_spans/text_runs/scalars_buf) ---
-        if (ctx.core.cb.on_vertices_partial != null) {
+        if (ctx.core.cb.on_vertices_partial != null or ctx.core.cb.on_vertices_row != null) {
             const pf_opt = ctx.core.cb.on_vertices_partial;
 
             // Decide what needs rebuilding/sending.
-            const need_main: bool = (ctx.core.grid.content_rev != ctx.core.last_sent_content_rev);
+            // dirty_all must force a rebuild even when content_rev is already
+            // synced: the atlas-reset/glyph-miss recovery paths call
+            // markAllDirty() AFTER last_sent_content_rev was synced for this
+            // flush (row-mode retry exit, and the non-row-mode unsent-return
+            // above the partial send). Without this OR, the early return
+            // below would clearDirty() the pending recovery and the screen
+            // would stay stale/blank until the next real content change.
+            const need_main: bool = (ctx.core.grid.content_rev != ctx.core.last_sent_content_rev) or ctx.core.grid.dirty_all;
             const need_cursor: bool = (ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev);
+            var cursor_retry_required = false;
 
             // If nothing changed, avoid doing any work.
             if (!need_main and !need_cursor) {
                 ctx.core.grid.clearDirty();
-                ctx.core.grid.clearScrollState();
                 return;
             }
 
@@ -2620,14 +3308,21 @@ pub const FlushCtx = struct {
                 fn pushSolidQuad(
                     out: *std.ArrayListUnmanaged(c_api.Vertex),
                     alloc: std.mem.Allocator,
-                    x0: f32, y0: f32, x1: f32, y1: f32,
+                    x0: f32,
+                    y0: f32,
+                    x1: f32,
+                    y1: f32,
                     col: [4]f32,
-                    vw: f32, vh: f32,
+                    vw: f32,
+                    vh: f32,
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) !void {
                     const pts = ndc4(x0, y0, x1, y1, vw, vh);
-                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+                    const p0 = pts[0];
+                    const p1 = pts[1];
+                    const p2 = pts[2];
+                    const p3 = pts[3];
 
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
@@ -2644,14 +3339,21 @@ pub const FlushCtx = struct {
                 /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
                 fn pushSolidQuadAssumeCapacity(
                     out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    x0: f32, y0: f32, x1: f32, y1: f32,
+                    x0: f32,
+                    y0: f32,
+                    x1: f32,
+                    y1: f32,
                     col: [4]f32,
-                    vw: f32, vh: f32,
+                    vw: f32,
+                    vh: f32,
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) void {
                     const pts = ndc4(x0, y0, x1, y1, vw, vh);
-                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+                    const p0 = pts[0];
+                    const p1 = pts[1];
+                    const p2 = pts[2];
+                    const p3 = pts[3];
 
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
@@ -2667,10 +3369,17 @@ pub const FlushCtx = struct {
                 fn pushGlyphQuad(
                     out: *std.ArrayListUnmanaged(c_api.Vertex),
                     alloc: std.mem.Allocator,
-                    x0: f32, y0: f32, x1: f32, y1: f32,
-                    uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32,
+                    x0: f32,
+                    y0: f32,
+                    x1: f32,
+                    y1: f32,
+                    uv0: [2]f32,
+                    uv1: [2]f32,
+                    uv2: [2]f32,
+                    uv3: [2]f32,
                     col: [4]f32,
-                    vw: f32, vh: f32,
+                    vw: f32,
+                    vh: f32,
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) !void {
@@ -2681,15 +3390,25 @@ pub const FlushCtx = struct {
                 /// Same as pushGlyphQuad but caller guarantees capacity.
                 fn pushGlyphQuadAssumeCapacity(
                     out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    x0: f32, y0: f32, x1: f32, y1: f32,
-                    uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32,
+                    x0: f32,
+                    y0: f32,
+                    x1: f32,
+                    y1: f32,
+                    uv0: [2]f32,
+                    uv1: [2]f32,
+                    uv2: [2]f32,
+                    uv3: [2]f32,
                     col: [4]f32,
-                    vw: f32, vh: f32,
+                    vw: f32,
+                    vh: f32,
                     grid_id: i64,
                     base_deco_flags: u32,
                 ) void {
                     const pts = ndc4(x0, y0, x1, y1, vw, vh);
-                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+                    const p0 = pts[0];
+                    const p1 = pts[1];
+                    const p2 = pts[2];
+                    const p3 = pts[3];
 
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
@@ -2705,21 +3424,28 @@ pub const FlushCtx = struct {
                 fn pushDecoQuad(
                     out: *std.ArrayListUnmanaged(c_api.Vertex),
                     alloc: std.mem.Allocator,
-                    x0: f32, y0: f32, x1: f32, y1: f32,
+                    x0: f32,
+                    y0: f32,
+                    x1: f32,
+                    y1: f32,
                     col: [4]f32,
-                    vw: f32, vh: f32,
+                    vw: f32,
+                    vh: f32,
                     grid_id: i64,
                     deco_flags: u32,
                     deco_phase: f32,
                 ) !void {
                     const pts = ndc4(x0, y0, x1, y1, vw, vh);
-                    const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+                    const p0 = pts[0];
+                    const p1 = pts[1];
+                    const p2 = pts[2];
+                    const p3 = pts[3];
 
                     // UV coordinates for decorations:
                     // - UV.x = -1 (sentinel for solid/decoration)
                     // - UV.y = local Y position within quad (0.0 at top, 1.0 at bottom)
                     // This allows the shader to know the fragment's position within the quad
-                    const uv_top: [2]f32 = .{ -1.0, 0.0 };    // y0 vertices (top)
+                    const uv_top: [2]f32 = .{ -1.0, 0.0 }; // y0 vertices (top)
                     const uv_bottom: [2]f32 = .{ -1.0, 1.0 }; // y1 vertices (bottom)
 
                     try out.ensureUnusedCapacity(alloc, 6);
@@ -2735,35 +3461,17 @@ pub const FlushCtx = struct {
                     v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                 }
-
-                /// Compute DECO_SCROLLABLE flag for a cell at global grid row `r` with the given grid_id.
-                /// For grid_id=1, uses the pre-computed main_scrollable flag.
-                /// For sub-grids, checks the sub-grid's own viewport margins.
-                fn computeScrollFlag(
-                    r: u32,
-                    run_grid_id: i64,
-                    main_scrollable: u32,
-                    cached_sgs: []const CachedSubgrid,
-                ) u32 {
-                    if (run_grid_id == 1) return main_scrollable;
-                    for (cached_sgs) |csg| {
-                        if (csg.grid_id == run_grid_id) {
-                            const internal_row = r -| csg.row_start;
-                            if (internal_row >= csg.margin_top and internal_row < csg.sg_rows -| csg.margin_bottom)
-                                return c_api.DECO_SCROLLABLE;
-                            return 0;
-                        }
-                    }
-                    return c_api.DECO_SCROLLABLE; // Unknown grid: default scrollable
-                }
             };
 
             var sent_main_by_rows: bool = false;
+            var main_retry_required: bool = false;
 
             // Pre-compute subgrid info — declared outside need_main so the
             // snapshot is accessible for saveSubgridSnapshots in all exit paths.
-            var cached_subgrids: [MAX_CACHED_SUBGRIDS]CachedSubgrid = undefined;
-            var cached_subgrid_count: usize = 0;
+            // Backed by a persistent Core-owned buffer (no fixed cap): row-mode
+            // composition draws ONLY from this set, so truncating it would
+            // silently drop the topmost floats in layouts with many grids.
+            var cached_subgrids: []const CachedSubgrid = &.{};
 
             // ----------------------------
             // Rebuild MAIN only when needed
@@ -2803,36 +3511,26 @@ pub const FlushCtx = struct {
                         });
                     }
 
-                    // Sort back-to-front: smaller first, larger last (insertion sort)
-                    {
-                        var j: usize = 1;
-                        while (j < ctx.core.grid_entries.items.len) : (j += 1) {
-                            const key = ctx.core.grid_entries.items[j];
-                            var k: usize = j;
-                            while (k > 0) {
-                                const prev = ctx.core.grid_entries.items[k - 1];
-
-                                const less =
-                                    (key.zindex < prev.zindex) or
-                                    (key.zindex == prev.zindex and key.compindex < prev.compindex) or
-                                    (key.zindex == prev.zindex and key.compindex == prev.compindex and key.order < prev.order) or
-                                    (key.zindex == prev.zindex and key.compindex == prev.compindex and key.order == prev.order and key.grid_id < prev.grid_id);
-
-                                if (!less) break;
-
-                                ctx.core.grid_entries.items[k] = prev;
-                                k -= 1;
-                            }
-                            ctx.core.grid_entries.items[k] = key;
+                    // Sort back-to-front: smaller first, larger last.
+                    // std.sort.block is O(n log n) — insertion sort here was
+                    // O(n^2), a frame-time spike under grid_mu (blocking
+                    // try_get_* callers) for layouts with many floats/splits.
+                    std.sort.block(GridEntry, ctx.core.grid_entries.items, {}, struct {
+                        fn lessThan(_: void, a: GridEntry, b: GridEntry) bool {
+                            if (a.zindex != b.zindex) return a.zindex < b.zindex;
+                            if (a.compindex != b.compindex) return a.compindex < b.compindex;
+                            if (a.order != b.order) return a.order < b.order;
+                            return a.grid_id < b.grid_id;
                         }
-                    }
+                    }.lessThan);
                 }
 
                 // Pre-compute subgrid info (shared by row-mode and non-row-mode paths).
                 // Caches win_pos/sub_grids lookups and viewport margins to avoid
                 // per-row hash map access during vertex generation.
+                ctx.core.cached_subgrids_buf.clearRetainingCapacity();
+                try ctx.core.cached_subgrids_buf.ensureTotalCapacity(ctx.core.alloc, ctx.core.grid_entries.items.len);
                 for (ctx.core.grid_entries.items) |ent| {
-                    if (cached_subgrid_count >= MAX_CACHED_SUBGRIDS) break;
                     const subgrid_id = ent.grid_id;
                     const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
                     const sg = ctx.core.grid.sub_grids.get(subgrid_id) orelse continue;
@@ -2841,19 +3539,23 @@ pub const FlushCtx = struct {
                     if (pos.anchor_grid != 1 and ctx.core.grid.external_grids.contains(pos.anchor_grid)) continue;
 
                     const sg_margins = ctx.core.grid.getViewportMargins(subgrid_id);
-                    cached_subgrids[cached_subgrid_count] = .{
+                    ctx.core.cached_subgrids_buf.appendAssumeCapacity(.{
                         .grid_id = subgrid_id,
                         .row_start = pos.row,
-                        .row_end = pos.row + sg.rows,
+                        // Saturating: a hostile win_pos row near maxInt(u32)
+                        // must not overflow-panic the flush.
+                        .row_end = pos.row +| sg.rows,
                         .col_start = pos.col,
                         .sg_cols = sg.cols,
                         .sg_rows = sg.rows,
                         .cells = sg.cells.ptr,
                         .margin_top = sg_margins.top,
                         .margin_bottom = sg_margins.bottom,
-                    };
-                    cached_subgrid_count += 1;
+                        .margin_left = sg_margins.left,
+                        .margin_right = sg_margins.right,
+                    });
                 }
+                cached_subgrids = ctx.core.cached_subgrids_buf.items;
 
                 // -------------------------------------------------
                 // Row callback mode: send only dirty rows (global grid)
@@ -2861,6 +3563,11 @@ pub const FlushCtx = struct {
 
                 const use_row_mode = (ctx.core.cb.on_vertices_row != null);
                 if (use_row_mode) {
+                    const use_main_subgrid_row_index = try ensureMainSubgridRowIndex(
+                        ctx.core,
+                        cached_subgrids,
+                        rows,
+                    );
                     const row_cb = ctx.core.cb.on_vertices_row.?;
                     sent_main_by_rows = true;
 
@@ -2898,7 +3605,7 @@ pub const FlushCtx = struct {
                         const cached_sg_count = ctx.core.grid_entries.items.len;
                         ctx.core.log.write(
                             "[scroll_debug] flush_row_mode dirty_rows={d} rebuild_all={any} scrolled_count={d} scrolled_grid_ids[0]={d} subgrid_count={d} cursor_row={d} cursor_col={d}\n",
-                            .{ log_dirty_rows, rebuild_all, scrolled_count, scrolled_ids_snapshot[0], cached_sg_count, ctx.core.grid.cursor_row, ctx.core.grid.cursor_col },
+                            .{ log_dirty_rows, rebuild_all, scrolled_count, ctx.core.grid.scrolled_grid_ids[0], cached_sg_count, ctx.core.grid.cursor_row, ctx.core.grid.cursor_col },
                         );
                         if (ctx.core.grid.pending_scroll) |ps| {
                             ctx.core.log.write(
@@ -3014,9 +3721,11 @@ pub const FlushCtx = struct {
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
-                    var atlas_retry_aborted: bool = false;
                     var used_scroll_fast_path: bool = false;
 
+                    // Dirty-row composition uses persistent per-row buckets.
+                    // Content-only flushes validate the layout in O(G), then
+                    // visit only subgrids intersecting each dirty row.
                     retry_loop: while (true) {
                         // On retry: force all rows (stale UVs in non-dirty rows too)
                         const effective_rebuild_all = rebuild_all or atlas_retried;
@@ -3069,194 +3778,212 @@ pub const FlushCtx = struct {
                             // glyph caches already cleared by resetGlyphCacheFlags() inside resetCoreAtlas()
                         }
 
-                    // Scroll-aware fast path eligibility check
-                    var t_prep_fast_path_check_start: i128 = 0;
-                    if (log_enabled) t_prep_fast_path_check_start = clock.nowNs();
-                    const scroll_check = checkScrollFastPath(
-                        &ctx.core.grid,
-                        effective_rebuild_all,
-                        atlas_retried,
-                        @intCast(scrolled_count),
-                        cached_subgrids[0..cached_subgrid_count],
-                    );
-                    if (log_enabled) {
-                        const t_prep_fast_path_check_end = clock.nowNs();
-                        perf_row_prep_fast_path_check_us = @intCast(@divTrunc(@max(0, t_prep_fast_path_check_end - t_prep_fast_path_check_start), 1000));
-                    }
-                    if (log_enabled and scrolled_count > 0) {
-                        ctx.core.log.write(
-                            "[scroll_debug] fast_path eligible={any} reason={d} touched={d}\n",
-                            .{ scroll_check.eligible, @intFromEnum(scroll_check.reason), ctx.core.grid.scroll_touched_count },
+                        // Scroll-aware fast path eligibility check
+                        var t_prep_fast_path_check_start: i128 = 0;
+                        if (log_enabled) t_prep_fast_path_check_start = clock.nowNs();
+                        const scroll_check = checkScrollFastPath(
+                            &ctx.core.grid,
+                            effective_rebuild_all,
+                            atlas_retried,
+                            @intCast(scrolled_count),
+                            cached_subgrids,
                         );
-                    }
+                        if (log_enabled) {
+                            const t_prep_fast_path_check_end = clock.nowNs();
+                            perf_row_prep_fast_path_check_us = @intCast(@divTrunc(@max(0, t_prep_fast_path_check_end - t_prep_fast_path_check_start), 1000));
+                        }
+                        if (log_enabled and scrolled_count > 0) {
+                            ctx.core.log.write(
+                                "[scroll_debug] fast_path eligible={any} reason={d} touched={d}\n",
+                                .{ scroll_check.eligible, @intFromEnum(scroll_check.reason), ctx.core.grid.scroll_touched_count },
+                            );
+                        }
 
-                    // Build the set of rows to compose this pass.
-                    // Fast path: only touched_rows + prev_cursor_row (frontend retains other rows).
-                    // Fallback: all dirty rows (existing behavior).
-                    var regen_rows: [48]u32 = undefined; // 32 touched + cursor + non-scroll dirty rows
-                    var regen_count: u32 = 0;
-                    var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
-
-                    if (use_scroll_fast_path) {
-                        var t_prep_regen_build_start: i128 = 0;
-                        if (log_enabled) t_prep_regen_build_start = clock.nowNs();
-                        // Add all touched rows (from grid_line after scroll)
-                        const tc = ctx.core.grid.scroll_touched_count;
-                        for (ctx.core.grid.scroll_touched_rows[0..tc]) |tr| {
-                            if (tr < rows) {
-                                regen_rows[regen_count] = tr;
-                                regen_count += 1;
+                        // Build the set of rows to compose this pass.
+                        // Fast path: only touched_rows + prev_cursor_row (frontend retains other rows).
+                        // Fallback: all dirty rows (existing behavior).
+                        // regen_rows must hold every scroll_touched_rows entry plus the
+                        // 2 bounds-checked cursor-row appends (prev/current cursor row).
+                        // The dirty-rows-outside-scroll-region and subgrid-diff-rows
+                        // appends below are separately bounds-checked at push time and
+                        // safely disable the fast path on overflow instead of writing
+                        // past the end, so only the touched-rows + cursor margin needs
+                        // a compile-time guarantee here.
+                        comptime {
+                            if (grid_mod.Grid.SCROLL_TOUCHED_ROWS_CAP + 2 > 48) {
+                                @compileError("regen_rows[48] no longer has enough margin for " ++
+                                    "Grid.SCROLL_TOUCHED_ROWS_CAP + 2 cursor rows -- resize " ++
+                                    "regen_rows in flush.zig to match");
                             }
                         }
-                        const scroll_op = scroll_check.scroll_op.?;
-                        const scroll_grid_id = scroll_op.grid_id;
-                        const cursor_rows = [_]?u32{
-                            ctx.core.grid.prevCursorMainRowAfterScroll(scroll_op),
-                            ctx.core.grid.currentCursorMainRow(scroll_grid_id),
-                        };
-                        for (cursor_rows) |maybe_row| {
-                            if (maybe_row) |cursor_row| {
-                                if (cursor_row < rows) {
+                        var regen_rows: [48]u32 = undefined; // SCROLL_TOUCHED_ROWS_CAP touched + cursor + non-scroll dirty rows
+                        var regen_count: u32 = 0;
+                        var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
+
+                        if (use_scroll_fast_path) {
+                            var t_prep_regen_build_start: i128 = 0;
+                            if (log_enabled) t_prep_regen_build_start = clock.nowNs();
+                            // Add all touched rows (from grid_line after scroll)
+                            const tc = ctx.core.grid.scroll_touched_count;
+                            for (ctx.core.grid.scroll_touched_rows[0..tc]) |tr| {
+                                if (tr < rows) {
+                                    regen_rows[regen_count] = tr;
+                                    regen_count += 1;
+                                }
+                            }
+                            const scroll_op = scroll_check.scroll_op.?;
+                            const scroll_grid_id = scroll_op.grid_id;
+                            const cursor_rows = [_]?u32{
+                                ctx.core.grid.prevCursorMainRowAfterScroll(scroll_op),
+                                ctx.core.grid.currentCursorMainRow(scroll_grid_id),
+                            };
+                            for (cursor_rows) |maybe_row| {
+                                if (maybe_row) |cursor_row| {
+                                    if (cursor_row < rows) {
+                                        var found = false;
+                                        for (regen_rows[0..regen_count]) |existing| {
+                                            if (existing == cursor_row) {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!found and regen_count < regen_rows.len) {
+                                            regen_rows[regen_count] = cursor_row;
+                                            regen_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            if (log_enabled) {
+                                const t_prep_regen_build_end = clock.nowNs();
+                                perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
+                            }
+
+                            // Expand regen_rows with rows that need regeneration
+                            // beyond the scroll-touched + cursor set.
+                            //
+                            // Two sources:
+                            // (A) Dirty rows OUTSIDE the scroll region.
+                            //     Events like win_float_pos, win_pos, win_hide mark
+                            //     dirty_rows but do not call recordScrollTouchedRow.
+                            //     scrollGrid's markDirtyRect covers the entire scroll
+                            //     region, so we skip in-region dirty rows (handled by
+                            //     cache shift).
+                            //
+                            // (B) Subgrid layout changes INSIDE the scroll region.
+                            //     If any composited subgrid moved, appeared, or
+                            //     disappeared since the last flush, the cached vertices
+                            //     for affected rows are stale. Detected by comparing
+                            //     current cached_subgrids against prev_subgrid_snapshots.
+                            //
+                            // Must run BEFORE shiftScrollCacheAndValidate so the
+                            // cache shift correctly invalidates these rows.
+                            if (!effective_rebuild_all) {
+                                const scroll_region_top: u32 = scroll_op.top + scroll_op.win_pos_row;
+                                const scroll_region_bot: u32 = scroll_op.bot + scroll_op.win_pos_row;
+
+                                // (A) Dirty rows outside the scroll region.
+                                var dr: u32 = 0;
+                                while (dr < rows) : (dr += 1) {
+                                    if (dr >= scroll_region_top and dr < scroll_region_bot) continue;
+                                    if (!ctx.core.grid.dirty_rows.isSet(@as(usize, dr))) continue;
                                     var found = false;
-                                    for (regen_rows[0..regen_count]) |existing| {
-                                        if (existing == cursor_row) {
+                                    for (regen_rows[0..regen_count]) |rr| {
+                                        if (rr == dr) {
                                             found = true;
                                             break;
                                         }
                                     }
-                                    if (!found and regen_count < regen_rows.len) {
-                                        regen_rows[regen_count] = cursor_row;
-                                        regen_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if (log_enabled) {
-                            const t_prep_regen_build_end = clock.nowNs();
-                            perf_row_prep_regen_build_us = @intCast(@divTrunc(@max(0, t_prep_regen_build_end - t_prep_regen_build_start), 1000));
-                        }
-
-                        // Expand regen_rows with rows that need regeneration
-                        // beyond the scroll-touched + cursor set.
-                        //
-                        // Two sources:
-                        // (A) Dirty rows OUTSIDE the scroll region.
-                        //     Events like win_float_pos, win_pos, win_hide mark
-                        //     dirty_rows but do not call recordScrollTouchedRow.
-                        //     scrollGrid's markDirtyRect covers the entire scroll
-                        //     region, so we skip in-region dirty rows (handled by
-                        //     cache shift).
-                        //
-                        // (B) Subgrid layout changes INSIDE the scroll region.
-                        //     If any composited subgrid moved, appeared, or
-                        //     disappeared since the last flush, the cached vertices
-                        //     for affected rows are stale. Detected by comparing
-                        //     current cached_subgrids against prev_subgrid_snapshots.
-                        //
-                        // Must run BEFORE shiftScrollCacheAndValidate so the
-                        // cache shift correctly invalidates these rows.
-                        if (!effective_rebuild_all) {
-                            const scroll_region_top: u32 = scroll_op.top + scroll_op.win_pos_row;
-                            const scroll_region_bot: u32 = scroll_op.bot + scroll_op.win_pos_row;
-
-                            // (A) Dirty rows outside the scroll region.
-                            var dr: u32 = 0;
-                            while (dr < rows) : (dr += 1) {
-                                if (dr >= scroll_region_top and dr < scroll_region_bot) continue;
-                                if (!ctx.core.grid.dirty_rows.isSet(@as(usize, dr))) continue;
-                                var found = false;
-                                for (regen_rows[0..regen_count]) |rr| {
-                                    if (rr == dr) { found = true; break; }
-                                }
-                                if (!found) {
-                                    if (regen_count >= regen_rows.len) {
-                                        use_scroll_fast_path = false;
-                                        break;
-                                    }
-                                    regen_rows[regen_count] = dr;
-                                    regen_count += 1;
-                                }
-                            }
-
-                            // (B) Subgrid layout diff inside scroll region.
-                            if (use_scroll_fast_path) {
-                                var diff_buf: [32]u32 = undefined;
-                                const diff_count = collectSubgridDiffRows(
-                                    ctx.core,
-                                    cached_subgrids[0..cached_subgrid_count],
-                                    scroll_region_top,
-                                    scroll_region_bot,
-                                    &diff_buf,
-                                    regen_rows[0..regen_count],
-                                );
-                                // diff_count == diff_buf.len means the buffer
-                                // may have overflowed — fall back to full regen.
-                                if (diff_count >= diff_buf.len) {
-                                    use_scroll_fast_path = false;
-                                }
-                                if (use_scroll_fast_path) {
-                                    for (diff_buf[0..diff_count]) |row| {
+                                    if (!found) {
                                         if (regen_count >= regen_rows.len) {
                                             use_scroll_fast_path = false;
                                             break;
                                         }
-                                        regen_rows[regen_count] = row;
+                                        regen_rows[regen_count] = dr;
                                         regen_count += 1;
                                     }
                                 }
-                            }
-                        }
 
-                        // --- Scroll cache: shift + y-adjust + validity check ---
-                        const cache_ready = ctx.core.scroll_cache_rows == rows;
-                        var cached_empty_rows: u32 = 0;
-
-                        if (cache_ready) {
-                            // position[1] is NDC: ndc_y = 1.0 - (y_px / dh) * 2.0
-                            // delta_ndc_y = scroll_rows * cellH / dh * 2.0
-                            const delta_y: f32 = @as(f32, @floatFromInt(scroll_op.rows)) * cellH / dh * 2.0;
-                            const scroll_top: usize = @intCast(scroll_op.top + scroll_op.win_pos_row);
-                            const scroll_bot: usize = @intCast(scroll_op.bot + scroll_op.win_pos_row);
-
-                            var t_prep_shift_start: i128 = 0;
-                            if (log_enabled) t_prep_shift_start = clock.nowNs();
-                            const shift_result = shiftScrollCacheAndValidate(
-                                ctx.core,
-                                scroll_top,
-                                scroll_bot,
-                                scroll_op.rows,
-                                delta_y,
-                                rows,
-                                regen_rows[0..regen_count],
-                            );
-                            if (log_enabled) {
-                                const t_prep_shift_end = clock.nowNs();
-                                perf_row_prep_shift_us = @intCast(@divTrunc(@max(0, t_prep_shift_end - t_prep_shift_start), 1000));
-                            }
-                            cached_empty_rows = shift_result.empty_emit_count;
-
-                            if (!shift_result.fast_path_ok) {
-                                use_scroll_fast_path = false;
-                                if (log_enabled) {
-                                    ctx.core.log.write("[scroll_debug] fast_path cancelled: non-regen rows have invalid cache\n", .{});
+                                // (B) Subgrid layout diff inside scroll region.
+                                if (use_scroll_fast_path) {
+                                    var diff_buf: [32]u32 = undefined;
+                                    const diff_count = collectSubgridDiffRows(
+                                        ctx.core,
+                                        cached_subgrids,
+                                        scroll_region_top,
+                                        scroll_region_bot,
+                                        &diff_buf,
+                                        regen_rows[0..regen_count],
+                                    );
+                                    // diff_count == diff_buf.len means the buffer
+                                    // may have overflowed — fall back to full regen.
+                                    if (diff_count >= diff_buf.len) {
+                                        use_scroll_fast_path = false;
+                                    }
+                                    if (use_scroll_fast_path) {
+                                        for (diff_buf[0..diff_count]) |row| {
+                                            if (regen_count >= regen_rows.len) {
+                                                use_scroll_fast_path = false;
+                                                break;
+                                            }
+                                            regen_rows[regen_count] = row;
+                                            regen_count += 1;
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        // Record final fast path decision for perf logging
-                        used_scroll_fast_path = use_scroll_fast_path and cache_ready;
+                            // --- Scroll cache: shift + y-adjust + validity check ---
+                            const cache_ready = ctx.core.scroll_cache_rows == rows;
 
-                        // Frontends that support main-row scroll shifting can update their
-                        // row storage in one callback and avoid per-row cached emission.
-                        if (used_scroll_fast_path) {
-                            if (cached_empty_rows == 0) {
+                            if (cache_ready) {
+                                // position[1] is NDC: ndc_y = 1.0 - (y_px / dh) * 2.0
+                                // delta_ndc_y = scroll_rows * cellH / dh * 2.0
+                                const delta_y: f32 = @as(f32, @floatFromInt(scroll_op.rows)) * cellH / dh * 2.0;
+                                const scroll_top: usize = @intCast(scroll_op.top + scroll_op.win_pos_row);
+                                const scroll_bot: usize = @intCast(scroll_op.bot + scroll_op.win_pos_row);
+
+                                var t_prep_shift_start: i128 = 0;
+                                if (log_enabled) t_prep_shift_start = clock.nowNs();
+                                const shift_result = shiftScrollCacheAndValidate(
+                                    ctx.core,
+                                    scroll_top,
+                                    scroll_bot,
+                                    scroll_op.rows,
+                                    delta_y,
+                                    rows,
+                                    regen_rows[0..regen_count],
+                                    ctx.core.cb.on_main_row_scroll == null,
+                                );
+                                if (log_enabled) {
+                                    const t_prep_shift_end = clock.nowNs();
+                                    perf_row_prep_shift_us = @intCast(@divTrunc(@max(0, t_prep_shift_end - t_prep_shift_start), 1000));
+                                }
+                                if (!shift_result.fast_path_ok) {
+                                    use_scroll_fast_path = false;
+                                    if (log_enabled) {
+                                        ctx.core.log.write("[scroll_debug] fast_path cancelled: non-regen rows have invalid cache\n", .{});
+                                    }
+                                }
+                            }
+
+                            // Record final fast path decision for perf logging
+                            used_scroll_fast_path = use_scroll_fast_path and cache_ready;
+
+                            // Frontends that support main-row scroll shifting can update their
+                            // row storage in one callback and avoid per-row cached emission.
+                            if (used_scroll_fast_path) {
                                 if (ctx.core.cb.on_main_row_scroll) |scroll_cb| {
+                                    // The frontend shifts row slots and seeds
+                                    // vacated rows, including empty cached rows.
+                                    // Cached vertex positions therefore stay in
+                                    // their original row-local coordinates.
                                     scroll_cb(
                                         ctx.core.ctx,
                                         scroll_op.top + scroll_op.win_pos_row,
                                         scroll_op.bot + scroll_op.win_pos_row,
-                                        scroll_op.left,
-                                        scroll_op.right,
+                                        0,
+                                        cols,
                                         scroll_op.rows,
                                         rows,
                                         cols,
@@ -3302,368 +4029,396 @@ pub const FlushCtx = struct {
                                         perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
                                     }
                                 }
-                            } else {
-                                var t_cached_emit_scan_start: i128 = 0;
-                                if (log_enabled) t_cached_emit_scan_start = clock.nowNs();
-                                for (0..rows) |ri| {
-                                    const row_idx: u32 = @intCast(ri);
-                                    // Skip regen rows (will be composed below)
-                                    var is_regen = false;
-                                    for (regen_rows[0..regen_count]) |rr| {
-                                        if (rr == row_idx) {
-                                            is_regen = true;
-                                            break;
-                                        }
-                                    }
-                                    if (is_regen) continue;
+                            }
 
-                                    if (ctx.core.scroll_cache_valid.isSet(ri)) {
-                                        const cached = &ctx.core.scroll_cache.items[ri];
-                                        if (log_enabled) {
-                                            perf_cached_emit_rows += 1;
-                                            if (cached.items.len == 0) perf_cached_emit_empty_rows += 1;
-                                        }
-                                        // Always emit, even when len==0 (empty/bg-only row).
-                                        // Frontend retains previous content for rows with no callback,
-                                        // so we must send empty updates to clear stale content.
-                                        // len==0: pass null pointer with count 0.
-                                        // Frontend must handle vert_count==0 as "clear row".
-                                        const ptr: ?[*]const c_api.Vertex = if (cached.items.len > 0) cached.items.ptr else null;
-                                        var t_cached_emit_cb_start: i128 = 0;
-                                        if (log_enabled) t_cached_emit_cb_start = clock.nowNs();
-                                        row_cb(ctx.core.ctx, 1, row_idx, 1, ptr, cached.items.len, 1, rows, cols);
-                                        if (log_enabled) {
-                                            const t_cached_emit_cb_end = clock.nowNs();
-                                            perf_cached_emit_cb_sum_us += @intCast(@divTrunc(@max(0, t_cached_emit_cb_end - t_cached_emit_cb_start), 1000));
-                                        }
-                                    }
-                                }
-                                if (log_enabled) {
-                                    const t_cached_emit_scan_end = clock.nowNs();
-                                    perf_cached_emit_scan_us = @intCast(@divTrunc(@max(0, t_cached_emit_scan_end - t_cached_emit_scan_start), 1000));
-                                }
+                            if (log_enabled) {
+                                ctx.core.log.write(
+                                    "[scroll_debug] fast_path regen_count={d}/{d} cache_ready={any}\n",
+                                    .{ regen_count, rows, cache_ready },
+                                );
+                                log_dirty_rows = regen_count;
                             }
                         }
 
-                        if (log_enabled) {
-                            ctx.core.log.write(
-                                "[scroll_debug] fast_path regen_count={d}/{d} cache_ready={any}\n",
-                                .{ regen_count, rows, cache_ready },
-                            );
-                            log_dirty_rows = regen_count;
-                        }
-                    }
-
-                    var r: u32 = 0;
-                    while (r < rows) : (r += 1) {
-                        if (use_scroll_fast_path) {
-                            // Fast path: only compose rows in regen set
-                            var in_regen = false;
-                            for (regen_rows[0..regen_count]) |rr| {
-                                if (rr == r) {
-                                    in_regen = true;
-                                    break;
-                                }
-                            }
-                            if (!in_regen) continue;
-                        } else if (!effective_rebuild_all) {
-                            if (!ctx.core.grid.dirty_rows.isSet(@as(usize, r))) continue;
-                        }
-
-                        // Compute scrollable flag for this row: content rows get DECO_SCROLLABLE, margin rows (tabline/statusline) do not
-                        const main_scrollable: u32 = if (r >= main_margins.top and r < rows -| main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
-
-                        var out = &ctx.core.row_verts;
-                        out.clearRetainingCapacity();
-                        var row_compose_us: i64 = 0;
-
-                        // Row-mode timing for composition measurement
-                        var t_row_compose_start: i128 = 0;
-                        if (log_enabled) {
-                            t_row_compose_start = clock.nowNs();
-                        }
-
-                        // Compose this row only (avoid full-screen tmp)
-                        // SIMD-optimized: batch process consecutive cells with same hl_id
-                        {
-                            const row_start: usize = @as(usize, r) * @as(usize, cols);
-                            const grid_cells = ctx.core.grid.cells;
-                            var c: u32 = 0;
-
-                            while (c < cols) {
-                                const first_cell = grid_cells[row_start + @as(usize, c)];
-                                const run_hl = first_cell.hl;
-
-                                // Find run of consecutive cells with same hl_id
-                                // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids)
-                                var run_end: u32 = c + 1;
-                                while (run_end < cols) : (run_end += 1) {
-                                    if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
-                                }
-
-                                // Get resolved attributes once for the entire run
-                                const a = blk: {
-                                    if (run_hl < hl_cache_limit) {
-                                        if (hl_valid[run_hl]) {
-                                            perf_hl_cache_hits += 1;
-                                            break :blk hl_cache[run_hl];
-                                        }
-                                        perf_hl_cache_misses += 1;
-                                        const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                        hl_cache[run_hl] = resolved;
-                                        hl_valid[run_hl] = true;
-                                        break :blk resolved;
+                        var r: u32 = 0;
+                        while (r < rows) : (r += 1) {
+                            if (used_scroll_fast_path) {
+                                // Fast path: only compose rows in regen set
+                                var in_regen = false;
+                                for (regen_rows[0..regen_count]) |rr| {
+                                    if (rr == r) {
+                                        in_regen = true;
+                                        break;
                                     }
-                                    // Fallback for hl_id >= hl_cache_limit
-                                    perf_hl_cache_misses += 1;
-                                    break :blk ctx.core.hl.getWithStyles(run_hl);
-                                };
-
-                                // Batch write all cells in the run with same fg/bg/sp/style_flags
-                                // Only scalar differs per cell
-                                const fg = a.fg;
-                                const bg = a.bg;
-                                const sp = a.sp;
-                                const flags = a.style_flags;
-
-                                // Batch fill constant fields with @memset (compiles to SIMD)
-                                const rs: usize = @intCast(c);
-                                const re: usize = @intCast(run_end);
-                                @memset(row_cells.fg_rgbs.items[rs..re], fg);
-                                @memset(row_cells.bg_rgbs.items[rs..re], bg);
-                                @memset(row_cells.sp_rgbs.items[rs..re], sp);
-                                @memset(row_cells.grid_ids.items[rs..re], 1);
-                                @memset(row_cells.style_flags_arr.items[rs..re], flags);
-                                @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
-                                if (glow_enabled) {
-                                    const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
-                                    @memset(row_cells.glow_arr.items[rs..re], has_glow);
                                 }
-                                // Only scalars (codepoints) differ per cell
-                                // SIMD stride-2 extraction: Cell{cp,hl} → cp only
-                                simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
-
-                                c = run_end;
+                                if (!in_regen) continue;
+                            } else if (!effective_rebuild_all) {
+                                if (!ctx.core.grid.dirty_rows.isSet(@as(usize, r))) continue;
                             }
 
-                            // Overlay sub-grids using pre-cached info (avoids per-row hash map lookups)
-                            for (cached_subgrids[0..cached_subgrid_count]) |csg| {
-                                // Fast row range check using cached bounds
-                                if (r < csg.row_start or r >= csg.row_end) continue;
-                                const r2: u32 = r - csg.row_start;
+                            // A prior row_cb call this loop may have called
+                            // zonvie_core_abort_flush (e.g. Windows row-buffer
+                            // OOM). Stop emitting further rows into a frontend
+                            // that already told us it cannot accept this flush —
+                            // composing and sending them would be discarded work
+                            // (the frontend cancels its whole bracket on abort).
+                            if (ctx.core.flush_aborted) break;
 
-                                var c2: u32 = 0;
-                                while (c2 < csg.sg_cols) : (c2 += 1) {
-                                    const tc = csg.col_start + c2;
-                                    if (tc >= cols) break;
+                            var out = &ctx.core.row_verts;
+                            out.clearRetainingCapacity();
+                            var row_compose_us: i64 = 0;
 
-                                    const src_i: usize = @as(usize, r2) * @as(usize, csg.sg_cols) + @as(usize, c2);
-                                    const cell = csg.cells[src_i];
-                                    // Use HL cache with direct index for O(1) access
-                                    const a2 = blk2: {
-                                        if (cell.hl < hl_cache_limit) {
-                                            if (hl_valid[cell.hl]) {
+                            // Row-mode timing for composition measurement
+                            var t_row_compose_start: i128 = 0;
+                            if (log_enabled) {
+                                t_row_compose_start = clock.nowNs();
+                            }
+
+                            // Compose this row only (avoid full-screen tmp)
+                            // SIMD-optimized: batch process consecutive cells with same hl_id
+                            {
+                                const row_start: usize = @as(usize, r) * @as(usize, cols);
+                                const grid_cells = ctx.core.grid.cells;
+                                setViewportRowDecoFlags(
+                                    row_cells.deco_base_flags.items[0..cols],
+                                    r,
+                                    rows,
+                                    cols,
+                                    main_margins,
+                                );
+                                var c: u32 = 0;
+
+                                while (c < cols) {
+                                    const first_cell = grid_cells[row_start + @as(usize, c)];
+                                    const run_hl = first_cell.hl;
+
+                                    // Find run of consecutive cells with same hl_id
+                                    // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids)
+                                    var run_end: u32 = c + 1;
+                                    while (run_end < cols) : (run_end += 1) {
+                                        if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
+                                    }
+
+                                    // Get resolved attributes once for the entire run
+                                    const a = blk: {
+                                        if (run_hl < hl_cache_limit) {
+                                            if (hl_valid[run_hl]) {
                                                 perf_hl_cache_hits += 1;
-                                                break :blk2 hl_cache[cell.hl];
+                                                break :blk hl_cache[run_hl];
                                             }
                                             perf_hl_cache_misses += 1;
-                                            const resolved = ctx.core.hl.getWithStyles(cell.hl);
-                                            hl_cache[cell.hl] = resolved;
-                                            hl_valid[cell.hl] = true;
-                                            break :blk2 resolved;
+                                            const resolved = ctx.core.hl.getWithStyles(run_hl);
+                                            hl_cache[run_hl] = resolved;
+                                            hl_valid[run_hl] = true;
+                                            break :blk resolved;
                                         }
                                         // Fallback for hl_id >= hl_cache_limit
                                         perf_hl_cache_misses += 1;
-                                        break :blk2 ctx.core.hl.getWithStyles(cell.hl);
+                                        break :blk ctx.core.hl.getWithStyles(run_hl);
                                     };
-                                    row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
+
+                                    // Batch write all cells in the run with same fg/bg/sp/style_flags
+                                    // Only scalar differs per cell
+                                    const fg = a.fg;
+                                    const bg = a.bg;
+                                    const sp = a.sp;
+                                    const flags = a.style_flags;
+
+                                    // Batch fill constant fields with @memset (compiles to SIMD)
+                                    const rs: usize = @intCast(c);
+                                    const re: usize = @intCast(run_end);
+                                    @memset(row_cells.fg_rgbs.items[rs..re], fg);
+                                    @memset(row_cells.bg_rgbs.items[rs..re], bg);
+                                    @memset(row_cells.sp_rgbs.items[rs..re], sp);
+                                    @memset(row_cells.grid_ids.items[rs..re], 1);
+                                    @memset(row_cells.style_flags_arr.items[rs..re], flags);
+                                    @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
                                     if (glow_enabled) {
-                                        row_cells.glow_arr.items[@intCast(tc)] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                        const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                        @memset(row_cells.glow_arr.items[rs..re], has_glow);
+                                    }
+                                    // Only scalars (codepoints) differ per cell
+                                    // SIMD stride-2 extraction: Cell{cp,hl} → cp only
+                                    simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
+
+                                    c = run_end;
+                                }
+
+                                // Overlay sub-grids using pre-cached info (avoids per-row hash map lookups).
+                                // Write each overlay's scroll flag while its CachedSubgrid is already
+                                // in hand; a later per-cell lookup would rescan all grids and turn
+                                // many-float composition into O(dirty_rows * cols * grids).
+                                const bucket_start = if (use_main_subgrid_row_index)
+                                    ctx.core.main_subgrid_row_offsets.items[@intCast(r)]
+                                else
+                                    0;
+                                const bucket_end = if (use_main_subgrid_row_index)
+                                    ctx.core.main_subgrid_row_offsets.items[@as(usize, @intCast(r)) + 1]
+                                else
+                                    cached_subgrids.len;
+                                var bucket_pos = bucket_start;
+                                while (bucket_pos < bucket_end) : (bucket_pos += 1) {
+                                    const csg_index = if (use_main_subgrid_row_index)
+                                        ctx.core.main_subgrid_row_indices.items[bucket_pos]
+                                    else
+                                        bucket_pos;
+                                    const csg = cached_subgrids[csg_index];
+                                    if (r < csg.row_start or r >= csg.row_end) continue;
+                                    const r2: u32 = r - csg.row_start;
+                                    const subgrid_margins = grid_mod.ViewportMargins{
+                                        .top = csg.margin_top,
+                                        .bottom = csg.margin_bottom,
+                                        .left = csg.margin_left,
+                                        .right = csg.margin_right,
+                                    };
+
+                                    var c2: u32 = 0;
+                                    while (c2 < csg.sg_cols) : (c2 += 1) {
+                                        const tc = csg.col_start + c2;
+                                        if (tc >= cols) break;
+
+                                        const src_i: usize = @as(usize, r2) * @as(usize, csg.sg_cols) + @as(usize, c2);
+                                        const cell = csg.cells[src_i];
+                                        // Use HL cache with direct index for O(1) access
+                                        const a2 = blk2: {
+                                            if (cell.hl < hl_cache_limit) {
+                                                if (hl_valid[cell.hl]) {
+                                                    perf_hl_cache_hits += 1;
+                                                    break :blk2 hl_cache[cell.hl];
+                                                }
+                                                perf_hl_cache_misses += 1;
+                                                const resolved = ctx.core.hl.getWithStyles(cell.hl);
+                                                hl_cache[cell.hl] = resolved;
+                                                hl_valid[cell.hl] = true;
+                                                break :blk2 resolved;
+                                            }
+                                            // Fallback for hl_id >= hl_cache_limit
+                                            perf_hl_cache_misses += 1;
+                                            break :blk2 ctx.core.hl.getWithStyles(cell.hl);
+                                        };
+                                        row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
+                                        row_cells.deco_base_flags.items[@intCast(tc)] = if (viewportCellScrollable(
+                                            r2,
+                                            c2,
+                                            csg.sg_rows,
+                                            csg.sg_cols,
+                                            subgrid_margins,
+                                        )) c_api.DECO_SCROLLABLE else 0;
+                                        if (glow_enabled) {
+                                            row_cells.glow_arr.items[@intCast(tc)] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        // Populate deco_base_flags via computeScrollFlag
-                        for (0..cols) |ci| {
-                            const gid = row_cells.grid_ids.items[ci];
-                            row_cells.deco_base_flags.items[ci] = Helpers.computeScrollFlag(r, gid, main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                        }
-
-                        // Row-mode timing
-                        var t_row_compose_end: i128 = 0;
-                        var t_row_gen_start: i128 = 0;
-                        if (log_enabled) {
-                            t_row_compose_end = clock.nowNs();
-                            t_row_gen_start = t_row_compose_end;
-                        }
-
-                        // Unified 5-pass vertex generation.
-                        // On error (e.g. buffer allocation failure), skip this row
-                        // so partial vertices are not cached or sent to the frontend.
-                        // markAllDirty at the end of the flush ensures a retry.
-                        const row_gen_stats = generateRowVertices(ctx.core, .{
-                            .row = r,
-                            .cols = cols,
-                            .vw = dw,
-                            .vh = dh,
-                            .cell_w = cellW,
-                            .cell_h = cellH,
-                            .top_pad = topPad,
-                            .default_bg = ctx.core.hl.default_bg,
-                            .blur_enabled = ctx.core.blur_enabled,
-                            .background_opacity = ctx.core.background_opacity,
-                            .is_cmdline = false,
-                            .glow_enabled = glow_enabled,
-                        }, out) catch {
-                            out.clearRetainingCapacity();
-                            had_glyph_miss = true;
-                            continue;
-                        };
-                        had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
-                        perf_shape_cache_hits += row_gen_stats.shape_cache_hits;
-                        perf_shape_cache_misses += row_gen_stats.shape_cache_misses;
-                        perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
-                        // Log row timing for performance measurement
-                        if (log_enabled) {
-                            const t_row_gen_end = clock.nowNs();
-                            row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
-                            const gen_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_gen_start), 1000));
-                            const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_compose_start), 1000));
-                            perf_row_compose_sum_us += row_compose_us;
-                            perf_row_total_sum_us += total_us;
-                            perf_row_count += 1;
-                            if (total_us > perf_row_max_total_us) {
-                                perf_row_max_total_us = total_us;
-                                perf_row_max_total_idx = r;
+                            // Row-mode timing
+                            var t_row_compose_end: i128 = 0;
+                            var t_row_gen_start: i128 = 0;
+                            if (log_enabled) {
+                                t_row_compose_end = clock.nowNs();
+                                t_row_gen_start = t_row_compose_end;
                             }
-                            // Accumulate per-pass times. Pass 3 (glyph) max-row tracked
-                            // separately to surface the row most expensive in the dominant pass.
-                            perf_row_pass_bg_sum_ns += row_gen_stats.bg_ns;
-                            perf_row_pass_under_sum_ns += row_gen_stats.under_ns;
-                            perf_row_pass_glyph_sum_ns += row_gen_stats.glyph_ns;
-                            perf_row_pass_strike_sum_ns += row_gen_stats.strike_ns;
-                            perf_row_pass_overline_sum_ns += row_gen_stats.overline_ns;
-                            perf_row_atlas_ensure_sum_ns += row_gen_stats.atlas_ensure_ns;
-                            perf_row_quad_emit_sum_ns += row_gen_stats.quad_emit_ns;
-                            if (row_gen_stats.glyph_ns > perf_row_pass_glyph_max_ns) {
-                                perf_row_pass_glyph_max_ns = row_gen_stats.glyph_ns;
-                                perf_row_pass_glyph_max_idx = r;
-                            }
-                            ctx.core.log.write(
-                                "[perf] row_mode row={d} cols={d} compose_us={d} gen_us={d} shape_us={d} shape_calls={d} sc_hit={d} sc_miss={d} ascii={d} total_us={d} bg_ns={d} under_ns={d} glyph_ns={d} strike_ns={d} overline_ns={d} ensure_ns={d} quad_ns={d}\n",
-                                .{ r, cols, row_compose_us, gen_us, row_gen_stats.shape_us, row_gen_stats.shape_calls, row_gen_stats.shape_cache_hits, row_gen_stats.shape_cache_misses, row_gen_stats.ascii_fast_path_runs, total_us, row_gen_stats.bg_ns, row_gen_stats.under_ns, row_gen_stats.glyph_ns, row_gen_stats.strike_ns, row_gen_stats.overline_ns, row_gen_stats.atlas_ensure_ns, row_gen_stats.quad_emit_ns },
-                            );
-                        }
 
-                        // Anomaly detection: warn if row has non-space cells but 0 glyph vertices
-                        // (could indicate atlas/cache corruption causing all glyphs to fail)
-                        if (log_enabled and scrolled_count > 0 and out.items.len == 0) {
-                            // Check if this row actually has visible content
-                            var has_visible: bool = false;
-                            for (0..cols) |idx| {
-                                const sc = row_cells.scalars.items[idx];
-                                if (sc != 0 and sc != 32) {
-                                    has_visible = true;
-                                    break;
+                            // Unified 5-pass vertex generation.
+                            // On error (e.g. buffer allocation failure), skip this row
+                            // so partial vertices are not cached or sent to the frontend.
+                            // markAllDirty at the end of the flush ensures a retry, but
+                            // that alone only makes the CONTENT eligible for regeneration
+                            // next flush — it does not stop this flush's write-set (with
+                            // this row silently missing/stale) from being committed as a
+                            // successful frame. Setting flush_aborted makes
+                            // zonvie_core_flush_was_aborted() tell both frontends to
+                            // cancel this bracket instead, and stops the loop (see the
+                            // flush_aborted check at the top of it) rather than composing
+                            // further rows into a flush that's being discarded anyway.
+                            const row_gen_stats = generateRowVertices(ctx.core, .{
+                                .row = r,
+                                .cols = cols,
+                                .vw = dw,
+                                .vh = dh,
+                                .cell_w = cellW,
+                                .cell_h = cellH,
+                                .top_pad = topPad,
+                                .default_bg = ctx.core.hl.default_bg,
+                                .blur_enabled = ctx.core.blur_enabled,
+                                .background_opacity = ctx.core.background_opacity,
+                                .is_cmdline = false,
+                                .glow_enabled = glow_enabled,
+                            }, out) catch {
+                                out.clearRetainingCapacity();
+                                had_glyph_miss = true;
+                                ctx.core.flush_aborted = true;
+                                break;
+                            };
+                            had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
+                            perf_shape_cache_hits += row_gen_stats.shape_cache_hits;
+                            perf_shape_cache_misses += row_gen_stats.shape_cache_misses;
+                            perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
+                            // Log row timing for performance measurement
+                            if (log_enabled) {
+                                const t_row_gen_end = clock.nowNs();
+                                row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
+                                const gen_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_gen_start), 1000));
+                                const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_compose_start), 1000));
+                                perf_row_compose_sum_us += row_compose_us;
+                                perf_row_total_sum_us += total_us;
+                                perf_row_count += 1;
+                                if (total_us > perf_row_max_total_us) {
+                                    perf_row_max_total_us = total_us;
+                                    perf_row_max_total_idx = r;
+                                }
+                                // Accumulate per-pass times. Pass 3 (glyph) max-row tracked
+                                // separately to surface the row most expensive in the dominant pass.
+                                perf_row_pass_bg_sum_ns += row_gen_stats.bg_ns;
+                                perf_row_pass_under_sum_ns += row_gen_stats.under_ns;
+                                perf_row_pass_glyph_sum_ns += row_gen_stats.glyph_ns;
+                                perf_row_pass_strike_sum_ns += row_gen_stats.strike_ns;
+                                perf_row_pass_overline_sum_ns += row_gen_stats.overline_ns;
+                                perf_row_atlas_ensure_sum_ns += row_gen_stats.atlas_ensure_ns;
+                                perf_row_quad_emit_sum_ns += row_gen_stats.quad_emit_ns;
+                                if (row_gen_stats.glyph_ns > perf_row_pass_glyph_max_ns) {
+                                    perf_row_pass_glyph_max_ns = row_gen_stats.glyph_ns;
+                                    perf_row_pass_glyph_max_idx = r;
+                                }
+                                // Per-row line: verbose tier only. Formatting + I/O for
+                                // 2 lines x N rows per flush measurably perturbs the
+                                // pipeline (~1-2ms/flush); the per-flush aggregates
+                                // (row_mode_compose / row_mode_breakdown) stay in the
+                                // normal tier and are built from the sums above.
+                                if (ctx.core.log.verbose) {
+                                    ctx.core.log.write(
+                                        "[perf] row_mode row={d} cols={d} compose_us={d} gen_us={d} shape_us={d} shape_calls={d} sc_hit={d} sc_miss={d} ascii={d} total_us={d} bg_ns={d} under_ns={d} glyph_ns={d} strike_ns={d} overline_ns={d} ensure_ns={d} quad_ns={d}\n",
+                                        .{ r, cols, row_compose_us, gen_us, row_gen_stats.shape_us, row_gen_stats.shape_calls, row_gen_stats.shape_cache_hits, row_gen_stats.shape_cache_misses, row_gen_stats.ascii_fast_path_runs, total_us, row_gen_stats.bg_ns, row_gen_stats.under_ns, row_gen_stats.glyph_ns, row_gen_stats.strike_ns, row_gen_stats.overline_ns, row_gen_stats.atlas_ensure_ns, row_gen_stats.quad_emit_ns },
+                                    );
                                 }
                             }
-                            if (has_visible) {
-                                ctx.core.log.write("[scroll_debug] ANOMALY row={d} has_visible_content=true vert_count=0\n", .{r});
+
+                            // Anomaly detection: warn if row has non-space cells but 0 glyph vertices
+                            // (could indicate atlas/cache corruption causing all glyphs to fail)
+                            if (log_enabled and scrolled_count > 0 and out.items.len == 0) {
+                                // Check if this row actually has visible content
+                                var has_visible: bool = false;
+                                for (0..cols) |idx| {
+                                    const sc = row_cells.scalars.items[idx];
+                                    if (sc != 0 and sc != 32) {
+                                        has_visible = true;
+                                        break;
+                                    }
+                                }
+                                if (has_visible) {
+                                    ctx.core.log.write("[scroll_debug] ANOMALY row={d} has_visible_content=true vert_count=0\n", .{r});
+                                }
                             }
-                        }
 
-                        // CHECK: atlas reset happened during glyph processing for this row.
-                        // Already-sent rows have stale UVs → need to restart or abort.
-                        if (ctx.core.atlas_reset_during_flush) {
-                            saw_atlas_reset = true;
-                            ctx.core.atlas_reset_during_flush = false; // Clear before retry
+                            // CHECK: atlas reset happened during glyph processing for this row.
+                            // Already-sent rows have stale UVs → need to restart or abort.
+                            if (ctx.core.atlas_reset_during_flush) {
+                                saw_atlas_reset = true;
+                                ctx.core.atlas_reset_during_flush = false; // Clear before retry
 
-                            if (!atlas_retried) {
-                                // First occurrence: restart loop from row 0 with all rows
-                                atlas_retried = true;
+                                if (!atlas_retried) {
+                                    // First occurrence: restart loop from row 0 with all rows
+                                    atlas_retried = true;
+                                    if (log_enabled) {
+                                        ctx.core.log.write(
+                                            "[scroll_debug] atlas_reset_during_flush at row={d}: restarting row loop\n",
+                                            .{r},
+                                        );
+                                    }
+                                    continue :retry_loop;
+                                }
+                                // A second reset invalidates rows already sent
+                                // by the retry. Publishing empty replacements
+                                // would commit a full-screen blank frame. Match
+                                // the external-grid path: cancel this bracket
+                                // and regenerate every layer next flush.
                                 if (log_enabled) {
                                     ctx.core.log.write(
-                                        "[scroll_debug] atlas_reset_during_flush at row={d}: restarting row loop\n",
+                                        "[scroll_debug] atlas_reset_during_flush at row={d} on retry: cancelling flush\n",
                                         .{r},
                                     );
                                 }
-                                continue :retry_loop;
+                                ctx.core.flush_atlas_corrupted = true;
+                                ctx.core.grid.markAllDirty();
+                                ctx.core.invalidateScrollCache();
+                                var reset_sg_it = ctx.core.grid.sub_grids.valueIterator();
+                                while (reset_sg_it.next()) |sg| {
+                                    sg.markAllDirty();
+                                }
+                                ctx.core.grid.cursor_rev +%= 1;
+                                return;
                             }
-                            // Already retried: clear all previously-sent rows (they carry
-                            // stale UVs) then abort. Send vert_count=0 for every row so
-                            // frontends replace stale vertex data with empty buffers.
-                            // markAllDirty (after the loop) ensures the next flush
-                            // regenerates everything against the fresh atlas.
-                            atlas_retry_aborted = true;
+
+                            var t_row_post_misc_before_cache_store: i128 = 0;
+                            var t_row_cache_store_end: i128 = 0;
                             if (log_enabled) {
-                                ctx.core.log.write(
-                                    "[scroll_debug] atlas_reset_during_flush at row={d} on retry: clearing all rows and aborting\n",
-                                    .{r},
-                                );
+                                t_row_post_misc_before_cache_store = clock.nowNs();
                             }
-                            for (0..rows) |clear_row| {
-                                row_cb(ctx.core.ctx, 1, @intCast(clear_row), 1, null, 0, 1, rows, cols);
+
+                            // Store composed vertices in scroll cache for future reuse
+                            if (r < ctx.core.scroll_cache_rows) {
+                                var cached_row = &ctx.core.scroll_cache.items[r];
+                                if (cached_row.ensureTotalCapacity(ctx.core.alloc, out.items.len)) |_| {
+                                    cached_row.clearRetainingCapacity();
+                                    cached_row.appendSliceAssumeCapacity(out.items);
+                                    ctx.core.scroll_cache_valid.set(r);
+                                } else |_| {
+                                    ctx.core.scroll_cache_valid.unset(r);
+                                }
                             }
-                            break;
-                        }
 
-                        var t_row_post_misc_before_cache_store: i128 = 0;
-                        var t_row_cache_store_end: i128 = 0;
-                        if (log_enabled) {
-                            t_row_post_misc_before_cache_store = clock.nowNs();
-                        }
+                            var t_row_before_cb: i128 = 0;
+                            if (log_enabled) {
+                                t_row_cache_store_end = clock.nowNs();
+                                t_row_before_cb = t_row_cache_store_end;
+                            }
 
-                        // Store composed vertices in scroll cache for future reuse
-                        if (r < ctx.core.scroll_cache_rows) {
-                            var cached_row = &ctx.core.scroll_cache.items[r];
-                            if (cached_row.ensureTotalCapacity(ctx.core.alloc, out.items.len)) |_| {
-                                cached_row.clearRetainingCapacity();
-                                cached_row.appendSliceAssumeCapacity(out.items);
-                                ctx.core.scroll_cache_valid.set(r);
-                            } else |_| {
-                                ctx.core.scroll_cache_valid.unset(r);
+                            // Contract: row_count == 1, grid_id == 1 for main window
+                            row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
+
+                            if (log_enabled) {
+                                const t_row_after_cb = clock.nowNs();
+                                const cache_store_us: i64 = @intCast(@divTrunc(@max(0, t_row_cache_store_end - t_row_post_misc_before_cache_store), 1000));
+                                const row_cb_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_before_cb), 1000));
+                                const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
+                                const known_total_us = row_compose_us + cache_store_us + row_cb_us;
+                                const post_misc_us: i64 = @max(0, total_us - known_total_us);
+                                perf_row_cache_store_sum_us += cache_store_us;
+                                perf_row_cb_sum_us += row_cb_us;
+                                perf_row_post_misc_sum_us += post_misc_us;
+                                if (row_cb_us > perf_row_max_cb_us) {
+                                    perf_row_max_cb_us = row_cb_us;
+                                    perf_row_max_cb_idx = r;
+                                }
+                                // Per-row line: verbose tier only (see row_mode above).
+                                if (ctx.core.log.verbose) {
+                                    ctx.core.log.write(
+                                        "[perf] row_mode_post row={d} cache_store_us={d} row_cb_us={d} post_misc_us={d}\n",
+                                        .{ r, cache_store_us, row_cb_us, post_misc_us },
+                                    );
+                                }
                             }
                         }
-
-                        var t_row_before_cb: i128 = 0;
-                        if (log_enabled) {
-                            t_row_cache_store_end = clock.nowNs();
-                            t_row_before_cb = t_row_cache_store_end;
-                        }
-
-                        // Contract: row_count == 1, grid_id == 1 for main window
-                        row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
-
-                        if (log_enabled) {
-                            const t_row_after_cb = clock.nowNs();
-                            const cache_store_us: i64 = @intCast(@divTrunc(@max(0, t_row_cache_store_end - t_row_post_misc_before_cache_store), 1000));
-                            const row_cb_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_before_cb), 1000));
-                            const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
-                            const known_total_us = row_compose_us + cache_store_us + row_cb_us;
-                            const post_misc_us: i64 = @max(0, total_us - known_total_us);
-                            perf_row_cache_store_sum_us += cache_store_us;
-                            perf_row_cb_sum_us += row_cb_us;
-                            perf_row_post_misc_sum_us += post_misc_us;
-                            if (row_cb_us > perf_row_max_cb_us) {
-                                perf_row_max_cb_us = row_cb_us;
-                                perf_row_max_cb_idx = r;
-                            }
-                            ctx.core.log.write(
-                                "[perf] row_mode_post row={d} cache_store_us={d} row_cb_us={d} post_misc_us={d}\n",
-                                .{ r, cache_store_us, row_cb_us, post_misc_us },
-                            );
-                        }
-                    }
-                    break; // Normal exit from retry_loop
+                        break; // Normal exit from retry_loop
                     }
 
                     // Snapshot overlay coverage for next flush's diff detection.
-                    saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
+                    saveSubgridSnapshots(ctx.core, cached_subgrids);
 
-                    ctx.core.grid.clearDirty();
-                    ctx.core.grid.clearScrollState();
+                    // A row_cb call in the loop above may have aborted this
+                    // flush (e.g. Windows row-buffer OOM). The frontend
+                    // cancels its whole triple-buffer bracket on abort — none
+                    // of what was composed above actually reached the
+                    // screen. clearDirty() here would erase the record that
+                    // this content still needs sending, and syncing
+                    // last_sent_content_rev below would make need_main false
+                    // on the next flush attempt — together these would make
+                    // zonvie_core_retry_flush's has_pending check see nothing
+                    // pending, permanently losing this content until an
+                    // unrelated future edit happens to touch the same rows.
+                    if (!ctx.core.flush_aborted) ctx.core.grid.clearDirty();
                     if (had_glyph_miss or saw_atlas_reset) {
+                        main_retry_required = true;
                         ctx.core.grid.markAllDirty();
                         // Atlas reset invalidates cached UVs in scroll cache — but only
                         // when the retry was aborted (partial/stale data) or no retry ran.
@@ -3672,13 +4427,19 @@ pub const FlushCtx = struct {
                         // Invalidating here would undo that work and force a full
                         // regeneration on the next scroll flush (~65-80ms for CJK).
                         if (saw_atlas_reset) {
-                            if (!atlas_retried or atlas_retry_aborted) {
+                            if (!atlas_retried) {
                                 ctx.core.invalidateScrollCache();
                             }
                             var sg_it = ctx.core.grid.sub_grids.valueIterator();
                             while (sg_it.next()) |sg| {
-                                sg.dirty = true;
+                                sg.markAllDirty();
                             }
+                            // The cursor is a separate vertex consumer gated
+                            // on cursor_rev alone (main and external both) —
+                            // an atlas reset invalidates its cached UVs too,
+                            // but dirtying grid/sub_grid content above never
+                            // touches this counter.
+                            ctx.core.grid.cursor_rev +%= 1;
                         }
                         if (log_enabled) {
                             ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss={any} saw_atlas_reset={any} scrolled={d}\n", .{
@@ -3689,7 +4450,12 @@ pub const FlushCtx = struct {
                     // Clear unconditionally so sendExternalGridVertices sees clean state
                     // (sub_grids already marked dirty above if needed)
                     ctx.core.atlas_reset_during_flush = false;
-                    ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
+                    // Skip on abort — see the clearDirty() guard above. Syncing
+                    // this would make the next flush's need_main check (and
+                    // zonvie_core_retry_flush's has_pending check) see no
+                    // pending main content, even though nothing was actually
+                    // committed this attempt.
+                    if (!ctx.core.flush_aborted) ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
                         const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
@@ -3783,12 +4549,21 @@ pub const FlushCtx = struct {
                     const nr_hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
                     const nr_hl_cache_limit: u32 = @intCast(nr_hl_valid.len);
                     @memset(nr_hl_valid, false);
+                    const nr_main_margins = ctx.core.grid.getViewportMargins(1);
+                    @memset(tmp.deco_base_flags.items, 0);
 
                     // 1) draw global grid(1) with RLE batching + hl_cache
                     const grid_cells = ctx.core.grid.cells;
                     var row_i: u32 = 0;
                     while (row_i < rows) : (row_i += 1) {
                         const row_start: usize = @as(usize, row_i) * @as(usize, cols);
+                        setViewportRowDecoFlags(
+                            tmp.deco_base_flags.items[row_start .. row_start + cols],
+                            row_i,
+                            rows,
+                            cols,
+                            nr_main_margins,
+                        );
                         var c: u32 = 0;
 
                         while (c < cols) {
@@ -3846,13 +4621,17 @@ pub const FlushCtx = struct {
                         const subgrid_id = ent.grid_id;
                         const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
                         const sg = ctx.core.grid.sub_grids.get(subgrid_id) orelse continue;
+                        const sg_margins = ctx.core.grid.getViewportMargins(subgrid_id);
 
                         // Skip float windows anchored to external grids (they belong to that external window)
                         if (pos.anchor_grid != 1 and ctx.core.grid.external_grids.contains(pos.anchor_grid)) continue;
 
                         var r2: u32 = 0;
                         while (r2 < sg.rows) : (r2 += 1) {
-                            const tr = pos.row + r2;
+                            // Saturating: hostile win_pos rows must not
+                            // overflow-panic (saturated value fails the bound
+                            // check below and breaks out).
+                            const tr = pos.row +| r2;
                             if (tr >= rows) break;
 
                             const sg_row_start: usize = @as(usize, r2) * @as(usize, sg.cols);
@@ -3860,7 +4639,7 @@ pub const FlushCtx = struct {
                             var c2: u32 = 0;
 
                             while (c2 < sg.cols) {
-                                const tc = pos.col + c2;
+                                const tc = pos.col +| c2;
                                 if (tc >= cols) break;
 
                                 const first_cell = sg.cells[sg_row_start + @as(usize, c2)];
@@ -3868,7 +4647,7 @@ pub const FlushCtx = struct {
 
                                 // Find run of consecutive subgrid cells with same hl_id
                                 var run_end: u32 = c2 + 1;
-                                while (run_end < sg.cols and pos.col + run_end < cols) : (run_end += 1) {
+                                while (run_end < sg.cols and pos.col +| run_end < cols) : (run_end += 1) {
                                     if (sg.cells[sg_row_start + @as(usize, run_end)].hl != run_hl) break;
                                 }
 
@@ -3894,11 +4673,22 @@ pub const FlushCtx = struct {
 
                                 var i: u32 = c2;
                                 while (i < run_end) : (i += 1) {
-                                    const ti = pos.col + i;
+                                    const ti = pos.col +| i;
                                     if (ti >= cols) break;
 
                                     const src_cell = sg.cells[sg_row_start + @as(usize, i)];
-                                    tmp.set(dst_row_start + @as(usize, ti), src_cell.cp, fg, bg, sp, subgrid_id, flags, ol);
+                                    const dst_index = dst_row_start + @as(usize, ti);
+                                    tmp.set(dst_index, src_cell.cp, fg, bg, sp, subgrid_id, flags, ol);
+                                    tmp.deco_base_flags.items[dst_index] = if (viewportCellScrollable(
+                                        r2,
+                                        i,
+                                        sg.rows,
+                                        sg.cols,
+                                        sg_margins,
+                                    )) c_api.DECO_SCROLLABLE else 0;
+                                    if (glow_enabled) {
+                                        tmp.glow_arr.items[dst_index] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                    }
                                 }
 
                                 c2 = run_end;
@@ -3907,382 +4697,94 @@ pub const FlushCtx = struct {
                     }
                 }
 
-
-
                 if (!sent_main_by_rows) {
-
-                    // Estimate capacity: rows*cols*12 vertices (BG + glyph) + glow
+                    // Partial-only ABI consumers use the same five-pass row
+                    // generator as row-mode consumers. Keeping one generator
+                    // preserves shaping, full-cluster overflow keys, decoration
+                    // ordering, and atlas transaction semantics in both modes.
                     const est_cells: usize = @as(usize, rows) * @as(usize, cols);
-                    _ = main.ensureTotalCapacity(ctx.core.alloc, est_cells * 12) catch {};
+                    try main.ensureTotalCapacity(ctx.core.alloc, est_cells * 12);
 
-                    // Get viewport margins for scrollable row detection (non-row-mode path)
-                    const nr_main_margins = ctx.core.grid.getViewportMargins(1);
+                    const row_cells = &ctx.core.row_cells;
+                    const row_len: usize = @intCast(cols);
+                    try row_cells.ensureTotalCapacity(ctx.core.alloc, row_len);
+                    row_cells.setLen(row_len);
 
-                    // 1) Background: run-length by bgRGB and grid_id per row
-                    var r: u32 = 0;
-
-                    while (r < rows) : (r += 1) {
-                        const nr_main_scrollable: u32 = if (r >= nr_main_margins.top and r < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
-                        const row_start: usize = @as(usize, r) * @as(usize, cols);
-
-                        var c: u32 = 0;
-                        while (c < cols) {
-                            const run_bg = tmp.bg_rgbs.items[row_start + @as(usize, c)];
-                            const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
-                            const run_start = c;
-
-                            const end: u32 = @intCast(@min(
-                                simdFindRunEndU32(tmp.bg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_bg),
-                                simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c), @intCast(cols), run_grid_id),
-                            ));
-
-                            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                            const x1: f32 = @as(f32, @floatFromInt(end)) * cellW;
-                            const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
-                            const y1: f32 = y0 + cellH;
-
-                            // Use transparency for default background (blur or background_opacity)
-                            const bg_alpha: f32 = if (run_bg == ctx.core.hl.default_bg)
-                                (if (ctx.core.blur_enabled) 0.0 else ctx.core.background_opacity)
-                            else
-                                1.0;
-                            const nr_scroll_flag: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_main_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                            try Helpers.pushSolidQuad(main, ctx.core.alloc, x0, y0, x1, y1, Helpers.rgba(run_bg, bg_alpha), dw, dh, run_grid_id, nr_scroll_flag);
-                            c = end;
-                        }
-                    }
-
-                    // Timing for performance measurement (only when logging enabled)
                     const perf_log_enabled = ctx.core.log.cb != null;
-                    var t_under_deco_start: i128 = 0;
-                    if (perf_log_enabled) {
-                        t_under_deco_start = clock.nowNs();
-                    }
+                    const t_full_start: i128 = if (perf_log_enabled) clock.nowNs() else 0;
+                    for (&ctx.core.partial_layer_verts) |*layer| layer.clearRetainingCapacity();
+                    const row_scratch = &ctx.core.row_verts;
+                    var had_glyph_miss = false;
+                    var r: u32 = 0;
+                    while (r < rows) : (r += 1) {
+                        const row_start: usize = @as(usize, r) * row_len;
+                        const row_end = row_start + row_len;
 
-                    // 2) Under-decorations: underline, underdouble, undercurl, underdotted, underdashed (drawn BEHIND glyphs)
-                    {
-                        var r2: u32 = 0;
-                        while (r2 < rows) : (r2 += 1) {
-                            const row_start: usize = @as(usize, r2) * @as(usize, cols);
-                            const nr_r2_scrollable: u32 = if (r2 >= nr_main_margins.top and r2 < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
+                        @memcpy(row_cells.scalars.items, tmp.scalars.items[row_start..row_end]);
+                        @memcpy(row_cells.fg_rgbs.items, tmp.fg_rgbs.items[row_start..row_end]);
+                        @memcpy(row_cells.bg_rgbs.items, tmp.bg_rgbs.items[row_start..row_end]);
+                        @memcpy(row_cells.sp_rgbs.items, tmp.sp_rgbs.items[row_start..row_end]);
+                        @memcpy(row_cells.grid_ids.items, tmp.grid_ids.items[row_start..row_end]);
+                        @memcpy(row_cells.style_flags_arr.items, tmp.style_flags_arr.items[row_start..row_end]);
+                        @memcpy(row_cells.overline_arr.items, tmp.overline_arr.items[row_start..row_end]);
+                        @memcpy(row_cells.deco_base_flags.items, tmp.deco_base_flags.items[row_start..row_end]);
+                        if (glow_enabled) {
+                            @memcpy(row_cells.glow_arr.items, tmp.glow_arr.items[row_start..row_end]);
+                        } else {
+                            @memset(row_cells.glow_arr.items, 0);
+                        }
 
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const cell_sf = tmp.style_flags_arr.items[row_start + @as(usize, c)];
-                                // Check for any under-decoration (not strikethrough)
-                                const under_mask = STYLE_UNDERLINE | STYLE_UNDERDOUBLE | STYLE_UNDERCURL | STYLE_UNDERDOTTED | STYLE_UNDERDASHED;
-                                if (cell_sf & under_mask == 0) {
-                                    c += 1;
-                                    continue;
-                                }
+                        row_scratch.clearRetainingCapacity();
+                        const row_stats = generateRowVertices(ctx.core, .{
+                            .row = r,
+                            .cols = cols,
+                            .vw = dw,
+                            .vh = dh,
+                            .cell_w = cellW,
+                            .cell_h = cellH,
+                            .top_pad = topPad,
+                            .default_bg = ctx.core.hl.default_bg,
+                            .blur_enabled = ctx.core.blur_enabled,
+                            .background_opacity = ctx.core.background_opacity,
+                            .is_cmdline = false,
+                            .glow_enabled = glow_enabled,
+                        }, row_scratch) catch {
+                            main.clearRetainingCapacity();
+                            ctx.core.flush_aborted = true;
+                            return;
+                        };
+                        had_glyph_miss = had_glyph_miss or row_stats.had_glyph_miss;
 
-                                // Find run of cells with same decoration style
-                                const run_start = c;
-                                const run_flags = cell_sf;
-                                const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c)];
-                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
-                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
-
-                                const run_end: u32 = @intCast(@min(
-                                    simdFindRunEndU8(tmp.style_flags_arr.items[row_start..], @intCast(c + 1), @intCast(cols), run_flags),
-                                    @min(
-                                        simdFindRunEndU32(tmp.sp_rgbs.items[row_start..], @intCast(c + 1), @intCast(cols), run_sp),
-                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c + 1), @intCast(cols), run_grid_id),
-                                    ),
-                                ));
-
-                                // Use special color if set, otherwise foreground
-                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                const nr_deco_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_r2_scrollable, cached_subgrids[0..cached_subgrid_count]);
-
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                const row_y: f32 = @as(f32, @floatFromInt(r2)) * cellH;
-
-                                // Underline: 1px line at bottom of cell
-                                if (run_flags & STYLE_UNDERLINE != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
-                                }
-
-                                // Underdouble: 2 lines at bottom with clear gap
-                                if (run_flags & STYLE_UNDERDOUBLE != 0) {
-                                    // First line: 6px from bottom
-                                    const y0_1 = row_y + cellH - 6.0;
-                                    const y1_1 = y0_1 + 1.0;
-                                    // Second line: 2px from bottom (4px gap between lines)
-                                    const y0_2 = row_y + cellH - 2.0;
-                                    const y1_2 = y0_2 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_1, x1, y1_1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0_2, x1, y1_2, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERLINE | nr_deco_scroll, 0);
-                                }
-
-                                // Undercurl: wavy line (shader-based)
-                                if (run_flags & STYLE_UNDERCURL != 0) {
-                                    const y0 = row_y + cellH - 4.0;
-                                    const y1 = row_y + cellH;
-                                    const phase: f32 = @floatFromInt(run_start);
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERCURL | nr_deco_scroll, phase);
-                                }
-
-                                // Underdotted: dotted line (shader-based)
-                                if (run_flags & STYLE_UNDERDOTTED != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDOTTED | nr_deco_scroll, 0);
-                                }
-
-                                // Underdashed: dashed line (shader-based)
-                                if (run_flags & STYLE_UNDERDASHED != 0) {
-                                    const y0 = row_y + cellH - 2.0;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_UNDERDASHED | nr_deco_scroll, 0);
-                                }
-
-                                c = run_end;
-                            }
+                        // Keep backgrounds for every row before any glyph or
+                        // decoration layer. Appending a complete five-pass row
+                        // at once lets the next row's background overpaint a
+                        // glyph that extends beyond its cell bounds.
+                        try main.appendSlice(ctx.core.alloc, row_scratch.items[0..row_stats.pass_ends[0]]);
+                        for (&ctx.core.partial_layer_verts, 0..) |*layer, layer_index| {
+                            const layer_start = row_stats.pass_ends[layer_index];
+                            const layer_end = row_stats.pass_ends[layer_index + 1];
+                            try layer.appendSlice(ctx.core.alloc, row_scratch.items[layer_start..layer_end]);
                         }
                     }
+                    for (&ctx.core.partial_layer_verts) |*layer| {
+                        try main.appendSlice(ctx.core.alloc, layer.items);
+                    }
 
-                    var t_under_deco_end: i128 = 0;
-                    var t_glyph_start: i128 = 0;
+                    if (had_glyph_miss) {
+                        main_retry_required = true;
+                        ctx.core.grid.markAllDirty();
+                    }
+                    if (!ctx.core.flush_aborted) {
+                        ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
+                    }
                     if (perf_log_enabled) {
-                        t_under_deco_end = clock.nowNs();
-                        t_glyph_start = t_under_deco_end;
-                    }
-
-                    // 3) Glyphs: run-length by (fg,bg,grid_id) and skip "all spaces"
-                    const ensure_base_full = ctx.core.cb.on_atlas_ensure_glyph;
-                    const ensure_styled_full = ctx.core.cb.on_atlas_ensure_glyph_styled;
-                    if (ctx.core.isPhase2Atlas() or ensure_base_full != null or ensure_styled_full != null) {
-                        r = 0;
-                        while (r < rows) : (r += 1) {
-                            const row_start: usize = @as(usize, r) * @as(usize, cols);
-                            const nr_glyph_scrollable: u32 = if (r >= nr_main_margins.top and r < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
-
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
-                                const run_bg = tmp.bg_rgbs.items[row_start + @as(usize, c)];
-                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
-                                const run_start = c;
-
-                                const run_glow_nr: u8 = if (glow_enabled) tmp.glow_arr.items[row_start + @as(usize, c)] else 0;
-                                const base_end_nr = @min(
-                                    simdFindRunEndU32(tmp.fg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_fg),
-                                    @min(
-                                        simdFindRunEndU32(tmp.bg_rgbs.items[row_start..], @intCast(c), @intCast(cols), run_bg),
-                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c), @intCast(cols), run_grid_id),
-                                    ),
-                                );
-                                const end: u32 = @intCast(if (glow_enabled)
-                                    @min(base_end_nr, simdFindRunEndU8(tmp.glow_arr.items[row_start..], @intCast(c), @intCast(cols), run_glow_nr))
-                                else
-                                    base_end_nr);
-                                const has_ink = simdHasInkInRange(tmp.scalars.items[row_start..], @intCast(c), @intCast(end));
-
-                                if (has_ink) {
-                                    const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
-                                    const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
-
-                                    var penX: f32 = baseX;
-                                    const fg = Helpers.rgb(run_fg);
-                                    const nr_run_has_glow = run_glow_nr != 0;
-
-                                    var col_i: u32 = run_start;
-                                    while (col_i < end) : (col_i += 1) {
-                                        const cell_scalar = tmp.scalars.items[row_start + @as(usize, col_i)];
-                                        const cell_style_flags = tmp.style_flags_arr.items[row_start + @as(usize, col_i)];
-                                        const scalar: u32 = if (cell_scalar == 0) 32 else cell_scalar;
-                                        if (scalar == 32) {
-                                            penX += cellW;
-                                            continue;
-                                        }
-                                        // Block element: geometric rendering (no atlas)
-                                        if (block_elements.isBlockElement(scalar)) {
-                                            const blk_geo = block_elements.getBlockGeometry(scalar);
-                                            if (blk_geo.count > 0) {
-                                                const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                                const nr_blk_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                                main.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6) catch {
-                                                    penX += cellW;
-                                                    continue;
-                                                };
-                                                for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                                    Helpers.pushSolidQuadAssumeCapacity(main, penX + rect.x0 * cellW, blk_y0 + rect.y0 * cellH, penX + rect.x1 * cellW, blk_y0 + rect.y1 * cellH, fg, dw, dh, run_grid_id, nr_blk_scroll);
-                                                }
-                                            }
-                                            penX += cellW;
-                                            continue;
-                                        }
-
-                                        var ge: c_api.GlyphEntry = undefined;
-                                        // Use styled callback for bold/italic if available
-                                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
-                                        const glyph_ok = blk: {
-                                            if (ctx.core.isPhase2Atlas()) {
-                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                if (ctx.core.ensureGlyphPhase2(scalar, c_style)) |entry| {
-                                                    ge = entry;
-                                                    break :blk true;
-                                                }
-                                                break :blk false;
-                                            } else if (style_mask != 0 and ensure_styled_full != null) {
-                                                const c_style: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                                break :blk ensure_styled_full.?(ctx.core.ctx, scalar, c_style, &ge) != 0;
-                                            } else if (ensure_base_full) |ensure| {
-                                                break :blk ensure(ctx.core.ctx, scalar, &ge) != 0;
-                                            } else {
-                                                break :blk false;
-                                            }
-                                        };
-                                        if (!glyph_ok) {
-                                            penX += cellW;
-                                            continue;
-                                        }
-
-                                        const baselineY: f32 = baseY + ge.ascent_px;
-
-                                        const gx0: f32 = penX + ge.bbox_origin_px[0];
-                                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                        const gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
-
-                                        const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                                        const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                                        const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                                        const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
-
-                                        if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                            const nr_glyph_scroll: u32 = Helpers.computeScrollFlag(r, run_grid_id, nr_glyph_scrollable, cached_subgrids[0..cached_subgrid_count]);
-                                            const nr_glyph_deco: u32 = nr_glyph_scroll | (if (nr_run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                            try Helpers.pushGlyphQuad(main, ctx.core.alloc, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, dw, dh, run_grid_id, nr_glyph_deco);
-                                        }
-
-                                        // Monospace cell model: advance by cellW
-                                        penX += cellW;
-                                    }
-                                }
-
-                                c = end;
-                            }
-                        }
-                    }
-
-                    var t_glyph_end: i128 = 0;
-                    var t_strike_start: i128 = 0;
-                    if (perf_log_enabled) {
-                        t_glyph_end = clock.nowNs();
-                        t_strike_start = t_glyph_end;
-                    }
-
-                    // 4) Strikethrough: drawn ON TOP of glyphs
-                    {
-                        var r2: u32 = 0;
-                        while (r2 < rows) : (r2 += 1) {
-                            const row_start: usize = @as(usize, r2) * @as(usize, cols);
-                            const nr_strike_scrollable: u32 = if (r2 >= nr_main_margins.top and r2 < rows -| nr_main_margins.bottom) c_api.DECO_SCROLLABLE else 0;
-
-                            var c: u32 = 0;
-                            while (c < cols) {
-                                const cell_sf2 = tmp.style_flags_arr.items[row_start + @as(usize, c)];
-                                // Only handle strikethrough here
-                                if (cell_sf2 & STYLE_STRIKETHROUGH == 0) {
-                                    c += 1;
-                                    continue;
-                                }
-
-                                // Find run of cells with same strikethrough style
-                                const run_start = c;
-                                const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c)];
-                                const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c)];
-                                const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c)];
-
-                                const run_end: u32 = @intCast(@min(
-                                    simdFindFirstBitUnset(tmp.style_flags_arr.items[row_start..], @intCast(c + 1), @intCast(cols), STYLE_STRIKETHROUGH),
-                                    @min(
-                                        simdFindRunEndU32(tmp.sp_rgbs.items[row_start..], @intCast(c + 1), @intCast(cols), run_sp),
-                                        simdFindRunEndI64(tmp.grid_ids.items[row_start..], @intCast(c + 1), @intCast(cols), run_grid_id),
-                                    ),
-                                ));
-
-                                // Use special color if set, otherwise foreground
-                                const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                const nr_strike_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_strike_scrollable, cached_subgrids[0..cached_subgrid_count]);
-
-                                const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                const row_y: f32 = @as(f32, @floatFromInt(r2)) * cellH;
-
-                                // Strikethrough: line through middle
-                                const y0 = row_y + cellH * 0.5 - 0.5;
-                                const y1 = y0 + 1.0;
-                                try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_STRIKETHROUGH | nr_strike_scroll, 0);
-
-                                c = run_end;
-                            }
-
-                            // 5) Overline (line at top of cell)
-                            {
-                                var c2_ol: u32 = 0;
-                                while (c2_ol < cols) {
-                                    if (tmp.overline_arr.items[row_start + @as(usize, c2_ol)] == 0) {
-                                        c2_ol += 1;
-                                        continue;
-                                    }
-
-                                    const run_start = c2_ol;
-                                    const run_sp = tmp.sp_rgbs.items[row_start + @as(usize, c2_ol)];
-                                    const run_fg = tmp.fg_rgbs.items[row_start + @as(usize, c2_ol)];
-                                    const run_grid_id = tmp.grid_ids.items[row_start + @as(usize, c2_ol)];
-
-                                    var run_end: u32 = c2_ol + 1;
-                                    while (run_end < cols) : (run_end += 1) {
-                                        if (tmp.overline_arr.items[row_start + @as(usize, run_end)] == 0) break;
-                                        if (tmp.sp_rgbs.items[row_start + @as(usize, run_end)] != run_sp) break;
-                                        if (tmp.grid_ids.items[row_start + @as(usize, run_end)] != run_grid_id) break;
-                                        if (run_sp == highlight.Highlights.SP_NOT_SET and
-                                            tmp.fg_rgbs.items[row_start + @as(usize, run_end)] != run_fg) break;
-                                    }
-
-                                    const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) Helpers.rgb(run_sp) else Helpers.rgb(run_fg);
-                                    const nr_ol_scroll: u32 = Helpers.computeScrollFlag(r2, run_grid_id, nr_strike_scrollable, cached_subgrids[0..cached_subgrid_count]);
-
-                                    const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-                                    const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
-                                    const row_y: f32 = @as(f32, @floatFromInt(r2)) * cellH;
-
-                                    const y0 = row_y;
-                                    const y1 = y0 + 1.0;
-                                    try Helpers.pushDecoQuad(main, ctx.core.alloc, x0, y0, x1, y1, deco_color, dw, dh, run_grid_id, c_api.DECO_OVERLINE | nr_ol_scroll, 0);
-
-                                    c2_ol = run_end;
-                                }
-                            }
-                        }
-                    }
-
-                    // Log timing for performance measurement
-                    if (perf_log_enabled) {
-                        const t_strike_end = clock.nowNs();
-                        const under_deco_ns: i128 = t_under_deco_end - t_under_deco_start;
-                        const glyph_ns: i128 = t_glyph_end - t_glyph_start;
-                        const strike_ns: i128 = t_strike_end - t_strike_start;
-                        const total_ns: i128 = t_strike_end - t_under_deco_start;
+                        const total_ns: i128 = clock.nowNs() - t_full_start;
                         ctx.core.log.write(
-                            "[perf] full_redraw rows={d} cols={d} under_deco_ns={d} glyph_ns={d} strike_ns={d} total_ns={d}\n",
-                            .{ rows, cols, under_deco_ns, glyph_ns, strike_ns, total_ns },
+                            "[perf] full_redraw_shared rows={d} cols={d} total_ns={d}\n",
+                            .{ rows, cols, total_ns },
                         );
                     }
-
-                    // Mark main as sent (content revision)
-                    ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
-
                 }
-
             }
 
             // ----------------------------
@@ -4306,7 +4808,7 @@ pub const FlushCtx = struct {
                         !ctx.core.grid.external_grids.contains(cursor_grid));
 
                 if (cursor_embedded_in_main) {
-                    _ = cursor.ensureTotalCapacity(ctx.core.alloc, 64) catch {};
+                    try cursor.ensureTotalCapacity(ctx.core.alloc, 64);
                 }
 
                 if (cursor_embedded_in_main and cursor_out.enabled != 0) {
@@ -4373,7 +4875,10 @@ pub const FlushCtx = struct {
                         // (so shader treats it as decoration, not background with transparency)
                         {
                             const pts = Helpers.ndc4(rx0, ry0, rx1, ry1, dw, dh);
-                            const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+                            const p0 = pts[0];
+                            const p1 = pts[1];
+                            const p2 = pts[2];
+                            const p3 = pts[3];
                             const col = Helpers.rgb(cursor_out.bgRGB);
                             const solid_uv = Helpers.solid_uv;
 
@@ -4393,96 +4898,110 @@ pub const FlushCtx = struct {
                             if (block_elements.isBlockElement(cursor_cp)) {
                                 const blk_geo = block_elements.getBlockGeometry(cursor_cp);
                                 if (blk_geo.count > 0) {
-                                    if (cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6)) {
-                                        const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
-                                        for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                            Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_SCROLLABLE);
-                                        }
-                                    } else |_| {}
+                                    try cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6);
+                                    const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
+                                    for (blk_geo.rects[0..blk_geo.count]) |rect| {
+                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_SCROLLABLE);
+                                    }
                                 }
                             } else {
-                            const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
-                            const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
+                                const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
+                                const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
 
-                            if (ctx.core.isPhase2Atlas() or ensure_base != null or ensure_styled != null) {
-                                var ge: c_api.GlyphEntry = undefined;
-                                var glyph_ok = false;
+                                if (ctx.core.isPhase2Atlas() or ensure_base != null or ensure_styled != null) {
+                                    var ge: c_api.GlyphEntry = undefined;
+                                    var glyph_ok = false;
 
-                                // Resolve style_flags for the cell under the cursor
-                                const cursor_style: u8 = ctx.core.hl.getWithStyles(cursor_cell.hl).style_flags;
-                                const cursor_style_mask = cursor_style & (STYLE_BOLD | STYLE_ITALIC);
-                                const cursor_c_style: u32 =
-                                    @as(u32, if (cursor_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                    // Resolve style_flags for the cell under the cursor
+                                    const cursor_style: u8 = ctx.core.hl.getWithStyles(cursor_cell.hl).style_flags;
+                                    const cursor_style_mask = cursor_style & (STYLE_BOLD | STYLE_ITALIC);
+                                    const cursor_c_style: u32 =
+                                        @as(u32, if (cursor_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                        @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
-                                // Set emoji cluster context for cursor cell if its overflow
-                                // contains emoji-significant codepoints (VS16, ZWJ, skin tone).
-                                if (ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col)) |extras| {
-                                    const is_emoji = isEmojiPresentation(cursor_cp) or for (extras) |e| {
-                                        if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
-                                    } else false;
-                                    if (is_emoji) {
-                                        ctx.core.emoji_cluster_buf[0] = cursor_cp;
-                                        const elen = @min(extras.len, ctx.core.emoji_cluster_buf.len - 1);
-                                        for (0..elen) |ei| {
-                                            ctx.core.emoji_cluster_buf[1 + ei] = extras[ei];
+                                    // Set emoji cluster context for cursor cell if its overflow
+                                    // contains emoji-significant codepoints (VS16, ZWJ, skin tone).
+                                    if (ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col)) |extras| {
+                                        const is_emoji = isEmojiPresentation(cursor_cp) or for (extras) |e| {
+                                            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
+                                        } else false;
+                                        if (is_emoji) {
+                                            ctx.core.emoji_cluster_buf[0] = cursor_cp;
+                                            const elen = @min(extras.len, ctx.core.emoji_cluster_buf.len - 1);
+                                            for (0..elen) |ei| {
+                                                ctx.core.emoji_cluster_buf[1 + ei] = extras[ei];
+                                            }
+                                            ctx.core.emoji_cluster_len = @intCast(1 + elen);
                                         }
-                                        ctx.core.emoji_cluster_len = @intCast(1 + elen);
+                                    }
+                                    defer ctx.core.emoji_cluster_len = 0;
+
+                                    // Get glyph entry from atlas using actual style
+                                    if (ctx.core.isPhase2Atlas()) {
+                                        const overflow = ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col);
+                                        if (try ensureCachedPhase2Glyph(ctx.core, cursor_cp, cursor_c_style, overflow)) |entry| {
+                                            ge = entry;
+                                            glyph_ok = true;
+                                        } else if (ctx.core.flush_aborted) {
+                                            return;
+                                        } else {
+                                            // Do not consume cursor_rev on a transient
+                                            // rasterizer miss. The next flush retries the
+                                            // same stationary cursor without cancelling
+                                            // the current transaction.
+                                            cursor_retry_required = true;
+                                        }
+                                    } else if (cursor_style_mask != 0 and ensure_styled != null) {
+                                        if (ensure_styled) |styled_fn| {
+                                            glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, cursor_c_style, &ge) != 0;
+                                        }
+                                    } else if (ensure_base) |base_fn| {
+                                        glyph_ok = base_fn(ctx.core.ctx, cursor_cp, &ge) != 0;
+                                    }
+
+                                    if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
+                                        // Calculate glyph position (same as global grid rendering)
+                                        // Use topPad from outer scope
+                                        const cursorBaseY: f32 = y0 + topPad;
+                                        const baselineY: f32 = cursorBaseY + ge.ascent_px;
+
+                                        const gx0: f32 = x0 + ge.bbox_origin_px[0];
+                                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
+                                        const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
+
+                                        // UV coordinates from atlas
+                                        const uv0 = [2]f32{ ge.uv_min[0], ge.uv_min[1] };
+                                        const uv1 = [2]f32{ ge.uv_max[0], ge.uv_min[1] };
+                                        const uv2 = [2]f32{ ge.uv_min[0], ge.uv_max[1] };
+                                        const uv3 = [2]f32{ ge.uv_max[0], ge.uv_max[1] };
+
+                                        // Use cursor foreground color (inverted)
+                                        const fg = Helpers.rgb(cursor_out.fgRGB);
+
+                                        try Helpers.pushGlyphQuad(
+                                            cursor,
+                                            ctx.core.alloc,
+                                            gx0,
+                                            gy0,
+                                            gx1,
+                                            gy1,
+                                            uv0,
+                                            uv1,
+                                            uv2,
+                                            uv3,
+                                            fg,
+                                            dw,
+                                            dh,
+                                            cursor_grid_id, // cursor belongs to its actual grid
+                                            c_api.DECO_SCROLLABLE | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0), // cursor is always in content area
+                                        );
                                     }
                                 }
-                                defer ctx.core.emoji_cluster_len = 0;
-
-                                // Get glyph entry from atlas using actual style
-                                if (ctx.core.isPhase2Atlas()) {
-                                    if (ctx.core.ensureGlyphPhase2(cursor_cp, cursor_c_style)) |entry| {
-                                        ge = entry;
-                                        glyph_ok = true;
-                                    }
-                                } else if (cursor_style_mask != 0 and ensure_styled != null) {
-                                    if (ensure_styled) |styled_fn| {
-                                        glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, cursor_c_style, &ge) != 0;
-                                    }
-                                } else if (ensure_base) |base_fn| {
-                                    glyph_ok = base_fn(ctx.core.ctx, cursor_cp, &ge) != 0;
-                                }
-
-                                if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                    // Calculate glyph position (same as global grid rendering)
-                                    // Use topPad from outer scope
-                                    const cursorBaseY: f32 = y0 + topPad;
-                                    const baselineY: f32 = cursorBaseY + ge.ascent_px;
-
-                                    const gx0: f32 = x0 + ge.bbox_origin_px[0];
-                                    const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                    const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                    const gy1: f32 = gy0 + ge.bbox_size_px[1];
-
-                                    // UV coordinates from atlas
-                                    const uv0 = [2]f32{ ge.uv_min[0], ge.uv_min[1] };
-                                    const uv1 = [2]f32{ ge.uv_max[0], ge.uv_min[1] };
-                                    const uv2 = [2]f32{ ge.uv_min[0], ge.uv_max[1] };
-                                    const uv3 = [2]f32{ ge.uv_max[0], ge.uv_max[1] };
-
-                                    // Use cursor foreground color (inverted)
-                                    const fg = Helpers.rgb(cursor_out.fgRGB);
-
-                                    try Helpers.pushGlyphQuad(
-                                        cursor,
-                                        ctx.core.alloc,
-                                        gx0, gy0, gx1, gy1,
-                                        uv0, uv1, uv2, uv3,
-                                        fg,
-                                        dw, dh,
-                                        cursor_grid_id, // cursor belongs to its actual grid
-                                        c_api.DECO_SCROLLABLE | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0), // cursor is always in content area
-                                    );
-                                }
-                            }
                             } // end else (non-block-element cursor glyph)
                         }
                     }
                 }
-
             }
 
             // If atlas was reset during vertex generation, do NOT submit this flush.
@@ -4494,34 +5013,43 @@ pub const FlushCtx = struct {
                 ctx.core.invalidateScrollCache();
                 var sg_it = ctx.core.grid.sub_grids.valueIterator();
                 while (sg_it.next()) |sg| {
-                    sg.dirty = true;
+                    sg.markAllDirty();
                 }
                 ctx.core.atlas_reset_during_flush = false;
+                // Row callbacks may already have published vertices whose UVs
+                // refer to the atlas generation that the cursor ensure just
+                // replaced. Dirtying repairs the next flush only; cancel this
+                // transaction so the stale rows are never committed once.
+                ctx.core.flush_atlas_corrupted = true;
                 return;
             }
 
             // ----------------------------
-            // Send vertices: partial if possible, else legacy full callback
+            // Send vertices via on_vertices_partial when registered. A
+            // row-only consumer receives main content above and the cursor as
+            // a dedicated row callback below.
             // ----------------------------
             if (pf_opt) |pf| {
                 var flags: u32 = 0;
-            
+
                 // If main was already sent by rows, do NOT send main here.
                 const send_main_here = need_main and !sent_main_by_rows;
-            
+
                 if (send_main_here) flags |= 1; // ZONVIE_VERT_UPDATE_MAIN
-                if (need_cursor)    flags |= 2; // ZONVIE_VERT_UPDATE_CURSOR
-            
+                if (need_cursor) flags |= 2; // ZONVIE_VERT_UPDATE_CURSOR
+
                 const main_ptr_opt: ?[*]const c_api.Vertex = if (send_main_here) main.items.ptr else null;
-                const cur_ptr_opt: ?[*]const c_api.Vertex  = if (need_cursor) cursor.items.ptr else null;
+                const cur_ptr_opt: ?[*]const c_api.Vertex = if (need_cursor) cursor.items.ptr else null;
 
                 const t_pf: i128 = if (perf_enabled) clock.nowNs() else 0;
                 const main_n_for_log: usize = if (send_main_here) main.items.len else 0;
                 const cur_n_for_log: usize = if (need_cursor) cursor.items.len else 0;
                 pf(
                     ctx.core.ctx,
-                    main_ptr_opt, main_n_for_log,
-                    cur_ptr_opt,  cur_n_for_log,
+                    main_ptr_opt,
+                    main_n_for_log,
+                    cur_ptr_opt,
+                    cur_n_for_log,
                     flags,
                 );
                 if (perf_enabled) {
@@ -4531,27 +5059,54 @@ pub const FlushCtx = struct {
                         .{ pf_us, main_n_for_log, cur_n_for_log, flags },
                     );
                 }
-                if (need_cursor) {
+                // Only update snapshot when main was rebuilt (subgrid info is current).
+                // cursor-only flushes leave cached_subgrids empty.
+                if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids);
+                // A vertex callback may have reported failure mid-flush
+                // (zonvie_core_abort_flush from a frontend OOM path). Keep
+                // dirty and scroll state so the complete cancelled bracket is
+                // replayed on retry. last_sent_cursor_rev must also
+                // stay unsynced on abort: the frontend cancelled its whole
+                // bracket, so the cursor vertices passed to pf() above were
+                // never actually committed. Syncing the revision here would
+                // make the next flush's need_cursor check see nothing
+                // pending and skip resending them.
+                if (ctx.core.flush_aborted) {
+                    return;
+                }
+                if (need_cursor and !cursor_retry_required) {
                     ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
                 }
-                // Only update snapshot when main was rebuilt (subgrid info is current).
-                // cursor-only flushes leave cached_subgrid_count == 0.
-                if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
-                ctx.core.grid.clearDirty();
-                ctx.core.grid.clearScrollState();
+                if (!main_retry_required) ctx.core.grid.clearDirty();
                 return;
             }
 
-            // If main was sent via row callback, do not call legacy full callback.
-            if (sent_main_by_rows) return;
-
-            if (need_main) saveSubgridSnapshots(ctx.core, cached_subgrids[0..cached_subgrid_count]);
-            ctx.core.grid.clearDirty();
-            ctx.core.grid.clearScrollState();
+            // Row-only ABI consumer. Main rows were sent individually above;
+            // use the same callback's CURSOR flag for the separate cursor
+            // layer, including an empty slice when the cursor left grid 1.
+            const row_cb = ctx.core.cb.on_vertices_row.?;
+            if (need_cursor) {
+                const cursor_ptr: ?[*]const c_api.Vertex = if (cursor.items.len != 0) cursor.items.ptr else null;
+                row_cb(
+                    ctx.core.ctx,
+                    1,
+                    cursor_out.row,
+                    1,
+                    cursor_ptr,
+                    cursor.items.len,
+                    c_api.VERT_UPDATE_CURSOR,
+                    rows,
+                    cols,
+                );
+                if (ctx.core.flush_aborted) return;
+                if (!cursor_retry_required) {
+                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
+                }
+            }
+            if (need_main and !sent_main_by_rows) saveSubgridSnapshots(ctx.core, cached_subgrids);
+            if (!main_retry_required) ctx.core.grid.clearDirty();
             return;
-
         }
-
     }
 
     pub fn onGuifont(ctx: *FlushCtx, font: []const u8) !void {
@@ -4570,6 +5125,7 @@ pub const FlushCtx = struct {
         // trigger vertex generation (e.g., Windows' updateLayoutToCore
         // calls sendExternalGridVertices when cell dimensions change).
         // Clearing first ensures those vertices use fresh cache lookups.
+        ctx.core.resetAtlasMaintenanceBackoff();
         ctx.core.resetGlyphCacheFlags();
         ctx.core.resetShapeCache();
         if (ctx.core.isPhase2Atlas()) {
@@ -4582,11 +5138,19 @@ pub const FlushCtx = struct {
         // every row with the new font/atlas. Without this, the global grid
         // keeps old vertices referencing the now-empty atlas → blank screen
         // until Neovim resends content after nvim_ui_try_resize.
+        // sg.dirty alone is not enough for sub_grids: the per-row emit path
+        // checks dirty_rows to pick which rows to regenerate, so with no
+        // bits set every row is skipped and dirty gets cleared at flush end
+        // with nothing ever resent — markAllDirty() sets both. The cursor
+        // is a separate vertex consumer gated on cursor_rev alone (main and
+        // external both), which this font change also invalidates but
+        // neither grid/sub_grid dirtying touches.
         ctx.core.grid.markAllDirty();
         var sg_it = ctx.core.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
-            sg.dirty = true;
+            sg.markAllDirty();
         }
+        ctx.core.grid.cursor_rev +%= 1;
 
         ctx.core.emitGuiFont(font);
     }
@@ -4603,6 +5167,16 @@ pub const FlushCtx = struct {
     }
 
     pub fn onDefaultColors(ctx: *FlushCtx, fg: u32, bg: u32) !void {
+        // Vertex colors are baked at generation time, including highlight
+        // entries whose fg/bg/sp inherit these defaults. Invalidate every
+        // resolved-color consumer before the frontend callback can re-enter
+        // layout/vertex generation.
+        ctx.core.reinitHlCache();
+        ctx.core.invalidateScrollCache();
+        ctx.core.grid.markAllDirty();
+        var sg_it = ctx.core.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.markAllDirty();
+        ctx.core.grid.cursor_rev +%= 1;
         ctx.core.emitDefaultColors(fg, bg);
     }
 
@@ -4618,28 +5192,23 @@ pub const FlushCtx = struct {
 pub fn notifyExternalWindowChanges(self: *Core) bool {
     var new_grids_added = false;
 
-    // Find closed external windows (were known, but no longer in grid.external_grids)
-    var closed_grids: std.ArrayListUnmanaged(i64) = .empty;
-    defer closed_grids.deinit(self.alloc);
+    // Never emit window lifecycle callbacks for a flush whose frontend
+    // transaction was cancelled. The retry flush will regenerate vertices and
+    // retry these notifications before its own commit.
+    if (self.flush_aborted) return false;
 
-    var known_it = self.known_external_grids.keyIterator();
-    while (known_it.next()) |grid_id_ptr| {
-        const grid_id = grid_id_ptr.*;
+    // Removal marks the current slot as a tombstone without rehashing or
+    // relocating entries, so advancing the iterator then removeByPtr is safe
+    // and visits every known grid once (O(G), rather than rescanning from the
+    // beginning after each close).
+    var known_it = self.known_external_grids.iterator();
+    while (known_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
         if (!self.grid.external_grids.contains(grid_id)) {
-            closed_grids.append(self.alloc, grid_id) catch continue;
+            if (self.cb.on_external_window_close) |cb| cb(self.ctx, grid_id);
+            if (self.flush_aborted) return new_grids_added;
+            self.known_external_grids.removeByPtr(entry.key_ptr);
         }
-    }
-
-    // Notify closed external windows
-    if (self.cb.on_external_window_close) |cb| {
-        for (closed_grids.items) |grid_id| {
-            cb(self.ctx, grid_id);
-        }
-    }
-
-    // Remove closed grids from known set
-    for (closed_grids.items) |grid_id| {
-        _ = self.known_external_grids.remove(grid_id);
     }
 
     // Find new or changed external windows
@@ -4683,25 +5252,393 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
                 if (rows < 2 or cols < 2) continue;
                 _ = self.grid.pending_ext_window_grids.remove(grid_id);
             }
+
+            // Reserve the known-map entry before invoking the frontend. This
+            // makes OOM a clean pre-callback abort instead of opening a window
+            // and then failing to record it, which would otherwise cause
+            // duplicate opens and lost closes on later retries.
+            self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch {
+                self.flush_aborted = true;
+                return new_grids_added;
+            };
         }
 
         // Notify frontend with position info
         if (self.cb.on_external_window) |cb| {
             cb(self.ctx, grid_id, info.win, rows, cols, info.start_row, info.start_col);
         }
+        // A lifecycle callback may abort the enclosing frontend transaction
+        // (Windows does this when queueing or PostMessageW fails). Do not leak
+        // later window-create side effects from a transaction that every
+        // frontend will cancel in on_flush_end; the retry flush will revisit
+        // this grid and every undispatched grid.
+        if (self.flush_aborted) return new_grids_added;
 
-        // Add/update known set with current position
-        self.known_external_grids.put(self.alloc, grid_id, .{
+        // Add/update the known set only after the callback completed without
+        // aborting. New entries use the capacity reserved above; changed
+        // entries update in place and cannot allocate.
+        const known_info: nvim_core.KnownExtGridInfo = .{
             .win = info.win,
             .start_row = info.start_row,
             .start_col = info.start_col,
             .rows = rows,
             .cols = cols,
-        }) catch continue;
-        if (is_new) new_grids_added = true;
+        };
+        if (is_new) {
+            self.known_external_grids.putAssumeCapacityNoClobber(grid_id, known_info);
+            new_grids_added = true;
+        } else if (self.known_external_grids.getPtr(grid_id)) |known| {
+            known.* = known_info;
+        }
     }
 
     return new_grids_added;
+}
+
+fn externalCursorVisibleOnGrid(grid: *const grid_mod.Grid, grid_id: i64) bool {
+    return grid.cursor_grid == grid_id and grid.cursor_valid and grid.cursor_visible;
+}
+
+fn externalCursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
+    return c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE |
+        (if (bytes_per_pixel == 4) c_api.DECO_COLOR_EMOJI else 0);
+}
+
+const ExternalFloatRowRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn externalFloatVisibleRowRange(
+    core: *const Core,
+    float_grid_id: i64,
+    ext_start_row: i64,
+    ext_start_col: i64,
+    viewport_rows: u32,
+    viewport_cols: u32,
+) ?ExternalFloatRowRange {
+    const pos = core.grid.win_pos.get(float_grid_id) orelse return null;
+    const sg = core.grid.sub_grids.get(float_grid_id) orelse return null;
+    if (sg.rows == 0 or sg.cols == 0) return null;
+
+    const row0 = @as(i64, pos.row) - ext_start_row;
+    const row1 = row0 + @as(i64, sg.rows);
+    const col0 = @as(i64, pos.col) - ext_start_col;
+    const col1 = col0 + @as(i64, sg.cols);
+    if (row1 <= 0 or row0 >= @as(i64, viewport_rows) or
+        col1 <= 0 or col0 >= @as(i64, viewport_cols)) return null;
+
+    return .{
+        .start = @intCast(@max(@as(i64, 0), row0)),
+        .end = @intCast(@min(@as(i64, viewport_rows), row1)),
+    };
+}
+
+/// Build one flush-local index of every float anchored to an external grid.
+/// The win_pos map is scanned once; per-anchor users then binary-search a
+/// contiguous, already layer-sorted slice instead of rescanning the map.
+fn releaseOversizedExternalFloatScratch(
+    comptime T: type,
+    list: *std.ArrayListUnmanaged(T),
+    alloc: std.mem.Allocator,
+    max_bytes: usize,
+) void {
+    const max_entries = max_bytes / @sizeOf(T);
+    if (list.capacity <= max_entries) return;
+    list.deinit(alloc);
+    list.* = .empty;
+}
+
+fn buildExternalFloatAnchorIndexWithLimit(core: *Core, max_bytes: usize) !void {
+    core.ext_float_anchor_entries.clearRetainingCapacity();
+    releaseOversizedExternalFloatScratch(
+        ExternalFloatAnchorEntry,
+        &core.ext_float_anchor_entries,
+        core.alloc,
+        max_bytes,
+    );
+    core.ext_float_anchor_index_valid = false;
+
+    const max_entries = max_bytes / @sizeOf(ExternalFloatAnchorEntry);
+    var anchor_entry_count: usize = 0;
+    var count_it = core.grid.win_pos.iterator();
+    while (count_it.next()) |entry| {
+        if (!core.grid.external_grids.contains(entry.value_ptr.anchor_grid)) continue;
+        if (anchor_entry_count >= max_entries) return error.TooManyWindowPlacements;
+        anchor_entry_count += 1;
+    }
+    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, anchor_entry_count);
+
+    var win_it = core.grid.win_pos.iterator();
+    while (win_it.next()) |entry| {
+        const anchor_grid_id = entry.value_ptr.anchor_grid;
+        if (!core.grid.external_grids.contains(anchor_grid_id)) continue;
+        const layer = core.grid.win_layer.get(entry.key_ptr.*) orelse grid_mod.WinLayer{};
+        core.ext_float_anchor_entries.appendAssumeCapacity(.{
+            .anchor_grid_id = anchor_grid_id,
+            .entry = .{
+                .grid_id = entry.key_ptr.*,
+                .zindex = layer.zindex,
+                .compindex = layer.compindex,
+                .order = layer.order,
+            },
+        });
+    }
+    std.sort.block(
+        ExternalFloatAnchorEntry,
+        core.ext_float_anchor_entries.items,
+        {},
+        ExternalFloatAnchorEntry.lessThan,
+    );
+    core.ext_float_anchor_index_valid = true;
+}
+
+fn buildExternalFloatAnchorIndex(core: *Core) !void {
+    return buildExternalFloatAnchorIndexWithLimit(
+        core,
+        MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
+    );
+}
+
+/// Build a sorted, per-row index for floats visible in one external grid.
+/// The flattened row buckets preserve the global layer order because entries
+/// are inserted into every covered row in sorted order.
+fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
+    const row_usizes = std.math.add(usize, offsets, write_offsets) catch return null;
+    const total_usizes = std.math.add(usize, row_usizes, refs) catch return null;
+    return std.math.mul(usize, total_usizes, @sizeOf(usize)) catch null;
+}
+
+fn externalFloatPersistentScratchCapacityByteSize(core: *const Core) ?usize {
+    const anchor_bytes = std.math.mul(
+        usize,
+        core.ext_float_anchor_entries.capacity,
+        @sizeOf(ExternalFloatAnchorEntry),
+    ) catch return null;
+    const entry_bytes = std.math.mul(
+        usize,
+        core.ext_float_entries.capacity,
+        @sizeOf(GridEntry),
+    ) catch return null;
+    const row_index_bytes = externalFloatRowIndexStorageByteSize(
+        core.ext_float_row_offsets.capacity,
+        core.ext_float_row_write_offsets.capacity,
+        core.ext_float_row_entry_indices.capacity,
+    ) orelse return null;
+    const entry_and_anchor = std.math.add(usize, anchor_bytes, entry_bytes) catch return null;
+    return std.math.add(usize, entry_and_anchor, row_index_bytes) catch null;
+}
+
+fn externalFloatRowIndexByteSize(rows: usize, refs: usize) ?usize {
+    const offset_count = std.math.add(usize, rows, 1) catch return null;
+    return externalFloatRowIndexStorageByteSize(offset_count, rows, refs);
+}
+
+fn clearExternalFloatRowIndexStorage(core: *Core) void {
+    core.ext_float_row_offsets.deinit(core.alloc);
+    core.ext_float_row_offsets = .empty;
+    core.ext_float_row_write_offsets.deinit(core.alloc);
+    core.ext_float_row_write_offsets = .empty;
+    core.ext_float_row_entry_indices.deinit(core.alloc);
+    core.ext_float_row_entry_indices = .empty;
+}
+
+fn releaseOversizedExternalFloatRowIndex(core: *Core, max_bytes: usize) void {
+    const retained_bytes = externalFloatRowIndexStorageByteSize(
+        core.ext_float_row_offsets.capacity,
+        core.ext_float_row_write_offsets.capacity,
+        core.ext_float_row_entry_indices.capacity,
+    ) orelse max_bytes +| 1;
+    if (retained_bytes <= max_bytes) return;
+    clearExternalFloatRowIndexStorage(core);
+}
+
+fn buildExternalFloatRowIndexWithLimits(
+    core: *Core,
+    anchor_entries: []const ExternalFloatAnchorEntry,
+    ext_info: ?grid_mod.ExternalGridInfo,
+    viewport_rows: u32,
+    viewport_cols: u32,
+    max_index_bytes: usize,
+    max_entry_bytes: usize,
+) !u64 {
+    core.ext_float_index_generation +%= 1;
+    const generation = core.ext_float_index_generation;
+
+    core.ext_float_entries.clearRetainingCapacity();
+    releaseOversizedExternalFloatScratch(
+        GridEntry,
+        &core.ext_float_entries,
+        core.alloc,
+        max_entry_bytes,
+    );
+    core.ext_float_row_offsets.clearRetainingCapacity();
+    core.ext_float_row_write_offsets.clearRetainingCapacity();
+    core.ext_float_row_entry_indices.clearRetainingCapacity();
+    core.ext_float_row_index_valid = false;
+    releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
+
+    const row_count: usize = viewport_rows;
+
+    const info = ext_info orelse return generation;
+    if (info.start_row < 0 or info.start_col < 0) return generation;
+    const ext_start_row: i64 = info.start_row;
+    const ext_start_col: i64 = info.start_col;
+
+    // anchor_entries is already in global layer order for this anchor. Count
+    // visible entries before allocating so invisible/missing/zero-cell floats
+    // do not contribute to the persistent high-water capacity.
+    const max_visible_entries = max_entry_bytes / @sizeOf(GridEntry);
+    var visible_entry_count: usize = 0;
+    for (anchor_entries) |anchor_entry| {
+        if (externalFloatVisibleRowRange(
+            core,
+            anchor_entry.entry.grid_id,
+            ext_start_row,
+            ext_start_col,
+            viewport_rows,
+            viewport_cols,
+        ) == null) continue;
+        if (visible_entry_count >= max_visible_entries) return error.TooManyWindowPlacements;
+        visible_entry_count += 1;
+    }
+    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, visible_entry_count);
+    for (anchor_entries) |anchor_entry| {
+        if (externalFloatVisibleRowRange(
+            core,
+            anchor_entry.entry.grid_id,
+            ext_start_row,
+            ext_start_col,
+            viewport_rows,
+            viewport_cols,
+        ) == null) continue;
+        core.ext_float_entries.appendAssumeCapacity(anchor_entry.entry);
+    }
+
+    var ref_count: usize = 0;
+    for (core.ext_float_entries.items) |entry| {
+        const range = externalFloatVisibleRowRange(
+            core,
+            entry.grid_id,
+            ext_start_row,
+            ext_start_col,
+            viewport_rows,
+            viewport_cols,
+        ) orelse continue;
+        ref_count = std.math.add(usize, ref_count, range.end - range.start) catch {
+            releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
+            return generation;
+        };
+    }
+
+    const required_bytes = externalFloatRowIndexByteSize(row_count, ref_count) orelse {
+        releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
+        return generation;
+    };
+    if (required_bytes > max_index_bytes) {
+        releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
+        return generation;
+    }
+    releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
+
+    const offset_count = row_count + 1;
+    const projected_retained_bytes = externalFloatRowIndexStorageByteSize(
+        @max(core.ext_float_row_offsets.capacity, offset_count),
+        @max(core.ext_float_row_write_offsets.capacity, row_count),
+        @max(core.ext_float_row_entry_indices.capacity, ref_count),
+    ) orelse max_index_bytes +| 1;
+    if (projected_retained_bytes > max_index_bytes) {
+        clearExternalFloatRowIndexStorage(core);
+    }
+    try core.ext_float_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
+    core.ext_float_row_offsets.items.len = offset_count;
+    @memset(core.ext_float_row_offsets.items, 0);
+
+    // Count references per visible row, then convert counts to offsets.
+    for (core.ext_float_entries.items) |entry| {
+        const range = externalFloatVisibleRowRange(
+            core,
+            entry.grid_id,
+            ext_start_row,
+            ext_start_col,
+            viewport_rows,
+            viewport_cols,
+        ) orelse continue;
+        for (range.start..range.end) |row| {
+            core.ext_float_row_offsets.items[row + 1] += 1;
+        }
+    }
+    for (1..core.ext_float_row_offsets.items.len) |i| {
+        core.ext_float_row_offsets.items[i] += core.ext_float_row_offsets.items[i - 1];
+    }
+
+    std.debug.assert(ref_count == core.ext_float_row_offsets.items[row_count]);
+    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
+    core.ext_float_row_entry_indices.items.len = ref_count;
+    try core.ext_float_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
+    core.ext_float_row_write_offsets.items.len = row_count;
+    @memcpy(
+        core.ext_float_row_write_offsets.items,
+        core.ext_float_row_offsets.items[0..row_count],
+    );
+
+    // Filling in global sorted order keeps every row bucket sorted without a
+    // second per-row sort.
+    for (core.ext_float_entries.items, 0..) |entry, entry_index| {
+        const range = externalFloatVisibleRowRange(
+            core,
+            entry.grid_id,
+            ext_start_row,
+            ext_start_col,
+            viewport_rows,
+            viewport_cols,
+        ) orelse continue;
+        for (range.start..range.end) |row| {
+            const dst = core.ext_float_row_write_offsets.items[row];
+            core.ext_float_row_entry_indices.items[dst] = entry_index;
+            core.ext_float_row_write_offsets.items[row] = dst + 1;
+        }
+    }
+
+    core.ext_float_row_index_valid = true;
+    return generation;
+}
+
+fn buildExternalFloatRowIndexWithLimit(
+    core: *Core,
+    anchor_entries: []const ExternalFloatAnchorEntry,
+    ext_info: ?grid_mod.ExternalGridInfo,
+    viewport_rows: u32,
+    viewport_cols: u32,
+    max_index_bytes: usize,
+) !u64 {
+    return buildExternalFloatRowIndexWithLimits(
+        core,
+        anchor_entries,
+        ext_info,
+        viewport_rows,
+        viewport_cols,
+        max_index_bytes,
+        MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
+    );
+}
+
+fn buildExternalFloatRowIndex(
+    core: *Core,
+    anchor_entries: []const ExternalFloatAnchorEntry,
+    ext_info: ?grid_mod.ExternalGridInfo,
+    viewport_rows: u32,
+    viewport_cols: u32,
+) !u64 {
+    return buildExternalFloatRowIndexWithLimits(
+        core,
+        anchor_entries,
+        ext_info,
+        viewport_rows,
+        viewport_cols,
+        MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
+        MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
+    );
 }
 
 /// Generate and send vertices for all external grids.
@@ -4719,6 +5656,21 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
 pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_grid_id: ?i64) void {
     self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d} force={} only_grid={?d}\n", .{ self.known_external_grids.count(), force_render, only_grid_id });
 
+    // Standalone callers own the flush-local anchor index they build. onFlush
+    // may have built it earlier for row-scroll dispatch; in that case its
+    // transaction-final defer invalidates it after this function returns.
+    var owns_anchor_index = false;
+    defer {
+        if (owns_anchor_index) self.ext_float_anchor_index_valid = false;
+    }
+
+    // The overlay map is visible only while generateRowVertices consumes one
+    // fully-composed row. In particular, frontend row callbacks run with this
+    // cleared so a re-entrant external-grid flush cannot observe stale row
+    // state from the outer invocation.
+    self.flush_float_overlay = null;
+    defer self.flush_float_overlay = null;
+
     // Cache glow state once — doesn't change while grid_mu is held.
     const ext_glow_enabled = self.glow_enabled.load(.acquire);
     const ext_glow_all = self.glow_all;
@@ -4729,6 +5681,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const cursor_rev = self.grid.cursor_rev;
     const cursor_changed = (cursor_rev != self.last_ext_cursor_rev);
     const cursor_grid_changed = (cursor_grid != self.last_ext_cursor_grid);
+    var ext_cursor_retry_required = false;
 
     self.log.write("[sendExternalGridVertices] cursor_grid={d} cursor_rev={d} last_grid={d} last_rev={d} changed={} grid_changed={}\n", .{
         cursor_grid, cursor_rev, self.last_ext_cursor_grid, self.last_ext_cursor_rev, cursor_changed, cursor_grid_changed,
@@ -4749,10 +5702,28 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const cursor_grid_pending = self.grid.external_grids.contains(cursor_grid) and
         !self.known_external_grids.contains(cursor_grid);
     defer {
-        if (has_external_grids and !cursor_grid_pending) {
-            self.last_ext_cursor_grid = cursor_grid;
+        // A per-grid callback below (e.g. Windows external row-buffer OOM)
+        // may call zonvie_core_abort_flush mid-loop. The frontend cancels
+        // this whole bracket on abort, so the external cursor update just
+        // computed above was never actually committed — skip syncing these
+        // so cursor_changed/cursor_grid_changed still read true on the next
+        // call and the cancelled update gets resent instead of silently
+        // dropped.
+        if (!self.flush_aborted and !ext_cursor_retry_required) {
+            if (has_external_grids and !cursor_grid_pending) {
+                self.last_ext_cursor_grid = cursor_grid;
+            }
+            self.last_ext_cursor_rev = cursor_rev;
+            // Only a full scan (only_grid_id == null, i.e. every external
+            // grid was actually re-checked) may consume this. A filtered,
+            // single-grid call (e.g. scroll-optimization's only_grid_id)
+            // can run before the real retry and would otherwise clear the
+            // flag having re-checked only ONE grid, silently skipping the
+            // rest — the exact case this flag exists to cover.
+            if (only_grid_id == null) {
+                self.force_ext_cursor_recheck = false;
+            }
         }
-        self.last_ext_cursor_rev = cursor_rev;
     }
 
     // Check if cursor is on a non-existent external grid (e.g., closed cmdline)
@@ -4831,14 +5802,21 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         /// Emit a solid-color quad (caller guarantees 6 vertices of capacity).
         fn pushSolidQuadAssumeCapacity(
             out: *std.ArrayListUnmanaged(c_api.Vertex),
-            x0: f32, y0: f32, x1: f32, y1: f32,
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
             col: [4]f32,
-            vw: f32, vh: f32,
+            vw: f32,
+            vh: f32,
             grid_id: i64,
             base_deco_flags: u32,
         ) void {
             const pts = ndc4(x0, y0, x1, y1, vw, vh);
-            const p0 = pts[0]; const p1 = pts[1]; const p2 = pts[2]; const p3 = pts[3];
+            const p0 = pts[0];
+            const p1 = pts[1];
+            const p2 = pts[2];
+            const p3 = pts[3];
 
             const v = out.addManyAsSliceAssumeCapacity(6);
 
@@ -4850,7 +5828,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
             v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
         }
-
     };
 
     // Default background for blur transparency
@@ -4881,6 +5858,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // notifyExternalWindowChanges adds them to known_external_grids.
     var ext_it = self.grid.external_grids.keyIterator();
     while (ext_it.next()) |grid_id_ptr| {
+        // A prior grid this loop may have aborted the flush (allocation
+        // failure). The frontend cancels its whole bracket on abort, so
+        // composing further grids would be discarded work — matches the
+        // equivalent check in the main row-mode loop.
+        if (self.flush_aborted) break;
+
         const grid_id = grid_id_ptr.*;
 
         // Filter by specific grid if requested (for scroll optimization)
@@ -4894,17 +5877,22 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // 1. Grid content is dirty, OR
         // 2. Cursor moved to/from this grid (grid changed), OR
         // 3. Cursor moved within this grid (cursor changed while on this grid)
-        const cursor_on_this_grid = (cursor_grid == grid_id);
+        const cursor_on_this_grid = externalCursorVisibleOnGrid(&self.grid, grid_id);
         const cursor_was_on_this_grid = (self.last_ext_cursor_grid == grid_id);
-        const cursor_affected = cursor_grid_changed and (cursor_on_this_grid or cursor_was_on_this_grid);
+        // force_ext_cursor_recheck (force resend): re-check EVERY external
+        // grid's cursor state once, since a prior failed flush may have
+        // left last_ext_cursor_grid naming the wrong (or right, but
+        // unconfirmed) grid — see its doc comment.
+        const cursor_affected = (cursor_changed and (cursor_on_this_grid or cursor_was_on_this_grid)) or
+            self.force_ext_cursor_recheck;
         const cursor_moved_within = cursor_changed and cursor_on_this_grid and !cursor_grid_changed;
 
         // Check if this grid needs forced redraw because cursor left closed cmdline
         const force_redraw_this = need_force_redraw_last and (grid_id == self.last_ext_cursor_grid);
 
         self.log.write("[ext_cursor_check] grid_id={d} dirty={} cursor_on={} cursor_was={} affected={} moved_within={} force={} force_closed={} cursor_grid={d} last_grid={d} rev={d} last_rev={d}\n", .{
-            grid_id, sg.dirty, cursor_on_this_grid, cursor_was_on_this_grid, cursor_affected, cursor_moved_within, force_render, force_redraw_this,
-            cursor_grid, self.last_ext_cursor_grid, cursor_rev, self.last_ext_cursor_rev,
+            grid_id,     sg.dirty,                  cursor_on_this_grid, cursor_was_on_this_grid,  cursor_affected, cursor_moved_within, force_render, force_redraw_this,
+            cursor_grid, self.last_ext_cursor_grid, cursor_rev,          self.last_ext_cursor_rev,
         });
 
         // Skip if no update needed (unless force_render is set or forced due to closed grid)
@@ -4924,6 +5912,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         const viewport_rows = if (target) |t| t.rows else sg.rows;
         const grid_w: f32 = @as(f32, @floatFromInt(viewport_cols)) * cellW;
         const grid_h: f32 = @as(f32, @floatFromInt(viewport_rows)) * cellH;
+        const cursor_row: ?u32 = if (externalCursorVisibleOnGrid(&self.grid, grid_id))
+            self.grid.cursor_row
+        else
+            null;
+        const cursor_col = self.grid.cursor_col;
+        var ext_saw_atlas_reset: bool = false;
+        var ext_had_row_error: bool = false;
+        var ext_had_glyph_miss: bool = false;
+        var regen_count: u32 = 0;
+        var use_ext_scroll_fast_path = false;
 
         // Debug: count non-space cells
         // (glyph statistics now tracked inside generateRowVertices; retained
@@ -4941,523 +5939,636 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Pass 2: All glyphs on top
         // This prevents glyphs that extend beyond cell bounds from being clipped by adjacent backgrounds.
 
-        // Pre-allocate capacity: 6 verts/cell for bg + 6 verts/cell for glyphs + 6 for cursor
-        const n_cells = @as(usize, sg.rows) * @as(usize, sg.cols);
-        const est_verts = n_cells * 12 + 6;
-        ext_verts.ensureTotalCapacity(self.alloc, est_verts) catch {
-            self.log.write("[ext_grid] WARN: failed to pre-allocate {d} vertices\n", .{est_verts});
-            continue; // Skip this grid if we can't allocate
-        };
+        // Cursor-only changes must not allocate/scan an entire external grid.
+        // The row pipeline below is needed only when content itself is dirty.
+        if (sg.dirty or need_full_redraw) {
+            const ext_info = self.grid.external_grids.get(grid_id);
 
-        // Create composite cell array - copy external grid cells and overlay float windows
-        // This approach ensures float windows completely overwrite (not blend with) the underlying cells
-        const composite_cells = self.alloc.alloc(grid_mod.Cell, n_cells) catch {
-            self.log.write("[ext_grid] WARN: failed to allocate composite cells for {d} cells\n", .{n_cells});
-            continue;
-        };
-        defer self.alloc.free(composite_cells);
-
-        // Float overlay overflow: reuse persistent map (cleared each ext grid).
-        self.flush_float_overlay_buf.clearRetainingCapacity();
-
-        // Copy external grid cells to composite array
-        if (sg.cells.len >= n_cells) {
-            @memcpy(composite_cells[0..n_cells], sg.cells[0..n_cells]);
-        } else {
-            // Fill with defaults if source is smaller
-            for (composite_cells) |*c| {
-                c.* = .{ .cp = ' ', .hl = 0 };
+            if (!self.ext_float_anchor_index_valid) {
+                buildExternalFloatAnchorIndex(self) catch {
+                    ext_had_row_error = true;
+                    self.flush_aborted = true;
+                    continue;
+                };
+                owns_anchor_index = true;
             }
-            @memcpy(composite_cells[0..sg.cells.len], sg.cells);
-        }
+            const anchor_entries = externalFloatAnchorEntries(
+                self.ext_float_anchor_entries.items,
+                grid_id,
+            );
 
-        // Overlay float windows anchored to this external grid into composite_cells
-        const ext_info = self.grid.external_grids.get(grid_id);
-        self.log.write("[ext_overlay_debug] grid_id={d} ext_info_exists={} win_pos_count={d}\n", .{
-            grid_id, ext_info != null, self.grid.win_pos.count(),
-        });
+            // Build float layer order and visible-row buckets once for this
+            // anchor grid. A callback can re-enter external flushing and reuse
+            // the scratch; the row loop below detects that by generation and
+            // rebuilds only on the rare re-entrant path.
+            var ext_float_index_generation = buildExternalFloatRowIndex(
+                self,
+                anchor_entries,
+                ext_info,
+                viewport_rows,
+                sg.cols,
+            ) catch {
+                ext_had_row_error = true;
+                self.flush_aborted = true;
+                continue;
+            };
 
-        var overlay_cell_count: u32 = 0;
-        if (ext_info) |info| {
-            self.log.write("[ext_overlay_debug] ext grid {d}: start_row={d} start_col={d}\n", .{
-                grid_id, info.start_row, info.start_col,
-            });
-            if (info.start_row >= 0 and info.start_col >= 0) {
-                const ext_start_row: i32 = info.start_row;
-                const ext_start_col: i32 = info.start_col;
+            // Row-based vertex generation: process each row independently
+            // This matches the main window's row-based approach for better partial updates
+            const ext_margins = self.grid.getViewportMargins(grid_id);
 
-                // Scan win_pos for float windows anchored to this external grid
-                var win_it = self.grid.win_pos.iterator();
-                while (win_it.next()) |entry| {
-                    const float_grid_id = entry.key_ptr.*;
-                    const float_pos = entry.value_ptr.*;
+            const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
 
-                    self.log.write("[ext_overlay_debug] checking win_pos: float_grid={d} anchor={d} pos=({d},{d}) (target ext={d})\n", .{
-                        float_grid_id, float_pos.anchor_grid, float_pos.row, float_pos.col, grid_id,
-                    });
+            var ext_retried: bool = false;
 
-                    // Check if this float window is anchored to our external grid
-                    if (float_pos.anchor_grid != grid_id) continue;
+            // Float windows anchored to this grid suppress on_grid_row_scroll in
+            // onFlush (GPU-blitting old pixels would shift stale overlay content),
+            // so the frontend performs no blit or row slot remap. The fast path
+            // must be ineligible and all shifted rows fully regenerated.
+            const ext_has_float_overlay = anchor_entries.len != 0;
 
-                    // Get the float window's sub_grid
-                    const float_sg = self.grid.sub_grids.get(float_grid_id) orelse {
-                        self.log.write("[ext_overlay_debug] WARN: float grid {d} has no sub_grid!\n", .{float_grid_id});
-                        continue;
+            // Determine external grid scroll fast path eligibility (before retry loop).
+            // When eligible, we skip non-dirty rows even when sg.dirty is set,
+            // because scroll() now only marks vacated rows dirty.
+            const ext_scroll_fast_path: bool = blk: {
+                if (force_render or need_full_redraw) break :blk false;
+                // Without this callback the consumer has no way to shift its
+                // retained row slots. Regenerate the whole viewport instead
+                // of sending only the vacated band.
+                if (self.cb.on_grid_row_scroll == null) break :blk false;
+                // A newly/re-opened external grid has no frontend seed until
+                // its lifecycle callback is committed. Regenerate all rows
+                // instead of asking a not-yet-existing surface to shift them.
+                if (!self.known_external_grids.contains(grid_id)) break :blk false;
+                const op = sg.last_scroll_op orelse break :blk false;
+                if (sg.scroll_fast_path_blocked) break :blk false;
+                if (ext_has_float_overlay) break :blk false;
+                _ = externalScrollFastPathRegion(
+                    op,
+                    sg.rows,
+                    sg.cols,
+                    viewport_rows,
+                    viewport_cols,
+                ) orelse break :blk false;
+                break :blk true;
+            };
+
+            // When a scroll happened but the fast path is not usable (multiple
+            // scrolls in one batch, scroll delta > 1, partial-width region,
+            // or float overlay suppressed the row scroll callback), the
+            // frontend won't receive on_grid_row_scroll (no row slot remap) and
+            // GPU scroll copy is disabled for external grids. All shifted rows
+            // need full vertex regeneration — dirty_rows only covers vacated
+            // rows. Any last_scroll_op the fast path rejected (not just the
+            // multi-scroll/float/abs(rows)>1 cases previously enumerated here)
+            // falls into this same "frontend can't shift it visually" bucket —
+            // e.g. a partial-width, abs(rows)==1 scroll, which ext_scroll_fast_path
+            // rejects (left/right != full width) but this condition used to miss,
+            // leaving the moved region's stale pre-scroll content on the GPU
+            // forever (only the vacated band was ever marked dirty).
+            const ext_scroll_needs_full_regen: bool =
+                !ext_scroll_fast_path and sg.last_scroll_op != null;
+
+            // Cursor is rendered as a separate layer (after row loop), NOT inline
+            // in row vertices. This eliminates cursor ghost artifacts during GPU
+            // scroll copy. No prev_cursor_row tracking needed for row regeneration.
+
+            // Build regen_rows set for scroll fast path (mirrors global grid approach).
+            // Pre-compute which rows need regeneration: dirty_rows only (no cursor rows).
+            var regen_rows: [12]u32 = undefined;
+            use_ext_scroll_fast_path = ext_scroll_fast_path;
+
+            if (ext_scroll_fast_path) {
+                // Add all dirty rows within viewport bounds.
+                // Rows beyond viewport_rows are invisible (outside NDC viewport)
+                // and should not be included in the regen set.
+                for (0..viewport_rows) |ri| {
+                    const r: u32 = @intCast(ri);
+                    if (sg.dirty_rows.bit_length > r and sg.dirty_rows.isSet(ri)) {
+                        if (regen_count < regen_rows.len) {
+                            regen_rows[regen_count] = r;
+                            regen_count += 1;
+                        } else {
+                            // Too many dirty rows for fast path — fall back
+                            use_ext_scroll_fast_path = false;
+                            break;
+                        }
+                    }
+                }
+                // When viewport_rows < sg.rows (margin rows present), the Neovim
+                // dirty bitmap marks the out-of-bounds vacated row (e.g. row 44
+                // for sg.rows=45, viewport_rows=44). The frontend scroll callback
+                // receives the clamped region, so its vacated row is within the
+                // viewport. Add the clamped vacated row to regen if not already
+                // present. Without this, the vacated row gets no vertex data and
+                // renders blank after the GPU scroll blit.
+                if (use_ext_scroll_fast_path and viewport_rows < sg.rows) {
+                    const op = sg.last_scroll_op.?;
+                    const clamped_bot = @min(op.bot, viewport_rows);
+                    const vacated: u32 = if (op.rows > 0) clamped_bot -| 1 else op.top;
+                    var found = false;
+                    for (regen_rows[0..regen_count]) |rr| {
+                        if (rr == vacated) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        if (regen_count < regen_rows.len) {
+                            regen_rows[regen_count] = vacated;
+                            regen_count += 1;
+                        } else {
+                            use_ext_scroll_fast_path = false;
+                        }
+                    }
+                }
+            }
+
+            ext_retry: while (true) {
+                if (ext_retried) {
+                    // Reset per-pass state for clean retry
+                    cache.reset(); // Resets perf counters + hl_valid (hl_valid reset is harmless)
+                    ext_had_row_error = false;
+                    ext_had_glyph_miss = false;
+                }
+                const ext_effective_rebuild = ext_retried;
+
+                // Iterate only up to viewport_rows (not sg.rows).
+                // Rows beyond viewport_rows are outside the NDC viewport and
+                // produce clipped vertices. Matching the vertex loop to the
+                // viewport ensures the frontend receives data only for drawable
+                // rows — the same invariant the main window always satisfies.
+                for (0..viewport_rows) |row_idx| {
+                    // A prior row_cb call this loop may have called
+                    // zonvie_core_abort_flush (e.g. Windows external row-buffer
+                    // OOM). Stop composing further rows in this grid — the
+                    // frontend cancels its whole bracket on abort, so continuing
+                    // would be discarded work — mirrors the identical check in the
+                    // main grid's row-mode loop.
+                    if (self.flush_aborted) break;
+
+                    const row: u32 = @intCast(row_idx);
+
+                    if (self.ext_float_index_generation != ext_float_index_generation) {
+                        const current_anchor_entries = externalFloatAnchorEntries(
+                            self.ext_float_anchor_entries.items,
+                            grid_id,
+                        );
+                        ext_float_index_generation = buildExternalFloatRowIndex(
+                            self,
+                            current_anchor_entries,
+                            ext_info,
+                            viewport_rows,
+                            sg.cols,
+                        ) catch {
+                            ext_had_row_error = true;
+                            self.flush_aborted = true;
+                            break :ext_retry;
+                        };
+                    }
+
+                    // Row skip logic — mirrors global grid approach:
+                    // Fast path: only compose rows in regen set (dirty + cursor rows).
+                    // Fallback: check dirty_rows bitmap.
+                    // When scroll happened but fast path is ineligible, regenerate all
+                    // rows because the frontend has no GPU blit or row slot remap to
+                    // shift the non-vacated rows visually.
+                    if (use_ext_scroll_fast_path and !ext_retried) {
+                        var in_regen = false;
+                        for (regen_rows[0..regen_count]) |rr| {
+                            if (rr == row) {
+                                in_regen = true;
+                                break;
+                            }
+                        }
+                        if (!in_regen) continue;
+                    } else if (!need_full_redraw and !ext_effective_rebuild and !ext_scroll_needs_full_regen) {
+                        if (sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(@as(usize, row))) {
+                            continue;
+                        }
+                    }
+
+                    // Clear buffer for this row
+                    ext_verts.clearRetainingCapacity();
+
+                    // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
+                    const row_est = @as(usize, sg.cols) * 24 + 12;
+                    ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
+                        ext_had_row_error = true;
+                        // Whole-flush abort (see the ensureTotalCapacity/alloc
+                        // catches earlier in this function) — the frontend must
+                        // cancel this bracket rather than commit it with this row
+                        // silently missing. Stop composing further rows for this
+                        // grid; the outer grid loop's flush_aborted check stops
+                        // further grids too.
+                        self.flush_aborted = true;
+                        break :ext_retry;
                     };
 
-                    // Calculate float window position relative to this external grid
-                    const float_row_in_ext: i32 = @as(i32, @intCast(float_pos.row)) - ext_start_row;
-                    const float_col_in_ext: i32 = @as(i32, @intCast(float_pos.col)) - ext_start_col;
+                    // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
+                    self.row_cells.clearRetainingCapacity();
+                    self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
+                        ext_had_row_error = true;
+                        self.flush_aborted = true;
+                        break :ext_retry;
+                    };
+                    self.row_cells.setLen(sg.cols);
 
-                    self.log.write("[ext_overlay_cells] FOUND anchored float: grid={d} size=({d}x{d}) rel_pos=({d},{d}) cells_len={d}\n", .{
-                        float_grid_id, float_sg.rows, float_sg.cols, float_row_in_ext, float_col_in_ext, float_sg.cells.len,
-                    });
+                    // Resolve the base external-grid row directly into the
+                    // row scratch. Work is proportional to the rows selected
+                    // above; clean rows never copy or scan their cells.
+                    const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
+                    for (0..sg.cols) |c| {
+                        const cell_idx = row_start + c;
+                        const cell: grid_mod.Cell = if (cell_idx < sg.cells.len)
+                            sg.cells[cell_idx]
+                        else
+                            .{ .cp = ' ', .hl = 0 };
+                        const attr = cache.getAttr(&self.hl, cell.hl);
+                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                        if (ext_glow_enabled) {
+                            self.row_cells.glow_arr.items[c] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                        }
+                    }
+                    setViewportRowDecoFlags(
+                        self.row_cells.deco_base_flags.items[0..sg.cols],
+                        row,
+                        sg.rows,
+                        sg.cols,
+                        ext_margins,
+                    );
 
-                    // Sample first few cells from float_sg for debugging
-                    if (float_sg.cells.len > 0) {
-                        const sample_count = @min(float_sg.cells.len, 5);
-                        for (0..sample_count) |i| {
-                            const c = float_sg.cells[i];
-                            self.log.write("[ext_overlay_cells] float_sg.cells[{d}]: cp=0x{x} hl={d}\n", .{ i, c.cp, c.hl });
+                    // Rebuild the row-local float state every time. A row
+                    // callback may re-enter this function and reuse both
+                    // persistent containers; the next outer row must not rely
+                    // on their pre-callback contents.
+                    self.flush_float_overlay_buf.clearRetainingCapacity();
+                    self.flush_float_overlay_buf.ensureTotalCapacity(self.alloc, sg.cols) catch {
+                        ext_had_row_error = true;
+                        self.flush_aborted = true;
+                        break :ext_retry;
+                    };
+
+                    if (ext_info) |info| {
+                        if (info.start_row >= 0 and info.start_col >= 0) {
+                            const ext_start_row: i64 = info.start_row;
+                            const row_i64: i64 = row;
+                            const ext_start_col: i64 = info.start_col;
+                            const ext_cols_i64: i64 = sg.cols;
+                            const row_usize: usize = @intCast(row);
+                            const has_row_index = self.ext_float_row_index_valid;
+                            var entry_cursor: usize = if (has_row_index)
+                                self.ext_float_row_offsets.items[row_usize]
+                            else
+                                0;
+                            const entry_end: usize = if (has_row_index)
+                                self.ext_float_row_offsets.items[row_usize + 1]
+                            else
+                                self.ext_float_entries.items.len;
+                            while (entry_cursor < entry_end) : (entry_cursor += 1) {
+                                const entry_index = if (has_row_index)
+                                    self.ext_float_row_entry_indices.items[entry_cursor]
+                                else
+                                    entry_cursor;
+                                const fent = self.ext_float_entries.items[entry_index];
+                                if (!has_row_index) {
+                                    const visible_rows = externalFloatVisibleRowRange(
+                                        self,
+                                        fent.grid_id,
+                                        ext_start_row,
+                                        ext_start_col,
+                                        viewport_rows,
+                                        sg.cols,
+                                    ) orelse continue;
+                                    if (row_usize < visible_rows.start or row_usize >= visible_rows.end) continue;
+                                }
+                                const float_pos = self.grid.win_pos.get(fent.grid_id) orelse continue;
+                                const float_sg = self.grid.sub_grids.get(fent.grid_id) orelse continue;
+                                const float_margins = self.grid.getViewportMargins(fent.grid_id);
+                                const float_row_in_ext = @as(i64, float_pos.row) - ext_start_row;
+                                const float_src_row_i64 = row_i64 - float_row_in_ext;
+                                if (float_src_row_i64 < 0 or float_src_row_i64 >= @as(i64, float_sg.rows)) continue;
+                                const float_src_row: u32 = @intCast(float_src_row_i64);
+
+                                const float_col_in_ext = @as(i64, float_pos.col) - ext_start_col;
+                                const target_col_start = @max(@as(i64, 0), float_col_in_ext);
+                                const target_col_end = @min(ext_cols_i64, float_col_in_ext + @as(i64, float_sg.cols));
+                                if (target_col_start >= target_col_end) continue;
+
+                                var target_col_i64 = target_col_start;
+                                while (target_col_i64 < target_col_end) : (target_col_i64 += 1) {
+                                    const target_col: u32 = @intCast(target_col_i64);
+                                    const float_src_col: u32 = @intCast(target_col_i64 - float_col_in_ext);
+                                    const float_cell_idx = @as(usize, float_src_row) * @as(usize, float_sg.cols) + @as(usize, float_src_col);
+                                    const cell: grid_mod.Cell = if (float_cell_idx < float_sg.cells.len)
+                                        float_sg.cells[float_cell_idx]
+                                    else
+                                        .{ .cp = ' ', .hl = 0 };
+                                    const attr = cache.getAttr(&self.hl, cell.hl);
+                                    // Keep the source grid identity as a shaping
+                                    // boundary: base and float text must never
+                                    // form one ligature/kerning run merely
+                                    // because their resolved styles match.
+                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                                    self.row_cells.deco_base_flags.items[target_col] = if (viewportCellScrollable(
+                                        float_src_row,
+                                        float_src_col,
+                                        float_sg.rows,
+                                        float_sg.cols,
+                                        float_margins,
+                                    )) c_api.DECO_SCROLLABLE else 0;
+                                    if (ext_glow_enabled) {
+                                        self.row_cells.glow_arr.items[target_col] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                    }
+
+                                    // Every overlaid cell gets an entry, including
+                                    // null overflow, so the float always shadows
+                                    // any base-grid emoji/combining overflow.
+                                    self.flush_float_overlay_buf.putAssumeCapacity(
+                                        .{ .row = row, .col = target_col },
+                                        self.grid.getOverflow(fent.grid_id, float_src_row, float_src_col),
+                                    );
+                                }
+                            }
                         }
                     }
 
-                    // Copy float window cells into composite array (overwriting underlying cells)
-                    for (0..float_sg.rows) |fr_idx| {
-                        const fr: u32 = @intCast(fr_idx);
-                        const target_row = float_row_in_ext + @as(i32, @intCast(fr));
-                        if (target_row < 0 or target_row >= @as(i32, @intCast(sg.rows))) continue;
+                    // The map pointer is valid only for synchronous row
+                    // generation. Clear it before any frontend row callback;
+                    // defer also covers allocation/rasterization errors.
+                    const row_gen_stats = row_gen: {
+                        self.flush_float_overlay = &self.flush_float_overlay_buf;
+                        defer self.flush_float_overlay = null;
+                        break :row_gen generateRowVertices(self, .{
+                            .row = row,
+                            .cols = sg.cols,
+                            .vw = grid_w,
+                            .vh = grid_h,
+                            .cell_w = cellW,
+                            .cell_h = cellH,
+                            .top_pad = topPad,
+                            .default_bg = default_bg,
+                            .blur_enabled = self.blur_enabled,
+                            .background_opacity = self.background_opacity,
+                            .is_cmdline = is_cmdline,
+                            .glow_enabled = ext_glow_enabled,
+                        }, ext_verts) catch {
+                            ext_verts.clearRetainingCapacity();
+                            ext_had_row_error = true;
+                            self.flush_aborted = true;
+                            break :ext_retry;
+                        };
+                    };
+                    ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
+                    // Cursor rendering moved to separate layer (after row loop)
 
-                        for (0..float_sg.cols) |fc_idx| {
-                            const fc: u32 = @intCast(fc_idx);
-                            const target_col = float_col_in_ext + @as(i32, @intCast(fc));
-                            if (target_col < 0 or target_col >= @as(i32, @intCast(sg.cols))) continue;
-
-                            const float_cell_idx: usize = @as(usize, fr) * @as(usize, float_sg.cols) + @as(usize, fc);
-                            if (float_cell_idx >= float_sg.cells.len) continue;
-
-                            const target_idx: usize = @as(usize, @intCast(target_row)) * @as(usize, sg.cols) + @as(usize, @intCast(target_col));
-                            if (target_idx >= n_cells) continue;
-
-                            // Overwrite composite cell with float window cell
-                            composite_cells[target_idx] = float_sg.cells[float_cell_idx];
-
-                            // Record float overlay for emoji lookup during row composition.
-                            // Always record (even without overflow) so the float shadows
-                            // any base grid overflow at this position. put() overwrites
-                            // so the last float wins (matching composite_cells semantics).
-                            self.flush_float_overlay_buf.put(self.alloc, .{
-                                .row = @intCast(target_row),
-                                .col = @intCast(target_col),
-                            }, self.grid.getOverflow(float_grid_id, fr, fc)) catch {};
-
-                            overlay_cell_count += 1;
+                    // CHECK: atlas reset happened during glyph processing for this row.
+                    // Already-sent rows have stale UVs → need to restart or abort.
+                    if (self.atlas_reset_during_flush) {
+                        ext_saw_atlas_reset = true;
+                        ext_saw_atlas_reset_any = true;
+                        self.atlas_reset_during_flush = false; // Clear for retry
+                        // A reset here can also invalidate glyphs the MAIN grid already
+                        // used earlier in this same flush (main grid always renders
+                        // before this deferred external-grid pass). Mark it so it
+                        // regenerates against the fresh atlas on the next flush.
+                        self.grid.markAllDirty();
+                        self.invalidateScrollCache();
+                        if (!ext_retried) {
+                            ext_retried = true;
+                            use_ext_scroll_fast_path = false; // Retry needs full redraw
+                            continue :ext_retry; // Restart this grid's row loop from row 0
                         }
+                        // 2nd reset: clear all sent rows (match global grid behavior)
+                        for (0..viewport_rows) |clear_ri| {
+                            // A clear callback can itself call zonvie_core_abort_flush
+                            // (e.g. Windows COW detach failure) — stop issuing further
+                            // clear callbacks into a flush that's already being
+                            // discarded, matching the abort check elsewhere in this loop.
+                            if (self.flush_aborted) break;
+                            row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
+                        }
+                        break; // Abort remaining rows
                     }
 
-                    self.log.write("[ext_overlay_cells] Copied {d} cells from float grid {d}\n", .{ overlay_cell_count, float_grid_id });
-                }
-            }
-        }
-
-        self.log.write("[ext_overlay_summary] grid_id={d} total_overlay_cells={d}\n", .{ grid_id, overlay_cell_count });
-
-        // Sample composite_cells after overlay for debugging
-        if (overlay_cell_count > 0) {
-            // Log a few cells from the overlay region
-            const sample_row: usize = 0;
-            for (0..@min(sg.cols, 10)) |c| {
-                const idx = sample_row * @as(usize, sg.cols) + c;
-                if (idx < n_cells) {
-                    const cell = composite_cells[idx];
-                    self.log.write("[ext_overlay_result] composite[row=0,col={d}]: cp=0x{x} hl={d}\n", .{ c, cell.cp, cell.hl });
-                }
-            }
-        }
-
-        // Row-based vertex generation: process each row independently
-        // This matches the main window's row-based approach for better partial updates
-        const ext_margins = self.grid.getViewportMargins(grid_id);
-
-        const cursor_row: ?u32 = if (self.grid.cursor_grid == grid_id and self.grid.cursor_valid and self.grid.cursor_visible)
-            self.grid.cursor_row
-        else
-            null;
-        const cursor_col = self.grid.cursor_col;
-        const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
-
-        var ext_saw_atlas_reset: bool = false;
-        var ext_retried: bool = false;
-        var ext_had_row_error: bool = false;
-
-        // Determine external grid scroll fast path eligibility (before retry loop).
-        // When eligible, we skip non-dirty rows even when sg.dirty is set,
-        // because scroll() now only marks vacated rows dirty.
-        const ext_scroll_fast_path: bool = blk: {
-            if (force_render or need_full_redraw) break :blk false;
-            const op = sg.last_scroll_op orelse break :blk false;
-            if (sg.scroll_fast_path_blocked) break :blk false;
-            const abs_rows: u32 = @intCast(@abs(op.rows));
-            if (abs_rows != 1) break :blk false;
-            if (op.cols != 0) break :blk false;
-            const region_height: u32 = op.bot -| op.top;
-            if (region_height <= 1) break :blk false;
-            if (op.left != 0 or op.right != sg.cols) break :blk false;
-            if (op.bot > sg.rows) break :blk false;
-            break :blk true;
-        };
-
-        // When a scroll happened but the fast path is not usable (multiple
-        // scrolls in one batch, or scroll delta > 1), the frontend won't
-        // receive on_grid_row_scroll (no row slot remap) and GPU scroll
-        // copy is disabled for external grids. All shifted rows need full
-        // vertex regeneration — dirty_rows only covers vacated rows.
-        const ext_scroll_needs_full_regen: bool =
-            !ext_scroll_fast_path and (sg.scroll_fast_path_blocked or
-            (if (sg.last_scroll_op) |op| @abs(op.rows) > 1 else false));
-
-        // Cursor is rendered as a separate layer (after row loop), NOT inline
-        // in row vertices. This eliminates cursor ghost artifacts during GPU
-        // scroll copy. No prev_cursor_row tracking needed for row regeneration.
-
-        // Build regen_rows set for scroll fast path (mirrors global grid approach).
-        // Pre-compute which rows need regeneration: dirty_rows only (no cursor rows).
-        var regen_rows: [12]u32 = undefined;
-        var regen_count: u32 = 0;
-        var use_ext_scroll_fast_path = ext_scroll_fast_path;
-
-        if (ext_scroll_fast_path) {
-            // Add all dirty rows within viewport bounds.
-            // Rows beyond viewport_rows are invisible (outside NDC viewport)
-            // and should not be included in the regen set.
-            for (0..viewport_rows) |ri| {
-                const r: u32 = @intCast(ri);
-                if (sg.dirty_rows.bit_length > r and sg.dirty_rows.isSet(ri)) {
-                    if (regen_count < regen_rows.len) {
-                        regen_rows[regen_count] = r;
-                        regen_count += 1;
-                    } else {
-                        // Too many dirty rows for fast path — fall back
-                        use_ext_scroll_fast_path = false;
-                        break;
+                    // Send this row's vertices
+                    // Pass viewport dimensions (target size) instead of sg dimensions so that
+                    // the frontend's scroll offset calculation matches the NDC viewport used here.
+                    if (ext_verts.items.len > 0) {
+                        row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
                     }
                 }
+                break :ext_retry; // Normal exit from retry loop
             }
-            // When viewport_rows < sg.rows (margin rows present), the Neovim
-            // dirty bitmap marks the out-of-bounds vacated row (e.g. row 44
-            // for sg.rows=45, viewport_rows=44). The frontend scroll callback
-            // receives the clamped region, so its vacated row is within the
-            // viewport. Add the clamped vacated row to regen if not already
-            // present. Without this, the vacated row gets no vertex data and
-            // renders blank after the GPU scroll blit.
-            if (use_ext_scroll_fast_path and viewport_rows < sg.rows) {
-                const op = sg.last_scroll_op.?;
-                const clamped_bot = @min(op.bot, viewport_rows);
-                const vacated: u32 = if (op.rows > 0) clamped_bot -| 1 else op.top;
-                var found = false;
-                for (regen_rows[0..regen_count]) |rr| {
-                    if (rr == vacated) { found = true; break; }
-                }
-                if (!found) {
-                    if (regen_count < regen_rows.len) {
-                        regen_rows[regen_count] = vacated;
-                        regen_count += 1;
-                    } else {
-                        use_ext_scroll_fast_path = false;
-                    }
-                }
-            }
-        }
-
-        ext_retry: while (true) {
-            if (ext_retried) {
-                // Reset per-pass state for clean retry
-                cache.reset(); // Resets perf counters + hl_valid (hl_valid reset is harmless)
-                ext_had_row_error = false;
-            }
-            const ext_effective_rebuild = ext_retried;
-
-        // Iterate only up to viewport_rows (not sg.rows).
-        // Rows beyond viewport_rows are outside the NDC viewport and
-        // produce clipped vertices. Matching the vertex loop to the
-        // viewport ensures the frontend receives data only for drawable
-        // rows — the same invariant the main window always satisfies.
-        for (0..viewport_rows) |row_idx| {
-            const row: u32 = @intCast(row_idx);
-
-            // Compute scrollable flag for this row in the external grid
-            const ext_scrollable: u32 = if (row >= ext_margins.top and row < sg.rows -| ext_margins.bottom) c_api.DECO_SCROLLABLE else 0;
-
-            // Row skip logic — mirrors global grid approach:
-            // Fast path: only compose rows in regen set (dirty + cursor rows).
-            // Fallback: check dirty_rows bitmap.
-            // When scroll happened but fast path is ineligible, regenerate all
-            // rows because the frontend has no GPU blit or row slot remap to
-            // shift the non-vacated rows visually.
-            if (use_ext_scroll_fast_path and !ext_retried) {
-                var in_regen = false;
-                for (regen_rows[0..regen_count]) |rr| {
-                    if (rr == row) { in_regen = true; break; }
-                }
-                if (!in_regen) continue;
-            } else if (!need_full_redraw and !ext_effective_rebuild and !ext_scroll_needs_full_regen) {
-                if (sg.dirty_rows.bit_length > row and !sg.dirty_rows.isSet(@as(usize, row))) {
-                    continue;
-                }
-            }
-
-            // Clear buffer for this row
-            ext_verts.clearRetainingCapacity();
-
-            // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
-            const row_est = @as(usize, sg.cols) * 24 + 12;
-            ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
-                ext_had_row_error = true;
-                continue;
-            };
-
-            // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
-            self.row_cells.clearRetainingCapacity();
-            self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
-                ext_had_row_error = true;
-                continue;
-            };
-            self.row_cells.setLen(sg.cols);
-
-            // Set float overlay context (used by getOverflowForCell for O(1) lookup)
-            self.flush_float_overlay = &self.flush_float_overlay_buf;
-
-            const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
-            for (0..sg.cols) |c| {
-                const cell_idx = row_start + c;
-                if (cell_idx >= n_cells) {
-                    self.row_cells.set(c, ' ', default_bg, default_bg, highlight.Highlights.SP_NOT_SET, grid_id, 0, 0);
-                    if (ext_glow_enabled) self.row_cells.glow_arr.items[c] = 0;
-                    continue;
-                }
-                const cell = composite_cells[cell_idx];
-                const attr = cache.getAttr(&self.hl, cell.hl);
-                self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
-                if (ext_glow_enabled) {
-                    self.row_cells.glow_arr.items[c] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
-                }
-            }
-
-            // Populate deco_base_flags: uniform ext_scrollable for external grids
-            @memset(self.row_cells.deco_base_flags.items[0..sg.cols], ext_scrollable);
-
-            // Unified 5-pass vertex generation
-            _ = generateRowVertices(self, .{
-                .row = row,
-                .cols = sg.cols,
-                .vw = grid_w,
-                .vh = grid_h,
-                .cell_w = cellW,
-                .cell_h = cellH,
-                .top_pad = topPad,
-                .default_bg = default_bg,
-                .blur_enabled = self.blur_enabled,
-                .background_opacity = self.background_opacity,
-                .is_cmdline = is_cmdline,
-                .glow_enabled = ext_glow_enabled,
-            }, ext_verts) catch {
-                ext_verts.clearRetainingCapacity();
-                ext_had_row_error = true;
-                continue;
-            };
-            // Cursor rendering moved to separate layer (after row loop)
-
-            // CHECK: atlas reset happened during glyph processing for this row.
-            // Already-sent rows have stale UVs → need to restart or abort.
-            if (self.atlas_reset_during_flush) {
-                ext_saw_atlas_reset = true;
-                ext_saw_atlas_reset_any = true;
-                self.atlas_reset_during_flush = false; // Clear for retry
-                if (!ext_retried) {
-                    ext_retried = true;
-                    use_ext_scroll_fast_path = false; // Retry needs full redraw
-                    continue :ext_retry; // Restart this grid's row loop from row 0
-                }
-                // 2nd reset: clear all sent rows (match global grid behavior)
-                for (0..viewport_rows) |clear_ri| {
-                    row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
-                }
-                break; // Abort remaining rows
-            }
-
-            // Send this row's vertices
-            // Pass viewport dimensions (target size) instead of sg dimensions so that
-            // the frontend's scroll offset calculation matches the NDC viewport used here.
-            if (ext_verts.items.len > 0) {
-                row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
-            }
-        }
-        // Clear float overlay context pointer (buffer is persistent, cleared next ext grid)
-        self.flush_float_overlay = null;
-        break :ext_retry; // Normal exit from retry loop
         }
 
         // --- Cursor layer: send cursor vertices as separate on_vertices_row with CURSOR flag ---
         // This keeps cursor independent of row buffers, so GPU scroll copy
         // cannot create cursor ghosts.
-        if (cursor_row) |cur_row| {
-            if (cur_row < sg.rows and cursor_col < sg.cols) {
-                ext_verts.clearRetainingCapacity();
-                // Estimate: 6 cursor bg + 6 cursor text + block element quads
-                ext_verts.ensureTotalCapacity(self.alloc, 48) catch {};
+        // Skipped on abort (see the row-loop check above) — the frontend
+        // cancels this grid's whole bracket, so sending a cursor layer for
+        // it would be discarded work on top of an already-doomed flush.
+        if (!self.flush_aborted) {
+            if (cursor_row) |cur_row| {
+                if (cur_row < sg.rows and cursor_col < sg.cols) {
+                    ext_verts.clearRetainingCapacity();
+                    // Estimate: 6 cursor bg + 6 cursor text + block element quads
+                    ext_verts.ensureTotalCapacity(self.alloc, 48) catch {
+                        self.flush_aborted = true;
+                        return;
+                    };
 
-                const cx0 = @as(f32, @floatFromInt(cursor_col)) * cellW;
-                const cy0 = @as(f32, @floatFromInt(cur_row)) * cellH;
+                    const cx0 = @as(f32, @floatFromInt(cursor_col)) * cellW;
+                    const cy0 = @as(f32, @floatFromInt(cur_row)) * cellH;
 
-                var is_double_width = false;
-                if (cursor_col + 1 < sg.cols) {
-                    const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
-                    if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
-                        is_double_width = true;
+                    var is_double_width = false;
+                    if (cursor_col + 1 < sg.cols) {
+                        const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
+                        if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
+                            is_double_width = true;
+                        }
                     }
-                }
-                const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
+                    const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
 
-                const pct_u32 = @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100));
-                const pct: f32 = @floatFromInt(pct_u32);
-                const tW = cellW * pct / 100.0;
-                const tH = cellH * pct / 100.0;
+                    const pct_u32 = @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100));
+                    const pct: f32 = @floatFromInt(pct_u32);
+                    const tW = cellW * pct / 100.0;
+                    const tH = cellH * pct / 100.0;
 
-                const crx0: f32 = cx0;
-                var cry0: f32 = cy0;
-                var crx1: f32 = cx0 + cursor_width;
-                const cry1: f32 = cy0 + cellH;
+                    const crx0: f32 = cx0;
+                    var cry0: f32 = cy0;
+                    var crx1: f32 = cx0 + cursor_width;
+                    const cry1: f32 = cy0 + cellH;
 
-                self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
-                    @tagName(self.grid.cursor_shape), pct_u32, self.grid.cursor_style_enabled,
-                });
+                    self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
+                        @tagName(self.grid.cursor_shape), pct_u32, self.grid.cursor_style_enabled,
+                    });
 
-                switch (self.grid.cursor_shape) {
-                    .vertical => crx1 = cx0 + tW,
-                    .horizontal => cry0 = cy0 + (cellH - tH),
-                    .block => {},
-                }
+                    switch (self.grid.cursor_shape) {
+                        .vertical => crx1 = cx0 + tW,
+                        .horizontal => cry0 = cy0 + (cellH - tH),
+                        .block => {},
+                    }
 
-                // Cursor background quad
-                const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
-                    self.hl.get(self.grid.cursor_attr_id).bg
-                else
-                    self.hl.default_fg;
-                const cursor_color = Helpers.rgb(cursor_bg);
+                    // Cursor background quad
+                    const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
+                        self.hl.get(self.grid.cursor_attr_id).bg
+                    else
+                        self.hl.default_fg;
+                    const cursor_color = Helpers.rgb(cursor_bg);
 
-                const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
-                const ctl = c_pts[0]; const ctr = c_pts[1]; const cbl = c_pts[2]; const cbr = c_pts[3];
+                    const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
+                    const ctl = c_pts[0];
+                    const ctr = c_pts[1];
+                    const cbl = c_pts[2];
+                    const cbr = c_pts[3];
 
-                ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
 
-                // Cursor text for block cursor
-                if (self.grid.cursor_shape == .block) {
-                    const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
-                    if (cell_idx < sg.cells.len) {
-                        const cursor_cell = sg.cells[cell_idx];
-                        if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
-                            if (block_elements.isBlockElement(cursor_cell.cp)) {
-                                const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
-                                if (eblk_geo.count > 0) {
-                                    const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
-                                        self.hl.get(self.grid.cursor_attr_id).fg
-                                    else
-                                        self.hl.default_bg;
-                                    const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
-                                    if (ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6)) {
+                    // Cursor text for block cursor
+                    if (self.grid.cursor_shape == .block) {
+                        const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
+                        if (cell_idx < sg.cells.len) {
+                            const cursor_cell = sg.cells[cell_idx];
+                            if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
+                                if (block_elements.isBlockElement(cursor_cell.cp)) {
+                                    const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
+                                    if (eblk_geo.count > 0) {
+                                        const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
+                                            self.hl.get(self.grid.cursor_attr_id).fg
+                                        else
+                                            self.hl.default_bg;
+                                        const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
+                                        ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
+                                            self.flush_aborted = true;
+                                            return;
+                                        };
                                         for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
                                             Helpers.pushSolidQuadAssumeCapacity(ext_verts, cx0 + rect.x0 * cursor_width, cy0 + rect.y0 * cellH, cx0 + rect.x1 * cursor_width, cy0 + rect.y1 * cellH, eblk_fg_col, grid_w, grid_h, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                                         }
-                                    } else |_| {}
-                                }
-                            } else {
-                                var glyph_entry: c_api.GlyphEntry = undefined;
-                                var glyph_ok: c_int = -1;
+                                    }
+                                } else {
+                                    var glyph_entry: c_api.GlyphEntry = undefined;
+                                    var glyph_ok: c_int = 0;
 
-                                const ext_cursor_resolved = self.hl.getWithStyles(cursor_cell.hl);
-                                const ext_cursor_c_style: u32 =
-                                    @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+                                    const ext_cursor_resolved = self.hl.getWithStyles(cursor_cell.hl);
+                                    const ext_cursor_c_style: u32 =
+                                        @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+                                        @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
 
-                                // Set emoji cluster context for ext grid cursor if emoji-significant
-                                if (self.grid.getOverflow(grid_id, cur_row, cursor_col)) |extras| {
-                                    const is_emoji = isEmojiPresentation(cursor_cell.cp) or for (extras) |e| {
-                                        if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
-                                    } else false;
-                                    if (is_emoji) {
-                                        self.emoji_cluster_buf[0] = cursor_cell.cp;
-                                        const elen = @min(extras.len, self.emoji_cluster_buf.len - 1);
-                                        for (0..elen) |ei| {
-                                            self.emoji_cluster_buf[1 + ei] = extras[ei];
+                                    // Set emoji cluster context for ext grid cursor if emoji-significant
+                                    if (self.grid.getOverflow(grid_id, cur_row, cursor_col)) |extras| {
+                                        const is_emoji = isEmojiPresentation(cursor_cell.cp) or for (extras) |e| {
+                                            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
+                                        } else false;
+                                        if (is_emoji) {
+                                            self.emoji_cluster_buf[0] = cursor_cell.cp;
+                                            const elen = @min(extras.len, self.emoji_cluster_buf.len - 1);
+                                            for (0..elen) |ei| {
+                                                self.emoji_cluster_buf[1 + ei] = extras[ei];
+                                            }
+                                            self.emoji_cluster_len = @intCast(1 + elen);
                                         }
-                                        self.emoji_cluster_len = @intCast(1 + elen);
                                     }
-                                }
-                                defer self.emoji_cluster_len = 0;
+                                    defer self.emoji_cluster_len = 0;
 
-                                if (self.isPhase2Atlas()) {
-                                    if (self.ensureGlyphPhase2(cursor_cell.cp, ext_cursor_c_style)) |entry| {
-                                        glyph_entry = entry;
-                                        glyph_ok = 1;
-                                    }
-                                } else if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
-                                    const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
-                                    if (ext_cursor_style != 0) {
-                                        glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
+                                    if (self.isPhase2Atlas()) {
+                                        const overflow = self.grid.getOverflow(grid_id, cur_row, cursor_col);
+                                        const cached_entry = ensureCachedPhase2Glyph(self, cursor_cell.cp, ext_cursor_c_style, overflow) catch blk: {
+                                            self.flush_aborted = true;
+                                            break :blk null;
+                                        };
+                                        if (cached_entry) |entry| {
+                                            glyph_entry = entry;
+                                            glyph_ok = 1;
+                                        } else if (self.flush_aborted) {
+                                            return;
+                                        } else {
+                                            ext_cursor_retry_required = true;
+                                        }
+                                    } else if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
+                                        const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
+                                        if (ext_cursor_style != 0) {
+                                            glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
+                                        } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
+                                            glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
+                                        }
                                     } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
                                         glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
                                     }
-                                } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
-                                    glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
-                                }
 
-                                if (glyph_ok != 0 and glyph_entry.bbox_size_px[0] > 0 and glyph_entry.bbox_size_px[1] > 0) {
-                                    const cursorBaseY: f32 = cy0 + topPad;
-                                    const baselineY: f32 = cursorBaseY + glyph_entry.ascent_px;
-                                    const gx0: f32 = cx0 + glyph_entry.bbox_origin_px[0];
-                                    const gx1: f32 = gx0 + glyph_entry.bbox_size_px[0];
-                                    const gy0: f32 = baselineY - (glyph_entry.bbox_origin_px[1] + glyph_entry.bbox_size_px[1]);
-                                    const gy1: f32 = gy0 + glyph_entry.bbox_size_px[1];
+                                    // CHECK: the cursor glyph ensure above can itself trigger an
+                                    // atlas reset that no later code in this function re-checks.
+                                    // Handle it here instead of leaking the flag into the next
+                                    // external grid's retry check or the next flush.
+                                    if (self.atlas_reset_during_flush) {
+                                        ext_saw_atlas_reset = true;
+                                        ext_saw_atlas_reset_any = true;
+                                        self.atlas_reset_during_flush = false;
+                                        self.grid.markAllDirty();
+                                        self.invalidateScrollCache();
+                                    }
 
-                                    const uv_x0 = glyph_entry.uv_min[0];
-                                    const uv_y0 = glyph_entry.uv_min[1];
-                                    const uv_x1 = glyph_entry.uv_max[0];
-                                    const uv_y1 = glyph_entry.uv_max[1];
+                                    if (glyph_ok != 0 and glyph_entry.bbox_size_px[0] > 0 and glyph_entry.bbox_size_px[1] > 0) {
+                                        const cursorBaseY: f32 = cy0 + topPad;
+                                        const baselineY: f32 = cursorBaseY + glyph_entry.ascent_px;
+                                        const gx0: f32 = cx0 + glyph_entry.bbox_origin_px[0];
+                                        const gx1: f32 = gx0 + glyph_entry.bbox_size_px[0];
+                                        const gy0: f32 = baselineY - (glyph_entry.bbox_origin_px[1] + glyph_entry.bbox_size_px[1]);
+                                        const gy1: f32 = gy0 + glyph_entry.bbox_size_px[1];
 
-                                    const cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
-                                        self.hl.get(self.grid.cursor_attr_id).fg
-                                    else
-                                        self.hl.default_bg;
-                                    const text_col = Helpers.rgb(cursor_fg);
+                                        const uv_x0 = glyph_entry.uv_min[0];
+                                        const uv_y0 = glyph_entry.uv_min[1];
+                                        const uv_x1 = glyph_entry.uv_max[0];
+                                        const uv_y1 = glyph_entry.uv_max[1];
 
-                                    const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
-                                    const gtl = cg_pts[0]; const gtr = cg_pts[1]; const gbl = cg_pts[2]; const gbr = cg_pts[3];
+                                        const cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
+                                            self.hl.get(self.grid.cursor_attr_id).fg
+                                        else
+                                            self.hl.default_bg;
+                                        const text_col = Helpers.rgb(cursor_fg);
 
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                                    ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                                        const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
+                                        const gtl = cg_pts[0];
+                                        const gtr = cg_pts[1];
+                                        const gbl = cg_pts[2];
+                                        const gbr = cg_pts[3];
+
+                                        const cursor_glyph_flags = externalCursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
+                                        ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Send cursor vertices as separate layer (flags = CURSOR)
-                row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
-                self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
+                    if (self.flush_aborted) return;
+
+                    // Send cursor vertices as separate layer (flags = CURSOR)
+                    row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
+                    self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
+                }
+            } else if ((cursor_was_on_this_grid or self.force_ext_cursor_recheck) and !cursor_on_this_grid) {
+                // Cursor left this grid: send empty cursor to clear previous
+                // cursor. force_ext_cursor_recheck: last_ext_cursor_grid cannot
+                // be trusted to still name the right grid after a prior failed
+                // flush (see its doc comment) — clearing the cursor on every
+                // OTHER external grid unconditionally is a harmless no-op for
+                // grids that were already clean, and closes the actual gap for
+                // whichever grid was NOT the one that got renamed.
+                row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
+                self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
             }
-        } else if (cursor_was_on_this_grid and !cursor_on_this_grid) {
-            // Cursor left this grid: send empty cursor to clear previous cursor
-            row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
-            self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
         }
 
         // Debug log glyph statistics
@@ -5473,27 +6584,53 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             grid_id, cache.perf_glyph_ascii_hits, cache.perf_glyph_ascii_misses, cache.perf_glyph_nonascii_hits, cache.perf_glyph_nonascii_misses,
         });
 
-        // Clear dirty flags after sending (both dirty and dirty_rows)
-        sg.clearDirty();
+        // Clear dirty flags after sending (both dirty and dirty_rows).
+        // Skipped on mid-flush abort (frontend OOM via
+        // zonvie_core_abort_flush): keep dirty so the rows are re-sent.
+        if (!self.flush_aborted) sg.clearDirtyContent();
         // If a row failed (allocation error), re-mark the grid dirty
         // so the failed rows get regenerated on the next flush.
         if (ext_had_row_error) {
-            sg.dirty = true;
+            sg.markAllDirty();
         }
         // If atlas was reset during this grid's rendering, re-mark dirty
         // so it gets re-rendered with correct UVs next flush.
         if (ext_saw_atlas_reset) {
-            sg.dirty = true;
+            sg.markAllDirty();
+        }
+        // A rasterizer miss is transient (font backend/cache publication may
+        // complete before the next frame). Keep the grid dirty so the missing
+        // glyph is regenerated instead of becoming permanently blank.
+        if (ext_had_glyph_miss) {
+            sg.markAllDirty();
         }
     }
 
     // After ALL grids processed: if any atlas reset occurred,
-    // already-sent grids also have stale UVs → mark ALL sub_grids dirty
+    // already-sent grids also have stale UVs → mark ALL sub_grids dirty.
+    // The MAIN grid is included too: this function runs as a deferred call
+    // AFTER the main row-mode loop already dispatched its vertices this
+    // same flush (on_vertices_row, with UVs baked against the pre-reset
+    // atlas). Those vertices are committed as-is alongside the just-reset
+    // (differently-packed) atlas texture — one frame of main-grid glyph
+    // corruption/blank cells that only markAllDirty (forcing a full main
+    // resend next flush against the corrected atlas) can heal.
     if (ext_saw_atlas_reset_any) {
+        self.grid.markAllDirty();
+        self.invalidateScrollCache();
         var sg_it = self.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg_val| {
-            sg_val.dirty = true;
+            sg_val.markAllDirty();
         }
+        // The cursor is a separate vertex consumer gated on cursor_rev
+        // alone (main and external both) — this atlas reset invalidates
+        // its cached UVs too, but none of the dirtying above touches it.
+        self.grid.cursor_rev +%= 1;
+        // markAllDirty schedules a correct NEXT flush; it cannot undo THIS
+        // flush's already-dispatched main vertices (pre-reset UVs). Signal
+        // frontends to cancel the current commit entirely — see the field
+        // doc comment (nvim_core.zig) and zonvie_core_flush_had_atlas_corruption.
+        self.flush_atlas_corrupted = true;
     }
 }
 
@@ -6532,15 +7669,47 @@ fn composeKanaVoiced(base: u32) ?u32 {
     // The pattern: base + 1 = voiced, but only for specific ranges with gaps.
     return switch (base) {
         // Hiragana
-        0x304B, 0x304D, 0x304F, 0x3051, 0x3053, // ka ki ku ke ko
-        0x3055, 0x3057, 0x3059, 0x305B, 0x305D, // sa si su se so
-        0x305F, 0x3061, 0x3064, 0x3066, 0x3068, // ta ti tu te to
-        0x306F, 0x3072, 0x3075, 0x3078, 0x307B, // ha hi hu he ho
+        0x304B,
+        0x304D,
+        0x304F,
+        0x3051,
+        0x3053, // ka ki ku ke ko
+        0x3055,
+        0x3057,
+        0x3059,
+        0x305B,
+        0x305D, // sa si su se so
+        0x305F,
+        0x3061,
+        0x3064,
+        0x3066,
+        0x3068, // ta ti tu te to
+        0x306F,
+        0x3072,
+        0x3075,
+        0x3078,
+        0x307B, // ha hi hu he ho
         // Katakana
-        0x30AB, 0x30AD, 0x30AF, 0x30B1, 0x30B3, // ka ki ku ke ko
-        0x30B5, 0x30B7, 0x30B9, 0x30BB, 0x30BD, // sa si su se so
-        0x30BF, 0x30C1, 0x30C4, 0x30C6, 0x30C8, // ta ti tu te to
-        0x30CF, 0x30D2, 0x30D5, 0x30D8, 0x30DB, // ha hi hu he ho
+        0x30AB,
+        0x30AD,
+        0x30AF,
+        0x30B1,
+        0x30B3, // ka ki ku ke ko
+        0x30B5,
+        0x30B7,
+        0x30B9,
+        0x30BB,
+        0x30BD, // sa si su se so
+        0x30BF,
+        0x30C1,
+        0x30C4,
+        0x30C6,
+        0x30C8, // ta ti tu te to
+        0x30CF,
+        0x30D2,
+        0x30D5,
+        0x30D8,
+        0x30DB, // ha hi hu he ho
         => base + 1,
         0x3046 => 0x3094, // Hiragana u → vu
         0x30A6 => 0x30F4, // Katakana u → vu
@@ -6557,9 +7726,17 @@ fn composeKanaSemiVoiced(base: u32) ?u32 {
     // は→ぱ = base + 2 for ha-row only
     return switch (base) {
         // Hiragana ha-row
-        0x306F, 0x3072, 0x3075, 0x3078, 0x307B,
+        0x306F,
+        0x3072,
+        0x3075,
+        0x3078,
+        0x307B,
         // Katakana ha-row
-        0x30CF, 0x30D2, 0x30D5, 0x30D8, 0x30DB,
+        0x30CF,
+        0x30D2,
+        0x30D5,
+        0x30D8,
+        0x30DB,
         => base + 2,
         else => null,
     };
@@ -6577,23 +7754,32 @@ pub fn sendPopupmenuHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.external_grids.fetchRemove(pum_grid_id);
+    _ = self.grid.removeSyntheticExternal(pum_grid_id);
 
     self.log.write("[popupmenu] hide\n", .{});
 }
 
 // --- ext_messages support ---
 
+fn scheduleMsgRetryDeadline(self: *Core, now: i128) i128 {
+    const retry_delay = self.msg_show_retry_delay_ns;
+    self.msg_show_retry_delay_ns = @min(retry_delay * 2, 1000 * std.time.ns_per_ms);
+    self.log.write("[msg] timer retry scheduled in {d}ms\n", .{@divTrunc(retry_delay, std.time.ns_per_ms)});
+    return now + retry_delay;
+}
+
 /// Check if msg_show throttle timeout has expired and process pending messages.
-/// Called from frontend tick (zonvie_core_tick_msg_throttle) to ensure messages are
-/// properly accumulated across multiple flush events before display (noice.nvim-style).
-/// This must NOT be called from onFlush, as Neovim may send multiple msg_show events
-/// across separate flush batches (e.g., list_cmd then shell_out for "!ls").
+/// Called from onFlush; the frontend timer drives an otherwise-empty onFlush when
+/// Neovim is idle. The deadline still accumulates msg_show events across redraw
+/// batches (e.g. list_cmd then shell_out for "!ls") before this check can fire.
 pub fn checkMsgShowThrottleTimeout(self: *Core) void {
     if (!self.ext_messages_enabled) return;
 
     const pending_since = self.msg_show_pending_since orelse return;
     const now = clock.nowNs();
+    if (self.msg_show_retry_at) |retry_at| {
+        if (now < retry_at) return;
+    }
     const elapsed = now - pending_since;
 
     if (elapsed >= self.msg_show_throttle_ns) {
@@ -6601,10 +7787,15 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
             @divTrunc(elapsed, std.time.ns_per_ms),
             @divTrunc(self.msg_show_throttle_ns, std.time.ns_per_ms),
         });
-        sendMsgShow(self);
-        self.grid.message_state.pending_count = 0;
-        self.grid.message_state.msg_dirty = false;
-        self.msg_show_pending_since = null;
+        if (sendMsgShow(self)) {
+            self.grid.message_state.pending_count = 0;
+            self.grid.message_state.msg_dirty = false;
+            self.msg_show_pending_since = null;
+            self.msg_show_retry_at = null;
+            self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
+        } else {
+            self.msg_show_retry_at = scheduleMsgRetryDeadline(self, now);
+        }
     }
 }
 
@@ -6614,11 +7805,13 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
 pub fn checkMsgAutoHideTimeout(self: *Core) void {
     if (!self.ext_messages_enabled) return;
     const now = clock.nowNs();
+    var hid_message = false;
 
     // msg_show (grid -102) auto-hide
     if (self.msg_show_auto_hide_at) |hide_at| {
         if (now >= hide_at) {
             self.msg_show_auto_hide_at = null;
+            hid_message = true;
             self.log.write("[msg] auto-hide: msg_show timeout expired\n", .{});
             self.grid.message_state.clearMessages(self.grid.alloc);
             hideMsgShow(self);
@@ -6644,6 +7837,7 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
     if (self.msg_history_auto_hide_at) |hide_at| {
         if (now >= hide_at) {
             self.msg_history_auto_hide_at = null;
+            hid_message = true;
             self.log.write("[msg] auto-hide: msg_history timeout expired\n", .{});
             hideMsgHistory(self);
             self.grid.msg_history_state.clear(self.grid.alloc);
@@ -6655,15 +7849,15 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
             }
         }
     }
+    if (hid_message) self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
 }
 
-/// Earliest absolute deadline (nanos) among the armed msg_show/msg_history
-/// timeouts, or null if none is pending. Lets the frontend schedule a single
-/// one-shot timer instead of polling every frame.
+/// Earliest absolute deadline (nanos) among message UI and core rendering
+/// maintenance work, or null if none is pending. The legacy public API name is
+/// retained, but the frontend's same one-shot timer also drives atlas-negative
+/// reprobes while Neovim is idle.
 /// IMPORTANT: Caller must hold grid_mu.
 pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
-    if (!self.ext_messages_enabled) return null;
-
     var earliest: ?i128 = null;
     const consider = struct {
         fn f(acc: *?i128, deadline: i128) void {
@@ -6675,14 +7869,22 @@ pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
         }
     }.f;
 
-    if (self.msg_show_pending_since) |since| {
-        consider(&earliest, since + self.msg_show_throttle_ns);
+    if (self.ext_messages_enabled) {
+        if (self.msg_show_pending_since) |since| {
+            consider(&earliest, self.msg_show_retry_at orelse since + self.msg_show_throttle_ns);
+        }
+        if (self.msg_show_auto_hide_at) |hide_at| {
+            consider(&earliest, hide_at);
+        }
+        if (self.msg_history_auto_hide_at) |hide_at| {
+            consider(&earliest, hide_at);
+        }
     }
-    if (self.msg_show_auto_hide_at) |hide_at| {
-        consider(&earliest, hide_at);
+    if (self.atlas_negative_retry_at) |retry_at| {
+        consider(&earliest, retry_at);
     }
-    if (self.msg_history_auto_hide_at) |hide_at| {
-        consider(&earliest, hide_at);
+    if (self.transient_glyph_retry_at) |retry_at| {
+        consider(&earliest, retry_at);
     }
     return earliest;
 }
@@ -6710,6 +7912,7 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     // Guard: at most one on_msg_clear per flush cycle
     var sent_msg_clear = false;
+    var msg_retry_needed = false;
 
     // Handle confirm message changes (noice.nvim pattern: separate from regular messages)
     if (confirm_dirty) {
@@ -6782,16 +7985,23 @@ pub fn notifyMessageChanges(self: *Core) void {
                 // Shell command without return_prompt yet: use throttle to accumulate output
                 if (self.msg_show_pending_since == null) {
                     self.msg_show_pending_since = clock.nowNs();
+                    self.msg_show_retry_at = null;
+                    self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
                 }
             } else {
                 // Other messages (including list_cmd): display immediately
-                sendMsgShow(self);
-                self.msg_show_pending_since = null;
+                if (sendMsgShow(self)) {
+                    self.msg_show_pending_since = null;
+                    self.msg_show_retry_at = null;
+                    self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
+                } else {
+                    msg_retry_needed = true;
+                }
             }
         }
     }
 
-    self.grid.message_state.msg_dirty = false;
+    self.grid.message_state.msg_dirty = msg_retry_needed;
     self.grid.message_state.confirm_dirty = false;
     self.grid.message_state.showmode_dirty = false;
     self.grid.message_state.showcmd_dirty = false;
@@ -6816,8 +8026,7 @@ pub fn notifyMessageChanges(self: *Core) void {
 
 /// Send msg_show as external grid (like popupmenu pattern).
 /// Confirm dialogs are sent via callback (special case for cmdline mode).
-pub fn sendMsgShow(self: *Core) void {
-    const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
+pub fn sendMsgShow(self: *Core) bool {
     const messages = self.grid.message_state.messages.items;
 
     if (messages.len == 0) {
@@ -6828,7 +8037,7 @@ pub fn sendMsgShow(self: *Core) void {
         if (self.cb.on_msg_clear) |cb| {
             cb(self.ctx);
         }
-        return;
+        return true;
     }
 
     // Count total lines across all messages (for min_lines/max_lines routing)
@@ -6895,15 +8104,19 @@ pub fn sendMsgShow(self: *Core) void {
     // Handle ext_float view (renders all ext_float-routed messages together)
     if (has_ext_float) {
         self.log.write("[msg] sendMsgShow: view=ext_float, rendering message grid\n", .{});
-        buildMsgLineCache(self);
+        if (!buildMsgLineCache(self)) {
+            self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
+            self.flush_aborted = true;
+            return false;
+        }
         self.msg_scroll_offset = 0;
-        renderMsgGridFromCache(self, 0);
+        if (!renderMsgGridFromCache(self, 0)) {
+            self.flush_aborted = true;
+            return false;
+        }
 
         // Set auto-hide timeout (timeout=0 means no auto-hide, e.g. errors)
-        if (max_ext_float_timeout > 0) {
-            const timeout_ns: i128 = @intFromFloat(
-                max_ext_float_timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
-            );
+        if (messageTimeoutNs(max_ext_float_timeout)) |timeout_ns| {
             self.msg_show_auto_hide_at = clock.nowNs() + timeout_ns;
         } else {
             self.msg_show_auto_hide_at = null;
@@ -6957,8 +8170,8 @@ pub fn sendMsgShow(self: *Core) void {
 
     // If no ext_float messages, remove the message grid
     if (!has_ext_float) {
-        _ = self.grid.external_grids.fetchRemove(msg_grid_id);
-        self.msg_show_auto_hide_at = null; // prevent stale timer
+        hideMsgShow(self);
+        self.msg_show_auto_hide_at = null;
     }
 
     // Drop transient messages from the array so they don't pile up across
@@ -6971,35 +8184,48 @@ pub fn sendMsgShow(self: *Core) void {
     // `:history`) would skip the addMsgShow clear-on-non-accumulating path
     // and combine its content with stale mini-routed messages in the same
     // split window.
-    var i: usize = 0;
-    while (i < self.grid.message_state.messages.items.len) {
-        const m = self.grid.message_state.messages.items[i];
+    dropTransientMessages(self, total_line_count);
+    return true;
+}
+
+/// Stable, single-pass removal of fire-and-forget message routes.
+fn dropTransientMessages(self: *Core, total_line_count: u32) void {
+    const messages = &self.grid.message_state.messages;
+    var write_idx: usize = 0;
+    for (0..messages.items.len) |read_idx| {
+        const m = &messages.items[read_idx];
         const r = self.msg_config.routeMessage(.msg_show, m.kind, total_line_count);
         const is_transient = switch (r.view) {
             .mini, .notification, .split => true,
             else => false,
         };
         if (is_transient) {
-            var removed = self.grid.message_state.messages.orderedRemove(i);
-            removed.deinit(self.alloc);
+            m.deinit(self.alloc);
         } else {
-            i += 1;
+            if (write_idx != read_idx) messages.items[write_idx] = messages.items[read_idx];
+            write_idx += 1;
         }
     }
+    messages.items.len = write_idx;
 }
 
 /// Build line cache from current messages (called once when messages change).
 /// Only includes messages that route to ext_float view.
-pub fn buildMsgLineCache(self: *Core) void {
+pub fn buildMsgLineCache(self: *Core) bool {
     const messages = self.grid.message_state.messages.items;
+    const build = &self.msg_line_cache_build;
 
-    // Clear existing cache
-    self.msg_line_cache.clearRetainingCapacity();
-    self.msg_cache_valid = false;
-    self.msg_total_lines = 0;
-    self.msg_cached_max_width = 10;
+    // Build transactionally so OOM never publishes a truncated cache.
+    build.clearRetainingCapacity();
 
-    if (messages.len == 0) return;
+    if (messages.len == 0) {
+        std.mem.swap(std.ArrayListUnmanaged(MsgCachedLine), &self.msg_line_cache, build);
+        build.clearRetainingCapacity();
+        self.msg_total_lines = 0;
+        self.msg_cached_max_width = 10;
+        self.msg_cache_valid = true;
+        return true;
+    }
 
     var max_width: u32 = 10;
 
@@ -7023,10 +8249,10 @@ pub fn buildMsgLineCache(self: *Core) void {
                     current_line.len += @intCast(copy_len);
 
                     // Finish current line (skip leading empty lines)
-                    if (current_line.len > 0 or self.msg_line_cache.items.len > 0) {
+                    if (current_line.len > 0 or build.items.len > 0) {
                         current_line.display_width = @intCast(countDisplayWidth(current_line.data[0..current_line.len]));
                         if (current_line.display_width > max_width) max_width = current_line.display_width;
-                        self.msg_line_cache.append(self.alloc, current_line) catch break;
+                        build.append(self.alloc, current_line) catch return false;
                     }
                     current_line = .{};
                     remaining = remaining[pos + 1 ..];
@@ -7041,13 +8267,15 @@ pub fn buildMsgLineCache(self: *Core) void {
         }
 
         // Finish last line of this message
-        if (current_line.len > 0 or self.msg_line_cache.items.len == 0) {
+        if (current_line.len > 0 or build.items.len == 0) {
             current_line.display_width = @intCast(countDisplayWidth(current_line.data[0..current_line.len]));
             if (current_line.display_width > max_width) max_width = current_line.display_width;
-            self.msg_line_cache.append(self.alloc, current_line) catch {};
+            build.append(self.alloc, current_line) catch return false;
         }
     }
 
+    std.mem.swap(std.ArrayListUnmanaged(MsgCachedLine), &self.msg_line_cache, build);
+    build.clearRetainingCapacity();
     self.msg_total_lines = @intCast(self.msg_line_cache.items.len);
     self.msg_cached_max_width = max_width;
     self.msg_cache_valid = true;
@@ -7056,14 +8284,19 @@ pub fn buildMsgLineCache(self: *Core) void {
         self.msg_line_cache.items.len,
         max_width,
     });
+    return true;
 }
 
 /// Render msg_show grid from cache (fast path for scrolling).
-pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
+/// Returns false on allocation failure (resizeGrid/external_grids.put) —
+/// the message grid was NOT actually updated to reflect scroll_offset, so
+/// callers must not advance any "this offset was rendered" bookkeeping as
+/// if it had been.
+pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
     const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
     const lines = self.msg_line_cache.items;
 
-    if (lines.len == 0) return;
+    if (lines.len == 0) return true;
 
     // Apply scroll offset (clamp to valid range)
     const actual_scroll: usize = @min(scroll_offset, if (lines.len > 0) lines.len - 1 else 0);
@@ -7085,7 +8318,7 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
     // Create or resize grid
     self.grid.resizeGrid(msg_grid_id, height, width) catch |e| {
         self.log.write("[msg] resizeGrid failed: {any}\n", .{e});
-        return;
+        return false;
     };
     self.grid.clearGrid(msg_grid_id);
 
@@ -7113,18 +8346,77 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
     }
 
     // Register as external grid
-    self.grid.external_grids.put(self.alloc, msg_grid_id, .{
+    self.grid.putSyntheticExternal(msg_grid_id, .{
         .win = 1, // Global grid
         .start_row = -2, // Special marker: position at top-right
         .start_col = -2,
     }) catch |e| {
         self.log.write("[msg] external_grids.put failed: {any}\n", .{e});
-        return;
+        return false;
     };
+    return true;
 }
 
 /// Handle scroll event for msg_show grid (Zonvie's own grid).
 /// Updates scroll offset and re-renders grid content.
+/// Runs the message grid's local-scroll vertex send wrapped in the same
+/// on_flush_begin/on_flush_end bracket as the normal onFlush() path.
+///
+/// handleMsgGridScroll/processPendingMsgScroll used to call
+/// sendExternalGridVerticesFiltered directly, with no on_flush_begin/
+/// on_flush_end around it. Both frontends' triple-buffer write-set open/
+/// commit/InvalidateRect logic lives in those callbacks (Windows: TBS
+/// commit + InvalidateRect, both gated on on_flush_end; macOS:
+/// beginFlush()/commitFlush(), including the atlas front-buffer swap and
+/// per-ExternalGridView atlas snapshot update). Without the bracket, the
+/// scroll's vertex data was composed but never actually published on
+/// Windows (no commit, no repaint), and on macOS a new glyph ensured along
+/// the way could leave committed vertex UVs pointing at an atlas
+/// generation the frontend never swapped to.
+/// Returns true if the scroll was actually committed. False means the
+/// caller must NOT clear msg_scroll_pending / advance msg_scroll_last_send
+/// — the scroll still needs to be retried once a full flush has resent
+/// everything (see the atlas-reset branch below).
+fn runMsgGridScrollFlush(self: *Core, offset: u32) bool {
+    const perf_enabled = self.log.cb != null;
+    const perf_start_ns = if (perf_enabled) clock.nowNs() else 0;
+    var committed = false;
+    defer if (perf_enabled) {
+        const elapsed_us_i128 = @divTrunc(@max(0, clock.nowNs() - perf_start_ns), 1000);
+        const elapsed_us: u32 = @intCast(@min(elapsed_us_i128, std.math.maxInt(u32)));
+        const sample_idx: usize = @intCast(self.msg_scroll_perf_count);
+        self.msg_scroll_perf_us[sample_idx] = elapsed_us;
+        self.msg_scroll_perf_count += 1;
+        if (!committed) self.msg_scroll_perf_aborted += 1;
+
+        if (self.msg_scroll_perf_count == self.msg_scroll_perf_us.len) {
+            var sorted = self.msg_scroll_perf_us;
+            std.sort.pdq(u32, &sorted, {}, comptime std.sort.asc(u32));
+            const p50 = sorted[(sorted.len * 50 - 1) / 100];
+            const p95 = sorted[(sorted.len * 95 - 1) / 100];
+            const p99 = sorted[(sorted.len * 99 - 1) / 100];
+            self.log.write(
+                "[perf] msg_scroll_transaction samples={d} p50_us={d} p95_us={d} p99_us={d} max_us={d} aborted={d} surfaces={d} msg_cells={d}\n",
+                .{ sorted.len, p50, p95, p99, sorted[sorted.len - 1], self.msg_scroll_perf_aborted, self.known_external_grids.count() + 1, self.grid.rows * self.grid.cols },
+            );
+            self.msg_scroll_perf_count = 0;
+            self.msg_scroll_perf_aborted = 0;
+        }
+    };
+
+    if (!renderMsgGridFromCache(self, offset)) {
+        return false;
+    }
+
+    // Publish through the standard full-flush transaction. It resets the
+    // atlas-corruption state and regenerates main plus all external consumers
+    // before one frontend commit, so a cancelled bracket cannot consume dirty.
+    var fctx = FlushCtx{ .core = self };
+    FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch return false;
+    committed = !self.flush_aborted and !self.flush_atlas_corrupted;
+    return committed;
+}
+
 pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
     // Check if message grid is active
     if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) {
@@ -7161,10 +8453,15 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
 
         if (elapsed >= throttle_ns) {
             self.log.write("[msg] handleMsgGridScroll: {s} offset {d} (send)\n", .{ direction, new_offset });
-            renderMsgGridFromCache(self, new_offset);
-            sendExternalGridVerticesFiltered(self, true, grid_mod.MESSAGE_GRID_ID);
-            self.msg_scroll_last_send = now;
-            self.msg_scroll_pending = false;
+            if (runMsgGridScrollFlush(self, new_offset)) {
+                self.msg_scroll_last_send = now;
+                self.msg_scroll_pending = false;
+            } else {
+                // Aborted (e.g. atlas reset mid-bracket) — retry once a full
+                // flush has resent everything; msg_scroll_offset already
+                // holds the target so the retry picks it up automatically.
+                self.msg_scroll_pending = true;
+            }
         } else {
             // Mark pending - will be processed on next throttle window or flush
             self.msg_scroll_pending = true;
@@ -7178,22 +8475,28 @@ pub fn processPendingMsgScroll(self: *Core) void {
     if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) return;
 
     self.log.write("[msg] processPendingMsgScroll: offset {d}\n", .{self.msg_scroll_offset});
-    renderMsgGridFromCache(self, self.msg_scroll_offset);
-    sendExternalGridVerticesFiltered(self, true, grid_mod.MESSAGE_GRID_ID);
-    self.msg_scroll_last_send = clock.nowNs();
-    self.msg_scroll_pending = false;
+    if (runMsgGridScrollFlush(self, self.msg_scroll_offset)) {
+        self.msg_scroll_last_send = clock.nowNs();
+        self.msg_scroll_pending = false;
+    }
+    // Aborted: leave msg_scroll_pending = true so a later retry (next
+    // throttle window, or the next explicit call) picks it up again.
 }
 
 /// Hide msg_show external grid.
 pub fn hideMsgShow(self: *Core) void {
     const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
-    _ = self.grid.external_grids.fetchRemove(msg_grid_id);
+    _ = self.grid.removeSyntheticExternal(msg_grid_id);
     // Reset scroll state and invalidate cache
     self.msg_scroll_offset = 0;
     self.msg_total_lines = 0;
     self.msg_cached_max_width = 0;
     self.msg_cache_valid = false;
+    self.msg_scroll_pending = false;
+    self.msg_show_retry_at = null;
+    self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
     self.msg_line_cache.clearRetainingCapacity();
+    self.msg_line_cache_build.clearRetainingCapacity();
     self.log.write("[msg] hideMsgShow\n", .{});
 }
 
@@ -7221,13 +8524,30 @@ fn sendConfirmCallback(self: *Core) void {
         cm.kind_len,
         &c_chunks,
         1,
-        0, 0, 0, // replace_last, history, append
+        0,
+        0,
+        0, // replace_last, history, append
         cm.id,
         0, // timeout_ms
     );
 }
 
 /// Send msg_show callback to frontend (helper for short messages or fallback).
+fn messageTimeoutMs(timeout_sec: f32) u32 {
+    if (!std.math.isFinite(timeout_sec) or timeout_sec <= 0) return 0;
+
+    const timeout_ms = @as(f64, timeout_sec) * 1000.0;
+    const max_timeout_ms: f64 = @floatFromInt(std.math.maxInt(u32));
+    if (timeout_ms >= max_timeout_ms) return std.math.maxInt(u32);
+    return @intFromFloat(timeout_ms);
+}
+
+fn messageTimeoutNs(timeout_sec: f32) ?i128 {
+    const timeout_ms = messageTimeoutMs(timeout_sec);
+    if (timeout_ms == 0) return null;
+    return @as(i128, timeout_ms) * std.time.ns_per_ms;
+}
+
 pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: config.MsgViewType, timeout_sec: f32) void {
     const cb = self.cb.on_msg_show orelse return;
 
@@ -7253,8 +8573,8 @@ pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: con
         .notification => .notification,
     };
 
-    // Convert timeout from seconds to milliseconds
-    const timeout_ms: u32 = if (timeout_sec > 0) @intFromFloat(timeout_sec * 1000.0) else 0;
+    // Convert timeout from seconds to milliseconds.
+    const timeout_ms = messageTimeoutMs(timeout_sec);
 
     cb(
         self.ctx,
@@ -7586,7 +8906,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
 
     if (entries.len == 0) {
         // No entries - hide the history window if visible
-        _ = self.grid.external_grids.fetchRemove(history_grid_id);
+        _ = self.grid.removeSyntheticExternal(history_grid_id);
         self.msg_history_auto_hide_at = null;
         self.log.write("[msg_history] hide (empty)\n", .{});
         return;
@@ -7600,7 +8920,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     switch (route_result.view) {
         .none => {
             // Don't show anything
-            _ = self.grid.external_grids.fetchRemove(history_grid_id);
+            _ = self.grid.removeSyntheticExternal(history_grid_id);
             self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=none, hiding\n", .{});
             return;
@@ -7725,7 +9045,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     // Register as external grid
     // Position: use special marker -2 to indicate "msg_show position" (top-right)
     // Frontend will interpret this and position like msg_show
-    self.grid.external_grids.put(self.alloc, history_grid_id, .{
+    self.grid.putSyntheticExternal(history_grid_id, .{
         .win = 1, // Global grid
         .start_row = -2, // Special marker: position like msg_show (top-right)
         .start_col = -2,
@@ -7735,11 +9055,9 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     };
 
     // Set auto-hide timeout (timeout=0 means no auto-hide)
-    if (route_result.timeout > 0) {
-        const timeout_ns: i128 = @intFromFloat(
-            route_result.timeout * @as(f32, @floatFromInt(std.time.ns_per_s)),
-        );
+    if (messageTimeoutNs(route_result.timeout)) |timeout_ns| {
         self.msg_history_auto_hide_at = clock.nowNs() + timeout_ns;
+        self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
     } else {
         self.msg_history_auto_hide_at = null;
     }
@@ -7748,7 +9066,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
 /// Hide msg_history external grid.
 pub fn hideMsgHistory(self: *Core) void {
     const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
-    _ = self.grid.external_grids.fetchRemove(history_grid_id);
+    _ = self.grid.removeSyntheticExternal(history_grid_id);
     self.log.write("[msg_history] hide\n", .{});
 }
 
@@ -7761,12 +9079,17 @@ pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, co
     // value null = float shadows base (no overflow). Either way, do NOT fall back.
     if (core.flush_float_overlay) |map| {
         const key = FloatOverlayKey{ .row = comp_row, .col = comp_col };
-        if (map.contains(key)) return map.get(key).?;
+        // Single lookup instead of contains()+get(): the map's value type is
+        // itself optional (null = float shadows base with no overflow), so
+        // unwrapping one Optional level here yields exactly that inner value.
+        if (map.get(key)) |v| return v;
     }
 
-    // Fall back to persistent overflow map (no float overlay at this cell)
-    if (core.grid.cell_overflow.count() == 0) return null;
+    // Fall back to persistent overflow map (no float overlay at this cell).
+    // The grid-local count avoids a cell-key hash when only another grid owns
+    // overflow clusters.
     const gid = rc.grid_ids.items[@intCast(comp_col)];
+    if (core.grid.overflowCountForGrid(gid) == 0) return null;
     const src_row: u32 = if (gid == 1) comp_row else blk: {
         if (core.grid.win_pos.get(gid)) |pos| break :blk comp_row -| pos.row;
         break :blk comp_row;
@@ -7796,11 +9119,16 @@ pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, co
 pub fn clusterCacheKey(first_scalar: u32, style_index: u32, overflow: ?[]const u32) u64 {
     // Start with base key: scalar + style
     var key: u64 = (@as(u64, first_scalar) << 2) | @as(u64, style_index);
-    // Fold in overflow codepoints
+    // Fold in overflow codepoints. Rotate between folds so the key depends
+    // on extras ORDER, not just their multiset -- plain XOR-fold alone is
+    // commutative, so two different-order sequences of the same codepoints
+    // (genuinely different grapheme clusters, e.g. distinct combining-mark
+    // orderings) would otherwise collide on an identical key.
     if (overflow) |extras| {
         for (extras) |cp| {
             // FNV-1a-like mixing into upper bits
             key ^= @as(u64, cp) *% 0x517cc1b727220a95;
+            key = (key << 17) | (key >> 47);
         }
     }
     return key;
@@ -7816,6 +9144,142 @@ fn clusterCacheHash(first_scalar: u32, style_index: u32, overflow: ?[]const u32)
         }
     }
     return h;
+}
+
+/// Resolve a cursor scalar through the same persistent Phase 2 caches used by
+/// row generation. Cursor movement must not rasterize and pack a duplicate
+/// atlas entry for a glyph that is already present in the retained row set.
+fn ensureCachedPhase2Glyph(
+    core: *Core,
+    scalar: u32,
+    style_flags: u32,
+    overflow: ?[]const u32,
+) !?c_api.GlyphEntry {
+    try core.initGlyphCache();
+
+    const style_index: u32 =
+        @as(u32, @intFromBool(style_flags & c_api.STYLE_BOLD != 0)) |
+        (@as(u32, @intFromBool(style_flags & c_api.STYLE_ITALIC != 0)) << 1);
+    const extras = overflow orelse &.{};
+    var ascii_insert: ?usize = null;
+    var non_ascii_insert: ?usize = null;
+    var non_ascii_key: u64 = 0;
+
+    if (scalar < 128 and extras.len == 0) {
+        // This is the canonical scalar cache layout used by row generation and
+        // ASCII preload. The former style-major index aliased unrelated glyphs.
+        const cache_index = @as(usize, scalar) * 4 + @as(usize, style_index);
+        if (core.glyph_cache_ascii) |cache| {
+            if (core.glyph_valid_ascii) |valid| {
+                if (cache_index < cache.len and cache_index < valid.len) {
+                    if (valid[cache_index]) return cache[cache_index];
+                    ascii_insert = cache_index;
+                }
+            }
+        }
+    }
+    if (ascii_insert == null) {
+        if (core.glyph_cache_non_ascii) |cache| {
+            if (core.glyph_keys_non_ascii) |keys| {
+                if (cache.len != 0 and cache.len == keys.len) {
+                    const key = clusterCacheKey(scalar, style_index, overflow);
+                    const hash = clusterCacheHash(scalar, style_index, overflow);
+                    const probe = nvim_core.glyphCacheProbe(keys, key, hash);
+                    if (probe.hit) |hit| return cache[hit];
+                    non_ascii_insert = probe.insert;
+                    non_ascii_key = key;
+                }
+            }
+        }
+    }
+
+    var resolved: ?c_api.GlyphEntry = null;
+    const use_scalar_cluster = extras.len != 0 or isEmojiPresentation(scalar);
+
+    if (use_scalar_cluster) {
+        // The scalar rasterizer consumes this side-channel for complete emoji
+        // and grapheme clusters. OverflowExtras is bounded to 15 elements.
+        core.emoji_cluster_buf[0] = scalar;
+        for (extras, 0..) |extra, i| core.emoji_cluster_buf[i + 1] = extra;
+        core.emoji_cluster_len = @intCast(1 + extras.len);
+        resolved = core.ensureGlyphPhase2(scalar, style_flags);
+    } else if (core.cb.on_shape_text_run) |shape| {
+        if (core.cb.on_rasterize_glyph_by_id != null) {
+            var glyph_ids: [8]u32 = undefined;
+            var clusters: [8]u32 = undefined;
+            var x_adv: [8]i32 = undefined;
+            var x_off: [8]i32 = undefined;
+            var y_off: [8]i32 = undefined;
+            const one_scalar = [1]u32{scalar};
+            const glyph_count = shape(
+                core.ctx,
+                &one_scalar,
+                1,
+                style_flags,
+                &glyph_ids,
+                &clusters,
+                &x_adv,
+                &x_off,
+                &y_off,
+                glyph_ids.len,
+            );
+            if (core.flush_aborted) return null;
+
+            // Cursor cells cannot carry a variable-size shaped run. Reuse the
+            // row glyph-ID cache only for the unambiguous single-glyph result;
+            // every abnormal result safely falls back to scalar rasterization.
+            if (glyph_count == 1 and glyph_ids[0] != 0 and clusters[0] == 0) {
+                if (core.glyph_cache_by_id) |cache| {
+                    if (core.glyph_keys_by_id) |keys| {
+                        if (cache.len != 0 and cache.len == keys.len) {
+                            const gid = glyph_ids[0];
+                            const key = (@as(u64, gid) << 2) | @as(u64, style_index);
+                            const hash = (gid *% 2654435761) ^ style_index;
+                            const probe = nvim_core.glyphCacheProbe(keys, key, hash);
+                            if (probe.hit) |hit| {
+                                resolved = cache[hit];
+                            } else if (core.ensureGlyphByID(gid, style_flags)) |entry| {
+                                cache[probe.insert] = entry;
+                                keys[probe.insert] = key;
+                                resolved = entry;
+                            } else if (core.flush_aborted) {
+                                return null;
+                            }
+                        }
+                    }
+                }
+                if (resolved == null) {
+                    resolved = core.ensureGlyphByID(glyph_ids[0], style_flags);
+                    if (core.flush_aborted) return null;
+                }
+                // A shaped glyph-ID may be unsupported by the selected face
+                // (or intentionally empty for a color-glyph handoff). Match
+                // row generation by falling back through the scalar path;
+                // the by-ID blank is cached, while only a final scalar miss
+                // arms bounded maintenance retries.
+                if (resolved) |entry| {
+                    if (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) {
+                        resolved = null;
+                    }
+                }
+            }
+        }
+    }
+
+    if (resolved == null) {
+        resolved = core.ensureGlyphPhase2(scalar, style_flags);
+        if (core.flush_aborted) return null;
+    }
+
+    const entry = resolved orelse return null;
+    if (ascii_insert) |index| {
+        core.glyph_cache_ascii.?[index] = entry;
+        core.glyph_valid_ascii.?[index] = true;
+    } else if (non_ascii_insert) |index| {
+        core.glyph_cache_non_ascii.?[index] = entry;
+        core.glyph_keys_non_ascii.?[index] = non_ascii_key;
+    }
+    return entry;
 }
 
 /// Populate core.emoji_cluster_buf from a cell's base scalar + overflow extras.
@@ -7853,12 +9317,20 @@ pub const EmojiCluster = struct {
 pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
     var it = std.unicode.Utf8Iterator{ .bytes = text, .i = start };
     const first_slice = it.nextCodepointSlice() orelse return .{
-        .first_cp = 0, .codepoint_count = 0, .display_width = 0,
-        .end_byte = start, .extras = undefined, .extras_len = 0,
+        .first_cp = 0,
+        .codepoint_count = 0,
+        .display_width = 0,
+        .end_byte = start,
+        .extras = undefined,
+        .extras_len = 0,
     };
     const first_cp = std.unicode.utf8Decode(first_slice) catch return .{
-        .first_cp = 0xFFFD, .codepoint_count = 1, .display_width = 1,
-        .end_byte = it.i, .extras = undefined, .extras_len = 0,
+        .first_cp = 0xFFFD,
+        .codepoint_count = 1,
+        .display_width = 1,
+        .end_byte = it.i,
+        .extras = undefined,
+        .extras_len = 0,
     };
 
     var extras: [15]u32 = undefined;
@@ -7901,10 +9373,19 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
         const after_zwj = prev_cp == 0x200D;
 
         if (is_cluster_ext or after_zwj) {
-            if (extras_len < extras.len) {
-                extras[extras_len] = cp2;
-                extras_len += 1;
+            if (extras_len >= extras.len) {
+                // Cluster exceeds the fixed extras capacity. Stop here
+                // instead of continuing to consume (and silently losing)
+                // further combining marks/tags/ZWJ components: `scan.i`
+                // must not advance past a codepoint that isn't recorded in
+                // `extras`, or end_byte's caller skips it with no trace.
+                // The un-stored codepoint stays in the stream for the next
+                // scanEmojiCluster call to pick up as its own cluster.
+                scan.i = save_i;
+                break;
             }
+            extras[extras_len] = cp2;
+            extras_len += 1;
             prev_cp = cp2;
         } else {
             scan.i = save_i;
@@ -8094,4 +9575,2240 @@ fn isEmojiPresentation(scalar: u32) bool {
         => true,
         else => false,
     };
+}
+
+test "external cursor visibility includes validity and busy visibility" {
+    var grid = grid_mod.Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    grid.cursor_grid = 7;
+    grid.cursor_valid = true;
+    grid.cursor_visible = true;
+    try std.testing.expect(externalCursorVisibleOnGrid(&grid, 7));
+
+    grid.cursor_visible = false;
+    try std.testing.expect(!externalCursorVisibleOnGrid(&grid, 7));
+    grid.cursor_visible = true;
+    grid.cursor_valid = false;
+    try std.testing.expect(!externalCursorVisibleOnGrid(&grid, 7));
+}
+
+test "external cursor color glyph retains emoji decoration" {
+    const rgba_flags = externalCursorGlyphDecoFlags(4);
+    try std.testing.expect((rgba_flags & c_api.DECO_CURSOR) != 0);
+    try std.testing.expect((rgba_flags & c_api.DECO_SCROLLABLE) != 0);
+    try std.testing.expect((rgba_flags & c_api.DECO_COLOR_EMOJI) != 0);
+    try std.testing.expect((externalCursorGlyphDecoFlags(1) & c_api.DECO_COLOR_EMOJI) == 0);
+}
+
+test "flush begin abort preserves undispatched scroll notification only" {
+    const State = struct {
+        core: *Core,
+        abort_begin: bool = true,
+        scroll_calls: u32 = 0,
+
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.abort_begin) self.core.flush_aborted = true;
+        }
+
+        fn onScroll(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) self.scroll_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 3, 3);
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_begin = State.onBegin;
+    core.cb.on_grid_scroll = State.onScroll;
+    core.grid.scrollGrid(1, 0, 3, 0, 3, 1, 0);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(3, 3);
+    try std.testing.expect(core.grid.main_scroll_notify_pending);
+    try std.testing.expect(core.grid.pending_scroll == null);
+    try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
+
+    state.abort_begin = false;
+    try flush_ctx.onFlush(3, 3);
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+    try std.testing.expect(!core.grid.main_scroll_notify_pending);
+}
+
+test "scroll callback abort consumes only dispatched IDs" {
+    const State = struct {
+        core: *Core,
+        abort_scroll: bool = true,
+        scroll_calls: u32 = 0,
+        ids: [2]i64 = .{ 0, 0 },
+
+        fn onScroll(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ids[self.scroll_calls] = grid_id;
+            self.scroll_calls += 1;
+            if (self.abort_scroll) self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 3, 3);
+    try core.grid.resizeGrid(2, 3, 3);
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_grid_scroll = State.onScroll;
+    core.grid.scrollGrid(1, 0, 3, 0, 3, 1, 0);
+    core.grid.scrollGrid(2, 0, 3, 0, 3, 1, 0);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(3, 3);
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+    try std.testing.expectEqual(@as(i64, 1), state.ids[0]);
+    try std.testing.expect(!core.grid.main_scroll_notify_pending);
+    try std.testing.expect(core.grid.sub_grids.get(2).?.scroll_notify_pending);
+    try std.testing.expectEqual(@as(u8, 1), core.grid.scrolled_grid_count);
+    try std.testing.expectEqual(@as(i64, 2), core.grid.scrolled_grid_ids[0]);
+
+    state.abort_scroll = false;
+    try flush_ctx.onFlush(3, 3);
+    try std.testing.expectEqual(@as(u32, 2), state.scroll_calls);
+    try std.testing.expectEqual(@as(i64, 2), state.ids[1]);
+    try std.testing.expect(!core.grid.sub_grids.get(2).?.scroll_notify_pending);
+}
+
+test "flush transaction orders begin vertices end and restores state on every abort point" {
+    const State = struct {
+        const AbortAt = enum { none, begin, vertices, end };
+
+        core: *Core,
+        abort_at: AbortAt,
+        events: [3]u8 = .{ 0, 0, 0 },
+        event_count: usize = 0,
+
+        fn push(self: *@This(), event: u8) void {
+            self.events[self.event_count] = event;
+            self.event_count += 1;
+        }
+
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.push('B');
+            if (self.abort_at == .begin) self.core.flush_aborted = true;
+        }
+
+        fn onVertices(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = main_verts;
+            _ = main_count;
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.push('V');
+            if (self.abort_at == .vertices) self.core.flush_aborted = true;
+        }
+
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.push('E');
+            if (self.abort_at == .end) self.core.flush_aborted = true;
+        }
+    };
+
+    const cases = [_]State.AbortAt{ .none, .begin, .vertices, .end };
+    for (cases) |abort_at| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try core.grid.resizeGrid(1, 1, 1);
+        core.grid.putCell(0, 0, 'A', 0);
+        core.drawable_w_px = 1;
+        core.drawable_h_px = 1;
+        core.cell_w_px = 1;
+        core.cell_h_px = 1;
+
+        var state = State{ .core = &core, .abort_at = abort_at };
+        core.ctx = &state;
+        core.cb.on_flush_begin = State.onBegin;
+        core.cb.on_vertices_partial = State.onVertices;
+        core.cb.on_flush_end = State.onEnd;
+
+        var flush_ctx = FlushCtx{ .core = &core };
+        try flush_ctx.onFlush(1, 1);
+
+        if (abort_at == .begin) {
+            try std.testing.expectEqualSlices(u8, "BE", state.events[0..state.event_count]);
+        } else {
+            try std.testing.expectEqualSlices(u8, "BVE", state.events[0..state.event_count]);
+        }
+
+        if (abort_at == .none) {
+            try std.testing.expect(!core.flush_aborted);
+            try std.testing.expect(!core.grid.dirty_all);
+            try std.testing.expectEqual(core.grid.content_rev, core.last_sent_content_rev);
+        } else {
+            try std.testing.expect(core.flush_aborted);
+            try std.testing.expect(core.grid.dirty_all);
+            try std.testing.expect(core.grid.content_rev != core.last_sent_content_rev or abort_at == .end);
+        }
+    }
+}
+
+test "external row scroll hint excludes composited grids and clamps target viewport" {
+    const State = struct {
+        calls: u32 = 0,
+        grid_id: i64 = 0,
+        row_start: u32 = 0,
+        row_end: u32 = 0,
+        col_start: u32 = 0,
+        col_end: u32 = 0,
+        rows_delta: i32 = 0,
+        total_rows: u32 = 0,
+        total_cols: u32 = 0,
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.grid_id = grid_id;
+            self.row_start = row_start;
+            self.row_end = row_end;
+            self.col_start = col_start;
+            self.col_end = col_end;
+            self.rows_delta = rows_delta;
+            self.total_rows = total_rows;
+            self.total_cols = total_cols;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 4, 4);
+    try core.grid.setWinPos(2, 42, 0, 0);
+    var state = State{};
+    core.ctx = &state;
+
+    core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), state.calls);
+
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    // During a resize transition the retained GridBuf may still be wider and
+    // taller than the frontend target viewport. The callback rectangle must
+    // describe the visible surface so its full-width eligibility check agrees
+    // with the core's external-row fast path.
+    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 3, .cols = 2 });
+    core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), state.calls);
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 3,
+        .cols = 2,
+    });
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try std.testing.expectEqual(@as(i64, 2), state.grid_id);
+    try std.testing.expectEqual(@as(u32, 0), state.row_start);
+    try std.testing.expectEqual(@as(u32, 3), state.row_end);
+    try std.testing.expectEqual(@as(u32, 0), state.col_start);
+    try std.testing.expectEqual(@as(u32, 2), state.col_end);
+    try std.testing.expectEqual(@as(i32, 1), state.rows_delta);
+    try std.testing.expectEqual(@as(u32, 3), state.total_rows);
+    try std.testing.expectEqual(@as(u32, 2), state.total_cols);
+}
+
+test "external row scroll eligibility fails closed on non-representable regions" {
+    const full = grid_mod.ScrollDelta{
+        .top = 0,
+        .bot = 4,
+        .left = 0,
+        .right = 4,
+        .rows = 1,
+        .cols = 0,
+    };
+    try std.testing.expectEqualDeep(
+        ExternalScrollFastPathRegion{
+            .row_start = 0,
+            .row_end = 2,
+            .col_start = 0,
+            .col_end = 2,
+        },
+        externalScrollFastPathRegion(full, 4, 4, 2, 2).?,
+    );
+
+    var invalid = full;
+    invalid.left = 1;
+    try std.testing.expect(externalScrollFastPathRegion(invalid, 4, 4, 2, 2) == null);
+    invalid = full;
+    invalid.right = 1;
+    try std.testing.expect(externalScrollFastPathRegion(invalid, 4, 4, 2, 2) == null);
+    invalid = full;
+    invalid.top = 1;
+    try std.testing.expect(externalScrollFastPathRegion(invalid, 4, 4, 2, 2) == null);
+
+    inline for (.{ @as(i32, 0), 2, -2, std.math.minInt(i32) }) |rows_delta| {
+        invalid = full;
+        invalid.rows = rows_delta;
+        try std.testing.expect(externalScrollFastPathRegion(invalid, 4, 4, 2, 2) == null);
+    }
+    invalid = full;
+    invalid.cols = 1;
+    try std.testing.expect(externalScrollFastPathRegion(invalid, 4, 4, 2, 2) == null);
+    try std.testing.expect(externalScrollFastPathRegion(full, 4, 4, 5, 2) == null);
+    try std.testing.expect(externalScrollFastPathRegion(full, 4, 4, 2, 5) == null);
+}
+
+test "row-only vertex consumer receives main rows and cursor layer" {
+    const State = struct {
+        main_calls: u32 = 0,
+        cursor_calls: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (flags & c_api.VERT_UPDATE_MAIN != 0) self.main_calls += 1;
+            if (flags & c_api.VERT_UPDATE_CURSOR != 0) self.cursor_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.setCursor(1, 0, 0);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    try std.testing.expect(core.cb.on_vertices_partial == null);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
+    try std.testing.expect(state.main_calls >= 2);
+    try std.testing.expectEqual(@as(u32, 1), state.cursor_calls);
+}
+
+test "standalone subgrid clear emits each covered retained main row" {
+    const State = struct {
+        seen_rows: [5]bool = .{false} ** 5,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 5, 5);
+    try core.grid.resizeGrid(2, 2, 2);
+    try core.grid.setWinPos(2, 42, 1, 2);
+    core.grid.putCellGrid(2, 0, 0, 'X', 0);
+    core.grid.putCellGrid(2, 1, 0, 'Y', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 5;
+    core.drawable_h_px = 5;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    try flush_ctx.onFlush(5, 5);
+    state = .{};
+    core.grid.clearGrid(2);
+    try flush_ctx.onFlush(5, 5);
+
+    try std.testing.expectEqual([5]bool{ false, true, true, false, false }, state.seen_rows);
+}
+
+test "viewport decoration flags exclude all four margins" {
+    const margins = grid_mod.ViewportMargins{ .top = 1, .bottom = 1, .left = 1, .right = 1 };
+    var flags: [5]u32 = undefined;
+
+    setViewportRowDecoFlags(&flags, 0, 4, 5, margins);
+    try std.testing.expectEqual([5]u32{ 0, 0, 0, 0, 0 }, flags);
+    setViewportRowDecoFlags(&flags, 1, 4, 5, margins);
+    try std.testing.expectEqual([5]u32{
+        0,
+        c_api.DECO_SCROLLABLE,
+        c_api.DECO_SCROLLABLE,
+        c_api.DECO_SCROLLABLE,
+        0,
+    }, flags);
+    setViewportRowDecoFlags(&flags, 3, 4, 5, margins);
+    try std.testing.expectEqual([5]u32{ 0, 0, 0, 0, 0 }, flags);
+    try std.testing.expect(!viewportCellScrollable(1, 0, 4, 5, margins));
+    try std.testing.expect(!viewportCellScrollable(1, 4, 4, 5, margins));
+    try std.testing.expect(viewportCellScrollable(2, 2, 4, 5, margins));
+}
+
+test "row generation preserves left and right margin flags in every emitted layer" {
+    const State = struct {
+        fn ensure(ctx: ?*anyopaque, scalar: u32, out_entry: *c_api.GlyphEntry) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            out_entry.* = std.mem.zeroes(c_api.GlyphEntry);
+            return 0;
+        }
+
+        fn expectLayer(vertices: []const c_api.Vertex, required_deco: u32) !void {
+            try std.testing.expect(vertices.len != 0);
+            try std.testing.expectEqual(@as(usize, 0), vertices.len % 6);
+            var quad_start: usize = 0;
+            while (quad_start < vertices.len) : (quad_start += 6) {
+                const quad = vertices[quad_start..][0..6];
+                const flags = quad[0].deco_flags;
+                for (quad[1..]) |vertex| try std.testing.expectEqual(flags, vertex.deco_flags);
+                try std.testing.expectEqual(required_deco, flags & required_deco);
+
+                var min_x = quad[0].position[0];
+                var max_x = min_x;
+                for (quad[1..]) |vertex| {
+                    min_x = @min(min_x, vertex.position[0]);
+                    max_x = @max(max_x, vertex.position[0]);
+                }
+                const center_x_px = ((min_x + max_x) * 0.5 + 1.0) * 2.5;
+                const expected_scrollable = center_x_px >= 1.0 and center_x_px < 4.0;
+                try std.testing.expectEqual(expected_scrollable, flags & c_api.DECO_SCROLLABLE != 0);
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 5);
+    core.row_cells.setLen(5);
+    const style = STYLE_UNDERLINE | STYLE_STRIKETHROUGH;
+    for (0..5) |col| {
+        const deco: u32 = if (col >= 1 and col < 4) c_api.DECO_SCROLLABLE else 0;
+        core.row_cells.setWithDeco(
+            col,
+            0x2588,
+            0xFFFFFF,
+            0x010203,
+            highlight.Highlights.SP_NOT_SET,
+            1,
+            style,
+            1,
+            deco,
+        );
+        core.row_cells.glow_arr.items[col] = 0;
+    }
+    core.cb.on_atlas_ensure_glyph = State.ensure;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 5,
+        .vw = 5,
+        .vh = 1,
+        .cell_w = 1,
+        .cell_h = 1,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+    }, &out);
+
+    const starts = [5]usize{
+        0,
+        stats.pass_ends[0],
+        stats.pass_ends[1],
+        stats.pass_ends[2],
+        stats.pass_ends[3],
+    };
+    const required = [5]u32{
+        0,
+        c_api.DECO_UNDERLINE,
+        0,
+        c_api.DECO_STRIKETHROUGH,
+        c_api.DECO_OVERLINE,
+    };
+    for (starts, stats.pass_ends, required) |start, end, deco| {
+        try State.expectLayer(out.items[start..end], deco);
+    }
+}
+
+test "external anchored float keeps its own viewport margin flags" {
+    const State = struct {
+        fixed_vertices: usize = 0,
+        scrollable_vertices: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or verts == null) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (verts.?[0..vert_count]) |vertex| {
+                if (vertex.grid_id != 3) continue;
+                if (vertex.deco_flags & c_api.DECO_SCROLLABLE != 0) {
+                    self.scrollable_vertices += 1;
+                } else {
+                    self.fixed_vertices += 1;
+                }
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(2, 1, 5);
+    try core.grid.putSyntheticExternal(2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+    });
+    try core.grid.resizeGrid(3, 1, 3);
+    try core.grid.setWinFloatPos(3, 43, 0, 1, 10, 0, 2);
+    try core.grid.setViewportMargins(3, 0, 0, 1, 1);
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.sendExternalGridVertices(true);
+
+    try std.testing.expectEqual(@as(usize, 12), state.fixed_vertices);
+    try std.testing.expectEqual(@as(usize, 6), state.scrollable_vertices);
+}
+
+test "margin-only change emits retained main rows" {
+    const State = struct {
+        main_calls: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.main_calls += row_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 3, 4);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 3;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    try flush_ctx.onFlush(3, 4);
+    state = .{};
+    try core.grid.setViewportMargins(1, 1, 1, 1, 1);
+    try flush_ctx.onFlush(3, 4);
+    try std.testing.expectEqual(@as(u32, 3), state.main_calls);
+}
+
+test "external scroll without row-shift callback regenerates every retained row" {
+    const State = struct {
+        row_calls: u32 = 0,
+        scroll_calls: u32 = 0,
+        seen_rows: [4]bool = .{false} ** 4,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.row_calls += row_count;
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scroll_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(1, 4, 2);
+    try core.grid.resizeGrid(2, 4, 2);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 4,
+        .cols = 2,
+    });
+    for (0..4) |row| {
+        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
+    }
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    try std.testing.expect(core.cb.on_grid_row_scroll == null);
+
+    // Seed the retained external surface, then isolate the scroll update.
+    core.sendExternalGridVertices(true);
+    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
+    state = .{};
+
+    core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
+    core.sendExternalGridVertices(false);
+    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
+
+    // A float anchored to the external grid must suppress both sides of the
+    // retained-row protocol even when it is outside the visible row index.
+    // Otherwise generation sends only the vacated row while dispatch refuses
+    // the shift callback, leaving every retained row stale.
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    try core.grid.resizeGrid(3, 1, 1);
+    try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2);
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+    core.sendExternalGridVertices(true);
+    state = .{};
+
+    core.grid.sub_grids.getPtr(2).?.clearScrollState();
+    core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
+    try buildExternalFloatAnchorIndex(&core);
+    const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 2);
+    try std.testing.expectEqual(@as(usize, 1), anchor_entries.len);
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2, anchor_entries));
+    core.ext_float_anchor_index_valid = false;
+    core.sendExternalGridVertices(false);
+    try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
+}
+
+test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
+    const State = struct {
+        raster_calls: u32 = 0,
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = scalar;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.raster_calls += 1;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'A', 0, null) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'A', 0, null) != null);
+    try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
+
+    const cluster_a = [_]u32{ 0x200D, 0x1F4BB };
+    const cluster_b = [_]u32{ 0x200D, 0x1F52C };
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_a) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_a) != null);
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_b) != null);
+    try std.testing.expectEqual(@as(u32, 3), state.raster_calls);
+}
+
+test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
+    const State = struct {
+        shape_calls: u32 = 0,
+        by_id_calls: u32 = 0,
+        scalar_calls: u32 = 0,
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            if (out_cap < 1 or scalar_count != 1) return 0;
+            out_glyph_ids[0] = if (scalars[0] == 0x4E2D) 78 else 77;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 64;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn rasterById(
+            ctx: ?*anyopaque,
+            glyph_id: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = glyph_id;
+            _ = style_flags;
+            _ = out_bitmap;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.by_id_calls += 1;
+            return 0;
+        }
+
+        fn rasterScalar(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = scalar;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scalar_calls += 1;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+            _ = ctx;
+            _ = width;
+            _ = height;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+
+    var ascii_entry = std.mem.zeroes(c_api.GlyphEntry);
+    ascii_entry.bbox_size_px = .{ 11, 1 };
+    const ascii_index = @as(usize, 'A') * 4 + 1;
+    core.glyph_cache_ascii.?[ascii_index] = ascii_entry;
+    core.glyph_valid_ascii.?[ascii_index] = true;
+
+    // This was the old style-major slot for bold 'A'. Populate it with a
+    // conflicting glyph to prove the cursor no longer aliases that layout.
+    var aliased_entry = std.mem.zeroes(c_api.GlyphEntry);
+    aliased_entry.bbox_size_px = .{ 22, 1 };
+    const old_style_major_index = 128 + @as(usize, 'A');
+    core.glyph_cache_ascii.?[old_style_major_index] = aliased_entry;
+    core.glyph_valid_ascii.?[old_style_major_index] = true;
+
+    const ascii = (try ensureCachedPhase2Glyph(&core, 'A', c_api.STYLE_BOLD, null)).?;
+    try std.testing.expectEqual(@as(f32, 11), ascii.bbox_size_px[0]);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.rasterById;
+    core.cb.on_rasterize_glyph = State.rasterScalar;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    const gid: u32 = 77;
+    const style_index: u32 = 0;
+    const key = (@as(u64, gid) << 2) | style_index;
+    const hash = (gid *% 2654435761) ^ style_index;
+    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, hash);
+    var shaped_entry = std.mem.zeroes(c_api.GlyphEntry);
+    shaped_entry.bbox_size_px = .{ 7, 1 };
+    core.glyph_cache_by_id.?[probe.insert] = shaped_entry;
+    core.glyph_keys_by_id.?[probe.insert] = key;
+
+    const first = (try ensureCachedPhase2Glyph(&core, 0x754C, 0, null)).?;
+    const second = (try ensureCachedPhase2Glyph(&core, 0x754C, 0, null)).?;
+    try std.testing.expectEqual(@as(f32, 7), first.bbox_size_px[0]);
+    try std.testing.expectEqual(@as(f32, 7), second.bbox_size_px[0]);
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.by_id_calls);
+
+    // A shaped primary-face miss falls back to the scalar/font path without
+    // arming a retry storm when the fallback renders successfully.
+    const fallback = (try ensureCachedPhase2Glyph(&core, 0x4E2D, 0, null)).?;
+    try std.testing.expectEqual(@as(f32, 1), fallback.bbox_size_px[0]);
+    try std.testing.expectEqual(@as(u32, 2), state.shape_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.by_id_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.scalar_calls);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+}
+
+test "wide block geometry spans continuation across legacy and shaped runs" {
+    const State = struct {
+        ensure_calls: u32 = 0,
+        shape_calls: u32 = 0,
+        raster_calls: u32 = 0,
+
+        fn ensure(ctx: ?*anyopaque, scalar: u32, out_entry: *c_api.GlyphEntry) callconv(.c) c_int {
+            _ = scalar;
+            out_entry.* = std.mem.zeroes(c_api.GlyphEntry);
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ensure_calls += 1;
+            return 0;
+        }
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = scalars;
+            _ = scalar_count;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            if (out_cap < 1) return 1;
+            out_glyph_ids[0] = 42;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 128;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn raster(
+            ctx: ?*anyopaque,
+            scalar_or_glyph_id: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = scalar_or_glyph_id;
+            _ = style_flags;
+            out_bitmap.* = std.mem.zeroes(c_api.GlyphBitmap);
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.raster_calls += 1;
+            return 0;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+            _ = ctx;
+            _ = width;
+            _ = height;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 2);
+    try core.row_cells.ensureTotalCapacity(core.alloc, 2);
+    core.row_cells.setLen(2);
+    core.row_cells.setWithDeco(0, 0x2588, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    // A different color deliberately splits the SIMD run. Width detection is
+    // based on Neovim's continuation cell, not the current style/color run.
+    core.row_cells.setWithDeco(1, 0, 0x00FF00, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_atlas_ensure_glyph = State.ensure;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const params = RowGenParams{
+        .row = 0,
+        .cols = 2,
+        .vw = 20,
+        .vh = 10,
+        .cell_w = 10,
+        .cell_h = 10,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+    };
+
+    const stats = try generateRowVertices(&core, params, &out);
+    const glyphs = out.items[stats.pass_ends[1]..stats.pass_ends[2]];
+    try std.testing.expectEqual(@as(usize, 6), glyphs.len);
+    var min_x: f32 = std.math.inf(f32);
+    var max_x: f32 = -std.math.inf(f32);
+    for (glyphs) |vertex| {
+        min_x = @min(min_x, vertex.position[0]);
+        max_x = @max(max_x, vertex.position[0]);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, -1), min_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), max_x, 0.001);
+    try std.testing.expectEqual(@as(u32, 0), state.ensure_calls);
+
+    // A real space is not a wide-cell continuation.
+    core.row_cells.scalars.items[1] = ' ';
+    out.clearRetainingCapacity();
+    const narrow_stats = try generateRowVertices(&core, params, &out);
+    const narrow_glyphs = out.items[narrow_stats.pass_ends[1]..narrow_stats.pass_ends[2]];
+    max_x = -std.math.inf(f32);
+    for (narrow_glyphs) |vertex| max_x = @max(max_x, vertex.position[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), max_x, 0.001);
+    try std.testing.expectEqual(@as(u32, 0), state.ensure_calls);
+
+    // The shaping collector must use the same row-wide continuation rule.
+    // Bold on the continuation forces a run boundary exactly between the two
+    // cells; the base block still owns both columns geometrically.
+    core.row_cells.scalars.items[1] = 0;
+    core.row_cells.fg_rgbs.items[1] = core.row_cells.fg_rgbs.items[0];
+    core.row_cells.style_flags_arr.items[1] = STYLE_BOLD;
+    core.cb.on_atlas_ensure_glyph = null;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph = State.raster;
+    core.cb.on_rasterize_glyph_by_id = State.raster;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+    out.clearRetainingCapacity();
+    const shaped_stats = try generateRowVertices(&core, params, &out);
+    const shaped_glyphs = out.items[shaped_stats.pass_ends[1]..shaped_stats.pass_ends[2]];
+    max_x = -std.math.inf(f32);
+    for (shaped_glyphs) |vertex| max_x = @max(max_x, vertex.position[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), max_x, 0.001);
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+}
+
+test "shaping includes overflow tails in input and cache key" {
+    const State = struct {
+        const Mode = enum { valid, invalid_cluster, failed, empty_by_id };
+
+        mode: Mode = .valid,
+        shape_calls: u32 = 0,
+        scalar_raster_calls: u32 = 0,
+        seen_len: usize = 0,
+        seen: [16]u32 = .{0} ** 16,
+
+        fn bitmap(width: u32) c_api.GlyphBitmap {
+            return .{
+                .pixels = null,
+                .width = width,
+                .height = if (width == 0) 0 else 1,
+                .pitch = @intCast(width),
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+        }
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            self.seen_len = @min(scalar_count, self.seen.len);
+            @memcpy(self.seen[0..self.seen_len], scalars[0..self.seen_len]);
+            if (self.mode == .failed) return 0;
+            if (out_cap < 1) return 1;
+            out_glyph_ids[0] = 42;
+            out_clusters[0] = if (self.mode == .invalid_cluster) 1 else 0;
+            out_x_advance[0] = 64;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn rasterById(
+            ctx: ?*anyopaque,
+            glyph_id: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = glyph_id;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            out_bitmap.* = bitmap(if (self.mode == .empty_by_id) 0 else 1);
+            return 1;
+        }
+
+        fn rasterScalar(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scalar_raster_calls += 1;
+            out_bitmap.* = bitmap(if (scalar == ' ') 0 else 1);
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            glyph_bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = glyph_bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+            _ = ctx;
+            _ = width;
+            _ = height;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+    core.row_cells.setLen(1);
+    core.row_cells.setWithDeco(0, 'e', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, c_api.DECO_SCROLLABLE);
+    core.row_cells.glow_arr.items[0] = 0;
+    try core.initGlyphCache();
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.rasterById;
+    core.cb.on_rasterize_glyph = State.rasterScalar;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const params = RowGenParams{
+        .row = 0,
+        .cols = 1,
+        .vw = 1,
+        .vh = 1,
+        .cell_w = 1,
+        .cell_h = 1,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+    };
+
+    const acute = [_]u32{0x0301};
+    try core.grid.putCellGridCluster(1, 0, 0, 'e', 0, &acute);
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expectEqual(@as(usize, 2), state.seen_len);
+    try std.testing.expectEqual(@as(u32, 'e'), state.seen[0]);
+    try std.testing.expectEqual(@as(u32, 0x0301), state.seen[1]);
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+
+    const grave = [_]u32{0x0300};
+    try core.grid.putCellGridCluster(1, 0, 0, 'e', 0, &grave);
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expectEqual(@as(u32, 2), state.shape_calls);
+    try std.testing.expectEqual(@as(u32, 0x0300), state.seen[1]);
+
+    // Malformed clusters are not cached and use the safe per-scalar path.
+    core.resetShapeCache();
+    state.mode = .invalid_cluster;
+    const scalar_calls_before = state.scalar_raster_calls;
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expect(state.scalar_raster_calls >= scalar_calls_before + 2);
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expectEqual(@as(u32, 4), state.shape_calls);
+
+    // A callback failure with a space base still draws its combining tail at
+    // the base cell origin, not one cell to the right after space advance.
+    core.resetShapeCache();
+    state.mode = .failed;
+    core.row_cells.scalars.items[0] = ' ';
+    try core.grid.putCellGridCluster(1, 0, 0, ' ', 0, &acute);
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expect(out.items.len >= 12);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), out.items[out.items.len - 6].position[0], 0.001);
+
+    // The real shaped glyph may also resolve to an empty bitmap. Its
+    // multi-scalar fallback must apply the same base anchor rule as .notdef.
+    core.resetShapeCache();
+    core.resetGlyphCacheFlags();
+    state.mode = .empty_by_id;
+    out.clearRetainingCapacity();
+    _ = try generateRowVertices(&core, params, &out);
+    try std.testing.expect(out.items.len >= 12);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), out.items[out.items.len - 6].position[0], 0.001);
+}
+
+test "partial-only Phase 2 preserves overflow clusters with and without shaping" {
+    const State = struct {
+        core: *Core,
+        partial_calls: u32 = 0,
+        scalar_calls: u32 = 0,
+        shape_calls: u32 = 0,
+        scalar_extras: [2]u32 = .{ 0, 0 },
+        shaped_len: usize = 0,
+        shaped_scalars: [4]u32 = .{ 0, 0, 0, 0 },
+        background_after_glyph: bool = false,
+
+        fn bitmap() c_api.GlyphBitmap {
+            return .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+        }
+
+        fn partial(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = cursor_verts;
+            _ = cursor_count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.partial_calls += 1;
+            if (flags & c_api.VERT_UPDATE_MAIN != 0) {
+                if (main_verts) |verts| {
+                    var saw_glyph = false;
+                    for (verts[0..main_count]) |vertex| {
+                        if (vertex.texCoord[0] >= 0) {
+                            saw_glyph = true;
+                        } else if (saw_glyph and vertex.texCoord[0] == -1 and vertex.texCoord[1] == -1) {
+                            self.background_after_glyph = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn rasterScalar(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = scalar;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.scalar_calls < self.scalar_extras.len and self.core.emoji_cluster_len > 1) {
+                self.scalar_extras[self.scalar_calls] = self.core.emoji_cluster_buf[1];
+            }
+            self.scalar_calls += 1;
+            out_bitmap.* = bitmap();
+            return 1;
+        }
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            self.shaped_len = @min(scalar_count, self.shaped_scalars.len);
+            @memcpy(self.shaped_scalars[0..self.shaped_len], scalars[0..self.shaped_len]);
+            if (out_cap < 1) return 1;
+            out_glyph_ids[0] = 77;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 64;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn rasterById(
+            ctx: ?*anyopaque,
+            glyph_id: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = glyph_id;
+            _ = style_flags;
+            out_bitmap.* = bitmap();
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            glyph_bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = glyph_bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+            _ = ctx;
+            _ = width;
+            _ = height;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 1);
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_partial = State.partial;
+    core.cb.on_rasterize_glyph = State.rasterScalar;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try core.grid.putCellGridCluster(1, 0, 0, 'A', 0, &.{0xFE0F});
+    try flush_ctx.onFlush(2, 1);
+    try std.testing.expectEqual(@as(u32, 1), state.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), state.scalar_extras[0]);
+
+    // Same base scalar, different tail: this must miss the full-cluster key
+    // instead of reusing the VS16 glyph cached by the preceding flush.
+    try core.grid.putCellGridCluster(1, 0, 0, 'A', 0, &.{0x0301});
+    try flush_ctx.onFlush(2, 1);
+    try std.testing.expectEqual(@as(u32, 2), state.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 0x0301), state.scalar_extras[1]);
+    try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
+
+    // Register shaping on the same partial-only consumer. The shared row
+    // generator must include the overflow tail in the shaping input.
+    core.resetGlyphCacheFlags();
+    core.resetShapeCache();
+    core.ascii_tables_valid = true;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.rasterById;
+    try core.grid.putCellGridCluster(1, 0, 0, 'e', 0, &.{0x0301});
+    try flush_ctx.onFlush(2, 1);
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.shaped_len);
+    try std.testing.expectEqualSlices(u32, &.{ 'e', 0x0301 }, state.shaped_scalars[0..2]);
+    try std.testing.expectEqual(@as(u32, 3), state.partial_calls);
+    try std.testing.expect(!state.background_after_glyph);
+}
+
+test "cursor atlas reset cancels current flush before partial commit" {
+    const State = struct {
+        partial_calls: u32 = 0,
+
+        fn partial(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = main_verts;
+            _ = main_count;
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.partial_calls += 1;
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.setCursor(1, 0, 0);
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.last_sent_content_rev = core.grid.content_rev;
+    core.grid.clearDirty();
+    core.last_sent_cursor_rev = core.grid.cursor_rev -% 1;
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_initialized = true;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_partial = State.partial;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(core.flush_atlas_corrupted);
+    try std.testing.expect(core.grid.dirty_all);
+    try std.testing.expectEqual(@as(u32, 0), state.partial_calls);
+}
+
+test "second row-mode atlas reset cancels instead of committing empty rows" {
+    const State = struct {
+        core: *Core,
+        row_calls: u32 = 0,
+        empty_main_calls: u32 = 0,
+        create_calls: u32 = 0,
+        upload_calls: u32 = 0,
+        committed_flushes: u32 = 0,
+        cancelled_flushes: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (flags & c_api.VERT_UPDATE_MAIN != 0) {
+                self.row_calls += 1;
+                if (vert_count == 0) self.empty_main_calls += 1;
+            }
+        }
+
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.core.flush_aborted or self.core.flush_atlas_corrupted) {
+                self.cancelled_flushes += 1;
+            } else {
+                self.committed_flushes += 1;
+            }
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.upload_calls += 1;
+            // Force the next uncached glyph to observe a full packer. The
+            // first upload follows 2048→4096 growth; the second glyph is
+            // reached only after the row loop restarts at the new generation.
+            if (self.upload_calls == 1) {
+                self.core.atlas_packer.?.next_x = self.core.atlas_w;
+                self.core.atlas_packer.?.next_y = self.core.atlas_h;
+                self.core.atlas_packer.?.row_h = 0;
+            }
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = atlas_w;
+            _ = atlas_h;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.create_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 1);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.putCell(1, 0, 'B', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_packer.?.next_x = core.atlas_w;
+    core.atlas_packer.?.next_y = core.atlas_h;
+    core.atlas_initialized = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_end = State.onEnd;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 1);
+
+    try std.testing.expect(core.flush_atlas_corrupted);
+    try std.testing.expect(core.grid.dirty_all);
+    try std.testing.expectEqual(@as(u32, 0), state.committed_flushes);
+    try std.testing.expectEqual(@as(u32, 1), state.cancelled_flushes);
+    try std.testing.expectEqual(@as(u32, 0), state.empty_main_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.row_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
+}
+
+test "atlas create abort does not leak reset edge into next flush" {
+    const State = struct {
+        core: *Core,
+        abort_create: bool = true,
+        create_calls: u32 = 0,
+        upload_calls: u32 = 0,
+        partial_calls: u32 = 0,
+
+        fn partial(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = main_verts;
+            _ = main_count;
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.partial_calls += 1;
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.upload_calls += 1;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = atlas_w;
+            _ = atlas_h;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.create_calls += 1;
+            if (self.abort_create) self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_initialized = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_partial = State.partial;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+    try std.testing.expectEqual(@as(u32, 1), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.partial_calls);
+
+    state.abort_create = false;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(!core.flush_atlas_corrupted);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+    try std.testing.expect(!core.grid.dirty_all);
+    try std.testing.expectEqual(@as(u32, 2), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.partial_calls);
+}
+
+fn checkShapingScratchAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    try ensureShapingScratch(&core, 64);
+}
+
+test "shaping scratch allocation failures propagate" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkShapingScratchAllocationFailure,
+        .{},
+    );
+}
+
+test "flush begin abort does not arm atlas capacity recovery" {
+    const State = struct {
+        core: *Core,
+
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    try core.initGlyphCache();
+    core.glyph_cache_ascii.?['x'] = std.mem.zeroes(c_api.GlyphEntry);
+    core.glyph_valid_ascii.?['x'] = true;
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_grid_rev = core.grid.glyph_working_set_rev;
+    core.grid.glyph_working_set_rev +%= 1;
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_begin = State.onBegin;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(core.glyph_valid_ascii.?['x']);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+}
+
+test "external float row index sorts once and buckets visible intersections" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(10, 4, 5);
+    try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 10, .start_col = 20 });
+    try core.grid.resizeGrid(20, 2, 2);
+    try core.grid.resizeGrid(21, 2, 2);
+    try core.grid.setWinFloatPos(20, 20, 10, 20, 20, 0, 10);
+    try core.grid.setWinFloatPos(21, 21, 11, 21, 10, 0, 10);
+
+    try buildExternalFloatAnchorIndex(&core);
+    const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 10);
+    const generation = try buildExternalFloatRowIndex(
+        &core,
+        anchor_entries,
+        core.grid.external_grids.get(10),
+        4,
+        5,
+    );
+    try std.testing.expectEqual(generation, core.ext_float_index_generation);
+    try std.testing.expectEqualSlices(i64, &.{ 21, 20 }, &.{
+        core.ext_float_entries.items[0].grid_id,
+        core.ext_float_entries.items[1].grid_id,
+    });
+
+    const offsets = core.ext_float_row_offsets.items;
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3, 4, 4 }, offsets);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 1, 0 }, core.ext_float_row_entry_indices.items);
+    try std.testing.expect(
+        externalFloatPersistentScratchCapacityByteSize(&core).? <=
+            MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES,
+    );
+
+    const fallback_generation = try buildExternalFloatRowIndexWithLimit(
+        &core,
+        anchor_entries,
+        core.grid.external_grids.get(10),
+        4,
+        5,
+        1,
+    );
+    try std.testing.expectEqual(fallback_generation, core.ext_float_index_generation);
+    try std.testing.expect(fallback_generation != generation);
+    try std.testing.expect(!core.ext_float_row_index_valid);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_offsets.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
+    // The sorted entry list remains available for the allocation-free
+    // per-row full-scan fallback.
+    try std.testing.expectEqualSlices(i64, &.{ 21, 20 }, &.{
+        core.ext_float_entries.items[0].grid_id,
+        core.ext_float_entries.items[1].grid_id,
+    });
+}
+
+test "external float persistent scratch partitions share one 8 MiB cap" {
+    try std.testing.expectEqual(
+        MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES,
+        MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES +
+            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES +
+            MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
+    );
+    try std.testing.expect(
+        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(ExternalFloatAnchorEntry) <=
+            MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
+    );
+    try std.testing.expect(
+        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(GridEntry) <=
+            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
+    );
+}
+
+test "main subgrid row index preserves layer order and updates on layout change" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
+    var cached = [_]CachedSubgrid{
+        .{ .grid_id = 10, .row_start = 0, .row_end = 2, .col_start = 0, .sg_cols = 1, .sg_rows = 2, .cells = cells[0..].ptr, .margin_top = 0, .margin_bottom = 0 },
+        .{ .grid_id = 11, .row_start = 1, .row_end = 3, .col_start = 0, .sg_cols = 1, .sg_rows = 2, .cells = cells[0..].ptr, .margin_top = 0, .margin_bottom = 0 },
+        .{ .grid_id = 12, .row_start = 1, .row_end = 2, .col_start = 0, .sg_cols = 1, .sg_rows = 1, .cells = cells[0..].ptr, .margin_top = 0, .margin_bottom = 0 },
+    };
+    try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 5, 5 }, core.main_subgrid_row_offsets.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 1, 2, 1 }, core.main_subgrid_row_indices.items);
+
+    const retained_capacity = core.main_subgrid_row_indices.capacity;
+    try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
+    try std.testing.expectEqual(retained_capacity, core.main_subgrid_row_indices.capacity);
+
+    cached[2].row_start = 3;
+    cached[2].row_end = 4;
+    try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3, 4, 5 }, core.main_subgrid_row_offsets.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 1, 1, 2 }, core.main_subgrid_row_indices.items);
+
+    // Five row references exceed this test budget, so the layout remains
+    // invalid and the production caller takes the allocation-free full scan.
+    const four_ref_budget = mainSubgridRowIndexByteSize(4, 4, cached.len).?;
+    try std.testing.expect(!try ensureMainSubgridRowIndexWithLimit(&core, &cached, 4, four_ref_budget));
+    try std.testing.expect(!core.main_subgrid_row_index_valid);
+
+    // Layout snapshots consume the same total budget even when the grids cover
+    // no visible rows and therefore contribute zero row references.
+    var layout_core = Core.initForTest(std.testing.allocator);
+    defer layout_core.deinitForTest();
+    var zero_height = cached;
+    for (&zero_height) |*csg| csg.row_end = csg.row_start;
+    const two_layout_budget = mainSubgridRowIndexByteSize(4, 0, 2).?;
+    try std.testing.expect(!try ensureMainSubgridRowIndexWithLimit(&layout_core, &zero_height, 4, two_layout_budget));
+    try std.testing.expect(!layout_core.main_subgrid_row_index_valid);
+}
+
+test "subgrid layout diff merges by id and reuses linear row marks" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var cell = [_]grid_mod.Cell{.{ .cp = ' ', .hl = 0 }};
+    var cached: [64]CachedSubgrid = undefined;
+    for (&cached, 0..) |*csg, index| {
+        // Reverse IDs prove comparison does not depend on layer order.
+        csg.* = .{
+            .grid_id = @intCast(cached.len - index),
+            .row_start = @intCast(index * 2),
+            .row_end = @intCast(index * 2 + 1),
+            .col_start = 0,
+            .sg_cols = 1,
+            .sg_rows = 1,
+            .cells = cell[0..].ptr,
+            .margin_top = 0,
+            .margin_bottom = 0,
+        };
+    }
+    saveSubgridSnapshots(&core, &cached);
+
+    var out: [32]u32 = undefined;
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        collectSubgridDiffRows(&core, &cached, 0, 128, &out, &.{}),
+    );
+    const current_capacity = core.subgrid_diff_current.capacity;
+    const mark_capacity = core.subgrid_diff_row_marks.capacity;
+
+    const moved_old_row = cached[10].row_start;
+    cached[10].row_start = 100;
+    cached[10].row_end = 101;
+    const count = collectSubgridDiffRows(
+        &core,
+        &cached,
+        0,
+        128,
+        &out,
+        &.{moved_old_row},
+    );
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expectEqual(@as(u32, 100), out[0]);
+    try std.testing.expectEqual(current_capacity, core.subgrid_diff_current.capacity);
+    try std.testing.expectEqual(mark_capacity, core.subgrid_diff_row_marks.capacity);
+}
+
+test "external float anchor index groups many anchors after one map scan" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const anchor_count = 64;
+    for (0..anchor_count) |i| {
+        const anchor_id: i64 = @intCast(100 + i);
+        const float_id: i64 = @intCast(1000 + i);
+        try core.grid.resizeGrid(anchor_id, 2, 2);
+        try core.grid.putSyntheticExternal(anchor_id, .{
+            .win = anchor_id,
+            .start_row = @intCast(i * 2),
+            .start_col = 0,
+        });
+        try core.grid.resizeGrid(float_id, 1, 1);
+        try core.grid.setWinFloatPos(float_id, float_id, @intCast(i * 2), 0, @intCast(i), 0, anchor_id);
+    }
+
+    try buildExternalFloatAnchorIndex(&core);
+    const retained_capacity = core.ext_float_anchor_entries.capacity;
+    try std.testing.expectEqual(@as(usize, anchor_count), core.ext_float_anchor_entries.items.len);
+    for (0..anchor_count) |i| {
+        const anchor_id: i64 = @intCast(100 + i);
+        const entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, anchor_id);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqual(@as(i64, @intCast(1000 + i)), entries[0].entry.grid_id);
+    }
+
+    // Rebuilding the same layout reuses the persistent allocation.
+    core.ext_float_anchor_index_valid = false;
+    try buildExternalFloatAnchorIndex(&core);
+    try std.testing.expectEqual(retained_capacity, core.ext_float_anchor_entries.capacity);
+}
+
+test "external float anchor scratch reserves only matching placements" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 1, 1);
+    for (0..128) |i| {
+        const grid_id: i64 = @intCast(1_000 + i);
+        try core.grid.setWinPos(grid_id, 0, 0, 0);
+    }
+    try core.grid.resizeGrid(5000, 1, 1);
+    try core.grid.putSyntheticExternal(5000, .{ .win = 5000, .start_row = 0, .start_col = 0 });
+    try core.grid.setWinFloatPos(5001, 0, 0, 0, 10, 0, 5000);
+
+    try buildExternalFloatAnchorIndex(&core);
+    try std.testing.expectEqual(@as(usize, 129), core.grid.win_pos.count());
+    try std.testing.expectEqual(@as(usize, 1), core.ext_float_anchor_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), core.ext_float_anchor_entries.capacity);
+}
+
+test "external float visible scratch excludes invisible entries and releases hostile capacity" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(10, 4, 5);
+    try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
+    try core.grid.resizeGrid(20, 1, 1);
+    try core.grid.setWinFloatPos(20, 20, 0, 0, 100, 0, 10);
+    for (0..32) |i| {
+        const float_id: i64 = @intCast(100 + i);
+        try core.grid.resizeGrid(float_id, 1, 1);
+        try core.grid.setWinFloatPos(float_id, float_id, @intCast(100 + i), 0, @intCast(i), 0, 10);
+    }
+
+    try buildExternalFloatAnchorIndex(&core);
+    const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 10);
+    _ = try buildExternalFloatRowIndex(&core, anchor_entries, core.grid.external_grids.get(10), 4, 5);
+    try std.testing.expectEqual(@as(usize, 1), core.ext_float_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), core.ext_float_entries.capacity);
+    try std.testing.expectEqual(@as(i64, 20), core.ext_float_entries.items[0].grid_id);
+
+    // A prior hostile high-water capacity is dropped before a later bounded
+    // build, rather than surviving clearRetainingCapacity indefinitely.
+    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 64);
+    _ = try buildExternalFloatRowIndexWithLimits(
+        &core,
+        &.{},
+        core.grid.external_grids.get(10),
+        4,
+        5,
+        MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
+        @sizeOf(GridEntry),
+    );
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
+
+    try std.testing.expectError(
+        error.TooManyWindowPlacements,
+        buildExternalFloatAnchorIndexWithLimit(&core, @sizeOf(ExternalFloatAnchorEntry)),
+    );
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
+}
+
+test "external close detection visits known grids once and removes in place" {
+    const Recorder = struct {
+        fn close(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const ids: *std.ArrayListUnmanaged(i64) = @ptrCast(@alignCast(ctx.?));
+            ids.append(std.testing.allocator, grid_id) catch unreachable;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    var closed: std.ArrayListUnmanaged(i64) = .empty;
+    defer closed.deinit(std.testing.allocator);
+    core.ctx = &closed;
+    core.cb.on_external_window_close = Recorder.close;
+
+    try core.known_external_grids.put(core.alloc, 10, .{ .win = 10, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    try core.known_external_grids.put(core.alloc, 11, .{ .win = 11, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    try core.grid.external_grids.put(core.alloc, 11, .{ .win = 11, .start_row = 0, .start_col = 0 });
+
+    _ = notifyExternalWindowChanges(&core);
+    try std.testing.expectEqualSlices(i64, &.{10}, closed.items);
+    try std.testing.expect(!core.known_external_grids.contains(10));
+    try std.testing.expect(core.known_external_grids.contains(11));
+}
+
+test "external open abort stops later lifecycle callbacks until retry" {
+    const State = struct {
+        core: *Core,
+        calls: u32 = 0,
+        abort_first: bool = true,
+
+        fn open(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            win: i64,
+            rows: u32,
+            cols: u32,
+            start_row: i32,
+            start_col: i32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = win;
+            _ = rows;
+            _ = cols;
+            _ = start_row;
+            _ = start_col;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (self.abort_first and self.calls == 1) self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(10, 2, 2);
+    try core.grid.resizeGrid(11, 2, 2);
+    try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
+    try core.grid.putSyntheticExternal(11, .{ .win = 11, .start_row = 2, .start_col = 0 });
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_external_window = State.open;
+
+    _ = notifyExternalWindowChanges(&core);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try std.testing.expectEqual(@as(usize, 0), core.known_external_grids.count());
+
+    core.flush_aborted = false;
+    state.abort_first = false;
+    _ = notifyExternalWindowChanges(&core);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expectEqual(@as(u32, 3), state.calls);
+    try std.testing.expectEqual(@as(usize, 2), core.known_external_grids.count());
+}
+
+test "transient message compaction is stable" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const kinds = [_][]const u8{ "search_count", "echo", "search_count", "emsg" };
+    for (kinds, 1..) |kind, id| {
+        const owned_kind = try core.alloc.dupe(u8, kind);
+        errdefer core.alloc.free(owned_kind);
+        try core.grid.message_state.messages.append(core.alloc, .{
+            .id = @intCast(id),
+            .kind = owned_kind,
+        });
+    }
+
+    dropTransientMessages(&core, 1);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.message_state.messages.items.len);
+    try std.testing.expectEqual(@as(i64, 2), core.grid.message_state.messages.items[0].id);
+    try std.testing.expectEqual(@as(i64, 4), core.grid.message_state.messages.items[1].id);
+}
+
+test "message timeout conversion rejects invalid values and saturates" {
+    try std.testing.expectEqual(@as(u32, 4000), messageTimeoutMs(4.0));
+    try std.testing.expectEqual(@as(u32, 0), messageTimeoutMs(0));
+    try std.testing.expectEqual(@as(u32, 0), messageTimeoutMs(-1));
+    try std.testing.expectEqual(@as(u32, 0), messageTimeoutMs(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(u32, 0), messageTimeoutMs(std.math.inf(f32)));
+    try std.testing.expectEqual(std.math.maxInt(u32), messageTimeoutMs(1.0e30));
+    try std.testing.expectEqual(@as(?i128, 4 * std.time.ns_per_s), messageTimeoutNs(4.0));
+    try std.testing.expectEqual(@as(?i128, null), messageTimeoutNs(std.math.nan(f32)));
 }

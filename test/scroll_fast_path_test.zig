@@ -126,6 +126,24 @@ test "second scrollGrid accumulates when same grid and region" {
     try std.testing.expectEqual(@as(i32, 2), g.pending_scroll.?.rows);
 }
 
+test "pending scroll aggregate overflow blocks fast path" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 4, 4, 4, 4);
+    defer g.deinit();
+
+    g.scrollGrid(2, 0, 4, 0, 4, 1, 0);
+    g.putCellGrid(2, 3, 0, 'X', 0);
+    try std.testing.expectEqual(@as(u8, 1), g.scroll_touched_count);
+    g.pending_scroll.?.rows = std.math.maxInt(i32);
+
+    // The second delta is normalized to the region height before touched-row
+    // shifting. Accumulating it still overflows i32 and must fail closed.
+    g.scrollGrid(2, 0, 4, 0, 4, std.math.maxInt(i32), 0);
+    try std.testing.expect(g.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(u8, 0), g.scroll_touched_count);
+    try std.testing.expectEqual(std.math.maxInt(i32), g.pending_scroll.?.rows);
+}
+
 test "second scrollGrid blocks when different grid" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
@@ -240,6 +258,60 @@ test "eligible: standard 1-line scroll down" {
     const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
     try std.testing.expect(result.eligible);
     try std.testing.expectEqual(flush_mod.ScrollFallbackReason.eligible, result.reason);
+}
+
+test "ineligible: scrolling cached subgrid is missing" {
+    const alloc = std.testing.allocator;
+    var g = try makeEligibleGrid(alloc);
+    defer g.deinit();
+
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &.{});
+    try std.testing.expect(!result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.no_subgrid, result.reason);
+}
+
+test "ineligible: local full-width split does not cover main surface" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 40);
+    defer g.deinit();
+    try g.setWinPos(2, 0, 0, 20);
+    g.scrollGrid(2, 1, 42, 0, 40, 1, 0);
+
+    const sgs = [_]flush_mod.CachedSubgrid{.{
+        .grid_id = 2,
+        .row_start = 0,
+        .row_end = 42,
+        .col_start = 20,
+        .sg_cols = 40,
+        .sg_rows = 42,
+        .cells = &dummy_cells,
+        .margin_top = 0,
+        .margin_bottom = 0,
+    }};
+    const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &sgs);
+    try std.testing.expect(!result.eligible);
+    try std.testing.expectEqual(flush_mod.ScrollFallbackReason.partial_width, result.reason);
+}
+
+test "ineligible: scrolling cached subgrid geometry changed after scroll" {
+    const alloc = std.testing.allocator;
+    var g = try makeEligibleGrid(alloc);
+    defer g.deinit();
+
+    var moved = scrollingSubgrid();
+    moved.row_start = 1;
+    moved.row_end = 43;
+    var resized_rows = scrollingSubgrid();
+    resized_rows.sg_rows = 41;
+    var resized_cols = scrollingSubgrid();
+    resized_cols.sg_cols = 79;
+
+    const cases = [_]flush_mod.CachedSubgrid{ moved, resized_rows, resized_cols };
+    for (cases) |csg| {
+        const result = flush_mod.checkScrollFastPath(&g, false, false, 1, &.{csg});
+        try std.testing.expect(!result.eligible);
+        try std.testing.expectEqual(flush_mod.ScrollFallbackReason.no_subgrid, result.reason);
+    }
 }
 
 test "ineligible: scrolled_count != 1" {
@@ -627,7 +699,14 @@ test "valid cache: cached rows emitted after shift (scroll down)" {
     const regen = [_]u32{4};
 
     const result = flush_mod.shiftScrollCacheAndValidate(
-        &core, 1, 5, 1, delta_y, total_rows, &regen,
+        &core,
+        1,
+        5,
+        1,
+        delta_y,
+        total_rows,
+        &regen,
+        true,
     );
 
     // Fast path should be OK: rows 0,1,2,3 valid, row 4 is regen
@@ -648,6 +727,35 @@ test "valid cache: cached rows emitted after shift (scroll down)" {
     const row0_y = core.scroll_cache.items[0].items[0].position[1];
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), row0_y, 0.001);
     try std.testing.expect(core.scroll_cache_valid.isSet(0));
+}
+
+test "frontend row shift preserves cached vertex coordinates" {
+    const alloc = std.testing.allocator;
+    const nvim_core_mod = zonvie_core.nvim_core;
+    var core = nvim_core_mod.Core.initForTest(alloc);
+    defer core.deinitForTest();
+
+    const total_rows: u32 = 5;
+    try core.ensureScrollCache(total_rows);
+    for (0..total_rows) |r| try populateRow(&core, r, total_rows);
+
+    const old_row_2_y = core.scroll_cache.items[2].items[0].position[1];
+    const regen = [_]u32{4};
+    const result = flush_mod.shiftScrollCacheAndValidate(
+        &core,
+        1,
+        5,
+        1,
+        0.4,
+        total_rows,
+        &regen,
+        false,
+    );
+
+    try std.testing.expect(result.fast_path_ok);
+    // Row metadata moved 2 -> 1, but the frontend owns the row-slot shift and
+    // therefore needs the cached vertices left untouched.
+    try std.testing.expectApproxEqAbs(old_row_2_y, core.scroll_cache.items[1].items[0].position[1], 0.001);
 }
 
 test "invalid cache: fast path cancelled when non-regen row is invalid" {
@@ -673,7 +781,14 @@ test "invalid cache: fast path cancelled when non-regen row is invalid" {
     const regen = [_]u32{4};
 
     const result = flush_mod.shiftScrollCacheAndValidate(
-        &core, 1, 5, 1, delta_y, total_rows, &regen,
+        &core,
+        1,
+        5,
+        1,
+        delta_y,
+        total_rows,
+        &regen,
+        true,
     );
 
     // Fast path should be cancelled: all valid bits are false
@@ -702,7 +817,14 @@ test "empty cached row emitted with vert_count==0" {
     const regen = [_]u32{4};
 
     const result = flush_mod.shiftScrollCacheAndValidate(
-        &core, 1, 5, 1, delta_y, total_rows, &regen,
+        &core,
+        1,
+        5,
+        1,
+        delta_y,
+        total_rows,
+        &regen,
+        true,
     );
 
     try std.testing.expect(result.fast_path_ok);
@@ -734,7 +856,14 @@ test "multi-row scroll down (rows=3): shift and vacate 3 rows" {
     const regen = [_]u32{ 7, 8, 9 };
 
     const result = flush_mod.shiftScrollCacheAndValidate(
-        &core, 1, 10, 3, delta_y, total_rows, &regen,
+        &core,
+        1,
+        10,
+        3,
+        delta_y,
+        total_rows,
+        &regen,
+        true,
     );
 
     try std.testing.expect(result.fast_path_ok);
@@ -781,7 +910,14 @@ test "multi-row scroll up (rows=-3): shift and vacate 3 rows" {
     const regen = [_]u32{ 1, 2, 3 };
 
     const result = flush_mod.shiftScrollCacheAndValidate(
-        &core, 1, 10, -3, delta_y, total_rows, &regen,
+        &core,
+        1,
+        10,
+        -3,
+        delta_y,
+        total_rows,
+        &regen,
+        true,
     );
 
     try std.testing.expect(result.fast_path_ok);

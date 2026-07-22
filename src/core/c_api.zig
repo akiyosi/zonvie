@@ -34,9 +34,9 @@ pub const Cursor = extern struct {
     cell_percentage: u32,
     fgRGB: u32,
     bgRGB: u32,
-    blink_wait_ms: u32,  // wait time before blink starts (ms), 0=no blink
-    blink_on_ms: u32,    // on time for blink cycle (ms)
-    blink_off_ms: u32,   // off time for blink cycle (ms)
+    blink_wait_ms: u32, // wait time before blink starts (ms), 0=no blink
+    blink_on_ms: u32, // on time for blink cycle (ms)
+    blink_off_ms: u32, // off time for blink cycle (ms)
 };
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -247,11 +247,11 @@ pub const GridInfo = extern struct {
 /// Viewport info for scrollbar rendering
 pub const ViewportInfo = extern struct {
     grid_id: i64,
-    topline: i64,      // First visible line (0-based)
-    botline: i64,      // First line below window (exclusive)
-    line_count: i64,   // Total lines in buffer
-    curline: i64,      // Current cursor line
-    curcol: i64,       // Current cursor column
+    topline: i64, // First visible line (0-based)
+    botline: i64, // First line below window (exclusive)
+    line_count: i64, // Total lines in buffer
+    curline: i64, // Current cursor line
+    curcol: i64, // Current cursor column
     scroll_delta: i64, // Lines scrolled since last update
 };
 
@@ -543,7 +543,6 @@ pub const Callbacks = extern struct {
     // Appended at the end for ABI compat (see on_restart note).
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
-
 
 pub const zonvie_core = opaque {};
 
@@ -1116,9 +1115,9 @@ pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callco
     box.core.log.write("[c_api] zonvie_core_set_ext_windows: enabled={any}\n", .{box.core.ext_windows_enabled});
 }
 
-/// Check if msg_show throttle timeout has expired and process pending messages.
-/// Frontend should call this periodically (e.g., every frame or 16ms) to ensure
-/// messages are displayed even when Neovim is waiting for user input.
+/// Process due message timeouts and render-maintenance retries. The legacy
+/// exported name is retained for ABI compatibility; frontends normally call
+/// this from the one-shot deadline query below.
 pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
@@ -1129,14 +1128,22 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     // grid_mu. Use async dispatch (DispatchQueue.main.async on macOS, PostMessage
     // on Windows) instead.
     box.core.grid_mu.lockUncancelable(clock.io());
-    defer box.core.grid_mu.unlock(clock.io());
-    box.core.checkMsgShowThrottleTimeout();
+    box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    defer {
+        box.core.redraw_thread_id.store(0, .seq_cst);
+        box.core.grid_mu.unlock(clock.io());
+    }
+
+    // The timeout can create/remove external grids. onFlush runs vertex
+    // generation and external-window lifecycle notification inside the same
+    // frontend bracket, so atlas publication and commit are one transaction.
+    var fctx = flush_mod.FlushCtx{ .core = &box.core };
+    flush_mod.FlushCtx.onFlush(&fctx, box.core.grid.rows, box.core.grid.cols) catch {};
 }
 
-/// Returns milliseconds until the earliest pending msg_show/msg_history
-/// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
-/// timeout is currently armed. Frontend uses this to schedule a one-shot
-/// timer instead of calling zonvie_core_tick_msg_throttle every frame.
+/// Returns milliseconds until the earliest pending message or render-
+/// maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
+/// Frontends use this to schedule one timer instead of polling every frame.
 pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64 {
     if (p == null) return -1;
     const box = asBox(p.?);
@@ -1443,7 +1450,24 @@ pub export fn zonvie_core_send_mouse_scroll(
     const box = asBox(p.?);
     const dir_str = std.mem.span(direction.?);
     const mod_str = if (modifier) |m| std.mem.span(m) else "";
-    box.core.sendMouseScroll(grid_id, row, col, dir_str, mod_str);
+    if (grid_id == grid_mod.MESSAGE_GRID_ID) {
+        box.core.grid_mu.lockUncancelable(clock.io());
+        box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        box.core.sendMouseScroll(grid_id, row, col, dir_str, mod_str);
+        box.core.redraw_thread_id.store(0, .seq_cst);
+        box.core.grid_mu.unlock(clock.io());
+        return;
+    }
+
+    // Resolve the cursor-grid sentinel under grid_mu, but do not retain the
+    // lock across allocation or the potentially blocking RPC transport write.
+    var effective_id = grid_id;
+    if (grid_id == -1) {
+        box.core.grid_mu.lockUncancelable(clock.io());
+        effective_id = box.core.grid.cursor_grid;
+        box.core.grid_mu.unlock(clock.io());
+    }
+    box.core.sendMouseScroll(effective_id, row, col, dir_str, mod_str);
 }
 
 /// Scroll view to specified line number (1-based).
@@ -1473,12 +1497,28 @@ pub export fn zonvie_core_page_scroll(
 
 /// Process pending message scroll update (for throttled scroll).
 /// Call this after scroll events stop to ensure final position is rendered.
+///
+/// Acquires grid_mu — same rationale as zonvie_core_send_mouse_scroll:
+/// processPendingMsgScroll mutates the same Grid/vertex/atlas-scratch state
+/// and can invoke frontend callbacks, called from a UI-thread timer.
 pub export fn zonvie_core_process_pending_msg_scroll(
     p: ?*zonvie_core,
 ) callconv(.c) void {
-    if (p == null) return;
+    _ = zonvie_core_process_pending_msg_scroll_retry_needed(p);
+}
+
+pub export fn zonvie_core_process_pending_msg_scroll_retry_needed(
+    p: ?*zonvie_core,
+) callconv(.c) bool {
+    if (p == null) return false;
     const box = asBox(p.?);
+    box.core.grid_mu.lockUncancelable(clock.io());
+    box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
     box.core.processPendingMsgScroll();
+    const retry_needed = box.core.msg_scroll_pending;
+    box.core.redraw_thread_id.store(0, .seq_cst);
+    box.core.grid_mu.unlock(clock.io());
+    return retry_needed;
 }
 
 /// Send mouse input event to Neovim (click, drag, release).
@@ -1795,7 +1835,7 @@ pub const zonvie_config_values = extern struct {
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
-    ime_option_as_meta: u8 = 0,  // 0=both, 1=none, 2=only_left, 3=only_right
+    ime_option_as_meta: u8 = 0, // 0=both, 1=none, 2=only_left, 3=only_right
     // shaders (custom post-process). Path array accessed via
     // zonvie_config_get_shader_count / zonvie_config_get_shader_path.
     shader_enabled: bool = false,
@@ -2022,10 +2062,21 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).
     box.core.grid.content_rev +%= 1;
+    // Every sub_grid's cached row vertices hold stale atlas UVs / font
+    // metrics too. sg.dirty alone is not enough: the per-row emit path
+    // checks dirty_rows to decide which rows to regenerate, so with no
+    // bits set every row is skipped and dirty gets cleared at flush end
+    // with nothing ever actually resent — markAllDirty() sets both.
     var sg_it = box.core.grid.sub_grids.valueIterator();
     while (sg_it.next()) |sg| {
-        sg.dirty = true;
+        sg.markAllDirty();
     }
+    // The main cursor's own regen check is gated on cursor_rev alone (not
+    // content_rev/dirty_all), and an external grid's cursor is a separate
+    // vertex consumer again — neither is covered by the dirtying above, so
+    // both would keep rendering with the stale atlas UVs/font metrics this
+    // call exists to invalidate.
+    box.core.grid.cursor_rev +%= 1;
 }
 
 // Abort the current flush cycle.
@@ -2255,16 +2306,24 @@ pub export fn zonvie_core_update_layout_px_locked(
 // Output: compiled source in the target shading language (MSL or HLSL).
 // Implementation: glslang (GLSL -> SPIR-V) + SPIRV-Cross (SPIR-V -> target).
 
-pub const zonvie_shader_target = enum(u8) {
+pub const zonvie_shader_target = enum(c_int) {
     msl = 0, // Metal Shading Language
     hlsl = 1, // HLSL (shader model 5.0)
 };
+
+comptime {
+    if (@sizeOf(zonvie_shader_target) != @sizeOf(c_int) or
+        @alignOf(zonvie_shader_target) != @alignOf(c_int))
+    {
+        @compileError("zonvie_shader_target must match the C enum ABI");
+    }
+}
 
 /// Per-frame Shadertoy-style uniforms. Layout matches the std140
 /// `ZonvieShaderUniforms` block emitted by `shader_compiler.zig`'s
 /// Shadertoy preamble; keep this struct and the C header version
 /// (`zonvie_shader_uniforms` in `include/zonvie_core.h`) in lock-step.
-/// Total size is 80 bytes; field ordering is load-bearing.
+/// Total size is 160 bytes; field ordering is load-bearing.
 ///
 /// iResolution is the main window's drawable size for every view, so the
 /// shader sees a single coordinate space across windows. iWindowOffset

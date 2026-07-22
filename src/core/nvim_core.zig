@@ -367,7 +367,6 @@ const PipeReader = rpc_session.PipeReader;
 const CwdOwner = rpc_session.CwdOwner;
 
 const GridEntry = flush.GridEntry;
-const MAX_CACHED_SUBGRIDS = flush.MAX_CACHED_SUBGRIDS;
 const CachedSubgrid = flush.CachedSubgrid;
 const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
@@ -496,6 +495,15 @@ pub const Core = struct {
     cursor_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
 
     row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
+    // Partial-only main submission preserves global five-pass ordering by
+    // accumulating under-decoration, glyph, strike, and overline layers here.
+    // Capacities are retained across flushes; no per-frame buffers are created.
+    partial_layer_verts: [4]std.ArrayListUnmanaged(c_api.Vertex) = .{
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+    },
 
     // Scroll-aware flush: per-row vertex cache.
     // Each entry holds the last emitted vertices for that row.
@@ -816,6 +824,11 @@ pub const Core = struct {
     // noice.nvim uses 1000/30 = ~33ms throttle by default
     msg_show_pending_since: ?i128 = null, // nanos timestamp when first msg_dirty was set
     msg_show_throttle_ns: i128 = 33 * std.time.ns_per_ms, // 33ms default throttle (matches noice.nvim)
+    // Allocation/render failures are retried by the frontend timer. Keep a
+    // separate deadline so an already-expired throttle does not spin a full
+    // flush at 0-1ms intervals under memory pressure.
+    msg_show_retry_at: ?i128 = null,
+    msg_show_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
 
     // Auto-hide deadlines for ext_float grids (nanos timestamp)
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
@@ -1038,6 +1051,7 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
         }
@@ -1140,7 +1154,6 @@ pub const Core = struct {
     ///     them via grid_resize + grid_line right after attach. The
     ///     frontend's last committed frame keeps the screen visually
     ///     stable in the gap (no flush runs between sessions).
-    ///   - hl table: hl_ids are redefined by hl_attr_define on attach.
     ///   - atlas / glyph caches / shape cache: keyed by content + style
     ///     + font_generation; valid as long as font is unchanged.
     ///   - mode info / cursor shape / cursor_visible: replaced by the
@@ -1273,10 +1286,12 @@ pub const Core = struct {
                     cb(self.ctx, grid_id_ptr.*);
                 }
             }
-            self.known_external_grids.clearRetainingCapacity();
             self.log.write("resetSessionState: closed {d} external windows from previous session\n", .{closed_count});
         }
-        self.grid.external_grids.clearRetainingCapacity();
+        self.known_external_grids.deinit(self.alloc);
+        self.known_external_grids = .{};
+        self.grid.external_grids.deinit(self.alloc);
+        self.grid.external_grids = .{};
         // ext_windows_grids: grid_id -> win_id mapping. Without clearing,
         // a fresh win_pos for the same grid_id on the new server hits
         // the redraw_handler.zig stale-detection path that re-promotes
@@ -1299,6 +1314,7 @@ pub const Core = struct {
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
         self.grid.resetForNewSession();
+        self.hl.reset();
 
         // Frontend overlay teardown for paths not covered by the external
         // window cleanup above. The cmdline / popupmenu / message external
@@ -1334,6 +1350,8 @@ pub const Core = struct {
         // msg_show events; carrying it across would auto-hide the new
         // session's first message at the old deadline.
         self.msg_show_pending_since = null;
+        self.msg_show_retry_at = null;
+        self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
         self.msg_show_auto_hide_at = null;
         self.msg_history_auto_hide_at = null;
         self.msg_scroll_offset = 0;
@@ -1385,6 +1403,10 @@ pub const Core = struct {
         self.ui_attach_mutex.lockUncancelable(clock.io());
         defer self.ui_attach_mutex.unlock(clock.io());
         if (self.ui_attach_ready) return;
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        self.desired_resize_rows = rows;
+        self.desired_resize_cols = cols;
+        self.pending_resize_mu.unlock(clock.io());
         self.ui_attach_rows = rows;
         self.ui_attach_cols = cols;
         // Pre-set last_layout to suppress a redundant resize after attach.
@@ -1578,6 +1600,7 @@ pub const Core = struct {
         // freed when the pump thread releases its own. Normal flows
         // have cleanupSession already null both fields by this point.
         if (self.stderr_pump) |p| {
+            p.finishCleanupDecision();
             p.detachFromCore();
             p.release();
             self.stderr_pump = null;
@@ -1585,12 +1608,18 @@ pub const Core = struct {
         if (self.stderr_thread) |t2| t2.join();
         self.stderr_thread = null;
 
+        if (self.child_reaper) |reaper| reaper.finishWithoutChild();
+        if (self.child_reaper_thread) |reaper_thread| reaper_thread.join();
+        self.child_reaper_thread = null;
+        if (self.child_reaper) |reaper| reaper.release();
+        self.child_reaper = null;
+
         if (self.stdout_file) |f| f.close();
         if (self.stderr_file) |f| f.close();
         self.stdout_file = null;
         self.stderr_file = null;
 
-        self.child_handle = null;
+        self.claimChildHandleForCleanup();
 
         self.hl.deinit();
         self.grid.deinit();
@@ -1599,6 +1628,7 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
         }
@@ -1766,6 +1796,14 @@ pub const Core = struct {
     /// Initialize glyph caches based on current size settings
     pub fn initGlyphCache(self: *Core) !void {
         if (self.glyph_cache_initialized) return;
+
+        // Partial failure must not leak: the row-mode flush retries this on
+        // EVERY flush with the error swallowed, and each retry's `try alloc`
+        // would overwrite the still-live pointers from the previous partial
+        // attempt — unbounded growth exactly when memory is already scarce.
+        // deinitGlyphCache frees-and-nulls every field, so it is a safe
+        // rollback for any prefix of the allocations below.
+        errdefer self.deinitGlyphCache();
 
         const ascii_size = self.glyph_cache_ascii_size;
         const non_ascii_size = self.glyph_cache_non_ascii_size;
@@ -2658,6 +2696,10 @@ pub const Core = struct {
     /// Send raw data to child process stdin (for SSH password input).
     /// Signals ssh_auth_done after writing.
     pub fn sendStdinData(self: *Core, data: []const u8) void {
+        if (self.stop_flag.load(.seq_cst)) return;
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        defer self.stdin_close_mu.unlock(clock.io());
+        if (self.stop_flag.load(.seq_cst)) return;
         if (self.stdin_file) |f| {
             f.writeAll(data) catch |e| {
                 self.log.write("sendStdinData write err: {any}\n", .{e});
@@ -2923,7 +2965,9 @@ pub const Core = struct {
     /// Non-blocking version of getViewportInfo.
     /// Returns null if grid_mu could not be acquired (another thread holds it).
     pub fn tryGetViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) ?i32 {
-        if (!self.grid_mu.tryLock()) return null;
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_viewport.record(acquired);
+        if (!acquired) return null;
         defer self.grid_mu.unlock(clock.io());
         return self.getViewportInfoLocked(grid_id, out);
     }
@@ -3486,21 +3530,20 @@ pub const Core = struct {
     ///
     /// Called from the redraw thread (grid_mu held).
     pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
-        // Drop any previously queued restart (only the latest matters).
-        if (self.restart_pending_addr) |old| {
-            self.alloc.free(old);
-            self.restart_pending_addr = null;
-        }
-
         const owned = self.alloc.dupe(u8, listen_addr) catch |e| {
             self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        self.restart_pending_addr = owned;
+        const old = self.restart_pending_addr;
         // Explicit reset in case a prior :connect queued (then aborted) left
         // the hot-swap flag set; :restart is NOT a hot-swap (the old nvim
         // dies), so spawn fallback on connect failure is the desired recovery.
         self.restart_pending_is_connect_hotswap = false;
+        self.connect_keeps_child_alive = false;
+        // Publish the address last so any observer that sees a pending restart
+        // also sees the restart (not hot-swap) cleanup policy above.
+        self.restart_pending_addr = owned;
+        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
 
@@ -3522,18 +3565,15 @@ pub const Core = struct {
     /// (`:connect`, old server stays alive headless) from a server
     /// replacement (`:restart`, old server dies).
     pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
-        if (self.restart_pending_addr) |old| {
-            self.alloc.free(old);
-            self.restart_pending_addr = null;
-        }
-
         const owned = self.alloc.dupe(u8, server_addr) catch |e| {
             self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        self.restart_pending_addr = owned;
+        const old = self.restart_pending_addr;
         self.restart_pending_is_connect_hotswap = true;
         self.connect_keeps_child_alive = true;
+        self.restart_pending_addr = owned;
+        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});
 
@@ -3543,8 +3583,12 @@ pub const Core = struct {
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
     /// Receives the stream by value to avoid racing with stop().
     fn writerThreadFn(self: *Core, file: Stream) void {
-        var drain: std.ArrayListUnmanaged(u8) = .empty;
-        defer drain.deinit(self.alloc);
+        // See rpc_session.runLoop's identical call for rationale: match the
+        // UI thread's QoS so this thread isn't starved relative to it.
+        if (comptime @import("builtin").os.tag == .macos) {
+            _ = std.c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0);
+        }
+        defer self.writer_exited.store(true, .release);
 
         while (true) {
             self.write_queue_mu.lockUncancelable(clock.io());
@@ -3830,7 +3874,7 @@ pub const Core = struct {
 
     pub fn requestGetApiInfo(self: *Core) !void {
         const id = self.nextMsgId();
-        self.get_api_info_msgid = id;  // Save msgid for response matching
+        self.get_api_info_msgid = id; // Save msgid for response matching
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
@@ -4746,7 +4790,6 @@ pub const Core = struct {
 
     const FlushCtx = flush.FlushCtx;
 
-
     // --- Forwarding stubs for rpc_session.zig ---
 
     pub fn containsPasswordPrompt(data: []const u8) bool {
@@ -4797,7 +4840,6 @@ pub const Core = struct {
         rpc_session.handleRpcNotification(self, arena, top);
     }
 
-
     /// Compare current external_grids with known_external_grids and notify frontend.
     /// Returns true if new external grids were added (need forced render).
 
@@ -4820,7 +4862,7 @@ pub const Core = struct {
     }
 
     pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_level: u32) void {
-        flush.sendCmdlineBlockShow(self, current_line_visible, visible_level);
+        _ = flush.sendCmdlineBlockShow(self, current_line_visible, visible_level);
     }
 
     pub fn sendCmdlineHide(self: *Core) void {
@@ -4836,7 +4878,7 @@ pub const Core = struct {
     }
 
     pub fn sendPopupmenuShow(self: *Core) void {
-        flush.sendPopupmenuShow(self);
+        _ = flush.sendPopupmenuShow(self);
     }
 
     pub fn sendPopupmenuHide(self: *Core) void {
@@ -4860,8 +4902,8 @@ pub const Core = struct {
         flush.buildMsgLineCache(self);
     }
 
-    pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
-        flush.renderMsgGridFromCache(self, scroll_offset);
+    pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
+        return flush.renderMsgGridFromCache(self, scroll_offset);
     }
 
     pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
@@ -4920,7 +4962,6 @@ pub const Core = struct {
         flush.hideMsgHistory(self);
     }
 
-
     /// Set a Neovim global variable via nvim_set_var
     fn requestSetVar(self: *Core, name: []const u8, value: []const u8) !void {
         const id = self.nextMsgId();
@@ -4952,9 +4993,1381 @@ pub const Core = struct {
         return flush.countDisplayWidth(s);
     }
 
-
-
     fn runLoop(self: *Core) void {
+        self.rpc_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+        defer self.rpc_thread_id.store(0, .release);
         rpc_session.runLoop(self);
     }
 };
+
+const AtlasFailureTestState = struct {
+    core: *Core,
+    raster_calls: u32 = 0,
+    upload_calls: u32 = 0,
+    create_calls: u32 = 0,
+    abort_upload: bool = false,
+    abort_create: bool = false,
+    abort_raster: bool = false,
+    raster_miss: bool = false,
+
+    fn rasterize(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = scalar;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.raster_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        if (self.abort_raster) self.core.flush_aborted = true;
+        return if (self.raster_miss) 0 else 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.upload_calls += 1;
+        if (self.abort_upload) self.core.flush_aborted = true;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = atlas_w;
+        _ = atlas_h;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.create_calls += 1;
+        if (self.abort_create) self.core.flush_aborted = true;
+    }
+};
+
+const AsciiPreloadTestState = struct {
+    core: *Core,
+    table_calls: u32 = 0,
+    raster_calls: u32 = 0,
+    scalar_calls: u32 = 0,
+    upload_calls: u32 = 0,
+    create_calls: u32 = 0,
+    abort_table_after: u32 = 0,
+    abort_raster_after: u32 = 0,
+    by_id_miss: bool = false,
+
+    fn getTable(
+        ctx: ?*anyopaque,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_x_advances: [*]i32,
+        out_lig_triggers: [*]u8,
+    ) callconv(.c) c_int {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.table_calls += 1;
+        @memset(out_glyph_ids[0..128], 0);
+        @memset(out_x_advances[0..128], 64);
+        @memset(out_lig_triggers[0..128], 0);
+        const style_index: u32 =
+            @as(u32, if (style_flags & c_api.STYLE_BOLD != 0) 1 else 0) +
+            @as(u32, if (style_flags & c_api.STYLE_ITALIC != 0) 2 else 0);
+        out_glyph_ids['A'] = 100 + style_index;
+        if (self.abort_table_after != 0 and self.table_calls == self.abort_table_after) {
+            self.core.flush_aborted = true;
+        }
+        return 1;
+    }
+
+    fn rasterizeById(
+        ctx: ?*anyopaque,
+        glyph_id: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = glyph_id;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.raster_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        if (self.abort_raster_after != 0 and self.raster_calls == self.abort_raster_after) {
+            self.core.flush_aborted = true;
+        }
+        return if (self.by_id_miss) 0 else 1;
+    }
+
+    fn rasterizeScalar(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = scalar;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.scalar_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        return 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.upload_calls += 1;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = atlas_w;
+        _ = atlas_h;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.create_calls += 1;
+    }
+};
+
+test "glyph cache two-choice probe preserves a primary collision" {
+    var keys = [_]u64{GLYPH_CACHE_INVALID_KEY} ** 8;
+    const hash: u64 = 3;
+    const key_a: u64 = 0x100;
+    const probe_a = glyphCacheProbe(&keys, key_a, hash);
+    keys[probe_a.insert] = key_a;
+
+    var key_b: u64 = key_a + 1;
+    var probe_b = glyphCacheProbe(&keys, key_b, hash);
+    while (probe_b.insert == probe_a.insert) : (key_b += 1) {
+        probe_b = glyphCacheProbe(&keys, key_b, hash);
+    }
+    keys[probe_b.insert] = key_b;
+
+    try std.testing.expectEqual(probe_a.insert, glyphCacheProbe(&keys, key_a, hash).hit.?);
+    try std.testing.expectEqual(probe_b.insert, glyphCacheProbe(&keys, key_b, hash).hit.?);
+}
+
+test "aborted atlas upload rolls back shelf allocation" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .abort_upload = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    const after_first = core.atlas_packer.?;
+    try std.testing.expectEqual(@as(u32, 1), after_first.next_x);
+    try std.testing.expectEqual(@as(u32, 1), after_first.next_y);
+    try std.testing.expectEqual(@as(u32, 0), after_first.row_h);
+
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    const after_second = core.atlas_packer.?;
+    try std.testing.expectEqual(after_first.next_x, after_second.next_x);
+    try std.testing.expectEqual(after_first.next_y, after_second.next_y);
+    try std.testing.expectEqual(after_first.row_h, after_second.row_h);
+    try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
+}
+
+test "atlas create abort stops raster and retries creation" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .abort_create = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    try std.testing.expectEqual(@as(u32, 1), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+    try std.testing.expect(!core.atlas_initialized);
+    try std.testing.expect(core.atlas_packer == null);
+
+    state.abort_create = false;
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    try std.testing.expectEqual(@as(u32, 2), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
+}
+
+test "atlas reset create abort stops before upload" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    const uploads_before = state.upload_calls;
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_full_resets_this_flush = 0;
+    state.abort_create = true;
+
+    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expectEqual(uploads_before, state.upload_calls);
+    try std.testing.expect(!core.atlas_initialized);
+    try std.testing.expect(core.atlas_packer == null);
+}
+
+test "rasterizer miss returns a cacheable blank while explicit abort stays null" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .raster_miss = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_rasterize_glyph_by_id = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    const id_blank = core.ensureGlyphByID(123, c_api.STYLE_BOLD).?;
+    try std.testing.expectEqual(@as(f32, 0), id_blank.bbox_size_px[0]);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+
+    const scalar_blank = core.ensureGlyphPhase2('A', 0).?;
+    try std.testing.expectEqual(@as(f32, 0), scalar_blank.bbox_size_px[0]);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    const first_retry_at = core.transient_glyph_retry_at.?;
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(first_retry_at, core.transient_glyph_retry_at.?);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+
+    core.resetAtlasMaintenanceBackoff();
+    state.abort_raster = true;
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+}
+
+test "ASCII table and pre-raster callbacks stop immediately on abort" {
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        var state = AsciiPreloadTestState{ .core = &core, .abort_table_after = 2 };
+        core.ctx = &state;
+        core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+        core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+        core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+        core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+        try std.testing.expect(!core.loadAsciiTables());
+        try std.testing.expectEqual(@as(u32, 2), state.table_calls);
+        try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+        try std.testing.expect(!core.ascii_tables_valid);
+    }
+
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        var state = AsciiPreloadTestState{ .core = &core, .abort_raster_after = 2 };
+        core.ctx = &state;
+        core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+        core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+        core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+        core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+        try std.testing.expect(!core.loadAsciiTables());
+        try std.testing.expectEqual(@as(u32, 4), state.table_calls);
+        try std.testing.expectEqual(@as(u32, 2), state.raster_calls);
+        try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
+        try std.testing.expect(!core.ascii_tables_valid);
+    }
+}
+
+test "ASCII pre-raster mirrors by-ID entries into canonical scalar slots" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AsciiPreloadTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+    core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+    core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+    core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+    try std.testing.expect(core.loadAsciiTables());
+    try std.testing.expect(core.ascii_tables_valid);
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+        try std.testing.expect(core.glyph_cache_ascii.?[scalar_index].bbox_size_px[0] > 0);
+        core.glyph_valid_ascii.?[scalar_index] = false;
+    }
+
+    // A second preload hits the by-ID cache, repairs the scalar aliases, and
+    // performs no duplicate rasterization or upload.
+    try std.testing.expect(core.preRasterizeAscii());
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.upload_calls);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+    }
+}
+
+test "ASCII pre-raster resolves a blank by-ID entry through scalar fallback" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AsciiPreloadTestState{ .core = &core, .by_id_miss = true };
+    core.ctx = &state;
+    core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+    core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+    core.cb.on_rasterize_glyph = AsciiPreloadTestState.rasterizeScalar;
+    core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+    core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+    try std.testing.expect(core.loadAsciiTables());
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.scalar_calls);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+        try std.testing.expect(core.glyph_cache_ascii.?[scalar_index].bbox_size_px[0] > 0);
+    }
+}
+
+test "unrepresentable glyph bitmap dimensions return blank without upload" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    const packer_before = core.atlas_packer.?;
+    const reset_seq_before = core.atlas_reset_seq;
+
+    var hostile = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = std.math.maxInt(u32),
+        .height = 1,
+        .pitch = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 192,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    const too_wide = core.packAndUploadBitmap(&hostile).?;
+    try std.testing.expectEqual(@as(f32, 0), too_wide.bbox_size_px[0]);
+    try std.testing.expectEqual(@as(f32, 3), too_wide.advance_px);
+
+    hostile.width = 1;
+    hostile.height = std.math.maxInt(u32);
+    const too_tall = core.packAndUploadBitmap(&hostile).?;
+    try std.testing.expectEqual(@as(f32, 0), too_tall.bbox_size_px[1]);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+    try std.testing.expectEqual(reset_seq_before, core.atlas_reset_seq);
+    try std.testing.expectEqualDeep(packer_before, core.atlas_packer.?);
+}
+
+test "atlas grows and maximum-size full retry converges" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.atlas_w = 8;
+    core.atlas_h = 8;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(8, 8);
+    core.atlas_initialized = true;
+    const grow_bitmap = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = 10,
+        .height = 10,
+        .pitch = 10,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 64,
+        .ascent_px = 8,
+        .descent_px = 2,
+        .bytes_per_pixel = 1,
+    };
+    const grown = core.packAndUploadBitmap(&grow_bitmap).?;
+    try std.testing.expect(core.atlas_w >= 16 and core.atlas_h >= 16);
+    try std.testing.expect(core.atlas_reset_during_flush);
+    try std.testing.expect(grown.bbox_size_px[0] > 0);
+
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_reset_during_flush = false;
+    const reset_seq = core.atlas_reset_seq;
+    const oversized = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = config.atlas_size_max,
+        .height = 1,
+        .pitch = config.atlas_size_max,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 128,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    const missed = core.packAndUploadBitmap(&oversized).?;
+    try std.testing.expectEqual(@as(f32, 0), missed.bbox_size_px[0]);
+    try std.testing.expectEqual(reset_seq, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+
+    // A packer-full miss at max gets exactly one same-size reset so the
+    // working set can change. A second full condition in the same flush is
+    // blank-negative-cached without another reset.
+    const small = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = 1,
+        .height = 1,
+        .pitch = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 64,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_reset_during_flush = false;
+    const before_full = core.atlas_reset_seq;
+    const first = core.packAndUploadBitmap(&small).?;
+    try std.testing.expect(first.bbox_size_px[0] > 0);
+    try std.testing.expectEqual(before_full +% 1, core.atlas_reset_seq);
+    try std.testing.expectEqual(@as(u8, 1), core.atlas_full_resets_this_flush);
+
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_reset_during_flush = false;
+    const before_second = core.atlas_reset_seq;
+    const second = core.packAndUploadBitmap(&small).?;
+    try std.testing.expectEqual(@as(f32, 0), second.bbox_size_px[0]);
+    try std.testing.expectEqual(before_second, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+    try std.testing.expect(core.atlas_has_capacity_negative);
+
+    // A working-set change schedules one delayed reprobe rather than
+    // recreating a maximum atlas synchronously.
+    const before_revision_changes = core.atlas_reset_seq;
+    try core.grid.resizeGrid(1, 2, 2);
+    core.grid.putCell(0, 0, 'x', 0);
+    core.grid.scrollGrid(1, 0, 2, 0, 2, 1, 0);
+    try core.hl.define(7, null, null, null, false, 0, .{ .bold = true }, false);
+    const schedule_now: i128 = 10 * std.time.ns_per_s;
+    const retry_at = schedule_now + 250 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(schedule_now));
+    try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(retry_at, flush.nextMsgTimeoutNs(&core).?);
+
+    // Until the scheduled deadline, repeated new-glyph edits remain negative
+    // cached. They neither recreate the maximum texture nor postpone the
+    // absolute deadline, even though each is a new flush with a fresh local
+    // same-size-reset budget.
+    const ordinary_flush_times = [_]i128{
+        schedule_now + 1,
+        schedule_now + 100 * std.time.ns_per_ms,
+    };
+    for (ordinary_flush_times) |ordinary_now| {
+        core.grid.glyph_working_set_rev +%= 1;
+        try std.testing.expect(!core.prepareAtlasCapacityRetryAt(ordinary_now));
+        core.atlas_full_resets_this_flush = 0;
+        core.atlas_packer.?.next_y = config.atlas_size_max;
+        core.atlas_reset_during_flush = false;
+        const blocked = core.packAndUploadBitmap(&small).?;
+        try std.testing.expectEqual(@as(f32, 0), blocked.bbox_size_px[0]);
+        try std.testing.expectEqual(before_revision_changes, core.atlas_reset_seq);
+        try std.testing.expectEqual(@as(u8, 0), core.atlas_full_resets_this_flush);
+        try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+        try std.testing.expect(!core.atlas_negative_recovery_armed);
+        try std.testing.expect(!core.atlas_reset_during_flush);
+    }
+
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(retry_at));
+    try std.testing.expectEqual(before_revision_changes, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+
+    // A genuinely uncached glyph reaches the packer. On the next flush it may
+    // reactively perform exactly one same-size reset and recover capacity.
+    core.atlas_full_resets_this_flush = 0;
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    const recovered = core.packAndUploadBitmap(&small).?;
+    try std.testing.expect(recovered.bbox_size_px[0] > 0);
+    try std.testing.expectEqual(before_revision_changes +% 1, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    core.finishAtlasCapacityRetry();
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+}
+
+test "capacity-negative retry is selective and backs off after repeated failure" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+
+    const negative_index: usize = 'x';
+    const positive_index: usize = 'y';
+    core.glyph_cache_ascii.?[negative_index] = std.mem.zeroes(c_api.GlyphEntry);
+    core.glyph_valid_ascii.?[negative_index] = true;
+    var positive = std.mem.zeroes(c_api.GlyphEntry);
+    positive.bbox_size_px = .{ 1, 1 };
+    core.glyph_cache_ascii.?[positive_index] = positive;
+    core.glyph_valid_ascii.?[positive_index] = true;
+
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_grid_rev = core.grid.glyph_working_set_rev;
+    core.atlas_negative_retry_style_rev = core.hl.glyph_style_rev;
+    core.grid.glyph_working_set_rev +%= 1;
+    const first_now: i128 = 1 * std.time.ns_per_s;
+    const first_retry_at = first_now + 250 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_now));
+    try std.testing.expectEqual(first_retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(first_retry_at, flush.nextMsgTimeoutNs(&core).?);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(first_retry_at));
+    try std.testing.expect(!core.glyph_valid_ascii.?[negative_index]);
+    try std.testing.expect(core.glyph_valid_ascii.?[positive_index]);
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+
+    // Simulate the delayed reprobe finding the working set still impossible.
+    // The unchanged set gets no deadline and therefore cannot churn while idle.
+    core.recordAtlasCapacityNegative();
+    try std.testing.expectEqual(@as(i128, 500 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_retry_at + std.time.ns_per_s));
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+
+    const second_now = first_retry_at + 2 * std.time.ns_per_s;
+    core.grid.glyph_working_set_rev +%= 1;
+    const second_retry_at = second_now + 500 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(second_now));
+    try std.testing.expectEqual(second_retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(second_retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(second_retry_at));
+
+    // No renewed miss means the old negative left the visible working set.
+    // A successful flush retires the episode and restores the minimum delay.
+    core.finishAtlasCapacityRetry();
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expectEqual(@as(i128, 250 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_delay_ns = 4 * std.time.ns_per_s;
+    core.atlas_negative_recovery_armed = true;
+    core.resetAtlasCapacityRetryBackoff();
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expectEqual(@as(i128, 250 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+}
+
+test "restart replaces connect cleanup policy before notifying observers" {
+    const State = struct {
+        core: *Core,
+        restart_calls: u32 = 0,
+        saw_pending_restart: bool = false,
+        saw_connect_hotswap: bool = true,
+        saw_keep_child_alive: bool = true,
+
+        fn onRestart(
+            ctx: ?*anyopaque,
+            listen_addr: [*]const u8,
+            listen_addr_len: usize,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.restart_calls += 1;
+            self.saw_pending_restart = self.core.restart_pending_addr != null and
+                std.mem.eql(u8, self.core.restart_pending_addr.?, listen_addr[0..listen_addr_len]);
+            self.saw_connect_hotswap = self.core.restart_pending_is_connect_hotswap;
+            self.saw_keep_child_alive = self.core.connect_keeps_child_alive;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_restart = State.onRestart;
+
+    try core.handleConnectEvent("old-server");
+    try std.testing.expect(core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(core.connect_keeps_child_alive);
+
+    try core.handleRestartEvent("new-server");
+    try std.testing.expectEqual(@as(u32, 1), state.restart_calls);
+    try std.testing.expect(state.saw_pending_restart);
+    try std.testing.expect(!state.saw_connect_hotswap);
+    try std.testing.expect(!state.saw_keep_child_alive);
+}
+
+fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+
+    try core.handleConnectEvent("old-connect");
+    const old = core.restart_pending_addr.?;
+    core.handleRestartEvent("new-restart") catch |err| {
+        try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);
+        try std.testing.expectEqualSlices(u8, "old-connect", core.restart_pending_addr.?);
+        try std.testing.expect(core.restart_pending_is_connect_hotswap);
+        try std.testing.expect(core.connect_keeps_child_alive);
+        return err;
+    };
+
+    try std.testing.expectEqualSlices(u8, "new-restart", core.restart_pending_addr.?);
+    try std.testing.expect(!core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(!core.connect_keeps_child_alive);
+}
+
+test "restart replacement OOM preserves pending connect address and policy" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRestartReplacementAllocationFailure,
+        .{},
+    );
+}
+
+fn checkConnectReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+
+    try core.handleRestartEvent("old-restart");
+    const old = core.restart_pending_addr.?;
+    core.handleConnectEvent("new-connect") catch |err| {
+        try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);
+        try std.testing.expectEqualSlices(u8, "old-restart", core.restart_pending_addr.?);
+        try std.testing.expect(!core.restart_pending_is_connect_hotswap);
+        try std.testing.expect(!core.connect_keeps_child_alive);
+        return err;
+    };
+
+    try std.testing.expectEqualSlices(u8, "new-connect", core.restart_pending_addr.?);
+    try std.testing.expect(core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(core.connect_keeps_child_alive);
+}
+
+test "connect replacement OOM preserves pending restart address and policy" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkConnectReplacementAllocationFailure,
+        .{},
+    );
+}
+
+test "transient glyph retries are bounded and restart after working-set change" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var now: i128 = 3 * std.time.ns_per_s;
+    core.recordTransientGlyphNegativeAt(now);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(now + 250 * std.time.ns_per_ms, core.transient_glyph_retry_at.?);
+    try std.testing.expectEqual(core.transient_glyph_retry_at.?, flush.nextMsgTimeoutNs(&core).?);
+
+    // Repeated misses before the timer fires must not postpone the deadline.
+    const first_retry_at = core.transient_glyph_retry_at.?;
+    core.recordTransientGlyphNegativeAt(now + 100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(first_retry_at, core.transient_glyph_retry_at.?);
+
+    const expected_delays = [_]i128{
+        250 * std.time.ns_per_ms,
+        500 * std.time.ns_per_ms,
+        1 * std.time.ns_per_s,
+        2 * std.time.ns_per_s,
+        4 * std.time.ns_per_s,
+    };
+    for (expected_delays, 0..) |delay_ns, attempt_index| {
+        const retry_at = core.transient_glyph_retry_at.?;
+        try std.testing.expectEqual(now + delay_ns, retry_at);
+        try std.testing.expect(!core.prepareAtlasMaintenanceAt(retry_at - 1));
+        try std.testing.expect(core.prepareAtlasMaintenanceAt(retry_at));
+        try std.testing.expect(core.transient_glyph_recovery_armed);
+
+        now = retry_at;
+        core.recordTransientGlyphNegativeAt(now);
+        try std.testing.expect(core.transient_glyph_has_negative);
+        try std.testing.expect(!core.transient_glyph_recovery_armed);
+        if (attempt_index + 1 < expected_delays.len) {
+            try std.testing.expectEqual(@as(u8, @intCast(attempt_index + 2)), core.transient_glyph_retry_attempts);
+            try std.testing.expect(core.transient_glyph_retry_at != null);
+        } else {
+            try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS, core.transient_glyph_retry_attempts);
+            try std.testing.expect(core.transient_glyph_retry_at == null);
+        }
+    }
+
+    // An unchanged unsupported glyph converges with no timer.
+    try std.testing.expect(!core.prepareAtlasMaintenanceAt(now + 10 * std.time.ns_per_s));
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+
+    // The blank remains cached, so prepare (not another raster callback) must
+    // notice a new working set and restart the bounded budget.
+    const changed_now = now + 20 * std.time.ns_per_s;
+    core.grid.glyph_working_set_rev +%= 1;
+    try std.testing.expect(!core.prepareAtlasMaintenanceAt(changed_now));
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    const restarted_at = changed_now + TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+    try std.testing.expectEqual(restarted_at, core.transient_glyph_retry_at.?);
+    try std.testing.expect(core.prepareAtlasMaintenanceAt(restarted_at));
+
+    // No renewed raster miss means the retry succeeded; successful commit
+    // clears the transient episode without touching capacity state.
+    core.finishAtlasMaintenance();
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(!core.transient_glyph_recovery_armed);
+    try std.testing.expectEqual(@as(u8, 0), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_INITIAL_NS, core.transient_glyph_retry_delay_ns);
+}
+
+test "maintenance abort rearms capacity and transient retries without consuming attempts" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const now: i128 = 5 * std.time.ns_per_s;
+    core.recordTransientGlyphNegativeAt(now);
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_at = now + TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+    try std.testing.expect(core.prepareAtlasMaintenanceAt(now + TRANSIENT_GLYPH_RETRY_INITIAL_NS));
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+    try std.testing.expect(core.transient_glyph_recovery_armed);
+
+    const retry_at = now + std.time.ns_per_s;
+    core.rearmAtlasMaintenanceAfterAbort(retry_at);
+    try std.testing.expect(core.atlas_has_capacity_negative);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expect(!core.transient_glyph_recovery_armed);
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(retry_at, core.transient_glyph_retry_at.?);
+
+    core.resetAtlasMaintenanceBackoff();
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+    try std.testing.expectEqual(@as(u8, 0), core.transient_glyph_retry_attempts);
+}
+
+test "maintenance timeout selects earliest independent glyph deadline" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.atlas_negative_retry_at = 900;
+    core.transient_glyph_retry_at = 700;
+    try std.testing.expectEqual(@as(i128, 700), flush.nextMsgTimeoutNs(&core).?);
+    core.transient_glyph_retry_at = 1_100;
+    try std.testing.expectEqual(@as(i128, 900), flush.nextMsgTimeoutNs(&core).?);
+}
+
+test "Core stop owns teardown exactly once" {
+    var core = Core.initForTest(std.testing.allocator);
+    core.stop();
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+    try std.testing.expectEqual(@as(u8, 2), core.stop_state.load(.acquire));
+}
+
+test "RPC-thread stop requests shutdown without joining itself" {
+    const Worker = struct {
+        fn run(core: *Core, returned: *std.atomic.Value(bool)) void {
+            core.rpc_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+            core.stop();
+            core.rpc_thread_id.store(0, .release);
+            returned.store(true, .release);
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    var returned = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &core, &returned });
+    core.thread = thread;
+
+    while (!returned.load(.acquire)) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u8, 0), core.stop_state.load(.acquire));
+
+    // The lifecycle thread takes ownership and joins the already-returned RPC
+    // thread before releasing Core resources.
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+}
+
+test "on_log stop stays non-blocking while teardown mutex is held" {
+    const Callback = struct {
+        fn log(ctx: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {
+            const core: *Core = @ptrCast(@alignCast(ctx.?));
+            core.stop();
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.log.cb = Callback.log;
+    core.log.ctx = &core;
+
+    // Models cleanup/teardown joining a callback worker while owning the
+    // transport mutex. The callback must only request cancellation.
+    core.child_handle_mu.lockUncancelable(clock.io());
+    core.stdin_close_mu.lockUncancelable(clock.io());
+    core.write_queue_mu.lockUncancelable(clock.io());
+    core.log.write("callback stop\n", .{});
+    core.write_queue_mu.unlock(clock.io());
+    core.stdin_close_mu.unlock(clock.io());
+    core.child_handle_mu.unlock(clock.io());
+
+    try std.testing.expect(core.stop_flag.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), core.stop_state.load(.acquire));
+    core.log.cb = null;
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+}
+
+test "session reset republishes the latest desired resize" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    _ = core.resize(47, 113);
+    // Model a successful enqueue to the old session: pending delivery was
+    // cleared, but the queue can still be discarded by reconnect cleanup.
+    core.pending_resize_valid = false;
+    core.ui_attached.store(true, .release);
+    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
+    try core.hl.setGroup("SessionOnly", 9);
+
+    core.resetSessionState();
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+    try std.testing.expect(core.pending_resize_valid);
+    try std.testing.expectEqual(@as(u32, 47), core.pending_resize_rows);
+    try std.testing.expectEqual(@as(u32, 113), core.pending_resize_cols);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
+}
+
+test "redraw allocation failure poisons epoch and suppresses batch presentation" {
+    const TestCtx = struct {
+        row_callbacks: u32 = 0,
+
+        fn onVerticesRow(
+            opaque_ctx: ?*anyopaque,
+            _: i64,
+            _: u32,
+            _: u32,
+            _: ?[*]const c_api.Vertex,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {
+            const ctx: *@This() = @ptrCast(@alignCast(opaque_ctx.?));
+            ctx.row_callbacks += 1;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var test_ctx: TestCtx = .{};
+    var core = Core.init(failing.allocator(), .{ .on_vertices_row = TestCtx.onVerticesRow }, &test_ctx);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+
+    var cell_a_fields = [_]mp.Value{.{ .str = "A" }};
+    var cells_a = [_]mp.Value{.{ .arr = &cell_a_fields }};
+    var line_a_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 0 }, .{ .arr = &cells_a }, .{ .bool = false },
+    };
+    var line_a_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_a_tuple } };
+
+    var group_tuple = [_]mp.Value{ .{ .str = "RecoveryTest" }, .{ .int = 7 } };
+    var group_event = [_]mp.Value{ .{ .str = "hl_group_set" }, .{ .arr = &group_tuple } };
+
+    var cell_b_fields = [_]mp.Value{.{ .str = "B" }};
+    var cells_b = [_]mp.Value{.{ .arr = &cell_b_fields }};
+    var line_b_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 1 }, .{ .arr = &cells_b }, .{ .bool = false },
+    };
+    var line_b_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_b_tuple } };
+    var flush_event = [_]mp.Value{.{ .str = "flush" }};
+    var params = [_]mp.Value{
+        .{ .arr = &line_a_event },
+        .{ .arr = &group_event },
+        .{ .arr = &line_b_event },
+        .{ .arr = &flush_event },
+    };
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    // The next allocation is hl_group_set's duplicated group-name key.
+    failing.fail_index = failing.alloc_index;
+    rpc_session.handleRpcNotification(&core, failing.allocator(), &top);
+
+    try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCell(0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0), test_ctx.row_callbacks);
+    try std.testing.expect(!core.hl.groups.contains("RecoveryTest"));
+    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+}
+
+test "redraw detach response resets poisoned protocol state before reattach" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.setWinPos(2, 200, 0, 0);
+    try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
+    try core.hl.setGroup("PoisonedEpoch", 9);
+
+    core.redraw_recovery_state = .await_detach;
+    core.redraw_recovery_msgid = 77;
+    var response = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 77 },
+        .nil,
+        .nil,
+    };
+    rpc_session.handleRpcResponse(&core, &response);
+
+    // The test core has no writer thread, so queueing the fresh attach fails
+    // after reset. That still proves the detach-response boundary clears the
+    // complete old protocol epoch before any reattach can be attempted.
+    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.sub_grids.count());
+    try std.testing.expectEqual(@as(usize, 0), core.grid.win_pos.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
+}
+
+test "redraw recovery rejects old epoch and admits fresh attach replay" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 2);
+
+    var cell_fields = [_]mp.Value{.{ .str = "A" }};
+    var cells = [_]mp.Value{.{ .arr = &cell_fields }};
+    var line_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 0 }, .{ .arr = &cells }, .{ .bool = false },
+    };
+    var line_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_tuple } };
+    var params = [_]mp.Value{.{ .arr = &line_event }};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    core.redraw_recovery_state = .await_detach;
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCell(0, 0).cp);
+
+    // Neovim serializes the fresh replay before the ui_attach response, so it
+    // must be accepted while that response is still pending.
+    core.redraw_recovery_state = .await_attach;
+    core.redraw_recovery_attempts = 1;
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u8, 1), core.redraw_recovery_attempts);
+}
+
+test "redraw recovery retains resize that cannot queue after fresh attach" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.redraw_recovery_state = .await_attach;
+    core.redraw_recovery_msgid = 91;
+    core.redraw_recovery_attach_rows = 24;
+    core.redraw_recovery_attach_cols = 80;
+    core.pending_resize_valid = true;
+    core.pending_resize_rows = 30;
+    core.pending_resize_cols = 100;
+    var response = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 91 },
+        .nil,
+        .nil,
+    };
+    rpc_session.handleRpcResponse(&core, &response);
+
+    try std.testing.expectEqual(RedrawRecoveryState.healthy, core.redraw_recovery_state);
+    try std.testing.expect(core.ui_attached.load(.acquire));
+    try std.testing.expect(core.pending_resize_valid);
+    try std.testing.expectEqual(@as(u32, 24), core.ui_attach_rows);
+    try std.testing.expectEqual(@as(u32, 80), core.ui_attach_cols);
+}
+
+test "focus send failure preserves the latest state for attach retry" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.ui_attached.store(true, .release);
+    core.requestUiSetFocus(true);
+
+    // A test core has no live writer, so the send fails. The focus state must
+    // remain pending for a future attachment.
+    try std.testing.expectEqual(@as(u8, 1), core.pending_focus.load(.acquire));
+}
+
+test "hard redraw resource limit fails the session without epoch retry" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var resize_tuple = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 80 },
+        .{ .int = @as(i64, grid_mod.MAX_GRID_ROWS) + 1 },
+    };
+    var resize_event = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_tuple } };
+    var params = [_]mp.Value{.{ .arr = &resize_event }};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+
+    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expectEqual(@as(u8, 0), core.redraw_recovery_attempts);
+    try std.testing.expectEqual(RedrawRecoveryState.healthy, core.redraw_recovery_state);
+}
+
+test "redraw post-processing failure poisons the attachment" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.pending_grid_resizes.append(core.alloc, .{
+        .grid_id = 9,
+        .width = 40,
+        .height = 12,
+    });
+
+    var params = [_]mp.Value{};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+
+    // The test core has no writer, so try_resize_grid fails. It must enter the
+    // same poisoned-session boundary instead of being logged and ignored.
+    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+}
+
+test "UI-state reserve preserves order across a full normal queue" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    defer core.stop();
+
+    var n0: rpc.Buf = .empty;
+    defer n0.deinit(core.alloc);
+    try core.sendRequestHeader(&n0, 10, "nvim_input");
+    try rpc.packArray(&n0, core.alloc, 1);
+    const n0_prefix_len = n0.items.len + 5;
+    const filler = try core.alloc.alloc(u8, Core.MAX_WRITE_QUEUE_SIZE - n0_prefix_len);
+    defer core.alloc.free(filler);
+    @memset(filler, 'x');
+    try rpc.packStr(&n0, core.alloc, filler);
+    try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE, n0.items.len);
+
+    var r1: rpc.Buf = .empty;
+    defer r1.deinit(core.alloc);
+    try core.sendRequestHeader(&r1, 11, "nvim_ui_set_focus");
+    try rpc.packArray(&r1, core.alloc, 1);
+    try rpc.packBool(&r1, core.alloc, false);
+
+    var n1: rpc.Buf = .empty;
+    defer n1.deinit(core.alloc);
+    try core.sendRequestHeader(&n1, 12, "nvim_input");
+    try rpc.packArray(&n1, core.alloc, 1);
+    try rpc.packStr(&n1, core.alloc, "y");
+
+    // Reproduce the reported failure boundary. N0 consumes the complete
+    // normal allowance, but R1 still appends to the same FIFO from reserved
+    // capacity. The writer then swaps N0+R1 before later N1 is produced.
+    {
+        core.write_queue_mu.lockUncancelable(clock.io());
+        defer core.write_queue_mu.unlock(clock.io());
+        try core.enqueueRawLocked(n0.items, .normal);
+        try core.enqueueRawLocked(r1.items, .ui_state);
+        try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE, core.write_queue_normal_bytes);
+        try std.testing.expectEqual(r1.items.len, core.write_queue_ui_state_bytes);
+        try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE + r1.items.len, core.write_queue.items.len);
+        core.write_queue_cond.signal(clock.io());
+    }
+
+    var swap_waits: usize = 0;
+    while (swap_waits < 1000) : (swap_waits += 1) {
+        core.write_queue_mu.lockUncancelable(clock.io());
+        const swapped = core.write_queue_normal_bytes == 0 and
+            core.write_queue_ui_state_bytes == 0;
+        core.write_queue_mu.unlock(clock.io());
+        if (swapped) break;
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(swap_waits < 1000);
+    try core.sendRaw(n1.items);
+
+    const total_len = n0.items.len + r1.items.len + n1.items.len;
+    const actual = try std.testing.allocator.alloc(u8, total_len);
+    defer std.testing.allocator.free(actual);
+    const read_stream = Stream.fromFile(read_file);
+    var offset: usize = 0;
+    while (offset < actual.len) {
+        const n = try read_stream.read(actual[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+    var reader = mp.SliceReader{ .data = actual };
+    const decoded_n0 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_n0);
+    const decoded_r1 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_r1);
+    const decoded_n1 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_n1);
+    try std.testing.expectEqual(actual.len, reader.i);
+    try std.testing.expectEqualStrings("nvim_input", decoded_n0.arr[2].str);
+    try std.testing.expectEqualStrings("nvim_ui_set_focus", decoded_r1.arr[2].str);
+    try std.testing.expect(!decoded_r1.arr[3].arr[0].bool);
+    try std.testing.expectEqualStrings("nvim_input", decoded_n1.arr[2].str);
+    try std.testing.expectEqualStrings("y", decoded_n1.arr[3].arr[0].str);
+    try std.testing.expect(core.write_queue.capacity <= Core.MAX_TOTAL_WRITE_QUEUE_SIZE);
+    try std.testing.expect(core.write_spare_queue.capacity <= Core.MAX_TOTAL_WRITE_QUEUE_SIZE);
+    try std.testing.expect(
+        core.write_queue.capacity + core.write_spare_queue.capacity <=
+            2 * Core.MAX_TOTAL_WRITE_QUEUE_SIZE,
+    );
+}
+
+test "pending focus and resize preserve publication order" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    defer core.stop();
+
+    var expected: rpc.Buf = .empty;
+    defer expected.deinit(core.alloc);
+    try core.sendRequestHeader(&expected, 1, "nvim_ui_set_focus");
+    try rpc.packArray(&expected, core.alloc, 1);
+    try rpc.packBool(&expected, core.alloc, false);
+    try core.sendRequestHeader(&expected, 2, "nvim_ui_try_resize");
+    try rpc.packArray(&expected, core.alloc, 2);
+    try rpc.packInt(&expected, core.alloc, 100);
+    try rpc.packInt(&expected, core.alloc, 30);
+    try core.sendRequestHeader(&expected, 3, "nvim_ui_try_resize");
+    try rpc.packArray(&expected, core.alloc, 2);
+    try rpc.packInt(&expected, core.alloc, 120);
+    try rpc.packInt(&expected, core.alloc, 40);
+    try core.sendRequestHeader(&expected, 4, "nvim_ui_set_focus");
+    try rpc.packArray(&expected, core.alloc, 1);
+    try rpc.packBool(&expected, core.alloc, true);
+
+    core.requestUiSetFocus(false);
+    _ = core.resize(30, 100);
+    core.pending_resize_mu.lockUncancelable(clock.io());
+    core.ui_attached.store(true, .release);
+    core.flushPendingUiStateLocked();
+    core.pending_resize_mu.unlock(clock.io());
+
+    core.ui_attached.store(false, .release);
+    _ = core.resize(40, 120);
+    core.requestUiSetFocus(true);
+    core.pending_resize_mu.lockUncancelable(clock.io());
+    core.ui_attached.store(true, .release);
+    core.flushPendingUiStateLocked();
+    core.pending_resize_mu.unlock(clock.io());
+
+    const actual = try std.testing.allocator.alloc(u8, expected.items.len);
+    defer std.testing.allocator.free(actual);
+    const read_stream = Stream.fromFile(read_file);
+    var used: usize = 0;
+    while (used < actual.len) {
+        const n = try read_stream.read(actual[used..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        used += n;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, actual);
+}
+
+test "writer stop cancels a full unread child pipe" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+
+    const payload = try std.testing.allocator.alloc(u8, 512 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    try core.sendRaw(payload);
+
+    // Let the writer fill the kernel pipe and enter its WouldBlock retry.
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    core.stop();
+    try std.testing.expectEqual(@as(u8, 2), core.stop_state.load(.acquire));
+}
+
+test "complete visible-grid snapshot reports truncation from one lock state" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 40, 120);
+    var grid_id: i64 = 2;
+    while (grid_id < 22) : (grid_id += 1) {
+        try core.grid.resizeGrid(grid_id, 4, 8);
+        try core.grid.setWinPos(grid_id, 1000 + grid_id, @intCast(grid_id), 0);
+    }
+    try core.grid.resizeGrid(30, 3, 7);
+    try core.grid.putSyntheticExternal(30, .{
+        .win = 3000,
+        .start_row = 0,
+        .start_col = 0,
+    });
+
+    var out: [16]c_api.GridInfo = undefined;
+    const snapshot = core.tryGetVisibleGridsComplete(&out).?;
+    try std.testing.expectEqual(@as(usize, out.len), snapshot.written);
+    try std.testing.expectEqual(@as(usize, 22), snapshot.total);
+    try std.testing.expectEqual(@as(i64, 1), out[0].grid_id);
+
+    var empty: [0]c_api.GridInfo = .{};
+    const count_only = core.tryGetVisibleGridsComplete(&empty).?;
+    try std.testing.expectEqual(@as(usize, 0), count_only.written);
+    try std.testing.expectEqual(snapshot.total, count_only.total);
+
+    core.grid_mu.lockUncancelable(clock.io());
+    defer core.grid_mu.unlock(clock.io());
+    try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
+}
+
+test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 2, 2);
+    try core.grid.win_pos.put(core.grid.alloc, 2, .{
+        .row = std.math.maxInt(u32),
+        .col = std.math.maxInt(u32),
+    });
+    try core.grid.viewport_margins.put(core.grid.alloc, 2, .{
+        .top = std.math.maxInt(u32),
+        .bottom = std.math.maxInt(u32),
+        .left = std.math.maxInt(u32),
+        .right = std.math.maxInt(u32),
+    });
+
+    var out: [2]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_row);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_col);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_top);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_right);
+
+    core.grid.cursor_grid = 1;
+    core.grid.cursor_row = std.math.maxInt(u32);
+    core.grid.cursor_col = std.math.maxInt(u32);
+    const cursor = core.getCursorPosition();
+    try std.testing.expectEqual(std.math.maxInt(i32), cursor.row);
+    try std.testing.expectEqual(std.math.maxInt(i32), cursor.col);
+}
+
+test "cmdline rendering consumes normalized hostile position and indent" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 8);
+    core.ext_cmdline_enabled = true;
+    const content = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "abc" }};
+    try core.grid.setCmdlineShow(
+        &content,
+        std.math.maxInt(u32),
+        ':',
+        "",
+        std.math.maxInt(u32),
+        1,
+        0,
+    );
+
+    core.notifyCmdlineChanges();
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(core.grid.sub_grids.contains(grid_mod.CMDLINE_GRID_ID));
+    try std.testing.expectEqual(@as(u32, 3), core.grid.getCmdlineState(1).?.pos);
+    try std.testing.expectEqual(@as(u32, 8), core.grid.getCmdlineState(1).?.indent);
+}

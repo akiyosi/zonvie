@@ -892,6 +892,17 @@ void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
                    against an older (smaller) struct layout.
    ctx:            opaque frontend context forwarded to all callbacks. */
 zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
+/* Must be called from a lifecycle thread which is not currently executing a
+   Zonvie callback. Calling destroy re-entrantly from a callback only requests
+   shutdown and retains the handle to avoid self-join and callback-context
+   use-after-free; the frontend must call destroy again later from its
+   lifecycle thread to release the handle. That final call must occur only
+   after the callback and the enclosing Core API invocation have both fully
+   returned, with no other Core API call in flight. It must have exactly one
+   externally serialized owner; concurrent lifecycle destroy calls are
+   unsupported. No new API call may start after the callback-thread request,
+   and no API may use the handle after a valid lifecycle-thread destroy
+   returns. */
 void zonvie_core_destroy(zonvie_core *core);
 
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);
@@ -916,6 +927,8 @@ int  zonvie_core_start_connect(
     const uint8_t *listen_addr, size_t listen_addr_len,
     unsigned rows, unsigned cols);
 
+/* Callback-safe. A callback-thread call requests shutdown without waiting;
+   resource teardown is completed by a later lifecycle-thread stop/destroy. */
 void zonvie_core_stop(zonvie_core *core);
 
 /* Notify the core that actual layout dimensions are ready.
@@ -940,7 +953,8 @@ void zonvie_core_unlock_grid(zonvie_core *core);
 
 /* updateLayoutPx variant for callers that already hold grid_mu via
    zonvie_core_lock_grid. Skips the redraw_thread_id check and the
-   internal grid_mu acquisition that the regular API performs. */
+   internal grid_mu acquisition that the regular API performs. A standalone
+   caller must request a full core flush after releasing grid_mu. */
 void zonvie_core_update_layout_px_locked(
     zonvie_core *core,
     unsigned drawable_w_px,
@@ -1256,6 +1270,12 @@ ZONVIE_API void zonvie_core_page_scroll(
 /* Process pending message scroll update (for throttled scroll).
    Call this after scroll events stop to ensure final position is rendered. */
 ZONVIE_API void zonvie_core_process_pending_msg_scroll(
+    zonvie_core *core
+);
+
+/* Same operation, returning true while an aborted/throttled update still
+   needs another frontend timer retry. */
+ZONVIE_API bool zonvie_core_process_pending_msg_scroll_retry_needed(
     zonvie_core *core
 );
 
@@ -1579,7 +1599,7 @@ typedef enum {
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
    declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
-   Frontends populate this struct in place and upload 80 bytes to the
+   Frontends populate this struct in place and upload 160 bytes to the
    uniform buffer each frame.
 
    Field order and offsets are load-bearing; do not reorder. std140 lays

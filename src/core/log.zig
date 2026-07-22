@@ -55,6 +55,8 @@ pub const Logger = struct {
 
         var buf: [1024]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        enterCallback();
+        defer leaveCallback();
         self.cb.?(self.ctx, msg.ptr, msg.len);
     }
 
