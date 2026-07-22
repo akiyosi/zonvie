@@ -816,6 +816,14 @@ void zonvie_core_set_log_perf_only(zonvie_core *core, int enabled);
  * logging for any output to appear. */
 void zonvie_core_set_log_scroll_only(zonvie_core *core, int enabled);
 
+/* Verbose tier: when enabled is non-zero, the highest-frequency per-row /
+ * per-glyph log lines ([perf] row_mode / row_mode_post, [shape_dump],
+ * [glyph_quad]) are also emitted. Off by default because their formatting
+ * and I/O cost is heavy enough to perturb the measured pipeline (~1-2ms per
+ * flush). Independent of zonvie_core_set_log_enabled — caller must still
+ * enable logging for any output to appear. */
+void zonvie_core_set_log_verbose(zonvie_core *core, int enabled);
+
 /* Enable ext_cmdline UI extension (must call before zonvie_core_start).
  * When enabled, cmdline is rendered as a separate external window. */
 void zonvie_core_set_ext_cmdline(zonvie_core *core, int enabled);
@@ -1340,6 +1348,7 @@ typedef struct zonvie_config_values {
     const char* log_path;             /* NULL if not set */
     bool log_perf_only;               /* true = drop non-[perf...] lines */
     bool log_scroll_only;             /* true = [perf...] + [scroll_debug] only */
+    bool log_verbose;                 /* true = also emit per-row/per-glyph lines */
     // performance
     int32_t perf_glyph_cache_ascii;
     int32_t perf_glyph_cache_non_ascii;

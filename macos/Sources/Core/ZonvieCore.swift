@@ -59,6 +59,11 @@ final class ZonvieCore {
     /// -> commit -> draw -> present chain can be traced without other debug
     /// noise. Takes precedence over appLogPerfOnly when both are set.
     static var appLogScrollOnly = false
+    /// Verbose tier: also emit the core's per-row/per-glyph lines
+    /// ([perf] row_mode / row_mode_post, [shape_dump], [glyph_quad]).
+    /// Off by default — the logging cost itself perturbs the pipeline.
+    /// Set from config.log.verbose during configureLogging.
+    static var appLogVerbose = false
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
     /// Process start time captured at first appLog reference; used to prefix
@@ -159,10 +164,11 @@ final class ZonvieCore {
     }
 
     /// Configure logging with file path (called from AppDelegate)
-    static func configureLogging(enabled: Bool, filePath: String?, perfOnly: Bool = false, scrollOnly: Bool = false) {
+    static func configureLogging(enabled: Bool, filePath: String?, perfOnly: Bool = false, scrollOnly: Bool = false, verbose: Bool = false) {
         appLogEnabled = enabled
         appLogPerfOnly = perfOnly
         appLogScrollOnly = scrollOnly
+        appLogVerbose = verbose
         appLogFilePath = filePath
 
         // Close existing handle if any

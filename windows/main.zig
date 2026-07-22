@@ -709,13 +709,17 @@ pub fn main() u8 {
         }
     }
 
+    // Apply frontend filters before enabling the sink so perf/scroll modes
+    // reject non-matching lines before formatting or enqueueing.
+    applog.setFilters(config.log.perf_only, config.log.scroll_only, config.log.verbose);
+
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
-        applog.setEnabled(true);
         applog.setLogPath(path);
-    } else if (config.log.enabled) {
         applog.setEnabled(true);
+    } else if (config.log.enabled) {
         applog.setLogPath(config.log.path);
+        applog.setEnabled(true);
     }
 
     // Validate --nvim path (reject quote characters that break shell/Zig parser quoting)

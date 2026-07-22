@@ -964,6 +964,18 @@ pub export fn zonvie_core_set_log_scroll_only(p: ?*zonvie_core, enabled: i32) ca
     box.core.log.scroll_only = (enabled != 0);
 }
 
+/// Verbose tier: when enabled is non-zero, the highest-frequency per-row /
+/// per-glyph log lines ([perf] row_mode / row_mode_post, [shape_dump],
+/// [glyph_quad]) are also emitted. Off by default because their formatting
+/// and I/O cost is heavy enough to perturb the measured pipeline (~1-2ms
+/// per flush). Independent of zonvie_core_set_log_enabled — caller must
+/// still enable logging for any output to appear.
+pub export fn zonvie_core_set_log_verbose(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.log.verbose = (enabled != 0);
+}
+
 /// Enable ext_cmdline UI extension. Must be called before zonvie_core_start().
 /// When enabled, cmdline is rendered as a separate external window.
 pub export fn zonvie_core_set_ext_cmdline(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -1554,6 +1566,7 @@ pub const zonvie_config_values = extern struct {
     log_path: ?[*:0]const u8 = null,
     log_perf_only: bool = false,
     log_scroll_only: bool = false,
+    log_verbose: bool = false,
     // performance
     perf_glyph_cache_ascii: i32 = 512,
     perf_glyph_cache_non_ascii: i32 = 256,
@@ -1672,6 +1685,7 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .log_path = dupeZForCOpt(alloc, cfg.log.path),
         .log_perf_only = cfg.log.perf_only,
         .log_scroll_only = cfg.log.scroll_only,
+        .log_verbose = cfg.log.verbose,
         // performance
         .perf_glyph_cache_ascii = @intCast(cfg.performance.glyph_cache_ascii_size),
         .perf_glyph_cache_non_ascii = @intCast(cfg.performance.glyph_cache_non_ascii_size),

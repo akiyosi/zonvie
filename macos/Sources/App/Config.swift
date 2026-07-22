@@ -127,6 +127,9 @@ struct ZonvieConfig {
         // Scroll-pipeline analysis mode: [perf...] plus [scroll_debug] lines
         // only. Takes precedence over perfOnly when both are set.
         var scrollOnly: Bool = false
+        // Verbose tier: also emit per-row/per-glyph lines (heavy — the
+        // logging itself perturbs the measured pipeline).
+        var verbose: Bool = false
     }
 
     struct PerformanceConfig {
@@ -135,8 +138,8 @@ struct ZonvieConfig {
         var glyphCacheAsciiSize: Int = 512
 
         /// Glyph cache size for non-ASCII characters (hash table)
-        /// Default: 256, Minimum: 64
-        var glyphCacheNonAsciiSize: Int = 256
+        /// Default: 512, Minimum: 64
+        var glyphCacheNonAsciiSize: Int = 512
 
         /// Highlight attribute cache size for flush vertex generation
         /// Default: 512, Range: 64-2048
@@ -295,6 +298,7 @@ struct ZonvieConfig {
         if let s = v.log_path { config.log.path = String(cString: s) }
         config.log.perfOnly = v.log_perf_only
         config.log.scrollOnly = v.log_scroll_only
+        config.log.verbose = v.log_verbose
 
         // Performance
         config.performance.glyphCacheAsciiSize = Int(v.perf_glyph_cache_ascii)

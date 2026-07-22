@@ -676,9 +676,11 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
         // toggle of the log flag doesn't reset them to their core defaults (off).
         core.zonvie_core_set_log_perf_only(app.corep, if (app.config.log.perf_only) 1 else 0);
         core.zonvie_core_set_log_scroll_only(app.corep, if (app.config.log.scroll_only) 1 else 0);
+        core.zonvie_core_set_log_verbose(app.corep, if (app.config.log.verbose) 1 else 0);
     }
 
     // 2) app-root switch (Windows side)
+    applog.setFilters(app.config.log.perf_only, app.config.log.scroll_only, app.config.log.verbose);
     applog.setEnabled(enabled);
 }
 
