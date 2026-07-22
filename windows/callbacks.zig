@@ -2261,6 +2261,20 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     }
 }
 
+/// Neovim resized the global grid itself (`:set columns=` / `:set lines=`).
+/// Runs on the core thread with grid_mu held, so the actual SetWindowPos is
+/// deferred to the UI thread via WM_APP_RESIZE_TO_GRID.
+pub fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (applog.isEnabled()) applog.appLog(
+        "[win] onMainGridSize: rows={d} cols={d}\n",
+        .{ rows, cols },
+    );
+    if (app.hwnd) |h| {
+        _ = c.PostMessageW(h, app_mod.WM_APP_RESIZE_TO_GRID, rows, @intCast(cols));
+    }
+}
+
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 

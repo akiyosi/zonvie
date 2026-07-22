@@ -48,6 +48,11 @@ test "gui:external_window" {
     try @import("scenarios/common/external_window.zig").run(testing.allocator);
 }
 
+test "gui:set_columns_lines" {
+    try requirePrereqs();
+    try @import("scenarios/common/set_columns_lines.zig").run(testing.allocator);
+}
+
 test "gui:window_frame_stability" {
     // macOS only: the Windows frontend does not persist the main window
     // frame across launches, so the 44705f8 regression cannot occur there.

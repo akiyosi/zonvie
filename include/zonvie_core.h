@@ -784,6 +784,19 @@ typedef struct zonvie_callbacks {
 
     /* AI-agent work state per tab. Appended at the end for ABI compat. */
     zonvie_on_agent_status_fn on_agent_status;
+
+    /* Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+       Fired only when grid 1's reported size differs from the size the
+       frontend last supplied via zonvie_core_update_layout_px, i.e. Neovim
+       changed it rather than echoing the UI's own resize request.
+       The frontend should resize its main window so the terminal area becomes
+       cols x rows cells. The resulting zonvie_core_update_layout_px is what
+       makes Neovim repaint at the new size, so the frontend must keep
+       reporting the layout as usual after the resize.
+       Runs on the core thread with grid_mu held: frontends must not perform
+       blocking window work inline (post/dispatch to the UI thread instead).
+       Appended at the end for ABI compat. */
+    void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

@@ -351,6 +351,11 @@ pub const Gui = struct {
         return platform.windowCountForPid(g.app_pid);
     }
 
+    /// On-screen bounds of the app's main window, or null while it has none.
+    pub fn mainWindowBounds(g: *Gui) ?platform.Bounds {
+        return platform.mainWindowBoundsForPid(g.app_pid);
+    }
+
     /// Capture the app's main window, retrying until two consecutive
     /// captures are pixel-identical (the frame has settled) or timeout.
     /// `crop` (a fixed top-left region) keeps the output dimensions stable

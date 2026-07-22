@@ -1047,6 +1047,13 @@ pub fn handleRedraw(
                     grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width }) catch {};
                 }
 
+                // Record the global grid size so core can detect a
+                // Neovim-initiated resize (`:set columns=` / `:set lines=`)
+                // after the batch completes.
+                if (grid_id == 1) {
+                    grid.pending_main_grid_size = .{ .rows = height, .cols = width };
+                }
+
                 if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });
             }
 

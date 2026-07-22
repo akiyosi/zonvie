@@ -1203,6 +1203,31 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         }
         self.grid.pending_grid_resizes.clearRetainingCapacity();
 
+        // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+        // Grid 1 normally echoes the size the frontend asked for through
+        // updateLayoutPx; a different size means Neovim changed it itself, so
+        // ask the frontend to resize its window to match.
+        if (self.grid.pending_main_grid_size) |sz| {
+            self.grid.pending_main_grid_size = null;
+            if (self.last_layout_rows != 0 and self.last_layout_cols != 0 and
+                (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
+            {
+                if (self.cb.on_main_grid_size) |cb| {
+                    // last_layout_* is deliberately NOT updated here. The main
+                    // grid's NDC viewport is derived from the drawable, so the
+                    // vertices Neovim just triggered cover only the cells that
+                    // fit the OLD window. Letting the post-resize
+                    // updateLayoutPx run its normal try_resize round trip makes
+                    // Neovim repaint once the drawable actually matches.
+                    self.log.write(
+                        "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
+                        .{ sz.rows, sz.cols },
+                    );
+                    cb(self.ctx, sz.rows, sz.cols);
+                }
+            }
+        }
+
         // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
         // These are deferred to the end of the redraw batch (not immediate) because they
         // depend on grid state that may be updated earlier in the same batch.

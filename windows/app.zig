@@ -166,6 +166,12 @@ pub const WM_APP_OPEN_FONT_PICKER: c.UINT = c.WM_APP + 30;
 /// Posted from WM_CREATE when launched with `--dialog`; the handler shows the
 /// startup connection dialog once the main window exists (see dialogs.zig).
 pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 31;
+/// Posted from the on_main_grid_size callback when Neovim resizes the global
+/// grid itself (`:set columns=` / `:set lines=`). wParam = rows, lParam = cols.
+/// The UI thread's handler grows/shrinks the main window by the terminal-area
+/// delta. Posted (not sent) because the callback runs on the core thread with
+/// grid_mu held, and SetWindowPos would re-enter updateLayoutToCore.
+pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 32;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -3553,9 +3559,8 @@ pub fn getEffectiveContentWidth(app: *App, client_width: u32) u32 {
     return client_width;
 }
 
-pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
-    if (app.corep == null) return;
-
+/// Terminal content area in pixels (client rect minus sidebar/scrollbar/tabbar chrome).
+pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     var rc: c.RECT = undefined;
     // When content_hwnd exists, use its client rect (already excludes tabbar area)
     const target_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
@@ -3582,6 +3587,16 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     else
         0;
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
+
+    return .{ .w = w, .h = h };
+}
+
+pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
+    if (app.corep == null) return;
+
+    const content = contentSizePx(hwnd, app);
+    const w = content.w;
+    const h = content.h;
 
     const cw: u32 = @max(1, app.cell_w_px);
     const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);

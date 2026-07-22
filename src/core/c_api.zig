@@ -538,6 +538,10 @@ pub const Callbacks = extern struct {
     // 4); frontends render the indicator from state & 0x7F and must not
     // edge-detect notifications themselves.
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
+
+    // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+    // Appended at the end for ABI compat (see on_restart note).
+    on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
 
 
@@ -645,6 +649,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_tabline_update = box.cb.on_tabline_update,
         .on_tabline_hide = box.cb.on_tabline_hide,
         .on_agent_status = box.cb.on_agent_status,
+
+        // Neovim-initiated main grid resize
+        .on_main_grid_size = box.cb.on_main_grid_size,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,

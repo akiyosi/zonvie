@@ -322,6 +322,12 @@ pub const Callbacks = struct {
         total_rows: u32,
         total_cols: u32,
     ) callconv(.c) void = null,
+
+    /// Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+    /// Fired only when grid 1's reported size differs from the size the
+    /// frontend last supplied via updateLayoutPx, i.e. Neovim changed it
+    /// rather than echoing the UI's own resize request.
+    on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -1028,6 +1034,7 @@ pub const Core = struct {
         // unrelated grids in the new session.
         self.grid.pending_grid_resizes.clearRetainingCapacity();
         self.grid.pending_win_ops.clearRetainingCapacity();
+        self.grid.pending_main_grid_size = null;
 
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.

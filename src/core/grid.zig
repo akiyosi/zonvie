@@ -882,6 +882,11 @@ pub const Grid = struct {
     // ext_windows: pending grid resize requests (processed by core after redraw)
     pending_grid_resizes: std.ArrayListUnmanaged(PendingGridResize) = .empty,
 
+    // Last grid_resize seen for the global grid (id=1) in the current redraw
+    // batch. Core compares it against the layout it last requested to detect
+    // a Neovim-initiated resize (`:set columns=` / `:set lines=`).
+    pending_main_grid_size: ?GridSize = null,
+
     // ext_windows: pending layout operations (win_move, win_exchange, etc.)
     pending_win_ops: std.ArrayListUnmanaged(PendingWinOp) = .empty,
 

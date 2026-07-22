@@ -946,6 +946,11 @@ final class ZonvieCore {
                     title = ""
                 }
                 me.onAgentStatus(tabHandle: tabHandle, state: state, title: title)
+            },
+            on_main_grid_size: { ctx, rows, cols in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.onMainGridSize(rows: rows, cols: cols)
             }
         )
 
@@ -2174,6 +2179,37 @@ final class ZonvieCore {
     func updateLayoutPx(drawableW: UInt32, drawableH: UInt32, cellW: UInt32, cellH: UInt32) {
         guard let core else { return }
         zonvie_core_update_layout_px(core, drawableW, drawableH, cellW, cellH)
+    }
+
+    /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
+    /// Resize the main window so the terminal area becomes cols x rows cells.
+    /// Runs on the core thread with grid_mu held, so the window work is
+    /// dispatched to the main thread.
+    private func onMainGridSize(rows: UInt32, cols: UInt32) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let view = self.terminalView,
+                  let renderer = view.renderer,
+                  let window = view.window else { return }
+            let scale = window.backingScaleFactor
+            guard scale > 0 else { return }
+
+            let target_w_pt = CGFloat(cols) * CGFloat(renderer.cellWidthPx) / scale
+            let target_h_pt = CGFloat(rows) * CGFloat(renderer.cellHeightPx) / scale
+            let dw = target_w_pt - view.bounds.width
+            let dh = target_h_pt - view.bounds.height
+            if abs(dw) < 0.5 && abs(dh) < 0.5 { return }
+
+            // Apply the terminal-area delta to the window frame so tab bar /
+            // sidebar chrome keeps its size. The top-left corner stays fixed.
+            var frame = window.frame
+            frame.origin.y -= dh
+            frame.size.width += dw
+            frame.size.height += dh
+            window.setFrame(frame, display: true)
+
+            ZonvieCore.appLog("[main_grid_size] rows=\(rows) cols=\(cols) delta=(\(dw),\(dh))")
+        }
     }
 
     /// Set screen width in cells (for cmdline max width).

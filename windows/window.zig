@@ -733,6 +733,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_get_ascii_table = callbacks.onGetAsciiTable,
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
+        .on_main_grid_size = callbacks.onMainGridSize,
         .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
     };
@@ -3276,6 +3277,52 @@ pub export fn WndProc(
                 if (applog.isEnabled()) applog.appLog(
                     "[win] WM_APP_SNAP_MAIN_WINDOW: client=({d},{d}) -> ({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
                     .{ client_w, client_h, snapped_w, snapped_h, cell_w, cell_h, new_outer_w, new_outer_h },
+                );
+                _ = c.SetWindowPos(
+                    hwnd,
+                    null,
+                    0,
+                    0,
+                    new_outer_w,
+                    new_outer_h,
+                    c.SWP_NOZORDER | c.SWP_NOMOVE | c.SWP_NOACTIVATE,
+                );
+            }
+            return 0;
+        },
+
+        app_mod.WM_APP_RESIZE_TO_GRID => {
+            // Neovim resized the global grid itself (`:set columns=` /
+            // `:set lines=`). Grow/shrink the main window by the delta between
+            // the current terminal content area and the requested cell grid,
+            // so sidebar/tabbar/scrollbar chrome keeps its size.
+            // wParam = rows, lParam = cols.
+            if (getApp(hwnd)) |app| {
+                const rows: u32 = @intCast(wParam);
+                const cols: u32 = @intCast(lParam);
+                if (rows == 0 or cols == 0) return 0;
+
+                var window_rc: c.RECT = undefined;
+                if (c.GetWindowRect(hwnd, &window_rc) == 0) return 0;
+
+                app.mu.lockUncancelable(core.clock.io());
+                const cell_w: u32 = app.cell_w_px;
+                const cell_h: u32 = app.cell_h_px + app.linespace_px;
+                app.mu.unlock(core.clock.io());
+                if (cell_w == 0 or cell_h == 0) return 0;
+
+                const content = app_mod.contentSizePx(hwnd, app);
+                const dw: i32 = @as(i32, @intCast(cols * cell_w)) - @as(i32, @intCast(content.w));
+                const dh: i32 = @as(i32, @intCast(rows * cell_h)) - @as(i32, @intCast(content.h));
+                if (dw == 0 and dh == 0) return 0;
+
+                const new_outer_w: c_int = (window_rc.right - window_rc.left) + dw;
+                const new_outer_h: c_int = (window_rc.bottom - window_rc.top) + dh;
+                if (new_outer_w <= 0 or new_outer_h <= 0) return 0;
+
+                if (applog.isEnabled()) applog.appLog(
+                    "[win] WM_APP_RESIZE_TO_GRID: rows={d} cols={d} content=({d},{d}) delta=({d},{d}) outer=({d},{d})\n",
+                    .{ rows, cols, content.w, content.h, dw, dh, new_outer_w, new_outer_h },
                 );
                 _ = c.SetWindowPos(
                     hwnd,
