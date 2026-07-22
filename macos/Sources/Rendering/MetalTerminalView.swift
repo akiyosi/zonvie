@@ -36,14 +36,37 @@ final class MetalTerminalView: MTKView {
         return _inputContext
     }
 
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        activateDrawLoop()
+        requestRedraw(nil)
+    }
+
     // --- Scroll state for smooth scrolling ---
     // Per-grid accumulated scroll offset in pixels (for sub-cell smooth scrolling)
     private var scrollOffsetPx: [Int64: CGFloat] = [:]
+    // Persistent scratch buffers for updateScrollShaderOffset, reused via
+    // removeAll(keepingCapacity: true) instead of building fresh arrays
+    // (compactMap/etc.) every call — this runs in the pre-draw path on
+    // every scrolled frame.
+    private var scrollOffsetInfoScratch: [MetalTerminalRenderer.ScrollOffsetInfo] = []
+    private var scrollOffsetStaleKeysScratch: [Int64] = []
+    private var gridInfoMapScratch: [Int64: ZonvieCore.GridInfo] = [:]
+    private var visibleGridIdsScratch: Set<Int64> = []
+    // Reused by the fixedRects collection below; updateFixedFloatRects()
+    // copies elements into the renderer's own storage rather than aliasing
+    // this buffer, so reusing it here doesn't force a COW detach there.
+    private var fixedFloatRectsScratch: [MetalTerminalRenderer.FixedFloatRect] = []
     // Lock protecting scrollOffsetPx from concurrent access between
     // the RPC thread (processPendingScrollClears via submitVerticesRowRaw)
     // and the main thread (handleScrollInput, updateScrollShaderOffset).
     // Lock order: scrollOffsetLock -> pendingSentScrollLock (never reversed).
     private let scrollOffsetLock = NSLock()
+    // Tracks whether the previous updateScrollShaderOffset call had any
+    // offsets, so the idle (empty) case can skip rebuilding the
+    // Dictionary/Set/array below every frame while still running the one
+    // "just went empty" transition call that clears the renderer's state.
+    private var hadScrollOffsetsLastCall = false
 
     // Track scroll commands sent to Neovim (to distinguish frontend vs Neovim-initiated scrolls)
     // When we send a scroll, we increment this; when grid_scroll arrives, we decrement.
@@ -123,6 +146,13 @@ final class MetalTerminalView: MTKView {
     /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
     private static let scrollOffsetEpsilon: CGFloat = 1.0
 
+    /// Upper bound on the total scroll-offset entry count (directly-scrolled
+    /// windows + followed floats combined) passed to the renderer each
+    /// frame. The vertex shader uses binary search, but CPU preparation and
+    /// setVertexBytes'/GPU-buffer cost still grow with this count. This is
+    /// comfortably above any realistic simultaneous scroll-source count.
+    static let maxScrollOffsets = 128
+
     /// Stale-scroll thresholds: seconds without a grid_scroll response (while
     /// scrolls are pending) after which the scroll is considered blocked at a
     /// buffer edge. The short threshold applies when the viewport confirms the
@@ -175,7 +205,16 @@ final class MetalTerminalView: MTKView {
         // Skip while minimized: the Zig core's grid state must not be queried
         // while the window is in the Dock, and nothing is visible anyway.
         if window?.isMiniaturized == true { return }
-        let ms = core.nextMsgTimeoutMs()
+        let ms = core.tryNextMsgTimeoutMs()
+        if ms == -2 {
+            // Core's grid lock was busy (mid-flush). Do NOT treat this as
+            // "nothing pending" -- an already-armed auto-hide deadline could
+            // be missed. Retry shortly instead of polling every frame.
+            msgTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: false) { [weak self] _ in
+                self?.scheduleMsgTimer()
+            }
+            return
+        }
         guard ms >= 0 else { return }  // -1 => nothing pending
         msgTimer = Timer.scheduledTimer(withTimeInterval: Double(max(0, ms)) / 1000.0,
                                         repeats: false) { [weak self] _ in
@@ -898,12 +937,30 @@ final class MetalTerminalView: MTKView {
 
     // MARK: - Scrollbar
 
+    /// One-shot retry pending for updateScrollbarIfNeeded (main thread only).
+    private var scrollbarRetryScheduled = false
+
     /// Update scrollbar if viewport changed
-    private func updateScrollbarIfNeeded() {
+    func updateScrollbarIfNeeded() {
         let config = ZonvieConfig.shared.scrollbar
         guard config.enabled else { return }
         guard let core else { return }
-        guard let viewport = core.getViewport(gridId: -1) else { return }
+        var lockBusy = false
+        let viewportOrStale = core.getViewportNonBlocking(gridId: -1, lockBusy: &lockBusy)
+        if lockBusy, !scrollbarRetryScheduled {
+            // grid_mu was held (core thread mid-handleRedraw): the value above
+            // is the one-flush-stale cache. This update runs once per flush, so
+            // a busy read on the FINAL flush of a scroll burst has no later
+            // flush to heal it — the knob would stay at the pre-scroll position.
+            // One-shot main-thread retry, mirroring windows/ui/scrollbar.zig's
+            // TIMER_SCROLLBAR_RETRY (16ms ≈ one frame).
+            scrollbarRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                self?.scrollbarRetryScheduled = false
+                self?.updateScrollbarIfNeeded()
+            }
+        }
+        guard let viewport = viewportOrStale else { return }
 
         // Check if any viewport property changed (topline, botline, lineCount)
         let viewportChanged = viewport.topline != lastViewportTopline ||
@@ -998,7 +1055,7 @@ final class MetalTerminalView: MTKView {
 
         // Viewport may be nil if Neovim hasn't sent win_viewport for the cursor grid yet
         // (e.g., after window split with no content change). pageScroll doesn't need viewport.
-        let viewport = core.getViewport(gridId: -1)
+        let viewport = core.getViewportNonBlocking(gridId: -1)
 
         switch sender.hitPart {
         case .decrementPage:
@@ -1218,11 +1275,6 @@ final class MetalTerminalView: MTKView {
             cursorPtr: cursorPtr, cursorCount: cursorCount
         )
         requestRedraw()
-
-        // Update scrollbar on vertex submission
-        DispatchQueue.main.async { [weak self] in
-            self?.updateScrollbarIfNeeded()
-        }
     }
 
     func submitVerticesPartialRaw(
@@ -1348,11 +1400,11 @@ final class MetalTerminalView: MTKView {
 
 
 
-    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0) {
+    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0, totalCols: Int = 0) {
         // Process pending scroll clears BEFORE submitting new vertices.
         processPendingScrollClears()
 
-        renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows)
+        renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
 
         // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match vertexgen.ndc()).
         let cellHpx = CGFloat(renderer.cellHeightPx)
@@ -1380,16 +1432,12 @@ final class MetalTerminalView: MTKView {
 
     
         requestRedrawDrawablePx(rectPx)
-
-        // Update scrollbar on vertex submission
-        DispatchQueue.main.async { [weak self] in
-            self?.updateScrollbarIfNeeded()
-        }
     }
 
-    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+    @discardableResult
+    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) -> Bool {
         processPendingScrollClears()
-        renderer.applyMainRowScrollRaw(
+        let ok = renderer.applyMainRowScrollRaw(
             rowStart: rowStart,
             rowEnd: rowEnd,
             colStart: colStart,
@@ -1403,7 +1451,7 @@ final class MetalTerminalView: MTKView {
         let yFromTopPx = CGFloat(rowStart) * cellHpx
         let hPx = CGFloat(max(0, rowEnd - rowStart)) * cellHpx
         let drawableWPx = CGFloat(self.drawableSize.width)
-        guard drawableWPx > 0, hPx > 0 else { return }
+        guard drawableWPx > 0, hPx > 0 else { return ok }
 
         let rectPx = NSRect(
             x: 0,
@@ -1412,6 +1460,7 @@ final class MetalTerminalView: MTKView {
             height: hPx
         )
         requestRedrawDrawablePx(rectPx)
+        return ok
     }
 
     func applyLineSpace(px: Int32) {
@@ -1680,19 +1729,57 @@ final class MetalTerminalView: MTKView {
     private func updateScrollShaderOffset() {
         guard let core else { return }
 
-        let drawableHeight = Float(drawableSize.height)
         let cellHeightPx = Float(renderer.cellHeightPx)
-        guard drawableHeight > 0 && cellHeightPx > 0 else { return }
+        guard cellHeightPx > 0 else { return }
 
-        // Get grid info to look up margins and positions (non-blocking)
-        let grids = core.getVisibleGridsCached()
-        let gridInfoMap = Dictionary(uniqueKeysWithValues: grids.map { ($0.gridId, $0) })
+        // Use the same cell-snapped viewport height the vertex data and
+        // fragment shader already use (see draw()'s vpHeight / MetalTypes.swift
+        // fragmentHeight), not the raw drawable height — otherwise this
+        // scroll-offset math disagrees with the shader's NDC reconstruction
+        // whenever drawableHeight is not an exact multiple of cellHeightPx
+        // (fullscreen / zoomed / tiled window states).
+        let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
+        let drawableHi = max(1, UInt32(drawableSize.height))
+        let drawableHeight = Float((drawableHi / cellHi) * cellHi)
+        guard drawableHeight > 0 else { return }
 
-        // Prune stale entries: remove gridIds that are no longer visible
-        let visibleGridIds = Set(gridInfoMap.keys)
+        // Idle fast path: nothing to do once scrollOffsetPx has been empty
+        // for more than one call. appendFloatScrollOffsets() itself no-ops
+        // when offsets (built from scrollOffsetPx) is empty, so "no floats
+        // need servicing" is already implied here -- skip building the
+        // Dictionary/Set/array below entirely. The FIRST empty call after a
+        // non-empty one still falls through, so the transition still
+        // propagates an empty state to the renderer (clearing stale offsets).
         scrollOffsetLock.lock()
-        let staleKeys = scrollOffsetPx.keys.filter { !visibleGridIds.contains($0) }
-        for key in staleKeys {
+        let isEmptyNow = scrollOffsetPx.isEmpty
+        scrollOffsetLock.unlock()
+        if isEmptyNow && !hadScrollOffsetsLastCall {
+            return
+        }
+        hadScrollOffsetsLastCall = !isEmptyNow
+
+        // Get grid info to look up margins and positions (non-blocking).
+        // Built into persistent scratch storage (removeAll(keepingCapacity:)
+        // + manual insert loops) instead of grids.map + Dictionary(uniqueKeysWithValues:)
+        // + Set(...) — this runs in the pre-draw path on every scrolled frame.
+        let grids = core.getVisibleGridsCached()
+        gridInfoMapScratch.removeAll(keepingCapacity: true)
+        for g in grids { gridInfoMapScratch[g.gridId] = g }
+        let gridInfoMap = gridInfoMapScratch
+
+        // Prune stale entries: remove gridIds that are no longer visible.
+        // visibleGridIdsScratch and scrollOffsetStaleKeysScratch are reused
+        // below (cleared again) for the near-zero-offset pruning pass —
+        // safe since both passes are sequential, non-overlapping uses
+        // within this same call.
+        visibleGridIdsScratch.removeAll(keepingCapacity: true)
+        for key in gridInfoMap.keys { visibleGridIdsScratch.insert(key) }
+        scrollOffsetLock.lock()
+        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
+        for key in scrollOffsetPx.keys where !visibleGridIdsScratch.contains(key) {
+            scrollOffsetStaleKeysScratch.append(key)
+        }
+        for key in scrollOffsetStaleKeysScratch {
             scrollOffsetPx.removeValue(forKey: key)
             scrollEdgeBlocked.removeValue(forKey: key)
         }
@@ -1700,12 +1787,21 @@ final class MetalTerminalView: MTKView {
         // NDC scale: 2.0 / drawableHeight (top = 1.0, bottom = -1.0)
         let ndcScale: Float = 2.0 / drawableHeight
 
-        var offsets: [MetalTerminalRenderer.ScrollOffsetInfo] = scrollOffsetPx.compactMap { (gridId, offsetPx) in
-            guard let info = gridInfoMap[gridId] else { return nil }
+        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
+        scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
+        for (gridId, offsetPx) in scrollOffsetPx {
+            guard let info = gridInfoMap[gridId] else { continue }
             let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: CGFloat(cellHeightPx))
             // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
-            // preventing markAllRowsDirty from firing every frame.
-            guard abs(clampedOffsetPx) >= Self.scrollOffsetEpsilon else { return nil }
+            // preventing markAllRowsDirty from firing every frame. Also prune
+            // the entry itself — otherwise scrollOffsetPx never becomes empty
+            // for this grid, permanently disabling the idle fast path above
+            // and causing this function to rebuild the offsets array every
+            // call indefinitely.
+            guard abs(clampedOffsetPx) >= Self.scrollOffsetEpsilon else {
+                scrollOffsetStaleKeysScratch.append(gridId)
+                continue
+            }
 
             // Calculate grid's top Y in NDC
             // Grid starts at startRow (in cells from top), each cell is cellHeightPx
@@ -1713,14 +1809,17 @@ final class MetalTerminalView: MTKView {
             // In NDC: top of screen = 1.0, so gridTopY = 1.0 - (gridTopPx * scale)
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
-            return MetalTerminalRenderer.ScrollOffsetInfo(
+            scrollOffsetInfoScratch.append(MetalTerminalRenderer.ScrollOffsetInfo(
                 gridId: gridId,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
                 gridRows: info.rows,
                 marginTop: info.marginTop,
                 marginBottom: info.marginBottom
-            )
+            ))
+        }
+        for key in scrollOffsetStaleKeysScratch {
+            scrollOffsetPx.removeValue(forKey: key)
         }
         scrollOffsetLock.unlock()
 
@@ -1731,33 +1830,56 @@ final class MetalTerminalView: MTKView {
         // float by the same amount keeps it glued to the buffer line it annotates.
         // Floats carry their own grid_id with DECO_SCROLLABLE already set by the
         // core, so adding a scroll-offset entry is sufficient — no vertex regen.
-        appendFloatScrollOffsets(into: &offsets, grids: grids, gridInfoMap: gridInfoMap, cellHeightPx: cellHeightPx, ndcScale: ndcScale)
+        // Mutates scrollOffsetInfoScratch directly (rather than a local copy)
+        // so this append reuses its existing capacity instead of triggering
+        // a copy-on-write allocation.
+        let scrollOffsetsComplete = appendFloatScrollOffsets(
+            into: &scrollOffsetInfoScratch,
+            grids: grids,
+            gridInfoMap: gridInfoMap,
+            cellHeightPx: cellHeightPx,
+            ndcScale: ndcScale
+        )
 
         // Collect fixed (non-following) floats so the fragment shader can discard
         // scrolled content that would otherwise bleed over them while an adjacent
         // row is shifted. Only relevant while a smooth scroll is active.
-        var fixedRects: [MetalTerminalRenderer.FixedFloatRect] = []
-        if !offsets.isEmpty {
+        fixedFloatRectsScratch.removeAll(keepingCapacity: true)
+        if scrollOffsetsComplete && !scrollOffsetInfoScratch.isEmpty {
             let cellW = Float(renderer.cellWidthPx)
-            let ndcXScale: Float = 2.0 / Float(drawableSize.width)
             for g in grids where g.zindex > 0 && g.gridId != 1 && !g.followsScroll {
                 // A fixed float that is itself being scrolled (its own content,
                 // because it is logically scrollable) must not mask its own
                 // scrolled content — skip it so the guard never self-discards.
-                if offsets.contains(where: { $0.gridId == g.gridId }) { continue }
-                fixedRects.append(MetalTerminalRenderer.FixedFloatRect(
-                    x0: Float(g.startCol) * cellW * ndcXScale - 1.0,
-                    x1: Float(g.startCol + g.cols) * cellW * ndcXScale - 1.0,
-                    top: 1.0 - Float(g.startRow) * cellHeightPx * ndcScale,
-                    bottom: 1.0 - Float(g.startRow + g.rows) * cellHeightPx * ndcScale
+                if scrollOffsetInfoScratch.contains(where: { $0.gridId == g.gridId }) { continue }
+                fixedFloatRectsScratch.append(MetalTerminalRenderer.FixedFloatRect(
+                    x0: Float(g.startCol) * cellW,
+                    x1: Float(g.startCol + g.cols) * cellW,
+                    top: Float(g.startRow) * cellHeightPx,
+                    bottom: Float(g.startRow + g.rows) * cellHeightPx
                 ))
+                // One entry beyond the representable maximum is enough to
+                // select the cell-aligned fallback; do not grow this hot-path
+                // scratch buffer with every remaining float.
+                if fixedFloatRectsScratch.count > MetalTerminalRenderer.maxFixedFloatRects { break }
             }
         }
-        renderer.updateFixedFloatRects(fixedRects)
+        let fixedFloatMaskRepresentable = renderer.updateFixedFloatRects(fixedFloatRectsScratch)
 
-        renderer.updateScrollOffsets(offsets, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
+        // A partial transform is visibly wrong: it can split related windows
+        // or let shifted content bleed through an omitted fixed float. Fall
+        // back to the committed, cell-aligned frame when either constant
+        // buffer would overflow instead of truncating semantic state.
+        if !fixedFloatMaskRepresentable {
+            scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
+        } else if !scrollOffsetsComplete || scrollOffsetInfoScratch.count > Self.maxScrollOffsets {
+            scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
+            renderer.updateFixedFloatRects([])
+        }
 
-        if !offsets.isEmpty {
+        renderer.updateScrollOffsets(scrollOffsetInfoScratch, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
+
+        if !scrollOffsetInfoScratch.isEmpty {
             renderer.markAllRowsDirty()
         }
     }
@@ -1815,8 +1937,7 @@ final class MetalTerminalView: MTKView {
         // Detection: terminal mode + cursor not visible (busy)
         // When a terminal UI tool is running, the cursor is typically hidden (busy_start).
         if effectiveHasPrecise {
-            let mode = core.getCurrentMode()
-            let cursorVisible = core.isCursorVisible()
+            let (mode, cursorVisible) = core.getModeStateNonBlocking()
             if mode == "terminal" && !cursorVisible {
                 effectiveHasPrecise = false
             }
@@ -2251,8 +2372,8 @@ final class MetalTerminalView: MTKView {
         // Use integer-rounded cell dimensions to match core grid math exactly.
         // The core receives these rounded values via updateLayoutPx and uses them
         // for row/col computation and vertex positioning.
-        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
-        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.up))))
+        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.up))))
 
         // Compute integer drawable height from current bounds (same formula as
         // updateDrawableSizeIfPossible). This avoids depending on the stored
@@ -2400,9 +2521,10 @@ final class MetalTerminalView: MTKView {
         gridInfoMap: [Int64: ZonvieCore.GridInfo],
         cellHeightPx: Float,
         ndcScale: Float
-    ) {
+    ) -> Bool {
         // Nothing to propagate unless a window is actively being scrolled.
-        guard !offsets.isEmpty else { return }
+        guard !offsets.isEmpty else { return true }
+        guard offsets.count <= Self.maxScrollOffsets else { return false }
 
         // Only the window entries built before this call are scroll sources; the
         // float entries appended below must not be treated as sources. Capture the
@@ -2458,6 +2580,10 @@ final class MetalTerminalView: MTKView {
                 }
             }
             guard let offsetYPx = followedOffsetYPx else { continue }
+            // A partial offset set can split a float from its anchor. Signal
+            // overflow so the caller disables the whole transform for this
+            // frame instead of silently truncating semantic state.
+            guard offsets.count < Self.maxScrollOffsets else { return false }
 
             let gridTopPx = Float(floatGrid.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
@@ -2471,6 +2597,7 @@ final class MetalTerminalView: MTKView {
                 clipToContent: false
             ))
         }
+        return true
     }
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
@@ -2668,7 +2795,7 @@ extension MetalTerminalView: IMEPreeditHost {
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
         let cell = imePreeditCellSize
         if let core = core {
-            let cursor = core.getCursorPosition()
+            let cursor = core.getCursorPositionNonBlocking()
             if cursor.row >= 0 && cursor.col >= 0 {
                 // Cursor is grid-local; add the grid's screen offset.
                 var screenRow = Int(cursor.row)
@@ -2694,7 +2821,7 @@ extension MetalTerminalView: IMEPreeditHost {
         var screenRow = 0
         var screenCol = 0
         if let core = core {
-            let cursor = core.getCursorPosition()
+            let cursor = core.getCursorPositionNonBlocking()
             if cursor.row >= 0 && cursor.col >= 0 {
                 screenRow = Int(cursor.row)
                 screenCol = Int(cursor.col)

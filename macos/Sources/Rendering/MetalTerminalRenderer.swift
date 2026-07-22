@@ -3,6 +3,42 @@ import Metal
 import MetalKit
 import simd
 
+private let metalTerminalMaxRowBuffers = 20_000
+
+/// Allocation-free sparse set used only by the core/render callback thread.
+/// The row list makes synchronization O(changed rows); the bitset prevents a
+/// repeatedly updated row from growing that list. Capacity is reserved during
+/// renderer construction, never in the redraw/flush hot path.
+private final class StaleMainRowSet {
+    private(set) var rows: [UInt32] = []
+    private var membership: [UInt64]
+    private let rowLimit: Int
+
+    init(rowLimit: Int) {
+        self.rowLimit = rowLimit
+        membership = Array(repeating: 0, count: (rowLimit + 63) / 64)
+        rows.reserveCapacity(rowLimit)
+    }
+
+    func insert(_ row: Int) {
+        guard row >= 0, row < rowLimit else { return }
+        let word = row >> 6
+        let mask = UInt64(1) << UInt64(row & 63)
+        guard membership[word] & mask == 0 else { return }
+        membership[word] |= mask
+        rows.append(UInt32(row))
+    }
+
+    func removeAll() {
+        for storedRow in rows {
+            let row = Int(storedRow)
+            let word = row >> 6
+            membership[word] &= ~(UInt64(1) << UInt64(row & 63))
+        }
+        rows.removeAll(keepingCapacity: true)
+    }
+}
+
 // MTLCommandBuffer rule: any command buffer created via queue.makeCommandBuffer()
 // MUST be committed before being dropped. Uncommitted command buffers leak
 // IOAccelerator GPU memory regions that the kernel never reclaims (observable
@@ -22,6 +58,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var sampler: MTLSamplerState?
     private var initializationError: String?
     private var pipelineNeedsBuilding = true
+    private var pipelineRetryDelaySeconds: TimeInterval = 0.1
+    private var pipelineRetryNotBefore: CFAbsoluteTime = 0
     private weak var viewForPipeline: MTKView?
 
     // 2-pass rendering pipelines for blur support
@@ -196,10 +234,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     private let bufferSets: [SurfaceBufferSet] = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
     private var writeSetIndex: Int = 0       // Core thread only
+    private var mainWritePrepared = false    // Core thread only
     // Valid only while isInFlush == true. Tracks the committed set we are detaching from.
     private var flushSourceSetIndex: Int = 0 // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
+    private var cursorWriteSetIndex: Int = 0 // Core thread only
+    private var cursorWritePrepared = false  // Core thread only
+    private var committedCursorSetIndex: Int = 0 // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
+    // Complete row metadata is retained independently in all three sets. A
+    // non-committed set only needs rows changed since it last committed; this
+    // avoids O(totalRows) metadata copying for a one-row flush. Structural
+    // operations and aborted partial writes use the full-copy barrier.
+    private let staleMainRowsBySet: [StaleMainRowSet] = [
+        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
+        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
+        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
+    ]
+    private let flushChangedMainRows = StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers)
+    private var mainRowStateNeedsFullSync = [false, false, false]
+    private var flushHasStructuralMainChange = false
+    // Set (core thread) when a vertex/row buffer allocation fails during
+    // this flush bracket — an empty/undersized buffer set must not become
+    // the new committed state. Consumed by ZonvieCore's on_flush_end (via
+    // consumeFlushFailed()), which cancels the bracket instead of
+    // committing it and calls zonvie_core_force_resend + schedules a retry.
+    private(set) var flushFailed: Bool = false // Core thread only
+
+    /// Read and clear flushFailed. Called once per flush from on_flush_end.
+    func consumeFlushFailed() -> Bool {
+        let v = flushFailed
+        flushFailed = false
+        return v
+    }
     // Per-flush row submit accumulators. Reset in beginFlush, summed in
     // submitVerticesRowRaw, dumped in commitFlush as [perf] row_submit. Surfaces
     // the Swift-side cost inside Zig-measured row_cb_us (memcpy + slot remap).
@@ -257,15 +324,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // frame visible as a 1-row jitter.
     private var lastDrawnHadActiveScrollOffset: Bool = false // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
+    private var cursorGpuInFlightCount: [Int] = [0, 0, 0] // Protected by lock
     private var defaultBgRGB: UInt32 = 0               // Protected by lock
 
-    /// Check whether any draw() is currently in-flight (GPU reading buffers).
-    /// Must be called from core thread during flush to get a real-time snapshot.
-    private func isAnyGpuInFlight() -> Bool {
+    /// Buffer at the given physical slot in whichever set is currently GPU
+    /// in-flight, or nil when none. With semaphore=1 at most one set is
+    /// in-flight at any instant (the completion handler decrements under
+    /// lock BEFORE signaling). Buffer objects only alias across sets at the
+    /// same physical slot index: shallow copies preserve array positions and
+    /// slot remaps permute the logical->slot mapping, not the buffers array.
+    /// Must be called from the core thread during flush (the in-flight set
+    /// is never the write set, so its rowState is stable while we read it).
+    private func inflightRowBuffer(atSlot slot: Int) -> MTLBuffer? {
         lock.lock()
-        let result = gpuInFlightCount[0] > 0 || gpuInFlightCount[1] > 0 || gpuInFlightCount[2] > 0
-        lock.unlock()
-        return result
+        defer { lock.unlock() }
+        for i in 0..<3 where gpuInFlightCount[i] > 0 {
+            let bufs = bufferSets[i].rowState.buffers
+            return slot < bufs.count ? bufs[slot] : nil
+        }
+        return nil
+    }
+
+    /// Main vertex buffer of the set currently GPU in-flight (see
+    /// inflightRowBuffer(atSlot:) for the invariants).
+    private func inflightMainBuffer() -> MTLBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        for i in 0..<3 where gpuInFlightCount[i] > 0 {
+            return bufferSets[i].mainVertexBuffer
+        }
+        return nil
     }
 
     // Drawable size from the most recent committed flush.
@@ -276,6 +364,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // drawableSize changes between flushes.
     private var committedDrawableW: UInt32 = 0 // Protected by lock
     private var committedDrawableH: UInt32 = 0 // Protected by lock
+    // Layout associated with the last committed MAIN state. Cursor-only
+    // commits also refresh committedDrawable*, so they cannot be used to
+    // decide whether sparse row metadata crossed a layout transition.
+    private var mainRowStateDrawableW: UInt32 = 0 // Core thread only
+    private var mainRowStateDrawableH: UInt32 = 0 // Core thread only
 
     private var committedAtlasTexture: MTLTexture?  // Protected by lock
     private var linespacePx: Int32 = 0
@@ -304,18 +397,29 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     /// Cell width in drawable pixel coordinates.
-    var cellWidthPx: Float { atlas.cellWidthPx }
+    var cellWidthPx: Float { atlas.fontMetricsSnapshot().width }
 
     /// Cell height in drawable pixel coordinates.
     // var cellHeightPx: Float { atlas.cellHeightPx }
-    var cellHeightPx: Float { atlas.cellHeightPx + Float(linespacePx) }
+    // atlas.fontMetricsSnapshot() reads all four font metrics together
+    // under the atlas's own lock (setFont()/setBackingScale() write them
+    // there from the core/RPC thread); linespacePx is a separate field
+    // written under `lock` by setLineSpace(), read under that same lock
+    // here. Combining the two snapshots still can't mix a fresh atlas
+    // height with a stale linespace value within either field.
+    var cellHeightPx: Float {
+        lock.lock()
+        let ls = linespacePx
+        lock.unlock()
+        return atlas.fontMetricsSnapshot().height + Float(ls)
+    }
 
 
     /// Font ascent in drawable pixel coordinates.
-    var ascentPx: Float { atlas.ascentPx }
+    var ascentPx: Float { atlas.fontMetricsSnapshot().ascent }
 
     /// Font descent in drawable pixel coordinates.
-    var descentPx: Float { atlas.descentPx }
+    var descentPx: Float { atlas.fontMetricsSnapshot().descent }
 
     /// Current font name.
     var currentFontName: String { atlas.currentFontName }
@@ -355,18 +459,43 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: corePtr, outBitmap: outBitmap)
     }
 
-    func uploadAtlasRegion(destX: UInt32, destY: UInt32, width: UInt32, height: UInt32, bitmap: UnsafePointer<zonvie_glyph_bitmap>) {
+    /// Classifies an upload that did not actually happen so the C callback can
+    /// abort every failure, but rebuild only for terminal atlas damage. See
+    /// GlyphAtlas.uploadRegion's doc comment for the cache-publication contract.
+    @discardableResult
+    func uploadAtlasRegion(destX: UInt32, destY: UInt32, width: UInt32, height: UInt32, bitmap: UnsafePointer<zonvie_glyph_bitmap>) -> GlyphAtlas.UploadResult {
         atlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
     }
 
-    func recreateAtlasTexture(width: UInt32, height: UInt32) {
-        atlas.recreateTexture(width: Int(width), height: Int(height))
+    @discardableResult
+    func recreateAtlasTexture(width: UInt32, height: UInt32) -> Bool {
+        let created = atlas.recreateTexture(width: Int(width), height: Int(height))
+        if !created && isInFlush {
+            // on_atlas_create has a void C ABI. Latch the failure in the
+            // frontend transaction as well as aborting from the callback so
+            // on_flush_end can never publish vertices whose UVs belong to the
+            // texture generation that failed to allocate.
+            flushFailed = true
+        }
+        return created
     }
 
     // (vertexBuffer/cursorVertexBuffer moved into BufferSet for triple buffering)
 
     /// Cursor blink state (true = visible, false = hidden during blink)
-    var cursorBlinkState: Bool = true
+    private var cursorBlinkStateStorage: Bool = true
+    var cursorBlinkState: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return cursorBlinkStateStorage
+        }
+        set {
+            lock.lock()
+            cursorBlinkStateStorage = newValue
+            lock.unlock()
+        }
+    }
     /// Last rendered blink state to detect changes
     private var lastRenderedBlinkState: Bool = true
 
@@ -375,9 +504,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // to avoid shared MTLBuffer GPU/CPU race during smooth scrolling.
     private var scrollOffsetData: [ScrollOffset] = []
     private var hasActiveScrollOffset: Bool = false  // true when smooth scrolling is active
-    // Screen rects (NDC) of fixed, non-following floats; scrolled content inside
-    // them is discarded by the fragment shader so it does not bleed over them.
-    private var fixedFloatRectData: [FixedFloatRect] = []
+    // Exact union of fixed, non-following float rects, represented as disjoint
+    // horizontal intervals inside disjoint vertical bands. The fragment shader
+    // binary-searches both levels instead of scanning every float per pixel.
+    private var fixedFloatBandData: [FixedFloatBand] = []
+    private var fixedFloatIntervalData: [FixedFloatInterval] = []
+    private var fixedFloatRectInputData: [FixedFloatRect] = []
+    private var fixedFloatMaskOverflowed = false
+    private var fixedFloatYEdgesScratch: [Float] = []
+    private var fixedFloatIntervalsScratch: [FixedFloatInterval] = []
+    // setFragmentBytes is limited to 4096 bytes. Sixteen arbitrary rectangles
+    // produce at most 31 bands and 496 intervals, fitting both buffers. When
+    // this limit is exceeded the caller disables smooth scrolling for the
+    // frame instead of silently omitting an occluder.
+    static let maxFixedFloatRects = 16
 
     // ScrollOffset struct matching Shaders.metal
     struct ScrollOffset {
@@ -388,30 +528,148 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var move_all: Int32 = 0     // 1 = translate every vertex of this grid (float bodily move)
     }
 
-    // FixedFloatRect struct matching Shaders.metal (NDC edges; top > bottom).
-    struct FixedFloatRect {
+    // FixedFloatRect struct matching Shaders.metal (drawable pixel edges).
+    struct FixedFloatRect: Equatable {
         var x0: Float
         var x1: Float
         var top: Float
         var bottom: Float
     }
 
+    // Matches Shaders.metal. Bands are sorted from top to bottom; intervals
+    // belonging to each band are sorted left to right and do not overlap.
+    struct FixedFloatBand {
+        var top: Float
+        var bottom: Float
+        var intervalStart: UInt32
+        var intervalCount: UInt32
+    }
+
+    struct FixedFloatInterval {
+        var x0: Float
+        var x1: Float
+    }
+
     /// Set the fixed (non-following) float rects used by the fragment shader to
     /// keep scrolled content from bleeding over them. Called from the main thread.
-    func updateFixedFloatRects(_ rects: [FixedFloatRect]) {
+    /// Builds the exact rectangle union once per scroll-state update. Returns
+    /// false when the exact union cannot be represented by setFragmentBytes;
+    /// callers must then disable the scroll transform rather than use a
+    /// semantically truncated mask. Persistent arrays retain capacity; COW
+    /// only detaches when a draw snapshot is still in flight.
+    @discardableResult
+    func updateFixedFloatRects(_ rects: [FixedFloatRect]) -> Bool {
         lock.lock()
-        fixedFloatRectData = rects
-        lock.unlock()
+        defer { lock.unlock() }
+
+        if rects.count > Self.maxFixedFloatRects {
+            if !fixedFloatMaskOverflowed {
+                fixedFloatRectInputData.removeAll(keepingCapacity: true)
+                fixedFloatBandData.removeAll(keepingCapacity: true)
+                fixedFloatIntervalData.removeAll(keepingCapacity: true)
+                fixedFloatYEdgesScratch.removeAll(keepingCapacity: true)
+                fixedFloatMaskOverflowed = true
+            }
+            return false
+        }
+        if !fixedFloatMaskOverflowed && rects == fixedFloatRectInputData {
+            return true
+        }
+        fixedFloatMaskOverflowed = false
+        fixedFloatRectInputData.removeAll(keepingCapacity: true)
+        fixedFloatRectInputData.append(contentsOf: rects)
+        fixedFloatBandData.removeAll(keepingCapacity: true)
+        fixedFloatIntervalData.removeAll(keepingCapacity: true)
+        fixedFloatYEdgesScratch.removeAll(keepingCapacity: true)
+
+        guard !rects.isEmpty else { return true }
+
+        for rect in rects where rect.x0 < rect.x1 && rect.top < rect.bottom {
+            fixedFloatYEdgesScratch.append(rect.top)
+            fixedFloatYEdgesScratch.append(rect.bottom)
+        }
+        guard fixedFloatYEdgesScratch.count >= 2 else { return true }
+
+        fixedFloatYEdgesScratch.sort(by: <)
+        var uniqueCount = 1
+        for i in 1..<fixedFloatYEdgesScratch.count {
+            if fixedFloatYEdgesScratch[i] != fixedFloatYEdgesScratch[uniqueCount - 1] {
+                fixedFloatYEdgesScratch[uniqueCount] = fixedFloatYEdgesScratch[i]
+                uniqueCount += 1
+            }
+        }
+        if uniqueCount < fixedFloatYEdgesScratch.count {
+            fixedFloatYEdgesScratch.removeLast(fixedFloatYEdgesScratch.count - uniqueCount)
+        }
+
+        for edgeIndex in 0..<(fixedFloatYEdgesScratch.count - 1) {
+            let top = fixedFloatYEdgesScratch[edgeIndex]
+            let bottom = fixedFloatYEdgesScratch[edgeIndex + 1]
+            let sampleY = (top + bottom) * 0.5
+
+            fixedFloatIntervalsScratch.removeAll(keepingCapacity: true)
+            for rect in rects
+                where rect.x0 < rect.x1 && sampleY > rect.top && sampleY < rect.bottom
+            {
+                fixedFloatIntervalsScratch.append(FixedFloatInterval(x0: rect.x0, x1: rect.x1))
+            }
+            guard !fixedFloatIntervalsScratch.isEmpty else { continue }
+            fixedFloatIntervalsScratch.sort { lhs, rhs in
+                lhs.x0 == rhs.x0 ? lhs.x1 < rhs.x1 : lhs.x0 < rhs.x0
+            }
+
+            let start = fixedFloatIntervalData.count
+            var merged = fixedFloatIntervalsScratch[0]
+            for interval in fixedFloatIntervalsScratch.dropFirst() {
+                if interval.x0 <= merged.x1 {
+                    merged.x1 = max(merged.x1, interval.x1)
+                } else {
+                    fixedFloatIntervalData.append(merged)
+                    merged = interval
+                }
+            }
+            fixedFloatIntervalData.append(merged)
+            fixedFloatBandData.append(FixedFloatBand(
+                top: top,
+                bottom: bottom,
+                intervalStart: UInt32(start),
+                intervalCount: UInt32(fixedFloatIntervalData.count - start)
+            ))
+        }
+        return true
     }
 
     // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
 
-    /// Maximum row buffer count to prevent unbounded memory growth (1000 rows = ~40KB overhead)
-    private let maxRowBuffers: Int = 1000
+    /// Maximum row buffer count to bound worst-case memory growth. Row
+    /// storage (ensureSurfaceRowStorage) grows lazily per-row with no other
+    /// size constraint — neither the C ABI nor Neovim's redraw protocol
+    /// impose a row limit, so a grid taller than this cap would silently
+    /// drop on_vertices_row updates for every row beyond it, forever (a
+    /// tall terminal on a large/multi-monitor setup with a small font is a
+    /// realistic way to exceed a few hundred rows). 20000 rows is ~800KB of
+    /// bookkeeping overhead — a generous safety net against a corrupt/
+    /// hostile row index, not a practical content limit.
+    private let maxRowBuffers: Int = metalTerminalMaxRowBuffers
 
     // --- Dirty region tracking (drawable pixel coordinates) ---
     private var pendingDirtyRectPx: NSRect? = nil
     private var pendingDirtyRows: IndexSet = IndexSet()
+    // Render-thread scratch. Ownership is swapped into draw() for the frame
+    // and returned by defer, so appending/scroll expansion reuses capacity
+    // without a live property alias that would trigger Array COW detaches.
+    private var dirtyRowsScratch: [Int] = []
+    // Dirty marks staged during the current flush bracket (guarded by `lock`;
+    // written only on the core thread while isInFlush). A draw() interleaving
+    // with a flush consumes pendingDirtyRows BEFORE commitFlush publishes the
+    // matching vertices: it redraws those rows from the OLD committed set and
+    // the marks are lost, so the new content is never drawn (the row-mode
+    // skip in draw() cannot tell a "stolen" commit from an empty one).
+    // commitFlush re-publishes these staged marks so the next draw() redraws
+    // the rows from the newly committed set. When no draw() interleaved, the
+    // re-publish is an idempotent union (no behavior change).
+    private var flushDirtyRows: IndexSet = IndexSet()
+    private var flushDirtyRectPx: NSRect? = nil
     private var hasPresentedOnce: Bool = false
 
     /// Previous on-glass presentation time (MTLDrawable.presentedTime, seconds).
@@ -452,6 +710,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // Loaded once from config paths during bloom-pipeline construction.
     // Empty array when `[shaders].enabled = false` or no paths are listed.
     private(set) var customShaderPipelines: [CustomShaderPipeline] = []
+    /// Opaque variant of the custom shader chain for DECORATED surfaces
+    /// (ext-cmdline / popupmenu / messages). These surfaces have alpha=0 (or
+    /// low-alpha) regions in their backTex — the padding, and empty parts of
+    /// the input line — where `preserve_alpha` would make the shader inherit
+    /// alpha 0 and vanish (the exact hazard f0c81c07b95 documented). They
+    /// always compile with preserve_alpha OFF so the shader fills the whole
+    /// surface opaquely (like the pre-preserve_alpha behavior), while the main
+    /// window keeps `config.preserveAlpha` for its window transparency. When
+    /// `config.preserveAlpha` is false the two sets are identical, so this
+    /// just aliases `customShaderPipelines` (no double compile).
+    private(set) var customShaderPipelinesDecorated: [CustomShaderPipeline] = []
     /// Where the custom shader chain inserts relative to bloom. Mirrored from
     /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
     /// path does not need to re-read config each frame.
@@ -461,7 +730,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// draw loop active instead of falling back to flush-driven rendering.
     private(set) var anyCustomShaderNeedsAnimation: Bool = false
 
-    // Shadertoy-style uniforms block (64 bytes, std140). Populated per
+    // Shadertoy-style uniforms block (160 bytes, std140). Populated per
     // draw into a local `zonvie_shader_uniforms` value and handed to the
     // pipeline via `setFragmentBytes(_:length:index:)`, so each MTKView
     // (main window, external grids, cmdline, popupmenu) gets its own
@@ -482,6 +751,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// External views own their own ShaderViewTimingState instance and
     /// pass it to makeCustomShaderUniforms.
     public let mainShaderTiming = ShaderViewTimingState()
+    // Shadertoy iDate cache: Calendar(identifier:) construction plus
+    // dateComponents() ran every frame (up to 60Hz while an animated custom
+    // shader is active) purely to fill a uniform that effects use at
+    // wall-clock, not frame, granularity. Reuse the Calendar and recompute
+    // the components at most once per second.
+    private let shaderDateCalendar = Calendar(identifier: .gregorian)
+    private var shaderDateCacheSecond: Int = -1
+    private var shaderDateCache: (year: Float, month: Float, day: Float, secsInDay: Float) = (0, 0, 0, 0)
     /// Ping-pong render targets for multi-pass shader chains. Allocated
     /// only when pipelines.count > 1. Size matches backBufferSize.
     private var customShaderPong: [MTLTexture?] = [nil, nil]
@@ -512,10 +789,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         desc.storageMode = .private
 
         backBuffer = device.makeTexture(descriptor: desc)
+        // backBufferSize is read from updateCursorShaderStateFromVerts() on
+        // the core/RPC thread (to convert cursor NDC coords to pixels) —
+        // guard the write with `lock` so that read never sees a stale size
+        // paired with a shader-cursor rect computed against a texture that
+        // no longer matches it.
+        lock.lock()
         backBufferSize = drawableSize
-
         // After resize, we must clear once (contents undefined).
         hasPresentedOnce = false
+        lock.unlock()
 
         // DEBUG: Track backBuffer resize and hasPresentedOnce reset
         ZonvieCore.appLog("[DEBUG-RESIZE] ensureBackBuffer: oldSize=\(oldSize) newSize=\(drawableSize) wasPresented=\(wasPresented) -> hasPresentedOnce=false")
@@ -603,7 +886,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // recreate when core.start() later calls setAtlasSize() during nvim
         // bring-up. Clamp lower bound to 1024 to match Config validation.
         let configuredAtlasSize = max(1024, ZonvieConfig.shared.performance.atlasSize)
-        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize), atlasSize: configuredAtlasSize)
+        guard let builtAtlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize), atlasSize: configuredAtlasSize) else {
+            ZonvieCore.appLog("[Renderer] init failed: GlyphAtlas init failed")
+            return nil
+        }
+        self.atlas = builtAtlas
         self.blurEnabled = ZonvieConfig.shared.blurEnabled
 
         super.init()
@@ -810,12 +1097,50 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Ensure pipeline is ready for use by external grid views.
     /// Called before creating ExternalGridView to guarantee shared pipeline availability.
     /// This builds the pipeline synchronously if not already done.
-    func ensurePipelineReady(view: MTKView) {
-        if pipelineNeedsBuilding {
-            pipelineNeedsBuilding = false
-            buildPipeline(view: view)
-            ZonvieCore.appLog("[Renderer] Pipeline built on demand for external grid")
+    @discardableResult
+    func ensurePipelineReady(view: MTKView) -> Bool {
+        if pipeline != nil && sampler != nil {
+            pipelineRetryDelaySeconds = 0.1
+            pipelineRetryNotBefore = 0
+            return true
         }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        guard pipelineNeedsBuilding, now >= pipelineRetryNotBefore else { return false }
+
+        pipelineNeedsBuilding = false
+        if sampler == nil { buildSampler() }
+        buildPipeline(view: view)
+        if pipeline != nil && sampler != nil {
+            initializationError = nil
+            pipelineRetryDelaySeconds = 0.1
+            pipelineRetryNotBefore = 0
+            ZonvieCore.appLog("[Renderer] Pipeline built on demand")
+            return true
+        }
+
+        // Shader compiler/XPC failures can be transient. Keep the renderer
+        // retryable, but cap attempts so a permanent failure cannot spin the
+        // draw loop or external-window lifecycle at 10 Hz.
+        let retryDelay = pipelineRetryDelaySeconds
+        pipelineNeedsBuilding = true
+        pipelineRetryNotBefore = now + retryDelay
+        pipelineRetryDelaySeconds = min(pipelineRetryDelaySeconds * 2, 5.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self, weak view] in
+            guard let self, let view,
+                  self.pipeline == nil,
+                  CFAbsoluteTimeGetCurrent() >= self.pipelineRetryNotBefore else { return }
+            if let terminalView = view as? MetalTerminalView {
+                terminalView.requestRedraw()
+            } else {
+                view.setNeedsDisplay(view.bounds)
+            }
+        }
+        return false
+    }
+
+    func pipelineRetryDelay() -> TimeInterval {
+        max(0.1, pipelineRetryNotBefore - CFAbsoluteTimeGetCurrent())
     }
 
     // MARK: - Triple Buffer Flush Bracket
@@ -831,6 +1156,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         isInFlush = true
+        mainWritePrepared = false
+        cursorWritePrepared = false
+        flushChangedMainRows.removeAll()
+        flushHasStructuralMainChange = false
         let perfEnabled = ZonvieCore.appLogEnabled
         if perfEnabled {
             perfRowSubmitNs = 0
@@ -840,37 +1169,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
         var atlasPrepareUs: Double = 0
         var atlasCommitUs: Double = 0
-        var atlasWaitUs: Double = 0
         var atlasDidBlit = false
         var atlasDidCpuSync = false
         var atlasNeedsCoreInvalidation = false
         var atlasSyncedWasRecreate = false
 
-        // Under lock: read committed index + gpuInFlight to pick a safe write set
-        let srcIdx: Int
+        // Snapshot the row source, but defer all O(rows) COW preparation until
+        // the first main/row/scroll mutation. Cursor-only and no-op flushes do
+        // not touch the large row metadata arrays.
         lock.lock()
-        srcIdx = committedSetIndex
-        let picked = pickFreeBufferSetIndex(
-            count: 3,
-            committedIndex: srcIdx,
-            gpuInFlightCount: gpuInFlightCount
-        )
-        if picked == -1 {
-            // All non-committed sets are GPU in-flight (should be unreachable
-            // with semaphore=1 + sem.wait() before gpuInFlightCount++).
-            // Drop this flush entirely to avoid GPU/CPU race on shared buffers.
-            let inf = gpuInFlightCount
-            lock.unlock()
-            isInFlush = false
-            ZonvieCore.appLog("[WARNING] beginFlush: no free buffer set, dropping flush committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
-            return .dropped
-        }
-        writeSetIndex = picked
-        flushSourceSetIndex = srcIdx
-        if ZonvieCore.appLogEnabled {
-            let inf = gpuInFlightCount
-            ZonvieCore.appLog("[scroll_debug] beginFlush committed=\(srcIdx) write=\(picked) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
-        }
+        flushDirtyRows.removeAll()
+        flushDirtyRectPx = nil
+        flushSourceSetIndex = committedSetIndex
         lock.unlock()
 
         // Prepare atlas back texture.
@@ -894,28 +1204,78 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return .dropped
         }
         if prepResult.needsGpuBlit {
-            // GPU blit required — create command buffer now
+            // GPU blit required — commit it without waiting on the main
+            // renderer's own in-flight work. Waiting here blocked the core
+            // thread (grid_mu held) on a full-texture GPU round-trip,
+            // per-flush under atlas-full churn (no eviction). A later
+            // back-texture consumer polls the command and aborts/retries
+            // if it is still in flight. No redraw callback may wait for it while
+            // core grid_mu is held.
+            //
+            // beginAtlasWrite()/endAtlasWrite() is a SEPARATE, much cheaper
+            // check than the inflightSemaphore wait above: it closes the
+            // reader-admission gate against a different queue
+            // (ExternalGridView's) still reading (or about to start
+            // reading) the texture this blit is about to overwrite, and
+            // returns immediately in the overwhelmingly common case where
+            // no external window read is outstanding. Held across
+            // cmd.commit() (matching every exit path below) so no new
+            // external read is admitted between the drain wait and the
+            // blit's submission.
+            guard atlas.beginAtlasWrite() else {
+                // Fail-closed (see beginAtlasWrite's doc comment): drop
+                // this flush's atlas blit rather than mutate a texture an
+                // external read hasn't finished with. atlas_reset/back-sync
+                // state is untouched, so the next flush attempt retries it.
+                atlas.endAtlasWrite()
+                isInFlush = false
+                ZonvieCore.appLog("[WARNING] beginFlush: atlas write blocked by in-flight external reads, dropping flush")
+                return .dropped
+            }
             if let cmd = queue.makeCommandBuffer() {
                 let blitEncoded = atlas.encodeBackTextureBlit(commandBuffer: cmd)
+                guard blitEncoded else {
+                    // cmd was already created (driver-side resources reserved
+                    // at creation, per the IOAccelerator leak note in
+                    // CLAUDE.md); nothing was encoded into it, but it must
+                    // still be committed — an uncommitted MTLCommandBuffer
+                    // left to ARC deallocation does not reliably release
+                    // those resources, and this path can repeat on every
+                    // flush attempt while the driver stays under pressure.
+                    cmd.commit()
+                    atlas.endAtlasWrite()
+                    isInFlush = false
+                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit encode failed, dropping flush")
+                    return .dropped
+                }
+                // Signal on this SAME command buffer, before commit, so the
+                // event only reaches this generation once the GPU has
+                // actually finished the blit — endAtlasWrite() below reopens
+                // the CPU-side admission gate immediately (no waiting), but
+                // readers' beginAtlasExternalRead() wait-encode still orders
+                // their GPU work strictly after this blit via the event, independent of
+                // when endAtlasWrite() runs.
+                let blitGen = atlas.encodeBlitCompletionSignal(into: cmd)
+                // If the GPU stops executing this buffer before reaching the
+                // signal command above (device loss, driver error), the event
+                // never reaches blitGen and any reader already waiting on it
+                // would hang forever — see recoverFailedBlit's doc comment.
+                let atlasForBlitCompletion = atlas
+                cmd.addCompletedHandler { completedCmd in
+                    if completedCmd.status != .completed {
+                        atlasForBlitCompletion.recoverFailedBlit(generation: blitGen)
+                    }
+                }
                 let tAtlasCommitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 cmd.commit()
+                atlas.endAtlasWrite()
                 if perfEnabled {
                     atlasCommitUs = (CFAbsoluteTimeGetCurrent() - tAtlasCommitStart) * 1_000_000
                 }
-                let tAtlasWaitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-                cmd.waitUntilCompleted()
-                if perfEnabled {
-                    atlasWaitUs = (CFAbsoluteTimeGetCurrent() - tAtlasWaitStart) * 1_000_000
-                }
-                if cmd.status == .completed && blitEncoded {
-                    atlasDidBlit = true
-                    atlas.markBackSynced()
-                } else {
-                    isInFlush = false
-                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit command buffer failed (status=\(cmd.status.rawValue) encoded=\(blitEncoded)), dropping flush")
-                    return .dropped
-                }
+                atlas.setPendingBackBlit(cmd)
+                atlasDidBlit = true
             } else {
+                atlas.endAtlasWrite()
                 atlas.cancelPendingBackTextureBlit()
                 isInFlush = false
                 ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
@@ -923,71 +1283,105 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        let src = bufferSets[srcIdx]
-        let dst = bufferSets[picked]
-
-        let sharedRowRefs = perfEnabled ? src.rowState.counts.reduce(into: 0) { partial, count in
-            if count > 0 { partial += 1 }
-        } : 0
-        let tRowCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-
-        // Start from the committed set by sharing immutable buffer references.
-        // Updated rows/buffers will be detached lazily on first write.
-        let srcRowCount = src.rowState.buffers.count
-        copySurfaceBufferSetRowState(from: src, to: dst)
-        let tRowCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-
-        // Save dst's main buffer into the detach pool before shallow-copying src.
-        dst.detachPoolMainBuffer = dst.mainVertexBuffer
-        dst.detachPoolMainCap = dst.mainVertexBufferCap
-
-        let sharedMainBytes = src.mainVertexCount * MemoryLayout<Vertex>.stride
-        let tMainCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        dst.mainVertexBuffer = src.mainVertexBuffer
-        dst.mainVertexBufferCap = src.mainVertexBufferCap
-        dst.mainVertexCount = src.mainVertexCount
-        let tMainCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-
-        // Cursor buffer: do NOT COW-share with committed set.
-        // Cursor data is small (typically <1KB) and fully overwritten every flush.
-        // Sharing causes pool-alias failures that leak MTLBuffers (~32KB/flush).
-        // Instead, copy cursor data into dst's OWN buffer (reuse existing or allocate once).
-        let sharedCursorBytes = src.cursorVertexCount * MemoryLayout<Vertex>.stride
-        let tCursorCopyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        if src.cursorVertexCount > 0, let srcBuf = src.cursorVertexBuffer {
-            // Ensure dst has its own buffer with enough capacity
-            if dst.cursorVertexBuffer == nil || dst.cursorVertexBufferCap < sharedCursorBytes {
-                let newCap = max(sharedCursorBytes, 48 * MemoryLayout<Vertex>.stride)
-                dst.cursorVertexBuffer = device.makeBuffer(length: newCap, options: .storageModeShared)
-                dst.cursorVertexBufferCap = dst.cursorVertexBuffer != nil ? newCap : 0
-            }
-            if let dstBuf = dst.cursorVertexBuffer {
-                memcpy(dstBuf.contents(), srcBuf.contents(), sharedCursorBytes)
-            }
-        }
-        dst.cursorVertexCount = src.cursorVertexCount
-        let tCursorCopyEnd = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-
-        dst.pendingScroll = nil
-
         if perfEnabled {
-            let rowCopyUs = (tRowCopyEnd - tRowCopyStart) * 1_000_000
-            let mainCopyUs = (tMainCopyEnd - tMainCopyStart) * 1_000_000
-            let cursorCopyUs = (tCursorCopyEnd - tCursorCopyStart) * 1_000_000
             let totalUs = (CFAbsoluteTimeGetCurrent() - tBeginFlushStart) * 1_000_000
-            let rowCopyUsStr = String(format: "%.1f", rowCopyUs)
-            let mainCopyUsStr = String(format: "%.1f", mainCopyUs)
-            let cursorCopyUsStr = String(format: "%.1f", cursorCopyUs)
             let totalUsStr = String(format: "%.1f", totalUs)
             let atlasPrepareUsStr = String(format: "%.1f", atlasPrepareUs)
             let atlasCommitUsStr = String(format: "%.1f", atlasCommitUs)
-            let atlasWaitUsStr = String(format: "%.1f", atlasWaitUs)
             ZonvieCore.appLog(
-                "[perf] begin_flush_prepare src=\(srcIdx) dst=\(picked) atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) atlasWaitUs=\(atlasWaitUsStr) rowBuffers=\(srcRowCount) sharedRowRefs=\(sharedRowRefs) sharedRowBytes=\(src.rowState.counts.reduce(0, +) * MemoryLayout<Vertex>.stride) rowPrepUs=\(rowCopyUsStr) sharedMainBytes=\(sharedMainBytes) mainPrepUs=\(mainCopyUsStr) sharedCursorBytes=\(sharedCursorBytes) cursorPrepUs=\(cursorCopyUsStr) totalUs=\(totalUsStr)"
+                "[perf] begin_flush_prepare lazyRows=true atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) totalUs=\(totalUsStr)"
             )
         }
 
         return needsCoreInvalidation ? .proceedWithInvalidation : .proceed
+    }
+
+    /// Lazily prepare the large row/main state on the first mutation in a
+    /// flush. Cursor-only, atlas-only, and no-op flushes never call this.
+    @discardableResult
+    private func prepareMainWriteState() -> Bool {
+        if mainWritePrepared { return true }
+        guard isInFlush else { return false }
+
+        lock.lock()
+        let picked = pickFreeBufferSetIndex(
+            count: 3,
+            committedIndex: flushSourceSetIndex,
+            gpuInFlightCount: gpuInFlightCount
+        )
+        if picked == -1 {
+            let inf = gpuInFlightCount
+            lock.unlock()
+            flushFailed = true
+            ZonvieCore.appLog("[WARNING] prepareMainWriteState: no free row set committed=\(flushSourceSetIndex) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+            return false
+        }
+        writeSetIndex = picked
+        lock.unlock()
+
+        let started = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let src = bufferSets[flushSourceSetIndex]
+        let dst = bufferSets[picked]
+        let staleRows = staleMainRowsBySet[picked].rows
+        var syncMode = "sparse"
+        var syncedRows = staleRows.count
+        if mainRowStateNeedsFullSync[picked] {
+            copySurfaceBufferSetRowState(from: src, to: dst)
+            syncMode = "full_barrier"
+            syncedRows = src.rowState.buffers.count
+        } else if !copySurfaceBufferSetRows(
+            from: src,
+            to: dst,
+            logicalRows: staleRows,
+            maxRowBuffers: maxRowBuffers
+        ) {
+            // A missed structural transition must never be approximated by
+            // row patches: mappings are frame state, not per-row content.
+            copySurfaceBufferSetRowState(from: src, to: dst)
+            syncMode = "full_mapping_fallback"
+            syncedRows = src.rowState.buffers.count
+        }
+
+        dst.detachPoolMainBuffer = dst.mainVertexBuffer
+        dst.detachPoolMainCap = dst.mainVertexBufferCap
+        dst.mainVertexBuffer = src.mainVertexBuffer
+        dst.mainVertexBufferCap = src.mainVertexBufferCap
+        dst.mainVertexCount = src.mainVertexCount
+        dst.pendingScroll = nil
+        mainWritePrepared = true
+
+        if ZonvieCore.appLogEnabled {
+            let elapsedUs = (CFAbsoluteTimeGetCurrent() - started) * 1_000_000
+            ZonvieCore.appLog("[perf] lazy_main_prepare src=\(flushSourceSetIndex) dst=\(picked) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(String(format: "%.1f", elapsedUs))")
+        }
+        return true
+    }
+
+    /// Reserve a small cursor slot independently from the row triple. Cursor
+    /// callbacks fully replace cursor content, so no committed-state copy is
+    /// needed before writing the chosen non-in-flight slot.
+    @discardableResult
+    private func prepareCursorWriteState() -> Bool {
+        if cursorWritePrepared { return true }
+        guard isInFlush else { return false }
+
+        lock.lock()
+        let picked = pickFreeBufferSetIndex(
+            count: 3,
+            committedIndex: committedCursorSetIndex,
+            gpuInFlightCount: cursorGpuInFlightCount
+        )
+        if picked == -1 {
+            let inf = cursorGpuInFlightCount
+            lock.unlock()
+            flushFailed = true
+            ZonvieCore.appLog("[WARNING] prepareCursorWriteState: no free cursor set committed=\(committedCursorSetIndex) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+            return false
+        }
+        cursorWriteSetIndex = picked
+        lock.unlock()
+        cursorWritePrepared = true
+        return true
     }
 
     /// Called after beginFlush() returned .proceed/.proceedWithInvalidation but
@@ -995,6 +1389,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Clears isInFlush so commitFlush becomes a no-op, preventing stale vertices
     /// from being published under the new layout dimensions.
     func abortFlush() {
+        _ = atlas.endFlushUploadTransaction()
+        if mainWritePrepared {
+            // The scratch set may contain any prefix of this flush. It cannot
+            // participate in sparse carry-forward until fully overwritten.
+            mainRowStateNeedsFullSync[writeSetIndex] = true
+            staleMainRowsBySet[writeSetIndex].removeAll()
+        }
+        flushChangedMainRows.removeAll()
+        flushHasStructuralMainChange = false
+        mainWritePrepared = false
+        cursorWritePrepared = false
         isInFlush = false
     }
 
@@ -1003,24 +1408,77 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// drawableW/drawableH are the core's layout at flush time, read via
     /// zonvie_core_get_layout while grid_mu is still held — this guarantees
     /// the values match the NDC coordinates in the committed vertices.
-    func commitFlush(drawableW: UInt32, drawableH: UInt32) {
-        guard isInFlush else { return }  // Flush was dropped or aborted
+    @discardableResult
+    func commitFlush(drawableW: UInt32, drawableH: UInt32) -> Bool {
+        guard isInFlush else { return false }  // Flush was dropped or aborted
 
-        // Atomically commit atlas (swap if modified) and snapshot front texture
-        let newAtlasTex = atlas.commitAndSnapshotFrontTexture()
+        // Commit staged CPU pixels while holding reader admission only across
+        // the actual texture replace. If readers or a prior blit are active,
+        // preserve staging and retry the frame without publishing its UVs.
+        guard atlas.endFlushUploadTransaction() else {
+            if mainWritePrepared {
+                mainRowStateNeedsFullSync[writeSetIndex] = true
+                staleMainRowsBySet[writeSetIndex].removeAll()
+            }
+            flushChangedMainRows.removeAll()
+            flushHasStructuralMainChange = false
+            mainWritePrepared = false
+            cursorWritePrepared = false
+            isInFlush = false
+            ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas upload writer unavailable")
+            return false
+        }
 
+        // Atomically commit atlas (swap if modified) and snapshot front texture.
+        // An in-flight back-sync is polled, never waited on under grid_mu.
+        let atlasCommit = atlas.commitAndSnapshotFrontTexture()
+        guard atlasCommit.committed else {
+            if mainWritePrepared {
+                mainRowStateNeedsFullSync[writeSetIndex] = true
+                staleMainRowsBySet[writeSetIndex].removeAll()
+            }
+            flushChangedMainRows.removeAll()
+            flushHasStructuralMainChange = false
+            mainWritePrepared = false
+            cursorWritePrepared = false
+            isInFlush = false
+            ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas back-sync still pending or failed")
+            return false
+        }
+
+        let didMainWrite = mainWritePrepared
+        let didCursorWrite = cursorWritePrepared
         let ws = writeSetIndex
+        let mainColumnsContracted = didMainWrite
+            && bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[ws].knownTotalCols
         lock.lock()
-        committedSetIndex = writeSetIndex
+        let mainLayoutChanged = didMainWrite
+            && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
+        if didMainWrite {
+            committedSetIndex = writeSetIndex
+        }
+        if didCursorWrite {
+            committedCursorSetIndex = cursorWriteSetIndex
+        }
         committedDrawableW = drawableW
         committedDrawableH = drawableH
-        committedAtlasTexture = newAtlasTex  // same lock as vertex state
+        committedAtlasTexture = atlasCommit.texture  // same lock as vertex state
         commitRevision &+= 1
         let rev = commitRevision
+        if mainColumnsContracted {
+            for i in bufferSets.indices
+            where i != ws && gpuInFlightCount[i] == 0 {
+                retireSurfaceRowStorageForContractedLayout(
+                    bufferSet: bufferSets[i],
+                    demandSet: bufferSets[ws],
+                    includeActiveBuffers: true
+                )
+            }
+        }
         // Accumulate the write set's pendingScroll into the global accumulator.
         // Done here (under lock, after committedSetIndex update) so draw() never
         // sees a scroll delta that precedes the matching vertex data.
-        if let ps = bufferSets[ws].pendingScroll {
+        if didMainWrite, let ps = bufferSets[ws].pendingScroll {
             if let existing = pendingScrollAccum,
                existing.rowStart == ps.rowStart,
                existing.rowEnd == ps.rowEnd {
@@ -1029,14 +1487,48 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     rowEnd: ps.rowEnd,
                     colStart: ps.colStart,
                     colEnd: ps.colEnd,
-                    rowsDelta: existing.rowsDelta + ps.rowsDelta,
+                    // Wrapping add: both operands originate from the core's
+                    // i32 scroll delta, so this can't realistically overflow
+                    // Swift's 64-bit Int, but &+ (matching the core's own
+                    // +%= idiom for the same class of accumulator) avoids a
+                    // hard trap/crash if a corrupted value ever did. Clamp
+                    // the result so a wrapped value can never itself reach
+                    // Int.min/max — downstream code calls abs() on this
+                    // field (e.g. for GPU scroll-copy shift amounts), which
+                    // traps on Int.min. The clamp bound is astronomically
+                    // larger than any real row count, so it never affects
+                    // legitimate scrolling, and a value already within it
+                    // plus another clamped value can never itself overflow.
+                    rowsDelta: clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta),
                     totalRows: ps.totalRows,
                     totalCols: ps.totalCols
                 )
             } else {
+                // Region mismatch: the old accumulator's GPU back-buffer blit
+                // will never be applied, but its row slots were already
+                // remapped at scroll-apply time — the committed vertices are
+                // post-scroll. Dirty the dropped region's rows so draw()
+                // redraws them from those vertices instead of leaving
+                // pre-scroll pixels on the non-vacated rows (two stacked
+                // windows scrolling in consecutive flushes between draws).
+                if let existing = pendingScrollAccum,
+                   existing.rowEnd > existing.rowStart {
+                    pendingDirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
+                }
                 pendingScrollAccum = ps
             }
         }
+        // Re-publish dirty marks staged during this flush. A draw() that
+        // interleaved with the flush consumed pendingDirtyRows and redrew
+        // those rows from the PREVIOUS committed set; without this the rows
+        // committed here would never be drawn (and lastCommitTime below
+        // would not be updated). Idempotent when no draw() interleaved.
+        pendingDirtyRows.formUnion(flushDirtyRows)
+        if let staged = flushDirtyRectPx {
+            pendingDirtyRectPx = pendingDirtyRectPx?.union(staged) ?? staged
+        }
+        flushDirtyRows.removeAll()
+        flushDirtyRectPx = nil
         // Only update lastCommitTime when there are pending visual changes
         // (dirty rows, dirty rect, or scroll delta). Empty flushes should not
         // prevent the draw loop from deactivating.
@@ -1044,9 +1536,37 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lastCommitTime = mach_absolute_time()
         }
         lock.unlock()
+
+        if didMainWrite {
+            // Only a successful publication advances other sets' sparse
+            // history. Aborted scratch mutations are handled by abortFlush's
+            // full-sync barrier instead.
+            staleMainRowsBySet[ws].removeAll()
+            mainRowStateNeedsFullSync[ws] = false
+            if flushHasStructuralMainChange || mainLayoutChanged {
+                for i in bufferSets.indices where i != ws {
+                    staleMainRowsBySet[i].removeAll()
+                    mainRowStateNeedsFullSync[i] = true
+                }
+            } else {
+                for storedRow in flushChangedMainRows.rows {
+                    let row = Int(storedRow)
+                    for i in bufferSets.indices
+                    where i != ws && !mainRowStateNeedsFullSync[i] {
+                        staleMainRowsBySet[i].insert(row)
+                    }
+                }
+            }
+            mainRowStateDrawableW = drawableW
+            mainRowStateDrawableH = drawableH
+        }
+        flushChangedMainRows.removeAll()
+        flushHasStructuralMainChange = false
+        mainWritePrepared = false
+        cursorWritePrepared = false
         isInFlush = false
-        let bs = bufferSets[ws]
-        if ZonvieCore.appLogEnabled {
+        if ZonvieCore.appLogEnabled, didMainWrite {
+            let bs = bufferSets[ws]
             let rowCount = bs.rowState.buffers.count
             var totalVerts = 0
             for i in 0..<rowCount {
@@ -1056,6 +1576,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
             ZonvieCore.appLog("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
+        return true
     }
 
     /// Returns true if a flush was committed within the given time window.
@@ -1087,6 +1608,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return tex
     }
 
+    /// Forwards to GlyphAtlas.beginExternalRead(commandBuffer:snapshot:) —
+    /// see that method's doc comment. Called by an ExternalGridView right
+    /// after creating its command buffer and BEFORE creating any render
+    /// encoder that samples the atlas, passing a closure that returns the
+    /// texture reference (e.g. `{ committed.atlasTextureSnapshot }`). This
+    /// single call performs reader admission, the texture snapshot, and the
+    /// GPU-side wait-for-latest-blit encode as one atomic step under the
+    /// atlas's gate lock — splitting these into separate calls would leave a
+    /// gap where a writer's blit (and generation bump) lands between them.
+    func beginAtlasExternalRead<T>(commandBuffer cmd: MTLCommandBuffer, snapshot: () -> T?) -> T? {
+        atlas.beginExternalRead(commandBuffer: cmd, snapshot: snapshot)
+    }
+
+    /// Forwards to GlyphAtlas.endExternalRead(). Called from the
+    /// completion handler of the command buffer whose render pass was
+    /// covered by the matching beginAtlasExternalRead().
+    func endAtlasExternalRead() {
+        atlas.endExternalRead()
+    }
+
     /// Update the default Neovim background color (for clear color in viewport edges).
     /// Called from core thread during flush.
     func updateDefaultBgColor(_ rgb: UInt32) {
@@ -1103,15 +1644,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[WARNING] submitVerticesRaw called outside flush bracket")
             return
         }
+        guard prepareMainWriteState(), prepareCursorWriteState() else { return }
+        flushHasStructuralMainChange = true
         // Write to write set (called during flush, no lock needed for vertex data)
         let s = writeSetIndex
+        let cursorSet = cursorWriteSetIndex
 
         bufferSets[s].rowState.usingRowBuffers = false
 
-        // Clear dirty tracking under lock
+        // Clear dirty tracking under lock (staged marks too — a full submit
+        // supersedes any row/rect marks made earlier in this flush, and
+        // commitFlush must not resurrect them as a scissor).
         lock.lock()
         pendingDirtyRows.removeAll()
         pendingDirtyRectPx = nil
+        flushDirtyRows.removeAll()
+        flushDirtyRectPx = nil
         lock.unlock()
 
         // main (always updated)
@@ -1129,16 +1677,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // cursor (always updated)
         if cursorCount > 0, let cursorPtr {
-            ensureCursorBufferInSet(s, vertexCount: cursorCount)
-            if let cvb = bufferSets[s].cursorVertexBuffer {
+            ensureCursorBufferInSet(cursorSet, vertexCount: cursorCount)
+            if let cvb = bufferSets[cursorSet].cursorVertexBuffer {
                 memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                bufferSets[s].cursorVertexCount = cursorCount
+                bufferSets[cursorSet].cursorVertexCount = cursorCount
             } else {
-                bufferSets[s].cursorVertexCount = 0
+                bufferSets[cursorSet].cursorVertexCount = 0
             }
             updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
         } else {
-            bufferSets[s].cursorVertexCount = 0
+            bufferSets[cursorSet].cursorVertexCount = 0
         }
     }
 
@@ -1152,8 +1700,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[WARNING] submitVerticesPartialRaw called outside flush bracket")
             return
         }
+        if updateMain, !prepareMainWriteState() { return }
+        if updateCursor, !prepareCursorWriteState() { return }
+        if updateMain {
+            flushHasStructuralMainChange = true
+        }
         // Write to write set (called during flush, no lock needed for vertex data)
         let s = writeSetIndex
+        let cursorSet = cursorWriteSetIndex
 
         if updateMain {
             if mainCount > 0, let mainPtr {
@@ -1171,16 +1725,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         if updateCursor {
             if cursorCount > 0, let cursorPtr {
-                ensureCursorBufferInSet(s, vertexCount: cursorCount)
-                if let cvb = bufferSets[s].cursorVertexBuffer {
+                ensureCursorBufferInSet(cursorSet, vertexCount: cursorCount)
+                if let cvb = bufferSets[cursorSet].cursorVertexBuffer {
                     memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                    bufferSets[s].cursorVertexCount = cursorCount
+                    bufferSets[cursorSet].cursorVertexCount = cursorCount
                 } else {
-                    bufferSets[s].cursorVertexCount = 0
+                    bufferSets[cursorSet].cursorVertexCount = 0
                 }
                 updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
             } else {
-                bufferSets[s].cursorVertexCount = 0
+                bufferSets[cursorSet].cursorVertexCount = 0
             }
         }
     }
@@ -1206,8 +1760,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if p.y > maxY { maxY = p.y }
         }
         // NDC -> main window drawable px. NDC top is y = +1.
-        let w = Float(backBufferSize.width)
-        let h = Float(backBufferSize.height)
+        // backBufferSize is written under `lock` by ensureBackBuffer() (main
+        // thread); read it under the same lock here since this runs on the
+        // core/RPC thread and a resize can race with this cursor update.
+        let (bufW, bufH): (CGFloat, CGFloat) = {
+            lock.lock()
+            defer { lock.unlock() }
+            return (backBufferSize.width, backBufferSize.height)
+        }()
+        let w = Float(bufW)
+        let h = Float(bufH)
+        // Before the first ensureBackBuffer() call, backBufferSize is still
+        // .zero — skip computing nonsensical (0,0,0,0) cursor-shader uniforms;
+        // the next call (once a real size is known) will compute correctly.
+        guard w > 0, h > 0 else { return }
         let xPx = (minX + 1.0) * 0.5 * w
         let rightPx = (maxX + 1.0) * 0.5 * w
         let topPx = (1.0 - maxY) * 0.5 * h
@@ -1255,7 +1821,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let scale: Float = drawableHeight > 0 ? 2.0 / drawableHeight : 0
         let cellHeightNDC: Float = cellHeightPx * scale
 
-        var scrollOffsets = offsets.map { info in
+        let count = offsets.count
+        ZonvieCore.appLog("[renderer] updateScrollOffsets: count=\(count) drawableHeight=\(drawableHeight)")
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Reuse scrollOffsetData's own storage (removeAll + append) instead
+        // of building a fresh array via offsets.map and assigning it: this
+        // only allocates when draw(in:)'s scrollSnapshot from an in-flight
+        // frame still holds this buffer's previous storage (a genuine,
+        // unavoidable thread-safety copy — see updateFixedFloatRects for
+        // the same reasoning), not unconditionally on every scrolled frame.
+        scrollOffsetData.removeAll(keepingCapacity: true)
+        scrollOffsetData.reserveCapacity(offsets.count)
+        for info in offsets {
             let ndc = -info.offsetYPx * scale
 
             // Calculate content bounds in NDC
@@ -1271,24 +1851,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
             ZonvieCore.appLog("[renderer] scroll offset: gridId=\(info.gridId) offsetYPx=\(info.offsetYPx) ndc=\(ndc) contentTop=\(contentTopY) contentBottom=\(contentBottomY)")
-            return ScrollOffset(
+            scrollOffsetData.append(ScrollOffset(
                 grid_id: Int32(truncatingIfNeeded: info.gridId),
                 offset_y: ndc,
                 content_top_y: contentTopY,
                 content_bottom_y: contentBottomY,
                 move_all: info.clipToContent ? 0 : 1
-            )
+            ))
         }
-
-        let count = scrollOffsets.count
-        ZonvieCore.appLog("[renderer] updateScrollOffsets: count=\(count) drawableHeight=\(drawableHeight)")
-
-        lock.lock()
-        defer { lock.unlock() }
+        // Shaders.metal uses binary search for the per-vertex grid lookup.
+        // Sort the renderer-owned buffer after conversion so every draw pass
+        // (main, extract, and cursor) observes the same ordering contract.
+        scrollOffsetData.sort { $0.grid_id < $1.grid_id }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
         // This eliminates the GPU/CPU race on shared MTLBuffers.
-        scrollOffsetData = scrollOffsets
         hasActiveScrollOffset = count > 0
     }
 
@@ -1352,14 +1929,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        // Keep the vsync draw loop alive while any custom shader references
-        // animation-driving uniforms (iTime etc.). activateDrawLoop resets
-        // the idle counter and unpauses the MTKView; without this the
-        // shader would be frozen between Neovim flush events.
-        if anyCustomShaderNeedsAnimation {
-            (view as? MetalTerminalView)?.activateDrawLoop()
-        }
-
         // Process pending scroll clears before rendering
         onPreDraw?()
 
@@ -1373,18 +1942,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // Deferred pipeline initialization: build pipeline on first draw
             // This avoids XPC errors when multiple instances start simultaneously
-            if pipelineNeedsBuilding {
-                pipelineNeedsBuilding = false
-                buildPipeline(view: view)
-            }
+            _ = ensurePipelineReady(view: view)
 
             // Graceful degradation: if GPU initialization failed, skip rendering
             guard pipeline != nil, sampler != nil else {
                 if let error = initializationError {
                     ZonvieCore.appLog("[draw] Skipping render due to initialization error: \(error)")
                 }
+                (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
+            }
+
+            // Keep the vsync draw loop alive while any custom shader references
+            // animation-driving uniforms (iTime etc.). A missing pipeline must
+            // not reset the idle counter every frame.
+            if anyCustomShaderNeedsAnimation {
+                (view as? MetalTerminalView)?.activateDrawLoop()
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
@@ -1392,20 +1966,34 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Update atlas backing scale outside lock (atlas has its own internal lock)
-            atlas.setBackingScale(backingScale)
+            // Keep the last exact-size frame while AppKit is live-resizing.
+            // Recreating back/scratch/ping-pong textures for every size tick
+            // creates a stream of IOAccelerator resources. Do this before the
+            // committed/dirty snapshots below so no render state is consumed;
+            // viewDidEndLiveResize requests one exact-size full redraw.
+            if view.inLiveResize, backBuffer != nil, backBufferSize != view.drawableSize {
+                (view as? MetalTerminalView)?.didDrawFrame()
+                return
+            }
 
             // Acquire GPU slot BEFORE marking gpuInFlightCount.
-            // This prevents sem.wait()-blocked draw() from inflating gpuInFlightCount,
+            // This prevents a slot-blocked draw() from inflating gpuInFlightCount,
             // which would cause beginFlush() to incorrectly see all sets as "in-flight".
-            var t_sem_start: CFAbsoluteTime = 0
-            if ZonvieCore.appLogEnabled {
-                t_sem_start = CFAbsoluteTimeGetCurrent()
-            }
-            inflightSemaphore.wait()
-            if ZonvieCore.appLogEnabled {
-                let sem_us = (CFAbsoluteTimeGetCurrent() - t_sem_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_semaphore_wait us=\(String(format: "%.1f", sem_us))")
+            //
+            // Non-blocking: draw(in:) runs on the MAIN thread, so blocking
+            // here until the previous frame's GPU work completes stalls input
+            // event processing for the whole wait (measured up to ~6.7ms under
+            // blur when GPU frames approach the vsync budget). When the slot
+            // is busy, skip this tick and re-request a redraw — nothing has
+            // been consumed yet, and the content lands one vsync later. Same
+            // pattern as ExternalGridView.draw().
+            // Note: this does NOT remove the acquire-drawable wait further
+            // below; CAMetalLayer has no non-blocking nextDrawable.
+            if inflightSemaphore.wait(timeout: .now()) != .success {
+                ZonvieCore.appLog("[perf] draw_semaphore_busy skip=true")
+                (view as? MetalTerminalView)?.didDrawFrame()
+                (view as? MetalTerminalView)?.requestRedraw()
+                return
             }
 
             // === PERF LOG: lock取得開始 ===
@@ -1417,17 +2005,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // --- Single lock: read committed index + pending state + mark GPU in-flight ---
             // This prevents beginFlush() from picking our committed set as its write target.
             let csi: Int
+            let cci: Int
             let currentCommitRevision: UInt64
             let atlasTex: MTLTexture?
             let dirtyRectPxOpt: CGRect?
-            var dirtyRows: [Int]
+            var dirtyRows: [Int] = []
             let smoothScrolling: Bool
             // Raw value of hasActiveScrollOffset at snapshot time (NOT the
             // combined smoothScrolling). Stored to lastDrawnHadActiveScrollOffset
             // below so the one-frame extension does not self-latch.
             let hadActiveScrollOffsetThisFrame: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
-            let fixedFloatSnapshot: [FixedFloatRect]  // Snapshot for setFragmentBytes
+            let fixedFloatBandsSnapshot: [FixedFloatBand]  // Snapshots for setFragmentBytes
+            let fixedFloatIntervalsSnapshot: [FixedFloatInterval]
             let pendingScroll: SurfaceRowScroll?
             let rowLogicalToSlotSnapshot: [Int]
             let rowSlotSourceRowsSnapshot: [Int]
@@ -1438,12 +2028,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             lock.lock()
             csi = committedSetIndex
+            cci = committedCursorSetIndex
             currentCommitRevision = commitRevision
             gpuInFlightCount[csi] += 1  // Prevent beginFlush from using this set
+            cursorGpuInFlightCount[cci] += 1
 
             atlasTex = committedAtlasTexture  // same lock scope as vertex snapshot
             dirtyRectPxOpt = pendingDirtyRectPx
-            dirtyRows = Array(pendingDirtyRows)
+            swap(&dirtyRows, &dirtyRowsScratch)
+            dirtyRows.removeAll(keepingCapacity: true)
+            dirtyRows.append(contentsOf: pendingDirtyRows)
             pendingDirtyRectPx = nil
             pendingDirtyRows.removeAll()
             // Extend smoothScrolling for one extra frame after the offset
@@ -1455,10 +2049,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
             smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
-            fixedFloatSnapshot = fixedFloatRectData  // Value-type copy (safe across frames)
+            fixedFloatBandsSnapshot = fixedFloatBandData  // Value-type copies (safe across frames)
+            fixedFloatIntervalsSnapshot = fixedFloatIntervalData
             // Use accumulated scroll delta (covers multiple flushes between draws)
             // instead of per-set pendingScroll which only has the last flush's delta.
-            pendingScroll = pendingScrollAccum ?? bufferSets[csi].pendingScroll
+            // pendingScrollAccum is the sole authority: applySurfaceRowScrollRaw
+            // goes through prepareMainWriteState(), so any set carrying a
+            // pendingScroll was committed with didMainWrite and accumulated here.
+            // Never fall back to bufferSets[csi].pendingScroll — that field is not
+            // cleared once a draw consumes it, and a cursor-only flush neither
+            // rotates committedSetIndex nor clears it, so reading it would re-apply
+            // an already-applied scroll on every subsequent cursor-only draw.
+            pendingScroll = pendingScrollAccum
             pendingScrollAccum = nil
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
@@ -1466,6 +2068,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             snappedCommittedDrawableW = committedDrawableW
             snappedCommittedDrawableH = committedDrawableH
             lock.unlock()
+
+            defer {
+                dirtyRows.removeAll(keepingCapacity: true)
+                swap(&dirtyRows, &dirtyRowsScratch)
+            }
 
             // Safety defer: decrement gpuInFlight + signal semaphore on early return.
             // On normal GPU submission, the completion handler handles cleanup instead.
@@ -1475,17 +2082,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     inflightSemaphore.signal()
                     lock.lock()
                     gpuInFlightCount[csi] -= 1
+                    cursorGpuInFlightCount[cci] -= 1
                     lock.unlock()
                 }
             }
 
             // Now safe to read from committed set (protected by gpuInFlight)
             let committed = bufferSets[csi]
+            let committedCursor = bufferSets[cci]
             let rowBuffersSnapshot = committed.rowState.buffers
             let rowCountsSnapshot = committed.rowState.counts
             let rowMode = committed.rowState.usingRowBuffers
             let committedMainCount = committed.mainVertexCount
-            let committedCursorCount = committed.cursorVertexCount
+            let committedCursorCount = committedCursor.cursorVertexCount
 
             // All values below (csi, currentCommitRevision, scrollSnapshot, dirtyRows)
             // are local snapshots taken under lock above, so they form a consistent set.
@@ -1504,8 +2113,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             ZonvieCore.appLog("draw(fetch): rowMode=\(rowMode) mainCount=\(committedMainCount) cursorCount=\(committedCursorCount) dirtyRectPxOpt=\(String(describing: dirtyRectPxOpt)) dirtyRowsCount=\(dirtyRows.count) hasPresentedOnce=\(hasPresentedOnce) drawableSize=\(view.drawableSize)")
 
-            let cw = atlas.cellWidthPx
-            let ch = atlas.cellHeightPx + Float(linespacePx)
+            // Single locked snapshot of hasPresentedOnce for this entire draw
+            // call. hasPresentedOnce is also written from the GPU completion-
+            // handler thread (unlocked previously); reading it once here
+            // (instead of per-branch) keeps all control-flow decisions in this
+            // frame consistent even if a completion handler races concurrently.
+            let renderStateSnapshot: (hasPresented: Bool, cursorBlink: Bool) = {
+                lock.lock()
+                defer { lock.unlock() }
+                return (hasPresentedOnce, cursorBlinkStateStorage)
+            }()
+            let hasPresentedOnceSnapshot = renderStateSnapshot.hasPresented
+            let cursorBlinkStateSnapshot = renderStateSnapshot.cursorBlink
+
+            let cw = cellWidthPx
+            let ch = cellHeightPx
             if cw != lastCellWidthPx || ch != lastCellHeightPx {
                 lastCellWidthPx = cw
                 lastCellHeightPx = ch
@@ -1525,7 +2147,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             // Check if cursor blink state changed
-            let blinkStateChanged = cursorBlinkState != lastRenderedBlinkState
+            let blinkStateChanged = cursorBlinkStateSnapshot != lastRenderedBlinkState
 
             // Check if committed data changed since last draw
             let hasNewCommit = currentCommitRevision != lastDrawnRevision
@@ -1547,7 +2169,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 && dirtyRectPxOpt == nil
                 && !smoothScrolling
                 && !drawableSizeChanged
-                && hasPresentedOnce
+                && hasPresentedOnceSnapshot
 
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
@@ -1557,7 +2179,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // shader pass sees an advancing clock. Otherwise the shader only
             // runs on Neovim flushes and the animation appears frozen
             // between keystrokes.
-            if hasPresentedOnce,
+            if hasPresentedOnceSnapshot,
                !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
@@ -1576,7 +2198,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
             // destroys the backbuffer between GPU-blit scroll frames.
             // Same animation exception as above.
-            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce && !anyCustomShaderNeedsAnimation {
+            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation {
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -1604,7 +2226,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 && pendingScroll == nil
                 && currentCursorCount == 0
                 && !anyCustomShaderNeedsAnimation {
-                lastRenderedBlinkState = cursorBlinkState
+                lastRenderedBlinkState = cursorBlinkStateSnapshot
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -1640,6 +2262,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Rendering will proceed — reset active draw loop idle counter.
             (view as? MetalTerminalView)?.notifyDrawActive()
 
+            // Snapshot pre-frame skip-gate state so an acquisition failure
+            // below (bailWithoutSubmit) can un-consume it for retry.
+            let prevDrawnRevision = lastDrawnRevision
+            let prevDrawnDrawableSize = lastDrawnDrawableSize
+            let prevDrawnHadActiveScrollOffset = lastDrawnHadActiveScrollOffset
+            let prevRenderedBlinkState = lastRenderedBlinkState
+
             // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision
             lastDrawnDrawableSize = view.drawableSize
@@ -1651,14 +2280,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lastDrawnHadActiveScrollOffset = hadActiveScrollOffsetThisFrame
 
             // Update last rendered blink state since we're proceeding with render
-            lastRenderedBlinkState = cursorBlinkState
+            lastRenderedBlinkState = cursorBlinkStateSnapshot
 
             // isBlinkOnlyFrame is computed earlier (right after drawableSizeChanged)
             // so the skipFrame early-return above can share the same predicate.
 
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
-            let cellWi = max(1, UInt32(cw.rounded(.toNearestOrAwayFromZero)))
-            let cellHi = max(1, UInt32(ch.rounded(.toNearestOrAwayFromZero)))
+            let cellWi = max(1, UInt32(cw.rounded(.up)))
+            let cellHi = max(1, UInt32(ch.rounded(.up)))
             let drawableWi: UInt32
             let drawableHi: UInt32
             if snappedCommittedDrawableW > 0 && snappedCommittedDrawableH > 0 {
@@ -1687,15 +2316,25 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Glow must be checked early — it disables partial-redraw optimizations
             // (GPU scroll copy, dirty-row-only rendering) because additive bloom
             // composite accumulates brightness when backBuffer preserves previous glow.
-            let glowEnabled = (view as? MetalTerminalView)?.core?.isGlowEnabled() ?? false
+            // The bloom pass blurs a flattened surface, so it cannot preserve the
+            // z-order boundary between shifted content and a fixed float. Disable
+            // bloom only for those transient smooth-scroll frames; otherwise its
+            // blur would be composited through the float after the main-pass mask.
+            let configuredGlowEnabled = (view as? MetalTerminalView)?.core?.isGlowEnabled() ?? false
+            let glowEnabled = configuredGlowEnabled
+                && !(smoothScrolling && !fixedFloatBandsSnapshot.isEmpty)
 
             let useGpuScrollCopy = rowMode
                 && hasNewCommit
                 && pendingScroll != nil
-                && hasPresentedOnce
+                && hasPresentedOnceSnapshot
                 && !smoothScrolling
                 && !drawableSizeChanged
                 && !glowEnabled
+                // Blur partial redraw requires overwrite-background and
+                // alpha-glyph pipelines. If either failed to initialize,
+                // skip the blit and full-redraw from retained row slots.
+                && (!blurEnabled || use2Pass)
             let rowTranslationDenom = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
             func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow >= 0, logicalRow < safeRowCount else { return nil }
@@ -1710,7 +2349,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // --- Step 3: Compute cursor grid row from NDC vertex positions ---
             var cursorGridRow: Int = -1
-            if currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
+            if currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
                 let ptr = cvb.contents().bindMemory(to: Vertex.self, capacity: currentCursorCount)
                 var maxNdcY: Float = ptr[0].position.y
                 for i in 1..<currentCursorCount {
@@ -1754,18 +2393,33 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 && dirtyRectPxOpt == nil
                 && !smoothScrolling
                 && !drawableSizeChanged
-                && hasPresentedOnce
+                && hasPresentedOnceSnapshot
             let skipMainPass = noMainWorkFrame && !glowEnabled
 
-            // We always need a drawable to present.
-            var t_drawable_start: CFAbsoluteTime = 0
-            if ZonvieCore.appLogEnabled {
-                t_drawable_start = CFAbsoluteTimeGetCurrent()
-            }
-            guard let drawable = view.currentDrawable else { return }
-            if ZonvieCore.appLogEnabled {
-                let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
+            // Bail path for acquisition failures below (drawable exhaustion
+            // under compositor backpressure, command-buffer failure).
+            // Dirty rows/rect, the scroll accumulator and the skip-gate state
+            // were already consumed under the lock above; returning without
+            // restoring them leaves stale rows / an unshifted scroll band
+            // until the next full update, and the redraw scheduler stays
+            // wedged because didDrawFrame() never fires. Restore a superset
+            // (all rows dirty — a full row redraw also heals the unapplied
+            // scroll blit, since committed vertices are already post-scroll),
+            // un-consume the skip-gate state, and re-request a redraw.
+            func bailWithoutSubmit(_ reason: String) {
+                ZonvieCore.appLog("[WARNING] draw bailed (\(reason)); restoring dirty state for retry")
+                markAllRowsDirty()
+                if let r = dirtyRectPxOpt {
+                    lock.lock()
+                    pendingDirtyRectPx = pendingDirtyRectPx?.union(r) ?? r
+                    lock.unlock()
+                }
+                lastDrawnRevision = prevDrawnRevision
+                lastDrawnDrawableSize = prevDrawnDrawableSize
+                lastDrawnHadActiveScrollOffset = prevDrawnHadActiveScrollOffset
+                lastRenderedBlinkState = prevRenderedBlinkState
+                (view as? MetalTerminalView)?.didDrawFrame()
+                (view as? MetalTerminalView)?.requestRedraw()
             }
 
             // Ensure persistent back buffer matches current drawable size.
@@ -1778,9 +2432,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
                 ZonvieCore.appLog("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
             }
-            guard let backTex = backBuffer else { return }
+            guard let backTex = backBuffer else {
+                bailWithoutSubmit("no backbuffer")
+                return
+            }
 
             guard let cmd = queue.makeCommandBuffer() else {
+                bailWithoutSubmit("command buffer creation failed")
                 return
             }
             // Per-pass GPU timing: reset slot list at frame start; attach calls
@@ -1811,32 +2469,53 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     logEnabled: ZonvieCore.appLogEnabled
                 )
 
-                // When multiple flushes accumulate between draws, the blit shifts
-                // by the total accumulated delta D.  The vacated region (D rows)
-                // must be redrawn.  Additionally, intermediate scroll steps each
-                // produced a new row whose vertex data was inherited via buffer-set
-                // copy + slot remap, but the backbuffer still holds pre-scroll
-                // pixels for those positions.  Expand dirty rows by 2*D to cover
-                // both the vacated region and these intermediate rows.
-                let shift = abs(pendingScroll.rowsDelta)
-                if shift > 0 {
-                    let expandStart: Int
-                    let expandEnd: Int
-                    if pendingScroll.rowsDelta > 0 {
-                        // Scroll down: vacated at bottom, intermediate rows above
-                        expandEnd = pendingScroll.rowEnd
-                        expandStart = max(pendingScroll.rowStart, pendingScroll.rowEnd - 2 * shift)
-                    } else {
-                        // Scroll up: vacated at top, intermediate rows below
-                        expandStart = pendingScroll.rowStart
-                        expandEnd = min(pendingScroll.rowEnd, pendingScroll.rowStart + 2 * shift)
-                    }
-                    for row in expandStart..<expandEnd {
-                        if !dirtyRows.contains(row) {
-                            dirtyRows.append(row)
+                if scrollClearBand == nil {
+                    // The blit never ran (scratch texture or blit encoder
+                    // creation failed — see encodePendingMainRowScrollCopy's
+                    // guard clauses), so the back texture's pixels were NEVER
+                    // shifted for this scroll. The 2*shift expansion below
+                    // assumes a successful blit and only covers the vacated
+                    // band + intermediate rows; every OTHER row in the scroll
+                    // region still holds correct pre-scroll content only
+                    // where it happened to already sit, which after a failed
+                    // shift is nowhere. Mark the ENTIRE scroll region dirty so
+                    // the per-row scissor draw below (useGpuScrollCopy branch)
+                    // fully overwrites every affected row from scratch instead
+                    // of leaving most of it as stale, un-shifted pixels the
+                    // core will never re-send (it only marks the vacated band
+                    // dirty on the assumption the frontend shifts the rest).
+                    // Append the contiguous fallback region directly; the
+                    // combined rows are canonicalized below. This avoids the
+                    // previous contains(row) scan that made a failed scroll
+                    // blit O(R²) exactly when the fallback is hottest.
+                    dirtyRows.append(contentsOf: pendingScroll.rowStart..<pendingScroll.rowEnd)
+                } else {
+                    // When multiple flushes accumulate between draws, the blit shifts
+                    // by the total accumulated delta D.  The vacated region (D rows)
+                    // must be redrawn.  Additionally, intermediate scroll steps each
+                    // produced a new row whose vertex data was inherited via buffer-set
+                    // copy + slot remap, but the backbuffer still holds pre-scroll
+                    // pixels for those positions.  Expand dirty rows by 2*D to cover
+                    // both the vacated region and these intermediate rows.
+                    let shift = abs(pendingScroll.rowsDelta)
+                    if shift > 0 {
+                        let expandStart: Int
+                        let expandEnd: Int
+                        if pendingScroll.rowsDelta > 0 {
+                            // Scroll down: vacated at bottom, intermediate rows above
+                            expandEnd = pendingScroll.rowEnd
+                            expandStart = max(pendingScroll.rowStart, pendingScroll.rowEnd - 2 * shift)
+                        } else {
+                            // Scroll up: vacated at top, intermediate rows below
+                            expandStart = pendingScroll.rowStart
+                            expandEnd = min(pendingScroll.rowEnd, pendingScroll.rowStart + 2 * shift)
                         }
+                        dirtyRows.append(contentsOf: expandStart..<expandEnd)
                     }
                 }
+            }
+            if useGpuScrollCopy {
+                surfaceSortAndDeduplicateRows(&dirtyRows)
             }
 
             // --- 1) Render into back buffer (partial redraw is valid here) ---
@@ -1862,11 +2541,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // row-mode draws to avoid expensive full-clear redraws between scroll
             // flushes (e.g. statusline updates).
             let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
-                && hasPresentedOnce && !smoothScrolling && !drawableSizeChanged && !glowEnabled
+                && hasPresentedOnceSnapshot && !smoothScrolling && !drawableSizeChanged && !glowEnabled
             let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
-                hasPresentedOnce: hasPresentedOnce,
+                hasPresentedOnce: hasPresentedOnceSnapshot,
                 drawableSizeChanged: drawableSizeChanged,
                 shouldReusePreviousContents: shouldReusePreviousContents,
                 forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
@@ -1908,18 +2587,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
                 // an uncommitted MTLCommandBuffer leaks GPU memory permanently.
-                hasPresentedOnce = false
                 let sem = inflightSemaphore
                 let lk = lock
                 cmd.addCompletedHandler { [weak self] _ in
                     lk.lock()
                     self?.gpuInFlightCount[csi] -= 1
+                    self?.cursorGpuInFlightCount[cci] -= 1
                     lk.unlock()
                     sem.signal()
                 }
                 cmd.commit()
                 gpuSubmitted = true
-                (view as? MetalTerminalView)?.didDrawFrame()
+                bailWithoutSubmit("render encoder creation failed")
                 return
             }
 
@@ -1938,20 +2617,42 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             enc.setFragmentSamplerState(sampler!, index: 0)
 
             // Bind scroll offsets, fragment state (drawable size, alpha, blink) via shared helpers
-            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot, device: device)
+            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot, device: device, scratchBuffer: &committed.scrollOffsetBuffer, scratchCapacity: &committed.scrollOffsetBufferCap)
             bindSurfaceFragmentState(
                 encoder: enc,
                 viewportMetrics: viewportMetrics,
                 backgroundAlphaBuffer: backgroundAlphaBuffer,
                 cursorBlinkBuffer: cursorBlinkBuffer,
                 cursorBlinkVisible: true,  // always visible; cursor drawn as separate overlay pass
-                fixedFloatRects: fixedFloatSnapshot
+                fixedFloatBands: fixedFloatBandsSnapshot,
+                fixedFloatIntervals: fixedFloatIntervalsSnapshot
             )
             var zeroRowTranslation: Float = 0
             enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
 
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
+
+            // With loadAction=.load, a dirty row whose committed vertex count
+            // is zero must actively overwrite its old pixels. The regular
+            // non-blur pipeline is sufficient here: backgroundAlpha is 1.0,
+            // so the solid quad has overwrite semantics while preserving the
+            // same RGB/alpha contract as a normal empty terminal row.
+            func clearEmptyDirtyRowsNonBlur(_ rows: [Int]) {
+                enc.setRenderPipelineState(pipeline!)
+                let width = Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width))
+                let height = Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height))
+                for row in rows where resolvedRowState(row) == nil {
+                    let topPx = row * cellH
+                    drawBackgroundClearBand(
+                        enc,
+                        clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
+                        drawableWidth: width,
+                        drawableHeight: height,
+                        bgRGB: snappedBgRGB
+                    )
+                }
+            }
 
             // === PERF LOG: encode_setup → encode_rows boundary ===
             let t_encode_rows_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -1970,30 +2671,33 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         let vc = resolved.vc
                         let vb = resolved.vb
 
-                        let y = max(0, cursorGridRow * Int(cellHi))
-                        let h = Int(cellHi)
-                        if drawableW > 0 && h > 0 {
-                            enc.setScissorRect(MTLScissorRect(x: 0, y: y, width: drawableW, height: h))
-                        }
+                        if let scissor = makeRowScissorRect(
+                            row: cursorGridRow,
+                            cellHeight_px: Int(cellHi),
+                            drawableWidth_px: drawableW,
+                            renderTargetWidth_px: backTex.width,
+                            renderTargetHeight_px: backTex.height
+                        ) {
+                            enc.setScissorRect(scissor)
+                            var rowTranslation = resolved.translationY
+                            if let unified = unifiedBlurPipeline {
+                                enc.setRenderPipelineState(unified)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                            } else {
+                                // Pass 1: Background (overwrite blending — erases old cursor)
+                                enc.setRenderPipelineState(backgroundPipeline!)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
 
-                        var rowTranslation = resolved.translationY
-                        if let unified = unifiedBlurPipeline {
-                            enc.setRenderPipelineState(unified)
-                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                            enc.setVertexBuffer(vb, offset: 0, index: 0)
-                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-                        } else {
-                            // Pass 1: Background (overwrite blending — erases old cursor)
-                            enc.setRenderPipelineState(backgroundPipeline!)
-                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                            enc.setVertexBuffer(vb, offset: 0, index: 0)
-                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-
-                            // Pass 2: Glyph (alpha blending — redraws text/decorations)
-                            enc.setRenderPipelineState(glyphPipeline!)
-                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                            enc.setVertexBuffer(vb, offset: 0, index: 0)
-                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                                // Pass 2: Glyph (alpha blending — redraws text/decorations)
+                                enc.setRenderPipelineState(glyphPipeline!)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
+                            }
                         }
 
                         ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc) unified=\(unifiedBlurPipeline != nil)")
@@ -2038,7 +2742,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             rows: dirtyRows,
                             resolve: resolvedRowState,
                             scissor: { row in
-                                makeRowScissorRect(row: row, cellHeight_px: scrollCellHiI, drawableWidth_px: drawableW)
+                                makeRowScissorRect(
+                                    row: row,
+                                    cellHeight_px: scrollCellHiI,
+                                    drawableWidth_px: drawableW,
+                                    renderTargetWidth_px: backTex.width,
+                                    renderTargetHeight_px: backTex.height
+                                )
                             },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
@@ -2081,7 +2791,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             rows: dirtyRows,
                             resolve: resolvedRowState,
                             scissor: { row in
-                                makeRowScissorRect(row: row, cellHeight_px: cellHiI, drawableWidth_px: drawableW)
+                                makeRowScissorRect(
+                                    row: row,
+                                    cellHeight_px: cellHiI,
+                                    drawableWidth_px: drawableW,
+                                    renderTargetWidth_px: backTex.width,
+                                    renderTargetHeight_px: backTex.height
+                                )
                             },
                             pipeline: pipeline!,
                             backgroundPipeline: backgroundPipeline,
@@ -2124,27 +2840,45 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             bgRGB: snappedBgRGB
                         )
                     }
+                    clearEmptyDirtyRowsNonBlur(dirtyRows)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
                         rows: dirtyRows,
                         resolve: resolvedRowState,
                         scissor: { row in
-                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: cellH,
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
                         },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
                         useTwoPass: false
                     )
-                } else if !glowEnabled && !dirtyRows.isEmpty {
+                } else if !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
+                            && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
                     // Skipped when glow is enabled — full redraw needed for correct bloom composite.
+                    // Use this only when the render pass preserved clean rows.
+                    // Resize and fail-closed blur-pipeline frames use .clear;
+                    // drawing only dirty rows there would blank every other row.
+                    clearEmptyDirtyRowsNonBlur(dirtyRows)
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
                         rows: dirtyRows,
                         resolve: resolvedRowState,
                         scissor: { row in
-                            makeRowScissorRect(row: row, cellHeight_px: cellH, drawableWidth_px: drawableW)
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: cellH,
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
                         },
                         pipeline: pipeline!,
                         backgroundPipeline: nil,
@@ -2166,11 +2900,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             } else {
                 // Non-rowMode: shared helper handles 2-pass vs single-pass dispatch
                 let dirtyScissor: MTLScissorRect? = {
-                    guard !use2Pass, let dr = dirtyRectPxOpt else { return nil }
-                    let x = max(0, Int(dr.origin.x.rounded(.down)))
-                    let y = max(0, Int(dr.origin.y.rounded(.down)))
-                    let w = max(0, Int(dr.size.width.rounded(.up)))
-                    let h = max(0, Int(dr.size.height.rounded(.up)))
+                    // A scissor is valid only when the render pass preserved
+                    // the rest of backTex. On a first/resize frame .clear has
+                    // already erased everything outside the dirty rectangle,
+                    // so that frame must redraw the complete committed set.
+                    guard !use2Pass,
+                          rpd.colorAttachments[0].loadAction == .load,
+                          let dr = dirtyRectPxOpt
+                    else { return nil }
+                    guard dr.minX.isFinite, dr.maxX.isFinite,
+                          dr.minY.isFinite, dr.maxY.isFinite,
+                          backTex.width > 0, backTex.height > 0
+                    else { return nil }
+                    let targetW = CGFloat(backTex.width)
+                    let targetH = CGFloat(backTex.height)
+                    let minX = max(0, min(targetW, dr.minX.rounded(.down)))
+                    let maxX = max(0, min(targetW, dr.maxX.rounded(.up)))
+                    let minY = max(0, min(targetH, dr.minY.rounded(.down)))
+                    let maxY = max(0, min(targetH, dr.maxY.rounded(.up)))
+                    let x = Int(minX)
+                    let y = Int(minY)
+                    let w = Int(maxX - minX)
+                    let h = Int(maxY - minY)
                     return (w > 0 && h > 0) ? MTLScissorRect(x: x, y: y, width: w, height: h) : nil
                 }()
                 encodeSurfaceNonRowContent(
@@ -2214,6 +2965,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }  // end of `if !skipMainPass`
 
             // --- Post-process bloom (neon glow) ---
+            var glowPassSucceeded = !glowEnabled
             if glowEnabled,
                let extractPipe = glowExtractPipeline,
                let downPipe = kawaseDownPipeline,
@@ -2223,11 +2975,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                let bilinSamp = bilinearSampler
             {
                 let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
-                glowTextures.ensure(device: device, drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
-                glowTextures.ensureIntensityBuffer(device: device)
                 let intensity = (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8
 
-                encodeSurfaceBloomPasses(
+                if glowTextures.ensure(device: device, drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat),
+                   glowTextures.ensureIntensityBuffer(device: device) {
+                    glowPassSucceeded = encodeSurfaceBloomPasses(
                     cmd: cmd,
                     backTex: backTex,
                     viewportSize: vpSize,
@@ -2240,7 +2992,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     copyVertexBuffer: copyVB,
                     bilinearSampler: bilinSamp,
                     intensity: intensity
-                ) { enc in
+                    ) { enc in
                     // Extract vertices: atlas + scroll offsets + row/main + cursor
                     if let tex = atlasTex {
                         enc.setFragmentTexture(tex, index: 0)
@@ -2275,13 +3027,60 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
 
                     // Cursor glow
-                    if cursorBlinkState, currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
+                    if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
                         var ct: Float = 0
                         enc.setVertexBytes(&ct, length: MemoryLayout<Float>.size, index: 3)
                         enc.setVertexBuffer(cvb, offset: 0, index: 0)
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
                     }
+                    }
                 }
+            }
+
+            guard glowPassSucceeded else {
+                let sem = inflightSemaphore
+                let lk = lock
+                cmd.addCompletedHandler { [weak self] _ in
+                    lk.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    self?.cursorGpuInFlightCount[cci] -= 1
+                    lk.unlock()
+                    sem.signal()
+                }
+                cmd.commit()
+                gpuSubmitted = true
+                bailWithoutSubmit("glow resource/encoder creation failed")
+                return
+            }
+
+            // Delay CAMetalLayer acquisition until the final drawable copy.
+            // All earlier work targets persistent textures, so acquiring here
+            // shortens drawable ownership and reduces pool-starvation risk.
+            var t_drawable_start: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled {
+                t_drawable_start = CFAbsoluteTimeGetCurrent()
+            }
+            guard let drawable = view.currentDrawable else {
+                // Commit the already-encoded persistent-texture work so Metal
+                // can reclaim the command buffer. A full dirty retry heals the
+                // consumed scroll state before the next presentation.
+                let sem = inflightSemaphore
+                let lk = lock
+                cmd.addCompletedHandler { [weak self] _ in
+                    lk.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    self?.cursorGpuInFlightCount[cci] -= 1
+                    lk.unlock()
+                    sem.signal()
+                }
+                cmd.commit()
+                gpuSubmitted = true
+                bailWithoutSubmit("no drawable after back-buffer encode")
+                return
+            }
+            if ZonvieCore.appLogEnabled {
+                let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
+                ZonvieCore.appLog("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
             }
 
             // === PERF LOG: Copy開始 ===
@@ -2325,23 +3124,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     pipelines.count <= 1
                     || (customShaderPong[0] != nil && customShaderPong[1] != nil)
                 if pongsReady {
+                    var allPassesEncoded = true
                     for (i, pipeline) in pipelines.enumerated() {
                         let isLast = (i == pipelines.count - 1)
                         let inputTex: MTLTexture = (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
                         let outputTex: MTLTexture = isLast ? drawable.texture : customShaderPong[i % 2]!
-                        pipeline.encode(
+                        if !pipeline.encode(
                             cmd: cmd,
                             input: inputTex,
                             output: outputTex,
                             copyVertexBuffer: copyVB,
                             sampler: bilinSamp,
                             uniforms: uniforms
-                        )
+                        ) {
+                            allPassesEncoded = false
+                            break
+                        }
                     }
-                    customShaderHandled = true
+                    customShaderHandled = allPassesEncoded
                 }
             }
 
+            var finalCopyEncoded = customShaderHandled
             if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
                 let copyRPD = MTLRenderPassDescriptor()
                 copyRPD.colorAttachments[0].texture = drawable.texture
@@ -2359,7 +3163,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     copyEnc.setFragmentSamplerState(sampler!, index: 0)
                     copyEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
                     copyEnc.endEncoding()
+                    finalCopyEncoded = true
                 }
+            }
+
+            guard finalCopyEncoded else {
+                // Submit the already-encoded back-buffer work so Metal can
+                // reclaim this command buffer, but do not present an
+                // untouched drawable or consume the frame's dirty state.
+                let sem = inflightSemaphore
+                let lk = lock
+                cmd.addCompletedHandler { [weak self] _ in
+                    lk.lock()
+                    self?.gpuInFlightCount[csi] -= 1
+                    self?.cursorGpuInFlightCount[cci] -= 1
+                    lk.unlock()
+                    sem.signal()
+                }
+                cmd.commit()
+                gpuSubmitted = true
+                bailWithoutSubmit("final copy encoder creation failed")
+                return
             }
 
             // === PERF LOG: Copy終了 ===
@@ -2418,7 +3242,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     && !useGpuScrollCopy
                     && !drawableSizeChanged
                     && !blinkStateChanged
-                    && hasPresentedOnce
+                    && hasPresentedOnceSnapshot
                     && !customShaderHandled
                 ZonvieCore.appLog("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
             }
@@ -2426,8 +3250,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Cursor is composited only on the final drawable.
             // This keeps the persistent back buffer cursor-free and prevents stale
             // cursor pixels from being moved by GPU scroll-region copies.
-            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkState) cursorCount=\(currentCursorCount)")
-            if cursorBlinkState, currentCursorCount > 0, let cvb = committed.cursorVertexBuffer {
+            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkStateSnapshot) cursorCount=\(currentCursorCount)")
+            if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
                 let cursorRPD = MTLRenderPassDescriptor()
                 cursorRPD.colorAttachments[0].texture = drawable.texture
                 cursorRPD.colorAttachments[0].loadAction = .load
@@ -2435,36 +3259,55 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
                 attachGpuPerfSamples(to: cursorRPD, label: "cursor")
                 attachGpuStatsSamples(to: cursorRPD, label: "cursor")
-                if let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) {
-                    viewportMetrics.applyViewport(to: cursorEnc)
-                    cursorEnc.setRenderPipelineState(pipeline!)
-                    if let tex = atlasTex {
-                        cursorEnc.setFragmentTexture(tex, index: 0)
+                guard let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) else {
+                    // The drawable copy was encoded, but presenting it without
+                    // the requested cursor would consume cursor_rev and leave a
+                    // visibly incomplete transaction. Submit the already-
+                    // encoded back-buffer work only to release driver resources,
+                    // then roll the frame state back for a complete retry.
+                    let sem = inflightSemaphore
+                    let lk = lock
+                    cmd.addCompletedHandler { [weak self] _ in
+                        lk.lock()
+                        self?.gpuInFlightCount[csi] -= 1
+                        self?.cursorGpuInFlightCount[cci] -= 1
+                        lk.unlock()
+                        sem.signal()
                     }
-                    cursorEnc.setFragmentSamplerState(sampler!, index: 0)
-
-                    bindSurfaceScrollOffsets(encoder: cursorEnc, offsets: scrollSnapshot, device: device)
-                    bindSurfaceFragmentState(
-                        encoder: cursorEnc,
-                        viewportMetrics: viewportMetrics,
-                        backgroundAlphaBuffer: backgroundAlphaBuffer,
-                        cursorBlinkBuffer: cursorBlinkBuffer,
-                        cursorBlinkVisible: true,
-                        fixedFloatRects: fixedFloatSnapshot  // mask a scrolling cursor under a fixed float
-                    )
-                    var zeroTranslation: Float = 0
-                    cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
-
-                    cursorEnc.setVertexBuffer(cvb, offset: 0, index: 0)
-                    cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
-                    cursorEnc.endEncoding()
+                    cmd.commit()
+                    gpuSubmitted = true
+                    bailWithoutSubmit("cursor encoder creation failed")
+                    return
                 }
+                viewportMetrics.applyViewport(to: cursorEnc)
+                cursorEnc.setRenderPipelineState(pipeline!)
+                if let tex = atlasTex {
+                    cursorEnc.setFragmentTexture(tex, index: 0)
+                }
+                cursorEnc.setFragmentSamplerState(sampler!, index: 0)
+
+                bindSurfaceScrollOffsets(encoder: cursorEnc, offsets: scrollSnapshot, device: device, scratchBuffer: &committedCursor.cursorScrollOffsetBuffer, scratchCapacity: &committedCursor.cursorScrollOffsetBufferCap)
+                bindSurfaceFragmentState(
+                    encoder: cursorEnc,
+                    viewportMetrics: viewportMetrics,
+                    backgroundAlphaBuffer: backgroundAlphaBuffer,
+                    cursorBlinkBuffer: cursorBlinkBuffer,
+                    cursorBlinkVisible: true,
+                    fixedFloatBands: fixedFloatBandsSnapshot,
+                    fixedFloatIntervals: fixedFloatIntervalsSnapshot  // mask a scrolling cursor under a fixed float
+                )
+                var zeroTranslation: Float = 0
+                cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+
+                cursorEnc.setVertexBuffer(cvb, offset: 0, index: 0)
+                cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
+                cursorEnc.endEncoding()
             }
 
             var t_present_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
                 t_present_start = CFAbsoluteTimeGetCurrent()
-                if !hasPresentedOnce {
+                if !hasPresentedOnceSnapshot {
                     ZonvieCore.appLog("[startup] first present scheduled (cmd.present called)")
                 }
                 // On-glass presentation cadence: presentedTime is the host time
@@ -2519,6 +3362,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
                 self?.gpuInFlightCount[csi] -= 1
+                self?.cursorGpuInFlightCount[cci] -= 1
                 lk.unlock()
                 sem.signal()
 
@@ -2617,8 +3461,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
 
                 guard let self = self else { return }
+                guard completed.status == .completed else {
+                    self.lock.lock()
+                    self.hasPresentedOnce = false
+                    self.lock.unlock()
+                    ZonvieCore.appLog("[WARNING] Metal command failed (status=\(completed.status.rawValue)); forcing full redraw")
+                    DispatchQueue.main.async { [weak view] in
+                        (view as? MetalTerminalView)?.requestRedraw()
+                    }
+                    return
+                }
+                self.lock.lock()
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
+                self.lock.unlock()
                 if ZonvieCore.appLogEnabled, wasFirstPresent {
                     ZonvieCore.appLog("[startup] first present completed (GPU done)")
                 }
@@ -3035,31 +3891,50 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         uniforms.iWindowOffset.1 = Float(windowOffset.y)
         uniforms.iWindowSize.0 = Float(windowSize.width)
         uniforms.iWindowSize.1 = Float(windowSize.height)
-        // Ghostty 1.1+ cursor uniforms.
-        uniforms.iCurrentCursor = shaderCursorCurrent
-        uniforms.iPreviousCursor = shaderCursorPrevious
-        uniforms.iCurrentCursorColor = shaderCursorCurrentColor
-        uniforms.iPreviousCursorColor = shaderCursorPreviousColor
-        uniforms.iTimeCursorChange = shaderCursorChangeTime
+        // Ghostty 1.1+ cursor uniforms. Snapshot together under `lock` —
+        // setCursorShaderState() (core/RPC thread) writes these same fields
+        // as one unit; reading them individually here could otherwise mix
+        // a new rect with a stale color/timestamp for one frame.
+        let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime): (
+            (Float, Float, Float, Float), (Float, Float, Float, Float),
+            (Float, Float, Float, Float), (Float, Float, Float, Float), Float
+        ) = {
+            lock.lock()
+            defer { lock.unlock() }
+            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime)
+        }()
+        uniforms.iCurrentCursor = cursorCur
+        uniforms.iPreviousCursor = cursorPrev
+        uniforms.iCurrentCursorColor = cursorCurColor
+        uniforms.iPreviousCursorColor = cursorPrevColor
+        uniforms.iTimeCursorChange = cursorChangeTime
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,
         // time in seconds" without specifying month indexing. Forward
         // Calendar's .month component verbatim (already 1..12), which
         // matches the most common interpretation.
-        let cal = Calendar(identifier: .gregorian)
-        let comp = cal.dateComponents(
-            [.year, .month, .day, .hour, .minute, .second, .nanosecond],
-            from: Date()
-        )
-        let secsInDay: Float =
-            Float(comp.hour ?? 0) * 3600.0 +
-            Float(comp.minute ?? 0) * 60.0 +
-            Float(comp.second ?? 0) +
-            Float(comp.nanosecond ?? 0) / 1_000_000_000.0
-        uniforms.iDate.0 = Float(comp.year ?? 0)
-        uniforms.iDate.1 = Float(comp.month ?? 1)
-        uniforms.iDate.2 = Float(comp.day ?? 0)
-        uniforms.iDate.3 = secsInDay
+        // Recomputed at most once per wall-clock second (see
+        // shaderDateCache doc above) -- effects using iDate don't need
+        // finer than 1s granularity.
+        let wallDate = Date()
+        let wallSecond = Int(wallDate.timeIntervalSince1970)
+        if wallSecond != shaderDateCacheSecond {
+            shaderDateCacheSecond = wallSecond
+            let comp = shaderDateCalendar.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second, .nanosecond],
+                from: wallDate
+            )
+            let secsInDay: Float =
+                Float(comp.hour ?? 0) * 3600.0 +
+                Float(comp.minute ?? 0) * 60.0 +
+                Float(comp.second ?? 0) +
+                Float(comp.nanosecond ?? 0) / 1_000_000_000.0
+            shaderDateCache = (Float(comp.year ?? 0), Float(comp.month ?? 1), Float(comp.day ?? 0), secsInDay)
+        }
+        uniforms.iDate.0 = shaderDateCache.year
+        uniforms.iDate.1 = shaderDateCache.month
+        uniforms.iDate.2 = shaderDateCache.day
+        uniforms.iDate.3 = shaderDateCache.secsInDay
         // iMouse unimplemented on macOS — stays zero.
 
         state.frameIndex &+= 1
@@ -3072,6 +3947,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// when incoming state matches the current state, so shaders keep
     /// seeing the last real change's iTimeCursorChange.
     func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float)) {
+        // Called from the vertex-submit path (core/RPC thread), while
+        // makeCustomShaderUniforms() reads these same fields from the main
+        // thread during draw(in:). Guard with the existing `lock` (already
+        // used for other cross-thread snapshots in this class) so a torn
+        // rect/color combination is never observed mid-frame.
+        lock.lock()
+        defer { lock.unlock() }
+
         let sameRect =
             rect.0 == shaderCursorCurrent.0 &&
             rect.1 == shaderCursorCurrent.1 &&
@@ -3110,6 +3993,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let config = ZonvieConfig.shared.shaders
         customShaderPostProcess = config.postProcess
         customShaderPipelines.removeAll()
+        customShaderPipelinesDecorated.removeAll()
         anyCustomShaderNeedsAnimation = false
         if !config.enabled || config.paths.isEmpty {
             return
@@ -3135,7 +4019,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
         }
-        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders, anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
+        // Decorated variant: always opaque (preserve_alpha OFF). Only a
+        // separate compile is needed when the main set is NOT already opaque;
+        // otherwise alias it to avoid a redundant compile.
+        if config.preserveAlpha {
+            for path in config.paths {
+                let expanded = (path as NSString).expandingTildeInPath
+                if let pipeline = CustomShaderPipeline.load(
+                    device: device,
+                    library: lib,
+                    vsCustomPost: vsCustomPost,
+                    copyVertexDescriptor: copyVertexDesc,
+                    sourcePath: expanded,
+                    pixelFormat: pixelFormat,
+                    preserveAlpha: false
+                ) {
+                    customShaderPipelinesDecorated.append(pipeline)
+                }
+            }
+        } else {
+            customShaderPipelinesDecorated = customShaderPipelines
+        }
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
     }
 
     /// Try to load pipeline from binary archive
@@ -3360,7 +4265,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// the pool buffer saved in beginFlush, or allocate new if pool is insufficient.
     private func ensureMainBufferInSet(_ setIdx: Int, vertexCount: Int) {
         let vc = max(0, vertexCount)
-        guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else { return }
+        guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else {
+            flushFailed = true
+            return
+        }
 
         let srcMain = bufferSets[flushSourceSetIndex].mainVertexBuffer
         let sharesSource = setIdx == writeSetIndex && srcMain != nil
@@ -3370,15 +4278,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             || needed > bufferSets[setIdx].mainVertexBufferCap
 
         if needsNew {
-            guard let nextCap = surfaceGrowCapacity(current: bufferSets[setIdx].mainVertexBufferCap, needed: max(1, needed)) else { return }
+            guard let nextCap = surfaceGrowCapacity(current: bufferSets[setIdx].mainVertexBufferCap, needed: max(1, needed)) else {
+                flushFailed = true
+                return
+            }
 
             // Try detach pool first.
-            // Guard: pool buffer must not alias source, otherwise we'd
-            // write into the committed frame.
+            // Guard: pool buffer must not alias the source (committed) main
+            // buffer NOR the main buffer of a GPU in-flight set — the COW
+            // chain can leave the same object shared into an older set the
+            // GPU is still reading (see ensureSurfaceRowBuffer).
             let bs = bufferSets[setIdx]
             if let poolBuf = bs.detachPoolMainBuffer,
                bs.detachPoolMainCap >= nextCap,
-               poolBuf !== srcMain
+               poolBuf !== srcMain,
+               poolBuf !== inflightMainBuffer()
             {
                 bs.mainVertexBuffer = poolBuf
                 bs.mainVertexBufferCap = bs.detachPoolMainCap
@@ -3388,6 +4302,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 bs.mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
                 if bs.mainVertexBuffer == nil {
                     bs.mainVertexBufferCap = 0
+                    flushFailed = true
                 }
             }
         }
@@ -3398,7 +4313,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// the pool buffer saved in beginFlush, or allocate new if pool is insufficient.
     private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
         let vc = max(0, vertexCount)
-        guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else { return }
+        guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else {
+            flushFailed = true
+            return
+        }
 
         // Cursor buffer is NOT COW-shared (beginFlush copies data into dst's own buffer).
         // Only allocate if nil or too small.
@@ -3406,11 +4324,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let needsNew = bs.cursorVertexBuffer == nil || needed > bs.cursorVertexBufferCap
 
         if needsNew {
-            guard let nextCap = surfaceGrowCapacity(current: bs.cursorVertexBufferCap, needed: max(1, needed)) else { return }
+            guard let nextCap = surfaceGrowCapacity(current: bs.cursorVertexBufferCap, needed: max(1, needed)) else {
+                flushFailed = true
+                return
+            }
             bs.cursorVertexBufferCap = nextCap
             bs.cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
             if bs.cursorVertexBuffer == nil {
                 bs.cursorVertexBufferCap = 0
+                flushFailed = true
             }
         }
     }
@@ -3420,8 +4342,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         ensureSurfaceRowStorage(bufferSet: bufferSets[setIdx], row, maxRowBuffers: maxRowBuffers)
     }
 
-    private func prepareRowModeSetForWrite(_ setIdx: Int, totalRows: Int) {
-        prepareSurfaceRowModeSetForWrite(bufferSet: bufferSets[setIdx], totalRows: totalRows)
+    private func prepareRowModeSetForWrite(_ setIdx: Int, totalRows: Int, totalCols: Int) {
+        prepareSurfaceRowModeSetForWrite(bufferSet: bufferSets[setIdx], totalRows: totalRows, totalCols: totalCols)
     }
 
     private func ensureRowBufferInSet(_ setIdx: Int, row: Int, vertexCount: Int) -> MTLBuffer? {
@@ -3435,7 +4357,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             row: row,
             vertexCount: vertexCount,
             maxRowBuffers: maxRowBuffers,
-            gpuInFlight: isAnyGpuInFlight()
+            inflightRowBuffers: (inflightRowBuffer(atSlot: row), nil)
         )
     }
 
@@ -3452,7 +4374,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowStart: Int,
         rowEnd: Int,
         rowsDelta: Int,
-        totalRows: Int
+        totalRows: Int,
+        totalCols: Int
     ) {
         remapSurfaceRowSlots(
             bufferSet: bufferSets[setIdx],
@@ -3460,10 +4383,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             rowEnd: rowEnd,
             rowsDelta: rowsDelta,
             totalRows: totalRows,
+            totalCols: totalCols,
             maxRowBuffers: maxRowBuffers
         )
     }
 
+    /// Returns false if a row buffer allocation failed while shifting an
+    /// otherwise-non-empty row (srcCount > 0) — the caller must propagate
+    /// this to zonvie_core_abort_flush() rather than silently committing a
+    /// frame with that row blanked (count set to 0 below): the core only
+    /// expects the vacated band to be empty and assumes every other shifted
+    /// row still shows its real content, so silently dropping one is a
+    /// content-loss bug, not a safe degradation, the same class of issue
+    /// GlyphAtlas.uploadRegion's failure path exists to avoid.
+    @discardableResult
     private func cpuShiftMainRowBuffers(
         setIdx: Int,
         rowStart: Int,
@@ -3471,13 +4404,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowsDelta: Int,
         totalRows: Int,
         totalCols: Int
-    ) {
-        prepareRowModeSetForWrite(setIdx, totalRows: totalRows)
-        remapMainRowSlots(setIdx: setIdx, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows)
+    ) -> Bool {
+        prepareRowModeSetForWrite(setIdx, totalRows: totalRows, totalCols: totalCols)
+        remapMainRowSlots(setIdx: setIdx, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols)
 
         let regionHeight = rowEnd - rowStart
         let shift = abs(rowsDelta)
-        guard shift > 0, shift < regionHeight else { return }
+        guard shift > 0, shift < regionHeight else { return true }
+        var didFail = false
 
         let drawableH: Float = {
             lock.lock()
@@ -3496,12 +4430,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if rowsDelta > 0 {
             for dstRow in rowStart..<(rowEnd - shift) {
                 let srcRow = dstRow + shift
+                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
                 guard srcRow < srcSet.rowLogicalToSlot.count else {
-                    bufferSets[setIdx].rowState.counts[dstRow] = 0
+                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }
                 let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
                 guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
@@ -3512,7 +4446,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     continue
                 }
                 guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                    // Allocation failure with real content to preserve
+                    // (srcCount > 0, checked above) — not a safe row-empty
+                    // case, see this function's doc comment.
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
+                    didFail = true
                     continue
                 }
                 let byteCount = srcCount * MemoryLayout<Vertex>.stride
@@ -3540,13 +4478,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 let srcSlot = srcSet.rowLogicalToSlot[srcRow]
                 let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+                guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
+                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
+                    continue
+                }
                 let srcCount = srcSet.rowState.counts[srcSlot]
                 guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
                     continue
                 }
                 guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+                    // Allocation failure with real content to preserve
+                    // (srcCount > 0, checked above) — not a safe row-empty
+                    // case, see this function's doc comment.
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
+                    didFail = true
                     continue
                 }
                 let byteCount = srcCount * MemoryLayout<Vertex>.stride
@@ -3567,6 +4513,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         markDirtyRows(rowStart: rowStart, rowCount: rowEnd - rowStart)
+        return !didFail
     }
 
     private func ndcX(_ xPx: Float, drawableWidth: Float) -> Float {
@@ -3575,31 +4522,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     private func ndcY(_ yPx: Float, drawableHeight: Float) -> Float {
         return 1.0 - (yPx / max(1.0, drawableHeight)) * 2.0
-    }
-
-    private func appendBackgroundQuadVertices(
-        _ out: inout [Vertex],
-        x0: Float,
-        y0: Float,
-        x1: Float,
-        y1: Float,
-        drawableWidth: Float,
-        drawableHeight: Float,
-        bgRGB: UInt32
-    ) {
-        let r = Float((bgRGB >> 16) & 0xFF) / 255.0
-        let g = Float((bgRGB >> 8) & 0xFF) / 255.0
-        let b = Float(bgRGB & 0xFF) / 255.0
-        let color = simd_float4(r, g, b, 1.0)
-        let tl = Vertex(position: simd_float2(ndcX(x0, drawableWidth: drawableWidth), ndcY(y0, drawableHeight: drawableHeight)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let tr = Vertex(position: simd_float2(ndcX(x1, drawableWidth: drawableWidth), ndcY(y0, drawableHeight: drawableHeight)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let bl = Vertex(position: simd_float2(ndcX(x0, drawableWidth: drawableWidth), ndcY(y1, drawableHeight: drawableHeight)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let br = Vertex(position: simd_float2(ndcX(x1, drawableWidth: drawableWidth), ndcY(y1, drawableHeight: drawableHeight)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        out.append(contentsOf: [tl, bl, tr, tr, bl, br])
     }
 
     private func encodePendingMainRowScrollCopy(
@@ -3660,20 +4582,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let top = max(0, clearBand.clearTopPx)
         let bottom = max(top, clearBand.clearBottomPx)
         guard bottom > top else { return }
-        var verts: [Vertex] = []
-        verts.reserveCapacity(6)
-        appendBackgroundQuadVertices(
-            &verts,
-            x0: 0,
-            y0: Float(top),
-            x1: drawableWidth,
-            y1: Float(bottom),
-            drawableWidth: drawableWidth,
-            drawableHeight: drawableHeight,
-            bgRGB: bgRGB
-        )
-        verts.withUnsafeBytes { bytes in
-            encoder.setVertexBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+        let r = Float((bgRGB >> 16) & 0xFF) / 255.0
+        let g = Float((bgRGB >> 8) & 0xFF) / 255.0
+        let b = Float(bgRGB & 0xFF) / 255.0
+        let color = simd_float4(r, g, b, 1.0)
+        let x0 = ndcX(0, drawableWidth: drawableWidth)
+        let x1 = ndcX(drawableWidth, drawableWidth: drawableWidth)
+        let y0 = ndcY(Float(top), drawableHeight: drawableHeight)
+        let y1 = ndcY(Float(bottom), drawableHeight: drawableHeight)
+        let tl = Vertex(position: simd_float2(x0, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let tr = Vertex(position: simd_float2(x1, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let bl = Vertex(position: simd_float2(x0, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        let br = Vertex(position: simd_float2(x1, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
+        // (no heap) instead of building a fresh [Vertex] array every scroll frame.
+        withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
+            buffer[0] = tl
+            buffer[1] = bl
+            buffer[2] = tr
+            buffer[3] = tr
+            buffer[4] = bl
+            buffer[5] = br
+            encoder.setVertexBytes(buffer.baseAddress!, length: MemoryLayout<Vertex>.stride * 6, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
     }
@@ -3684,18 +4614,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// When scroll_fast_path_blocked (e.g. touched-row overflow in
     /// Grid.recordScrollTouchedRow), this is NOT called and both frontends
     /// fall back to full dirty-row regeneration via on_vertices_row.
-    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+    ///
+    /// Returns false only when the CPU-shift fallback (cpuShiftMainRowBuffers)
+    /// failed to allocate storage for a row it needed to preserve — the
+    /// caller (ZonvieCore.swift's on_main_row_scroll registration) must call
+    /// zonvie_core_abort_flush() in that case, matching the pattern already
+    /// used for on_atlas_upload failures, instead of silently committing a
+    /// frame with that row blanked.
+    @discardableResult
+    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) -> Bool {
         guard isInFlush else {
             ZonvieCore.appLog("[WARNING] applySurfaceRowScrollRaw called outside flush bracket")
-            return
+            return true
         }
-        guard rowsDelta != 0 else { return }
-        guard rowStart >= 0, rowEnd > rowStart else { return }
-        guard colStart == 0, colEnd == totalCols else { return }
+        guard rowsDelta != 0 else { return true }
+        guard rowStart >= 0, rowEnd > rowStart else { return true }
+        guard colStart == 0, colEnd == totalCols else { return true }
+        guard prepareMainWriteState() else { return false }
+        flushHasStructuralMainChange = true
 
         let s = writeSetIndex
         if canUseGpuMainRowScrollCopy() {
-            remapMainRowSlots(setIdx: s, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows)
+            remapMainRowSlots(setIdx: s, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols)
             bufferSets[s].pendingScroll = SurfaceRowScroll(
                 rowStart: rowStart,
                 rowEnd: rowEnd,
@@ -3707,9 +4647,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             )
             // pendingScrollAccum is accumulated in commitFlush() (not here)
             // to ensure draw() never sees a delta ahead of committed vertex data.
+            return true
         } else {
             bufferSets[s].pendingScroll = nil
-            cpuShiftMainRowBuffers(
+            let ok = cpuShiftMainRowBuffers(
                 setIdx: s,
                 rowStart: rowStart,
                 rowEnd: rowEnd,
@@ -3721,30 +4662,44 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lock.lock()
             pendingScrollAccum = nil
             lock.unlock()
+            return ok
         }
     }
 
-    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0) {
+    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0, totalCols: Int = 0) {
         guard isInFlush else {
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
         }
         // We currently assume Zig calls with rowCount == 1 (contract in Zig onFlush).
         guard rowCount > 0 else { return }
+        guard prepareMainWriteState() else { return }
 
         let perfEnabled = ZonvieCore.appLogEnabled
         let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
-        submitSurfaceRowVertices(
+        let sourceSet = bufferSets[flushSourceSetIndex]
+        let changesRowStructure = !sourceSet.rowState.usingRowBuffers
+            || (totalRows > 0 && totalRows != sourceSet.knownTotalRows)
+            || (totalCols > 0 && totalCols != sourceSet.knownTotalCols)
+        let submitted = submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
-            sourceSet: bufferSets[flushSourceSetIndex],
+            sourceSet: sourceSet,
             device: device,
             rowStart: rowStart,
             ptr: UnsafeRawPointer(ptr),
             count: count,
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
-            gpuInFlight: isAnyGpuInFlight()
+            totalCols: totalCols,
+            inflightRowBuffers: { (self.inflightRowBuffer(atSlot: $0), nil) }
         )
+        if !submitted {
+            flushFailed = true
+        } else if changesRowStructure {
+            flushHasStructuralMainChange = true
+        } else {
+            flushChangedMainRows.insert(rowStart)
+        }
         if perfEnabled {
             let dt = zonvie_core_perf_now_ns() - t0
             perfRowSubmitNs &+= dt
@@ -3763,6 +4718,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if rowCount > 0 {
             let end = max(rowStart, rowStart + rowCount)
             pendingDirtyRows.insert(integersIn: rowStart..<end)
+            // isInFlush is core-thread-only; all in-flush callers of this
+            // method run on the core thread (row/partial submit paths).
+            if isInFlush {
+                flushDirtyRows.insert(integersIn: rowStart..<end)
+            }
         }
     }
 
@@ -3781,6 +4741,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if rowCount > 0 {
             let end = max(rowStart, rowStart + rowCount)
             pendingDirtyRows.insert(integersIn: rowStart..<end)
+        }
+
+        // isInFlush is core-thread-only; all in-flush callers of this
+        // method run on the core thread (cursor erase path).
+        if isInFlush {
+            if let cur = flushDirtyRectPx {
+                flushDirtyRectPx = cur.union(rectPx)
+            } else {
+                flushDirtyRectPx = rectPx
+            }
+            if rowCount > 0 {
+                let end = max(rowStart, rowStart + rowCount)
+                flushDirtyRows.insert(integersIn: rowStart..<end)
+            }
         }
     }
 
