@@ -19,6 +19,10 @@ typedef struct zonvie_font_feature {
 
 // face_index is the TTC/collection face index (CoreText kCTFontIndexAttribute).
 zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index);
+// Borrowed variant: font_bytes must remain valid until destroy. Used by the
+// macOS fallback cache with a retained mmap-backed NSData to avoid a second
+// full-font allocation/copy inside the C bridge.
+zonvie_ft_hb_font* zonvie_ft_hb_font_create_borrowed(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index);
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f);
 
 // Set OpenType features for HarfBuzz shaping.
@@ -95,4 +99,3 @@ int zonvie_ft_hb_get_ascii_lig_triggers(zonvie_ft_hb_font* f, uint8_t* out_lig_t
 #ifdef __cplusplus
 }
 #endif
-

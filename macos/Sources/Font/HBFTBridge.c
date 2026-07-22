@@ -19,6 +19,7 @@ struct zonvie_ft_hb_font {
   hb_buffer_t* hb_buf;
 
   uint8_t* font_bytes_owned;
+  int owns_font_bytes;
   size_t font_len;
   uint32_t pixel_size;  // stored for hb_font_set_scale re-apply after variation changes
 
@@ -135,15 +136,21 @@ static void build_ascii_tables(zonvie_ft_hb_font* f) {
   f->ascii_tables_valid = 1;
 }
 
-zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index) {
+static zonvie_ft_hb_font* zonvie_ft_hb_font_create_impl(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index, int copy_bytes) {
   if (!font_bytes || font_len == 0 || pixel_size == 0) return NULL;
 
   zonvie_ft_hb_font* f = (zonvie_ft_hb_font*)calloc(1, sizeof(*f));
   if (!f) return NULL;
 
-  f->font_bytes_owned = (uint8_t*)malloc(font_len);
-  if (!f->font_bytes_owned) { free(f); return NULL; }
-  memcpy(f->font_bytes_owned, font_bytes, font_len);
+  if (copy_bytes) {
+    f->font_bytes_owned = (uint8_t*)malloc(font_len);
+    if (!f->font_bytes_owned) { free(f); return NULL; }
+    memcpy(f->font_bytes_owned, font_bytes, font_len);
+    f->owns_font_bytes = 1;
+  } else {
+    f->font_bytes_owned = (uint8_t*)font_bytes;
+    f->owns_font_bytes = 0;
+  }
   f->font_len = font_len;
 
   if (FT_Init_FreeType(&f->ft_lib) != 0) goto fail;
@@ -179,6 +186,14 @@ zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t fo
 fail:
   zonvie_ft_hb_font_destroy(f);
   return NULL;
+}
+
+zonvie_ft_hb_font* zonvie_ft_hb_font_create(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index) {
+  return zonvie_ft_hb_font_create_impl(font_bytes, font_len, pixel_size, face_index, 1);
+}
+
+zonvie_ft_hb_font* zonvie_ft_hb_font_create_borrowed(const uint8_t* font_bytes, size_t font_len, uint32_t pixel_size, uint32_t face_index) {
+  return zonvie_ft_hb_font_create_impl(font_bytes, font_len, pixel_size, face_index, 0);
 }
 
 void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feature* features, size_t count) {
@@ -259,7 +274,7 @@ void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {
   if (f->ft_face) FT_Done_Face(f->ft_face);
   if (f->ft_lib) FT_Done_FreeType(f->ft_lib);
 
-  if (f->font_bytes_owned) free(f->font_bytes_owned);
+  if (f->owns_font_bytes && f->font_bytes_owned) free(f->font_bytes_owned);
   free(f);
 }
 
@@ -307,13 +322,22 @@ size_t zonvie_hb_shape_utf32(
     return (size_t)glyph_count; // signal "needed"
   }
 
+  // RTL runs (Arabic/Hebrew via guess_segment_properties) come back in
+  // VISUAL order with descending cluster values. The core's cluster walker
+  // assumes monotonically ascending clusters (it computes next - this and
+  // indexes the scalar run with it), so emit backward runs reversed into
+  // logical order. Glyph forms (joining, marks) are already resolved by the
+  // shaper; only the output order changes. Bidi visual reordering is the
+  // application's (nvim's) concern, not the grid renderer's.
+  const int backward = HB_DIRECTION_IS_BACKWARD(hb_buffer_get_direction(f->hb_buf));
   for (unsigned int i = 0; i < glyph_count; i++) {
-    out_glyph_ids[i] = infos[i].codepoint;
-    if (out_clusters) out_clusters[i] = infos[i].cluster;
-    out_x_advance[i] = poss[i].x_advance;
-    out_y_advance[i] = poss[i].y_advance;
-    out_x_offset[i]  = poss[i].x_offset;
-    out_y_offset[i]  = poss[i].y_offset;
+    const unsigned int src = backward ? (glyph_count - 1 - i) : i;
+    out_glyph_ids[i] = infos[src].codepoint;
+    if (out_clusters) out_clusters[i] = infos[src].cluster;
+    out_x_advance[i] = poss[src].x_advance;
+    out_y_advance[i] = poss[src].y_advance;
+    out_x_offset[i]  = poss[src].x_offset;
+    out_y_offset[i]  = poss[src].y_offset;
   }
   return (size_t)glyph_count;
 }
@@ -406,4 +430,3 @@ int zonvie_ft_hb_get_ascii_lig_triggers(zonvie_ft_hb_font* f, uint8_t* out_lig_t
   memcpy(out_lig_triggers, f->ascii_lig_triggers, sizeof(f->ascii_lig_triggers));
   return 1;
 }
-
