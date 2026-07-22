@@ -31,6 +31,8 @@
 		ABCC10022F10000000000002 /* ConnectionMenuViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10012F10000000000001 /* ConnectionMenuViewController.swift */; };
 		ABCC10042F10000000000004 /* SessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10032F10000000000003 /* SessionManager.swift */; };
 		ABCC10062F10000000000006 /* SessionMenuController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCC10052F10000000000005 /* SessionMenuController.swift */; };
+		ACF001012F2000010072639A /* ExternalFontResetState.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001002F2000010072639A /* ExternalFontResetState.swift */; };
+		ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF002002F2000020072639A /* FlushRetryBackoff.swift */; };
 
 /* End PBXBuildFile section */
 
@@ -61,6 +63,8 @@
 		ABCC10012F10000000000001 /* ConnectionMenuViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMenuViewController.swift; sourceTree = "<group>"; };
 		ABCC10032F10000000000003 /* SessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionManager.swift; sourceTree = "<group>"; };
 		ABCC10052F10000000000005 /* SessionMenuController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionMenuController.swift; sourceTree = "<group>"; };
+		ACF001002F2000010072639A /* ExternalFontResetState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalFontResetState.swift; sourceTree = "<group>"; };
+		ACF002002F2000020072639A /* FlushRetryBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlushRetryBackoff.swift; sourceTree = "<group>"; };
 
 /* End PBXFileReference section */
 
@@ -125,6 +129,7 @@
 			isa = PBXGroup;
 			children = (
 				AB9AE9C72EF23C170072639A /* ZonvieCore.swift */,
+				ACF002002F2000020072639A /* FlushRetryBackoff.swift */,
 				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
 			);
 			path = Core;
@@ -147,6 +152,7 @@
 				AB9AE9BA2EF22AED0072639A /* Shaders.metal */,
 				AB9AE9C42EF236FC0072639A /* MetalTypes.swift */,
 				ABCA11BA2EFB01010072639A /* CustomShaderPipeline.swift */,
+				ACF001002F2000010072639A /* ExternalFontResetState.swift */,
 			);
 			path = Rendering;
 			sourceTree = "<group>";
@@ -269,6 +275,8 @@
 				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
 				AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */,
 				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
+				ACF001012F2000010072639A /* ExternalFontResetState.swift in Sources */,
+				ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */,
 				AB79DAFF2F1621F7005729E6 /* Config.swift in Sources */,
 				AB79DB012F1621F8005729E6 /* TabBarView.swift in Sources */,
 				AB79DB032F1621F9005729E6 /* TabSidebarView.swift in Sources */,
