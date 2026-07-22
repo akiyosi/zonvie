@@ -110,7 +110,12 @@ var g_CreateDispatcherQueueController: ?CreateDispatcherQueueControllerFn = null
 var g_winrt_loaded: bool = false;
 
 fn loadWinRTFunctions() bool {
-    if (g_winrt_loaded) return g_RoInitialize != null;
+    if (g_winrt_loaded) {
+        return g_RoInitialize != null and
+            g_RoActivateInstance != null and
+            g_WindowsCreateString != null and
+            g_CreateDispatcherQueueController != null;
+    }
     g_winrt_loaded = true;
 
     // Load combase.dll
@@ -180,19 +185,37 @@ fn createHStringFromPtr(ptr: [*]const u16, len: u32) HSTRING {
 
 /// Initialize WinRT Composition for backdrop blur
 pub fn init(hwnd: c.HWND) bool {
+    // Re-init must always be deinit-then-init, never an accumulate: without
+    // this, a second init() call while already initialized would overwrite
+    // dispatcher_queue_controller/compositor with new handles, dropping the
+    // old ones without releasing them (see LOW-5).
+    if (g_state.initialized) deinit();
+
+    initInner(hwnd) catch return false;
+    g_state.initialized = true;
+    if (applog.isEnabled()) applog.appLog("[winrt] WinRT Composition initialized successfully\n", .{});
+    return true;
+}
+
+/// Does the actual step-by-step init. Each successful assignment into
+/// g_state is immediately paired with an errdefer that releases it, so a
+/// later step failing (returning an error) does not leak the objects
+/// created by earlier steps (see LOW-1). Zig runs errdefers in reverse
+/// order automatically.
+fn initInner(hwnd: c.HWND) !void {
     if (applog.isEnabled()) applog.appLog("[winrt] Initializing WinRT Composition\n", .{});
 
     // Load WinRT functions dynamically
     if (!loadWinRTFunctions()) {
         if (applog.isEnabled()) applog.appLog("[winrt] Failed to load WinRT functions\n", .{});
-        return false;
+        return error.WinRTLoadFailed;
     }
 
     // Initialize WinRT
     var hr = g_RoInitialize.?(RO_INIT_SINGLETHREADED);
     if (c.FAILED(hr) and hr != @as(c.HRESULT, @bitCast(@as(u32, 0x80010106)))) { // RPC_E_CHANGED_MODE is OK
         if (applog.isEnabled()) applog.appLog("[winrt] RoInitialize failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
-        return false;
+        return error.RoInitializeFailed;
     }
     if (applog.isEnabled()) applog.appLog("[winrt] RoInitialize ok\n", .{});
 
@@ -206,9 +229,14 @@ pub fn init(hwnd: c.HWND) bool {
     hr = g_CreateDispatcherQueueController.?(&options, &g_state.dispatcher_queue_controller);
     if (c.FAILED(hr)) {
         if (applog.isEnabled()) applog.appLog("[winrt] CreateDispatcherQueueController failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
-        return false;
+        return error.CreateDispatcherQueueControllerFailed;
     }
     if (applog.isEnabled()) applog.appLog("[winrt] CreateDispatcherQueueController ok\n", .{});
+    errdefer {
+        const unk: *IInspectable = @ptrCast(@alignCast(g_state.dispatcher_queue_controller.?));
+        _ = unk.lpVtbl.Release(unk);
+        g_state.dispatcher_queue_controller = null;
+    }
 
     // Create Compositor via RoActivateInstance
     // Class name: "Windows.UI.Composition.Compositor" (34 chars)
@@ -217,7 +245,7 @@ pub fn init(hwnd: c.HWND) bool {
 
     if (hstr == null) {
         if (applog.isEnabled()) applog.appLog("[winrt] Failed to create HSTRING for Compositor class\n", .{});
-        return false;
+        return error.CreateHStringFailed;
     }
     defer {
         if (g_WindowsDeleteString) |deleteStr| {
@@ -228,9 +256,14 @@ pub fn init(hwnd: c.HWND) bool {
     hr = g_RoActivateInstance.?(hstr, &g_state.compositor);
     if (c.FAILED(hr) or g_state.compositor == null) {
         if (applog.isEnabled()) applog.appLog("[winrt] RoActivateInstance(Compositor) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
-        return false;
+        return error.RoActivateInstanceFailed;
     }
     if (applog.isEnabled()) applog.appLog("[winrt] RoActivateInstance(Compositor) ok: 0x{x}\n", .{@intFromPtr(g_state.compositor)});
+    errdefer {
+        const compositor = g_state.compositor.?;
+        _ = compositor.lpVtbl.Release(compositor);
+        g_state.compositor = null;
+    }
 
     // Query for ICompositorDesktopInterop
     hr = g_state.compositor.?.lpVtbl.QueryInterface(
@@ -240,9 +273,14 @@ pub fn init(hwnd: c.HWND) bool {
     );
     if (c.FAILED(hr) or g_state.desktop_interop == null) {
         if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
-        return false;
+        return error.QueryDesktopInteropFailed;
     }
     if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorDesktopInterop) ok\n", .{});
+    errdefer {
+        const interop = g_state.desktop_interop.?;
+        _ = interop.lpVtbl.Release(interop);
+        g_state.desktop_interop = null;
+    }
 
     // Query for ICompositorInterop (for swapchain surface)
     hr = g_state.compositor.?.lpVtbl.QueryInterface(
@@ -255,6 +293,11 @@ pub fn init(hwnd: c.HWND) bool {
         // Not fatal, continue
     } else {
         if (applog.isEnabled()) applog.appLog("[winrt] QueryInterface(ICompositorInterop) ok\n", .{});
+        errdefer {
+            const interop = g_state.compositor_interop.?;
+            _ = interop.lpVtbl.Release(interop);
+            g_state.compositor_interop = null;
+        }
     }
 
     // Create DesktopWindowTarget
@@ -266,17 +309,12 @@ pub fn init(hwnd: c.HWND) bool {
     );
     if (c.FAILED(hr) or g_state.desktop_target == null) {
         if (applog.isEnabled()) applog.appLog("[winrt] CreateDesktopWindowTarget failed: 0x{x}\n", .{@as(u32, @bitCast(hr))});
-        return false;
+        return error.CreateDesktopWindowTargetFailed;
     }
     if (applog.isEnabled()) applog.appLog("[winrt] CreateDesktopWindowTarget ok: 0x{x}\n", .{@intFromPtr(g_state.desktop_target)});
 
-    g_state.initialized = true;
-    if (applog.isEnabled()) applog.appLog("[winrt] WinRT Composition initialized successfully\n", .{});
-
     // TODO: Create backdrop brush and sprite visual
     // This requires more WinRT interface definitions (ICompositor2, ISpriteVisual, etc.)
-
-    return true;
 }
 
 /// Cleanup WinRT Composition resources

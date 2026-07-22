@@ -11,6 +11,8 @@ pub const c = @import("win32.zig").c;
 pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
+const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
+pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
@@ -35,21 +37,27 @@ pub const zonvie_core_send_key_event = core.zonvie_core_send_key_event;
 pub const zonvie_core_resize = core.zonvie_core_resize;
 pub const zonvie_core_try_resize_grid = core.zonvie_core_try_resize_grid;
 pub const zonvie_core_get_viewport = core.zonvie_core_get_viewport;
+pub const zonvie_core_try_get_viewport = core.zonvie_core_try_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
 pub const zonvie_core_try_get_visible_grids = core.zonvie_core_try_get_visible_grids;
+pub const zonvie_core_try_get_visible_grids_complete = core.zonvie_core_try_get_visible_grids_complete;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
+pub const zonvie_core_try_get_cursor_position = core.zonvie_core_try_get_cursor_position;
 pub const zonvie_core_get_win_id = core.zonvie_core_get_win_id;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
 pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
 pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
+pub const zonvie_core_try_get_cursor_blink = core.zonvie_core_try_get_cursor_blink;
 pub const zonvie_core_send_mouse_scroll = core.zonvie_core_send_mouse_scroll;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
+pub const zonvie_core_process_pending_msg_scroll_retry_needed = core.zonvie_core_process_pending_msg_scroll_retry_needed;
 pub const zonvie_core_send_mouse_input = core.zonvie_core_send_mouse_input;
 pub const zonvie_core_update_layout_px = core.zonvie_core_update_layout_px;
 pub const zonvie_core_set_screen_cols = core.zonvie_core_set_screen_cols;
 pub const zonvie_core_get_hl_by_name = core.zonvie_core_get_hl_by_name;
+pub const zonvie_core_get_hl_by_names_batch = core.zonvie_core_get_hl_by_names_batch;
 pub const zonvie_core_set_log_enabled = core.zonvie_core_set_log_enabled;
 pub const zonvie_core_set_log_perf_only = core.zonvie_core_set_log_perf_only;
 pub const zonvie_core_set_ext_cmdline = core.zonvie_core_set_ext_cmdline;
@@ -57,6 +65,7 @@ pub const zonvie_core_set_ext_popupmenu = core.zonvie_core_set_ext_popupmenu;
 pub const zonvie_core_set_ext_messages = core.zonvie_core_set_ext_messages;
 pub const zonvie_core_set_ext_tabline = core.zonvie_core_set_ext_tabline;
 pub const zonvie_core_tick_msg_throttle = core.zonvie_core_tick_msg_throttle;
+pub const zonvie_core_try_next_msg_timeout_ms = core.zonvie_core_try_next_msg_timeout_ms;
 pub const zonvie_core_set_blur_enabled = core.zonvie_core_set_blur_enabled;
 pub const zonvie_core_set_inherit_cwd = core.zonvie_core_set_inherit_cwd;
 pub const zonvie_core_set_glyph_cache_size = core.zonvie_core_set_glyph_cache_size;
@@ -75,6 +84,9 @@ pub const zonvie_core_perf_now_ns = core.zonvie_core_perf_now_ns;
 pub const zonvie_version = core.zonvie_version;
 pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;
 pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
+pub const zonvie_core_retry_flush = core.zonvie_core_retry_flush;
+pub const zonvie_core_flush_had_atlas_corruption = core.zonvie_core_flush_had_atlas_corruption;
+pub const zonvie_core_flush_was_aborted = core.zonvie_core_flush_was_aborted;
 pub const zonvie_core_invalidate_glyph_cache = core.zonvie_core_invalidate_glyph_cache;
 
 // Re-export additional core types used by sub-modules
@@ -163,15 +175,39 @@ pub const WM_APP_THEME_REREAD: c.UINT = c.WM_APP + 29;
 /// The UI thread's handler opens the native ChooseFontW dialog (which must
 /// run on the UI thread, not the core thread that fires the callback).
 pub const WM_APP_OPEN_FONT_PICKER: c.UINT = c.WM_APP + 30;
+/// Posted from WM_PAINT when the D3D11 device is lost (TDR / driver reset).
+/// The handler rebuilds the shared device, the D2D interop, the main
+/// renderer, and every external window's renderer, then forces a full
+/// reseed. Without this the app freezes forever after a TDR.
+pub const WM_APP_DEVICE_LOST_RECOVER: c.UINT = c.WM_APP + 31;
+/// Posted from onFlushBegin (CORE thread) when it aborts a flush. SetTimer
+/// must run on the thread that owns hwnd's message queue (the UI thread),
+/// so the core thread cannot arm TIMER_FLUSH_RETRY directly — it records a
+/// durable request and posts this wakeup. The UI message loop consumes that
+/// request directly if PostMessageW fails because the queue is full.
+pub const WM_APP_FLUSH_RETRY_ARM: c.UINT = c.WM_APP + 32;
+/// Coalesced request from onFlushEnd to arm/cancel the message throttle
+/// one-shot timer after grid_mu has been released.
+pub const WM_APP_MSG_THROTTLE_ARM: c.UINT = c.WM_APP + 33;
+/// Posted from onFlushEnd when glow first becomes enabled. The UI-thread
+/// handler compiles bloom shaders before invalidating glow-enabled surfaces.
+pub const WM_APP_PREPARE_GLOW: c.UINT = c.WM_APP + 34;
+/// Timer-queue fallback messages are distinct from WM_TIMER so a late
+/// callback cannot consume a newer HWND timer generation.
+pub const WM_APP_PAINT_RETRY_FALLBACK: c.UINT = c.WM_APP + 35;
+pub const WM_APP_DEVICE_LOST_RETRY_FALLBACK: c.UINT = c.WM_APP + 36;
+pub const WM_APP_SIZE_REPLAY_FALLBACK: c.UINT = c.WM_APP + 37;
+pub const WM_APP_EXTERNAL_CREATE_RETRY_FALLBACK: c.UINT = c.WM_APP + 38;
+pub const WM_APP_FLUSH_RETRY_FALLBACK: c.UINT = c.WM_APP + 39;
 /// Posted from WM_CREATE when launched with `--dialog`; the handler shows the
 /// startup connection dialog once the main window exists (see dialogs.zig).
-pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 31;
+pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 40;
 /// Posted from the on_main_grid_size callback when Neovim resizes the global
 /// grid itself (`:set columns=` / `:set lines=`). wParam = rows, lParam = cols.
 /// The UI thread's handler grows/shrinks the main window by the terminal-area
 /// delta. Posted (not sent) because the callback runs on the core thread with
 /// grid_mu held, and SetWindowPos would re-enter updateLayoutToCore.
-pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 32;
+pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -212,6 +248,42 @@ pub const CUSTOM_SHADER_ANIM_INTERVAL_MS: c.UINT = 16;
 pub const TIMER_AGENT_SPINNER: c.UINT_PTR = 12;
 /// Frame cadence for the agent spinner (matches Claude Code's 120ms).
 pub const AGENT_SPINNER_INTERVAL_MS: c.UINT = 120;
+/// One-shot retry timer for cursor-blink settings reads that hit grid_mu
+/// contention (WM_APP_UPDATE_CURSOR_BLINK is posted while the core thread
+/// still holds grid_mu, so a busy tryLock there is structurally common).
+pub const TIMER_CURSOR_BLINK_RETRY: c.UINT_PTR = 13;
+/// One-shot retry timer for scrollbar updates that only saw a stale cached
+/// viewport under grid_mu contention (the WM_APP_UPDATE_SCROLLBAR message
+/// is one-shot; without a retry the post-scroll repaint would be dropped).
+pub const TIMER_SCROLLBAR_RETRY: c.UINT_PTR = 14;
+/// Retry cadence for the two grid_mu-contention retry timers above
+/// (mirrors macOS's 16ms timer re-arm for the same conversions).
+pub const LOCK_RETRY_INTERVAL_MS: c.UINT = 16;
+/// One-shot retry after a failed device-loss recovery. D3D11CreateDevice
+/// transiently fails while the driver is still mid-reset right after a TDR,
+/// and the WM_PAINT re-post condition (renderer.device_lost) is unreachable
+/// once app.renderer is null — this timer is the only retry path then.
+pub const TIMER_DEVICE_LOST_RETRY: c.UINT_PTR = 15;
+pub const DEVICE_LOST_RETRY_INTERVAL_MS: c.UINT = 1000;
+/// Compatibility timer ID for a queued flush retry. New retries use the main
+/// message loop's allocation-free deadline driver and exponential backoff, so
+/// permanent frontend allocation failures neither lose their wake nor spin at
+/// a fixed frame cadence.
+pub const TIMER_FLUSH_RETRY: c.UINT_PTR = 16;
+pub const FLUSH_RETRY_INTERVAL_MS: c.UINT = LOCK_RETRY_INTERVAL_MS;
+pub const FLUSH_RETRY_MAX_MS: u32 = 2000;
+/// One-shot completion retry for throttled message-grid scrolling.
+pub const TIMER_MSG_SCROLL_RETRY: c.UINT_PTR = 17;
+/// Replays an external WM_SIZE that arrived while device recovery held the
+/// App/renderer generation in an unpublished state.
+pub const TIMER_EXTERNAL_SIZE_REPLAY: c.UINT_PTR = 18;
+pub const TIMER_MSG_THROTTLE: c.UINT_PTR = 19;
+/// Replays a main-window WM_SIZE suppressed during device recovery so the
+/// recovered HWND size is also propagated to Neovim rows/cols.
+pub const TIMER_MAIN_SIZE_REPLAY: c.UINT_PTR = 20;
+pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
+pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
+pub const MSG_SCROLL_RETRY_INTERVAL_MS: c.UINT = 16;
 /// Tray icon init delay in milliseconds
 pub const TRAY_INIT_DELAY_MS: c.UINT = 50;
 /// Quit timeout in milliseconds (5 seconds)
@@ -285,6 +357,23 @@ pub const SCROLLBAR_THROTTLE_MS: i64 = 32; // ~30fps for smooth but not excessiv
 
 // Global exit code for Nvy-style exit (returned from main instead of ExitProcess)
 pub var g_exit_code: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+// Failure/success epochs are the durable retry state. PostMessageW is only a
+// wakeup; the UI thread never clears a producer-owned pending flag, so a
+// failure racing an older success observation cannot be lost.
+pub var g_flush_retry_failure_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_flush_retry_success_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_flush_retry_delivery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var g_external_create_retry_delivery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var g_device_lost_retry_delivery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var g_main_size_replay_delivery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var g_external_size_replay_delivery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var g_next_window_wake_cookie: std.atomic.Value(usize) = std.atomic.Value(usize).init(1);
+
+pub fn nextWindowWakeCookie() usize {
+    var cookie = g_next_window_wake_cookie.fetchAdd(1, .monotonic);
+    if (cookie == 0) cookie = g_next_window_wake_cookie.fetchAdd(1, .monotonic);
+    return cookie;
+}
 
 // --- Startup timing globals ---
 pub var g_startup_freq: c.LARGE_INTEGER = undefined;
@@ -312,6 +401,16 @@ pub const PendingExternalWindow = struct {
     /// the existing entry's seq so the original posted message still
     /// matches.
     seq: u64,
+    /// Set while the UI thread is attempting the fallible HWND/renderer/map
+    /// creation. The request stays queued until every step succeeds so a
+    /// transient failure can be retried without allocating another entry.
+    create_in_progress: bool = false,
+    /// Incremented whenever a same-grid lifecycle callback replaces the
+    /// geometry while this request is being created from an older snapshot.
+    update_revision: u64 = 0,
+    /// A close received while create_in_progress cannot remove this storage;
+    /// the UI thread observes this flag and tears down any just-published HWND.
+    cancel_requested: bool = false,
 };
 
 /// CPU-side surface state shared between external windows and pending
@@ -329,15 +428,16 @@ pub const SurfaceState = struct {
     cols: u32 = 0,
     last_cursor_row: ?u32 = null,
 
-    pub fn ensureRowStorage(self: *SurfaceState, alloc: std.mem.Allocator, row: u32) void {
+    pub fn ensureRowStorage(self: *SurfaceState, alloc: std.mem.Allocator, row: u32) bool {
         const need: usize = @intCast(row + 1);
-        if (self.row_verts.items.len >= need) return;
+        if (self.row_verts.items.len >= need) return true;
         const old_len = self.row_verts.items.len;
-        self.row_verts.resize(alloc, need) catch return;
+        self.row_verts.resize(alloc, need) catch return false;
         var i = old_len;
         while (i < need) : (i += 1) {
             self.row_verts.items[i] = .{};
         }
+        return true;
     }
 
     pub fn clearExtraRows(self: *SurfaceState, needed_rows: u32) void {
@@ -378,22 +478,24 @@ pub const SurfaceState = struct {
 /// Row data is accessed via row_map → SlotPool indirection (COW shared slots).
 pub const VertexSet = struct {
     row_map: std.ArrayListUnmanaged(RowMapping) = .empty, // logical row → physical slot index
-    cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     flat_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     rows: u32 = 0,
     cols: u32 = 0,
-    last_cursor_row: ?u32 = null,
+    // Shared font/cell/linespace generation used to build row NDC. Main
+    // drawable-only resizes deliberately do not affect this value.
+    metrics_gen: u64 = 0,
 
-    pub fn ensureRowStorage(self: *VertexSet, alloc: std.mem.Allocator, row: u32) void {
+    pub fn ensureRowStorage(self: *VertexSet, alloc: std.mem.Allocator, row: u32) bool {
         const need: usize = @intCast(row + 1);
-        if (self.row_map.items.len >= need) return;
+        if (self.row_map.items.len >= need) return true;
         const old_len = self.row_map.items.len;
-        self.row_map.resize(alloc, need) catch return;
+        self.row_map.resize(alloc, need) catch return false;
         var i = old_len;
         while (i < need) : (i += 1) {
             self.row_map.items[i] = .{};
         }
+        return true;
     }
 
     /// Release all slots in this set's row_map via pool, then clear the map.
@@ -411,7 +513,7 @@ pub const VertexSet = struct {
         var total: usize = 0;
         for (self.row_map.items) |m| {
             if (m.slot != SLOT_NONE) {
-                total += pool.slots.items[m.slot].verts.items.len;
+                total += pool.slotPtrConst(m.slot).verts.items.len;
             }
         }
         return total;
@@ -420,15 +522,27 @@ pub const VertexSet = struct {
     /// Free VertexSet-owned arrays. Slot memory is owned by SlotPool.
     /// Caller must releaseAllSlots before calling this.
     pub fn deinitCpu(self: *VertexSet, alloc: std.mem.Allocator) void {
-        self.cursor_verts.deinit(alloc);
         self.flat_verts.deinit(alloc);
         self.row_map.deinit(alloc);
+    }
+};
+
+/// Cursor publication is independent from the O(rows) row-map
+/// snapshot. Cursor callbacks replace this complete (small) buffer, so a
+/// cursor-only flush can rotate one of these sets without cloning row slots.
+pub const CursorSet = struct {
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    last_cursor_row: ?u32 = null,
+
+    fn deinit(self: *CursorSet, alloc: std.mem.Allocator) void {
+        self.verts.deinit(alloc);
     }
 };
 
 /// Snapshot returned by acquireForPaint.
 pub const PaintSnapshot = struct {
     committed_index: u8,
+    cursor_index: u8,
     paint_full: bool,
     /// Scroll state bundled with this committed set (consumed atomically).
     scroll_rect: ?c.RECT = null,
@@ -448,7 +562,7 @@ pub const PaintSnapshot = struct {
 ///  - Vertex data in the write set is accessed lock-free by the core thread during flush.
 ///  - Vertex data in the committed set is accessed lock-free by the UI thread during paint.
 pub const TripleBufferedSurface = struct {
-    pub const SET_COUNT = 3;
+    pub const SET_COUNT = render_pipeline_helpers.SparseRowSyncStorage.set_count;
     sets: [SET_COUNT]VertexSet = .{ .{}, .{}, .{} },
     pool: SlotPool = .{}, // Shared slot pool across all sets
 
@@ -466,13 +580,27 @@ pub const TripleBufferedSurface = struct {
     // when the inner paint releases the outer paints protection.
     ui_read_refcount: [SET_COUNT]u32 = .{ 0, 0, 0 },
 
+    // The cursor rotates under the same lock as the row sets, but has its
+    // own read refs so cursor-only flushes never touch the row_map.
+    main_cursor_sets: [SET_COUNT]CursorSet = .{ .{}, .{}, .{} },
+    main_cursor_write_index: u8 = 0,
+    main_cursor_committed_index: u8 = 1,
+    main_cursor_in_flush: bool = false,
+    main_cursor_flush_paint_full: bool = false,
+    main_cursor_flush_old_row: ?u32 = null,
+    main_cursor_flush_new_row: ?u32 = null,
+    main_cursor_ui_read_refcount: [SET_COUNT]u32 = .{ 0, 0, 0 },
+
     // Dirty state accumulation (rotation_mu protected, WM_PAINT clears).
     pending_dirty: std.DynamicBitSetUnmanaged = .{},
     pending_paint_full: bool = true,
 
-    // Flush-local dirty state (core thread only, no lock needed).
-    flush_dirty: std.DynamicBitSetUnmanaged = .{},
+    // Flush-local dirty state plus the per-set sparse catch-up history.
+    // Extracted as a production type so partial allocation failures can be
+    // exhaustively tested on non-Windows hosts without importing Win32.
+    sparse_sync: render_pipeline_helpers.SparseRowSyncStorage = .{},
     flush_paint_full: bool = false,
+    flush_requires_full_sync: bool = false,
 
     // Flush-local scroll state (core thread only, no lock needed).
     // Accumulated by onMainRowScroll / onGridRowScroll during a single flush.
@@ -496,20 +624,8 @@ pub const TripleBufferedSurface = struct {
     paint_dirty_snapshot: std.DynamicBitSetUnmanaged = .{},
     paint_nesting: u32 = 0,
 
-    /// Check if a free set exists (read-only, short lock).
-    pub fn hasFreeSet(self: *TripleBufferedSurface) bool {
-        self.rotation_mu.lockUncancelable(core.clock.io());
-        defer self.rotation_mu.unlock(core.clock.io());
-        const ci = self.committed_index;
-        for (0..SET_COUNT) |i| {
-            const idx: u8 = @intCast(i);
-            if (idx != ci and self.ui_read_refcount[i] == 0) return true;
-        }
-        return false;
-    }
-
-    /// Begin a flush cycle. Picks a free write set and shallow-copies slot
-    /// mappings from committed (COW — ~130 bytes for 65 rows instead of ~620KB).
+    /// Begin a flush cycle. Picks a free write set and catches up only slot
+    /// mappings changed since that set's previous publication.
     /// Returns false on alloc failure or no free set (caller should abort flush).
     pub fn beginFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) bool {
         var picked: ?u8 = null;
@@ -519,11 +635,18 @@ pub const TripleBufferedSurface = struct {
             self.rotation_mu.lockUncancelable(core.clock.io());
             defer self.rotation_mu.unlock(core.clock.io());
             ci = self.committed_index;
+            var best_cost: usize = std.math.maxInt(usize);
             for (0..SET_COUNT) |i| {
                 const idx: u8 = @intCast(i);
                 if (idx != ci and self.ui_read_refcount[i] == 0) {
-                    picked = idx;
-                    break;
+                    const cost = if (self.sparse_sync.row_sync_full[i])
+                        std.math.maxInt(usize)
+                    else
+                        self.sparse_sync.row_sync_rows[i].items.len;
+                    if (picked == null or cost < best_cost) {
+                        picked = idx;
+                        best_cost = cost;
+                    }
                 }
             }
             if (picked == null) return false;
@@ -533,14 +656,44 @@ pub const TripleBufferedSurface = struct {
 
         const wi = picked.?;
 
-        // Shallow copy from flush_source to write set.
-        if (!self.shallowCopyVertexSet(alloc, wi, ci)) return false;
+        // Recover a previously partial sparse-storage grow before any write
+        // set mutation. The common case is an allocation-free readiness check.
+        if (!self.prepareRowSyncTracking(alloc, self.sets[ci].row_map.items.len)) return false;
+
+        const perf_enabled = applog.isEnabled();
+        var sync_freq: c.LARGE_INTEGER = undefined;
+        var sync_start: c.LARGE_INTEGER = undefined;
+        if (perf_enabled) {
+            _ = c.QueryPerformanceFrequency(&sync_freq);
+            _ = c.QueryPerformanceCounter(&sync_start);
+        }
+        const sparse_row_count = self.sparse_sync.row_sync_rows[wi].items.len;
+        const did_full_sync = self.sparse_sync.row_sync_full[wi] or
+            self.sets[wi].row_map.items.len != self.sets[ci].row_map.items.len;
+
+        // Bring only mappings changed while this set was spare/read-owned up
+        // to the committed snapshot. Dimension/layout barriers use the old
+        // full clone path, but steady one-row updates touch one mapping.
+        if (!self.syncVertexSetForWrite(alloc, wi, ci)) return false;
+
+        if (perf_enabled) {
+            var sync_end: c.LARGE_INTEGER = undefined;
+            _ = c.QueryPerformanceCounter(&sync_end);
+            const sync_us: i64 = if (sync_freq.QuadPart > 0)
+                @divTrunc((sync_end.QuadPart - sync_start.QuadPart) * 1_000_000, sync_freq.QuadPart)
+            else
+                0;
+            applog.appLog(
+                "[perf] tbs_begin_sync rows={d} sparse_rows={d} full={d} total_us={d}\n",
+                .{ self.sets[ci].row_map.items.len, sparse_row_count, @intFromBool(did_full_sync), sync_us },
+            );
+        }
 
         // Clear flush-local dirty state.
-        if (self.flush_dirty.bit_length > 0) {
-            self.flush_dirty.unsetAll();
-        }
+        self.sparse_sync.clearFlushDirty();
+        self.sparse_sync.clearFlushMapping();
         self.flush_paint_full = false;
+        self.flush_requires_full_sync = false;
 
         // Clear flush-local scroll state.
         self.flush_scroll_rect = null;
@@ -553,33 +706,178 @@ pub const TripleBufferedSurface = struct {
         return true;
     }
 
+    /// Reserve persistent sparse-sync state. This storage is core-owned and
+    /// may be resized while a UI reader holds a VertexSet; row maps themselves
+    /// are never reallocated through this method.
+    pub fn prepareRowSyncTracking(self: *TripleBufferedSurface, alloc: std.mem.Allocator, row_count: usize) bool {
+        self.sparse_sync.prepare(alloc, row_count) catch return false;
+        std.debug.assert(self.sparse_sync.isReady(row_count));
+        return true;
+    }
+
+    /// Mark a visual row dirty without claiming that its slot mapping changed
+    /// (cursor damage uses this path).
+    pub fn markFlushDirtyRow(self: *TripleBufferedSurface, row: usize) bool {
+        return self.sparse_sync.markFlushDirtyRow(row);
+    }
+
+    /// Mark a row whose logical-to-physical slot mapping changed, and mark it
+    /// visually dirty as well.
+    pub fn markFlushRowChanged(self: *TripleBufferedSurface, row: usize) bool {
+        if (!self.markFlushDirtyRow(row)) return false;
+        return self.markFlushMappingChanged(row);
+    }
+
+    /// Record a mapping-only change, such as a non-vacated scroll row that is
+    /// moved by Present1 instead of redrawn.
+    pub fn markFlushMappingChanged(self: *TripleBufferedSurface, row: usize) bool {
+        return self.sparse_sync.markFlushMappingRow(row);
+    }
+
+    pub fn requireFullRowSync(self: *TripleBufferedSurface) void {
+        self.flush_requires_full_sync = true;
+    }
+
+    /// Replace the complete cursor buffer for this flush. The
+    /// candidate is reserved before any bytes are overwritten, so OOM leaves
+    /// the last committed cursor intact and the caller can abort the flush.
+    pub fn storeMainCursor(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        verts: []const Vertex,
+        last_cursor_row: ?u32,
+    ) bool {
+        if (!self.main_cursor_in_flush) {
+            var picked: ?u8 = null;
+            self.rotation_mu.lockUncancelable(core.clock.io());
+            const ci = self.main_cursor_committed_index;
+            for (0..SET_COUNT) |i| {
+                const idx: u8 = @intCast(i);
+                if (idx != ci and self.main_cursor_ui_read_refcount[i] == 0) {
+                    picked = idx;
+                    break;
+                }
+            }
+            self.rotation_mu.unlock(core.clock.io());
+            if (picked == null) return false;
+
+            const dst = &self.main_cursor_sets[picked.?];
+            dst.verts.ensureTotalCapacity(alloc, verts.len) catch return false;
+            self.main_cursor_write_index = picked.?;
+            self.main_cursor_flush_paint_full = false;
+            self.main_cursor_flush_old_row = self.main_cursor_sets[ci].last_cursor_row;
+            self.main_cursor_in_flush = true;
+        } else {
+            self.main_cursor_sets[self.main_cursor_write_index].verts.ensureTotalCapacity(alloc, verts.len) catch return false;
+        }
+
+        const dst = &self.main_cursor_sets[self.main_cursor_write_index];
+        dst.verts.clearRetainingCapacity();
+        dst.verts.appendSliceAssumeCapacity(verts);
+        dst.last_cursor_row = last_cursor_row;
+        self.main_cursor_flush_new_row = last_cursor_row;
+        return true;
+    }
+
+    /// Reserve the cursor candidate selected by storeMainCursor without
+    /// publishing it. External-window seed application uses this to keep all
+    /// fallible allocations ahead of its row/cursor publication phase.
+    pub fn reserveMainCursorCapacity(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        vert_count: usize,
+    ) bool {
+        var candidate = self.main_cursor_write_index;
+        if (!self.main_cursor_in_flush) {
+            var picked: ?u8 = null;
+            self.rotation_mu.lockUncancelable(core.clock.io());
+            const ci = self.main_cursor_committed_index;
+            for (0..SET_COUNT) |i| {
+                const idx: u8 = @intCast(i);
+                if (idx != ci and self.main_cursor_ui_read_refcount[i] == 0) {
+                    picked = idx;
+                    break;
+                }
+            }
+            self.rotation_mu.unlock(core.clock.io());
+            candidate = picked orelse return false;
+        }
+        self.main_cursor_sets[candidate].verts.ensureTotalCapacity(alloc, vert_count) catch return false;
+        return true;
+    }
+
+    pub fn markFlushPaintFull(self: *TripleBufferedSurface) void {
+        if (self.is_in_flush) self.flush_paint_full = true;
+        if (self.main_cursor_in_flush) self.main_cursor_flush_paint_full = true;
+    }
+
     /// Cancel a flush (reset is_in_flush without committing).
     pub fn cancelFlush(self: *TripleBufferedSurface) void {
+        if (self.is_in_flush) self.sparse_sync.row_sync_full[self.write_index] = true;
         self.is_in_flush = false;
+        self.main_cursor_in_flush = false;
+        self.main_cursor_flush_paint_full = false;
+        self.main_cursor_flush_old_row = null;
+        self.main_cursor_flush_new_row = null;
     }
 
     /// Commit the write set as the new committed set.
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
-        if (!self.is_in_flush) return;
+        if (!self.is_in_flush and !self.main_cursor_in_flush) return;
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
 
-        // Merge flush_dirty into pending_dirty.
-        if (self.flush_dirty.bit_length > 0) {
-            if (self.pending_dirty.bit_length != self.flush_dirty.bit_length) {
-                // Resize pending_dirty to match flush_dirty.
-                self.pending_dirty.resize(alloc, self.flush_dirty.bit_length, false) catch {
+        // Cursor and rows publish while holding the same lock. A paint can
+        // therefore observe either the complete old pair or complete new pair,
+        // never new rows with the previous cursor (or vice versa).
+        if (self.main_cursor_in_flush) {
+            // The retained back texture contains no cursor after a row draw,
+            // but the currently presented buffer does. Redraw both logical
+            // rows before overlaying the replacement cursor so moves, shape
+            // changes, and disappearance cannot leave the previous cursor.
+            const row_count: usize = if (self.is_in_flush)
+                self.sets[self.write_index].row_map.items.len
+            else
+                self.sets[self.committed_index].row_map.items.len;
+            if (self.pending_dirty.bit_length != row_count) {
+                self.pending_dirty.resize(alloc, row_count, false) catch {
                     self.pending_paint_full = true;
-                    self.flush_dirty.unsetAll();
-                    self.committed_index = self.write_index;
-                    self.commit_rev +%= 1;
-                    self.is_in_flush = false;
-                    return;
+                };
+            }
+            if (self.pending_dirty.bit_length == row_count) {
+                var cursor_dirty_storage: [2]usize = undefined;
+                for (render_pipeline_helpers.cursorDirtyRows(
+                    self.main_cursor_flush_old_row,
+                    self.main_cursor_flush_new_row,
+                    row_count,
+                    &cursor_dirty_storage,
+                )) |row_index| self.pending_dirty.set(row_index);
+            } else {
+                self.pending_paint_full = true;
+            }
+            self.main_cursor_committed_index = self.main_cursor_write_index;
+            if (self.main_cursor_flush_paint_full) self.pending_paint_full = true;
+            self.main_cursor_in_flush = false;
+            self.main_cursor_flush_paint_full = false;
+            self.main_cursor_flush_old_row = null;
+            self.main_cursor_flush_new_row = null;
+        }
+        if (!self.is_in_flush) return;
+
+        // Merge flush_dirty into pending_dirty.
+        if (self.sparse_sync.flush_dirty.bit_length > 0) {
+            if (self.pending_dirty.bit_length != self.sparse_sync.flush_dirty.bit_length) {
+                // Resize pending_dirty to match flush_dirty.
+                self.pending_dirty.resize(alloc, self.sparse_sync.flush_dirty.bit_length, false) catch {
+                    // Dirty-rect precision is optional; row-map publication
+                    // and spare-set catch-up are not. Fall back to a full
+                    // paint but continue through the single publication path.
+                    self.pending_paint_full = true;
                 };
                 // Resize paint_dirty_snapshot if no paint is active.
                 if (self.paint_nesting == 0) {
-                    self.paint_dirty_snapshot.resize(alloc, self.flush_dirty.bit_length, false) catch {
+                    self.paint_dirty_snapshot.resize(alloc, self.sparse_sync.flush_dirty.bit_length, false) catch {
                         self.pending_paint_full = true;
                     };
                 }
@@ -587,8 +885,10 @@ pub const TripleBufferedSurface = struct {
             }
 
             // Bitwise OR merge: pending_dirty |= flush_dirty
-            if (self.pending_dirty.bit_length == self.flush_dirty.bit_length) {
-                self.mergeDirtyBits();
+            if (self.pending_dirty.bit_length == self.sparse_sync.flush_dirty.bit_length) {
+                for (self.sparse_sync.flush_dirty_rows.items) |row| {
+                    if (row < self.pending_dirty.bit_length) self.pending_dirty.set(row);
+                }
             } else {
                 // Length mismatch after resize attempt — fall back to full paint.
                 self.pending_paint_full = true;
@@ -632,7 +932,48 @@ pub const TripleBufferedSurface = struct {
         // via on_vertices_row; the shift described by pending_scroll_* still
         // matches the committed row_map at paint time.
 
-        self.committed_index = self.write_index;
+        const old_committed = self.committed_index;
+        const new_committed = self.write_index;
+        const new_set = &self.sets[new_committed];
+        const old_set = &self.sets[old_committed];
+        const structural_barrier = self.flush_requires_full_sync or
+            new_set.row_mode != old_set.row_mode or
+            new_set.rows != old_set.rows or
+            new_set.cols != old_set.cols or
+            new_set.metrics_gen != old_set.metrics_gen;
+
+        // Publish an exact row-map snapshot while keeping spare sets caught up
+        // by only the mappings changed in this flush. Reader-owned sets merely
+        // accumulate sparse indices and are synchronized after release.
+        self.clearSetStaleTracking(new_committed);
+        for (0..SET_COUNT) |i| {
+            const idx: u8 = @intCast(i);
+            if (idx == new_committed) continue;
+            if (structural_barrier) {
+                self.sparse_sync.row_sync_full[i] = true;
+                self.sparse_sync.clearSetStale(i);
+            } else if (!self.sparse_sync.row_sync_full[i]) {
+                for (self.sparse_sync.flush_mapping_rows.items) |row| {
+                    if (!self.addSetStaleRow(idx, row)) {
+                        self.sparse_sync.row_sync_full[i] = true;
+                        self.sparse_sync.clearSetStale(i);
+                        break;
+                    }
+                }
+            }
+
+            if (self.ui_read_refcount[i] == 0) {
+                if (self.sparse_sync.row_sync_full[i]) {
+                    if (self.shallowCopyVertexSet(alloc, idx, new_committed)) {
+                        self.clearSetStaleTracking(idx);
+                    }
+                } else {
+                    self.applySparseRowSync(alloc, idx, new_committed);
+                }
+            }
+        }
+
+        self.committed_index = new_committed;
         self.commit_rev +%= 1;
         self.is_in_flush = false;
     }
@@ -644,22 +985,34 @@ pub const TripleBufferedSurface = struct {
 
     /// Acquire the committed set for painting. Returns snapshot info.
     /// Caller must call releaseFromPaint when done.
-    pub fn acquireForPaint(self: *TripleBufferedSurface) PaintSnapshot {
+    pub fn acquireForPaint(self: *TripleBufferedSurface, alloc: std.mem.Allocator) PaintSnapshot {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
 
         const ci = self.committed_index;
+        const cursor_ci = self.main_cursor_committed_index;
         self.ui_read_refcount[ci] += 1;
+        self.main_cursor_ui_read_refcount[cursor_ci] += 1;
 
         var paint_full: bool = false;
 
         if (self.paint_nesting == 0) {
             // Outermost paint: snapshot dirty state.
+            var snapshot_ready = true;
             if (self.paint_dirty_snapshot.bit_length != self.pending_dirty.bit_length) {
-                // Size mismatch — fall back to full paint, clear pending.
-                self.pending_paint_full = true;
-                self.pending_dirty.unsetAll();
-            } else if (self.pending_dirty.bit_length > 0) {
+                // A dimension-changing commit can land while another paint is
+                // active, in which case commitFlush deliberately defers this
+                // resize. Retry it here; otherwise the mismatch would persist
+                // forever because pending_dirty already has the new length and
+                // later commits no longer enter their resize branch.
+                self.paint_dirty_snapshot.resize(alloc, self.pending_dirty.bit_length, false) catch {
+                    snapshot_ready = false;
+                    self.pending_paint_full = true;
+                    self.pending_dirty.unsetAll();
+                    self.paint_dirty_snapshot.unsetAll();
+                };
+            }
+            if (snapshot_ready and self.pending_dirty.bit_length > 0) {
                 // Copy pending_dirty → paint_dirty_snapshot (memcpy of backing words).
                 self.copyDirtySnapshot();
                 self.pending_dirty.unsetAll();
@@ -691,6 +1044,7 @@ pub const TripleBufferedSurface = struct {
         self.paint_nesting += 1;
         return .{
             .committed_index = ci,
+            .cursor_index = cursor_ci,
             .paint_full = paint_full,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
@@ -702,10 +1056,11 @@ pub const TripleBufferedSurface = struct {
 
     /// Release the committed set after painting. Returns true if
     /// InvalidateRect is needed (pending dirty accumulated during paint).
-    pub fn releaseFromPaint(self: *TripleBufferedSurface, index: u8) bool {
+    pub fn releaseFromPaint(self: *TripleBufferedSurface, index: u8, cursor_index: u8) bool {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
         self.ui_read_refcount[index] -= 1;
+        self.main_cursor_ui_read_refcount[cursor_index] -= 1;
         self.paint_nesting -= 1;
         // When nesting returns to 0, check if new dirty state accumulated.
         const needs_reinvalidate = (self.paint_nesting == 0) and
@@ -720,6 +1075,71 @@ pub const TripleBufferedSurface = struct {
         return (bit_length + (@bitSizeOf(usize) - 1)) / @bitSizeOf(usize);
     }
 
+    fn clearSetStaleTracking(self: *TripleBufferedSurface, idx: u8) void {
+        self.sparse_sync.row_sync_full[idx] = false;
+        self.sparse_sync.clearSetStale(idx);
+    }
+
+    fn addSetStaleRow(self: *TripleBufferedSurface, idx: u8, row: u32) bool {
+        const stale = &self.sparse_sync.row_sync_stale[idx];
+        if (row >= stale.bit_length) return false;
+        if (!stale.isSet(row)) {
+            // prepareRowSyncTracking reserves row_count entries, so this is
+            // infallible in steady state. If a caller missed the dimension
+            // barrier, conservatively force a complete clone.
+            if (self.sparse_sync.row_sync_rows[idx].items.len == self.sparse_sync.row_sync_rows[idx].capacity) return false;
+            self.sparse_sync.row_sync_rows[idx].appendAssumeCapacity(row);
+            stale.set(row);
+        }
+        return true;
+    }
+
+    fn applySparseRowSync(self: *TripleBufferedSurface, alloc: std.mem.Allocator, dst_idx: u8, src_idx: u8) void {
+        const dst = &self.sets[dst_idx];
+        const src = &self.sets[src_idx];
+        std.debug.assert(dst.row_map.items.len == src.row_map.items.len);
+        for (self.sparse_sync.row_sync_rows[dst_idx].items) |row_u32| {
+            const row: usize = @intCast(row_u32);
+            if (row >= dst.row_map.items.len) continue;
+            const old_slot = dst.row_map.items[row].slot;
+            const new_slot = src.row_map.items[row].slot;
+            if (old_slot != new_slot) {
+                // Retain first: releasing an exclusive old slot puts it on
+                // free_list immediately and must never race a same-slot retain.
+                self.pool.retain(new_slot);
+                self.pool.release(alloc, old_slot);
+                dst.row_map.items[row] = src.row_map.items[row];
+            }
+        }
+        dst.row_mode = src.row_mode;
+        dst.rows = src.rows;
+        dst.cols = src.cols;
+        dst.metrics_gen = src.metrics_gen;
+        self.clearSetStaleTracking(dst_idx);
+    }
+
+    fn syncVertexSetForWrite(self: *TripleBufferedSurface, alloc: std.mem.Allocator, dst_idx: u8, src_idx: u8) bool {
+        const dst = &self.sets[dst_idx];
+        const src = &self.sets[src_idx];
+        if (self.sparse_sync.row_sync_full[dst_idx] or dst.row_map.items.len != src.row_map.items.len) {
+            if (!self.shallowCopyVertexSet(alloc, dst_idx, src_idx)) return false;
+            self.clearSetStaleTracking(dst_idx);
+            return true;
+        }
+
+        // Reserve payload arrays before mutating any mapping, preserving the
+        // existing all-or-nothing beginFlush failure contract.
+        if (!src.row_mode) {
+            dst.flat_verts.ensureTotalCapacity(alloc, src.flat_verts.items.len) catch return false;
+        }
+        self.applySparseRowSync(alloc, dst_idx, src_idx);
+        if (!src.row_mode) {
+            dst.flat_verts.clearRetainingCapacity();
+            dst.flat_verts.appendSliceAssumeCapacity(src.flat_verts.items);
+        }
+        return true;
+    }
+
     /// Shallow-copy slot mappings from src set to dst set (COW).
     /// Only copies the u16 row_map array + retains slots. ~130 bytes for 65 rows.
     /// Returns false on alloc failure.
@@ -727,18 +1147,26 @@ pub const TripleBufferedSurface = struct {
         const dst = &self.sets[dst_idx];
         const src = &self.sets[src_idx];
 
-        // Release dst's old slot references first.
+        // Reserve every destination array before releasing any slot references
+        // or changing scalar state. A failed beginFlush must leave the candidate
+        // set intact so a later retry can safely reuse it.
+        const src_len = src.row_map.items.len;
+        dst.row_map.ensureTotalCapacity(alloc, src_len) catch return false;
+        if (!src.row_mode) {
+            dst.flat_verts.ensureTotalCapacity(alloc, src.flat_verts.items.len) catch return false;
+        }
+
+        // All remaining operations are infallible.
         dst.releaseAllSlots(alloc, &self.pool);
 
         // Copy scalar fields (no alloc).
         dst.row_mode = src.row_mode;
         dst.rows = src.rows;
         dst.cols = src.cols;
-        dst.last_cursor_row = src.last_cursor_row;
+        dst.metrics_gen = src.metrics_gen;
 
         // Shallow copy row_map (u16 array).
-        const src_len = src.row_map.items.len;
-        dst.row_map.resize(alloc, src_len) catch return false;
+        dst.row_map.items.len = src_len;
         @memcpy(dst.row_map.items[0..src_len], src.row_map.items[0..src_len]);
 
         // Retain all slot references for dst.
@@ -746,13 +1174,13 @@ pub const TripleBufferedSurface = struct {
             self.pool.retain(m.slot);
         }
 
-        // Cursor verts: always full copy (small, ~6-12 verts).
-        dst.cursor_verts.clearRetainingCapacity();
-        dst.cursor_verts.appendSlice(alloc, src.cursor_verts.items) catch return false;
-
-        // Flat verts: always full copy (non-row-mode only).
-        dst.flat_verts.clearRetainingCapacity();
-        dst.flat_verts.appendSlice(alloc, src.flat_verts.items) catch return false;
+        // Flat verts are irrelevant in row mode. Avoid copying an old flat
+        // payload on a row-mode barrier/catch-up; a transition back to flat
+        // mode publishes a complete replacement payload.
+        if (!src.row_mode) {
+            dst.flat_verts.clearRetainingCapacity();
+            dst.flat_verts.appendSliceAssumeCapacity(src.flat_verts.items);
+        }
 
         return true;
     }
@@ -771,31 +1199,20 @@ pub const TripleBufferedSurface = struct {
             const new_idx = self.pool.acquireSlot(alloc) orelse return null;
             mapping.slot = new_idx;
             self.pool.retain(new_idx);
-            return &self.pool.slots.items[new_idx];
+            return self.pool.slotPtr(new_idx);
         }
 
-        if (self.pool.slots.items[old_slot].ref_count > 1) {
+        if (self.pool.slotPtr(old_slot).ref_count > 1) {
             // COW: allocate new slot, release old.
             const new_idx = self.pool.acquireSlot(alloc) orelse return null;
             self.pool.release(alloc, old_slot);
             mapping.slot = new_idx;
             self.pool.retain(new_idx);
-            return &self.pool.slots.items[new_idx];
+            return self.pool.slotPtr(new_idx);
         }
 
         // Exclusive ownership — write in place.
-        return &self.pool.slots.items[old_slot];
-    }
-
-    /// OR-merge flush_dirty into pending_dirty (same bit_length assumed).
-    fn mergeDirtyBits(self: *TripleBufferedSurface) void {
-        const pd_n = numMasks(self.pending_dirty.bit_length);
-        const fd_n = numMasks(self.flush_dirty.bit_length);
-        if (pd_n == 0 or fd_n == 0) return;
-        const len = @min(pd_n, fd_n);
-        for (0..len) |i| {
-            self.pending_dirty.masks[i] |= self.flush_dirty.masks[i];
-        }
+        return self.pool.slotPtr(old_slot);
     }
 
     /// Copy pending_dirty bits to paint_dirty_snapshot (same bit_length assumed).
@@ -822,10 +1239,11 @@ pub const TripleBufferedSurface = struct {
             set.releaseAllSlots(alloc, &self.pool);
             set.deinitCpu(alloc);
         }
+        for (&self.main_cursor_sets) |*set| set.deinit(alloc);
         // Free slot pool (vertex memory lives in slots).
         self.pool.deinit(alloc);
         self.pending_dirty.deinit(alloc);
-        self.flush_dirty.deinit(alloc);
+        self.sparse_sync.deinit(alloc);
         self.paint_dirty_snapshot.deinit(alloc);
     }
 };
@@ -834,6 +1252,8 @@ pub const TripleBufferedSurface = struct {
 /// Uses SurfaceState (legacy RowVerts) since TBS is not set up until window creation.
 pub const PendingExternalVertices = struct {
     grid_id: i64,
+    flush_generation: u64 = 0,
+    metrics_gen: u64 = 0,
     surface: SurfaceState,
 
     pub fn deinit(self: *PendingExternalVertices, alloc: std.mem.Allocator) void {
@@ -1233,45 +1653,145 @@ pub const RowMapping = struct {
     slot: u16 = SLOT_NONE,
 };
 
+/// Number of RowSlot entries per chunk. 256 keeps a typical pool (a few
+/// hundred rows) to 1-2 chunk allocations while keeping the fixed directory
+/// small (256 * @sizeOf(?*SlotChunk) = 2048 bytes per pool).
+const SLOTS_PER_CHUNK: usize = 256;
+
+/// Directory size. SLOTS_PER_CHUNK * MAX_SLOT_CHUNKS == 65536 index values,
+/// of which 65535 are usable slots -- SLOT_NONE (maxInt(u16)) is reserved as
+/// the sentinel, and acquireSlot's `len >= SLOT_NONE` guard turns index-space
+/// exhaustion into a graceful `null` (allocation-failure path callers already
+/// handle) instead of a silent sentinel alias at 65535 or an @intCast panic
+/// at 65536. (acquireSlot casts the index to u16 today; this fix does not
+/// change that range.)
+const MAX_SLOT_CHUNKS: usize = 256;
+
+pub const SlotChunk = [SLOTS_PER_CHUNK]RowSlot;
+
 /// Pool of physical row slots shared across all VertexSets in a TBS.
+///
+/// Pointer-stability rationale: `chunks` is a FIXED-SIZE array field (never
+/// reallocated), so reading `chunks[i]` is a single non-moving load — no
+/// concurrent writer can ever free or relocate this directory. Each
+/// individual chunk is heap-allocated once via `alloc.create` and is never
+/// moved or freed until SlotPool.deinit(); therefore a `*RowSlot` obtained
+/// from `slotPtr`/`slotPtrConst` remains valid for the pool's entire
+/// lifetime, even while other slots are concurrently being acquired on
+/// another thread. This is what fixes the UAF: the OLD `ArrayListUnmanaged`
+/// design could relocate+free the entire backing buffer on every single
+/// `append`; this design never relocates anything after a chunk is created.
 pub const SlotPool = struct {
-    slots: std.ArrayListUnmanaged(RowSlot) = .empty,
+    chunks: [MAX_SLOT_CHUNKS]?*SlotChunk = [_]?*SlotChunk{null} ** MAX_SLOT_CHUNKS,
+    len: usize = 0, // number of logically-allocated slots (monotonic)
     free_list: std.ArrayListUnmanaged(u16) = .empty,
 
-    /// Acquire an unused slot. Returns null on OOM.
+    /// Largest row payload observed since `layout_cols` last changed, or 0
+    /// before this layout has written a row. `len` is monotonic and `release`
+    /// keeps a slot's payload allocation, so without this the pool would stay
+    /// pinned at the widest grid ever displayed.
+    ///
+    /// This is a measurement, not an estimate: a row's vertex count is the sum
+    /// of its background runs, its glyph quads and its decoration, so no
+    /// per-cell constant bounds it — a cell carrying a two-quad block glyph, an
+    /// unmerged background and an underdouble already exceeds the core's own
+    /// 12-verts-per-cell capacity estimate. Deriving the retirement threshold
+    /// from a constant would retire the backing of any row denser than the
+    /// guess on every release, and slot rotation would then reallocate it on
+    /// the next write — per-frame heap churn on the render path. Comparing
+    /// against what this layout actually produced cannot misjudge a dense row.
+    layout_peak_verts: usize = 0,
+
+    /// Width `layout_peak_verts` was observed at. A change discards the peak so
+    /// it rebuilds against the new layout; otherwise a shrink would keep
+    /// comparing against the widest grid ever displayed and never retire.
+    layout_cols: u32 = 0,
+
+    // pub: slotPtr is called cross-file (windows/ui/external_windows.zig,
+    // the external-window TBS seed); slotPtrConst is made pub for symmetry.
+    pub fn slotPtr(self: *SlotPool, idx: u16) *RowSlot {
+        const chunk_idx = idx / SLOTS_PER_CHUNK;
+        const offset = idx % SLOTS_PER_CHUNK;
+        return &self.chunks[chunk_idx].?[offset];
+    }
+
+    pub fn slotPtrConst(self: *const SlotPool, idx: u16) *const RowSlot {
+        const chunk_idx = idx / SLOTS_PER_CHUNK;
+        const offset = idx % SLOTS_PER_CHUNK;
+        return &self.chunks[chunk_idx].?[offset];
+    }
+
+    /// Publish the layout a subsequent noteRowVerts applies to. Discards the
+    /// observed peak on a width change so retirement is measured against the
+    /// new layout rather than the widest one ever displayed.
+    pub fn noteLayoutWidth(self: *SlotPool, cols: u32) void {
+        if (self.layout_cols == cols) return;
+        self.layout_cols = cols;
+        self.layout_peak_verts = 0;
+    }
+
+    /// Record a row payload this layout produced. Feeds the retirement floor,
+    /// so a legitimately dense row raises the bar and keeps its own backing.
+    pub fn noteRowVerts(self: *SlotPool, vert_count: usize) void {
+        if (vert_count > self.layout_peak_verts) self.layout_peak_verts = vert_count;
+    }
+
+    /// Acquire an unused slot. Returns null on OOM or index-space exhaustion.
     pub fn acquireSlot(self: *SlotPool, alloc: std.mem.Allocator) ?u16 {
         if (self.free_list.items.len > 0) {
             return self.free_list.pop();
         }
-        // Grow pool by one slot.
-        const idx: u16 = @intCast(self.slots.items.len);
-        self.slots.append(alloc, .{}) catch return null;
+        if (self.len >= SLOT_NONE) return null; // slot index space exhausted; SLOT_NONE is reserved
+        const idx: u16 = @intCast(self.len);
+        const chunk_idx: usize = @as(usize, idx) / SLOTS_PER_CHUNK;
+        if (self.chunks[chunk_idx] == null) {
+            // Every slot in a published chunk can eventually be released at
+            // once. Reserve that worst case before publishing the chunk so
+            // release() is infallible and never silently loses a slot.
+            const chunk_slot_count = @min((chunk_idx + 1) * SLOTS_PER_CHUNK, @as(usize, SLOT_NONE));
+            self.free_list.ensureTotalCapacity(alloc, chunk_slot_count) catch return null;
+            const new_chunk = alloc.create(SlotChunk) catch return null;
+            new_chunk.* = [_]RowSlot{.{}} ** SLOTS_PER_CHUNK;
+            self.chunks[chunk_idx] = new_chunk;
+        }
+        self.len += 1;
         return idx;
     }
 
     /// Increment ref_count for a slot.
     pub fn retain(self: *SlotPool, idx: u16) void {
         if (idx == SLOT_NONE) return;
-        self.slots.items[idx].ref_count += 1;
+        self.slotPtr(idx).ref_count += 1;
     }
 
     /// Decrement ref_count. If it reaches 0, return slot to free_list.
     pub fn release(self: *SlotPool, alloc: std.mem.Allocator, idx: u16) void {
         if (idx == SLOT_NONE) return;
-        const slot = &self.slots.items[idx];
-        if (slot.ref_count > 0) {
-            slot.ref_count -= 1;
-        }
+        const slot = self.slotPtr(idx);
+        if (slot.ref_count == 0) return;
+        slot.ref_count -= 1;
         if (slot.ref_count == 0) {
-            self.free_list.append(alloc, idx) catch {};
+            // A slot reaching ref_count 0 is referenced by no VertexSet, so no
+            // painter can reach it and its payload is dead — the next acquirer
+            // overwrites it. Retire backing this layout has outgrown, mirroring
+            // maybeShrinkRowStorage's 2x threshold. Freeing cannot fail, so
+            // release stays infallible.
+            if (render_pipeline_helpers.shouldRetireSlotBacking(slot.verts.capacity, self.layout_peak_verts)) {
+                slot.verts.clearAndFree(alloc);
+            }
+            self.free_list.appendAssumeCapacity(idx);
         }
     }
 
     pub fn deinit(self: *SlotPool, alloc: std.mem.Allocator) void {
-        for (self.slots.items) |*s| {
-            s.verts.deinit(alloc);
+        for (&self.chunks) |*maybe_chunk| {
+            if (maybe_chunk.*) |chunk| {
+                for (chunk) |*s| s.verts.deinit(alloc);
+                alloc.destroy(chunk);
+                maybe_chunk.* = null;
+            }
         }
-        self.slots.deinit(alloc);
+        self.len = 0;
         self.free_list.deinit(alloc);
     }
 };
@@ -1304,6 +1824,7 @@ pub const PaintRowRange = struct {
 /// External window state for win_external_pos grids
 pub const ExternalWindow = struct {
     hwnd: c.HWND,
+    window_wake_cookie: usize,
     win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
 
@@ -1318,12 +1839,21 @@ pub const ExternalWindow = struct {
     vb_bytes: usize = 0,
     vert_count: usize = 0,
     needs_redraw: bool = false,
+    paint_retry: PaintRetryState = .{},
+    paint_retry_deadline_ms: u64 = 0,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
+    atlas_reset_generation: u64 = 0, // Last atlas_reset_generation this window has fully re-uploaded for
     atlas_upload_cursor: u64 = 0, // Per-window cursor into renderer's pending_uploads queue
+    // DPI scale of the monitor this external window is currently on (may
+    // differ from app.dpi_scale on a mixed-DPI multi-monitor setup). Used
+    // ONLY for this window's own scrollbar hit-test geometry — NOT for font
+    // rasterization, which remains driven solely by the shared app.atlas
+    // (see ExternalWndProc's WM_DPICHANGED case for why).
+    dpi_scale: f32 = 1.0,
     scroll_accum: i16 = 0, // Accumulated vertical scroll delta for high-resolution scrolling
     h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
@@ -1339,6 +1869,8 @@ pub const ExternalWindow = struct {
     // Persistent scratch buffer for shiftRowVBs; sized to abs(vb_shift) before each shift.
     // Owned here (not on stack) so large scrolls never overflow a fixed stack array.
     row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
+    // Persistent destination for linear dirty-row/range union during scroll.
+    scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
     scrollbar_vb: ?*c.ID3D11Buffer = null,
     scrollbar_vb_bytes: usize = 0,
 
@@ -1375,6 +1907,12 @@ pub const ExternalWindow = struct {
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
     paint_scratch: std.ArrayListUnmanaged(Vertex) = .empty,
     paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .empty,
+    paint_dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
+    paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
+    // Back-texture damage submitted through the renderer's per-swapchain-
+    // buffer queue. Persistent so partial external paints allocate only when
+    // the grid's high-water row count grows.
+    paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
 
     pub fn recomputeVertCount(self: *ExternalWindow) void {
         self.vert_count = self.surface.recomputeVertCount();
@@ -1390,6 +1928,9 @@ pub const ExternalWindow = struct {
         // Now safe to release D3D resources
         self.paint_scratch.deinit(alloc);
         self.paint_row_ranges.deinit(alloc);
+        self.paint_dirty_row_keys.deinit(alloc);
+        self.paint_rows_to_draw.deinit(alloc);
+        self.paint_present_rects.deinit(alloc);
         self.flat_draw_scratch.deinit(alloc);
         // Release GPU VBs from row_verts before deinitCpuState frees the list.
         for (self.surface.row_verts.items) |*rv| {
@@ -1405,6 +1946,7 @@ pub const ExternalWindow = struct {
         // buffers are owned by row_vbs, never by the scratch, so just free
         // the list backing without touching .vb pointers.
         self.row_vbs_shift_scratch.deinit(alloc);
+        self.scroll_rows_merge_scratch.deinit(alloc);
         self.tbs.deinit(alloc); // Handles slot release + pool deinit
         if (self.vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
@@ -1435,29 +1977,31 @@ pub fn computeRowsToDraw(
     dirty_row_keys: []const u32,
     total_rows: u32,
     max_valid_row: u32,
-) void {
+) bool {
     out.clearRetainingCapacity();
 
-    const cap = if (force_full) total_rows else @as(u32, @intCast(dirty_row_keys.len));
-    out.ensureTotalCapacity(alloc, cap) catch {};
+    // Reserve the complete row range once. This also leaves enough room for
+    // scroll-exposed rows appended later in the same paint without hot-path
+    // allocation.
+    out.ensureTotalCapacity(alloc, @max(total_rows, max_valid_row)) catch return false;
 
     if (force_full) {
         var r: u32 = 0;
         const n: u32 = @min(total_rows, max_valid_row);
         while (r < n) : (r += 1) {
-            out.append(alloc, r) catch break;
+            out.appendAssumeCapacity(r);
         }
-        return; // Already in order, no duplicates possible.
+        return true; // Already in order, no duplicates possible.
     }
 
     // Dirty-row path: filter to valid range, then sort + dedup.
     for (dirty_row_keys) |k| {
         if (k < max_valid_row) {
-            out.append(alloc, k) catch break;
+            out.appendAssumeCapacity(k);
         }
     }
 
-    if (out.items.len <= 1) return;
+    if (out.items.len <= 1) return true;
 
     std.sort.pdq(u32, out.items, {}, comptime std.sort.asc(u32));
 
@@ -1471,6 +2015,7 @@ pub fn computeRowsToDraw(
         }
     }
     out.items.len = w;
+    return true;
 }
 
 pub fn snapshotSurfaceVerts(
@@ -1551,7 +2096,7 @@ pub fn ensureRowVBReadyFromSlot(
     pool: *const SlotPool,
 ) !bool {
     if (mapping.slot == SLOT_NONE) return false;
-    const slot = &pool.slots.items[mapping.slot];
+    const slot = pool.slotPtrConst(mapping.slot);
     const src = slot.verts.items;
     if (src.len == 0) return false;
 
@@ -1663,6 +2208,9 @@ pub fn ensureShiftScratch(
 pub const ScrollShiftResult = struct {
     /// The scroll region rect (in back_tex coords). null if no scroll was applied.
     scroll_rect: ?c.RECT = null,
+    /// False when dirty-row union scratch could not grow. The caller must not
+    /// present this partially shifted back buffer and must schedule a full draw.
+    rows_complete: bool = true,
 };
 
 /// Apply scroll pixel shift to back_tex, shift row_vbs, and add cursor ghost
@@ -1690,6 +2238,7 @@ pub fn applyScrollShift(
     row_vbs: []RowVB,
     shift_scratch: *std.ArrayListUnmanaged(RowVB),
     rows_to_draw: *std.ArrayListUnmanaged(u32),
+    row_merge_scratch: *std.ArrayListUnmanaged(u32),
     scroll_rect: c.RECT,
     scroll_dy_px: i32,
     vb_shift_rows: i32,
@@ -1723,10 +2272,14 @@ pub fn applyScrollShift(
             const shifted_row: i32 = @as(i32, @intCast(prev_cr)) + scroll_rows;
             if (shifted_row >= 0 and shifted_row < @as(i32, @intCast(effective_rows))) {
                 const sr_u32: u32 = @intCast(shifted_row);
-                appendRowSorted(alloc, rows_to_draw, sr_u32);
+                if (!render_pipeline_helpers.insertSortedRow(alloc, rows_to_draw, sr_u32)) {
+                    return .{ .rows_complete = false };
+                }
             }
             if (prev_cr < effective_rows) {
-                appendRowSorted(alloc, rows_to_draw, prev_cr);
+                if (!render_pipeline_helpers.insertSortedRow(alloc, rows_to_draw, prev_cr)) {
+                    return .{ .rows_complete = false };
+                }
             }
         }
     }
@@ -1740,7 +2293,7 @@ pub fn applyScrollShift(
     filled.top += y_offset;
     filled.bottom += y_offset;
 
-    g.scrollBackTex(filled, scroll_dy_px);
+    const scroll_copy_ok = g.scrollBackTex(filled, scroll_dy_px);
 
     // 4. When multiple scroll flushes accumulate before a paint, the back buffer
     //    shift leaves gap rows with stale pixels.  The per-flush dirty bitmap
@@ -1750,16 +2303,25 @@ pub fn applyScrollShift(
     //    redrawn from the current slot data.
     if (row_h_px > 0) {
         const abs_shift: u32 = @intCast(if (vb_shift_rows < 0) -vb_shift_rows else vb_shift_rows);
-        if (abs_shift > 1) {
+        if (abs_shift > 1 or !scroll_copy_ok) {
             const region_top_row: u32 = @intCast(@divTrunc(filled.top - y_offset, row_h_px));
             const region_bot_row: u32 = @intCast(@divTrunc(filled.bottom - y_offset, row_h_px));
             const region_height: u32 = region_bot_row - region_top_row;
 
-            if (abs_shift >= region_height) {
-                // Accumulated shift covers the entire scroll region; scrollBackTex
-                // early-returned without copying anything.  Redraw every row in
-                // the region instead of computing a gap.
-                mergeContiguousRows(alloc, rows_to_draw, region_top_row, @min(region_bot_row, effective_rows));
+            if (!scroll_copy_ok or abs_shift >= region_height) {
+                // scrollBackTex reported failure (resource/context missing,
+                // staging texture OOM, or the shift covered the whole
+                // region and it early-returned without copying anything)
+                // — back_tex pixels were never shifted, so every row in the
+                // scroll region, not just the accumulated-shift gap, still
+                // shows stale pre-scroll content. Redraw the whole region.
+                if (!render_pipeline_helpers.mergeSortedRowsWithRange(
+                    alloc,
+                    rows_to_draw,
+                    row_merge_scratch,
+                    region_top_row,
+                    @min(region_bot_row, effective_rows),
+                )) return .{ .scroll_rect = filled, .rows_complete = false };
             } else if (vb_shift_rows > 0) {
                 // Scroll up (j-key): gap rows at bottom of scroll region.
                 // Gap rows form a contiguous range; merge them into the sorted
@@ -1767,11 +2329,23 @@ pub fn applyScrollShift(
                 // appendRowSorted.
                 const gap_start: u32 = region_bot_row - abs_shift;
                 const gap_end: u32 = @min(region_bot_row, effective_rows);
-                mergeContiguousRows(alloc, rows_to_draw, gap_start, gap_end);
+                if (!render_pipeline_helpers.mergeSortedRowsWithRange(
+                    alloc,
+                    rows_to_draw,
+                    row_merge_scratch,
+                    gap_start,
+                    gap_end,
+                )) return .{ .scroll_rect = filled, .rows_complete = false };
             } else {
                 // Scroll down (k-key): gap rows at top of scroll region.
                 const gap_end: u32 = @min(region_top_row + abs_shift, effective_rows);
-                mergeContiguousRows(alloc, rows_to_draw, region_top_row, gap_end);
+                if (!render_pipeline_helpers.mergeSortedRowsWithRange(
+                    alloc,
+                    rows_to_draw,
+                    row_merge_scratch,
+                    region_top_row,
+                    gap_end,
+                )) return .{ .scroll_rect = filled, .rows_complete = false };
             }
         }
     }
@@ -1784,40 +2358,6 @@ pub fn applyScrollShift(
     }
 
     return .{ .scroll_rect = filled };
-}
-
-/// Insert a row into a sorted rows_to_draw list if not already present.
-fn appendRowSorted(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32), row: u32) void {
-    for (list.items) |r| {
-        if (r == row) return;
-    }
-    list.append(alloc, row) catch return;
-    std.sort.insertion(u32, list.items, {}, std.sort.asc(u32));
-}
-
-/// Merge a contiguous range [start, end) into a sorted rows_to_draw list,
-/// skipping rows already present.  Avoids per-row insertion sort by
-/// appending new rows and re-sorting once.
-fn mergeContiguousRows(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32), start: u32, end: u32) void {
-    if (start >= end) return;
-    var added: u32 = 0;
-    var r: u32 = start;
-    while (r < end) : (r += 1) {
-        var found = false;
-        for (list.items) |existing| {
-            if (existing == r) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            list.append(alloc, r) catch return;
-            added += 1;
-        }
-    }
-    if (added > 0) {
-        std.sort.insertion(u32, list.items, {}, std.sort.asc(u32));
-    }
 }
 
 /// Draw rows from slot-based row_map with separate RowVB GPU buffers.
@@ -1846,19 +2386,21 @@ pub fn drawSurfaceRowsVBFromSlots(
         const row: u32 = if (rows_to_draw) |rows| rows[i] else @intCast(i);
         if (row >= row_map.len or row >= row_vbs.len) {
             metrics.skipped_empty += 1;
+            metrics.failed_rows += 1;
             continue;
         }
 
         const mapping = row_map[@intCast(row)];
         if (mapping.slot == SLOT_NONE) {
             metrics.skipped_empty += 1;
+            metrics.failed_rows += 1;
             if (metrics.first_empty_row == null) {
                 metrics.first_empty_row = row;
             }
             continue;
         }
 
-        const slot = &pool.slots.items[mapping.slot];
+        const slot = pool.slotPtrConst(mapping.slot);
         const src = slot.verts.items;
         if (src.len == 0) {
             // Core sends vert_count==0 as "clear row" (flush.zig:2904).
@@ -1875,10 +2417,15 @@ pub fn drawSurfaceRowsVBFromSlots(
                         vp_dirty = false;
                     }
                 }
-                g.drawClearRow() catch {};
+                g.drawClearRow() catch {
+                    metrics.skipped_empty += 1;
+                    metrics.failed_rows += 1;
+                    continue;
+                };
                 metrics.drawn_rows += 1;
             } else {
                 metrics.skipped_empty += 1;
+                metrics.failed_rows += 1;
                 if (metrics.first_empty_row == null) metrics.first_empty_row = row;
             }
             continue;
@@ -1890,6 +2437,7 @@ pub fn drawSurfaceRowsVBFromSlots(
             const t_upload_start = if (log_enabled) core.clock.nowNs() else 0;
             _ = ensureRowVBReadyFromSlot(g, vb, mapping, pool) catch {
                 metrics.skipped_empty += 1;
+                metrics.failed_rows += 1;
                 continue;
             };
             if (log_enabled) {
@@ -1941,9 +2489,15 @@ pub fn drawSurfaceRowsVBFromSlots(
             }
         }
 
-        const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
-        g.drawVB(vb.vb.?, src.len) catch {
+        const row_vb = vb.vb orelse {
             metrics.skipped_empty += 1;
+            metrics.failed_rows += 1;
+            continue;
+        };
+        const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
+        g.drawVB(row_vb, src.len) catch {
+            metrics.skipped_empty += 1;
+            metrics.failed_rows += 1;
             continue;
         };
         if (log_enabled) {
@@ -1973,12 +2527,10 @@ pub fn drawSurfaceRowsVBFromSlots(
 /// Does NOT hold app_mu during VB upload (lock-free via TBS refcount).
 pub fn drawRowModeSetupAndRowsFromSlots(
     g: *d3d11.Renderer,
-    alloc: std.mem.Allocator,
     row_map: []const RowMapping,
     pool: *const SlotPool,
     row_vbs: []RowVB,
     rows_to_draw: []const u32,
-    bloom_verts: *std.ArrayListUnmanaged(Vertex),
     params: RowModeDrawParams,
 ) !RowModeDrawResult {
     const log_enabled = applog.isEnabled();
@@ -2053,30 +2605,6 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         &result.metrics,
     );
 
-    // Collect all row verts for bloom extract.
-    if (params.glow_enabled) {
-        const vp_h: f32 = base_vp.h;
-        for (row_map, 0..) |m, row_index| {
-            if (m.slot == SLOT_NONE) continue;
-            const slot = &pool.slots.items[m.slot];
-            if (slot.verts.items.len == 0) continue;
-            const origin_i32: i32 = @intCast(slot.origin_row);
-            const row_i32: i32 = @intCast(row_index);
-            const row_delta = row_i32 - origin_i32;
-            if (row_delta == 0) {
-                bloom_verts.appendSlice(alloc, slot.verts.items) catch {};
-            } else {
-                const delta_px: f32 = @floatFromInt(row_delta * params.row_h_px);
-                const ndc_shift: f32 = -2.0 * delta_px / vp_h;
-                const base_len = bloom_verts.items.len;
-                bloom_verts.appendSlice(alloc, slot.verts.items) catch continue;
-                for (bloom_verts.items[base_len..]) |*v| {
-                    v.position[1] += ndc_shift;
-                }
-            }
-        }
-    }
-
     return result;
 }
 
@@ -2084,16 +2612,91 @@ pub fn drawRowModeSetupAndRowsFromSlots(
 /// Both main window WM_PAINT and external window paintExternalWindow
 /// call this inside their respective gpu.lockContext() scopes.
 /// Returns the new upload cursor value.
+/// Device-loss recovery: release the GPU vertex buffers referenced by a
+/// SurfaceState. CPU vertex data survives; upload bookkeeping resets so the
+/// next paint re-creates and re-uploads the buffers on the new device.
+pub fn releaseSurfaceGpuVBs(surface: *SurfaceState) void {
+    for (surface.row_verts.items) |*rv| {
+        if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        rv.vb = null;
+        rv.vb_bytes = 0;
+        rv.uploaded_gen = 0;
+    }
+}
+
+/// Detach one device-bound row buffer without calling COM. The caller may
+/// release the returned pointer after dropping app.mu.
+pub fn detachOneSurfaceGpuVB(surface: *SurfaceState) ?*c.ID3D11Buffer {
+    for (surface.row_verts.items) |*rv| {
+        if (rv.vb) |vb| {
+            rv.vb = null;
+            rv.vb_bytes = 0;
+            rv.uploaded_gen = 0;
+            return vb;
+        }
+    }
+    return null;
+}
+
+/// Device-loss recovery: release row-slot GPU buffers and reset their upload
+/// bookkeeping (slot mappings stay valid — they index the CPU-side pool).
+pub fn releaseRowVBs(row_vbs: []RowVB) void {
+    for (row_vbs) |*rvb| {
+        if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        rvb.* = .{};
+    }
+}
+
+/// Match the UI-thread-owned GPU row-buffer list to the committed row count.
+/// Shrinking releases the unreachable tail immediately but retains the CPU
+/// pointer-array capacity, so a later resize back to the previous high-water
+/// mark does not allocate metadata in WM_PAINT. D3D11 defers destruction while
+/// an already-submitted command still references a released resource.
+pub fn resizeRowVBsForPaint(
+    alloc: std.mem.Allocator,
+    row_vbs: *std.ArrayListUnmanaged(RowVB),
+    need_len: usize,
+) bool {
+    if (row_vbs.items.len > need_len) {
+        releaseRowVBs(row_vbs.items[need_len..]);
+        row_vbs.items.len = need_len;
+        return true;
+    }
+    if (row_vbs.items.len == need_len) return true;
+
+    const old_len = row_vbs.items.len;
+    row_vbs.resize(alloc, need_len) catch return false;
+    for (row_vbs.items[old_len..]) |*rvb| rvb.* = .{};
+    return true;
+}
+
+pub fn detachOneRowVB(row_vbs: []RowVB) ?*c.ID3D11Buffer {
+    for (row_vbs) |*rvb| {
+        if (rvb.vb) |vb| {
+            rvb.* = .{};
+            return vb;
+        }
+    }
+    return null;
+}
+
+pub const AtlasFlushResult = struct {
+    cursor: u64,
+    success: bool,
+};
+
 pub fn flushAtlasUploads(
     atlas: *dwrite_d2d.Renderer,
     gpu: *d3d11.Renderer,
     upload_cursor: u64,
     need_full_upload: bool,
-) u64 {
+) AtlasFlushResult {
     if (need_full_upload) {
-        atlas.uploadFullAtlasToD3D(gpu);
+        const full = atlas.uploadFullAtlasToD3D(gpu);
+        return .{ .cursor = full.cursor, .success = full.success };
     }
-    return atlas.flushPendingAtlasUploadsSinceToD3D(gpu, upload_cursor);
+    const pending = atlas.flushPendingAtlasUploadsSinceToD3D(gpu, upload_cursor);
+    return .{ .cursor = pending.cursor, .success = pending.success };
 }
 
 /// Snap client height to cell grid boundaries (at least 1 row).
@@ -2325,6 +2928,9 @@ pub fn drawRowModeSetupAndRows(
 pub const SurfaceRowDrawMetrics = struct {
     drawn_rows: u32 = 0,
     skipped_empty: u32 = 0,
+    // Rows whose clear/upload/draw could not be submitted. Callers must not
+    // consume the paint snapshot as a successful partial frame.
+    failed_rows: u32 = 0,
     first_empty_row: ?u32 = null,
     vb_upload_rows: u32 = 0,
     vb_upload_rows_bytes: u64 = 0,
@@ -2496,6 +3102,11 @@ pub const CursorOverlayParams = struct {
     /// would stack the new overlay on top of the stale one (block + bar). The
     /// clear+redraw erases the old overlay even over empty (no-bg-quad) cells.
     erase_cursor_row: bool = false,
+    /// The caller already redrew every row, including the cursor row, in this
+    /// frame. In that case blink-on only needs the cursor quad and blink-off
+    /// needs no work; clearing/redrawing again would double-blend transparent
+    /// row content.
+    row_already_redrawn: bool = false,
 };
 
 pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
@@ -2554,13 +3165,20 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
     // blink is visible.
     // Default path (main window): blink on draws the cursor; blink off redraws
     // the row content to erase the cursor.
-    if (p.erase_cursor_row) {
+    if (p.row_already_redrawn) {
+        if (p.blink_visible) {
+            if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
+            g.drawVB(vb, p.cursor_verts.len) catch {};
+        } else if (log_enabled) {
+            applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
+        }
+    } else if (p.erase_cursor_row) {
         if (log_enabled) applog.appLog("[cursor-overlay] erase+draw row={d} verts={d} blink={}\n", .{ cursor_row, p.cursor_verts.len, p.blink_visible });
         g.drawClearRow() catch {};
         if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
             const rvb = &p.row_vbs[cursor_row];
             const mapping = p.row_map[cursor_row];
-            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slots.items[mapping.slot].verts.items.len else 0;
+            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
                     g.drawVB(row_vb, slot_verts_len) catch {};
@@ -2575,10 +3193,14 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
         g.drawVB(vb, p.cursor_verts.len) catch {};
     } else {
         if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
+        // The core represents a genuinely empty row with an empty vertex list.
+        // Redrawing that list is a no-op, so first overwrite the scissored row
+        // with the default background to erase the previously composited cursor.
+        g.drawClearRow() catch {};
         if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
             const rvb = &p.row_vbs[cursor_row];
             const mapping = p.row_map[cursor_row];
-            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slots.items[mapping.slot].verts.items.len else 0;
+            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
                     g.drawVB(row_vb, slot_verts_len) catch {};
@@ -2628,6 +3250,88 @@ pub fn drawBloomOverlay(
     g.drawBloomFromVerts(bloom_verts, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
 }
 
+const BloomRowsContext = struct {
+    row_map: []const RowMapping,
+    pool: *const SlotPool,
+    row_vbs: []const RowVB,
+    row_h_px: i32,
+};
+
+fn drawBloomRowBuffers(
+    opaque_ctx: ?*const anyopaque,
+    g: *d3d11.Renderer,
+    d3d_ctx: *c.ID3D11DeviceContext,
+    viewport_x: f32,
+    viewport_y: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+) void {
+    const ctx: *const BloomRowsContext = @ptrCast(@alignCast(opaque_ctx orelse return));
+    const set_viewport = d3d_ctx.*.lpVtbl.*.RSSetViewports orelse return;
+
+    for (ctx.row_map, 0..) |mapping, row_index| {
+        if (row_index >= ctx.row_vbs.len or mapping.slot == SLOT_NONE) continue;
+        const vb = ctx.row_vbs[row_index].vb orelse continue;
+        const slot = ctx.pool.slotPtrConst(mapping.slot);
+        if (slot.verts.items.len == 0) continue;
+
+        const row_delta = @as(i32, @intCast(row_index)) - @as(i32, @intCast(slot.origin_row));
+        var viewport: c.D3D11_VIEWPORT = .{
+            .TopLeftX = viewport_x,
+            .TopLeftY = viewport_y + @as(f32, @floatFromInt(row_delta * ctx.row_h_px)) / 2.0,
+            .Width = viewport_w,
+            .Height = viewport_h,
+            .MinDepth = 0,
+            .MaxDepth = 1,
+        };
+        set_viewport(d3d_ctx, 1, &viewport);
+        g.drawVB(vb, slot.verts.items.len) catch {};
+    }
+
+    // drawBloomPasses draws the cursor after this callback using the base
+    // extract viewport, so do not leave the final row's scroll offset active.
+    var base_viewport: c.D3D11_VIEWPORT = .{
+        .TopLeftX = viewport_x,
+        .TopLeftY = viewport_y,
+        .Width = viewport_w,
+        .Height = viewport_h,
+        .MinDepth = 0,
+        .MaxDepth = 1,
+    };
+    set_viewport(d3d_ctx, 1, &base_viewport);
+}
+
+/// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
+/// glow out of the per-paint heap and avoids copying every grid vertex.
+pub fn drawBloomRowsOverlay(
+    g: *d3d11.Renderer,
+    row_map: []const RowMapping,
+    pool: *const SlotPool,
+    row_vbs: []const RowVB,
+    cursor_verts: []const Vertex,
+    glow_intensity: f32,
+    draw_params: RowModeDrawParams,
+) void {
+    var has_rows = false;
+    for (row_map, 0..) |mapping, row_index| {
+        if (row_index >= row_vbs.len or mapping.slot == SLOT_NONE or row_vbs[row_index].vb == null) continue;
+        if (pool.slotPtrConst(mapping.slot).verts.items.len != 0) {
+            has_rows = true;
+            break;
+        }
+    }
+    if (!has_rows) return;
+
+    const rows_ctx = BloomRowsContext{
+        .row_map = row_map,
+        .pool = pool,
+        .row_vbs = row_vbs,
+        .row_h_px = draw_params.row_h_px,
+    };
+    const bvp = draw_params.bloomViewport(g.width);
+    g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
+}
+
 /// Pending glyph entry for deferred atlas population
 /// (used when glyph is requested before atlas is ready)
 pub const PendingGlyph = struct {
@@ -2670,6 +3374,7 @@ pub const App = struct {
     mu: std.Io.Mutex = .init,
 
     hwnd: ?c.HWND = null,
+    window_wake_cookie: usize = 0,
     content_hwnd: ?c.HWND = null, // Child window for D3D11 rendering (when ext_tabline enabled)
     corep: ?*zonvie_core = null,
 
@@ -2692,7 +3397,13 @@ pub const App = struct {
     renderer: ?d3d11.Renderer = null,
 
     // External windows (grid_id -> ExternalWindow)
-    external_windows: std.AutoHashMapUnmanaged(i64, ExternalWindow) = .{},
+    external_windows: std.AutoHashMapUnmanaged(i64, *ExternalWindow) = .{},
+
+    // UI-thread custom-shader animation snapshot. Capacity tracks the
+    // high-water external-window count so the 60 Hz path allocates only when
+    // that population grows and never truncates at a fixed grid count.
+    shader_anim_external_grids: std.ArrayListUnmanaged(i64) = .empty,
+    shader_anim_external_renderers: std.ArrayListUnmanaged(*d3d11.Renderer) = .empty,
 
     // Pending external window creation requests (for UI thread processing)
     pending_external_windows: std.ArrayListUnmanaged(PendingExternalWindow) = .empty,
@@ -2704,6 +3415,23 @@ pub const App = struct {
     // by onExternalWindowClose) won't dequeue an unrelated new-session
     // request whose seq doesn't match the message's lParam.
     pending_external_seq_counter: u64 = 0,
+    external_create_retry_delay_ms: u32 = EXTERNAL_CREATE_RETRY_INTERVAL_MS,
+    external_create_retry_generation: u32 = 0,
+    external_create_retry_armed: bool = false,
+    external_create_retry_needed: bool = false,
+    external_create_retry_fallback_wake_issued: bool = false,
+    external_create_retry_deadline_ms: u64 = 0,
+    external_close_drain_needed: bool = false,
+    flush_retry_wake_armed: bool = false,
+    flush_retry_fallback_wake_issued: bool = false,
+    flush_retry_delay_ms: u32 = FLUSH_RETRY_INTERVAL_MS,
+    flush_retry_deadline_ms: u64 = 0,
+    flush_retry_armed_failure_epoch: u64 = 0,
+    flush_retry_consumed_failure_epoch: u64 = 0,
+    flush_retry_observed_success_epoch: u64 = 0,
+    main_paint_retry_deadline_ms: u64 = 0,
+    external_paint_retry_deadline_ms: u64 = 0,
+    device_lost_retry_deadline_ms: u64 = 0,
 
     // Pending position for next external window (set by tab externalization)
     pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
@@ -2737,6 +3465,15 @@ pub const App = struct {
     quit_pending: bool = false,
     // Flag to ignore delayed quit responses after timeout fired
     quit_timeout_fired: bool = false,
+    // Same-thread re-entrancy guard for presentShaderAnimationFrame: a
+    // nested message pump inside DXGI's Present (triggered by the timer
+    // tick below) could otherwise re-enter this same UI-thread handler
+    // before the outer call returns. Plain bool (not atomic): both the
+    // set and the check always happen on the UI thread.
+    in_present_shader_animation_frame: bool = false,
+    // D3DCompile/CreateShader can pump messages. Treat the one-time bloom
+    // warm-up like paint/recovery so reentrant destruction is deferred.
+    glow_prepare_in_progress: bool = false,
     // Set by the tray menu's "Quit" so the next WM_CLOSE runs the real
     // graceful-quit path instead of hiding back to the tray (close_to_tray).
     tray_quit_requested: bool = false,
@@ -2747,10 +3484,38 @@ pub const App = struct {
 
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
     tbs: TripleBufferedSurface = .{},
+    // Cross-thread flush bracket state. The core thread publishes it from
+    // onFlushBegin and clears it while atomically committing/cancelling in
+    // onFlushEnd. Main and external TBS write sets join lazily on mutation;
+    // the UI thread uses this flag when publishing a newly-created HWND so its
+    // TBS joins the current transaction instead of exposing a partial seed.
+    core_flush_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // An atlas reset invalidates every previously committed vertex UV. Unlike
+    // additive atlas uploads, it must exclude paints until a flush commits a
+    // matching vertex generation. A failed flush intentionally leaves the
+    // gate closed so the last frame is frozen rather than redrawn with the
+    // new atlas and old UVs.
+    atlas_reset_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    atlas_paint_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Set before teardown waits for the core thread. Atlas callbacks use it to
+    // reject late non-blocking reset admission while App is still alive.
+    shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // on_atlas_create has a void ABI. If paint admission or CPU-atlas recreation
+    // fails, retain the requested dimensions and retry from a later
+    // on_flush_begin before accepting any atlas uploads for that generation.
+    atlas_create_retry_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    atlas_create_retry_w: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    atlas_create_retry_h: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    // Monotonic identity of the current core flush. Pending external CPU
+    // captures record this when mutated so onFlushEnd can discard only data
+    // produced by a failed transaction while preserving older valid seeds.
+    core_flush_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
     row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
+    // Persistent destination for linear dirty-row/range union during scroll.
+    scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
@@ -2764,8 +3529,11 @@ pub const App = struct {
     row_tmp_verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // WM_PAINT(row) persistent buffers (avoid per-frame alloc/free)
+    wm_paint_dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
+    wm_paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .empty,
     wm_paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
     wm_paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
+    paint_retry: PaintRetryState = .{},
 
     // Cursor overlay VB for row-mode (avoid extra g.drawEx per paint).
     cursor_vb: ?*c.ID3D11Buffer = null,
@@ -2783,8 +3551,25 @@ pub const App = struct {
     // Skips InvalidateRect for flushes with no visual changes (e.g. msg_showcmd-only).
     flush_needs_invalidate: bool = false,
 
+    // Set (under app.mu) by vertex callbacks that hit OOM mid-flush, paired
+    // with zonvie_core_abort_flush (which makes the CORE keep its dirty
+    // state). onFlushEnd checks this and CANCELS the TBS write-set brackets
+    // instead of committing them — the write sets hold partially-updated
+    // rows, and committing would publish them as a complete frame.
+    flush_failed: bool = false,
+
+    // Frontend row submission aggregate. Updated under app.mu and emitted
+    // once from onFlushEnd after releasing the lock.
+    log_flush_row_callbacks: u64 = 0,
+    log_flush_vertex_count: u64 = 0,
+
     // Scrollbar update coalescing: set by on_flush_end (core thread), cleared by WM_APP_UPDATE_SCROLLBAR (UI thread).
     scrollbar_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    msg_throttle_arm_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Claimed by the first glow warm-up request in an enabled period. A flush
+    // with glow disabled clears it so later runtime re-enable warms renderers
+    // created while glow was off.
+    glow_prepare_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // DWrite rasterization perf counters (accumulated during flush, reported by onFlushEnd)
     rasterize_call_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -2823,9 +3608,72 @@ pub const App = struct {
     // When row-mode starts (or after resize), we must seed the persistent back buffer once.
     // Otherwise the first present may clear to black and only the dirty row gets drawn.
     need_full_seed: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    // Set from WM_DPICHANGED (UI thread) when the DPI actually changed;
+    // consumed at the start of onFlushBegin (core thread) which is the only
+    // thread allowed to call zonvie_core_invalidate_glyph_cache — see MED-1
+    // in the fix-plan doc for why the call cannot be made directly from the
+    // wndproc.
+    pending_core_glyph_invalidate: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // After atlas reset, external window paints may consume shared pending_uploads.
     // This flag ensures the main window uploads the full atlas to cover any missed regions.
-    atlas_full_upload_needed: bool = false,
+    // Atomic: set from the core/RPC thread (callbacks.zig), consumed via a
+    // read-then-clear on the UI thread (window.zig paint path). A plain bool
+    // read-then-write is a check-then-act race — a new true set by the RPC
+    // thread between the UI thread's read and its write-back-to-false gets
+    // silently lost. swap(false, .acq_rel) makes the read+clear atomic.
+    atlas_full_upload_needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Device-loss recovery state (WM_APP_DEVICE_LOST_RECOVER). `posted`
+    // dedupes the paint-side trigger; `attempts` caps recovery to 3 per
+    // process lifetime before advising a restart.
+    device_lost_recover_posted: bool = false,
+    // Durable UI-loop wake when both USER timers and the process timer queue
+    // are unavailable during device-loss recovery.
+    device_lost_retry_needed: bool = false,
+    main_size_replay_needed: bool = false,
+    external_size_replay_needed: bool = false,
+    device_lost_recover_attempts: u32 = 0,
+    // Set for the entire WM_APP_DEVICE_LOST_RECOVER handler (window.zig).
+    // Device/D2D/swapchain creation there can pump window messages, which
+    // can reenter WM_PAINT/WM_SIZE on this same UI thread — those handlers
+    // check this (same idiom as wm_paint_in_progress) and bail instead of
+    // blocking on app.mu, which recovery holds across parts of its own
+    // handler and would otherwise self-deadlock against.
+    device_lost_recovering: bool = false,
+    // ResizeBuffers can synchronously pump this thread's message queue. Keep
+    // App/renderer alive and defer every nested main resize until the outer
+    // swapchain transition has completely unwound.
+    main_resize_in_progress: bool = false,
+    // WM_DPICHANGED calls SetWindowPos, which synchronously dispatches WM_SIZE.
+    // Pin the outer DPI stack until its post-resize layout update returns.
+    main_dpi_change_in_progress: bool = false,
+    main_dpi_replay_needed: bool = false,
+    pending_main_dpi: u32 = 0,
+    pending_main_dpi_rect: c.RECT = std.mem.zeroes(c.RECT),
+    // serviceDeferredUiRetries issues synchronous WM_SIZE messages. Pin App
+    // for the whole service pass so a nested WM_NCDESTROY cannot free the
+    // pointer that the remaining retry stages still use.
+    deferred_ui_service_in_progress: bool = false,
+    // Set by WM_NCDESTROY while any message-pumping operation still uses
+    // App/renderer state, including main resize and deferred retry service.
+    // Actual destruction is deferred until the last active operation returns.
+    pending_destroy_after_active_operation: bool = false,
+    // UI-thread guard for fallible external HWND/D3D creation. Those APIs can
+    // pump messages just like Present(), so WM_NCDESTROY must defer App
+    // destruction until the outer create handler has unwound.
+    external_window_create_in_progress: bool = false,
+    // Scratch for the external-window recovery snapshot in
+    // WM_APP_DEVICE_LOST_RECOVER (window.zig). Unbounded — external_windows
+    // has no fixed size limit, so a fixed-size array silently drops windows
+    // beyond its capacity. This is a rare recovery path (at most a handful
+    // of times per process lifetime), not a per-frame hot path, so reusing
+    // one persistent buffer (cleared and re-filled each call) is fine.
+    device_lost_recover_grids: std.ArrayListUnmanaged(i64) = .empty,
+
+    // Last-uploaded tabline content signature (renderTablineToD3D change
+    // gate). 0 forces a re-render — reset when the renderer/texture is
+    // recreated (device-loss recovery).
+    tabline_render_sig: u64 = 0,
     // Main window cursor into renderer's pending_uploads queue (since-based upload).
     atlas_upload_cursor: u64 = 0,
     // Row-mode seed tracking: require a full set of rows before presenting.
@@ -2834,6 +3682,9 @@ pub const App = struct {
     row_valid: std.DynamicBitSetUnmanaged = .{},
     row_valid_count: u32 = 0,
     row_layout_gen: u64 = 0,
+    // Incremented only when shared font/cell/linespace metrics change.
+    // External row vertices do not depend on main drawable rows/cols.
+    shared_metrics_gen: u64 = 0,
 
     // True when back_tex holds a fully-painted frame at the current dimensions
     // and metrics, so subsequent paints may preserve it (preserve_back=true) and
@@ -2893,6 +3744,14 @@ pub const App = struct {
     url_cache_grid: i64 = 0,
     url_cache_row: i32 = 0,
     url_cache_col: i32 = 0,
+    // Non-blocking viewport query cache (scrollbar paint/flush/drag paths),
+    // keyed by grid_id (-1 for the main/cursor grid). Updated on tryLock
+    // success, served stale (at most one flush old) when the core's grid
+    // lock is busy -- mirrors macOS's cachedViewports.
+    viewport_cache: std.AutoHashMapUnmanaged(i64, ViewportInfo) = .empty,
+    // Non-blocking cursor position cache (IME candidate-window positioning).
+    // Single slot: IME only ever needs "the current cursor position".
+    cursor_pos_cache: struct { grid_id: i64 = -1, row: i32 = -1, col: i32 = -1 } = .{},
     scrollbar_repeat_dir: i8 = 0, // -1 = page up, 1 = page down, 0 = none
     scrollbar_repeat_timer: c.UINT_PTR = 0, // Timer for repeat scroll
     scrollbar_last_scroll_time: i64 = 0, // Last scroll time in ms (for throttling)
@@ -2998,6 +3857,18 @@ pub const App = struct {
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,
 
+    // Paint reentrancy guard (UI-thread-only, no lock needed): DXGI
+    // Present() can internally pump Win32 messages, which may deliver a
+    // reentrant WM_PAINT (main or external window; they share this one
+    // App/Renderer) on the same thread while the outer call still holds
+    // Renderer.ctx_mu (non-recursive std.Io.Mutex). The reentrant call must
+    // skip rendering and instead request follow-up paints once the outer call
+    // finishes. A bool intentionally invalidates every surface: multiple
+    // distinct HWNDs can reenter one Present, so a single HWND slot loses all
+    // but the last request.
+    wm_paint_in_progress: bool = false,
+    wm_paint_reinvalidate_all: bool = false,
+
     // Atomic: written by RPC thread (onFlushEnd), read by UI thread
     // (WM_SIZE handler) to gate updateLayoutToCore vs notify_layout_ready.
     window_shown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -3029,18 +3900,60 @@ pub const App = struct {
     // (for parallel nvim spawn + renderer init)
     pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .empty,
 
-    // Cached visible grids for non-blocking UI queries (UI thread only).
-    // Updated on successful tryLock; stale data used when grid_mu is contended.
-    cached_visible_grids: [16]GridInfo = undefined,
-    cached_visible_grids_count: usize = 0,
+    // Persistent query/cache storage for non-blocking visible-grid queries
+    // (UI thread only). Capacity grows only when the core reports that the
+    // current query buffer cannot hold a complete snapshot; steady-state
+    // hit-testing performs no heap work. The published cache is separate so
+    // an incomplete query can never replace the last complete snapshot.
+    visible_grids_query: std.ArrayListUnmanaged(GridInfo) = .empty,
+    cached_visible_grids: std.ArrayListUnmanaged(GridInfo) = .empty,
 
     // Tray icon for OS notification (balloon notification)
     tray_icon: ?TrayIcon = null,
 
     d3d_init_thread: ?std.Thread = null,
+    // Set before teardown joins d3d_init_thread. The worker owns any device it
+    // creates until it observes this flag and publishes into App.
+    d3d_init_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Maximum row buffer count to prevent unbounded memory growth
-    pub const max_row_buffers: u32 = 1000;
+    /// Match the core's accepted grid-row limit. The per-surface SlotPool can
+    /// hold three 20,000-row sets (60,000 slots) below its u16 sentinel limit;
+    /// the core's aggregate cell cap remains the primary memory bound.
+    pub const max_row_buffers: u32 = 20_000;
+
+    pub const AtlasResetAdmission = render_pipeline_helpers.AtlasResetAdmission;
+
+    /// Close paint admission before onAtlasCreate invalidates the atlas.
+    /// This is non-blocking because the core callback can hold grid_mu while a
+    /// paint is stalled in Present. A busy reader aborts the current flush and
+    /// the existing timer retries after the UI reader is no longer active.
+    pub fn beginAtlasResetTransaction(self: *App) AtlasResetAdmission {
+        return render_pipeline_helpers.tryBeginAtlasReset(
+            &self.atlas_reset_active,
+            &self.atlas_paint_active,
+            &self.shutting_down,
+        );
+    }
+
+    /// Open paint admission after a successful matching TBS commit. Returns
+    /// true when an atlas transaction was active, so onFlushEnd can repaint
+    /// every surface whose WM_PAINT was consumed while the gate was closed.
+    pub fn endAtlasResetTransaction(self: *App) bool {
+        return self.atlas_reset_active.swap(false, .seq_cst);
+    }
+
+    /// Acquire the single UI-thread atlas reader. The second active check
+    /// closes the race where onAtlasCreate starts between admission checks.
+    pub fn beginAtlasPaint(self: *App) bool {
+        return render_pipeline_helpers.tryBeginAtlasPaint(
+            &self.atlas_reset_active,
+            &self.atlas_paint_active,
+        );
+    }
+
+    pub fn endAtlasPaint(self: *App) void {
+        render_pipeline_helpers.endAtlasPaint(&self.atlas_paint_active);
+    }
 
     pub fn ensureRowStorage(self: *App, row: u32) void {
         // Enforce maximum row limit
@@ -3078,20 +3991,63 @@ pub const App = struct {
         }
     }
 
-    /// Non-blocking visible grids query with cache fallback (UI thread only).
-    /// Attempts tryLock on grid_mu; on success updates cached_visible_grids.
-    /// On failure returns the previously cached data.
-    pub fn getVisibleGridsCached(self: *App, corep: *zonvie_core) struct { grids: [16]GridInfo, count: usize } {
-        var buf: [16]GridInfo = undefined;
-        const result = zonvie_core_try_get_visible_grids(corep, &buf, 16);
-        if (result >= 0) {
-            const count: usize = @intCast(result);
-            @memcpy(self.cached_visible_grids[0..count], buf[0..count]);
-            self.cached_visible_grids_count = count;
-            return .{ .grids = self.cached_visible_grids, .count = count };
+    /// Non-blocking visible grids query with complete-snapshot cache fallback
+    /// (UI thread only). Busy, allocation failure, and truncated queries keep
+    /// the last complete cache. Buffers grow only when the visible-grid count
+    /// exceeds their current size, so steady-state input paths do no heap work.
+    pub fn getVisibleGridsCached(self: *App, corep: *zonvie_core) []const GridInfo {
+        const initial_capacity = 16;
+
+        if (self.visible_grids_query.items.len == 0) {
+            self.visible_grids_query.resize(self.alloc, initial_capacity) catch
+                return self.cached_visible_grids.items;
         }
-        // tryLock failed — return stale cache
-        return .{ .grids = self.cached_visible_grids, .count = self.cached_visible_grids_count };
+        if (self.cached_visible_grids.capacity < self.visible_grids_query.items.len) {
+            self.cached_visible_grids.ensureTotalCapacity(self.alloc, self.visible_grids_query.items.len) catch
+                return self.cached_visible_grids.items;
+        }
+
+        // One bounded retry publishes a newly grown snapshot without allowing
+        // a core whose grid count is changing continuously to stall the UI.
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            var total_count: usize = 0;
+            const result = zonvie_core_try_get_visible_grids_complete(
+                corep,
+                self.visible_grids_query.items.ptr,
+                self.visible_grids_query.items.len,
+                &total_count,
+            );
+            if (result < 0) return self.cached_visible_grids.items;
+
+            const written: usize = @intCast(result);
+            if (written > self.visible_grids_query.items.len or written > total_count) {
+                return self.cached_visible_grids.items;
+            }
+
+            if (written == total_count) {
+                self.cached_visible_grids.items.len = written;
+                @memcpy(
+                    self.cached_visible_grids.items,
+                    self.visible_grids_query.items[0..written],
+                );
+                return self.cached_visible_grids.items;
+            }
+
+            // The core returned a valid but truncated snapshot. Grow both
+            // persistent buffers, but never expose its partial contents.
+            if (total_count <= self.visible_grids_query.items.len or
+                total_count > std.math.maxInt(i32))
+            {
+                return self.cached_visible_grids.items;
+            }
+            self.visible_grids_query.resize(self.alloc, total_count) catch
+                return self.cached_visible_grids.items;
+            self.cached_visible_grids.ensureTotalCapacity(self.alloc, total_count) catch
+                return self.cached_visible_grids.items;
+        }
+
+        return self.cached_visible_grids.items;
     }
 
     /// Get target rectangle for ext-float (msg_show/msg_history) positioning
@@ -3199,7 +4155,80 @@ pub const App = struct {
         return @intFromFloat(@round(@as(f32, @floatFromInt(base_px)) * self.dpi_scale));
     }
 
+    pub fn hasActiveOperation(self: *const App) bool {
+        return (render_pipeline_helpers.ActiveOperationFlags{
+            .paint = self.wm_paint_in_progress,
+            .shader_present = self.in_present_shader_animation_frame,
+            .glow_prepare = self.glow_prepare_in_progress,
+            .device_recovery = self.device_lost_recovering,
+            .external_create = self.external_window_create_in_progress,
+            .main_resize = self.main_resize_in_progress,
+            .main_dpi_change = self.main_dpi_change_in_progress,
+            .deferred_service = self.deferred_ui_service_in_progress,
+        }).any();
+    }
+
+    /// Finish a message-pumping operation. Returns
+    /// true when this call destroyed `self`; callers must not dereference App again.
+    pub fn finishActiveOperation(self: *App) bool {
+        if (self.hasActiveOperation()) return false;
+
+        if (self.pending_destroy_after_active_operation) {
+            self.pending_destroy_after_active_operation = false;
+            self.owned_by_hwnd = false;
+            const alloc = self.alloc;
+            self.deinit();
+            alloc.destroy(self);
+            return true;
+        }
+
+        if (self.wm_paint_reinvalidate_all) {
+            self.wm_paint_reinvalidate_all = false;
+            if (self.hwnd) |main_hwnd| {
+                _ = c.InvalidateRect(main_hwnd, null, c.FALSE);
+            }
+            self.mu.lockUncancelable(core.clock.io());
+            var it = self.external_windows.valueIterator();
+            while (it.next()) |ext_win_ptr| {
+                _ = c.InvalidateRect(ext_win_ptr.*.hwnd, null, c.FALSE);
+            }
+            self.mu.unlock(core.clock.io());
+        }
+        return false;
+    }
+
     pub fn deinit(self: *App) void {
+        // Publish shutdown before waiting for the core thread. A core callback
+        // may currently be attempting non-blocking atlas reset admission; it
+        // must observe this while App and callback-visible fields are alive.
+        self.shutting_down.store(true, .release);
+        // The startup worker writes d3d_device/d3d_ctx through App. Stop that
+        // publication and join it while App is still alive, including shutdown
+        // before WM_APP_DEFERRED_INIT had a chance to perform its normal join.
+        self.d3d_init_cancelled.store(true, .release);
+        if (self.d3d_init_thread) |thr| {
+            thr.join();
+            self.d3d_init_thread = null;
+        }
+
+        // Join the core thread FIRST. zonvie_core_destroy() -> Core.stop() blocks
+        // until both the writer thread and the core/RPC thread have fully exited
+        // (src/core/nvim_core.zig Core.stop(), joins the writer thread and then
+        // the core/RPC thread). This MUST happen before any renderer/TBS/atlas/
+        // external-window state is freed below: the core thread's callbacks
+        // (on_vertices_row, on_atlas_*, etc.) read and write that state, and can
+        // still be executing at the moment deinit() is called (e.g. the
+        // force-quit path in windows/window.zig WM_APP_QUIT_TIMEOUT is
+        // specifically for a Neovim process that is NOT responding, i.e. very
+        // plausibly mid-callback).
+        if (self.corep) |p| zonvie_core_destroy(p);
+        self.corep = null;
+        // No core callbacks or UI paints can remain after the core join and
+        // active-operation teardown. Do not carry a failed-flush freeze into
+        // destruction diagnostics or any late idempotent cleanup path.
+        self.atlas_reset_active.store(false, .seq_cst);
+        self.atlas_paint_active.store(false, .seq_cst);
+
         // Cached AI-agent color-emoji bitmap (tabline idle indicator).
         if (self.tabline_state.agent_emoji_hbm) |hbm| {
             _ = c.DeleteObject(hbm);
@@ -3228,9 +4257,12 @@ pub const App = struct {
         // Scratch holds shallow copies during a shift; GPU buffers belong to
         // row_vbs, so only free the list storage.
         self.row_vbs_shift_scratch.deinit(self.alloc);
+        self.scroll_rows_merge_scratch.deinit(self.alloc);
 
         // WM_PAINT(row) scratch
         self.row_tmp_verts.deinit(self.alloc);
+        self.wm_paint_dirty_row_keys.deinit(self.alloc);
+        self.wm_paint_rects_snapshot.deinit(self.alloc);
         self.wm_paint_rows_to_draw.deinit(self.alloc);
         self.wm_paint_present_rects.deinit(self.alloc);
         self.row_valid.deinit(self.alloc);
@@ -3253,6 +4285,9 @@ pub const App = struct {
         self.paint_rects.deinit(self.alloc);
         self.nvim_extra_args.deinit(self.alloc);
         self.pending_glyphs.deinit(self.alloc);
+        self.viewport_cache.deinit(self.alloc);
+        self.visible_grids_query.deinit(self.alloc);
+        self.cached_visible_grids.deinit(self.alloc);
 
         // IME state cleanup
         self.ime_composition_str.deinit(self.alloc);
@@ -3262,9 +4297,12 @@ pub const App = struct {
         // External windows cleanup
         var ext_it = self.external_windows.iterator();
         while (ext_it.next()) |entry| {
-            entry.value_ptr.deinit(self.alloc);
+            entry.value_ptr.*.deinit(self.alloc);
+            self.alloc.destroy(entry.value_ptr.*);
         }
         self.external_windows.deinit(self.alloc);
+        self.shader_anim_external_grids.deinit(self.alloc);
+        self.shader_anim_external_renderers.deinit(self.alloc);
         self.pending_external_windows.deinit(self.alloc);
         for (self.pending_external_verts.items) |*pv| {
             pv.deinit(self.alloc);
@@ -3273,15 +4311,34 @@ pub const App = struct {
         self.saved_external_window_positions.deinit(self.alloc);
         self.pending_messages.deinit(self.alloc);
         self.display_messages.deinit(self.alloc);
+        self.device_lost_recover_grids.deinit(self.alloc);
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;
 
+        // Release App's own reference on the shared D3D11 device/context (the
+        // renderer, as of this fix, takes and releases its OWN reference via
+        // AddRef/Release in initWithDevice/deinit -- see
+        // windows/renderer/d3d11_renderer.zig). Without this, the device
+        // would leak by one reference at process exit.
+        if (self.d3d_ctx) |p| {
+            const rel = p.*.lpVtbl.*.Release orelse null;
+            if (rel) |f| _ = f(p);
+            self.d3d_ctx = null;
+        }
+        if (self.d3d_device) |p| {
+            const rel = p.*.lpVtbl.*.Release orelse null;
+            if (rel) |f| _ = f(p);
+            self.d3d_device = null;
+        }
+
         if (self.atlas) |*a| a.deinit();
         self.atlas = null;
-
-        if (self.corep) |p| zonvie_core_destroy(p);
-        self.corep = null;
+        // doEarlyCoreInit stores the metrics renderer here until deferred
+        // renderer initialization takes ownership. Startup may fail before
+        // that transfer, so App remains the owner of this optional value.
+        if (self.early_atlas) |*a| a.deinit();
+        self.early_atlas = null;
 
         // Clipboard event cleanup
         if (self.clipboard_event != null) {
