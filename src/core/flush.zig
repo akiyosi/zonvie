@@ -39,6 +39,25 @@ pub const GridEntry = struct {
     order: u64,
 };
 
+pub const ExternalFloatAnchorEntry = struct {
+    anchor_grid_id: i64,
+    entry: GridEntry,
+
+    fn lessThan(_: void, a: ExternalFloatAnchorEntry, b: ExternalFloatAnchorEntry) bool {
+        if (a.anchor_grid_id != b.anchor_grid_id) return a.anchor_grid_id < b.anchor_grid_id;
+        if (a.entry.zindex != b.entry.zindex) return a.entry.zindex < b.entry.zindex;
+        if (a.entry.compindex != b.entry.compindex) return a.entry.compindex < b.entry.compindex;
+        if (a.entry.order != b.entry.order) return a.entry.order < b.entry.order;
+        return a.entry.grid_id < b.entry.grid_id;
+    }
+};
+
+pub const MainSubgridRowLayout = struct {
+    grid_id: i64,
+    row_start: u32,
+    row_end: u32,
+};
+
 // Pre-computed subgrid info for row-mode compose optimization.
 // Caches win_pos/sub_grids lookups to avoid per-row hash map access.
 pub const MAX_CACHED_SUBGRIDS = 32;
@@ -53,12 +72,11 @@ pub const SubgridSnapshot = struct {
     sg_cols: u32,
     margin_top: u32,
     margin_bottom: u32,
+    margin_left: u32,
+    margin_right: u32,
 
-    fn matchesCsg(self: SubgridSnapshot, csg: CachedSubgrid) bool {
-        return self.grid_id == csg.grid_id and
-            self.row_start == csg.row_start and self.row_end == csg.row_end and
-            self.col_start == csg.col_start and self.sg_cols == csg.sg_cols and
-            self.margin_top == csg.margin_top and self.margin_bottom == csg.margin_bottom;
+    fn lessThanGridId(_: void, a: SubgridSnapshot, b: SubgridSnapshot) bool {
+        return a.grid_id < b.grid_id;
     }
 };
 
@@ -72,6 +90,8 @@ pub const CachedSubgrid = struct {
     cells: [*]const grid_mod.Cell, // pointer to subgrid cells
     margin_top: u32, // viewport margin rows at top (not scrollable)
     margin_bottom: u32, // viewport margin rows at bottom (not scrollable)
+    margin_left: u32 = 0, // viewport margin columns at left (not scrollable)
+    margin_right: u32 = 0, // viewport margin columns at right (not scrollable)
 };
 
 // Style flags for RenderCell (bit positions)
@@ -627,10 +647,15 @@ pub fn checkScrollFastPath(
 /// Must receive the same cached_subgrids slice that was used for vertex
 /// generation so the snapshot and the comparison target are identical sets.
 fn saveSubgridSnapshots(core: *Core, cached_subgrids: []const CachedSubgrid) void {
-    var count: u32 = 0;
+    core.prev_subgrid_snapshots.clearRetainingCapacity();
+    core.prev_subgrid_snapshots.ensureTotalCapacity(core.alloc, cached_subgrids.len) catch {
+        // Empty snapshot is the conservative fallback: the next flush's diff
+        // treats every current subgrid as newly added and regenerates the
+        // affected rows (or falls back from the scroll fast path).
+        return;
+    };
     for (cached_subgrids) |csg| {
-        if (count >= MAX_CACHED_SUBGRIDS) break;
-        core.prev_subgrid_snapshots[count] = .{
+        core.prev_subgrid_snapshots.appendAssumeCapacity(.{
             .grid_id = csg.grid_id,
             .row_start = csg.row_start,
             .row_end = csg.row_end,
@@ -638,10 +663,11 @@ fn saveSubgridSnapshots(core: *Core, cached_subgrids: []const CachedSubgrid) voi
             .sg_cols = csg.sg_cols,
             .margin_top = csg.margin_top,
             .margin_bottom = csg.margin_bottom,
-        };
-        count += 1;
+            .margin_left = csg.margin_left,
+            .margin_right = csg.margin_right,
+        });
     }
-    core.prev_subgrid_snapshot_count = count;
+    std.sort.block(SubgridSnapshot, core.prev_subgrid_snapshots.items, {}, SubgridSnapshot.lessThanGridId);
 }
 
 /// Collect rows affected by subgrid layout changes between previous and
@@ -654,7 +680,7 @@ fn saveSubgridSnapshots(core: *Core, cached_subgrids: []const CachedSubgrid) voi
 /// `out.len`, the buffer may have overflowed — the caller must treat this
 /// as "too many diff rows" and fall back from the fast path.
 fn collectSubgridDiffRows(
-    core: *const Core,
+    core: *Core,
     cached_subgrids: []const CachedSubgrid,
     region_top: u32,
     region_bot: u32,
@@ -662,36 +688,70 @@ fn collectSubgridDiffRows(
     existing_regen: []const u32,
 ) u32 {
     var count: u32 = 0;
-    const prev = core.prev_subgrid_snapshots[0..core.prev_subgrid_snapshot_count];
+    const prev = core.prev_subgrid_snapshots.items;
 
-    // Detect removed or moved grids: iterate previous snapshots.
-    for (prev) |ps| {
-        var found_same = false;
-        for (cached_subgrids) |csg| {
-            if (ps.matchesCsg(csg)) {
-                found_same = true;
-                break;
-            }
-        }
-        if (!found_same) {
-            count = addRowRange(ps.row_start, ps.row_end, region_top, region_bot, out, count, existing_regen);
-            if (count >= out.len) return count;
+    // Normalize the current layout by grid id in persistent scratch. Sorting
+    // costs O(G log G), then a merge with the already-sorted committed
+    // snapshot detects additions/removals/moves in O(G). Capacity is retained,
+    // so the steady-state scroll hot path does not allocate.
+    core.subgrid_diff_current.clearRetainingCapacity();
+    core.subgrid_diff_current.ensureTotalCapacity(core.alloc, cached_subgrids.len) catch return @intCast(out.len);
+    for (cached_subgrids) |csg| {
+        core.subgrid_diff_current.appendAssumeCapacity(.{
+            .grid_id = csg.grid_id,
+            .row_start = csg.row_start,
+            .row_end = csg.row_end,
+            .col_start = csg.col_start,
+            .sg_cols = csg.sg_cols,
+            .margin_top = csg.margin_top,
+            .margin_bottom = csg.margin_bottom,
+            .margin_left = csg.margin_left,
+            .margin_right = csg.margin_right,
+        });
+    }
+    std.sort.block(SubgridSnapshot, core.subgrid_diff_current.items, {}, SubgridSnapshot.lessThanGridId);
+    const current = core.subgrid_diff_current.items;
+
+    const mark_len: usize = @intCast(region_bot);
+    const old_mark_len = core.subgrid_diff_row_marks.items.len;
+    core.subgrid_diff_row_marks.resize(core.alloc, mark_len) catch return @intCast(out.len);
+    if (mark_len > old_mark_len) {
+        @memset(core.subgrid_diff_row_marks.items[old_mark_len..mark_len], 0);
+    }
+    core.subgrid_diff_row_generation +%= 1;
+    if (core.subgrid_diff_row_generation == 0) {
+        @memset(core.subgrid_diff_row_marks.items, 0);
+        core.subgrid_diff_row_generation = 1;
+    }
+    const generation = core.subgrid_diff_row_generation;
+    for (existing_regen) |row| {
+        if (row < core.subgrid_diff_row_marks.items.len) {
+            core.subgrid_diff_row_marks.items[row] = generation;
         }
     }
 
-    // Detect added or moved grids: iterate current subgrids.
-    for (cached_subgrids) |csg| {
-        var found_same = false;
-        for (prev) |ps| {
-            if (ps.matchesCsg(csg))
-            {
-                found_same = true;
-                break;
+    var prev_i: usize = 0;
+    var current_i: usize = 0;
+    while (prev_i < prev.len or current_i < current.len) {
+        if (prev_i < prev.len and current_i < current.len and prev[prev_i].grid_id == current[current_i].grid_id) {
+            if (!std.meta.eql(prev[prev_i], current[current_i])) {
+                count = addMarkedRowRange(core, prev[prev_i].row_start, prev[prev_i].row_end, region_top, region_bot, out, count, generation);
+                if (count >= out.len) return count;
+                count = addMarkedRowRange(core, current[current_i].row_start, current[current_i].row_end, region_top, region_bot, out, count, generation);
+                if (count >= out.len) return count;
             }
-        }
-        if (!found_same) {
-            count = addRowRange(csg.row_start, csg.row_end, region_top, region_bot, out, count, existing_regen);
+            prev_i += 1;
+            current_i += 1;
+        } else if (current_i >= current.len or
+            (prev_i < prev.len and prev[prev_i].grid_id < current[current_i].grid_id))
+        {
+            count = addMarkedRowRange(core, prev[prev_i].row_start, prev[prev_i].row_end, region_top, region_bot, out, count, generation);
             if (count >= out.len) return count;
+            prev_i += 1;
+        } else {
+            count = addMarkedRowRange(core, current[current_i].row_start, current[current_i].row_end, region_top, region_bot, out, count, generation);
+            if (count >= out.len) return count;
+            current_i += 1;
         }
     }
 
@@ -699,15 +759,16 @@ fn collectSubgridDiffRows(
 }
 
 /// Helper: add rows from [start, end) that fall within [region_top, region_bot)
-/// to out[], skipping duplicates against both out[0..count] and existing_regen.
-fn addRowRange(
+/// to out[], using generation marks for O(1) duplicate suppression.
+fn addMarkedRowRange(
+    core: *Core,
     start: u32,
     end: u32,
     region_top: u32,
     region_bot: u32,
     out: []u32,
     initial_count: u32,
-    existing_regen: []const u32,
+    generation: u32,
 ) u32 {
     var count = initial_count;
     const clamped_start = @max(start, region_top);
@@ -715,25 +776,11 @@ fn addRowRange(
     var r = clamped_start;
     while (r < clamped_end) : (r += 1) {
         if (count >= out.len) return count;
-        var dup = false;
-        for (out[0..count]) |existing| {
-            if (existing == r) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            for (existing_regen) |er| {
-                if (er == r) {
-                    dup = true;
-                    break;
-                }
-            }
-        }
-        if (!dup) {
-            out[count] = r;
-            count += 1;
-        }
+        const row_index: usize = @intCast(r);
+        if (core.subgrid_diff_row_marks.items[row_index] == generation) continue;
+        core.subgrid_diff_row_marks.items[row_index] = generation;
+        out[count] = r;
+        count += 1;
     }
     return count;
 }

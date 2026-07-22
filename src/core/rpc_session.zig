@@ -11,7 +11,8 @@ const mp = @import("msgpack.zig");
 const rpc = @import("rpc_encode.zig");
 const redraw = @import("redraw_handler.zig");
 const config = @import("config.zig");
-const Logger = @import("log.zig").Logger;
+const log_mod = @import("log.zig");
+const Logger = log_mod.Logger;
 const flush = @import("flush.zig");
 const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
@@ -228,6 +229,59 @@ fn envVarOwned(alloc: std.mem.Allocator, name: [*:0]const u8) error{ Environment
     return alloc.dupe(u8, std.mem.span(val));
 }
 
+/// POSIX child-wait service created before a spawned session is admitted.
+/// A preserved child is transferred to this already-running thread during
+/// cleanup, so waitpid progress neither allocates nor depends on stderr EOF.
+pub const ChildReaper = struct {
+    alloc: std.mem.Allocator,
+    mu: std.Io.Mutex,
+    decision_ready: std.Io.Condition,
+    decided: bool,
+    child: ?std.process.Child,
+    refcount: std.atomic.Value(u32),
+    reaped: std.atomic.Value(bool),
+
+    pub fn release(self: *ChildReaper) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) self.alloc.destroy(self);
+    }
+
+    pub fn run(self: *ChildReaper) void {
+        defer self.release();
+
+        self.mu.lockUncancelable(clock.io());
+        while (!self.decided) {
+            self.decision_ready.waitUncancelable(clock.io(), &self.mu);
+        }
+        var child = self.child;
+        self.child = null;
+        self.mu.unlock(clock.io());
+
+        if (child) |*owned| {
+            _ = owned.wait(clock.io()) catch return;
+            self.reaped.store(true, .release);
+        }
+    }
+
+    fn adopt(self: *ChildReaper, child: std.process.Child) bool {
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
+        if (self.decided) return false;
+        self.child = child;
+        self.decided = true;
+        self.decision_ready.signal(clock.io());
+        return true;
+    }
+
+    pub fn finishWithoutChild(self: *ChildReaper) void {
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
+        if (self.decided) return;
+        self.decided = true;
+        self.decision_ready.signal(clock.io());
+    }
+};
+
 /// Build a child-process environment map from the LIVE libc `environ` at call
 /// time (POSIX only). Returns null on Windows and on allocation failure.
 ///
@@ -275,13 +329,11 @@ fn liveEnvironMap(alloc: std.mem.Allocator) ?std.process.Environ.Map {
 ///     path: detachFromCore + release; non-orphan: thread.join (which
 ///     drops the thread's ref) then Core's release.
 ///
-/// Core access (the `core` pointer) is gated by `mu`.
-/// cleanupSession's orphan path calls detachFromCore() (which holds
-/// mu while nulling the back-pointer) before letting Core go away;
-/// subsequent pump iterations see core==null inside the lock and skip
-/// every dereference. The mutex being inside the heap struct (not in
-/// Core) is what makes this safe — it outlives Core for the duration
-/// of the detached pump.
+/// Core access begins under `mu` and increments `active_core_users`, but
+/// frontend callbacks run without the mutex held. cleanupSession's orphan
+/// path calls detachFromCore(), which nulls the back-pointer and waits for
+/// active users before letting Core go away. The mutex/condition being inside
+/// the heap struct (not Core) is what makes this safe for detached pumps.
 ///
 /// `alloc` MUST outlive every release(). Callers pass
 /// std.heap.c_allocator (process-lifetime) instead of CoreBox's GPA
@@ -291,8 +343,11 @@ pub const StderrPump = struct {
     alloc: std.mem.Allocator,
     f: rpc_transport.Stream,
     mu: std.Io.Mutex,
+    core_users_done: std.Io.Condition,
     core: ?*Core,
+    active_core_users: u32,
     refcount: std.atomic.Value(u32),
+    cleanup_decided: bool,
 
     /// Drop one reference. When the count drops to zero, close the
     /// fd and free the struct. Safe to call from any thread.
@@ -307,44 +362,76 @@ pub const StderrPump = struct {
     /// Run the pump until EOF / read error. Called from the pump
     /// thread; never directly. Drops the thread's ref on exit.
     pub fn run(self: *StderrPump) void {
-        defer self.release();
+        defer self.finishRun();
         var buf: [4096]u8 = undefined;
         while (true) {
             // Stop check: Core may have flagged termination.
-            {
-                self.mu.lockUncancelable(clock.io());
-                defer self.mu.unlock(clock.io());
-                if (self.core) |c| {
-                    if (c.stop_flag.load(.seq_cst)) break;
-                }
-            }
+            const stop_core = self.acquireCore();
+            const stopped = if (stop_core) |c| c.stop_flag.load(.seq_cst) else false;
+            if (stop_core != null) self.releaseCore();
+            if (stopped) break;
 
             const n = self.f.read(&buf) catch break;
             if (n == 0) break;
 
-            // Logging + SSH detection. Both touch Core, so guarded
-            // by the same mutex. After detachFromCore() this branch
-            // is a no-op — orphaned pumps simply discard the data.
-            // (We could keep logging via a captured on_log function
-            // pointer + ctx — both App-owned, safe across Core
-            // teardown — but that adds another snapshot field for
-            // a feature the orphan path does not need.)
-            self.mu.lockUncancelable(clock.io());
-            defer self.mu.unlock(clock.io());
-            if (self.core) |c| {
-                if (c.cb.on_log) |logfn| logfn(c.ctx, buf[0..n].ptr, n);
+            // Hold a logical Core user while invoking callbacks, but never the
+            // pump mutex itself. detachFromCore() prevents new users and waits
+            // for active callbacks, preserving Core lifetime without making a
+            // callback-safe stop() recurse into this mutex.
+            const c = self.acquireCore() orelse continue;
+            defer self.releaseCore();
+            if (c.cb.on_log) |logfn| {
+                log_mod.enterCallback();
+                logfn(c.ctx, buf[0..n].ptr, n);
+                log_mod.leaveCallback();
+            }
 
-                if (c.is_ssh_mode and !c.ssh_auth_done.load(.seq_cst)) {
-                    if (containsPasswordPrompt(buf[0..n])) {
-                        c.log.write("SSH: detected password prompt in stderr\n", .{});
-                        if (c.cb.on_ssh_auth_prompt) |prompt_cb| {
-                            c.ssh_auth_pending.store(true, .seq_cst);
-                            prompt_cb(c.ctx, "SSH Password:", 13);
-                        }
+            if (c.is_ssh_mode and !c.ssh_auth_done.load(.seq_cst)) {
+                if (containsPasswordPrompt(buf[0..n])) {
+                    c.log.write("SSH: detected password prompt in stderr\n", .{});
+                    if (c.cb.on_ssh_auth_prompt) |prompt_cb| {
+                        c.ssh_auth_pending.store(true, .seq_cst);
+                        log_mod.enterCallback();
+                        prompt_cb(c.ctx, "SSH Password:", 13);
+                        log_mod.leaveCallback();
                     }
                 }
             }
         }
+    }
+
+    fn finishRun(self: *StderrPump) void {
+        self.mu.lockUncancelable(clock.io());
+        while (!self.cleanup_decided) {
+            self.core_users_done.waitUncancelable(clock.io(), &self.mu);
+        }
+        self.mu.unlock(clock.io());
+        self.release();
+    }
+
+    /// Tell an EOF'd pump that cleanup retained no child for it to reap.
+    pub fn finishCleanupDecision(self: *StderrPump) void {
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
+        if (self.cleanup_decided) return;
+        self.cleanup_decided = true;
+        self.core_users_done.broadcast(clock.io());
+    }
+
+    fn acquireCore(self: *StderrPump) ?*Core {
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
+        const c = self.core orelse return null;
+        self.active_core_users += 1;
+        return c;
+    }
+
+    fn releaseCore(self: *StderrPump) void {
+        self.mu.lockUncancelable(clock.io());
+        defer self.mu.unlock(clock.io());
+        std.debug.assert(self.active_core_users > 0);
+        self.active_core_users -= 1;
+        if (self.active_core_users == 0) self.core_users_done.broadcast(clock.io());
     }
 
     /// Sever the pump's back-reference to Core under the pump's own
@@ -356,6 +443,9 @@ pub const StderrPump = struct {
         self.mu.lockUncancelable(clock.io());
         defer self.mu.unlock(clock.io());
         self.core = null;
+        while (self.active_core_users != 0) {
+            self.core_users_done.waitUncancelable(clock.io(), &self.mu);
+        }
     }
 };
 
@@ -412,6 +502,131 @@ pub fn logEnvHints(self: *Core) void {
         self.log.write("PATH: (missing)\n", .{});
 }
 
+fn failRedrawRecovery(self: *Core, reason: anyerror) void {
+    self.log.write("redraw recovery failed: {any}\n", .{reason});
+    self.redraw_recovery_failed = true;
+    self.pending_resize_mu.lockUncancelable(clock.io());
+    self.ui_attached.store(false, .seq_cst);
+    self.pending_resize_mu.unlock(clock.io());
+}
+
+const max_redraw_recovery_attempts: u8 = 2;
+
+fn handleRedrawFailure(self: *Core, reason: anyerror) void {
+    // Reattaching replays the same authoritative Neovim state. A local hard
+    // resource limit therefore cannot be healed by an epoch reset and would
+    // otherwise produce an unbounded detach/attach loop.
+    switch (reason) {
+        error.GridTooLarge, error.TooManyWindowPlacements => {
+            failRedrawRecovery(self, reason);
+            return;
+        },
+        else => {},
+    }
+    beginRedrawRecovery(self);
+}
+
+fn requestRedrawRecoveryAttach(self: *Core) !void {
+    // Serialize the attach size with the latest-wins resize state, matching the
+    // initial session attach path.
+    self.pending_resize_mu.lockUncancelable(clock.io());
+    defer self.pending_resize_mu.unlock(clock.io());
+
+    const rows = if (self.pending_resize_valid)
+        self.pending_resize_rows
+    else if (self.desired_resize_rows != 0)
+        self.desired_resize_rows
+    else
+        @max(1, self.ui_attach_rows);
+    const cols = if (self.pending_resize_valid)
+        self.pending_resize_cols
+    else if (self.desired_resize_cols != 0)
+        self.desired_resize_cols
+    else
+        @max(1, self.ui_attach_cols);
+
+    const id = try self.requestUiAttachTracked(rows, cols);
+    self.redraw_recovery_attach_rows = rows;
+    self.redraw_recovery_attach_cols = cols;
+    self.redraw_recovery_msgid = id;
+    self.redraw_recovery_state = .await_attach;
+    self.log.write("redraw recovery: fresh ui_attach queued id={d} rows={d} cols={d}\n", .{ id, rows, cols });
+}
+
+fn beginRedrawRecovery(self: *Core) void {
+    if (self.redraw_recovery_failed or self.redraw_recovery_state == .await_detach) return;
+    if (self.redraw_recovery_attempts >= max_redraw_recovery_attempts) {
+        failRedrawRecovery(self, error.RedrawRecoveryLimitExceeded);
+        return;
+    }
+    self.redraw_recovery_attempts += 1;
+
+    self.pending_resize_mu.lockUncancelable(clock.io());
+    self.ui_attached.store(false, .seq_cst);
+    self.pending_resize_mu.unlock(clock.io());
+    const id = self.requestUiDetachTracked() catch |err| {
+        failRedrawRecovery(self, err);
+        return;
+    };
+    // Publishing this after sendRaw succeeds is safe: this function runs on
+    // the sole RPC reader thread, so no response can be dispatched meanwhile.
+    self.redraw_recovery_msgid = id;
+    self.redraw_recovery_state = .await_detach;
+    self.log.write("redraw recovery: poisoned UI epoch, detach queued id={d}\n", .{id});
+}
+
+fn handleRedrawRecoveryResponse(self: *Core, id: i64, has_err: bool) bool {
+    if (id != self.redraw_recovery_msgid) return false;
+
+    switch (self.redraw_recovery_state) {
+        .healthy => return false,
+        .await_detach => {
+            if (has_err) {
+                failRedrawRecovery(self, error.UiDetachFailed);
+                return true;
+            }
+
+            // Every byte emitted by the old RemoteUI precedes this response on
+            // the same channel. Reset only after crossing that boundary.
+            self.resetRedrawProtocolState();
+            requestRedrawRecoveryAttach(self) catch |err| failRedrawRecovery(self, err);
+            return true;
+        },
+        .await_attach => {
+            if (has_err) {
+                failRedrawRecovery(self, error.UiAttachFailed);
+                return true;
+            }
+
+            self.pending_resize_mu.lockUncancelable(clock.io());
+            if (self.pending_resize_valid and
+                self.pending_resize_rows == self.redraw_recovery_attach_rows and
+                self.pending_resize_cols == self.redraw_recovery_attach_cols)
+            {
+                self.pending_resize_valid = false;
+                self.pending_resize_sequence = 0;
+            }
+            self.ui_attach_rows = self.redraw_recovery_attach_rows;
+            self.ui_attach_cols = self.redraw_recovery_attach_cols;
+            self.ui_attached.store(true, .seq_cst);
+            self.flushPendingUiStateLocked();
+            self.pending_resize_mu.unlock(clock.io());
+
+            self.redraw_recovery_state = .healthy;
+            self.redraw_recovery_msgid = 0;
+            self.redraw_recovery_attach_rows = 0;
+            self.redraw_recovery_attach_cols = 0;
+            // The tracked attach response is serialized after its full-state
+            // replay. Only this boundary proves the recovery completed; an
+            // earlier successful replay batch must not reset the retry limit
+            // before a later batch reproduces the same deterministic error.
+            self.redraw_recovery_attempts = 0;
+            self.log.write("redraw recovery: fresh UI epoch attached\n", .{});
+            return true;
+        },
+    }
+}
+
 pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
     // [type=1, msgid, error, result]
     if (top.len < 4) return;
@@ -420,6 +635,8 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
 
     const errv = top[2];
     const has_err = (errv != .nil);
+
+    if (handleRedrawRecoveryResponse(self, id, has_err)) return;
 
     if (has_err) {
         self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
@@ -478,20 +695,27 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         applyGlowConfig(self, top[3]);
         return;
     }
-
 }
 
 /// Force full vertex regeneration (content_rev bump + dirty_all + onFlush).
 /// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
 fn forceGlowFlush(self: *Core) void {
-    self.grid.content_rev +%= 1;
-    self.grid.dirty_all = true;
-    self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    // Owner id is set/cleared strictly inside the locked section — see the
+    // matching comment in handleRpcNotification's "redraw" branch for why
+    // (a store before lock or a clear after unlock opens a window where a
+    // different thread, e.g. zonvie_core_retry_flush, can observe/clobber
+    // this id while this thread's critical section is still in progress).
     self.grid_mu.lockUncancelable(clock.io());
+    self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    self.grid.content_rev +%= 1;
+    self.grid.markAllDirty();
+    var sg_it = self.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| sg.markAllDirty();
+    self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch {};
-    self.grid_mu.unlock(clock.io());
     self.redraw_thread_id.store(0, .seq_cst);
+    self.grid_mu.unlock(clock.io());
 }
 
 /// Disable glow and flush if it was previously enabled (clears DECO_GLOW from vertices).
@@ -724,8 +948,8 @@ pub fn handleWinMoveCursor(self: *Core, msgid: i64, params: mp.Value) void {
     var count: i32 = 1;
 
     if (params == .arr and params.arr.len >= 2) {
-        if (params.arr[0] == .int) direction = @intCast(params.arr[0].int);
-        if (params.arr[1] == .int) count = @intCast(params.arr[1].int);
+        if (params.arr[0] == .int) direction = redraw.checkedI32(params.arr[0].int) orelse 0;
+        if (params.arr[1] == .int) count = redraw.checkedI32(params.arr[1].int) orelse 1;
     }
 
     self.log.write("[win_move_cursor] direction={d} count={d}\n", .{ direction, count });
@@ -1104,8 +1328,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
     const params = top[2].arr;
 
     if (std.mem.eql(u8, method, "redraw")) {
-        // Store current thread ID to detect re-entrant updateLayoutPx calls from this thread.
-        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        // Detach has been queued but its response boundary has not arrived.
+        // These batches were produced by the poisoned UI epoch and must never
+        // be applied. During await_attach, redraw belongs to the fresh epoch
+        // and is intentionally processed before Neovim serializes the attach
+        // response.
+        if (self.redraw_recovery_failed or self.redraw_recovery_state == .await_detach) return;
 
         // Lock grid_mu to prevent concurrent access from UI thread during redraw.
         // NOTE: All frontend callbacks invoked below (on_vertices_*, on_guifont,
@@ -1114,7 +1342,21 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // zonvie_core_get_* or other APIs that acquire grid_mu.
         self.grid_mu.lockUncancelable(clock.io());
 
+        // Store current thread ID (to detect re-entrant updateLayoutPx calls
+        // from this thread) only AFTER acquiring grid_mu, and clear it
+        // before unlocking below — the owner id must never be visible to
+        // another thread except while grid_mu is actually held by the
+        // thread that set it. Setting it before the lock (or clearing it
+        // after unlocking) opens a window where a different thread — e.g.
+        // zonvie_core_retry_flush on the UI thread — can read/write this
+        // same atomic while this thread is mid-callback (or vice versa),
+        // clobbering the id a re-entrant updateLayoutPx call on the OTHER
+        // thread depends on and causing it to self-deadlock on grid_mu it
+        // already holds.
+        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+
         var fctx = flush.FlushCtx{ .core = self };
+        var redraw_error: ?anyerror = null;
         redraw.handleRedraw(
             &self.grid,
             &self.hl,
@@ -1133,13 +1375,26 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             flush.FlushCtx.onConnect,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
+            redraw_error = re;
         };
+
+        if (redraw_error) |reason| {
+            // Do not run UI-extension post-processing and do not present this
+            // partial batch. Release grid_mu before enqueueing detach: sendRaw
+            // takes the writer lock and session teardown/reset has its own
+            // lock ordering.
+            self.redraw_thread_id.store(0, .seq_cst);
+            self.grid_mu.unlock(clock.io());
+            handleRedrawFailure(self, reason);
+            return;
+        }
 
         // Per-redraw post-processing notifications. Each one is a thin wrapper
         // over UI-extension state diffing, but they fire callbacks that may run
         // arbitrary frontend code, so individual timing helps explain
-        // redraw_batch tail latency.
-        const log_on_notify = self.log.cb != null;
+        // redraw_batch tail latency. Verbose tier: 4 lines per redraw batch
+        // add up during scroll bursts; enable [log] verbose to trace them.
+        const log_on_notify = self.log.cb != null and self.log.verbose;
 
         // Update cmdline grid BEFORE checking external windows
         // (cmdline is rendered as an external grid)
@@ -1175,265 +1430,290 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             self.log.write("[perf] notify_tabline us={d}\n", .{dt});
         }
 
-        // Process pending ext_windows grid resizes (from win_resize events).
-        // win_resize is Neovim's request to the UI. The UI decides the actual
-        // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
-        for (self.grid.pending_grid_resizes.items) |resize| {
-            if (!self.known_external_grids.contains(resize.grid_id)) {
-                // NEW grid: Use a reasonable initial size for new external windows.
-                // Neovim's proposed size is based on terminal layout (e.g. height=2)
-                // which is too small for an OS window. Use half the main window.
-                const init_rows = @max(resize.height, self.grid.rows / 2);
-                const init_cols = @max(resize.width, self.grid.cols / 2);
-                self.requestTryResizeGrid(resize.grid_id, init_rows, init_cols);
+        var postprocess_error: ?anyerror = null;
+        postprocess: {
+            // Process pending ext_windows grid resizes (from win_resize events).
+            // win_resize is Neovim's request to the UI. The UI decides the actual
+            // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
+            for (self.grid.pending_grid_resizes.items) |resize| {
+                if (!self.known_external_grids.contains(resize.grid_id)) {
+                    // NEW grid: Use a reasonable initial size for new external windows.
+                    // Neovim's proposed size is based on terminal layout (e.g. height=2)
+                    // which is too small for an OS window. Use half the main window.
+                    const init_rows = @max(resize.height, self.grid.rows / 2);
+                    const init_cols = @max(resize.width, self.grid.cols / 2);
+                    self.requestTryResizeGridInternal(resize.grid_id, init_rows, init_cols) catch |err| {
+                        postprocess_error = err;
+                        break :postprocess;
+                    };
 
-                // Mark grid as pending initial resize. Window creation will be
-                // deferred in notifyExternalWindowChanges until Neovim responds
-                // with grid_resize matching the requested dimensions.
-                self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
-                    .grid_id = resize.grid_id,
-                    .width = init_cols,
-                    .height = init_rows,
-                }) catch {};
-            } else {
-                // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
-                // Honor the request by calling try_resize_grid with Neovim's values.
-                self.requestTryResizeGrid(resize.grid_id, resize.height, resize.width);
-            }
-        }
-        self.grid.pending_grid_resizes.clearRetainingCapacity();
-
-        // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
-        // Grid 1 normally echoes the size the frontend asked for through
-        // updateLayoutPx; a different size means Neovim changed it itself, so
-        // ask the frontend to resize its window to match.
-        if (self.grid.pending_main_grid_size) |sz| {
-            self.grid.pending_main_grid_size = null;
-            if (self.last_layout_rows != 0 and self.last_layout_cols != 0 and
-                (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
-            {
-                if (self.cb.on_main_grid_size) |cb| {
-                    // last_layout_* is deliberately NOT updated here. The main
-                    // grid's NDC viewport is derived from the drawable, so the
-                    // vertices Neovim just triggered cover only the cells that
-                    // fit the OLD window. Letting the post-resize
-                    // updateLayoutPx run its normal try_resize round trip makes
-                    // Neovim repaint once the drawable actually matches.
-                    self.log.write(
-                        "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
-                        .{ sz.rows, sz.cols },
-                    );
-                    cb(self.ctx, sz.rows, sz.cols);
+                    // Mark grid as pending initial resize. Window creation will be
+                    // deferred in notifyExternalWindowChanges until Neovim responds
+                    // with grid_resize matching the requested dimensions.
+                    self.grid.pending_ext_window_grids.put(self.alloc, resize.grid_id, .{
+                        .grid_id = resize.grid_id,
+                        .width = init_cols,
+                        .height = init_rows,
+                    }) catch |err| {
+                        postprocess_error = err;
+                        break :postprocess;
+                    };
+                } else {
+                    // EXISTING grid: Neovim is requesting a resize (e.g. <C-w>+/-/>/<).
+                    // Honor the request by calling try_resize_grid with Neovim's values.
+                    self.requestTryResizeGridInternal(resize.grid_id, resize.height, resize.width) catch |err| {
+                        postprocess_error = err;
+                        break :postprocess;
+                    };
                 }
             }
-        }
+            self.grid.pending_grid_resizes.clearRetainingCapacity();
 
-        // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
-        // These are deferred to the end of the redraw batch (not immediate) because they
-        // depend on grid state that may be updated earlier in the same batch.
-        // The frontend callbacks run synchronously here on the core thread.
-        for (self.grid.pending_win_ops.items) |op| {
-            switch (op.op) {
-                .move => {
-                    if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
-                },
-                .exchange => {
-                    if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
-                },
-                .rotate => {
-                    if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
-                },
-                .resize_equal => {
-                    if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
-                },
-            }
-        }
-        self.grid.pending_win_ops.clearRetainingCapacity();
-
-        // ext_windows: Promote external grids back to composited when the main
-        // window has no composited editor windows left.
-        //
-        // This handles the case where the user closes the last composited window
-        // in a split layout (e.g. :close). Neovim sends win_close for the closed
-        // grid and win_pos for the remaining grid(s) in the same redraw batch.
-        // After processing the batch, if no editor windows remain composited in
-        // the main window, we promote external grids back to composited so the
-        // user sees them in the main window instead of only in separate OS windows.
-        //
-        // notifyExternalWindowChanges() (below) naturally detects the removal from
-        // external_grids and fires on_external_window_close so the frontend closes
-        // the external OS window.
-        //
-        // IMPORTANT: This must run BEFORE the grid 2 auto-compositing fallback
-        // below, because win_close removes grid 2 from win_pos, and the fallback
-        // would re-add it — making the promotion check think there's still a
-        // composited editor window and skipping promotion entirely.
-        var ext_windows_promoted = false;
-        if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
-            // Detect whether the global grid has any composited editor windows.
-            // Skip: grid 1 (global/status), floats (in win_layer), external grids,
-            // and grids without a real Neovim window handle (not in grid_win_ids).
-            var has_composited_editor_win = false;
-            var only_grid2_composited = true;
-            {
-                var wp_it = self.grid.win_pos.keyIterator();
-                while (wp_it.next()) |key_ptr| {
-                    const gid = key_ptr.*;
-                    if (gid == 1) continue;
-                    if (self.grid.win_layer.contains(gid)) continue;
-                    if (self.grid.external_grids.contains(gid)) continue;
-                    if (!self.grid.grid_win_ids.contains(gid)) continue;
-                    has_composited_editor_win = true;
-                    if (gid != 2) only_grid2_composited = false;
-                }
-            }
-
-            // If a composited editor window was closed in this batch and the
-            // only remaining composited window is grid 2, treat grid 2 as a
-            // Neovim fallback and remove it so promotion can proceed.
-            // This handles the case where: user closes a promoted window →
-            // Neovim re-composites grid 2 as default → we want to promote the
-            // next external window instead of showing grid 2's empty buffer.
-            if (has_composited_editor_win and self.grid.composited_win_closed and only_grid2_composited) {
-                self.grid.hideWin(2);
-                has_composited_editor_win = false;
-                self.log.write("[ext_windows_promote] removed fallback grid 2 (composited_win_closed)\n", .{});
-            }
-            self.grid.composited_win_closed = false;
-
-            if (!has_composited_editor_win) {
-                // Main window is empty of editor windows. Collect promotion candidates.
-                // Only consider grids in BOTH ext_windows_grids AND external_grids.
-                // ext_windows_grids can contain win_hide'd grids (tab switch) that have
-                // been removed from external_grids — those must not be promoted.
-                const PromoteEntry = struct {
-                    grid_id: i64,
-                    win_id: i64,
-                    row: u32,
-                    col: u32,
-                };
-
-                // Find ONE grid to promote. Only promote a single grid to avoid
-                // multiple external grids rendering on top of each other in the
-                // main window. The remaining external windows stay as separate
-                // OS windows.
-                //
-                // Selection: pick the first candidate that exists in BOTH
-                // ext_windows_grids AND external_grids, preferring one with a
-                // valid position (start_row >= 0). If none have valid positions,
-                // fall back to (0,0).
-                var promote_target: ?PromoteEntry = null;
-                var fallback_target: ?PromoteEntry = null;
+            // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
+            // Grid 1 normally echoes the size the frontend asked for through
+            // updateLayoutPx; a different size means Neovim changed it itself, so
+            // ask the frontend to resize its window to match.
+            if (self.grid.pending_main_grid_size) |sz| {
+                self.grid.pending_main_grid_size = null;
+                if (self.last_layout_rows != 0 and self.last_layout_cols != 0 and
+                    (sz.rows != self.last_layout_rows or sz.cols != self.last_layout_cols))
                 {
-                    var ew_it = self.grid.ext_windows_grids.iterator();
-                    while (ew_it.next()) |entry| {
-                        const gid = entry.key_ptr.*;
-                        const wid = entry.value_ptr.*;
+                    if (self.cb.on_main_grid_size) |cb| {
+                        // last_layout_* is deliberately NOT updated here. The main
+                        // grid's NDC viewport is derived from the drawable, so the
+                        // vertices Neovim just triggered cover only the cells that
+                        // fit the OLD window. Letting the post-resize
+                        // updateLayoutPx run its normal try_resize round trip makes
+                        // Neovim repaint once the drawable actually matches.
+                        self.log.write(
+                            "[main_grid_size] neovim-initiated resize rows={d} cols={d}\n",
+                            .{ sz.rows, sz.cols },
+                        );
+                        cb(self.ctx, sz.rows, sz.cols);
+                    }
+                }
+            }
 
-                        const ext_info = self.grid.external_grids.get(gid) orelse continue;
+            // Process pending ext_windows layout operations (win_move, win_exchange, etc.)
+            // These are deferred to the end of the redraw batch (not immediate) because they
+            // depend on grid state that may be updated earlier in the same batch.
+            // The frontend callbacks run synchronously here on the core thread.
+            for (self.grid.pending_win_ops.items) |op| {
+                switch (op.op) {
+                    .move => {
+                        if (self.cb.on_win_move) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction);
+                    },
+                    .exchange => {
+                        if (self.cb.on_win_exchange) |cb| cb(self.ctx, op.grid_id, op.win, op.count);
+                    },
+                    .rotate => {
+                        if (self.cb.on_win_rotate) |cb| cb(self.ctx, op.grid_id, op.win, op.flags_or_direction, op.count);
+                    },
+                    .resize_equal => {
+                        if (self.cb.on_win_resize_equal) |cb| cb(self.ctx);
+                    },
+                }
+            }
+            self.grid.pending_win_ops.clearRetainingCapacity();
 
-                        if (ext_info.start_row >= 0 and ext_info.start_col >= 0) {
-                            // First candidate with valid position wins.
-                            promote_target = .{
-                                .grid_id = gid,
-                                .win_id = wid,
-                                .row = @intCast(ext_info.start_row),
-                                .col = @intCast(ext_info.start_col),
-                            };
-                            break;
-                        } else if (fallback_target == null) {
-                            // Remember first candidate as fallback (position unknown).
-                            fallback_target = .{
-                                .grid_id = gid,
-                                .win_id = wid,
-                                .row = 0,
-                                .col = 0,
-                            };
+            // ext_windows: Promote external grids back to composited when the main
+            // window has no composited editor windows left.
+            //
+            // This handles the case where the user closes the last composited window
+            // in a split layout (e.g. :close). Neovim sends win_close for the closed
+            // grid and win_pos for the remaining grid(s) in the same redraw batch.
+            // After processing the batch, if no editor windows remain composited in
+            // the main window, we promote external grids back to composited so the
+            // user sees them in the main window instead of only in separate OS windows.
+            //
+            // notifyExternalWindowChanges() (below) naturally detects the removal from
+            // external_grids and fires on_external_window_close so the frontend closes
+            // the external OS window.
+            //
+            // IMPORTANT: This must run BEFORE the grid 2 auto-compositing fallback
+            // below, because win_close removes grid 2 from win_pos, and the fallback
+            // would re-add it — making the promotion check think there's still a
+            // composited editor window and skipping promotion entirely.
+            var ext_windows_promoted = false;
+            if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
+                // Detect whether the global grid has any composited editor windows.
+                // Skip: grid 1 (global/status), floats (in win_layer), external grids,
+                // and grids without a real Neovim window handle (not in grid_win_ids).
+                var has_composited_editor_win = false;
+                var only_grid2_composited = true;
+                {
+                    var wp_it = self.grid.win_pos.keyIterator();
+                    while (wp_it.next()) |key_ptr| {
+                        const gid = key_ptr.*;
+                        if (gid == 1) continue;
+                        if (self.grid.win_layer.contains(gid)) continue;
+                        if (self.grid.external_grids.contains(gid)) continue;
+                        if (!self.grid.grid_win_ids.contains(gid)) continue;
+                        has_composited_editor_win = true;
+                        if (gid != 2) only_grid2_composited = false;
+                    }
+                }
+
+                // If a composited editor window was closed in this batch and the
+                // only remaining composited window is grid 2, treat grid 2 as a
+                // Neovim fallback and remove it so promotion can proceed.
+                // This handles the case where: user closes a promoted window →
+                // Neovim re-composites grid 2 as default → we want to promote the
+                // next external window instead of showing grid 2's empty buffer.
+                if (has_composited_editor_win and self.grid.composited_win_closed and only_grid2_composited) {
+                    self.grid.hideWin(2);
+                    has_composited_editor_win = false;
+                    self.log.write("[ext_windows_promote] removed fallback grid 2 (composited_win_closed)\n", .{});
+                }
+                self.grid.composited_win_closed = false;
+
+                if (!has_composited_editor_win) {
+                    // Main window is empty of editor windows. Collect promotion candidates.
+                    // Only consider grids in BOTH ext_windows_grids AND external_grids.
+                    // ext_windows_grids can contain win_hide'd grids (tab switch) that have
+                    // been removed from external_grids — those must not be promoted.
+                    const PromoteEntry = struct {
+                        grid_id: i64,
+                        win_id: i64,
+                        row: u32,
+                        col: u32,
+                    };
+
+                    // Find ONE grid to promote. Only promote a single grid to avoid
+                    // multiple external grids rendering on top of each other in the
+                    // main window. The remaining external windows stay as separate
+                    // OS windows.
+                    //
+                    // Selection: pick the first candidate that exists in BOTH
+                    // ext_windows_grids AND external_grids, preferring one with a
+                    // valid position (start_row >= 0). If none have valid positions,
+                    // fall back to (0,0).
+                    var promote_target: ?PromoteEntry = null;
+                    var fallback_target: ?PromoteEntry = null;
+                    {
+                        var ew_it = self.grid.ext_windows_grids.iterator();
+                        while (ew_it.next()) |entry| {
+                            const gid = entry.key_ptr.*;
+                            const wid = entry.value_ptr.*;
+
+                            const ext_info = self.grid.external_grids.get(gid) orelse continue;
+
+                            if (ext_info.start_row >= 0 and ext_info.start_col >= 0) {
+                                // First candidate with valid position wins.
+                                promote_target = .{
+                                    .grid_id = gid,
+                                    .win_id = wid,
+                                    .row = @intCast(ext_info.start_row),
+                                    .col = @intCast(ext_info.start_col),
+                                };
+                                break;
+                            } else if (fallback_target == null) {
+                                // Remember first candidate as fallback (position unknown).
+                                fallback_target = .{
+                                    .grid_id = gid,
+                                    .win_id = wid,
+                                    .row = 0,
+                                    .col = 0,
+                                };
+                            }
                         }
                     }
-                }
 
-                // Use fallback if no candidate had a valid position.
-                if (promote_target == null and fallback_target != null) {
-                    promote_target = fallback_target;
-                    self.log.write("[ext_windows_promote] fallback: promoting grid={d} at (0,0) (no valid position)\n", .{fallback_target.?.grid_id});
-                }
+                    // Use fallback if no candidate had a valid position.
+                    if (promote_target == null and fallback_target != null) {
+                        promote_target = fallback_target;
+                        self.log.write("[ext_windows_promote] fallback: promoting grid={d} at (0,0) (no valid position)\n", .{fallback_target.?.grid_id});
+                    }
 
-                // Execute promotion of the single selected grid.
-                if (promote_target) |p| {
-                    // Remove from external tracking BEFORE calling setWinPos
-                    // (setWinPos has guard: if external_grids.contains(grid_id) return)
-                    _ = self.grid.external_grids.remove(p.grid_id);
-                    _ = self.grid.ext_windows_grids.remove(p.grid_id);
-                    _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
-                    _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
+                    // Execute promotion of the single selected grid.
+                    if (promote_target) |p| {
+                        self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col) catch |err| {
+                            self.log.write("[ext_windows_promote] setWinPos grid={d} failed: {any}\n", .{ p.grid_id, err });
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                        _ = self.grid.ext_windows_grids.remove(p.grid_id);
+                        _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
+                        _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
+                        self.log.write("[ext_windows_promote] promoted grid={d} win={d} at ({d},{d})\n", .{ p.grid_id, p.win_id, p.row, p.col });
 
-                    self.grid.setWinPos(p.grid_id, p.win_id, p.row, p.col) catch |e| {
-                        self.log.write("[ext_windows_promote] setWinPos grid={d} failed: {any}\n", .{ p.grid_id, e });
-                    };
-                    self.log.write("[ext_windows_promote] promoted grid={d} win={d} at ({d},{d})\n", .{ p.grid_id, p.win_id, p.row, p.col });
+                        // Resize the promoted grid to fill the main window IMMEDIATELY
+                        // so the grid content covers the entire main window (prevents
+                        // "window in a window" visual). New cells are filled with
+                        // spaces (default bg). Neovim will populate them when it
+                        // processes the try_resize_grid request.
+                        self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols) catch |err| {
+                            self.log.write("[ext_windows_promote] resizeGrid grid={d} failed: {any}\n", .{ p.grid_id, err });
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                        self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols) catch |err| {
+                            self.log.write("[ext_windows_promote] requestTryResizeGridInternal grid={d} failed: {any}\n", .{ p.grid_id, err });
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                        self.log.write("[ext_windows_promote] resized+requested grid={d} to {d}x{d}\n", .{ p.grid_id, self.grid.rows, self.grid.cols });
 
-                    // Resize the promoted grid to fill the main window IMMEDIATELY
-                    // so the grid content covers the entire main window (prevents
-                    // "window in a window" visual). New cells are filled with
-                    // spaces (default bg). Neovim will populate them when it
-                    // processes the try_resize_grid request.
-                    self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols) catch |e| {
-                        self.log.write("[ext_windows_promote] resizeGrid grid={d} failed: {any}\n", .{ p.grid_id, e });
-                    };
-                    self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols) catch |e| {
-                        self.log.write("[ext_windows_promote] requestTryResizeGridInternal grid={d} failed: {any}\n", .{ p.grid_id, e });
-                    };
-                    self.log.write("[ext_windows_promote] resized+requested grid={d} to {d}x{d}\n", .{ p.grid_id, self.grid.rows, self.grid.cols });
-
-                    ext_windows_promoted = true;
-                    self.grid.markAllDirty();
-                }
-            }
-        } else {
-            // Clear the flag even when the promotion block was skipped
-            // (e.g. ext_windows disabled or no ext_windows grids).
-            self.grid.composited_win_closed = false;
-        }
-
-        // ext_windows: ensure grid 2 (default editor window) is composited.
-        // With ext_windows, Neovim may not send win_pos for the default window.
-        // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
-        // auto-position it at (0,0) so it gets rendered in the main window.
-        //
-        // Skip this if:
-        //   - External grids were just promoted in this batch, OR
-        //   - Another non-float editor grid is already composited (e.g. a
-        //     previously promoted grid still occupying the main window).
-        // In both cases grid 2 would overlap the promoted grid.
-        if (!ext_windows_promoted) {
-            if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
-                var has_other_editor_grid = false;
-                {
-                    var wp_chk = self.grid.win_pos.keyIterator();
-                    while (wp_chk.next()) |key_ptr| {
-                        const gid = key_ptr.*;
-                        if (gid == 1 or gid == 2) continue;
-                        if (self.grid.win_layer.contains(gid)) continue;
-                        has_other_editor_grid = true;
-                        break;
+                        ext_windows_promoted = true;
+                        self.grid.markAllDirty();
                     }
                 }
-                if (!has_other_editor_grid) {
-                    self.grid.setWinPos(2, 1000, 0, 0) catch {};
+            } else {
+                // Clear the flag even when the promotion block was skipped
+                // (e.g. ext_windows disabled or no ext_windows grids).
+                self.grid.composited_win_closed = false;
+            }
+
+            // ext_windows: ensure grid 2 (default editor window) is composited.
+            // With ext_windows, Neovim may not send win_pos for the default window.
+            // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
+            // auto-position it at (0,0) so it gets rendered in the main window.
+            //
+            // Skip this if:
+            //   - External grids were just promoted in this batch, OR
+            //   - Another non-float editor grid is already composited (e.g. a
+            //     previously promoted grid still occupying the main window).
+            // In both cases grid 2 would overlap the promoted grid.
+            if (!ext_windows_promoted) {
+                if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
+                    var has_other_editor_grid = false;
+                    {
+                        var wp_chk = self.grid.win_pos.keyIterator();
+                        while (wp_chk.next()) |key_ptr| {
+                            const gid = key_ptr.*;
+                            if (gid == 1 or gid == 2) continue;
+                            if (self.grid.win_layer.contains(gid)) continue;
+                            has_other_editor_grid = true;
+                            break;
+                        }
+                    }
+                    if (!has_other_editor_grid) {
+                        self.grid.setWinPos(2, 1000, 0, 0) catch |err| {
+                            postprocess_error = err;
+                            break :postprocess;
+                        };
+                    }
                 }
             }
         }
 
-        // Check for external window changes and notify frontend.
-        // Vertex generation for all external grids (including newly added ones)
-        // is handled inside the flush bracket (onFlush defer iterates
-        // external_grids, not known_external_grids). Do NOT generate vertices
-        // here — it runs after commitFlush/atlas-swap, so rasterized glyphs
-        // would go to the new back texture while the front (used for drawing)
-        // would have empty texels, causing non-ASCII text to be invisible.
+        if (postprocess_error) |reason| {
+            self.log.write("redraw post-processing err: {any}\n", .{reason});
+            self.redraw_thread_id.store(0, .seq_cst);
+            self.grid_mu.unlock(clock.io());
+            handleRedrawFailure(self, reason);
+            return;
+        }
+
+        // Check again for external-window changes made by the promotion logic
+        // above, which runs after the redraw batch's final onFlush. Normal grid
+        // lifecycle notification already occurs transactionally inside onFlush;
+        // this post-pass only handles those later promotion mutations. Do NOT
+        // generate vertices here — it runs after commitFlush/atlas-swap.
         const t_notify_extwin: i128 = if (log_on_notify) clock.nowNs() else 0;
-        _ = self.notifyExternalWindowChanges();
+        if (!self.flush_aborted) {
+            _ = self.notifyExternalWindowChanges();
+        }
         if (log_on_notify) {
             const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_extwin), 1000));
             self.log.write("[perf] notify_extwin us={d}\n", .{dt});
@@ -1458,6 +1738,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         if (self.hl.groups_changed) {
             self.hl.groups_changed = false;
             self.resolveGlowGroups();
+            if (self.glow_enabled.load(.acquire)) {
+                self.grid.markAllDirty();
+                var sg_it = self.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| sg.markAllDirty();
+                self.force_ext_cursor_recheck = true;
+            }
         }
         if (self.hl.default_colors_changed) {
             self.hl.default_colors_changed = false;
@@ -1466,9 +1752,12 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
-        self.grid_mu.unlock(clock.io());
+        // Clear the owner id while STILL holding grid_mu (see the store
+        // above): only then unlock, so no other thread can ever observe a
+        // stale or cleared owner id while this thread's critical section
+        // is still technically in progress.
         self.redraw_thread_id.store(0, .seq_cst);
-
+        self.grid_mu.unlock(clock.io());
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -1487,11 +1776,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Store the new value atomically; the frontend reads it on each keyDown.
         if (params.len > 0 and params[0] == .str) {
             const val_str = params[0].str;
-            const val: u8 = if (std.mem.eql(u8, val_str, "both")) 0
-                else if (std.mem.eql(u8, val_str, "none")) 1
-                else if (std.mem.eql(u8, val_str, "only_left")) 2
-                else if (std.mem.eql(u8, val_str, "only_right")) 3
-                else return;  // unknown value: keep existing setting
+            const val: u8 = if (std.mem.eql(u8, val_str, "both")) 0 else if (std.mem.eql(u8, val_str, "none")) 1 else if (std.mem.eql(u8, val_str, "only_left")) 2 else if (std.mem.eql(u8, val_str, "only_right")) 3 else return; // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
@@ -1541,6 +1826,18 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
 }
 
 pub fn runLoop(self: *Core) void {
+    // Raise this thread to match the UI thread's QoS. grid_mu (std.Io.Mutex,
+    // a futex-based lock with no priority donation on Darwin -- see
+    // COMPARE_AND_WAIT vs UL_UNFAIR_LOCK) is held by this thread for the
+    // entire handleRedraw duration; without a matching QoS class, a lower-
+    // priority core thread contending against a user-interactive main
+    // thread can be starved by the scheduler, widening the exact
+    // priority-inversion window the try-lock conversions on the input path
+    // are meant to narrow. This is a complement to those conversions, not
+    // a substitute -- it does not shorten how long grid_mu is held.
+    if (comptime builtin.os.tag == .macos) {
+        _ = std.c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0);
+    }
     // DEBUG: Log immediately at runLoop start
     if (self.cb.on_log) |logfn| {
         const msg = "[RUNLOOP] runLoop started!\n";
@@ -1781,6 +2078,7 @@ pub fn runLoop(self: *Core) void {
                 break :blk null;
             };
             if (conn_opt) |conn| {
+                self.stdin_close_mu.lockUncancelable(clock.io());
                 self.transport_kind = .socket;
                 self.stdin_file = conn;
                 self.stdout_file = conn; // alias of the same fd / pipe wrapper
@@ -1800,6 +2098,7 @@ pub fn runLoop(self: *Core) void {
                     .win_pipe => |p| p,
                     .file => null,
                 };
+                self.stdin_close_mu.unlock(clock.io());
                 self.log.write("connect: established socket session to {s}\n", .{session_addr.?});
             } else if (nvim_path.len == 0) {
                 // Connect-only mode (started via zonvie_core_start_connect): no
@@ -1877,11 +2176,13 @@ pub fn runLoop(self: *Core) void {
             self.log.write("[TIMING] nvim spawn: {d}ms\n", .{spawn_ms});
             self.log.write("spawn returned ok, pid={any}\n", .{child.id});
 
+            self.publishChildHandle(child.id);
+            self.stdin_close_mu.lockUncancelable(clock.io());
             self.transport_kind = .pipes;
-            self.child_handle = child.id;
             self.stdin_file = if (child.stdin) |f| rpc_transport.Stream.fromFile(f) else null;
             self.stdout_file = if (child.stdout) |f| rpc_transport.Stream.fromFile(f) else null;
             self.stderr_file = if (child.stderr) |f| rpc_transport.Stream.fromFile(f) else null;
+            self.stdin_close_mu.unlock(clock.io());
 
             // OWNERSHIP TRANSFER: keep handles in Core; prevent Child from closing them.
             child.stdin = null;
@@ -1907,7 +2208,10 @@ pub fn runLoop(self: *Core) void {
                         .alloc = pump_alloc,
                         .f = ef,
                         .mu = .init,
+                        .core_users_done = .init,
                         .core = self,
+                        .active_core_users = 0,
+                        .cleanup_decided = false,
                         // refcount = 2 from the start: one for Core
                         // (kept via self.stderr_pump until cleanup
                         // calls release), one for the pump thread
@@ -1942,9 +2246,53 @@ pub fn runLoop(self: *Core) void {
                 self.stderr_file = null;
             }
 
+            if (builtin.os.tag != .windows) {
+                // Reserve the waitpid owner before admitting the session. It
+                // remains idle until cleanup either transfers a preserved
+                // child or releases it without one.
+                const reaper_alloc = std.heap.c_allocator;
+                const reaper = reaper_alloc.create(ChildReaper) catch null;
+                if (reaper) |r| {
+                    r.* = .{
+                        .alloc = reaper_alloc,
+                        .mu = .init,
+                        .decision_ready = .init,
+                        .decided = false,
+                        .child = null,
+                        .refcount = std.atomic.Value(u32).init(2),
+                        .reaped = std.atomic.Value(bool).init(false),
+                    };
+                    self.child_reaper = r;
+                    self.child_reaper_thread = std.Thread.spawn(.{
+                        .stack_size = 128 * 1024,
+                        .allocator = reaper_alloc,
+                    }, ChildReaper.run, .{r}) catch blk: {
+                        reaper_alloc.destroy(r);
+                        self.child_reaper = null;
+                        break :blk null;
+                    };
+                }
+            }
+
+            // Neither stderr draining nor waitpid ownership may be acquired
+            // lazily in cleanup, where allocation failure could block the
+            // child or leave a zombie.
+            const reaper_unavailable = builtin.os.tag != .windows and
+                (self.child_reaper == null or self.child_reaper_thread == null);
+            if (self.stderr_pump == null or self.stderr_thread == null or reaper_unavailable) {
+                self.log.write("FATAL: spawned-session helper unavailable; terminating child\n", .{});
+                _ = cleanupSession(self, &child, have_child, true, false, false);
+                if (!self.stop_flag.load(.seq_cst)) session_failed = true;
+                break :session;
+            }
+
             // SSH mode defers writer thread until after authentication completes.
             if (!self.is_ssh_mode) {
-                self.startWriterThread();
+                if (!self.startWriterThread()) {
+                    _ = cleanupSession(self, &child, have_child, true, false, false);
+                    if (!self.stop_flag.load(.seq_cst)) session_failed = true;
+                    break :session;
+                }
             }
 
             if (self.is_ssh_mode) {
@@ -1977,18 +2325,26 @@ pub fn runLoop(self: *Core) void {
                 }
 
                 self.ssh_auth_pending.store(false, .seq_cst);
-                self.startWriterThread();
 
                 if (self.stop_flag.load(.seq_cst)) {
                     self.log.write("SSH mode: stopped by user\n", .{});
-                    _ = cleanupSession(self, &child, have_child, false, false);
+                    _ = cleanupSession(self, &child, have_child, false, false, false);
+                    break :session;
+                }
+                if (!self.startWriterThread()) {
+                    _ = cleanupSession(self, &child, have_child, true, false, false);
+                    session_failed = true;
                     break :session;
                 }
             }
         } else {
             // Connect mode has no child process; the writer thread can
             // start immediately (no SSH auth in this path).
-            self.startWriterThread();
+            if (!self.startWriterThread()) {
+                _ = cleanupSession(self, &child, have_child, true, false, false);
+                if (!self.stop_flag.load(.seq_cst)) session_failed = true;
+                break :session;
+            }
         }
 
         var ui_attached: bool = false;
@@ -2006,7 +2362,7 @@ pub fn runLoop(self: *Core) void {
         }
 
         if (self.stop_flag.load(.seq_cst)) {
-            _ = cleanupSession(self, &child, have_child, false, false);
+            _ = cleanupSession(self, &child, have_child, false, false, false);
             break :session;
         }
 
@@ -2028,17 +2384,50 @@ pub fn runLoop(self: *Core) void {
             }
         }
 
-        self.requestUiAttach(self.ui_attach_rows, self.ui_attach_cols) catch |e| {
-            self.log.write("ui_attach send failed: {any}\n", .{e});
-            _ = cleanupSession(self, &child, have_child, true, false);
+        // Serialize attach publication with latest-wins resize state. A UI
+        // resize that arrives before this lock becomes pending and is drained
+        // below; one that arrives after waits until attach+drain complete.
+        var attach_failed = false;
+        {
+            self.pending_resize_mu.lockUncancelable(clock.io());
+            defer self.pending_resize_mu.unlock(clock.io());
+            // A resize successfully queued to the previous session can be
+            // discarded during reconnect cleanup. Attach the new session at
+            // the retained latest desired size, making publication independent
+            // of the old writer queue's delivery epoch.
+            const attach_rows = if (self.pending_resize_valid)
+                self.pending_resize_rows
+            else if (self.desired_resize_rows != 0)
+                self.desired_resize_rows
+            else
+                self.ui_attach_rows;
+            const attach_cols = if (self.pending_resize_valid)
+                self.pending_resize_cols
+            else if (self.desired_resize_cols != 0)
+                self.desired_resize_cols
+            else
+                self.ui_attach_cols;
+            self.requestUiAttach(attach_rows, attach_cols) catch |e| {
+                self.log.write("ui_attach send failed: {any}\n", .{e});
+                attach_failed = true;
+            };
+            if (!attach_failed) {
+                ui_attached = true;
+                ui_attached_overall = true;
+                self.ui_attached.store(true, .seq_cst);
+                self.ui_attach_rows = attach_rows;
+                self.ui_attach_cols = attach_cols;
+                self.pending_resize_valid = false;
+                self.pending_resize_sequence = 0;
+                self.flushPendingUiStateLocked();
+                self.log.write("ui_attach published latest layout rows={d} cols={d}\n", .{ attach_rows, attach_cols });
+            }
+        }
+        if (attach_failed) {
+            _ = cleanupSession(self, &child, have_child, true, false, false);
             session_failed = true;
             break :session;
-        };
-        ui_attached = true;
-        ui_attached_overall = true;
-        self.ui_attached.store(true, .seq_cst);
-        self.flushPendingFocus();
-
+        }
         // Discover our channel_id via vim.api.nvim_list_chans() and install
         // the clipboard provider hooks.
         setupClipboard(self);
@@ -2046,31 +2435,16 @@ pub fn runLoop(self: *Core) void {
         // Install the AI-agent tab-status reporter (zero user-side config).
         setupAgentStatus(self);
 
-        if (self.pending_resize_valid) {
-            const pr2 = self.pending_resize_rows;
-            const pc2 = self.pending_resize_cols;
-            if (pr2 == self.ui_attach_rows and pc2 == self.ui_attach_cols) {
-                self.pending_resize_valid = false;
-                self.log.write("pending resize skipped (same as attach size rows={d} cols={d})\n", .{ pr2, pc2 });
-            } else {
-                self.requestTryResize(pr2, pc2) catch |e| {
-                    self.log.write("pending resize send failed: {any}\n", .{e});
-                };
-                self.pending_resize_valid = false;
-                self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr2, pc2 });
-            }
-        }
-
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});
-            _ = cleanupSession(self, &child, have_child, true, false);
+            _ = cleanupSession(self, &child, have_child, true, false, false);
             session_failed = true;
             break :session;
         }
 
         var fr = FrameReader.init(self.alloc, self.stdout_file.?) catch |e| {
             self.log.write("FrameReader init failed: {any}\n", .{e});
-            _ = cleanupSession(self, &child, have_child, true, false);
+            _ = cleanupSession(self, &child, have_child, true, false, false);
             session_failed = true;
             break :session;
         };
@@ -2146,6 +2520,7 @@ pub fn runLoop(self: *Core) void {
             }
             if (t == 1) {
                 handleRpcResponse(self, top);
+                if (self.redraw_recovery_failed) break :outer;
                 continue;
             }
             if (t == 2) {
@@ -2164,6 +2539,7 @@ pub fn runLoop(self: *Core) void {
                         .{ method_for_log, decode_us, io_wait_us, dispatch_us },
                     );
                 }
+                if (self.redraw_recovery_failed) break :outer;
                 // If the notification queued a restart/connect, decide
                 // whether to break the inner loop NOW or wait for the
                 // natural channel close.
@@ -2204,8 +2580,12 @@ pub fn runLoop(self: *Core) void {
         // its own clean shutdown — channel close (EOF) is just one of
         // the last steps in nvim's exit, not the end. Propagate the
         // term so on_exit can compute the right exit code.
-        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any})\n", .{remote_restart_break});
-        if (cleanupSession(self, &child, have_child, false, remote_restart_break)) |t| last_term = t;
+        const redraw_recovery_failed = self.redraw_recovery_failed;
+        const preserve_recovery_child = redraw_recovery_failed and
+            !self.stop_flag.load(.seq_cst);
+        self.log.write("session loop: invoking cleanupSession (remote_restart_break={any}, redraw_recovery_failed={any})\n", .{ remote_restart_break, redraw_recovery_failed });
+        if (cleanupSession(self, &child, have_child, false, remote_restart_break, preserve_recovery_child)) |t| last_term = t;
+        if (redraw_recovery_failed) session_failed = true;
         self.log.write("session loop: cleanupSession returned\n", .{});
 
         // === Decide next iteration ===
@@ -2268,19 +2648,6 @@ pub fn runLoop(self: *Core) void {
     }
 }
 
-/// POSIX background reaper for `:connect` orphans. Without this, the
-/// orphaned headless nvim becomes a zombie when it eventually exits
-/// (e.g., `:connect!` from another UI, system shutdown), holding a
-/// kernel process-table entry until our process exits. The thread
-/// blocks in waitpid() until the orphan terminates, then naturally
-/// returns and self-cleans-up. Receives the Child by value so the
-/// owning runLoop frame can drop its local `child` without affecting
-/// the reaper.
-fn reapOrphanThread(orphan: std.process.Child) void {
-    var c = orphan;
-    _ = c.wait(clock.io()) catch {};
-}
-
 /// Tear down the current RPC session: stop the writer thread, close the
 /// transport (with socket-alias handling), reap the child (if any), and
 /// join the stderr pump. Safe to call from any session-exit path — both
@@ -2306,6 +2673,13 @@ fn reapOrphanThread(orphan: std.process.Child) void {
 /// UI event contract: the UI must wait for channel close + natural
 /// process exit, not force-terminate the old server.
 ///
+/// `preserve_child`: when true, close this session's transport but neither
+/// kill nor synchronously wait for its child. Redraw recovery uses this for
+/// failures such as allocator exhaustion: terminating an embedded Neovim for
+/// a GUI recovery failure could destroy unsaved editing state. POSIX reaps the
+/// child asynchronously after it reacts to transport EOF; Windows drops only
+/// this process's handles.
+///
 /// Returns the child's exit term, or null if not available (no child,
 /// orphaned for a `:connect` hot-swap, or wait() failed). The caller
 /// decides whether to propagate the term to `last_term` for on_exit's
@@ -2316,70 +2690,64 @@ fn cleanupSession(
     have_child: bool,
     force_kill_child: bool,
     kill_on_restart_pending: bool,
+    preserve_child: bool,
 ) ?std.process.Child.Term {
-    self.log.write("cleanupSession: enter (have_child={any} force_kill={any} kill_on_restart_pending={any} restart_pending={any} connect_keeps_child_alive={any})\n", .{
+    self.log.write("cleanupSession: enter (have_child={any} force_kill={any} kill_on_restart_pending={any} preserve_child={any} restart_pending={any} connect_keeps_child_alive={any})\n", .{
         have_child,
         force_kill_child,
         kill_on_restart_pending,
+        preserve_child,
         self.restart_pending_addr != null,
         self.connect_keeps_child_alive,
     });
-    // Stop the writer thread before closing the transport so its
-    // in-flight writeAll() does not observe a torn-down handle.
-    var wt: ?std.Thread = null;
-    {
-        self.write_queue_mu.lockUncancelable(clock.io());
-        self.write_queue_closed = true;
-        wt = self.writer_thread;
-        self.writer_thread = null;
-        self.write_queue_cond.signal(clock.io());
-        self.write_queue_mu.unlock(clock.io());
-    }
-    self.log.write("cleanupSession: writer queue closed (wt_present={any})\n", .{wt != null});
-    // `:connect` hot-swap: the old nvim is still alive headless on
-    // its own listen socket and would block child.wait() forever
-    // (the process never exits). Don't kill, don't wait — just drop
-    // the handle. The orphan continues running until the user kills
-    // it manually. We still close OUR end of the pipes (just FDs in
-    // our process; doesn't affect the running nvim).
-    const orphan_child = self.connect_keeps_child_alive;
+    // A `:connect` hot-swap leaves the old nvim alive headless. Recovery
+    // failure also avoids killing the child, but transport EOF lets an embed
+    // child perform its own shutdown. Neither path can synchronously wait.
+    var orphan_child = self.connect_keeps_child_alive or preserve_child;
+    const want_kill = have_child and !orphan_child and (force_kill_child or self.stop_flag.load(.seq_cst) or
+        (kill_on_restart_pending and self.restart_pending_addr != null));
 
-    // Serialize with stop() (nvim_core.zig) to prevent a race where both
-    // threads close the same fd. For POSIX .socket transport, double-close
-    // causes EBADF. Whichever thread gets the lock first closes and nulls;
-    // the other thread's `if (self.stdin_file)` check then sees null and skips.
+    // A published child always belongs to a pipe session. Kill it without an
+    // unsynchronized transport_kind read before waiting for teardown
+    // serialization; this also wakes a concurrent stop() joining its writer.
+    if (want_kill) self.requestChildTermination();
+
+    // Serialize the complete writer/raw-resource ownership transition with
+    // stopTeardownOwned. Lock order is stdin_close_mu -> write_queue_mu.
     self.stdin_close_mu.lockUncancelable(clock.io());
-    defer self.stdin_close_mu.unlock(clock.io());
-    if (self.stdin_file) |f| {
-        // POSIX socket transport aliases stdin/stdout on the same fd.
-        // Issue shutdown(SHUT_RDWR) before close() so the writer
-        // thread (blocked in writeAll on the socket) returns EPIPE
-        // and exits — close() alone leaves it stuck, and the
-        // wt.join() below would hang. The reader does not run here
-        // (we are on the runLoop thread, post inner-loop exit), so
-        // it is naturally not affected.
-        self.log.write("cleanupSession: closing stdin (transport={any})\n", .{self.transport_kind});
-        f.shutdownIfSocket(self.transport_kind == .socket);
-        f.close();
-        self.stdin_file = null;
-        // Socket transport aliases stdin and stdout on the same fd —
-        // closing once fully tears down the connection. Null both
-        // pointers so downstream cleanup does not double-close.
-        if (self.transport_kind == .socket) {
-            self.stdout_file = null;
-        }
-        self.log.write("cleanupSession: stdin closed\n", .{});
-    }
-    if (wt) |t| {
-        self.log.write("cleanupSession: joining writer thread\n", .{});
-        t.join();
-        self.log.write("cleanupSession: writer thread joined\n", .{});
-    }
+    const transport_kind = self.transport_kind;
+    var wt: ?std.Thread = null;
+    self.write_queue_mu.lockUncancelable(clock.io());
+    self.write_queue_closed = true;
+    wt = self.writer_thread;
+    self.writer_thread = null;
+    self.write_queue_cond.signal(clock.io());
+    self.write_queue_mu.unlock(clock.io());
+    const wt_present = wt != null;
+
+    const stdin = self.stdin_file;
+    self.cancelWriterIo(wt, stdin, transport_kind);
+    if (stdin) |f| f.close();
+    self.stdin_file = null;
+    if (transport_kind == .socket) self.stdout_file = null;
+    self.stdin_close_mu.unlock(clock.io());
+    self.log.write("cleanupSession: writer queue closed (wt_present={any})\n", .{wt_present});
+    if (wt_present) self.log.write("cleanupSession: writer thread joined\n", .{});
+    self.log.write("cleanupSession: stdin closed\n", .{});
 
     var session_term: ?std.process.Child.Term = null;
     if (have_child) {
+        // Withdraw the shared PID/HANDLE before any path below can reap the
+        // process or close its handle. A concurrent stop either signals it
+        // before this point or observes null; it can never signal a recycled
+        // PID/HANDLE after Child.wait()/kill().
+        self.claimChildHandleForCleanup();
         if (orphan_child) {
-            self.log.write("orphaning headless nvim (pid={any}) for :connect hot-swap\n", .{child.id});
+            self.log.write("preserving child without forced termination (pid={any}, connect_hotswap={any}, recovery_failure={any})\n", .{
+                child.id,
+                self.connect_keeps_child_alive,
+                preserve_child,
+            });
             // On Windows std.process.Child.Id is a HANDLE and there is
             // also a thread_handle for the main thread. Normally
             // child.wait() closes both, but the orphan path skips
@@ -2389,26 +2757,26 @@ fn cleanupSession(
             // process keeps running because HANDLEs are merely kernel-
             // object references, not the process itself.
             //
-            // On POSIX the orphan is reaped by a detached background
-            // thread. id is a pid_t (just an integer, no kernel HANDLE
-            // to close), but if we never waitpid() the orphan, it
-            // becomes a zombie when it eventually exits. The thread
-            // blocks in child.wait() and reaps the zombie when the
-            // orphan terminates. child.stdin/stdout/stderr were nulled
-            // on spawn (lines 1426-1428) so wait()'s cleanupStreams is
-            // a no-op — no double-close races with our own pipe
-            // teardown above.
+            // On POSIX the prestarted reaper adopts the Child and waits
+            // independently of stderr EOF. Spawned sessions are rejected
+            // before attach when that service is unavailable, so this cleanup
+            // path allocates nothing. child.stdin/stdout/stderr were nulled on
+            // ownership transfer, so wait() cannot close pump-owned handles.
             if (builtin.os.tag == .windows) {
                 if (child.id) |h| std.os.windows.CloseHandle(h);
                 std.os.windows.CloseHandle(child.thread_handle);
             } else {
-                if (std.Thread.spawn(.{}, reapOrphanThread, .{child.*})) |t| {
-                    t.detach();
-                } else |e| {
-                    self.log.write("orphan reaper spawn failed: {any}; pid {any} may zombie on exit\n", .{ e, child.id });
+                const reaper_adopted = if (self.child_reaper) |reaper| reaper.adopt(child.*) else false;
+                if (!reaper_adopted) {
+                    // This is an invariant violation, not a recoverable
+                    // allocation path. Reap synchronously via Child.kill()
+                    // rather than dropping the only process owner.
+                    self.log.write("FATAL: child reaper refused ownership; terminating child (pid={any})\n", .{child.id});
+                    child.kill(clock.io());
+                    session_term = .{ .signal = .TERM };
+                    orphan_child = false;
                 }
             }
-            self.child_handle = null;
         } else {
             // Kill conditions:
             //   - User stop (stop_flag): terminate promptly so we don't
@@ -2426,8 +2794,6 @@ fn cleanupSession(
             //     and reap via wait() — EOF is channel close, not
             //     process exit, so racing a kill against the still-in-
             //     progress teardown would truncate nvim's work.
-            const want_kill = force_kill_child or self.stop_flag.load(.seq_cst) or
-                (kill_on_restart_pending and self.restart_pending_addr != null);
             if (want_kill) {
                 self.log.write("cleanupSession: killing child (pid={any})\n", .{child.id});
                 // Zig 0.16: Child.kill(io) forcibly terminates AND reaps in a
@@ -2448,8 +2814,27 @@ fn cleanupSession(
                 };
             }
             if (session_term) |t| self.log.write("nvim terminated: {any}\n", .{t});
-            self.child_handle = null;
         }
+    }
+
+    // Finalize the POSIX wait service independently of the stderr pump. An
+    // adopted child can outlive this session, so detach its already-running
+    // waiter; all other paths wake and join the idle service synchronously.
+    if (orphan_child and self.child_reaper != null) {
+        if (self.child_reaper_thread) |reaper_thread| {
+            reaper_thread.detach();
+            self.child_reaper_thread = null;
+        }
+        if (self.child_reaper) |reaper| {
+            reaper.release();
+            self.child_reaper = null;
+        }
+    } else {
+        if (self.child_reaper) |reaper| reaper.finishWithoutChild();
+        if (self.child_reaper_thread) |reaper_thread| reaper_thread.join();
+        self.child_reaper_thread = null;
+        if (self.child_reaper) |reaper| reaper.release();
+        self.child_reaper = null;
     }
 
     // Close any remaining transport handles. stderr_file is intentionally
@@ -2464,6 +2849,10 @@ fn cleanupSession(
         self.log.write("cleanupSession: stdout closed\n", .{});
     }
     self.stderr_file = null;
+
+    // An EOF'd pump waits for this ownership decision before releasing its
+    // thread. Orphan reaping is handled independently above.
+    if (self.stderr_pump) |pump| pump.finishCleanupDecision();
 
     // Reap the stderr pump.
     //   - Final-shutdown path (no restart pending, no orphan): child
@@ -2555,4 +2944,73 @@ fn cleanupSession(
 
     self.log.write("cleanupSession: returning (term_present={any})\n", .{session_term != null});
     return session_term;
+}
+
+test "redraw recovery retry limit is session fatal" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.redraw_recovery_attempts = max_redraw_recovery_attempts;
+
+    beginRedrawRecovery(&core);
+
+    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expectEqual(nvim_core.RedrawRecoveryState.healthy, core.redraw_recovery_state);
+}
+
+test "child reaper does not wait for inherited stderr EOF" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    const reaper = try std.testing.allocator.create(ChildReaper);
+    reaper.* = .{
+        .alloc = std.testing.allocator,
+        .mu = .init,
+        .decision_ready = .init,
+        .decided = false,
+        .child = null,
+        .refcount = std.atomic.Value(u32).init(2),
+        .reaped = std.atomic.Value(bool).init(false),
+    };
+    const reaper_thread = try std.Thread.spawn(.{}, ChildReaper.run, .{reaper});
+    var reaper_joined = false;
+    defer {
+        if (!reaper_joined) {
+            reaper.finishWithoutChild();
+            reaper_thread.join();
+        }
+        reaper.release();
+    }
+
+    var child = try std.process.spawn(clock.io(), .{
+        .argv = &.{ "/bin/sh", "-c", "(trap '' HUP; sleep 1) & exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    const stderr_file = child.stderr.?;
+    child.stderr = null;
+    defer stderr_file.close(clock.io());
+
+    try std.testing.expect(reaper.adopt(child));
+    var waits: usize = 0;
+    while (!reaper.reaped.load(.acquire) and waits < 500) : (waits += 1) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(reaper.reaped.load(.acquire));
+
+    // The background descendant still owns stderr's write end. A nonblocking
+    // read must report WouldBlock rather than EOF even though the direct child
+    // has already been waited and reaped.
+    const stderr_stream = try rpc_transport.Stream.fromFile(stderr_file).preparePipeWriter();
+    var byte: [1]u8 = undefined;
+    const stderr_open = if (stderr_stream.read(&byte)) |n|
+        n != 0
+    else |e| switch (e) {
+        error.WouldBlock => true,
+        else => return e,
+    };
+    try std.testing.expect(stderr_open);
+
+    reaper_thread.join();
+    reaper_joined = true;
 }

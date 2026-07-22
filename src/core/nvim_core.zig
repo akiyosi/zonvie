@@ -8,7 +8,8 @@ const highlight = @import("highlight.zig");
 const Highlights = highlight.Highlights;
 const ResolvedAttrWithStyles = highlight.ResolvedAttrWithStyles;
 pub const redraw = @import("redraw_handler.zig");
-const Logger = @import("log.zig").Logger;
+const log_mod = @import("log.zig");
+const Logger = log_mod.Logger;
 const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
@@ -407,8 +408,30 @@ pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
     return if (h == 0) 1 else h;
 }
 
+/// Cumulative attempt/busy counters for a single grid_mu tryLock call site.
+/// See the perf_lock_* fields on Core for why these must be atomic.
+pub const LockContentionStat = struct {
+    attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    busy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn record(self: *LockContentionStat, acquired: bool) void {
+        _ = self.attempts.fetchAdd(1, .monotonic);
+        if (!acquired) _ = self.busy.fetchAdd(1, .monotonic);
+    }
+};
+
+pub const RedrawRecoveryState = enum {
+    healthy,
+    await_detach,
+    await_attach,
+};
+
 pub const Core = struct {
     const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
+    const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
+    const MAX_TOTAL_WRITE_QUEUE_SIZE: usize = MAX_WRITE_QUEUE_SIZE + UI_STATE_WRITE_RESERVE_SIZE;
+    const UI_STATE_RPC_STACK_SIZE: usize = 256;
+    const WriteClass = enum { normal, ui_state };
 
     alloc: std.mem.Allocator,
     cb: Callbacks,
@@ -418,6 +441,16 @@ pub const Core = struct {
     last_sent_cursor_rev: u64 = 0,
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
+    // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
+    // sendExternalGridVerticesFiltered to treat EVERY external grid as
+    // cursor_affected for one flush, regardless of last_ext_cursor_grid.
+    // A failed flush can leave last_ext_cursor_grid pointing at the NEW
+    // cursor grid even though the frontend never actually committed an empty
+    // cursor for the OLD one (the two are tracked independently — see
+    // sendExternalGridVerticesFiltered's abort-skip defer) — force resend
+    // cannot know which specific grid that was, so instead of relying on
+    // last_ext_cursor_grid it just re-checks every external grid once.
+    force_ext_cursor_recheck: bool = false,
     pre_cmdline_cursor_grid: i64 = 1, // Cursor grid before cmdline was shown (for restoring after cmdline closes)
     pre_cmdline_cursor_row: u32 = 0,
     pre_cmdline_cursor_col: u32 = 0,
@@ -445,13 +478,43 @@ pub const Core = struct {
     // from the previous successful flush. Compared against the current layout
     // to detect position changes, additions, and removals that invalidate
     // cached row vertices inside the scroll region.
-    prev_subgrid_snapshots: [MAX_CACHED_SUBGRIDS]SubgridSnapshot = undefined,
-    prev_subgrid_snapshot_count: u32 = 0,
+    prev_subgrid_snapshots: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
+    // Current-layout normalization and row-dedup scratch for the subgrid
+    // scroll-cache diff. Capacities persist across flushes.
+    subgrid_diff_current: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
+    subgrid_diff_row_marks: std.ArrayListUnmanaged(u32) = .empty,
+    subgrid_diff_row_generation: u32 = 0,
 
     // Reusable scratch buffers (zero-allocation hot path)
     tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
     grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    // Sort scratch for float overlays anchored to an external grid — same
+    // (zindex, compindex, order, grid_id) ordering as grid_entries, but kept
+    // separate since it's populated by a different function
+    // (sendExternalGridVerticesFiltered) that can run within the same flush
+    // cycle as the main composite path that owns grid_entries.
+    ext_float_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    // One win_pos scan per flush, grouped by external anchor and layer order.
+    ext_float_anchor_entries: std.ArrayListUnmanaged(flush.ExternalFloatAnchorEntry) = .empty,
+    ext_float_anchor_index_valid: bool = false,
+    // Flush-local row index for floats composited into an external grid.
+    // Entries are built once per anchor grid, sorted once, then referenced by
+    // per-row buckets so dirty rows never rescan/sort the full win_pos map.
+    ext_float_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_entry_indices: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_index_valid: bool = false,
+    ext_float_index_generation: u64 = 0,
+    cached_subgrids_buf: std.ArrayListUnmanaged(flush.CachedSubgrid) = .empty,
+    // Persistent main-composition row buckets. The exact layout snapshot
+    // avoids rebuilding these on content-only flushes.
+    main_subgrid_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_indices: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_layout: std.ArrayListUnmanaged(flush.MainSubgridRowLayout) = .empty,
+    main_subgrid_row_index_rows: u32 = 0,
+    main_subgrid_row_index_valid: bool = false,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
@@ -462,9 +525,18 @@ pub const Core = struct {
     write_queue_mu: std.Io.Mutex = .init,
     write_queue_cond: std.Io.Condition = .init,
     write_queue: std.ArrayListUnmanaged(u8) = .empty,
+    // The writer swaps the active FIFO with this spare and performs transport
+    // I/O without holding write_queue_mu. Both buffers permanently reserve
+    // UI_STATE_WRITE_RESERVE_SIZE bytes so focus/resize can join the same FIFO
+    // without allocation even when normal traffic reaches its 4 MiB cap.
+    write_spare_queue: std.ArrayListUnmanaged(u8) = .empty,
+    write_queue_normal_bytes: usize = 0,
+    write_queue_ui_state_bytes: usize = 0,
     write_queue_closed: bool = false,
     writer_failed: bool = false,
     writer_thread: ?std.Thread = null,
+    writer_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    writer_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
     // Mutex to protect grid state access from concurrent RPC and UI threads.
     grid_mu: std.Io.Mutex = .init,
@@ -475,14 +547,37 @@ pub const Core = struct {
     stdin_close_mu: std.Io.Mutex = .init,
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // stop() owns all Core resource teardown, not just thread shutdown.  It can
+    // therefore run exactly once even though the public C API permits the
+    // common stop(); destroy(); sequence.  Values: 0 = active, 1 = teardown in
+    // progress, 2 = teardown complete.
+    stop_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     /// Set to true after nvim_ui_attach completes successfully.
     ui_attached: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// RPC-thread-owned redraw recovery state. A failed batch poisons the
+    /// current UI attachment until a tracked detach/reset/attach cycle creates
+    /// a fresh protocol epoch.
+    redraw_recovery_state: RedrawRecoveryState = .healthy,
+    redraw_recovery_msgid: i64 = 0,
+    redraw_recovery_failed: bool = false,
+    redraw_recovery_attach_rows: u32 = 0,
+    redraw_recovery_attach_cols: u32 = 0,
+    redraw_recovery_attempts: u8 = 0,
     /// Stores pending focus state when setFocus is called before ui_attach.
     /// 0 = no pending, 1 = pending focus gained, 2 = pending focus lost.
     pending_focus: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    pending_focus_sequence: u64 = 0,
     thread: ?std.Thread = null,
+    // Stable identity of the RPC run-loop thread. redraw_thread_id only covers
+    // the intervals which hold grid_mu; callbacks such as on_exit run outside
+    // those intervals and must still avoid joining their own thread in stop().
+    rpc_thread_id: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    // Serializes publication, signaling, and withdrawal of child_handle.
+    // cleanup claims the handle before Child.wait()/kill() can reap/close it,
+    // so a concurrent stop can never signal a recycled PID/HANDLE.
+    child_handle_mu: std.Io.Mutex = .init,
     child_handle: ?std.process.Child.Id = null,
     stdin_file: ?Stream = null,
     stdout_file: ?Stream = null,
@@ -495,8 +590,14 @@ pub const Core = struct {
     /// pump might outlive Core (`:connect` orphan path). Always null
     /// it after detach / join — the pump destroys the struct itself.
     stderr_pump: ?*rpc_session.StderrPump = null,
+    /// POSIX-only wait service allocated and started with each spawned child.
+    /// Preserved children transfer waitpid ownership here without allocating
+    /// during cleanup or depending on stderr EOF.
+    child_reaper: ?*rpc_session.ChildReaper = null,
+    child_reaper_thread: ?std.Thread = null,
 
-    /// Transport mode of the current session.
+    /// Transport mode of the current session. Protected by stdin_close_mu;
+    /// teardown must retain a snapshot before releasing that mutex.
     /// .pipes: spawned child + 3 pipes (stdin/stdout/stderr separate handles).
     /// .socket: connected to a running nvim via TCP/Unix socket. In this mode
     /// stdin_file and stdout_file alias the same fd; close() must run only
@@ -578,9 +679,20 @@ pub const Core = struct {
 
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
+    // Serializes ui_attached publication and deferred focus/resize state.
+    // Lock order when both are needed:
+    // pending_resize_mu -> write_queue_mu.
+    pending_resize_mu: std.Io.Mutex = .init,
     pending_resize_rows: u32 = 0,
     pending_resize_cols: u32 = 0,
     pending_resize_valid: bool = false,
+    pending_resize_sequence: u64 = 0,
+    pending_ui_state_sequence: u64 = 0,
+    // Latest layout requested by the frontend, retained even after a resize
+    // was successfully enqueued. A reconnect may discard the old session's
+    // writer queue, so resetSessionState seeds the new attach from this value.
+    desired_resize_rows: u32 = 0,
+    desired_resize_cols: u32 = 0,
     missing_glyph_log_count: u32 = 0,
 
     // Per-flush atlas/callback aggregation (reset at flush start, dumped at flush end).
@@ -828,8 +940,22 @@ pub const Core = struct {
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.cached_subgrids_buf.deinit(self.alloc);
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.prev_subgrid_snapshots.deinit(self.alloc);
+        self.subgrid_diff_current.deinit(self.alloc);
+        self.subgrid_diff_row_marks.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
+        self.write_spare_queue.deinit(self.alloc);
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
@@ -928,52 +1054,80 @@ pub const Core = struct {
     /// MUST be called only from the RPC thread, after the previous
     /// session's writer thread has been joined and pipes/sockets closed.
     pub fn resetSessionState(self: *Core) void {
-        // UI attachment must be re-issued after reconnect.
-        self.ui_attached.store(false, .seq_cst);
+        self.resetProtocolState(true);
+    }
 
-        // Channel-bound state.
-        self.clipboard_setup_done = false;
+    /// Reset a poisoned redraw attachment without touching the live RPC
+    /// transport or writer queue. Called only after nvim_ui_detach has replied,
+    /// so no event from the old UI epoch can race this reset.
+    pub fn resetRedrawProtocolState(self: *Core) void {
+        self.resetProtocolState(false);
+    }
+
+    fn resetProtocolState(self: *Core, reset_transport: bool) void {
+        // UI attachment must be re-issued after reconnect.
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        self.ui_attached.store(false, .seq_cst);
+        const desired_rows = if (self.desired_resize_rows != 0)
+            self.desired_resize_rows
+        else
+            self.last_layout_rows;
+        const desired_cols = if (self.desired_resize_cols != 0)
+            self.desired_resize_cols
+        else
+            self.last_layout_cols;
+        if (desired_rows != 0 and desired_cols != 0) {
+            self.pending_resize_rows = desired_rows;
+            self.pending_resize_cols = desired_cols;
+            self.pending_resize_valid = true;
+            self.pending_resize_sequence = self.nextPendingUiStateSequenceLocked();
+        }
+        if (reset_transport) {
+            self.pending_focus.store(0, .seq_cst);
+            self.pending_focus_sequence = 0;
+        }
+        self.pending_resize_mu.unlock(clock.io());
 
         // Preedit highlight groups and namespace live in the dead session;
         // re-define them and re-place the extmark on the next composition.
         self.preedit_setup_done.store(false, .monotonic);
         self.preedit_visible.store(false, .monotonic);
 
-        // In-flight RPC IDs from the dead channel — drop tracking so any
-        // stale response from the new server (very unlikely; new msgid
-        // counter starts fresh on the nvim side) does not match.
-        self.get_api_info_msgid = null;
-        self.quit_request_msgid.store(0, .release);
-        self.glow_request_msgid.store(0, .release);
+        if (reset_transport) {
+            // Channel-bound state.
+            self.clipboard_setup_done = false;
+            self.redraw_recovery_state = .healthy;
+            self.redraw_recovery_msgid = 0;
+            self.redraw_recovery_failed = false;
+            self.redraw_recovery_attach_rows = 0;
+            self.redraw_recovery_attach_cols = 0;
+            self.redraw_recovery_attempts = 0;
 
-        // Re-arm the glow startup probe so it queries vim.g.zonvie_glow on
-        // the new server (the user's init.lua may set it again, identically
-        // or differently).
-        self.glow_startup_retries = 30;
+            // In-flight RPC IDs from the dead channel — drop tracking so any
+            // stale response from the new server cannot match.
+            self.get_api_info_msgid = null;
+            self.quit_request_msgid.store(0, .release);
+            self.glow_request_msgid.store(0, .release);
 
-        // Pending focus state from before the reconnect should not leak —
-        // the new server has its own initial focus state.
-        self.pending_focus.store(0, .seq_cst);
+            self.glow_startup_retries = 30;
+            self.ssh_auth_pending.store(false, .seq_cst);
+            self.ssh_auth_done.store(false, .seq_cst);
 
-        // SSH auth flags only apply to spawn-mode SSH sessions; reset so a
-        // future spawn-mode session (re-spawn fallback) starts unauthenticated.
-        self.ssh_auth_pending.store(false, .seq_cst);
-        self.ssh_auth_done.store(false, .seq_cst);
+            // Transport handles are already closed by cleanupSession.
+            self.stdin_close_mu.lockUncancelable(clock.io());
+            self.transport_kind = .pipes;
+            self.stdin_close_mu.unlock(clock.io());
 
-        // Transport handles are cleaned up by the caller (closed and nulled);
-        // here we only flip the kind tag for clarity until the next session
-        // re-assigns it.
-        self.transport_kind = .pipes;
-
-        // Re-arm the writer queue: the previous session's cleanup set
-        // write_queue_closed=true so the writer thread would drain and exit.
-        // Clearing it now allows startWriterThread() to succeed for the
-        // next session.
-        self.write_queue_mu.lockUncancelable(clock.io());
-        self.write_queue_closed = false;
-        self.writer_failed = false;
-        self.write_queue.clearRetainingCapacity();
-        self.write_queue_mu.unlock(clock.io());
+            // Re-arm the writer queue for the next session.
+            self.write_queue_mu.lockUncancelable(clock.io());
+            self.write_queue_closed = false;
+            self.writer_failed = false;
+            self.write_queue.clearRetainingCapacity();
+            self.write_spare_queue.clearRetainingCapacity();
+            self.write_queue_normal_bytes = 0;
+            self.write_queue_ui_state_bytes = 0;
+            self.write_queue_mu.unlock(clock.io());
+        }
 
         // === Grid-protected critical section ===
         //
@@ -1093,9 +1247,26 @@ pub const Core = struct {
 
         // Subgrid layout snapshot for scroll fast path: stale entries
         // would reference grid_ids the new session has not (yet) created.
-        self.prev_subgrid_snapshot_count = 0;
+        self.prev_subgrid_snapshots.clearRetainingCapacity();
 
-        self.log.write("resetSessionState: cleared session-scoped state\n", .{});
+        // External-float scratch is bounded during a session, but a hostile
+        // previous peer may have driven it to that high-water mark. Session
+        // changes are cold paths, so release rather than retain these buffers.
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries = .empty;
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_entries = .empty;
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_offsets = .empty;
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets = .empty;
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.ext_float_row_entry_indices = .empty;
+        self.ext_float_anchor_index_valid = false;
+        self.ext_float_row_index_valid = false;
+        self.ext_float_index_generation +%= 1;
+
+        self.log.write("resetProtocolState: cleared UI protocol state (transport_reset={any})\n", .{reset_transport});
     }
 
     /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
@@ -1116,7 +1287,119 @@ pub const Core = struct {
         self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
     }
 
+    /// True when synchronous teardown would either join the caller itself or
+    /// wait for an RPC thread which is blocked in a callback on the caller.
+    pub fn isCurrentThreadUnsafeForTeardown(self: *const Core) bool {
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        return log_mod.isInCallback() or
+            self.rpc_thread_id.load(.acquire) == current_tid or
+            self.redraw_thread_id.load(.acquire) == current_tid;
+    }
+
     pub fn stop(self: *Core) void {
+        // A callback running on the RPC/redraw thread cannot synchronously
+        // join its own stack. Request shutdown but leave teardown unclaimed so
+        // a later safe-thread stop/destroy can own it synchronously.
+        if (self.isCurrentThreadUnsafeForTeardown()) {
+            self.requestStopWithoutJoining();
+            return;
+        }
+
+        // Claim teardown ownership.  A concurrent/re-entrant caller must not
+        // wait here: the owner may be joining a thread whose callback made the
+        // re-entrant call.  zonvie_core_destroy uses waitUntilStopped() after
+        // this returns so it still cannot release CoreBox/GPA early.
+        if (self.stop_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
+        self.stopTeardownOwned();
+    }
+
+    /// Best-effort, idempotent shutdown request for callback-thread stop.
+    /// It intentionally does not wait for a mutex: a callback can originate
+    /// while the lifecycle owner holds that mutex and joins this callback's
+    /// worker. Raw resources remain owned until lifecycle-thread teardown.
+    fn requestStopWithoutJoining(self: *Core) void {
+        self.stop_flag.store(true, .seq_cst);
+
+        // std.Io.Condition is atomic and permits signaling without its
+        // associated mutex. The waiter rechecks stop_flag after every wake.
+        self.ui_attach_cond.broadcast(clock.io());
+        self.write_queue_cond.broadcast(clock.io());
+
+        // A writer blocked on a POSIX/Windows spawn pipe owns a copy of the
+        // raw descriptor/HANDLE. Terminate the peer first; never close that
+        // raw resource until a lifecycle-thread teardown has joined writer.
+        // A socket session has no published child, so this is a cheap no-op.
+        // Avoid reading transport_kind outside stdin_close_mu while the RPC
+        // thread may still be publishing a freshly-created transport.
+        self.tryRequestChildTermination();
+
+        // Do not wait behind cleanup/teardown: that owner may be joining the
+        // worker currently executing this callback. If the locks are free,
+        // publish queue closure and cancel socket I/O immediately. Otherwise
+        // the lock owner is already transitioning the same resources.
+        if (self.write_queue_mu.tryLock()) {
+            self.write_queue_closed = true;
+            self.write_queue_cond.broadcast(clock.io());
+            self.write_queue_mu.unlock(clock.io());
+        }
+        if (self.stdin_close_mu.tryLock()) {
+            if (self.stdin_file) |f| {
+                if (self.transport_kind == .socket) {
+                    f.shutdownIfSocket(true);
+                    switch (f) {
+                        .win_pipe => f.close(), // CancelIoEx; no HANDLE close.
+                        .file => {},
+                    }
+                }
+            }
+            self.stdin_close_mu.unlock(clock.io());
+        }
+    }
+
+    /// Ask the spawned child to terminate without waiting or releasing its
+    /// process handle. Safe to call before taking stdin_close_mu so it can wake
+    /// another teardown owner which is joining a pipe-blocked writer.
+    pub fn requestChildTermination(self: *Core) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.signalPublishedChildLocked();
+    }
+
+    fn tryRequestChildTermination(self: *Core) void {
+        if (!self.child_handle_mu.tryLock()) return;
+        defer self.child_handle_mu.unlock(clock.io());
+        self.signalPublishedChildLocked();
+    }
+
+    fn signalPublishedChildLocked(self: *Core) void {
+        if (self.child_handle) |child_id| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                _ = std.os.windows.ntdll.NtTerminateProcess(child_id, @enumFromInt(1));
+            } else {
+                const pid: std.posix.pid_t = @intCast(child_id);
+                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            }
+        }
+    }
+
+    /// Publish a newly spawned child for cancellation by stop().
+    pub fn publishChildHandle(self: *Core, child_id: ?std.process.Child.Id) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.child_handle = child_id;
+    }
+
+    /// Withdraw the shared cancellation handle before Child.kill()/wait()
+    /// reaps the PID or closes the Windows process HANDLE.
+    pub fn claimChildHandleForCleanup(self: *Core) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.child_handle = null;
+    }
+
+    fn stopTeardownOwned(self: *Core) void {
+        defer self.stop_state.store(2, .release);
+
         self.stop_flag.store(true, .seq_cst);
 
         // Unblock RPC thread if it is waiting on ui_attach_cond
@@ -1127,81 +1410,58 @@ pub const Core = struct {
             self.ui_attach_cond.signal(clock.io());
         }
 
-        // Signal writer thread to stop and capture thread handle under lock
-        var wt: ?std.Thread = null;
-        {
-            self.write_queue_mu.lockUncancelable(clock.io());
-            self.write_queue_closed = true;
-            wt = self.writer_thread;
-            self.writer_thread = null;
-            self.write_queue_cond.signal(clock.io());
-            self.write_queue_mu.unlock(clock.io());
-        }
+        // A pipe writer owns a by-value copy of the raw fd/HANDLE. Closing the
+        // Core's copy before join permits fd reuse while that thread is still
+        // inside writeAll(). A published child always belongs to a pipe
+        // session, so signal it without racing on transport_kind before
+        // waiting for transport ownership.
+        self.requestChildTermination();
 
-        // Unblock writer thread's writeAll() if blocked on transport I/O.
-        // Transport-specific semantics of Stream.close():
-        //   - POSIX (.file): closes the fd outright. For socket transport
-        //     (connect mode) stdin_file and stdout_file alias the same fd;
-        //     a second close would close an unrelated fd that the kernel
-        //     may have already recycled, so we null the alias to skip
-        //     cleanupSession's stdout close.
-        //   - Windows named pipe (.win_pipe): calls closeHandles() which
-        //     only fires CancelIoEx — the pipe HANDLE itself stays alive
-        //     until session_pipe.destroy() runs in cleanupSession (after
-        //     all threads holding a Stream value have been joined). We
-        //     still null the stdout alias to keep the cleanupSession path
-        //     symmetric: closeHandles is idempotent under its swap()
-        //     guard, but skipping the duplicate call is clearer.
-        // Serialize with cleanupSession() (rpc_session.zig) to prevent
-        // a race where both threads close the same fd. For POSIX .socket
-        // transport (where stdin/stdout alias the same fd), double-close
-        // causes EBADF signal 6. Whichever thread gets the lock first wins;
-        // the other thread's `if (self.stdin_file)` check then sees null.
-        // Hold stdin_close_mu ONLY across the close-and-null critical
-        // section, NOT across the thread joins below. cleanupSession()
-        // runs on the runLoop thread and also takes this mutex; if stop()
-        // held it while joining that thread (self.thread join below), the
-        // runLoop thread would block on the mutex inside cleanupSession
-        // while stop() blocks on the join — a deadlock that hangs every
-        // teardown. Releasing here preserves the double-close protection
-        // (whoever nulls stdin_file first wins; the other sees null and
-        // skips) without the lock-ordering hazard.
         self.stdin_close_mu.lockUncancelable(clock.io());
-        if (self.stdin_file) |f| {
-            // For POSIX .socket transport (connect mode, where stdin/
-            // stdout alias the same fd) close() alone does not wake
-            // the reader/writer thread blocked on the fd. Issue
-            // shutdown(SHUT_RDWR) first so those threads return EOF /
-            // EPIPE and can be join()ed below; otherwise stop() would
-            // hang waiting on self.thread / writer thread join.
-            f.shutdownIfSocket(self.transport_kind == .socket);
-            f.close();
-            self.stdin_file = null;
-            if (self.transport_kind == .socket) {
-                self.stdout_file = null;
+        const transport_kind = self.transport_kind;
+        // Close the narrow publication race where the RPC thread published a
+        // child after the first signal but before we acquired stdin_close_mu.
+        // This must precede writer join because that writer may be blocked in
+        // the freshly-published child's pipe.
+        self.requestChildTermination();
+        var wt: ?std.Thread = null;
+        self.write_queue_mu.lockUncancelable(clock.io());
+        self.write_queue_closed = true;
+        wt = self.writer_thread;
+        self.writer_thread = null;
+        self.write_queue_cond.signal(clock.io());
+        self.write_queue_mu.unlock(clock.io());
+
+        const stdin = self.stdin_file;
+        const defer_posix_socket_close = if (stdin) |f|
+            transport_kind == .socket and switch (f) {
+                .file => true,
+                .win_pipe => false,
             }
+        else
+            false;
+        self.cancelWriterIo(wt, stdin, transport_kind);
+        if (!defer_posix_socket_close) {
+            if (stdin) |f| f.close();
+            self.stdin_file = null;
+            if (transport_kind == .socket) self.stdout_file = null;
         }
         self.stdin_close_mu.unlock(clock.io());
 
-        // Join writer thread. It exits via:
-        //   - clean shutdown: write_queue_closed observed with empty queue
-        //   - I/O error: POSIX broken-pipe from the stdin close above, or
-        //     OperationAborted from CancelIoEx on the Windows pipe HANDLE
-        if (wt) |t| t.join();
-
-        if (self.child_handle) |_| {
-            // On Windows targets, std.posix.kill is not available.
-            // We rely on closing stdin + the child termination path in runLoop().
-            if (comptime @import("builtin").os.tag != .windows) {
-                // Keep POSIX behavior.
-                // NOTE: Child.Id is pid_t on POSIX.
-                const pid: std.posix.pid_t = @intCast(self.child_handle.?);
-                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-            }
-        }
-
         if (self.thread) |t| t.join();
         self.thread = null;
+
+        // The POSIX socket fd is also held by the RPC reader. shutdown above
+        // wakes it, but raw close waits until that thread is joined so its
+        // by-value Stream can never observe a recycled descriptor. Normally
+        // cleanupSession already performed this close on the RPC thread.
+        if (defer_posix_socket_close) {
+            self.stdin_close_mu.lockUncancelable(clock.io());
+            if (self.stdin_file) |f| f.close();
+            self.stdin_file = null;
+            self.stdout_file = null;
+            self.stdin_close_mu.unlock(clock.io());
+        }
 
         // Defensive: if a stderr pump is still pointing at Core (e.g., a
         // failure path bypassed cleanupSession), detach it now so its
@@ -1239,8 +1499,22 @@ pub const Core = struct {
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.cached_subgrids_buf.deinit(self.alloc);
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.prev_subgrid_snapshots.deinit(self.alloc);
+        self.subgrid_diff_current.deinit(self.alloc);
+        self.subgrid_diff_row_marks.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
+        self.write_spare_queue.deinit(self.alloc);
 
         // Free nvim path copy
         if (self.nvim_path_owned) |p| {
@@ -1280,6 +1554,20 @@ pub const Core = struct {
         // Free caches
         self.deinitHlCache();
         self.deinitGlyphCache();
+    }
+
+    /// Wait until the single stop() owner has released every Core-owned
+    /// allocation.  Only destruction needs this synchronization; ordinary
+    /// duplicate stop calls remain non-blocking to avoid callback/join cycles.
+    pub fn waitUntilStopped(self: *Core) bool {
+        if (self.isCurrentThreadUnsafeForTeardown()) return false;
+        while (true) {
+            switch (self.stop_state.load(.acquire)) {
+                2 => return true,
+                else => {},
+            }
+            std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+        }
     }
 
     /// Ensure scroll_cache has exactly `target_rows` entries.
@@ -1327,7 +1615,7 @@ pub const Core = struct {
         self.scroll_cache_rows = 0;
 
         // Reset subgrid snapshot so the next flush treats all subgrids as new.
-        self.prev_subgrid_snapshot_count = 0;
+        self.prev_subgrid_snapshots.clearRetainingCapacity();
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)
@@ -2610,18 +2898,32 @@ pub const Core = struct {
                 self.write_queue_cond.waitUncancelable(clock.io(), &self.write_queue_mu);
             }
 
-            if (self.write_queue.items.len == 0 and self.write_queue_closed) {
+            // Shutdown is cancellation, not a delivery barrier. Once closed,
+            // discard queued RPC bytes instead of starting another potentially
+            // blocking write while teardown is trying to join this thread.
+            if (self.write_queue_closed) {
+                self.write_queue.clearRetainingCapacity();
+                self.write_queue_normal_bytes = 0;
+                self.write_queue_ui_state_bytes = 0;
                 self.write_queue_mu.unlock(clock.io());
-                self.log.write("writer thread: clean shutdown (queue drained)\n", .{});
+                self.log.write("writer thread: shutdown (queued writes dropped)\n", .{});
                 break;
             }
 
-            // O(1) swap: take full queue, leave empty drain buffer for producers
-            std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_queue, &drain);
+            // All producers append to one FIFO. Swapping the whole buffer is
+            // the only drain boundary, so normal and UI-state RPCs retain the
+            // exact order in which they acquired write_queue_mu.
+            std.mem.swap(
+                std.ArrayListUnmanaged(u8),
+                &self.write_queue,
+                &self.write_spare_queue,
+            );
+            self.write_queue_normal_bytes = 0;
+            self.write_queue_ui_state_bytes = 0;
             self.write_queue_mu.unlock(clock.io());
 
             // Write to pipe WITHOUT holding any mutex
-            file.writeAll(drain.items) catch |e| {
+            file.writeAllCancelable(self.write_spare_queue.items, &self.writer_cancel_requested) catch |e| {
                 self.log.write("writer thread writeAll err: {any}\n", .{e});
                 // Mark writer as failed + closed, notify any future waiters
                 self.write_queue_mu.lockUncancelable(clock.io());
@@ -2632,16 +2934,22 @@ pub const Core = struct {
                 break;
             };
 
-            drain.clearRetainingCapacity();
+            self.write_spare_queue.clearRetainingCapacity();
         }
     }
 
     /// Start the dedicated writer thread for non-blocking stdin writes.
     /// Safe to call from rpc_session.zig after stdin_file is set.
-    pub fn startWriterThread(self: *Core) void {
-        const file = self.stdin_file orelse {
+    pub fn startWriterThread(self: *Core) bool {
+        // Publish the by-value Stream and writer handle atomically with
+        // teardown's stdin_close_mu -> write_queue_mu transition. Without the
+        // outer lock, stop could close/recycle the descriptor after this copy
+        // but before writer_thread becomes visible for joining.
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        var file = self.stdin_file orelse {
+            self.stdin_close_mu.unlock(clock.io());
             self.log.write("startWriterThread: stdin_file is null\n", .{});
-            return;
+            return false;
         };
 
         self.write_queue_mu.lockUncancelable(clock.io());
@@ -2649,25 +2957,103 @@ pub const Core = struct {
         // Guard: don't start if shutdown is in progress or already running.
         // write_queue_closed is set by stop() under the same mutex, so this
         // check fully closes the race window between stop_flag and lock acquisition.
-        if (self.write_queue_closed or self.writer_thread != null) {
+        if (self.writer_thread != null) {
             self.write_queue_mu.unlock(clock.io());
-            return;
+            self.stdin_close_mu.unlock(clock.io());
+            return true;
+        }
+        if (self.write_queue_closed) {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            return false;
         }
 
         // Reset state flags and drain stale data (safe for reconnect / re-use)
         self.writer_failed = false;
         self.write_queue.clearRetainingCapacity();
+        self.write_spare_queue.clearRetainingCapacity();
+        self.write_queue_normal_bytes = 0;
+        self.write_queue_ui_state_bytes = 0;
+        self.write_queue.ensureTotalCapacityPrecise(self.alloc, UI_STATE_WRITE_RESERVE_SIZE) catch |e| {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to reserve active writer UI-state capacity: {any}\n", .{e});
+            return false;
+        };
+        self.write_spare_queue.ensureTotalCapacityPrecise(self.alloc, UI_STATE_WRITE_RESERVE_SIZE) catch |e| {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to reserve spare writer UI-state capacity: {any}\n", .{e});
+            return false;
+        };
+
+        if (self.transport_kind == .pipes) {
+            file = file.preparePipeWriter() catch |e| {
+                self.write_queue_mu.unlock(clock.io());
+                self.stdin_close_mu.unlock(clock.io());
+                self.log.write("FATAL: failed to make writer pipe cancelable: {any}\n", .{e});
+                return false;
+            };
+            // Keep the Core-owned copy's metadata consistent with the writer
+            // copy. The kernel flag is shared by both descriptor aliases.
+            self.stdin_file = file;
+        }
+        self.writer_cancel_requested.store(false, .release);
+        self.writer_exited.store(false, .release);
 
         self.writer_thread = std.Thread.spawn(.{}, writerThreadFn, .{ self, file }) catch |e| {
+            self.writer_exited.store(true, .release);
             self.write_queue_mu.unlock(clock.io());
-            self.log.write("FATAL: failed to spawn writer thread: {any}, using sync writes\n", .{e});
-            return; // writer_thread remains null → sendRaw uses sync fallback
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to spawn writer thread: {any}\n", .{e});
+            return false;
         };
 
         self.write_queue_mu.unlock(clock.io());
+        self.stdin_close_mu.unlock(clock.io());
+        return true;
+    }
+
+    /// Release a writer blocked in transport I/O before joining it. The queue
+    /// must already be closed and signaled. POSIX child pipes are non-blocking
+    /// (preparePipeWriter); sockets use shutdown; Windows named pipes use
+    /// CancelIoEx; synchronous Windows child pipes are canceled by thread.
+    pub fn cancelWriterIo(self: *Core, writer: ?std.Thread, stdin: ?Stream, transport_kind: TransportKind) void {
+        self.writer_cancel_requested.store(true, .release);
+        if (stdin) |stream| {
+            if (transport_kind == .socket) stream.shutdownIfSocket(true);
+            switch (stream) {
+                .win_pipe => stream.close(),
+                .file => {},
+            }
+        }
+        if (writer) |thread| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                const synchronous_file = if (stdin) |stream| switch (stream) {
+                    .file => true,
+                    .win_pipe => false,
+                } else false;
+                if (synchronous_file) {
+                    while (!self.writer_exited.load(.acquire)) {
+                        var io_status: std.os.windows.IO_STATUS_BLOCK = undefined;
+                        _ = std.os.windows.ntdll.NtCancelSynchronousIoFile(thread.getHandle(), null, &io_status);
+                        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+                    }
+                }
+            }
+            thread.join();
+        }
     }
 
     pub fn sendRaw(self: *Core, bytes: []const u8) !void {
+        return self.sendRawClassified(bytes, .normal);
+    }
+
+    fn sendUiStateRaw(self: *Core, bytes: []const u8) !void {
+        return self.sendRawClassified(bytes, .ui_state);
+    }
+
+    fn sendRawClassified(self: *Core, bytes: []const u8, class: WriteClass) !void {
         // Don't attempt writes during shutdown (avoids sync fallback re-block)
         if (self.stop_flag.load(.seq_cst)) return error.BrokenPipe;
 
@@ -2693,17 +3079,9 @@ pub const Core = struct {
                 return error.BrokenPipe;
             }
 
-            // Queue cap check (subtraction form to avoid usize overflow)
-            if (bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue.items.len) {
-                self.log.write("sendRaw: write queue full ({d} bytes), dropping\n",
-                    .{self.write_queue.items.len});
+            self.enqueueRawLocked(bytes, class) catch |e| {
                 self.write_queue_mu.unlock(clock.io());
-                return error.OutOfMemory;
-            }
-
-            self.write_queue.appendSlice(self.alloc, bytes) catch {
-                self.write_queue_mu.unlock(clock.io());
-                return error.OutOfMemory;
+                return e;
             };
             self.write_queue_cond.signal(clock.io());
             self.write_queue_mu.unlock(clock.io());
@@ -2712,11 +3090,59 @@ pub const Core = struct {
 
         self.write_queue_mu.unlock(clock.io());
 
-        // Fallback: no writer thread → synchronous write (startup / spawn failure)
-        if (self.stdin_file) |f| {
-            try f.writeAll(bytes);
-        } else {
-            return error.BrokenPipe;
+        // RPC writes must never fall back to a blocking caller-thread write:
+        // teardown could otherwise neither cancel it safely nor prevent raw
+        // descriptor reuse. Session setup fails if the writer cannot start.
+        return error.BrokenPipe;
+    }
+
+    /// Append one complete RPC while write_queue_mu is held.
+    fn enqueueRawLocked(self: *Core, bytes: []const u8, class: WriteClass) !void {
+        switch (class) {
+            .normal => {
+                if (bytes.len > MAX_WRITE_QUEUE_SIZE or
+                    bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue_normal_bytes)
+                {
+                    self.log.write("sendRaw: normal write queue full ({d} bytes), dropping\n", .{
+                        self.write_queue_normal_bytes,
+                    });
+                    return error.OutOfMemory;
+                }
+
+                const new_normal_bytes = self.write_queue_normal_bytes + bytes.len;
+                const required_capacity = new_normal_bytes + UI_STATE_WRITE_RESERVE_SIZE;
+                if (self.write_queue.capacity < required_capacity) {
+                    var target_capacity = @max(self.write_queue.capacity, UI_STATE_WRITE_RESERVE_SIZE);
+                    while (target_capacity < required_capacity) {
+                        target_capacity = @min(MAX_TOTAL_WRITE_QUEUE_SIZE, target_capacity * 2);
+                    }
+                    self.write_queue.ensureTotalCapacityPrecise(self.alloc, target_capacity) catch {
+                        return error.OutOfMemory;
+                    };
+                }
+
+                self.write_queue.appendSliceAssumeCapacity(bytes);
+                self.write_queue_normal_bytes = new_normal_bytes;
+            },
+            .ui_state => {
+                if (bytes.len > UI_STATE_WRITE_RESERVE_SIZE or
+                    bytes.len > UI_STATE_WRITE_RESERVE_SIZE - self.write_queue_ui_state_bytes)
+                {
+                    self.log.write("sendRaw: UI-state write reserve full ({d} bytes), dropping\n", .{
+                        self.write_queue_ui_state_bytes,
+                    });
+                    return error.OutOfMemory;
+                }
+
+                // Every active buffer starts with the full reserve, and normal
+                // growth always preserves the unused part. This append cannot
+                // allocate or be displaced by normal traffic.
+                std.debug.assert(
+                    self.write_queue.items.len + bytes.len <= self.write_queue.capacity,
+                );
+                self.write_queue.appendSliceAssumeCapacity(bytes);
+                self.write_queue_ui_state_bytes += bytes.len;
+            },
         }
     }
 
@@ -2725,10 +3151,19 @@ pub const Core = struct {
     }
 
     pub fn sendRequestHeader(self: *Core, buf: *rpc.Buf, id: i64, method: []const u8) !void {
-        try rpc.packArray(buf, self.alloc, 4);
-        try rpc.packInt(buf, self.alloc, 0);
-        try rpc.packInt(buf, self.alloc, id);
-        try rpc.packStr(buf, self.alloc, method);
+        try packRequestHeader(buf, self.alloc, id, method);
+    }
+
+    fn packRequestHeader(
+        buf: *rpc.Buf,
+        alloc: std.mem.Allocator,
+        id: i64,
+        method: []const u8,
+    ) !void {
+        try rpc.packArray(buf, alloc, 4);
+        try rpc.packInt(buf, alloc, 0);
+        try rpc.packInt(buf, alloc, id);
+        try rpc.packStr(buf, alloc, method);
     }
 
     pub fn sendNotificationHeader(self: *Core, buf: *rpc.Buf, method: []const u8) !void {
@@ -2773,15 +3208,10 @@ pub const Core = struct {
         self.log.write("rpc send: nvim_set_client_info (id={d})\n", .{id});
     }
 
-    pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendNotificationHeader(&buf, "nvim_ui_attach");
-
-        try rpc.packArray(&buf, self.alloc, 3);
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
+    fn packUiAttachParams(self: *Core, buf: *rpc.Buf, rows: u32, cols: u32) !void {
+        try rpc.packArray(buf, self.alloc, 3);
+        try rpc.packInt(buf, self.alloc, @as(i64, @intCast(cols)));
+        try rpc.packInt(buf, self.alloc, @as(i64, @intCast(rows)));
 
         // Option count: ext_multigrid, rgb (always) + optional ext_*
         var opt_count: u32 = 2;
@@ -2790,40 +3220,74 @@ pub const Core = struct {
         if (self.ext_popupmenu_enabled) opt_count += 1;
         if (self.ext_messages_enabled) opt_count += 1;
         if (self.ext_tabline_enabled) opt_count += 1;
-        try rpc.packMap(&buf, self.alloc, opt_count);
-        try rpc.packStr(&buf, self.alloc, "ext_multigrid");
-        try rpc.packBool(&buf, self.alloc, true);
-        try rpc.packStr(&buf, self.alloc, "rgb");
-        try rpc.packBool(&buf, self.alloc, true);
+        try rpc.packMap(buf, self.alloc, opt_count);
+        try rpc.packStr(buf, self.alloc, "ext_multigrid");
+        try rpc.packBool(buf, self.alloc, true);
+        try rpc.packStr(buf, self.alloc, "rgb");
+        try rpc.packBool(buf, self.alloc, true);
 
         if (self.ext_windows_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_windows");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_windows");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_cmdline_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_cmdline");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_cmdline");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_popupmenu_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_popupmenu");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_popupmenu");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_messages_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_messages");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_messages");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_tabline_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_tabline");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_tabline");
+            try rpc.packBool(buf, self.alloc, true);
         }
+    }
+
+    pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendNotificationHeader(&buf, "nvim_ui_attach");
+        try self.packUiAttachParams(&buf, rows, cols);
 
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_attach (notification, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
+    }
+
+    /// Tracked variants are used only by redraw recovery. Neovim flushes any
+    /// pending UI bytes before serializing an RPC response on the same channel,
+    /// which makes the detach response a strict old-epoch boundary and the
+    /// attach response a completion marker for the fresh full-state replay.
+    pub fn requestUiDetachTracked(self: *Core) !i64 {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_detach");
+        try rpc.packArray(&buf, self.alloc, 0);
+        try self.sendRaw(buf.items);
+        return id;
+    }
+
+    pub fn requestUiAttachTracked(self: *Core, rows: u32, cols: u32) !i64 {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_attach");
+        try self.packUiAttachParams(&buf, rows, cols);
+        try self.sendRaw(buf.items);
+        return id;
     }
 
     /// Notify Neovim of window focus change via nvim_ui_set_focus.
@@ -2831,58 +3295,95 @@ pub const Core = struct {
     /// If called before nvim_ui_attach, the focus state is deferred and
     /// sent automatically once the UI session is established.
     pub fn requestUiSetFocus(self: *Core, gained: bool) void {
+        // Serialize the attached check, pending publication, and delivery with
+        // attach completion. This prevents a stale false observation from
+        // publishing pending focus after the attach thread already drained it.
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        defer self.pending_resize_mu.unlock(clock.io());
+
+        self.pending_focus.store(if (gained) 1 else 2, .seq_cst);
+        self.pending_focus_sequence = self.nextPendingUiStateSequenceLocked();
         if (!self.ui_attached.load(.seq_cst)) {
-            // UI not attached yet — store for later delivery.
-            self.pending_focus.store(if (gained) 1 else 2, .seq_cst);
             self.log.write("requestUiSetFocus: deferred (gained={any})\n", .{gained});
             return;
         }
-        self.requestUiSetFocusInternal(gained) catch |e| {
-            self.log.write("requestUiSetFocus error: {any}\n", .{e});
-        };
+        self.flushPendingUiStateLocked();
     }
 
     fn requestUiSetFocusInternal(self: *Core, gained: bool) !void {
         const id = self.nextMsgId();
+        var storage: [UI_STATE_RPC_STACK_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const fixed_alloc = fixed.allocator();
         var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
+        defer buf.deinit(fixed_alloc);
 
-        try self.sendRequestHeader(&buf, id, "nvim_ui_set_focus");
+        try packRequestHeader(&buf, fixed_alloc, id, "nvim_ui_set_focus");
 
-        try rpc.packArray(&buf, self.alloc, 1);
-        try rpc.packBool(&buf, self.alloc, gained);
+        try rpc.packArray(&buf, fixed_alloc, 1);
+        try rpc.packBool(&buf, fixed_alloc, gained);
 
-        try self.sendRaw(buf.items);
+        try self.sendUiStateRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_set_focus (id={d}, gained={any})\n", .{ id, gained });
     }
 
-    /// Send any focus state that was deferred before nvim_ui_attach.
-    pub fn flushPendingFocus(self: *Core) void {
-        const pending = self.pending_focus.swap(0, .seq_cst);
-        if (pending == 1) {
-            self.requestUiSetFocusInternal(true) catch |e| {
-                self.log.write("flushPendingFocus error: {any}\n", .{e});
+    fn nextPendingUiStateSequenceLocked(self: *Core) u64 {
+        self.pending_ui_state_sequence +%= 1;
+        if (self.pending_ui_state_sequence == 0) self.pending_ui_state_sequence = 1;
+        return self.pending_ui_state_sequence;
+    }
+
+    /// Drain deferred focus/resize in their original publication order. The
+    /// caller holds pending_resize_mu, so a newer UI event cannot replace a
+    /// record between selection and its FIFO enqueue.
+    pub fn flushPendingUiStateLocked(self: *Core) void {
+        while (true) {
+            const focus = self.pending_focus.load(.seq_cst);
+            const have_resize = self.pending_resize_valid;
+            if (focus == 0 and !have_resize) return;
+
+            const send_resize = have_resize and
+                (focus == 0 or self.pending_resize_sequence < self.pending_focus_sequence);
+            if (send_resize) {
+                const rows = self.pending_resize_rows;
+                const cols = self.pending_resize_cols;
+                self.requestTryResize(rows, cols) catch |e| {
+                    self.log.write(
+                        "pending resize send failed: {any} rows={d} cols={d}\n",
+                        .{ e, rows, cols },
+                    );
+                    return;
+                };
+                self.pending_resize_valid = false;
+                self.pending_resize_sequence = 0;
+                continue;
+            }
+
+            self.requestUiSetFocusInternal(focus == 1) catch |e| {
+                self.log.write("pending focus send failed: {any}\n", .{e});
+                return;
             };
-        } else if (pending == 2) {
-            self.requestUiSetFocusInternal(false) catch |e| {
-                self.log.write("flushPendingFocus error: {any}\n", .{e});
-            };
+            self.pending_focus.store(0, .seq_cst);
+            self.pending_focus_sequence = 0;
         }
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {
         const id = self.nextMsgId();
+        var storage: [UI_STATE_RPC_STACK_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const fixed_alloc = fixed.allocator();
         var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
+        defer buf.deinit(fixed_alloc);
 
-        try self.sendRequestHeader(&buf, id, "nvim_ui_try_resize");
+        try packRequestHeader(&buf, fixed_alloc, id, "nvim_ui_try_resize");
 
-        try rpc.packArray(&buf, self.alloc, 2);
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
+        try rpc.packArray(&buf, fixed_alloc, 2);
+        try rpc.packInt(&buf, fixed_alloc, @as(i64, @intCast(cols)));
+        try rpc.packInt(&buf, fixed_alloc, @as(i64, @intCast(rows)));
 
-        try self.sendRaw(buf.items);
+        try self.sendUiStateRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_try_resize (id={d}, rows={d}, cols={d})\n", .{ id, rows, cols });
     }
