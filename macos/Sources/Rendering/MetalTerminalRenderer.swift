@@ -260,12 +260,159 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // consumeFlushFailed()), which cancels the bracket instead of
     // committing it and calls zonvie_core_force_resend + schedules a retry.
     private(set) var flushFailed: Bool = false // Core thread only
+    // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
+    // the retry worker provisions Swift metadata and Metal buffers after the
+    // flush bracket closes and before it reacquires the core grid lock.
+    private var rowCapacityRequiredRows = 0
+    private var rowCapacityRequiredVertexCounts = [Int](
+        repeating: 0,
+        count: metalTerminalMaxRowBuffers
+    )
+    private var rowCapacityBracketOpen = false // Protected by lock
+    private var rowCapacityProvisioning = false // Protected by lock
+    private var rowCapacityHardFailure = false // Protected by lock
 
     /// Read and clear flushFailed. Called once per flush from on_flush_end.
     func consumeFlushFailed() -> Bool {
         let v = flushFailed
         flushFailed = false
         return v
+    }
+
+    private func closeRowCapacityBracket() {
+        lock.lock()
+        rowCapacityBracketOpen = false
+        lock.unlock()
+    }
+
+    private func requirePreparedRowCapacity(
+        row: Int,
+        vertexCount: Int,
+        totalRows: Int,
+        rowIsPhysical: Bool = false,
+        useWriteMapping: Bool = false
+    ) -> Bool {
+        let capacityRow: Int
+        let mappingSetIndex = useWriteMapping ? writeSetIndex : flushSourceSetIndex
+        if !rowIsPhysical,
+           mappingSetIndex >= 0,
+           mappingSetIndex < bufferSets.count {
+            capacityRow = surfacePhysicalCapacityRow(
+                logicalRow: row,
+                logicalToSlot: bufferSets[mappingSetIndex].rowLogicalToSlot
+            )
+        } else {
+            capacityRow = row
+        }
+        if surfaceRowCapacityIsPrepared(
+            bufferSets: bufferSets,
+            row: capacityRow,
+            vertexCount: vertexCount,
+            totalRows: totalRows,
+            maxRowBuffers: maxRowBuffers
+        ) {
+            return true
+        }
+        guard capacityRow >= 0, capacityRow < maxRowBuffers,
+              totalRows >= 0, totalRows <= maxRowBuffers,
+              surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
+        else {
+            lock.lock()
+            rowCapacityHardFailure = true
+            lock.unlock()
+            flushFailed = true
+            return false
+        }
+        lock.lock()
+        rowCapacityRequiredRows = max(max(rowCapacityRequiredRows, totalRows), capacityRow + 1)
+        rowCapacityRequiredVertexCounts[capacityRow] = max(
+            rowCapacityRequiredVertexCounts[capacityRow],
+            max(0, vertexCount)
+        )
+        lock.unlock()
+        flushFailed = true
+        return false
+    }
+
+    /// Called on the retry queue before it acquires core grid_mu. Flush
+    /// admission is gated while the plan is allocated and published, so row
+    /// callbacks never race these metadata mutations.
+    func provisionPendingRowCapacity() -> SurfaceRowProvisionStatus {
+        lock.lock()
+        if rowCapacityHardFailure {
+            lock.unlock()
+            return .hardFailure
+        }
+        if rowCapacityBracketOpen || rowCapacityProvisioning ||
+            gpuInFlightCount.contains(where: { $0 != 0 }) {
+            lock.unlock()
+            return .retry
+        }
+        guard rowCapacityRequiredRows > 0 else {
+            lock.unlock()
+            return .ready
+        }
+        rowCapacityProvisioning = true
+        let requiredRows = rowCapacityRequiredRows
+        let requiredVertexCounts = Array(rowCapacityRequiredVertexCounts[0..<requiredRows])
+        for row in 0..<requiredRows {
+            rowCapacityRequiredVertexCounts[row] = 0
+        }
+        rowCapacityRequiredRows = 0
+        lock.unlock()
+
+        let planResult = makeSurfaceRowProvisionPlan(
+            bufferSets: bufferSets,
+            device: device,
+            requiredRowCount: requiredRows,
+            requiredVertexCounts: requiredVertexCounts,
+            maxRowBuffers: maxRowBuffers
+        )
+
+        lock.lock()
+        defer {
+            rowCapacityProvisioning = false
+            lock.unlock()
+        }
+        switch planResult {
+        case .overBudget:
+            rowCapacityHardFailure = true
+            return .hardFailure
+        case .allocationFailed(let partialPlan):
+            let metrics = partialPlan.metrics
+            ZonvieCore.appLog(
+                "[Renderer] row provisioning allocation failed attempt=\(metrics.allocationAttemptCount) " +
+                "created=\(metrics.createdBufferCount) createdBytes=\(metrics.createdBufferBytes) " +
+                "planned=\(metrics.plannedReplacementCount) plannedBytes=\(metrics.plannedReplacementBytes) " +
+                "live=\(metrics.liveBufferCount) liveBytes=\(metrics.liveBufferBytes)"
+            )
+            // Private pool publication is independent of committed rowState.
+            // Retaining the successful prefix makes every retry monotonic
+            // without exposing a partially rendered frame.
+            applySurfaceRowProvisionPlan(
+                partialPlan,
+                to: bufferSets,
+                maxRowBuffers: maxRowBuffers
+            )
+            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
+            for row in 0..<requiredRows {
+                rowCapacityRequiredVertexCounts[row] = max(
+                    rowCapacityRequiredVertexCounts[row],
+                    requiredVertexCounts[row]
+                )
+            }
+            return .retry
+        case .ready(let plan):
+            if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
+                ZonvieCore.appLog(
+                    "[perf] row_provision created=\(plan.metrics.createdBufferCount) " +
+                    "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
+                    "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
+                )
+            }
+            applySurfaceRowProvisionPlan(plan, to: bufferSets, maxRowBuffers: maxRowBuffers)
+        }
+        return rowCapacityRequiredRows == 0 ? .ready : .retry
     }
     // Per-flush row submit accumulators. Reset in beginFlush, summed in
     // submitVerticesRowRaw, dumped in commitFlush as [perf] row_submit. Surfaces
@@ -324,8 +471,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // frame visible as a 1-row jitter.
     private var lastDrawnHadActiveScrollOffset: Bool = false // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
+    private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by lock
     private var cursorGpuInFlightCount: [Int] = [0, 0, 0] // Protected by lock
     private var defaultBgRGB: UInt32 = 0               // Protected by lock
+
+    /// Complete one protected GPU read and immediately service any contraction
+    /// that had to skip this set while it was in flight. Caller holds `lock`.
+    private func completeSurfaceGpuReadLocked(_ setIndex: Int) {
+        guard setIndex >= 0,
+              setIndex < gpuInFlightCount.count,
+              gpuInFlightCount[setIndex] > 0
+        else { return }
+        gpuInFlightCount[setIndex] -= 1
+        serviceSurfaceRowStorageRetirement(
+            bufferSets: bufferSets,
+            gpuInFlightCount: gpuInFlightCount,
+            committedSetIndex: committedSetIndex,
+            layoutContracted: false,
+            state: &rowStorageRetirement,
+            retireMainBuffers: true
+        )
+    }
 
     /// Buffer at the given physical slot in whichever set is currently GPU
     /// in-flight, or nil when none. With semaphore=1 at most one set is
@@ -1155,6 +1321,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     func beginFlush() -> BeginFlushResult {
+        lock.lock()
+        if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+            lock.unlock()
+            ZonvieCore.appLog("[Renderer] beginFlush: waiting for row capacity provisioning")
+            return .dropped
+        }
+        rowCapacityBracketOpen = true
+        lock.unlock()
         isInFlush = true
         mainWritePrepared = false
         cursorWritePrepared = false
@@ -1200,6 +1374,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         atlasSyncedWasRecreate = prepResult.syncedWasRecreate
         if prepResult.shouldAbort {
             isInFlush = false
+            closeRowCapacityBracket()
             ZonvieCore.appLog("[WARNING] beginFlush: atlas prepare failed, dropping flush")
             return .dropped
         }
@@ -1229,6 +1404,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // state is untouched, so the next flush attempt retries it.
                 atlas.endAtlasWrite()
                 isInFlush = false
+                closeRowCapacityBracket()
                 ZonvieCore.appLog("[WARNING] beginFlush: atlas write blocked by in-flight external reads, dropping flush")
                 return .dropped
             }
@@ -1245,6 +1421,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     cmd.commit()
                     atlas.endAtlasWrite()
                     isInFlush = false
+                    closeRowCapacityBracket()
                     ZonvieCore.appLog("[WARNING] beginFlush: atlas blit encode failed, dropping flush")
                     return .dropped
                 }
@@ -1278,6 +1455,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 atlas.endAtlasWrite()
                 atlas.cancelPendingBackTextureBlit()
                 isInFlush = false
+                closeRowCapacityBracket()
                 ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
                 return .dropped
             }
@@ -1342,11 +1520,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             syncedRows = src.rowState.buffers.count
         }
 
-        dst.detachPoolMainBuffer = dst.mainVertexBuffer
-        dst.detachPoolMainCap = dst.mainVertexBufferCap
-        dst.mainVertexBuffer = src.mainVertexBuffer
-        dst.mainVertexBufferCap = src.mainVertexBufferCap
-        dst.mainVertexCount = src.mainVertexCount
+        copySurfaceMainVertexState(from: src, to: dst)
         dst.pendingScroll = nil
         mainWritePrepared = true
 
@@ -1401,6 +1575,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         mainWritePrepared = false
         cursorWritePrepared = false
         isInFlush = false
+        closeRowCapacityBracket()
     }
 
     /// Called from on_flush_end callback (core thread, grid_mu held).
@@ -1425,6 +1600,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             mainWritePrepared = false
             cursorWritePrepared = false
             isInFlush = false
+            closeRowCapacityBracket()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas upload writer unavailable")
             return false
         }
@@ -1442,6 +1618,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             mainWritePrepared = false
             cursorWritePrepared = false
             isInFlush = false
+            closeRowCapacityBracket()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas back-sync still pending or failed")
             return false
         }
@@ -1449,8 +1626,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let didMainWrite = mainWritePrepared
         let didCursorWrite = cursorWritePrepared
         let ws = writeSetIndex
-        let mainColumnsContracted = didMainWrite
-            && bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[ws].knownTotalCols
+        let mainLayoutContracted = didMainWrite
+            && (bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[ws].knownTotalRows
+                || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[ws].knownTotalCols)
+        let mainLayoutIsEmpty = didMainWrite
+            && (bufferSets[ws].knownTotalRows == 0 || bufferSets[ws].knownTotalCols == 0)
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -1465,16 +1645,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         committedAtlasTexture = atlasCommit.texture  // same lock as vertex state
         commitRevision &+= 1
         let rev = commitRevision
-        if mainColumnsContracted {
-            for i in bufferSets.indices
-            where i != ws && gpuInFlightCount[i] == 0 {
-                retireSurfaceRowStorageForContractedLayout(
-                    bufferSet: bufferSets[i],
-                    demandSet: bufferSets[ws],
-                    includeActiveBuffers: true
-                )
-            }
-        }
+        serviceSurfaceRowStorageRetirement(
+            bufferSets: bufferSets,
+            gpuInFlightCount: gpuInFlightCount,
+            committedSetIndex: committedSetIndex,
+            layoutContracted: mainLayoutContracted,
+            state: &rowStorageRetirement,
+            retireMainBuffers: mainLayoutIsEmpty
+        )
         // Accumulate the write set's pendingScroll into the global accumulator.
         // Done here (under lock, after committedSetIndex update) so draw() never
         // sees a scroll delta that precedes the matching vertex data.
@@ -1565,6 +1743,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         mainWritePrepared = false
         cursorWritePrepared = false
         isInFlush = false
+        closeRowCapacityBracket()
         if ZonvieCore.appLogEnabled, didMainWrite {
             let bs = bufferSets[ws]
             let rowCount = bs.rowState.buffers.count
@@ -2027,6 +2206,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let snappedCommittedDrawableH: UInt32
 
             lock.lock()
+            if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+                lock.unlock()
+                inflightSemaphore.signal()
+                (view as? MetalTerminalView)?.didDrawFrame()
+                (view as? MetalTerminalView)?.requestRedraw()
+                return
+            }
             csi = committedSetIndex
             cci = committedCursorSetIndex
             currentCommitRevision = commitRevision
@@ -2081,7 +2267,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 if !gpuSubmitted {
                     inflightSemaphore.signal()
                     lock.lock()
-                    gpuInFlightCount[csi] -= 1
+                    completeSurfaceGpuReadLocked(csi)
                     cursorGpuInFlightCount[cci] -= 1
                     lock.unlock()
                 }
@@ -2591,7 +2777,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let lk = lock
                 cmd.addCompletedHandler { [weak self] _ in
                     lk.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     self?.cursorGpuInFlightCount[cci] -= 1
                     lk.unlock()
                     sem.signal()
@@ -3042,7 +3228,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let lk = lock
                 cmd.addCompletedHandler { [weak self] _ in
                     lk.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     self?.cursorGpuInFlightCount[cci] -= 1
                     lk.unlock()
                     sem.signal()
@@ -3068,7 +3254,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let lk = lock
                 cmd.addCompletedHandler { [weak self] _ in
                     lk.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     self?.cursorGpuInFlightCount[cci] -= 1
                     lk.unlock()
                     sem.signal()
@@ -3175,7 +3361,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let lk = lock
                 cmd.addCompletedHandler { [weak self] _ in
                     lk.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     self?.cursorGpuInFlightCount[cci] -= 1
                     lk.unlock()
                     sem.signal()
@@ -3269,7 +3455,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let lk = lock
                     cmd.addCompletedHandler { [weak self] _ in
                         lk.lock()
-                        self?.gpuInFlightCount[csi] -= 1
+                        self?.completeSurfaceGpuReadLocked(csi)
                         self?.cursorGpuInFlightCount[cci] -= 1
                         lk.unlock()
                         sem.signal()
@@ -3361,7 +3547,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             cmd.addCompletedHandler { [weak self, weak view] completed in
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
-                self?.gpuInFlightCount[csi] -= 1
+                self?.completeSurfaceGpuReadLocked(csi)
                 self?.cursorGpuInFlightCount[cci] -= 1
                 lk.unlock()
                 sem.signal()
@@ -4357,6 +4543,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             row: row,
             vertexCount: vertexCount,
             maxRowBuffers: maxRowBuffers,
+            allowAllocation: false,
             inflightRowBuffers: (inflightRowBuffer(atSlot: row), nil)
         )
     }
@@ -4450,6 +4637,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // (srcCount > 0, checked above) — not a safe row-empty
                     // case, see this function's doc comment.
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
+                    _ = requirePreparedRowCapacity(
+                        row: dstSlot,
+                        vertexCount: srcCount,
+                        totalRows: totalRows,
+                        rowIsPhysical: true
+                    )
                     didFail = true
                     continue
                 }
@@ -4492,6 +4685,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // (srcCount > 0, checked above) — not a safe row-empty
                     // case, see this function's doc comment.
                     bufferSets[setIdx].rowState.counts[dstSlot] = 0
+                    _ = requirePreparedRowCapacity(
+                        row: dstSlot,
+                        vertexCount: srcCount,
+                        totalRows: totalRows,
+                        rowIsPhysical: true
+                    )
                     didFail = true
                     continue
                 }
@@ -4630,6 +4829,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard rowsDelta != 0 else { return true }
         guard rowStart >= 0, rowEnd > rowStart else { return true }
         guard colStart == 0, colEnd == totalCols else { return true }
+        guard requirePreparedRowCapacity(
+            row: rowEnd - 1,
+            vertexCount: 0,
+            totalRows: totalRows
+        ) else { return false }
         guard prepareMainWriteState() else { return false }
         flushHasStructuralMainChange = true
 
@@ -4671,9 +4875,47 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
         }
-        // We currently assume Zig calls with rowCount == 1 (contract in Zig onFlush).
-        guard rowCount > 0 else { return }
+        let updateMain = (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
+        let updateCursor = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
+        if updateCursor && !updateMain {
+            submitVerticesPartialRaw(
+                mainPtr: nil,
+                mainCount: 0,
+                cursorPtr: UnsafeRawPointer(ptr),
+                cursorCount: count,
+                updateMain: false,
+                updateCursor: true
+            )
+            return
+        }
+        guard updateMain else { return }
+        if rowCount == 0 {
+            guard count == 0,
+                  prepareMainWriteState(),
+                  applySurfaceZeroCellLayout(
+                    bufferSet: bufferSets[writeSetIndex],
+                    totalRows: totalRows,
+                    totalCols: totalCols
+                  )
+            else {
+                flushFailed = true
+                return
+            }
+            flushChangedMainRows.removeAll()
+            flushHasStructuralMainChange = true
+            return
+        }
+        // Content submissions are one row at a time (contract in Zig onFlush).
+        // A preceding scroll may already have remapped the write set. Select
+        // and synchronize that set before resolving the physical capacity
+        // slot, otherwise the retry worker grows the source slot forever.
         guard prepareMainWriteState() else { return }
+        guard requirePreparedRowCapacity(
+            row: rowStart,
+            vertexCount: count,
+            totalRows: totalRows,
+            useWriteMapping: true
+        ) else { return }
 
         let perfEnabled = ZonvieCore.appLogEnabled
         let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
@@ -4691,6 +4933,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
+            allowAllocation: false,
             inflightRowBuffers: { (self.inflightRowBuffer(atSlot: $0), nil) }
         )
         if !submitted {

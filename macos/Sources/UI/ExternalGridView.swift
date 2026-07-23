@@ -140,6 +140,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var flushSourceSetIndex: Int = 0      // Main thread only (during flush)
     private var committedSetIndex: Int = 0        // Protected by tripleBufferLock
     private var gpuInFlightCount: [Int] = [0, 0, 0] // Protected by tripleBufferLock
+    private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by tripleBufferLock
     private var isInFlush: Bool = false           // Flush bracket thread only
     // Set (core thread) when a vertex/row buffer allocation fails during
     // this flush bracket. Consumed by ZonvieCore's on_flush_end via
@@ -174,12 +175,146 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var flushGeneratedTotalCols: Int = 0
     private var rowStateNeedsFullSync = [false, false, false]
     private var flushHasStructuralRowChange = false
+    // Fixed-size capacity ledger. The core callback only raises entries;
+    // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
+    // bracket closes, before retrying the core flush.
+    private var rowCapacityRequiredRows = 0
+    private var rowCapacityRequiredVertexCounts = [Int](repeating: 0, count: 20_000)
+    private var rowCapacityProvisioning = false // Protected by tripleBufferLock
+    private var rowCapacityHardFailure = false // Protected by tripleBufferLock
 
     /// Read and clear flushFailed. Called once per flush from on_flush_end.
     func consumeFlushFailed() -> Bool {
         let v = flushFailed
         flushFailed = false
         return v
+    }
+
+    private func requirePreparedRowCapacity(
+        row: Int,
+        vertexCount: Int,
+        totalRows: Int,
+        lockHeld: Bool = false,
+        useWriteMapping: Bool = false
+    ) -> Bool {
+        let capacityRow: Int
+        let mappingSetIndex = useWriteMapping ? writeSetIndex : flushSourceSetIndex
+        if mappingSetIndex >= 0,
+           mappingSetIndex < bufferSets.count {
+            capacityRow = surfacePhysicalCapacityRow(
+                logicalRow: row,
+                logicalToSlot: bufferSets[mappingSetIndex].rowLogicalToSlot
+            )
+        } else {
+            capacityRow = row
+        }
+        if surfaceRowCapacityIsPrepared(
+            bufferSets: bufferSets,
+            row: capacityRow,
+            vertexCount: vertexCount,
+            totalRows: totalRows,
+            maxRowBuffers: maxRowBuffers
+        ) {
+            return true
+        }
+        guard capacityRow >= 0, capacityRow < maxRowBuffers,
+              totalRows >= 0, totalRows <= maxRowBuffers,
+              surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
+        else {
+            if !lockHeld { tripleBufferLock.lock() }
+            rowCapacityHardFailure = true
+            if !lockHeld { tripleBufferLock.unlock() }
+            flushFailed = true
+            return false
+        }
+        if !lockHeld { tripleBufferLock.lock() }
+        rowCapacityRequiredRows = max(max(rowCapacityRequiredRows, totalRows), capacityRow + 1)
+        rowCapacityRequiredVertexCounts[capacityRow] = max(
+            rowCapacityRequiredVertexCounts[capacityRow],
+            max(0, vertexCount)
+        )
+        if !lockHeld { tripleBufferLock.unlock() }
+        flushFailed = true
+        return false
+    }
+
+    /// Called from the flush-retry queue before it acquires core grid_mu.
+    func provisionPendingRowCapacity() -> SurfaceRowProvisionStatus {
+        tripleBufferLock.lock()
+        if rowCapacityHardFailure {
+            tripleBufferLock.unlock()
+            return .hardFailure
+        }
+        if bracketOpen || rowCapacityProvisioning ||
+            gpuInFlightCount.contains(where: { $0 != 0 }) {
+            tripleBufferLock.unlock()
+            return .retry
+        }
+        guard rowCapacityRequiredRows > 0 else {
+            tripleBufferLock.unlock()
+            return .ready
+        }
+        rowCapacityProvisioning = true
+        let requiredRows = rowCapacityRequiredRows
+        let requiredVertexCounts = Array(rowCapacityRequiredVertexCounts[0..<requiredRows])
+        for row in 0..<requiredRows {
+            rowCapacityRequiredVertexCounts[row] = 0
+        }
+        rowCapacityRequiredRows = 0
+        tripleBufferLock.unlock()
+
+        let planResult = makeSurfaceRowProvisionPlan(
+            bufferSets: bufferSets,
+            device: mtlDevice,
+            requiredRowCount: requiredRows,
+            requiredVertexCounts: requiredVertexCounts,
+            maxRowBuffers: maxRowBuffers
+        )
+
+        tripleBufferLock.lock()
+        defer {
+            rowCapacityProvisioning = false
+            tripleBufferLock.unlock()
+        }
+        switch planResult {
+        case .overBudget:
+            rowCapacityHardFailure = true
+            return .hardFailure
+        case .allocationFailed(let partialPlan):
+            let metrics = partialPlan.metrics
+            ZonvieCore.appLog(
+                "[ExternalGridView] row provisioning allocation failed gridId=\(gridId) " +
+                "attempt=\(metrics.allocationAttemptCount) created=\(metrics.createdBufferCount) " +
+                "createdBytes=\(metrics.createdBufferBytes) planned=\(metrics.plannedReplacementCount) " +
+                "plannedBytes=\(metrics.plannedReplacementBytes) live=\(metrics.liveBufferCount) " +
+                "liveBytes=\(metrics.liveBufferBytes)"
+            )
+            // Publish only successful private-pool capacities. Committed row
+            // buffers and their counts remain transactionally unchanged.
+            applySurfaceRowProvisionPlan(
+                partialPlan,
+                to: bufferSets,
+                maxRowBuffers: maxRowBuffers
+            )
+            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
+            for row in 0..<requiredRows {
+                rowCapacityRequiredVertexCounts[row] = max(
+                    rowCapacityRequiredVertexCounts[row],
+                    requiredVertexCounts[row]
+                )
+            }
+            return .retry
+        case .ready(let plan):
+            if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
+                ZonvieCore.appLog(
+                    "[perf] external_row_provision gridId=\(gridId) created=\(plan.metrics.createdBufferCount) " +
+                    "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
+                    "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
+                )
+            }
+            applySurfaceRowProvisionPlan(plan, to: bufferSets, maxRowBuffers: maxRowBuffers)
+        }
+        return rowCapacityRequiredRows == 0 ? .ready : .retry
     }
 
     /// Same-slot buffers of the sets currently GPU in-flight (up to two —
@@ -344,6 +479,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // into rowStaging (newer staged entries win) so a cancelled flush cannot
     // permanently lose replayed rows. Protected by tripleBufferLock.
     private var rowStagingFolded: [Int: [zonvie_vertex]] = [:]
+
+    /// Complete one protected GPU read and immediately service any contraction
+    /// that had to skip this set while it was in flight. Caller holds
+    /// `tripleBufferLock`.
+    private func completeSurfaceGpuReadLocked(_ setIndex: Int) {
+        guard setIndex >= 0,
+              setIndex < gpuInFlightCount.count,
+              gpuInFlightCount[setIndex] > 0
+        else { return }
+        gpuInFlightCount[setIndex] -= 1
+        serviceSurfaceRowStorageRetirement(
+            bufferSets: bufferSets,
+            gpuInFlightCount: gpuInFlightCount,
+            committedSetIndex: committedSetIndex,
+            layoutContracted: false,
+            state: &rowStorageRetirement
+        )
+    }
 
     // True while a core-thread flush bracket is open on this view. Unlike
     // `isInFlush` (core-thread-owned, unsafe to read from main), this is
@@ -853,6 +1006,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     @discardableResult
     func beginFlush() -> Bool {
         tripleBufferLock.lock()
+        if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+            tripleBufferLock.unlock()
+            isInFlush = false
+            ZonvieCore.appLog("[ExternalGridView] beginFlush: waiting for row capacity provisioning gridId=\(gridId)")
+            return false
+        }
         if rowHistoryGrowthWaitingForBracket {
             // A capacity worker collided with the previous bracket. Give its
             // already-scheduled main-queue retry an allocation-free publish
@@ -984,7 +1143,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let structural = !src.rowState.usingRowBuffers
                         || rowStagingTotalRows != src.knownTotalRows
                         || rowStagingTotalCols != src.knownTotalCols
-                    if !submitSurfaceRowVertices(
+                    if !requirePreparedRowCapacity(
+                        row: row,
+                        vertexCount: verts.count,
+                        totalRows: rowStagingTotalRows,
+                        lockHeld: true,
+                        useWriteMapping: true
+                    ) || !submitSurfaceRowVertices(
                         target: cursorDst,
                         sourceSet: src,
                         device: mtlDevice,
@@ -994,6 +1159,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         maxRowBuffers: maxRowBuffers,
                         totalRows: rowStagingTotalRows,
                         totalCols: rowStagingTotalCols,
+                        allowAllocation: false,
                         inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
                     ) {
                         flushFailed = true
@@ -1070,23 +1236,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let hadContent = flushHadContent
         var shouldScheduleGrowth = false
         if hadContent {
-            let columnsContracted = bufferSets[flushSourceSetIndex].knownTotalCols
-                > bufferSets[writeSetIndex].knownTotalCols
+            let layoutContracted =
+                bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[writeSetIndex].knownTotalRows
+                || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[writeSetIndex].knownTotalCols
             tripleBufferLock.lock()
             committedSetIndex = writeSetIndex
             committedGridRows = gridRows
             committedGridCols = gridCols
             commitRevision &+= 1
-            if columnsContracted {
-                for i in bufferSets.indices
-                where i != writeSetIndex && gpuInFlightCount[i] == 0 {
-                    retireSurfaceRowStorageForContractedLayout(
-                        bufferSet: bufferSets[i],
-                        demandSet: bufferSets[writeSetIndex],
-                        includeActiveBuffers: true
-                    )
-                }
-            }
+            serviceSurfaceRowStorageRetirement(
+                bufferSets: bufferSets,
+                gpuInFlightCount: gpuInFlightCount,
+                committedSetIndex: committedSetIndex,
+                layoutContracted: layoutContracted,
+                state: &rowStorageRetirement
+            )
             // Freeze the atlas texture reference into the SAME buffer set
             // as this commit's vertex data — see SurfaceBufferSet.atlasTextureSnapshot
             // for why draw(in:) must read both from one consistent
@@ -1201,6 +1365,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         // Consumer-side eligibility: only remap for full-width, single-row scrolls
         guard colStart == 0, colEnd == totalCols else { return }
+        guard requirePreparedRowCapacity(
+            row: rowEnd - 1,
+            vertexCount: 0,
+            totalRows: totalRows,
+            useWriteMapping: true
+        ) else { return }
 
         let ws = bufferSets[writeSetIndex]
         flushHasStructuralRowChange = true
@@ -1345,7 +1515,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // beginFlush() to apply at the next safe point.
                 tripleBufferLock.lock()
                 let csi = committedSetIndex
-                if !bracketOpen && gpuInFlightCount[csi] == 0 {
+                if !bracketOpen && !rowCapacityProvisioning && gpuInFlightCount[csi] == 0 {
                     // No open bracket (a bracket's commit would rotate onto a
                     // write set copied BEFORE this write, discarding it) and
                     // the set is idle: safe to write directly.
@@ -1385,9 +1555,35 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         // Normal row update (ZONVIE_VERT_UPDATE_MAIN)
 
-        guard rowCount > 0 else { return }
+        if rowCount == 0 {
+            guard !outOfBracket,
+                  count == 0,
+                  applySurfaceZeroCellLayout(
+                    bufferSet: bufferSets[writeSetIndex],
+                    totalRows: totalRows,
+                    totalCols: totalCols
+                  )
+            else {
+                flushFailed = true
+                return
+            }
+            flushHadContent = true
+            flushChangedRows.removeAll()
+            flushGeneratedRows.removeAll()
+            flushGeneratedTotalRows = totalRows
+            flushGeneratedTotalCols = totalCols
+            flushHasStructuralRowChange = true
+            return
+        }
 
-        guard requestRowHistoryCapacity(rowCount: totalRows) else {
+        let historyReady = requestRowHistoryCapacity(rowCount: totalRows)
+        let rowCapacityReady = requirePreparedRowCapacity(
+            row: rowStart,
+            vertexCount: count,
+            totalRows: totalRows,
+            useWriteMapping: !outOfBracket
+        )
+        guard historyReady && rowCapacityReady else {
             flushFailed = true
             return
         }
@@ -1408,6 +1604,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 maxRowBuffers: maxRowBuffers,
                 totalRows: totalRows,
                 totalCols: totalCols,
+                allowAllocation: false,
                 inflightRowBuffers: { self.inflightRowBuffers(atSlot: $0) }
             ) {
                 flushFailed = true
@@ -1458,7 +1655,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let csi = committedSetIndex
         let allIdle = gpuInFlightCount[0] == 0 && gpuInFlightCount[1] == 0 && gpuInFlightCount[2] == 0
         var stagedForRetry = false
-        if !bracketOpen && allIdle {
+        if !bracketOpen && !rowCapacityProvisioning && allIdle {
             // Locked variant: tripleBufferLock is held (NSLock is
             // non-recursive) — and with all sets idle there are no in-flight
             // aliases anyway.
@@ -1476,6 +1673,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 maxRowBuffers: maxRowBuffers,
                 totalRows: totalRows,
                 totalCols: totalCols,
+                allowAllocation: false,
                 inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
             )
             if submitted {
@@ -1855,6 +2053,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let cursorBlinkStateSnapshot: Bool
             let committedFontIsCurrent: Bool
             tripleBufferLock.lock()
+            if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+                tripleBufferLock.unlock()
+                inflightSemaphore.signal()
+                redrawScheduler.didDrawFrame()
+                finishedRedraw = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.requestRedraw()
+                }
+                return
+            }
             csi = committedSetIndex
             // Apply staged out-of-bracket ROW updates once ALL sets are idle
             // (row buffers are COW-shared across sets, so csi-idle alone is
@@ -1887,6 +2095,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             maxRowBuffers: maxRowBuffers,
                             totalRows: rowStagingTotalRows,
                             totalCols: rowStagingTotalCols,
+                            allowAllocation: false,
                             inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
                         )
                     }
@@ -2033,7 +2242,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 if !gpuSubmitted {
                     inflightSemaphore.signal()
                     tripleBufferLock.lock()
-                    gpuInFlightCount[csi] -= 1
+                    completeSurfaceGpuReadLocked(csi)
                     tripleBufferLock.unlock()
                 }
             }
@@ -2384,7 +2593,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
                 }
@@ -2731,7 +2940,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
                     if hadAtlasRead {
@@ -2754,7 +2963,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
                     // Paired with beginAtlasExternalRead() above. Uses the
@@ -2863,7 +3072,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.gpuInFlightCount[csi] -= 1
+                    self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
                     if hadAtlasRead {
@@ -2895,7 +3104,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let hadAtlasRead = atlasTex != nil
                     cmd.addCompletedHandler { [weak self] _ in
                         tbLock.lock()
-                        self?.gpuInFlightCount[csi] -= 1
+                        self?.completeSurfaceGpuReadLocked(csi)
                         tbLock.unlock()
                         sem.signal()
                         if hadAtlasRead {
@@ -2944,7 +3153,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let tbLock = tripleBufferLock
             cmd.addCompletedHandler { [weak self] completed in
                 tbLock.lock()
-                self?.gpuInFlightCount[csi] -= 1
+                self?.completeSurfaceGpuReadLocked(csi)
                 tbLock.unlock()
                 sem.signal()
                 // Paired with beginAtlasExternalRead() at atlas-bind time

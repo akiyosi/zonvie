@@ -100,9 +100,36 @@ final class ZonvieCore {
     // asyncAfter closure below clears the flag on the main thread.
     private var flushRetryScheduledLock = os_unfair_lock()
     private var flushRetryScheduled = false
+    private var flushRetryAccepting = true
     private var flushRetryGeneration: UInt64 = 0
     private var flushRetryBackoff = FlushRetryBackoff()
     private let flushRetryQueue = DispatchQueue(label: "com.zonvie.flush-retry", qos: .userInitiated)
+    private let flushRetryQueueKey = DispatchSpecificKey<UInt8>()
+
+    /// Provision row metadata and Metal buffers without holding core grid_mu.
+    /// Views gate new flush brackets while their plans are being published.
+    private func provisionPendingSurfaceRowCapacity() -> SurfaceRowProvisionStatus {
+        var status: SurfaceRowProvisionStatus = .ready
+        if let renderer = terminalView?.renderer {
+            switch renderer.provisionPendingRowCapacity() {
+            case .hardFailure: return .hardFailure
+            case .retry: status = .retry
+            case .ready: break
+            }
+        }
+
+        externalGridViewsLock.lock()
+        let gridViews = Array(externalGridViews.values)
+        externalGridViewsLock.unlock()
+        for gridView in gridViews {
+            switch gridView.provisionPendingRowCapacity() {
+            case .hardFailure: return .hardFailure
+            case .retry: status = .retry
+            case .ready: break
+            }
+        }
+        return status
+    }
 
     /// Schedule a one-shot retry of an aborted flush. Safe to call from the
     /// core thread (on_flush_begin runs there); the actual retry call
@@ -110,7 +137,7 @@ final class ZonvieCore {
     /// callback's stack.
     func scheduleFlushRetry() {
         os_unfair_lock_lock(&flushRetryScheduledLock)
-        if flushRetryScheduled {
+        if !flushRetryAccepting || flushRetryScheduled {
             os_unfair_lock_unlock(&flushRetryScheduledLock)
             return
         }
@@ -124,16 +151,51 @@ final class ZonvieCore {
         // blocks AppKit input/drawing on the main thread.
         flushRetryQueue.asyncAfter(deadline: .now() + delaySeconds) { [weak self] in
             guard let self else { return }
-            guard let corePtr = self.core else { return }
 
             // Most retries become stale because a normal redraw commits first.
-            // Reject those before touching grid_mu so the worker does not
-            // contend with shaping/atlas work for an already-cancelled retry.
+            // Reject those before reading the Core pointer or provisioning so
+            // a delayed closure cannot race lifecycle teardown.
             os_unfair_lock_lock(&self.flushRetryScheduledLock)
-            let shouldAttempt = self.flushRetryScheduled
+            let shouldAttempt = self.flushRetryAccepting
+                && self.flushRetryScheduled
                 && self.flushRetryGeneration == generation
             os_unfair_lock_unlock(&self.flushRetryScheduledLock)
             guard shouldAttempt else { return }
+            guard let corePtr = self.core else { return }
+
+            // A row callback that discovered new geometry only recorded its
+            // requirements. Allocate and publish those capacities here,
+            // before grid_mu is acquired and before the core regenerates the
+            // full transaction. If a concurrent normal flush still owns a
+            // bracket, re-arm with backoff instead of allocating under it.
+            let provisionStatus = self.provisionPendingSurfaceRowCapacity()
+            if provisionStatus == .hardFailure {
+                os_unfair_lock_lock(&self.flushRetryScheduledLock)
+                let stillCurrent = self.flushRetryAccepting
+                    && self.flushRetryGeneration == generation
+                if stillCurrent {
+                    self.flushRetryScheduled = false
+                }
+                os_unfair_lock_unlock(&self.flushRetryScheduledLock)
+                if stillCurrent {
+                    zonvie_core_fail_render_budget(corePtr)
+                }
+                return
+            }
+            guard provisionStatus == .ready else {
+                os_unfair_lock_lock(&self.flushRetryScheduledLock)
+                let shouldRearm = self.flushRetryAccepting
+                    && self.flushRetryScheduled
+                    && self.flushRetryGeneration == generation
+                if shouldRearm {
+                    self.flushRetryScheduled = false
+                }
+                os_unfair_lock_unlock(&self.flushRetryScheduledLock)
+                if shouldRearm {
+                    self.scheduleFlushRetry()
+                }
+                return
+            }
 
             // Serialize the final generation check with normal redraws. If
             // this timer was waiting for grid_mu while an RPC flush committed,
@@ -143,7 +205,8 @@ final class ZonvieCore {
             defer { zonvie_core_unlock_grid(corePtr) }
 
             os_unfair_lock_lock(&self.flushRetryScheduledLock)
-            guard self.flushRetryScheduled,
+            guard self.flushRetryAccepting,
+                  self.flushRetryScheduled,
                   self.flushRetryGeneration == generation else {
                 os_unfair_lock_unlock(&self.flushRetryScheduledLock)
                 return
@@ -308,6 +371,7 @@ final class ZonvieCore {
     }
 
     init() {
+        flushRetryQueue.setSpecific(key: flushRetryQueueKey, value: 1)
         let unmanaged = Unmanaged.passUnretained(self)
         self.ctxPtr = unmanaged.toOpaque()
 
@@ -371,6 +435,11 @@ final class ZonvieCore {
                         totalRows: Int(totalRows),
                         totalCols: Int(totalCols)
                     )
+                    if (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
+                        DispatchQueue.main.async {
+                            core.updateCursorBlinking()
+                        }
+                    }
                 } else {
                     // External grid: submit vertices directly from core thread.
                     // ExternalGridView's triple-buffered methods are thread-safe.
@@ -822,30 +891,22 @@ final class ZonvieCore {
                     anyFailed = true
                 }
                 if anyFailed {
+                    if let corePtr = me.core {
+                        // on_flush_end is the frontend's commit decision.
+                        // Propagate a late renderer rejection into the same
+                        // core transaction so its vertex accounting is
+                        // invalidated along with the frontend write sets.
+                        zonvie_core_abort_flush(corePtr)
+                    }
                     me.terminalView?.renderer.abortFlush()
                     for gridView in me.extViewsScratch {
                         gridView.cancelFlush()
                     }
                     me.extViewsScratch.removeAll(keepingCapacity: true)
-                    if let corePtr = me.core {
-                        // The core already cleared its dirty state for this
-                        // flush (onFlush ran to completion before this
-                        // deferred callback fired) — zonvie_core_abort_flush
-                        // would be too late to matter. Force everything
-                        // dirty again so the content that failed to store
-                        // gets regenerated, and arm a retry since nothing
-                        // guarantees a further Neovim redraw will arrive to
-                        // naturally trigger that regeneration. Idempotent
-                        // when the core already did this itself (atlas
-                        // corruption path).
-                        // _locked variant: on_flush_end runs on the core/RPC
-                        // thread with grid_mu held for the entire
-                        // handleRedraw duration — the plain (self-locking)
-                        // zonvie_core_force_resend would deadlock here on
-                        // the non-recursive grid_mu.
-                        zonvie_core_force_resend_locked(corePtr)
+                    let retryable = me.core.map { zonvie_core_flush_is_retryable($0) } ?? false
+                    if retryable {
+                        me.scheduleFlushRetry()
                     }
-                    me.scheduleFlushRetry()
                     return
                 }
 
@@ -867,7 +928,7 @@ final class ZonvieCore {
                     }
                     me.extViewsScratch.removeAll(keepingCapacity: true)
                     if let corePtr = me.core {
-                        zonvie_core_force_resend_locked(corePtr)
+                        zonvie_core_abort_flush(corePtr)
                     }
                     me.scheduleFlushRetry()
                     return
@@ -1103,6 +1164,7 @@ final class ZonvieCore {
             sshNotificationObserver = nil
         }
 
+        stop()
         if let core { zonvie_core_destroy(core) }
         core = nil
         ctxPtr = nil
@@ -1614,6 +1676,22 @@ final class ZonvieCore {
     }
 
     func stop() {
+        os_unfair_lock_lock(&flushRetryScheduledLock)
+        flushRetryAccepting = false
+        flushRetryScheduled = false
+        flushRetryGeneration &+= 1
+        flushRetryBackoff.reset()
+        os_unfair_lock_unlock(&flushRetryScheduledLock)
+
+        // Wait for retry work which already began provisioning or is blocked
+        // on grid_mu. A future asyncAfter closure is made harmless by the
+        // admission/generation checks before it reads the Core pointer.
+        // deinit can run as the last operation on this serial queue; that
+        // current closure is already the only in-flight worker.
+        if DispatchQueue.getSpecific(key: flushRetryQueueKey) == nil {
+            flushRetryQueue.sync {}
+        }
+
         guard let core else { return }
         zonvie_core_stop(core)
     }

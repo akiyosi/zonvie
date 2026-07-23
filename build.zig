@@ -239,6 +239,21 @@ pub fn build(b: *std.Build) !void {
         const run_font_reset_test = b.addSystemCommand(&.{"/usr/bin/env"});
         run_font_reset_test.addFileArg(font_reset_test_exe);
         test_step.dependOn(&run_font_reset_test.step);
+
+        // Metal row provisioning must retain each successful private-buffer
+        // prefix across retries while committed row content remains untouched.
+        const compile_row_provision_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_row_provision_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_row_provision_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
+        compile_row_provision_test.addFileArg(b.path("macos/Tests/SurfaceRowProvisionTests.swift"));
+        compile_row_provision_test.addArg("-o");
+        const row_provision_test_exe = compile_row_provision_test.addOutputFileArg("surface-row-provision-tests");
+        const run_row_provision_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_row_provision_test.addFileArg(row_provision_test_exe);
+        test_step.dependOn(&run_row_provision_test.step);
     }
 
     // Core inline tests (c_api.zig and its relative imports, including the

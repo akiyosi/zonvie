@@ -421,6 +421,180 @@ func clampRowsDelta(_ value: Int) -> Int {
 
 /// Maximum vertex buffer capacity (64 MB).
 private let surfaceMaxVertexBufferCapacity: Int = 64 * 1024 * 1024
+// Provisioning may hold two private row buffers in each of three sets. Bound
+// both the allocation peak and the IOAccelerator object count independently
+// from the core's logical vertex budget.
+let surfaceMaxProvisionedRowBytes: Int = 256 * 1024 * 1024
+let surfaceMaxProvisionedRowBufferCount: Int = 16_384
+let processMaxProvisionedRowBytes: Int = 512 * 1024 * 1024
+let processMaxProvisionedRowBufferCount: Int = 32_768
+
+func surfaceProvisionBudgetAllows(
+    liveBytes: Int,
+    liveBufferCount: Int,
+    plannedBytes: Int,
+    plannedBufferCount: Int,
+    byteLimit: Int,
+    bufferCountLimit: Int
+) -> Bool {
+    guard liveBytes >= 0, liveBufferCount >= 0,
+          plannedBytes >= 0, plannedBufferCount >= 0,
+          byteLimit >= 0, bufferCountLimit >= 0
+    else { return false }
+    let (peakBytes, byteOverflow) = liveBytes.addingReportingOverflow(plannedBytes)
+    let (peakCount, countOverflow) = liveBufferCount.addingReportingOverflow(plannedBufferCount)
+    return !byteOverflow && !countOverflow
+        && peakBytes <= byteLimit
+        && peakCount <= bufferCountLimit
+}
+
+/// Process-wide owner for row MTLBuffer allocations across the main renderer
+/// and every external surface. Weak registrations follow ARC ownership, while
+/// reservations make concurrent replacement peaks visible before allocation.
+final class SurfaceRowProvisionBudget {
+    struct Reservation {
+        fileprivate let id: UInt64
+    }
+
+    static let shared = SurfaceRowProvisionBudget(
+        byteLimit: processMaxProvisionedRowBytes,
+        bufferCountLimit: processMaxProvisionedRowBufferCount
+    )
+
+    private final class LiveBuffer {
+        weak var object: AnyObject?
+        let bytes: Int
+
+        init(_ buffer: MTLBuffer) {
+            object = buffer as AnyObject
+            bytes = buffer.length
+        }
+    }
+
+    private struct ReservedCapacity {
+        let bytes: Int
+        let count: Int
+    }
+
+    private let lock = NSLock()
+    private let byteLimit: Int
+    private let bufferCountLimit: Int
+    private var liveBuffers: [ObjectIdentifier: LiveBuffer] = [:]
+    private var reservations: [UInt64: ReservedCapacity] = [:]
+    private var nextReservationID: UInt64 = 1
+
+    init(byteLimit: Int, bufferCountLimit: Int) {
+        self.byteLimit = byteLimit
+        self.bufferCountLimit = bufferCountLimit
+    }
+
+    private func pruneLocked() {
+        liveBuffers = liveBuffers.filter { $0.value.object != nil }
+    }
+
+    private func totalsLocked() -> (bytes: Int, count: Int)? {
+        var bytes = 0
+        var count = 0
+        for buffer in liveBuffers.values {
+            let (nextBytes, byteOverflow) = bytes.addingReportingOverflow(buffer.bytes)
+            if byteOverflow { return nil }
+            bytes = nextBytes
+            count += 1
+        }
+        for reservation in reservations.values {
+            let (nextBytes, byteOverflow) = bytes.addingReportingOverflow(reservation.bytes)
+            let (nextCount, countOverflow) = count.addingReportingOverflow(reservation.count)
+            if byteOverflow || countOverflow { return nil }
+            bytes = nextBytes
+            count = nextCount
+        }
+        return (bytes, count)
+    }
+
+    func observe(_ buffers: [MTLBuffer]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked()
+        for buffer in buffers {
+            let identity = ObjectIdentifier(buffer as AnyObject)
+            if liveBuffers[identity] == nil {
+                liveBuffers[identity] = LiveBuffer(buffer)
+            }
+        }
+        guard let totals = totalsLocked() else { return false }
+        return surfaceProvisionBudgetAllows(
+            liveBytes: totals.bytes,
+            liveBufferCount: totals.count,
+            plannedBytes: 0,
+            plannedBufferCount: 0,
+            byteLimit: byteLimit,
+            bufferCountLimit: bufferCountLimit
+        )
+    }
+
+    func reserve(bytes: Int, bufferCount: Int) -> Reservation? {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked()
+        guard let totals = totalsLocked(),
+              surfaceProvisionBudgetAllows(
+                  liveBytes: totals.bytes,
+                  liveBufferCount: totals.count,
+                  plannedBytes: bytes,
+                  plannedBufferCount: bufferCount,
+                  byteLimit: byteLimit,
+                  bufferCountLimit: bufferCountLimit
+              )
+        else { return nil }
+
+        var id = nextReservationID
+        while id == 0 || reservations[id] != nil {
+            nextReservationID &+= 1
+            id = nextReservationID
+        }
+        nextReservationID = id &+ 1
+        reservations[id] = ReservedCapacity(bytes: bytes, count: bufferCount)
+        return Reservation(id: id)
+    }
+
+    /// Replace a peak reservation with weak ownership records for the buffers
+    /// actually created. Partial allocation failures therefore retain only
+    /// their successful prefix in the process ledger.
+    func complete(_ reservation: Reservation, createdBuffers: [MTLBuffer]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        reservations.removeValue(forKey: reservation.id)
+        pruneLocked()
+        for buffer in createdBuffers {
+            let identity = ObjectIdentifier(buffer as AnyObject)
+            if liveBuffers[identity] == nil {
+                liveBuffers[identity] = LiveBuffer(buffer)
+            }
+        }
+        guard let totals = totalsLocked() else { return false }
+        return surfaceProvisionBudgetAllows(
+            liveBytes: totals.bytes,
+            liveBufferCount: totals.count,
+            plannedBytes: 0,
+            plannedBufferCount: 0,
+            byteLimit: byteLimit,
+            bufferCountLimit: bufferCountLimit
+        )
+    }
+
+    func cancel(_ reservation: Reservation) {
+        lock.lock()
+        reservations.removeValue(forKey: reservation.id)
+        lock.unlock()
+    }
+
+    func currentTotals() -> (bytes: Int, count: Int)? {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked()
+        return totalsLocked()
+    }
+}
 
 /// Compute needed bytes for a vertex count, with overflow protection.
 func surfaceSafeNeededBytes(vertexCount: Int) -> Int? {
@@ -456,6 +630,27 @@ func surfaceGrowCapacity(current: Int, needed: Int) -> Int? {
     return next
 }
 
+private func surfaceCapacityIsOversized(_ capacity: Int, neededBytes: Int) -> Bool {
+    guard capacity > 0 else { return false }
+    if neededBytes == 0 { return true }
+    let (doubleNeeded, overflow) = neededBytes.multipliedReportingOverflow(by: 2)
+    return !overflow && capacity > doubleNeeded
+}
+
+private func surfaceCapacityBasisForDemand(_ capacity: Int, neededBytes: Int) -> Int {
+    surfaceCapacityIsOversized(capacity, neededBytes: neededBytes) ? 0 : capacity
+}
+
+/// Resolve a logical row through the exact set that will receive the write.
+/// Scroll remaps physical slots on the write set, so consulting the source
+/// set here can provision a different slot and make retry non-convergent.
+func surfacePhysicalCapacityRow(logicalRow: Int, logicalToSlot: [Int]) -> Int {
+    guard logicalRow >= 0, logicalRow < logicalToSlot.count else {
+        return logicalRow
+    }
+    return logicalToSlot[logicalRow]
+}
+
 /// Ensure row storage arrays cover at least `row + 1` entries.
 func ensureSurfaceRowStorage(bufferSet: SurfaceBufferSet, _ row: Int, maxRowBuffers: Int) {
     if row < 0 { return }
@@ -463,12 +658,445 @@ func ensureSurfaceRowStorage(bufferSet: SurfaceBufferSet, _ row: Int, maxRowBuff
     if row < bufferSet.rowState.buffers.count { return }
     let oldCount = bufferSet.rowState.buffers.count
     let newCount = row + 1
-    let grow = newCount - oldCount
-    bufferSet.rowState.buffers.append(contentsOf: Array(repeating: nil, count: grow))
-    bufferSet.rowState.capacities.append(contentsOf: Array(repeating: 0, count: grow))
-    bufferSet.rowState.counts.append(contentsOf: Array(repeating: 0, count: grow))
-    bufferSet.rowLogicalToSlot.append(contentsOf: Array(oldCount..<newCount))
-    bufferSet.rowSlotSourceRows.append(contentsOf: Array(oldCount..<newCount))
+    bufferSet.rowState.buffers.reserveCapacity(newCount)
+    bufferSet.rowState.capacities.reserveCapacity(newCount)
+    bufferSet.rowState.counts.reserveCapacity(newCount)
+    bufferSet.rowLogicalToSlot.reserveCapacity(newCount)
+    bufferSet.rowSlotSourceRows.reserveCapacity(newCount)
+    for index in oldCount..<newCount {
+        bufferSet.rowState.buffers.append(nil)
+        bufferSet.rowState.capacities.append(0)
+        bufferSet.rowState.counts.append(0)
+        bufferSet.rowLogicalToSlot.append(index)
+        bufferSet.rowSlotSourceRows.append(index)
+    }
+}
+
+/// A buffer allocated outside the core redraw callback and installed into one
+/// set's private two-slot row pool during the short publication phase.
+struct SurfaceRowProvisionEntry {
+    let setIndex: Int
+    let row: Int
+    let slot0: MTLBuffer?
+    let slot0Capacity: Int
+    let slot1: MTLBuffer?
+    let slot1Capacity: Int
+}
+
+struct SurfaceRowProvisionMetrics {
+    let liveBufferBytes: Int
+    let liveBufferCount: Int
+    let plannedReplacementBytes: Int
+    let plannedReplacementCount: Int
+    let allocationAttemptCount: Int
+    let createdBufferBytes: Int
+    let createdBufferCount: Int
+}
+
+struct SurfaceRowProvisionPlan {
+    let rowCount: Int
+    let entries: [SurfaceRowProvisionEntry]
+    let metrics: SurfaceRowProvisionMetrics
+}
+
+enum SurfaceRowProvisionPlanResult {
+    case ready(SurfaceRowProvisionPlan)
+    case overBudget
+    // Successfully allocated private buffers remain owned by this partial
+    // plan. The caller publishes only those private capacities, then retries
+    // the still-missing suffix; live rowState content remains untouched.
+    case allocationFailed(SurfaceRowProvisionPlan)
+}
+
+enum SurfaceRowProvisionStatus: Equatable {
+    case ready
+    case retry
+    case hardFailure
+}
+
+/// Return true only when a row submission can complete without growing Swift
+/// arrays or creating an MTLBuffer. Both private slots are required because a
+/// COW chain can make either one alias the committed or an in-flight set.
+func surfaceRowCapacityIsPrepared(
+    bufferSets: [SurfaceBufferSet],
+    row: Int,
+    vertexCount: Int,
+    totalRows: Int,
+    maxRowBuffers: Int
+) -> Bool {
+    guard row >= 0, row < maxRowBuffers,
+          totalRows >= 0, totalRows <= maxRowBuffers,
+          let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
+          neededBytes <= surfaceMaxVertexBufferCapacity
+    else { return false }
+
+    let requiredRows = max(totalRows, row + 1)
+    var copiedActiveCapacity = 0
+    for set in bufferSets where row < set.rowState.capacities.count {
+        copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
+    }
+    copiedActiveCapacity = surfaceCapacityBasisForDemand(
+        copiedActiveCapacity,
+        neededBytes: neededBytes
+    )
+    for set in bufferSets {
+        guard set.rowState.buffers.count >= requiredRows,
+              set.rowState.capacities.count >= requiredRows,
+              set.rowState.counts.count >= requiredRows,
+              set.rowLogicalToSlot.count >= requiredRows,
+              set.rowSlotSourceRows.count >= requiredRows,
+              set.detachPoolRowBuffers.count >= requiredRows,
+              set.detachPoolRowCapacities.count >= requiredRows,
+              set.privateRowBuffers0.count >= requiredRows,
+              set.privateRowCapacities0.count >= requiredRows,
+              set.privateRowBuffers1.count >= requiredRows,
+              set.privateRowCapacities1.count >= requiredRows,
+              set.privateRowNextSlot.count >= requiredRows
+        else { return false }
+
+        if neededBytes > 0 {
+            guard let requiredCapacity = surfaceGrowCapacity(
+                current: copiedActiveCapacity,
+                needed: max(1, neededBytes)
+            ),
+            set.privateRowBuffers0[row] != nil,
+            set.privateRowCapacities0[row] >= requiredCapacity,
+            !surfaceCapacityIsOversized(
+                set.privateRowCapacities0[row],
+                neededBytes: neededBytes
+            ),
+            set.privateRowBuffers1[row] != nil,
+            set.privateRowCapacities1[row] >= requiredCapacity,
+            !surfaceCapacityIsOversized(
+                set.privateRowCapacities1[row],
+                neededBytes: neededBytes
+            )
+            else { return false }
+        }
+    }
+    return true
+}
+
+/// Allocate every missing private row buffer without touching live renderer
+/// metadata. The owner excludes flush-bracket mutation while this plan is
+/// built, then publishes it under its render-state lock.
+func makeSurfaceRowProvisionPlan(
+    bufferSets: [SurfaceBufferSet],
+    device: MTLDevice,
+    requiredRowCount: Int,
+    requiredVertexCounts: [Int],
+    maxRowBuffers: Int,
+    shouldFailAllocationAtAttempt: ((Int) -> Bool)? = nil,
+    budgetOwner: SurfaceRowProvisionBudget = .shared
+) -> SurfaceRowProvisionPlanResult {
+    guard requiredRowCount >= 0, requiredRowCount <= maxRowBuffers else { return .overBudget }
+    var entries: [SurfaceRowProvisionEntry] = []
+    entries.reserveCapacity(requiredRowCount * bufferSets.count)
+
+    var provisionedBytes = 0
+    var provisionedBufferCount = 0
+    var liveBufferIDs = Set<ObjectIdentifier>()
+    var liveBufferBytes = 0
+    var liveBufferCount = 0
+    var plannedReplacementBytes = 0
+    var plannedReplacementCount = 0
+    var allocationAttemptCount = 0
+    var createdBufferBytes = 0
+    var createdBufferCount = 0
+    var liveBuffersForProcess: [MTLBuffer] = []
+    var createdBuffersForProcess: [MTLBuffer] = []
+    var budgetReservation: SurfaceRowProvisionBudget.Reservation?
+
+    func metrics() -> SurfaceRowProvisionMetrics {
+        SurfaceRowProvisionMetrics(
+            liveBufferBytes: liveBufferBytes,
+            liveBufferCount: liveBufferCount,
+            plannedReplacementBytes: plannedReplacementBytes,
+            plannedReplacementCount: plannedReplacementCount,
+            allocationAttemptCount: allocationAttemptCount,
+            createdBufferBytes: createdBufferBytes,
+            createdBufferCount: createdBufferCount
+        )
+    }
+
+    func allocationFailure() -> SurfaceRowProvisionPlanResult {
+        if let reservation = budgetReservation {
+            budgetReservation = nil
+            if !budgetOwner.complete(reservation, createdBuffers: createdBuffersForProcess) {
+                return .overBudget
+            }
+        }
+        return .allocationFailed(SurfaceRowProvisionPlan(
+            rowCount: requiredRowCount,
+            entries: entries,
+            metrics: metrics()
+        ))
+    }
+
+    func appendProvisionEntry(
+        setIndex: Int,
+        row: Int,
+        slot0: MTLBuffer?,
+        existingSlot0Capacity: Int,
+        slot1: MTLBuffer?,
+        existingSlot1Capacity: Int,
+        requiredCapacity: Int
+    ) {
+        guard slot0 != nil || slot1 != nil else { return }
+        entries.append(SurfaceRowProvisionEntry(
+            setIndex: setIndex,
+            row: row,
+            slot0: slot0,
+            slot0Capacity: slot0 == nil ? existingSlot0Capacity : requiredCapacity,
+            slot1: slot1,
+            slot1Capacity: slot1 == nil ? existingSlot1Capacity : requiredCapacity
+        ))
+    }
+
+    func accountLiveBuffer(_ buffer: MTLBuffer?) -> Bool {
+        guard let buffer else { return true }
+        let identity = ObjectIdentifier(buffer as AnyObject)
+        guard liveBufferIDs.insert(identity).inserted else { return true }
+        liveBuffersForProcess.append(buffer)
+        let (nextBytes, overflow) = provisionedBytes.addingReportingOverflow(buffer.length)
+        if overflow { return false }
+        provisionedBytes = nextBytes
+        provisionedBufferCount += 1
+        return provisionedBytes <= surfaceMaxProvisionedRowBytes
+            && provisionedBufferCount <= surfaceMaxProvisionedRowBufferCount
+    }
+
+    // Count every currently-live row buffer by Metal object identity. The
+    // active and detach arrays intentionally alias buffers across sets during
+    // COW publication; identity de-duplication counts each allocation once
+    // while still charging old buffers that remain live during replacement.
+    for set in bufferSets {
+        for buffer in set.rowState.buffers where !accountLiveBuffer(buffer) { return .overBudget }
+        for buffer in set.detachPoolRowBuffers where !accountLiveBuffer(buffer) { return .overBudget }
+        for buffer in set.privateRowBuffers0 where !accountLiveBuffer(buffer) { return .overBudget }
+        for buffer in set.privateRowBuffers1 where !accountLiveBuffer(buffer) { return .overBudget }
+    }
+    liveBufferBytes = provisionedBytes
+    liveBufferCount = provisionedBufferCount
+
+    // Account the allocation peak before creating any MTLBuffer. Replaced
+    // buffers remain live in their sets until the completed plan is published.
+    for row in 0..<requiredRowCount {
+        let vertexCount = row < requiredVertexCounts.count ? requiredVertexCounts[row] : 0
+        guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
+              neededBytes <= surfaceMaxVertexBufferCapacity
+        else { return .overBudget }
+        guard neededBytes > 0 else { continue }
+
+        var copiedActiveCapacity = 0
+        for set in bufferSets where row < set.rowState.capacities.count {
+            copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
+        }
+        copiedActiveCapacity = surfaceCapacityBasisForDemand(
+            copiedActiveCapacity,
+            neededBytes: neededBytes
+        )
+        guard let requiredCapacity = surfaceGrowCapacity(
+            current: copiedActiveCapacity,
+            needed: max(1, neededBytes)
+        ) else { return .overBudget }
+
+        for set in bufferSets {
+            let slot0Ready = row < set.privateRowBuffers0.count
+                && set.privateRowBuffers0[row] != nil
+                && set.privateRowCapacities0[row] >= requiredCapacity
+                && !surfaceCapacityIsOversized(
+                    set.privateRowCapacities0[row],
+                    neededBytes: neededBytes
+                )
+            let slot1Ready = row < set.privateRowBuffers1.count
+                && set.privateRowBuffers1[row] != nil
+                && set.privateRowCapacities1[row] >= requiredCapacity
+                && !surfaceCapacityIsOversized(
+                    set.privateRowCapacities1[row],
+                    neededBytes: neededBytes
+                )
+            for ready in [slot0Ready, slot1Ready] where !ready {
+                let (nextBytes, overflow) = provisionedBytes.addingReportingOverflow(requiredCapacity)
+                if overflow { return .overBudget }
+                provisionedBytes = nextBytes
+                provisionedBufferCount += 1
+                let (nextReplacementBytes, replacementOverflow) = plannedReplacementBytes.addingReportingOverflow(requiredCapacity)
+                if replacementOverflow { return .overBudget }
+                plannedReplacementBytes = nextReplacementBytes
+                plannedReplacementCount += 1
+            }
+        }
+        if provisionedBytes > surfaceMaxProvisionedRowBytes
+            || provisionedBufferCount > surfaceMaxProvisionedRowBufferCount {
+            return .overBudget
+        }
+    }
+
+    guard budgetOwner.observe(liveBuffersForProcess),
+          let reservation = budgetOwner.reserve(
+              bytes: plannedReplacementBytes,
+              bufferCount: plannedReplacementCount
+          )
+    else { return .overBudget }
+    budgetReservation = reservation
+    defer {
+        if let reservation = budgetReservation {
+            budgetOwner.cancel(reservation)
+        }
+    }
+
+    for row in 0..<requiredRowCount {
+        let vertexCount = row < requiredVertexCounts.count ? requiredVertexCounts[row] : 0
+        guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
+              neededBytes <= surfaceMaxVertexBufferCapacity
+        else { return .overBudget }
+        guard neededBytes > 0 else { continue }
+
+        var copiedActiveCapacity = 0
+        for set in bufferSets where row < set.rowState.capacities.count {
+            copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
+        }
+        copiedActiveCapacity = surfaceCapacityBasisForDemand(
+            copiedActiveCapacity,
+            neededBytes: neededBytes
+        )
+
+        for (setIndex, set) in bufferSets.enumerated() {
+            guard let requiredCapacity = surfaceGrowCapacity(
+                current: copiedActiveCapacity,
+                needed: max(1, neededBytes)
+            ) else { return .overBudget }
+
+            let existingSlot0 = row < set.privateRowBuffers0.count
+                ? set.privateRowBuffers0[row]
+                : nil
+            let existingSlot0Capacity = row < set.privateRowCapacities0.count
+                ? set.privateRowCapacities0[row]
+                : 0
+            let existingSlot1 = row < set.privateRowBuffers1.count
+                ? set.privateRowBuffers1[row]
+                : nil
+            let existingSlot1Capacity = row < set.privateRowCapacities1.count
+                ? set.privateRowCapacities1[row]
+                : 0
+
+            var slot0: MTLBuffer? = nil
+            var slot1: MTLBuffer? = nil
+            if existingSlot0 == nil ||
+                existingSlot0Capacity < requiredCapacity ||
+                surfaceCapacityIsOversized(existingSlot0Capacity, neededBytes: neededBytes) {
+                allocationAttemptCount += 1
+                if shouldFailAllocationAtAttempt?(allocationAttemptCount) == true {
+                    return allocationFailure()
+                }
+                guard let allocated = device.makeBuffer(
+                    length: requiredCapacity,
+                    options: .storageModeShared
+                ) else { return allocationFailure() }
+                slot0 = allocated
+                createdBufferBytes += requiredCapacity
+                createdBufferCount += 1
+                createdBuffersForProcess.append(allocated)
+            }
+            if existingSlot1 == nil ||
+                existingSlot1Capacity < requiredCapacity ||
+                surfaceCapacityIsOversized(existingSlot1Capacity, neededBytes: neededBytes) {
+                allocationAttemptCount += 1
+                if shouldFailAllocationAtAttempt?(allocationAttemptCount) == true {
+                    appendProvisionEntry(
+                        setIndex: setIndex,
+                        row: row,
+                        slot0: slot0,
+                        existingSlot0Capacity: existingSlot0Capacity,
+                        slot1: nil,
+                        existingSlot1Capacity: existingSlot1Capacity,
+                        requiredCapacity: requiredCapacity
+                    )
+                    return allocationFailure()
+                }
+                guard let allocated = device.makeBuffer(
+                    length: requiredCapacity,
+                    options: .storageModeShared
+                ) else {
+                    appendProvisionEntry(
+                        setIndex: setIndex,
+                        row: row,
+                        slot0: slot0,
+                        existingSlot0Capacity: existingSlot0Capacity,
+                        slot1: nil,
+                        existingSlot1Capacity: existingSlot1Capacity,
+                        requiredCapacity: requiredCapacity
+                    )
+                    return allocationFailure()
+                }
+                slot1 = allocated
+                createdBufferBytes += requiredCapacity
+                createdBufferCount += 1
+                createdBuffersForProcess.append(allocated)
+            }
+            appendProvisionEntry(
+                setIndex: setIndex,
+                row: row,
+                slot0: slot0,
+                existingSlot0Capacity: existingSlot0Capacity,
+                slot1: slot1,
+                existingSlot1Capacity: existingSlot1Capacity,
+                requiredCapacity: requiredCapacity
+            )
+        }
+    }
+    if let reservation = budgetReservation {
+        budgetReservation = nil
+        guard budgetOwner.complete(reservation, createdBuffers: createdBuffersForProcess) else {
+            return .overBudget
+        }
+    }
+    return .ready(SurfaceRowProvisionPlan(
+        rowCount: requiredRowCount,
+        entries: entries,
+        metrics: metrics()
+    ))
+}
+
+/// Publish a completed provision plan. Callers hold their render-state lock
+/// and have excluded a concurrent flush bracket.
+func applySurfaceRowProvisionPlan(
+    _ plan: SurfaceRowProvisionPlan,
+    to bufferSets: [SurfaceBufferSet],
+    maxRowBuffers: Int
+) {
+    guard plan.rowCount > 0 else { return }
+    let lastRow = plan.rowCount - 1
+    for set in bufferSets {
+        ensureSurfaceRowStorage(bufferSet: set, lastRow, maxRowBuffers: maxRowBuffers)
+        while set.detachPoolRowBuffers.count < plan.rowCount {
+            set.detachPoolRowBuffers.append(nil)
+            set.detachPoolRowCapacities.append(0)
+        }
+        while set.privateRowBuffers0.count < plan.rowCount {
+            set.privateRowBuffers0.append(nil)
+            set.privateRowCapacities0.append(0)
+            set.privateRowBuffers1.append(nil)
+            set.privateRowCapacities1.append(0)
+            set.privateRowNextSlot.append(0)
+        }
+    }
+
+    for entry in plan.entries {
+        guard entry.setIndex >= 0, entry.setIndex < bufferSets.count,
+              entry.row >= 0, entry.row < plan.rowCount
+        else { continue }
+        let set = bufferSets[entry.setIndex]
+        if let slot0 = entry.slot0 {
+            set.privateRowBuffers0[entry.row] = slot0
+            set.privateRowCapacities0[entry.row] = entry.slot0Capacity
+        }
+        if let slot1 = entry.slot1 {
+            set.privateRowBuffers1[entry.row] = slot1
+            set.privateRowCapacities1[entry.row] = entry.slot1Capacity
+        }
+    }
 }
 
 /// Release GPU buffers belonging only to logical rows removed by a grid
@@ -509,19 +1137,15 @@ private func evictSurfaceRowsOutsideLogicalRange(
 /// Prepare row-mode set for write (ensure identity mapping, trim if oversize).
 func prepareSurfaceRowModeSetForWrite(bufferSet: SurfaceBufferSet, totalRows: Int, totalCols: Int) {
     let previousTotalRows = bufferSet.knownTotalRows
-    if totalRows > 0 {
-        bufferSet.knownTotalRows = totalRows
-    }
-    if totalCols > 0 {
-        bufferSet.knownTotalCols = totalCols
-    }
+    bufferSet.knownTotalRows = max(0, totalRows)
+    bufferSet.knownTotalCols = max(0, totalCols)
     bufferSet.rowState.usingRowBuffers = true
 
     // submitSurfaceRowVertices calls this once per dirty row. Clearing the
     // complete historical tail on every call made a D-row update after shrink
     // O(D * (peakRows - totalRows)). The tail only changes when dimensions do;
     // copied buffer sets already inherit the source set's cleared counts.
-    if totalRows > 0,
+    if totalRows >= 0,
        totalRows != previousTotalRows,
        totalRows < bufferSet.rowLogicalToSlot.count {
         evictSurfaceRowsOutsideLogicalRange(bufferSet: bufferSet, totalRows: totalRows)
@@ -537,6 +1161,30 @@ func prepareSurfaceRowModeSetForWrite(bufferSet: SurfaceBufferSet, totalRows: In
     }
 }
 
+/// Publish a zero-cell layout into a non-in-flight write set without allocating
+/// or destroying backing storage. Commit-time retirement owns the actual
+/// resource release so an aborted flush cannot alter the committed set.
+func applySurfaceZeroCellLayout(
+    bufferSet: SurfaceBufferSet,
+    totalRows: Int,
+    totalCols: Int
+) -> Bool {
+    guard totalRows >= 0,
+          totalCols >= 0,
+          totalRows == 0 || totalCols == 0
+    else { return false }
+
+    bufferSet.knownTotalRows = totalRows
+    bufferSet.knownTotalCols = totalCols
+    bufferSet.rowState.usingRowBuffers = true
+    for index in bufferSet.rowState.counts.indices {
+        bufferSet.rowState.counts[index] = 0
+    }
+    bufferSet.mainVertexCount = 0
+    bufferSet.pendingScroll = nil
+    return true
+}
+
 /// Drop oversized row backing only while replacing that row in a non-in-flight
 /// write set after a column contraction. Other COW sets retain any aliased
 /// MTLBuffer until their own GPU reads complete.
@@ -547,28 +1195,22 @@ private func retireOversizedSurfaceRowStorage(
 ) {
     guard row >= 0, row < bufferSet.rowState.buffers.count else { return }
 
-    func isOversized(_ capacity: Int) -> Bool {
-        guard capacity > 0 else { return false }
-        if neededBytes == 0 { return true }
-        return capacity > neededBytes * 2
-    }
-
-    if isOversized(bufferSet.rowState.capacities[row]) {
+    if surfaceCapacityIsOversized(bufferSet.rowState.capacities[row], neededBytes: neededBytes) {
         bufferSet.rowState.buffers[row] = nil
         bufferSet.rowState.capacities[row] = 0
     }
     if row < bufferSet.detachPoolRowCapacities.count,
-       isOversized(bufferSet.detachPoolRowCapacities[row]) {
+       surfaceCapacityIsOversized(bufferSet.detachPoolRowCapacities[row], neededBytes: neededBytes) {
         bufferSet.detachPoolRowBuffers[row] = nil
         bufferSet.detachPoolRowCapacities[row] = 0
     }
     if row < bufferSet.privateRowCapacities0.count,
-       isOversized(bufferSet.privateRowCapacities0[row]) {
+       surfaceCapacityIsOversized(bufferSet.privateRowCapacities0[row], neededBytes: neededBytes) {
         bufferSet.privateRowBuffers0[row] = nil
         bufferSet.privateRowCapacities0[row] = 0
     }
     if row < bufferSet.privateRowCapacities1.count,
-       isOversized(bufferSet.privateRowCapacities1[row]) {
+       surfaceCapacityIsOversized(bufferSet.privateRowCapacities1[row], neededBytes: neededBytes) {
         bufferSet.privateRowBuffers1[row] = nil
         bufferSet.privateRowCapacities1[row] = 0
     }
@@ -621,6 +1263,194 @@ func retireSurfaceRowStorageForContractedLayout(
     }
 }
 
+/// Durable retirement state for the three row-buffer sets owned by a surface.
+/// A fixed representation avoids allocation when commits or GPU completions
+/// update the state.
+struct SurfaceRowStorageRetirementState {
+    private var pending0 = false
+    private var pending1 = false
+    private var pending2 = false
+    private var pendingMain0 = false
+    private var pendingMain1 = false
+    private var pendingMain2 = false
+    private var pendingMainBuffer0: MTLBuffer?
+    private var pendingMainBuffer1: MTLBuffer?
+    private var pendingMainBuffer2: MTLBuffer?
+    private var pendingDetachMain0: MTLBuffer?
+    private var pendingDetachMain1: MTLBuffer?
+    private var pendingDetachMain2: MTLBuffer?
+
+    mutating func markMainBuffersPending(_ index: Int, bufferSet: SurfaceBufferSet) {
+        switch index {
+        case 0:
+            pendingMain0 = true
+            pendingMainBuffer0 = bufferSet.mainVertexBuffer
+            pendingDetachMain0 = bufferSet.detachPoolMainBuffer
+        case 1:
+            pendingMain1 = true
+            pendingMainBuffer1 = bufferSet.mainVertexBuffer
+            pendingDetachMain1 = bufferSet.detachPoolMainBuffer
+        case 2:
+            pendingMain2 = true
+            pendingMainBuffer2 = bufferSet.mainVertexBuffer
+            pendingDetachMain2 = bufferSet.detachPoolMainBuffer
+        default: break
+        }
+    }
+
+    func isMainBuffersPending(_ index: Int) -> Bool {
+        switch index {
+        case 0: return pendingMain0
+        case 1: return pendingMain1
+        case 2: return pendingMain2
+        default: return false
+        }
+    }
+
+    func pendingMainBuffer(_ index: Int) -> MTLBuffer? {
+        switch index {
+        case 0: return pendingMainBuffer0
+        case 1: return pendingMainBuffer1
+        case 2: return pendingMainBuffer2
+        default: return nil
+        }
+    }
+
+    func pendingDetachMainBuffer(_ index: Int) -> MTLBuffer? {
+        switch index {
+        case 0: return pendingDetachMain0
+        case 1: return pendingDetachMain1
+        case 2: return pendingDetachMain2
+        default: return nil
+        }
+    }
+
+    mutating func clearMainBuffersPending(_ index: Int) {
+        switch index {
+        case 0:
+            pendingMain0 = false
+            pendingMainBuffer0 = nil
+            pendingDetachMain0 = nil
+        case 1:
+            pendingMain1 = false
+            pendingMainBuffer1 = nil
+            pendingDetachMain1 = nil
+        case 2:
+            pendingMain2 = false
+            pendingMainBuffer2 = nil
+            pendingDetachMain2 = nil
+        default: break
+        }
+    }
+
+    var hasMainBuffersPending: Bool {
+        pendingMain0 || pendingMain1 || pendingMain2
+    }
+
+    mutating func markPending(_ index: Int) {
+        switch index {
+        case 0: pending0 = true
+        case 1: pending1 = true
+        case 2: pending2 = true
+        default: break
+        }
+    }
+
+    mutating func clearPending(_ index: Int) {
+        switch index {
+        case 0: pending0 = false
+        case 1: pending1 = false
+        case 2: pending2 = false
+        default: break
+        }
+    }
+
+    func isPending(_ index: Int) -> Bool {
+        switch index {
+        case 0: return pending0
+        case 1: return pending1
+        case 2: return pending2
+        default: return false
+        }
+    }
+
+    var hasPending: Bool {
+        pending0 || pending1 || pending2
+    }
+}
+
+/// Record a contraction for every set, then retire each idle set against the
+/// latest committed demand. Busy sets remain pending until their GPU
+/// completion calls this function again. Looking up the demand by committed
+/// index, rather than copying row counts into the pending state, makes a
+/// repeated contraction automatically supersede an older demand without a
+/// per-frame allocation.
+func serviceSurfaceRowStorageRetirement(
+    bufferSets: [SurfaceBufferSet],
+    gpuInFlightCount: [Int],
+    committedSetIndex: Int,
+    layoutContracted: Bool,
+    state: inout SurfaceRowStorageRetirementState,
+    retireMainBuffers: Bool = false
+) {
+    guard bufferSets.count == 3,
+          gpuInFlightCount.count == 3,
+          committedSetIndex >= 0,
+          committedSetIndex < bufferSets.count
+    else { return }
+
+    if layoutContracted {
+        for index in bufferSets.indices {
+            state.markPending(index)
+        }
+        if retireMainBuffers {
+            for index in bufferSets.indices {
+                state.markMainBuffersPending(index, bufferSet: bufferSets[index])
+            }
+        }
+    }
+
+    let demandSet = bufferSets[committedSetIndex]
+    if state.hasPending {
+        let committedLayoutIsEmpty =
+            demandSet.knownTotalRows == 0 || demandSet.knownTotalCols == 0
+        for index in bufferSets.indices
+        where state.isPending(index) && gpuInFlightCount[index] == 0 {
+            retireSurfaceRowStorageForContractedLayout(
+                bufferSet: bufferSets[index],
+                demandSet: demandSet,
+                includeActiveBuffers: index != committedSetIndex || committedLayoutIsEmpty
+            )
+            state.clearPending(index)
+        }
+    }
+
+    if state.hasMainBuffersPending {
+        for index in bufferSets.indices
+        where state.isMainBuffersPending(index) && gpuInFlightCount[index] == 0 {
+            let set = bufferSets[index]
+            if let pending = state.pendingMainBuffer(index), set.mainVertexBuffer === pending {
+                set.mainVertexBuffer = nil
+                set.mainVertexBufferCap = 0
+                set.mainVertexCount = 0
+            }
+            if let pending = state.pendingDetachMainBuffer(index), set.detachPoolMainBuffer === pending {
+                set.detachPoolMainBuffer = nil
+                set.detachPoolMainCap = 0
+            }
+            state.clearMainBuffersPending(index)
+        }
+    }
+}
+
+func copySurfaceMainVertexState(from src: SurfaceBufferSet, to dst: SurfaceBufferSet) {
+    dst.detachPoolMainBuffer = dst.mainVertexBuffer
+    dst.detachPoolMainCap = dst.mainVertexBufferCap
+    dst.mainVertexBuffer = src.mainVertexBuffer
+    dst.mainVertexBufferCap = src.mainVertexBufferCap
+    dst.mainVertexCount = src.mainVertexCount
+}
+
 /// Ensure a writable row buffer for the given slot.
 /// If the current buffer is shared with the source set (COW), detach by
 /// taking a buffer from the detach pool (saved in copySurfaceBufferSetRowState).
@@ -633,10 +1463,13 @@ func ensureSurfaceRowBuffer(
     row: Int,
     vertexCount: Int,
     maxRowBuffers: Int,
+    allowAllocation: Bool = true,
     inflightRowBuffers: (MTLBuffer?, MTLBuffer?) = (nil, nil)
 ) -> MTLBuffer? {
     guard row >= 0 && row < maxRowBuffers else { return nil }
-    ensureSurfaceRowStorage(bufferSet: bufferSet, row, maxRowBuffers: maxRowBuffers)
+    if allowAllocation {
+        ensureSurfaceRowStorage(bufferSet: bufferSet, row, maxRowBuffers: maxRowBuffers)
+    }
     guard row < bufferSet.rowState.buffers.count else { return nil }
     guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) else { return nil }
 
@@ -647,13 +1480,19 @@ func ensureSurfaceRowBuffer(
     let sharesSource = sourceSet != nil && srcRowBuffer != nil
         && bufferSet.rowState.buffers[row] === srcRowBuffer
 
+    let activeCapacity = bufferSet.rowState.capacities[row]
     let needsNewBuffer = sharesSource
         || bufferSet.rowState.buffers[row] == nil
-        || neededBytes > bufferSet.rowState.capacities[row]
+        || neededBytes > activeCapacity
+        || surfaceCapacityIsOversized(activeCapacity, neededBytes: neededBytes)
 
     if needsNewBuffer {
+        let capacityBasis = surfaceCapacityBasisForDemand(
+            activeCapacity,
+            neededBytes: neededBytes
+        )
         guard let nextCap = surfaceGrowCapacity(
-            current: bufferSet.rowState.capacities[row],
+            current: capacityBasis,
             needed: max(1, neededBytes)
         ) else { return nil }
 
@@ -674,6 +1513,10 @@ func ensureSurfaceRowBuffer(
            let poolBuf = bufferSet.detachPoolRowBuffers[row],
            row < bufferSet.detachPoolRowCapacities.count,
            bufferSet.detachPoolRowCapacities[row] >= nextCap,
+           !surfaceCapacityIsOversized(
+               bufferSet.detachPoolRowCapacities[row],
+               neededBytes: neededBytes
+           ),
            poolBuf !== srcRowBuffer,
            poolBuf !== inflightRowBuffers.0,
            poolBuf !== inflightRowBuffers.1
@@ -695,6 +1538,15 @@ func ensureSurfaceRowBuffer(
             // all 3 sets within 2 rotations. With only 1 private slot, after
             // those rotations src would alias this set's single private slot
             // (since src inherited it via COW). 2 slots break the cycle.
+            if !allowAllocation && (
+                bufferSet.privateRowBuffers0.count <= row ||
+                bufferSet.privateRowCapacities0.count <= row ||
+                bufferSet.privateRowBuffers1.count <= row ||
+                bufferSet.privateRowCapacities1.count <= row ||
+                bufferSet.privateRowNextSlot.count <= row
+            ) {
+                return nil
+            }
             while bufferSet.privateRowBuffers0.count <= row {
                 bufferSet.privateRowBuffers0.append(nil)
                 bufferSet.privateRowCapacities0.append(0)
@@ -714,6 +1566,7 @@ func ensureSurfaceRowBuffer(
                 let buf = (slot == 0) ? bufferSet.privateRowBuffers0[row] : bufferSet.privateRowBuffers1[row]
                 let cap = (slot == 0) ? bufferSet.privateRowCapacities0[row] : bufferSet.privateRowCapacities1[row]
                 if let priv = buf, cap >= nextCap, priv !== srcRowBuffer,
+                   !surfaceCapacityIsOversized(cap, neededBytes: neededBytes),
                    priv !== inflightRowBuffers.0, priv !== inflightRowBuffers.1 {
                     pickedSlotIdx = slot
                     bufferSet.rowState.buffers[row] = priv
@@ -726,6 +1579,7 @@ func ensureSurfaceRowBuffer(
                 // Reuse: toggle nextSlot so future detaches alternate naturally.
                 bufferSet.privateRowNextSlot[row] = 1 - pickedSlotIdx
             } else {
+                guard allowAllocation else { return nil }
                 // Both private slots are unusable (nil, too small, or aliased).
                 // Allocate a fresh buffer into the primary slot. Old contents
                 // (if any) are dropped from this set; ARC will eventually
@@ -834,7 +1688,7 @@ func copySurfaceBufferSetRowState(from src: SurfaceBufferSet, to dst: SurfaceBuf
     dst.rowLogicalToSlot.append(contentsOf: src.rowLogicalToSlot)
     dst.rowSlotSourceRows.removeAll(keepingCapacity: true)
     dst.rowSlotSourceRows.append(contentsOf: src.rowSlotSourceRows)
-    if src.knownTotalRows > 0, src.knownTotalRows < destinationRowsBeforeCopy {
+    if src.knownTotalRows < destinationRowsBeforeCopy {
         // Evict after installing the source mapping. Scroll remaps make the
         // logical tail a non-contiguous set of physical slots; using dst's old
         // mapping here could release a still-live copied row and retain an old
@@ -845,6 +1699,9 @@ func copySurfaceBufferSetRowState(from src: SurfaceBufferSet, to dst: SurfaceBuf
             totalRows: src.knownTotalRows
         )
     }
+    // Zero-column retirement is owned by commit, which can include the newly
+    // committed active set. Doing it here would also discard narrow private
+    // buffers provisioned for a following zero-to-narrow expansion.
     if src.knownTotalCols > 0, src.knownTotalCols < destinationColsBeforeCopy {
         retireSurfaceRowStorageForContractedLayout(
             bufferSet: dst,
@@ -958,16 +1815,19 @@ func submitSurfaceRowVertices(
     maxRowBuffers: Int,
     totalRows: Int,
     totalCols: Int,
+    allowAllocation: Bool = true,
     inflightRowBuffers: (Int) -> (MTLBuffer?, MTLBuffer?) = { _ in (nil, nil) }
 ) -> Bool {
-    let columnsContracted = totalCols > 0 &&
-        ((sourceSet?.knownTotalCols ?? 0) > totalCols || target.knownTotalCols > totalCols)
+    let columnsContracted =
+        (sourceSet?.knownTotalCols ?? 0) > totalCols || target.knownTotalCols > totalCols
     prepareSurfaceRowModeSetForWrite(bufferSet: target, totalRows: totalRows, totalCols: totalCols)
 
     guard rowStart >= 0, rowStart < maxRowBuffers else { return false }
     let row = rowStart
 
-    ensureSurfaceRowStorage(bufferSet: target, row, maxRowBuffers: maxRowBuffers)
+    if allowAllocation {
+        ensureSurfaceRowStorage(bufferSet: target, row, maxRowBuffers: maxRowBuffers)
+    }
     guard row < target.rowLogicalToSlot.count else { return false }
     let slot = target.rowLogicalToSlot[row]
     guard slot >= 0 && slot < target.rowState.buffers.count else { return false }
@@ -978,7 +1838,7 @@ func submitSurfaceRowVertices(
         target.rowState.counts[slot] = 0
         return false
     }
-    if columnsContracted {
+    if columnsContracted && allowAllocation {
         retireOversizedSurfaceRowStorage(
             bufferSet: target,
             row: slot,
@@ -1001,6 +1861,7 @@ func submitSurfaceRowVertices(
         row: slot,
         vertexCount: count,
         maxRowBuffers: maxRowBuffers,
+        allowAllocation: allowAllocation,
         inflightRowBuffers: inflightRowBuffers(slot)
     ) else {
         target.rowState.counts[slot] = 0

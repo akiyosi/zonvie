@@ -1406,6 +1406,34 @@ final class MetalTerminalView: MTKView {
 
         renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
 
+        let isZeroCellLayout =
+            rowCount == 0
+            && count == 0
+            && (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
+            && (totalRows == 0 || totalCols == 0)
+        if isZeroCellLayout {
+            let fullDrawableRectPx = NSRect(
+                x: 0,
+                y: 0,
+                width: CGFloat(drawableSize.width),
+                height: CGFloat(drawableSize.height)
+            )
+            if fullDrawableRectPx.width > 0, fullDrawableRectPx.height > 0 {
+                // A layout-only callback has no rows from which to derive
+                // damage. Clear the previous wide frame only after this
+                // bracket commits by staging full drawable damage.
+                renderer.markDirtyRect(
+                    rowStart: 0,
+                    rowCount: 0,
+                    rectPx: fullDrawableRectPx
+                )
+                requestRedrawDrawablePx(fullDrawableRectPx)
+            } else {
+                requestRedraw()
+            }
+            return
+        }
+
         // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match vertexgen.ndc()).
         let cellHpx = CGFloat(renderer.cellHeightPx)
     
