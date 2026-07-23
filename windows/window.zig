@@ -545,10 +545,6 @@ const WM_APP_CLOSE_EXTERNAL_WINDOW = app_mod.WM_APP_CLOSE_EXTERNAL_WINDOW;
 const WM_APP_DEFERRED_INIT = app_mod.WM_APP_DEFERRED_INIT;
 const WM_APP_SHOW_CONNECT_DIALOG = app_mod.WM_APP_SHOW_CONNECT_DIALOG;
 
-// Hoisted to container scope: each top-level decl gets its own comptime
-// branch quota, keeping the WndProc body's shared quota under the limit.
-const DEVICE_LOST_MSG_UTF16 = std.unicode.utf8ToUtf16LeStringLiteral("GPU device lost; recovery failed. Please restart Zonvie.");
-const DEVICE_LOST_TITLE_UTF16 = std.unicode.utf8ToUtf16LeStringLiteral("Zonvie");
 const WM_APP_UPDATE_IME_POSITION = app_mod.WM_APP_UPDATE_IME_POSITION;
 const WM_APP_MSG_SHOW = app_mod.WM_APP_MSG_SHOW;
 const WM_APP_MSG_CLEAR = app_mod.WM_APP_MSG_CLEAR;
@@ -617,6 +613,7 @@ fn armMsgThrottleTimer(hwnd: c.HWND, app: *App) void {
 }
 
 pub fn postDeviceLostRecovery(hwnd: c.HWND, app: *App) void {
+    if (app.device_lost_recovery_cancelled) return;
     if (app.device_lost_recover_posted) return;
     app.device_lost_recover_posted = true;
     if (c.PostMessageW(hwnd, app_mod.WM_APP_DEVICE_LOST_RECOVER, 0, @bitCast(app.window_wake_cookie)) == 0) {
@@ -762,18 +759,26 @@ pub fn scheduleReliableWindowMessage(
 }
 
 pub fn scheduleDeviceLostRetry(hwnd: c.HWND, app: *App) void {
+    if (app.device_lost_recovery_cancelled) return;
+    const delay_ms = render_helpers.deviceLostRetryDelayMs(app.device_lost_recover_attempts);
     app.device_lost_retry_needed = true;
-    app.device_lost_retry_deadline_ms = c.GetTickCount64() + app_mod.DEVICE_LOST_RETRY_INTERVAL_MS;
-    if (c.SetTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY, app_mod.DEVICE_LOST_RETRY_INTERVAL_MS, null) != 0) return;
+    app.device_lost_retry_deadline_ms = c.GetTickCount64() + delay_ms;
+    if (c.SetTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY, delay_ms, null) != 0) return;
     if (!scheduleReliableWindowMessage(
         hwnd,
         app_mod.WM_APP_DEVICE_LOST_RETRY_FALLBACK,
         0,
         @bitCast(app.window_wake_cookie),
-        app_mod.DEVICE_LOST_RETRY_INTERVAL_MS,
+        delay_ms,
     )) {
         // The main-loop deadline remains armed even when both USER timer
         // mechanisms are unavailable.
+    }
+}
+
+fn releaseRemainingDeviceLostRecoveryPins(app: *App, start_index: usize) void {
+    for (app.device_lost_recover_grids.items[start_index..]) |grid_id| {
+        external_windows.finishExternalWindowPaint(app, grid_id);
     }
 }
 
@@ -935,6 +940,23 @@ fn scheduleMainPaintRetry(hwnd: c.HWND, app: *App) void {
     )) _ = app.paint_retry.timerArmFailed(ticket.generation);
 }
 
+fn recoverMainPaintFailure(hwnd: c.HWND, app: *App) void {
+    app.mu.lockUncancelable(core.clock.io());
+    app.surface.paint_full = true;
+    app.mu.unlock(core.clock.io());
+    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
+    app.tbs.pending_paint_full = true;
+    app.tbs.rotation_mu.unlock(core.clock.io());
+
+    var device_lost = false;
+    if (app.renderer) |*renderer| device_lost = renderer.device_lost;
+    if (device_lost) {
+        postDeviceLostRecovery(hwnd, app);
+    } else {
+        scheduleMainPaintRetry(hwnd, app);
+    }
+}
+
 fn completeMainPaintRetry(app: *App) void {
     app.main_paint_retry_deadline_ms = 0;
     _ = app.paint_retry.succeeded();
@@ -1071,7 +1093,13 @@ fn releaseMainRecoveryBuffers(app: *App) void {
     while (true) {
         app.mu.lockUncancelable(core.clock.io());
         var vb = app_mod.detachOneSurfaceGpuVB(&app.surface);
-        if (vb == null) vb = app_mod.detachOneRowVB(app.row_vbs.items);
+        var row_vb_bytes: usize = 0;
+        if (vb == null) {
+            if (app_mod.detachOneRowVB(app.row_vbs.items)) |detached| {
+                vb = detached.buffer;
+                row_vb_bytes = detached.bytes;
+            }
+        }
         if (vb == null) {
             vb = app.cursor_vb;
             app.cursor_vb = null;
@@ -1085,6 +1113,12 @@ fn releaseMainRecoveryBuffers(app: *App) void {
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
+            if (row_vb_bytes != 0) {
+                app.row_vb_budget.release(
+                    &app.row_vb_retained_bytes,
+                    row_vb_bytes,
+                );
+            }
         } else {
             break;
         }
@@ -1099,7 +1133,13 @@ fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.Ext
             return false;
         }
         var vb = app_mod.detachOneSurfaceGpuVB(&ext_win.surface);
-        if (vb == null) vb = app_mod.detachOneRowVB(ext_win.row_vbs.items);
+        var row_vb_bytes: usize = 0;
+        if (vb == null) {
+            if (app_mod.detachOneRowVB(ext_win.row_vbs.items)) |detached| {
+                vb = detached.buffer;
+                row_vb_bytes = detached.bytes;
+            }
+        }
         if (vb == null) {
             vb = ext_win.vb;
             ext_win.vb = null;
@@ -1118,6 +1158,12 @@ fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.Ext
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
+            if (row_vb_bytes != 0) {
+                app.row_vb_budget.release(
+                    &ext_win.row_vb_retained_bytes,
+                    row_vb_bytes,
+                );
+            }
         } else {
             return true;
         }
@@ -2176,12 +2222,23 @@ pub export fn WndProc(
                     if (!row_mode) {
                         // Flat rendering no longer references the per-row
                         // buffers retained by a previous row-mode frame.
-                        _ = app_mod.resizeRowVBsForPaint(app.alloc, &app.row_vbs, 0);
+                        _ = app_mod.resizeRowVBsForPaint(
+                            app.alloc,
+                            &app.row_vbs,
+                            &app.row_vb_budget,
+                            &app.row_vb_retained_bytes,
+                            0,
+                        );
 
                         // A mode transition can leave a row-mode scrollbar in
                         // retained back_tex. Restore it and widen this flat
                         // draw's damage so the clean strip is also presented.
-                        if (g.restoreScrollbarUnderlay()) |restored_rect| {
+                        const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
+                            if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
+                            recoverMainPaintFailure(hwnd, app);
+                            return 0;
+                        };
+                        if (restored_scrollbar_rect) |restored_rect| {
                             dirty = if (dirty) |old| callbacks.unionRect(old, restored_rect) else restored_rect;
                         }
 
@@ -2483,7 +2540,12 @@ pub export fn WndProc(
                         // this frame's row/cursor updates; the returned strip is
                         // real back_tex damage and must reach every swapchain
                         // buffer through the per-buffer damage queue.
-                        if (g.restoreScrollbarUnderlay()) |restored_rect| {
+                        const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
+                            if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
+                            recoverMainPaintFailure(hwnd, app);
+                            return 0;
+                        };
+                        if (restored_scrollbar_rect) |restored_rect| {
                             present_rects.append(app.alloc, restored_rect) catch {
                                 present_rects_fallback_full = true;
                             };
@@ -2715,7 +2777,13 @@ pub export fn WndProc(
                         // Ensure row_vbs array covers committed set's row count.
                         {
                             const need_len = committed.row_map.items.len;
-                            if (!app_mod.resizeRowVBsForPaint(app.alloc, &app.row_vbs, need_len)) {
+                            if (!app_mod.resizeRowVBsForPaint(
+                                app.alloc,
+                                &app.row_vbs,
+                                &app.row_vb_budget,
+                                &app.row_vb_retained_bytes,
+                                need_len,
+                            )) {
                                 app.tbs.rotation_mu.lockUncancelable(core.clock.io());
                                 app.tbs.pending_paint_full = true;
                                 app.tbs.rotation_mu.unlock(core.clock.io());
@@ -2765,19 +2833,28 @@ pub export fn WndProc(
 
                         // TBS lock-free draw: committed set is protected by refcount,
                         // no app.mu needed during VB upload + draw.
+                        var row_vb_budget_exceeded = false;
                         const row_draw_result = app_mod.drawRowModeSetupAndRowsFromSlots(
                             g,
+                            &app.row_vb_budget,
+                            &app.row_vb_retained_bytes,
                             committed.row_map.items,
                             &app.tbs.pool,
                             app.row_vbs.items,
                             rows_to_draw.items,
                             row_draw_params,
                         ) catch |e| blk: {
+                            row_vb_budget_exceeded = e == error.RowVBPhysicalBudgetExceeded;
                             if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
                             var failed_result = app_mod.RowModeDrawResult{};
                             failed_result.metrics.failed_rows = 1;
                             break :blk failed_result;
                         };
+                        if (row_vb_budget_exceeded) {
+                            app.row_vb_budget_failed = true;
+                            if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                            return 0;
+                        }
 
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d} committed_rows={d} committed_cols={d} row_map_len={d}\n",
@@ -2809,6 +2886,7 @@ pub export fn WndProc(
                         }
 
                         // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
+                        var cursor_overlay_failed = false;
                         app_mod.drawCursorOverlay(g, .{
                             .cursor_verts = cursor_verts_snapshot,
                             .cursor_row = committed_cursor.last_cursor_row,
@@ -2827,7 +2905,10 @@ pub export fn WndProc(
                             .rs_set_sc_fn = rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
                             .row_already_redrawn = force_full_rows,
-                        });
+                        }) catch |e| {
+                            cursor_overlay_failed = true;
+                            if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
+                        };
 
                         // Post-process bloom (neon glow) for row-mode
                         if (glow_enabled) {
@@ -2910,6 +2991,7 @@ pub export fn WndProc(
                             // back_tex. Treat the whole paint as failed so the
                             // common recovery path requeues a full redraw.
                             if (failed_rows != 0) break :blk false;
+                            if (cursor_overlay_failed) break :blk false;
 
                             // When seed_clear is true, we must present to sync the cleared back buffer
                             // to all swapchain buffers. Skip other checks - the cleared state must be
@@ -2973,113 +3055,127 @@ pub export fn WndProc(
                         }
 
                         if (allow_present) {
-                            // Save only the track strip before drawing the
-                            // alpha-blended overlay. The next fade/update paint
-                            // restores this clean copy instead of clearing and
-                            // regenerating the entire row set.
-                            if (app.config.scrollbar.enabled and scrollbar_alpha_snapshot > 0.001) {
-                                var scrollbar_verts: [12]core.Vertex = undefined;
-                                const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
-                                if (scrollbar_vert_count != 0) {
-                                    if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
-                                        if (g.captureScrollbarUnderlay(track_rect)) {
-                                            present_rects.append(app.alloc, track_rect) catch {
-                                                present_rects_fallback_full = true;
+                            present_frame: {
+                                // Save only the track strip before drawing the
+                                // alpha-blended overlay. The next fade/update paint
+                                // restores this clean copy instead of clearing and
+                                // regenerating the entire row set.
+                                if (app.config.scrollbar.enabled and scrollbar_alpha_snapshot > 0.001) {
+                                    var scrollbar_verts: [12]core.Vertex = undefined;
+                                    const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
+                                    if (scrollbar_vert_count != 0) {
+                                        if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
+                                            const captured_scrollbar_rect = g.captureScrollbarUnderlay(track_rect) catch |e| {
+                                                if (log_enabled) applog.appLog("captureScrollbarUnderlay failed: {any}\n", .{e});
+                                                break :present_frame;
                                             };
-                                            app_mod.drawScrollbarOverlay(g, &app.scrollbar_vb, &app.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                                            if (captured_scrollbar_rect) |captured_rect| {
+                                                present_rects.append(app.alloc, captured_rect) catch {
+                                                    present_rects_fallback_full = true;
+                                                };
+                                                app_mod.drawScrollbarOverlay(
+                                                    g,
+                                                    &app.scrollbar_vb,
+                                                    &app.scrollbar_vb_bytes,
+                                                    scrollbar_verts[0..scrollbar_vert_count],
+                                                ) catch |e| {
+                                                    if (log_enabled) applog.appLog("drawScrollbarOverlay failed: {any}\n", .{e});
+                                                    break :present_frame;
+                                                };
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            // When seed_clear is true, the back buffer was just cleared.
-                            // We must do a full present to sync the cleared state to all swapchain buffers,
-                            // otherwise areas not covered by partial present rects may show stale content.
-                            // seed_pending alone no longer forces a full present: when
-                            // back_tex_valid_snapshot is true the swapchain has already been
-                            // synced to a complete frame, and partial present rects keep
-                            // DXGI from copying unchanged regions every paint.
-                            const force_full_present = force_full_rows or
-                                (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
-                                seed_clear or
-                                present_rects_fallback_full;
-                            const present_rects_slice: []const c.RECT =
-                                if (force_full_present) &[_]c.RECT{} else present_rects.items;
+                                // When seed_clear is true, the back buffer was just cleared.
+                                // We must do a full present to sync the cleared state to all swapchain buffers,
+                                // otherwise areas not covered by partial present rects may show stale content.
+                                // seed_pending alone no longer forces a full present: when
+                                // back_tex_valid_snapshot is true the swapchain has already been
+                                // synced to a complete frame, and partial present rects keep
+                                // DXGI from copying unchanged regions every paint.
+                                const force_full_present = force_full_rows or
+                                    (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
+                                    seed_clear or
+                                    present_rects_fallback_full;
+                                const present_rects_slice: []const c.RECT =
+                                    if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
-                            // Present1 scroll params: disabled for now.
-                            // back_tex pixel shift (scrollBackTex) already handles the retained
-                            // content shift. Adding pScrollRect/pScrollOffset to Present1 would
-                            // cause a double-shift since we CopySubresourceRegion back_tex→bb.
+                                // Present1 scroll params: disabled for now.
+                                // back_tex pixel shift (scrollBackTex) already handles the retained
+                                // content shift. Adding pScrollRect/pScrollOffset to Present1 would
+                                // cause a double-shift since we CopySubresourceRegion back_tex→bb.
 
-                            if (g.presentFromBackRectsWithCursorNoResize(
-                                present_rects_slice,
-                                app.cursor_vb,
-                                cursor_verts_snapshot.len,
-                                cursor_rc_opt,
-                                force_full_present,
-                                null,
-                                null,
-                            )) {
-                                render_ok = true;
-                                // Assign back_tex_valid directly so it can also transition
-                                // true → false in the same paint. Two paths to true:
-                                //
-                                //   1. preserve_back was true AND back_tex_valid_snapshot was
-                                //      true. The previous paint left back_tex in a valid state
-                                //      and this paint only overlaid dirty rows on top of it —
-                                //      back_tex is still valid even if this paint didn't render
-                                //      every row.
-                                //
-                                //   2. We just rendered a complete frame regardless of prior
-                                //      state. "Complete" here is render-side completeness
-                                //      (skipped_empty == 0 and rows_to_draw covers every row),
-                                //      not Neovim-side validation (row_valid_count). The
-                                //      distinction matters for minimize/restore, where
-                                //      row_valid is unsetAll'd by WM_SIZE but row_verts still
-                                //      holds full pre-minimize data — a seed_clear paint
-                                //      redraws every row from that data and back_tex becomes
-                                //      complete even with row_valid_count == 0.
-                                //
-                                // Both conditions fail (preserve_back=false AND incomplete
-                                // render) → back_tex_valid falls to false. This is the
-                                // critical case for the on_vertices_row dimension-change path:
-                                // seed_clear bypasses the row_valid completeness check at
-                                // allow_present and presents anyway, so without an explicit
-                                // false-assignment a stale snapshot value would survive a
-                                // paint that wiped back_tex.
-                                const rendered_complete_frame =
-                                    effective_rows != 0 and
-                                    skipped_empty == 0 and
-                                    rows_to_draw.items.len == effective_rows;
-                                const new_back_tex_valid =
-                                    (back_tex_valid_snapshot and preserve_back) or
-                                    rendered_complete_frame;
-                                app.mu.lockUncancelable(core.clock.io());
-                                app.back_tex_valid = new_back_tex_valid;
-                                app.mu.unlock(core.clock.io());
-                                // last_painted_cursor_row is tracked by drawCursorOverlay above.
-                            } else |e| {
-                                if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
-                            }
-
-                            if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
-                                app.mu.lockUncancelable(core.clock.io());
-                                app.seed_pending = false;
-                                app.surface.paint_full = true;
-                                app.paint_rects.clearRetainingCapacity();
-                                app.seed_clear_pending = true;
-                                app.mu.unlock(core.clock.io());
-                                // Also set TBS pending_paint_full for next paint cycle.
-                                {
-                                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                    app.tbs.pending_paint_full = true;
-                                    app.tbs.rotation_mu.unlock(core.clock.io());
+                                if (g.presentFromBackRectsWithCursorNoResize(
+                                    present_rects_slice,
+                                    app.cursor_vb,
+                                    cursor_verts_snapshot.len,
+                                    cursor_rc_opt,
+                                    force_full_present,
+                                    null,
+                                    null,
+                                )) {
+                                    render_ok = true;
+                                    // Assign back_tex_valid directly so it can also transition
+                                    // true → false in the same paint. Two paths to true:
+                                    //
+                                    //   1. preserve_back was true AND back_tex_valid_snapshot was
+                                    //      true. The previous paint left back_tex in a valid state
+                                    //      and this paint only overlaid dirty rows on top of it —
+                                    //      back_tex is still valid even if this paint didn't render
+                                    //      every row.
+                                    //
+                                    //   2. We just rendered a complete frame regardless of prior
+                                    //      state. "Complete" here is render-side completeness
+                                    //      (skipped_empty == 0 and rows_to_draw covers every row),
+                                    //      not Neovim-side validation (row_valid_count). The
+                                    //      distinction matters for minimize/restore, where
+                                    //      row_valid is unsetAll'd by WM_SIZE but row_verts still
+                                    //      holds full pre-minimize data — a seed_clear paint
+                                    //      redraws every row from that data and back_tex becomes
+                                    //      complete even with row_valid_count == 0.
+                                    //
+                                    // Both conditions fail (preserve_back=false AND incomplete
+                                    // render) → back_tex_valid falls to false. This is the
+                                    // critical case for the on_vertices_row dimension-change path:
+                                    // seed_clear bypasses the row_valid completeness check at
+                                    // allow_present and presents anyway, so without an explicit
+                                    // false-assignment a stale snapshot value would survive a
+                                    // paint that wiped back_tex.
+                                    const rendered_complete_frame =
+                                        effective_rows != 0 and
+                                        skipped_empty == 0 and
+                                        rows_to_draw.items.len == effective_rows;
+                                    const new_back_tex_valid =
+                                        (back_tex_valid_snapshot and preserve_back) or
+                                        rendered_complete_frame;
+                                    app.mu.lockUncancelable(core.clock.io());
+                                    app.back_tex_valid = new_back_tex_valid;
+                                    app.mu.unlock(core.clock.io());
+                                    // last_painted_cursor_row is tracked by drawCursorOverlay above.
+                                } else |e| {
+                                    if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
                                 }
-                                if (log_enabled) applog.appLog(
-                                    "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
-                                    .{ effective_rows, effective_row_valid_count },
-                                );
-                                _ = c.InvalidateRect(hwnd, null, c.FALSE);
+
+                                if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
+                                    app.mu.lockUncancelable(core.clock.io());
+                                    app.seed_pending = false;
+                                    app.surface.paint_full = true;
+                                    app.paint_rects.clearRetainingCapacity();
+                                    app.seed_clear_pending = true;
+                                    app.mu.unlock(core.clock.io());
+                                    // Also set TBS pending_paint_full for next paint cycle.
+                                    {
+                                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
+                                        app.tbs.pending_paint_full = true;
+                                        app.tbs.rotation_mu.unlock(core.clock.io());
+                                    }
+                                    if (log_enabled) applog.appLog(
+                                        "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
+                                        .{ effective_rows, effective_row_valid_count },
+                                    );
+                                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                                }
                             }
                         } else if (log_enabled) {
                             var resize_age_ms: i64 = -1;
@@ -3132,24 +3228,7 @@ pub export fn WndProc(
                 // Recover dirty state if rendering failed, so the next
                 // WM_PAINT will retry a full redraw instead of showing stale content.
                 if (!render_ok) {
-                    app.mu.lockUncancelable(core.clock.io());
-                    app.surface.paint_full = true;
-                    app.mu.unlock(core.clock.io());
-                    {
-                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                        app.tbs.pending_paint_full = true;
-                        app.tbs.rotation_mu.unlock(core.clock.io());
-                    }
-                    // Device loss is unrecoverable by repaint alone —
-                    // resourcesReady() stays false forever. Post the dedicated
-                    // recovery handler (deduped) instead of paint-spinning.
-                    var dev_lost = false;
-                    if (app.renderer) |*r| dev_lost = r.device_lost;
-                    if (dev_lost) {
-                        postDeviceLostRecovery(hwnd, app);
-                    } else {
-                        scheduleMainPaintRetry(hwnd, app);
-                    }
+                    recoverMainPaintFailure(hwnd, app);
                 } else {
                     completeMainPaintRetry(app);
                 }
@@ -4610,29 +4689,41 @@ pub export fn WndProc(
                 if (!any_device_lost) {
                     app.device_lost_recover_posted = false;
                     app.device_lost_recover_attempts = 0;
+                    app.device_lost_recovery_warning_shown = false;
+                    app.device_lost_retry_needed = false;
+                    app.device_lost_retry_deadline_ms = 0;
                     _ = c.KillTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY);
                     if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: stale retry ignored\n", .{});
                     return 0;
                 }
 
                 _ = c.KillTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY);
+                app.device_lost_retry_needed = false;
+                app.device_lost_retry_deadline_ms = 0;
                 app.device_lost_recovering = true;
                 defer {
                     app.device_lost_recovering = false;
                     _ = app.finishActiveOperation();
                 }
                 app.device_lost_recover_posted = false;
-                app.device_lost_recover_attempts += 1;
-                if (app.device_lost_recover_attempts > 3) {
-                    if (app.device_lost_recover_attempts == 4) {
-                        _ = c.MessageBoxW(
-                            hwnd,
-                            DEVICE_LOST_MSG_UTF16,
-                            DEVICE_LOST_TITLE_UTF16,
-                            c.MB_OK | c.MB_ICONWARNING,
-                        );
+                app.device_lost_recover_attempts +|= 1;
+                if (render_helpers.shouldWarnDeviceLostRecovery(
+                    app.device_lost_recover_attempts,
+                    app.device_lost_recovery_warning_shown,
+                )) {
+                    app.device_lost_recovery_warning_shown = true;
+                    // A modal dialog would suspend the recovery loop until
+                    // dismissed. Use the existing non-blocking tray channel so
+                    // the next rebuild attempt starts immediately.
+                    if (app.tray_icon == null) app.tray_icon = TrayIcon.init(hwnd);
+                    if (app.tray_icon) |*tray| {
+                        if (tray.add()) {
+                            tray.showBalloon(
+                                "Zonvie",
+                                "GPU recovery is taking longer than expected. Zonvie will keep retrying; restart the app if the problem persists.",
+                            );
+                        }
                     }
-                    return 0;
                 }
                 if (applog.isEnabled()) applog.appLog("[win] device-lost recovery attempt {d}\n", .{app.device_lost_recover_attempts});
 
@@ -4695,6 +4786,7 @@ pub export fn WndProc(
                 if (old_main_renderer) |*r| r.deinit();
                 if (old_d3d_ctx) |ctx| _ = ctx.lpVtbl.*.Release.?(ctx);
                 if (old_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
+                if (app.device_lost_recovery_cancelled) return 0;
 
                 // 3. Fresh device + D2D rebind + renderer (same order as
                 // WM_APP_DEFERRED_INIT phase 2) — unlocked, see above.
@@ -4777,7 +4869,7 @@ pub export fn WndProc(
                     if (app.atlas) |*a| a.releaseD2DDeviceObjects();
                     if (new_d3d_ctx) |ctx| _ = ctx.lpVtbl.*.Release.?(ctx);
                     if (new_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
-                    if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: renderer re-init failed, retrying in {d}ms\n", .{app_mod.DEVICE_LOST_RETRY_INTERVAL_MS});
+                    if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: renderer re-init failed\n", .{});
                     scheduleDeviceLostRetry(hwnd, app);
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     return 0;
@@ -4793,6 +4885,13 @@ pub export fn WndProc(
                     scheduleDeviceLostRetry(hwnd, app);
                     return 0;
                 };
+                if (app.device_lost_recovery_cancelled) {
+                    recovered_gpu.?.deinit();
+                    if (app.atlas) |*a| a.releaseD2DDeviceObjects();
+                    if (new_d3d_ctx) |ctx| _ = ctx.lpVtbl.*.Release.?(ctx);
+                    if (new_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
+                    return 0;
+                }
                 app.mu.lockUncancelable(core.clock.io());
                 app.d3d_device = new_d3d_device;
                 app.d3d_ctx = new_d3d_ctx;
@@ -4853,6 +4952,10 @@ pub export fn WndProc(
 
                 var ri: usize = 0;
                 while (ri < app.device_lost_recover_grids.items.len) : (ri += 1) {
+                    if (app.device_lost_recovery_cancelled) {
+                        releaseRemainingDeviceLostRecoveryPins(app, ri);
+                        return 0;
+                    }
                     const grid_id = app.device_lost_recover_grids.items[ri];
                     app.mu.lockUncancelable(core.clock.io());
                     const ext_win_opt = app.external_windows.get(grid_id);
@@ -4907,6 +5010,11 @@ pub export fn WndProc(
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
+                    if (app.device_lost_recovery_cancelled) {
+                        new_renderer.deinit();
+                        releaseRemainingDeviceLostRecoveryPins(app, ri);
+                        return 0;
+                    }
                     const ext_dpi = GetDpiForWindow(ext_win.hwnd);
                     if (!releaseExternalRecoveryBuffers(app, grid_id, ext_win)) {
                         new_renderer.deinit();
@@ -4957,10 +5065,13 @@ pub export fn WndProc(
                     // used when the MAIN renderer's own re-init fails above;
                     // reusing it here also catches these stragglers instead
                     // of leaving them permanently unrecovered.
-                    if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: one or more external windows still unrecovered, retrying in {d}ms\n", .{app_mod.DEVICE_LOST_RETRY_INTERVAL_MS});
+                    if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: one or more external windows still unrecovered\n", .{});
                     scheduleDeviceLostRetry(hwnd, app);
                 } else {
                     app.device_lost_recover_attempts = 0;
+                    app.device_lost_recovery_warning_shown = false;
+                    app.device_lost_retry_needed = false;
+                    app.device_lost_retry_deadline_ms = 0;
                     _ = c.KillTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY);
                 }
 
@@ -6501,6 +6612,15 @@ pub export fn WndProc(
 
         c.WM_NCDESTROY => {
             if (getApp(hwnd)) |app| {
+                // End the recovery lifecycle before removing HWND ownership.
+                // Queued messages are rejected by the wake cookie, while the
+                // durable deadline and USER timer are cancelled explicitly.
+                app.device_lost_recovery_cancelled = true;
+                app.device_lost_recover_posted = false;
+                app.device_lost_retry_needed = false;
+                app.device_lost_retry_deadline_ms = 0;
+                _ = c.KillTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY);
+
                 // Clear userdata first (prevent access by subsequent messages/re-entry)
                 _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, 0);
 

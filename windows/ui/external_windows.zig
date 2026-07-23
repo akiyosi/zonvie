@@ -333,7 +333,7 @@ fn drawNormalExternalSurface(
 
     // All normal modes share the same retained back_tex. Restore a prior
     // row/flat scrollbar before either path mutates or clears it.
-    const restored_scrollbar_rect = g.restoreScrollbarUnderlay();
+    const restored_scrollbar_rect = try g.restoreScrollbarUnderlay();
 
     // Row-mode path: use per-row VB rendering with scissor (same as main window).
     if (tbs_committed.row_mode) {
@@ -357,7 +357,13 @@ fn drawNormalExternalSurface(
     }
 
     // Flat-mode fallback: snapshot-based flat draw (decorated surfaces or non-row-mode).
-    _ = app_mod.resizeRowVBsForPaint(app.alloc, &ext_win.row_vbs, 0);
+    _ = app_mod.resizeRowVBsForPaint(
+        app.alloc,
+        &ext_win.row_vbs,
+        &app.row_vb_budget,
+        &ext_win.row_vb_retained_bytes,
+        0,
+    );
     if (log_enabled) applog.appLog("[win] drawNormalExternalSurface: flat mode grid_id={d}\n", .{grid_id});
 
     try app_mod.drawExternalSurfaceFlat(
@@ -387,8 +393,8 @@ fn drawNormalExternalSurface(
         );
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (g.captureScrollbarUnderlay(track_rect)) {
-                    app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                if (try g.captureScrollbarUnderlay(track_rect)) |_| {
+                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
                 }
             }
         }
@@ -470,7 +476,13 @@ fn drawNormalExternalSurfaceRowMode(
     // Ensure row_vbs array covers committed set's row count.
     {
         const need_len: usize = @intCast(tbs_committed.rows);
-        if (!app_mod.resizeRowVBsForPaint(app.alloc, &ext_win.row_vbs, need_len))
+        if (!app_mod.resizeRowVBsForPaint(
+            app.alloc,
+            &ext_win.row_vbs,
+            &app.row_vb_budget,
+            &ext_win.row_vb_retained_bytes,
+            need_len,
+        ))
             return error.OutOfMemory;
     }
 
@@ -511,6 +523,8 @@ fn drawNormalExternalSurfaceRowMode(
     // no app.mu needed during VB upload + draw.
     const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
         g,
+        &app.row_vb_budget,
+        &ext_win.row_vb_retained_bytes,
         tbs_committed.row_map.items,
         &ext_win.tbs.pool,
         ext_win.row_vbs.items,
@@ -527,7 +541,7 @@ fn drawNormalExternalSurfaceRowMode(
     if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
 
     // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-    app_mod.drawCursorOverlay(g, .{
+    try app_mod.drawCursorOverlay(g, .{
         .cursor_verts = tbs_cursor.verts.items,
         .cursor_row = tbs_cursor.last_cursor_row,
         .cursor_vb = &ext_win.cursor_vb,
@@ -638,9 +652,9 @@ fn drawNormalExternalSurfaceRowMode(
         );
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (g.captureScrollbarUnderlay(track_rect)) {
-                    app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
-                    present_rects.appendAssumeCapacity(track_rect);
+                if (try g.captureScrollbarUnderlay(track_rect)) |captured_rect| {
+                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                    present_rects.appendAssumeCapacity(captured_rect);
                 }
             }
         }
@@ -955,7 +969,7 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
             dst_row.gen = src_row.gen;
             dst_row.origin_row = src_row.origin_row;
         }
-        ext_win.surface.clearExtraRows(pv.surface.rows);
+        _ = ext_win.surface.truncateRows(app.alloc, pv.surface.rows);
         ext_win.recomputeVertCount();
     } else {
         ext_win.surface.verts.clearRetainingCapacity();
@@ -1805,7 +1819,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         app.mu.unlock(core.clock.io());
 
         // deinit handles DestroyWindow and resource cleanup
-        ext_win.deinit(app.alloc);
+        ext_win.deinit(app.alloc, &app.row_vb_budget);
         if (applog.isEnabled()) applog.appLog("[win] destroyed external window hwnd={*}\n", .{ext_win.hwnd});
         app.alloc.destroy(ext_win); // free the heap box itself; deinit() only frees its owned sub-resources
     }
@@ -2996,12 +3010,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         return;
     }
 
-    if (ext_win.vert_count == 0) {
-        app.mu.unlock(core.clock.io());
-        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: vert_count=0, skipping\n", .{});
-        return;
-    }
-
     // Cover the committed-set and atlas-generation snapshots as well as the
     // draw. A reset that commits in the gap between those snapshots and a
     // late admission check would pair old vertex UVs with the new atlas.
@@ -3362,7 +3370,13 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         if (surface_kind != .normal) {
             // Decorated surfaces never consume row VBs. Release buffers left
             // by an earlier normal row-mode incarnation of this window.
-            _ = app_mod.resizeRowVBsForPaint(app.alloc, &ext_win.row_vbs, 0);
+            _ = app_mod.resizeRowVBsForPaint(
+                app.alloc,
+                &ext_win.row_vbs,
+                &app.row_vb_budget,
+                &ext_win.row_vb_retained_bytes,
+                0,
+            );
 
             // cmdline/msg_show/msg_history derive their content dims from
             // ext_win.surface.rows/cols (same computation as the matching
@@ -3421,6 +3435,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             row_h_px_snapshot,
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
+            if (e == error.RowVBPhysicalBudgetExceeded) {
+                app.row_vb_budget_failed = true;
+                if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                return;
+            }
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         };

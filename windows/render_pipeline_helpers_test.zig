@@ -8,6 +8,137 @@ test "retry delay doubles and saturates" {
     try std.testing.expectEqual(@as(u32, 2000), helpers.nextBackoffDelayMs(std.math.maxInt(u32), 2000));
 }
 
+test "device-loss recovery retries indefinitely with bounded backoff" {
+    const expected = [_]u32{ 1000, 1000, 2000, 4000, 8000, 16_000, 30_000, 30_000 };
+    for (expected, 0..) |delay_ms, failed_attempts| {
+        try std.testing.expectEqual(
+            delay_ms,
+            helpers.deviceLostRetryDelayMs(@intCast(failed_attempts)),
+        );
+    }
+    try std.testing.expectEqual(
+        helpers.device_lost_retry_max_ms,
+        helpers.deviceLostRetryDelayMs(std.math.maxInt(u32)),
+    );
+}
+
+test "device-loss recovery warning is one-shot and does not stop retries" {
+    try std.testing.expect(!helpers.shouldWarnDeviceLostRecovery(3, false));
+    try std.testing.expect(helpers.shouldWarnDeviceLostRecovery(4, false));
+    try std.testing.expect(!helpers.shouldWarnDeviceLostRecovery(5, true));
+}
+
+test "GPU buffer growth is geometric and bounded" {
+    const max_bytes: usize = 64 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 4096), helpers.geometricBufferCapacity(0, 1, max_bytes).?);
+    try std.testing.expectEqual(@as(usize, 4096), helpers.geometricBufferCapacity(4096, 4096, max_bytes).?);
+    try std.testing.expectEqual(@as(usize, 8192), helpers.geometricBufferCapacity(4096, 4097, max_bytes).?);
+    try std.testing.expectEqual(max_bytes, helpers.geometricBufferCapacity(max_bytes / 2, max_bytes, max_bytes).?);
+    try std.testing.expect(helpers.geometricBufferCapacity(max_bytes, max_bytes + 1, max_bytes) == null);
+
+    var capacity: usize = 0;
+    var growth_count: usize = 0;
+    for (1..100_001) |need_bytes| {
+        const next = helpers.geometricBufferCapacity(capacity, need_bytes, max_bytes).?;
+        if (next != capacity) growth_count += 1;
+        capacity = next;
+    }
+    try std.testing.expect(growth_count <= 6);
+}
+
+test "RowVB physical budget charges replacement peak across surfaces" {
+    const mib: usize = 1024 * 1024;
+    try std.testing.expect(helpers.rowVBPhysicalGrowthFits(
+        400 * mib,
+        0,
+        120 * mib,
+        64 * mib,
+        helpers.row_vb_surface_budget_bytes,
+        helpers.row_vb_process_budget_bytes,
+    ));
+    try std.testing.expect(!helpers.rowVBPhysicalGrowthFits(
+        480 * mib,
+        0,
+        120 * mib,
+        64 * mib,
+        helpers.row_vb_surface_budget_bytes,
+        helpers.row_vb_process_budget_bytes,
+    ));
+    try std.testing.expect(!helpers.rowVBPhysicalGrowthFits(
+        200 * mib,
+        0,
+        224 * mib,
+        64 * mib,
+        helpers.row_vb_surface_budget_bytes,
+        helpers.row_vb_process_budget_bytes,
+    ));
+    try std.testing.expect(!helpers.rowVBPhysicalGrowthFits(
+        400 * mib,
+        64 * mib,
+        120 * mib,
+        64 * mib,
+        helpers.row_vb_surface_budget_bytes,
+        helpers.row_vb_process_budget_bytes,
+    ));
+}
+
+test "RowVB physical budget reservation commits rolls back and releases" {
+    const mib: usize = 1024 * 1024;
+    var budget = helpers.RowVBPhysicalBudget{};
+    var main_surface_bytes: usize = 0;
+    var external_surface_bytes: usize = 0;
+    const third_surface_bytes: usize = 0;
+
+    var initial = try budget.reserveGrowth(main_surface_bytes, 0, 128 * mib);
+    try std.testing.expectEqual(@as(usize, 128 * mib), budget.reserved_bytes);
+    budget.commit(&main_surface_bytes, &initial);
+    try std.testing.expectEqual(@as(usize, 128 * mib), budget.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 128 * mib), main_surface_bytes);
+
+    var external = try budget.reserveGrowth(external_surface_bytes, 0, 256 * mib);
+    budget.commit(&external_surface_bytes, &external);
+    try std.testing.expectEqual(@as(usize, 384 * mib), budget.retained_bytes);
+
+    try std.testing.expectError(
+        error.RowVBPhysicalBudgetExceeded,
+        budget.reserveGrowth(third_surface_bytes, 0, 129 * mib),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.reserved_bytes);
+
+    var replacement = try budget.reserveGrowth(main_surface_bytes, 64 * mib, 128 * mib);
+    budget.cancel(&replacement);
+    try std.testing.expectEqual(@as(usize, 384 * mib), budget.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.reserved_bytes);
+
+    replacement = try budget.reserveGrowth(main_surface_bytes, 64 * mib, 128 * mib);
+    budget.commit(&main_surface_bytes, &replacement);
+    try std.testing.expectEqual(@as(usize, 448 * mib), budget.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 192 * mib), main_surface_bytes);
+
+    budget.release(&main_surface_bytes, 192 * mib);
+    budget.release(&external_surface_bytes, 256 * mib);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), main_surface_bytes);
+}
+
+test "scrollbar underlay failure clears validity and retries the same geometry" {
+    var state = helpers.ScrollbarUnderlayState{};
+    try std.testing.expect(state.geometryChanged(12, 480));
+
+    state.captured(12, 480);
+    try std.testing.expect(state.valid);
+    try std.testing.expect(!state.geometryChanged(12, 480));
+
+    state.resourceFailed();
+    try std.testing.expect(!state.valid);
+    try std.testing.expect(state.geometryChanged(12, 480));
+
+    state.captured(12, 480);
+    state.restored();
+    try std.testing.expect(!state.valid);
+    try std.testing.expect(!state.geometryChanged(12, 480));
+}
+
 test "resize and deferred retry service pin App lifetime" {
     try std.testing.expect(!(helpers.ActiveOperationFlags{}).any());
     try std.testing.expect((helpers.ActiveOperationFlags{ .main_resize = true }).any());

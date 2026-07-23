@@ -246,11 +246,6 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
         if (r1 > max_rows) r1 = max_rows;
     }
 
-    var r: u32 = r0;
-    while (r < r1) : (r += 1) {
-        _ = app.surface.dirty_rows.put(app.alloc, r, {}) catch {};
-    }
-
     // TBS: also mark rows dirty in flush_dirty (if in flush).
     if (app.tbs.is_in_flush) {
         var rr: u32 = r0;
@@ -825,6 +820,23 @@ pub fn onVerticesRow(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     const log_enabled = applog.isEnabled();
     const log_verbose = applog.isVerbose();
+    const layout_only =
+        row_count == 0 and
+        vert_count == 0 and
+        (total_rows == 0 or total_cols == 0);
+
+    // In row-only ABI configurations the core sends the main-window cursor
+    // through this callback with CURSOR set and MAIN clear. Reuse the partial
+    // callback's independent cursor-layer transaction; the row payload must
+    // never replace or dirty the main row set.
+    if (grid_id == 1 and
+        (flags & app_mod.VERT_UPDATE_CURSOR) != 0 and
+        (flags & app_mod.VERT_UPDATE_MAIN) == 0)
+    {
+        onVerticesPartial(ctx, null, 0, verts_ptr, vert_count, flags);
+        return;
+    }
+
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
     if (log_enabled) {
@@ -857,7 +869,7 @@ pub fn onVerticesRow(
             },
         );
     }
-    if (row_count != 1 and log_verbose) {
+    if (row_count != 1 and !layout_only and log_verbose) {
         applog.appLog(
             "[win] on_vertices_row WARN row_count={d} row_start={d} vert_count={d}\n",
             .{ row_count, row_start, vert_count },
@@ -1018,17 +1030,10 @@ pub fn onVerticesRow(
                 if (ext_win.surface.row_mode) {
                     // Row-mode: store cursor verts separately (same pattern as main window).
                     // Mark old cursor row dirty so it gets redrawn to erase the cursor overlay.
-                    if (ext_win.surface.last_cursor_row) |old_row| {
-                        if (old_row != row_start) {
-                            _ = ext_win.surface.dirty_rows.put(app.alloc, old_row, {}) catch {};
-                        }
-                    }
                     ext_win.surface.cursor_verts.clearRetainingCapacity();
                     if (cursor_slice.len != 0) {
                         ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
                         ext_win.surface.last_cursor_row = row_start;
-                        // Mark new cursor row dirty so it triggers a redraw with cursor overlay.
-                        _ = ext_win.surface.dirty_rows.put(app.alloc, row_start, {}) catch {};
                     } else {
                         ext_win.surface.last_cursor_row = null;
                     }
@@ -1104,7 +1109,11 @@ pub fn onVerticesRow(
             if (row_count == 1) {
                 ext_win.surface.row_mode = true;
                 ext_win.surface.verts.clearRetainingCapacity();
-                ext_win.surface.clearExtraRows(total_rows);
+                const removed_vert_count = ext_win.surface.truncateRows(app.alloc, total_rows);
+                const old_vert_count = if (row_start < ext_win.surface.row_verts.items.len)
+                    ext_win.surface.row_verts.items[@intCast(row_start)].verts.items.len
+                else
+                    0;
                 if (!storeSurfaceRowVerts(app.alloc, &ext_win.surface.row_verts, row_start, verts_ptr, vert_count)) {
                     // Row storage OOM: without an abort the core clears this
                     // row's dirty bit at flush end and the stale row persists
@@ -1113,8 +1122,7 @@ pub fn onVerticesRow(
                     failFlush(app);
                     return;
                 }
-                _ = ext_win.surface.dirty_rows.put(app.alloc, row_start, {}) catch {};
-                ext_win.recomputeVertCount();
+                ext_win.vert_count = ext_win.vert_count -| removed_vert_count -| old_vert_count + vert_count;
                 // TBS: COW detach + write to slot, mark dirty.
                 if (ext_win.tbs.is_in_flush) {
                     const ws = ext_win.tbs.writeSet();
@@ -1277,7 +1285,7 @@ pub fn onVerticesRow(
                 if (row_count == 1) {
                     pv.surface.row_mode = true;
                     pv.surface.verts.clearRetainingCapacity();
-                    pv.surface.clearExtraRows(total_rows);
+                    _ = pv.surface.truncateRows(app.alloc, total_rows);
                     if (!storeSurfaceRowVerts(app.alloc, &pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
                         // OOM mid-frame: rows updated earlier this flush mix
                         // with older rows — the entry is no longer a
@@ -1377,9 +1385,11 @@ pub fn onVerticesRow(
         );
     }
 
-    // Update app.surface.rows based on total_rows from core (handles both growth and shrink)
-    if (total_rows != app.surface.rows) {
+    // Rows and columns are both part of the published layout. A width-only
+    // zero-cell transition has no row payload to overwrite stale contents.
+    if (total_rows != app.surface.rows or total_cols != app.surface.cols) {
         const old_rows = app.surface.rows;
+        const old_cols = app.surface.cols;
         app.surface.rows = total_rows;
         app.surface.cols = total_cols;
         app.seed_pending = true;
@@ -1397,11 +1407,12 @@ pub fn onVerticesRow(
             rv.verts.clearRetainingCapacity();
             rv.gen +%= 1;
         }
-        // Shrink row_verts if significantly oversized
-        app.maybeShrinkRowStorage(total_rows);
+        if (old_rows != total_rows) {
+            app.maybeShrinkRowStorage(total_rows);
+        }
         if (log_verbose) applog.appLog(
-            "[win] on_vertices_row resize old={d} new={d} row_valid={d}\n",
-            .{ old_rows, total_rows, app.row_valid_count },
+            "[win] on_vertices_row resize old={d}x{d} new={d}x{d} row_valid={d}\n",
+            .{ old_rows, old_cols, total_rows, total_cols, app.row_valid_count },
         );
     }
 
@@ -1445,6 +1456,13 @@ pub fn onVerticesRow(
             // difference and applies a structural synchronization barrier.
             write_set.cols = total_cols;
         }
+        if (layout_only) {
+            app.tbs.requireFullRowSync();
+            write_set.releaseAllSlots(app.alloc, &app.tbs.pool);
+            for (write_set.row_map.items) |*mapping| {
+                mapping.slot = app_mod.SLOT_NONE;
+            }
+        }
     }
 
     // Note: We don't set content_rows_dirty here anymore.
@@ -1465,6 +1483,18 @@ pub fn onVerticesRow(
         }
     } else {
         app.surface.row_mode = true;
+    }
+
+    if (layout_only) {
+        app.row_valid_count = 0;
+        if (app.row_valid.bit_length != 0) {
+            app.row_valid.unsetAll();
+        }
+        app.need_full_seed.store(true, .seq_cst);
+        app.seed_pending = true;
+        app.seed_clear_pending = true;
+        app.flush_needs_invalidate = true;
+        return;
     }
 
     // Clamp to [0, app.surface.rows) to avoid index==rows.
@@ -2054,6 +2084,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // committed set, never a write set that is about to be cancelled.
     const atlas_corrupted = if (app.corep) |corep| app_mod.zonvie_core_flush_had_atlas_corruption(corep) else false;
     const core_aborted = if (app.corep) |corep| app_mod.zonvie_core_flush_was_aborted(corep) else false;
+    const retryable = if (app.corep) |corep| app_mod.zonvie_core_flush_is_retryable(corep) else false;
     app.mu.lockUncancelable(core.clock.io());
     const failed = app.flush_failed or atlas_corrupted or core_aborted;
     app.flush_failed = false;
@@ -2085,7 +2116,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // failure. Its pending copy has already been consumed, so make the
         // retry reconstruct every surface even when that external grid was
         // otherwise clean.
-        core.zonvie_core_force_resend_locked(app.corep);
+        if (retryable) core.zonvie_core_force_resend_locked(app.corep);
     } else {
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
@@ -2147,7 +2178,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // but core-side abort/atlas-corruption paths do not. Re-posting is
         // harmless and guarantees the full resend scheduled above has a
         // driver even when no further Neovim redraw arrives.
-        requestFlushRetry(app);
+        if (retryable) requestFlushRetry(app);
         return;
     }
 

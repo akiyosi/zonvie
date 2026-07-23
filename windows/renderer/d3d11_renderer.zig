@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const core = @import("zonvie_core");
 const c = @import("../win32.zig").c;
 const applog = @import("../app_log.zig");
+const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const compiled_shaders = @import("../shaders/compiled_shaders.zig");
 const custom_shader_mod = @import("custom_shader_pipeline.zig");
 const CustomShaderPipeline = custom_shader_mod.CustomShaderPipeline;
@@ -192,11 +193,8 @@ pub const Renderer = struct {
     // Restoring it before the next overlay avoids alpha accumulation without
     // clearing and regenerating every terminal row on each fade tick.
     scrollbar_underlay_tex: ?*c.ID3D11Texture2D = null,
-    scrollbar_underlay_w: u32 = 0,
-    scrollbar_underlay_h: u32 = 0,
     scrollbar_underlay_rect: c.RECT = std.mem.zeroes(c.RECT),
-    scrollbar_underlay_valid: bool = false,
-    scrollbar_underlay_failed: bool = false,
+    scrollbar_underlay_state: render_pipeline_helpers.ScrollbarUnderlayState = .{},
 
     // Cached VB for drawing bg-fill quads on empty rows (6 verts, lazily created).
     clear_row_vb: ?*c.ID3D11Buffer = null,
@@ -850,10 +848,7 @@ pub const Renderer = struct {
         safeRelease(&self.back_tex);
         safeRelease(&self.scroll_staging_tex);
         safeRelease(&self.scrollbar_underlay_tex);
-        self.scrollbar_underlay_w = 0;
-        self.scrollbar_underlay_h = 0;
-        self.scrollbar_underlay_valid = false;
-        self.scrollbar_underlay_failed = false;
+        self.scrollbar_underlay_state.resourceFailed();
         safeRelease(&self.clear_row_vb);
         // Scratch + ping-pong textures belong to the old back buffer's
         // size/format; drop them and let the shader pass rebuild on
@@ -1059,7 +1054,7 @@ pub const Renderer = struct {
         if (should_clear) {
             // A full clear erases any baked scrollbar overlay, so its saved
             // underlay no longer belongs to the new back_tex contents.
-            self.scrollbar_underlay_valid = false;
+            self.scrollbar_underlay_state.restored();
             const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
             clear_rtv(ctx, back_rtv, &clear);
         }
@@ -2419,13 +2414,39 @@ pub const Renderer = struct {
         // If existing is enough, reuse
         if (vb_ptr.* != null and vb_bytes_ptr.* >= need_bytes) return;
 
-        // Release old
-        safeRelease(vb_ptr);
+        const current_bytes = if (vb_ptr.* != null) vb_bytes_ptr.* else 0;
+        const new_bytes = plannedExternalVertexBufferCapacity(
+            current_bytes,
+            need_bytes,
+        ) orelse return error.VertexBufferTooLarge;
+        try self.replaceExternalVertexBuffer(vb_ptr, vb_bytes_ptr, new_bytes);
+    }
 
+    pub fn plannedExternalVertexBufferCapacity(current_bytes: usize, need_bytes: usize) ?usize {
+        // Row callbacks are capped at 64 MiB by the core. Keep the frontend
+        // allocation in the same logical envelope while growing geometrically
+        // to avoid a CreateBuffer/Release pair for every small high-water bump.
+        const max_buffer_bytes: usize = 64 * 1024 * 1024;
+        return render_pipeline_helpers.geometricBufferCapacity(
+            current_bytes,
+            need_bytes,
+            max_buffer_bytes,
+        );
+    }
+
+    pub fn replaceExternalVertexBuffer(
+        self: *Renderer,
+        vb_ptr: *?*c.ID3D11Buffer,
+        vb_bytes_ptr: *usize,
+        new_bytes: usize,
+    ) !void {
+        if (new_bytes == 0 or new_bytes > 64 * 1024 * 1024) {
+            return error.VertexBufferTooLarge;
+        }
         const dev = self.device orelse return error.NoDevice;
 
         var desc: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
-        desc.ByteWidth = @intCast(need_bytes);
+        desc.ByteWidth = @intCast(new_bytes);
         desc.Usage = c.D3D11_USAGE_DYNAMIC;
         desc.BindFlags = c.D3D11_BIND_VERTEX_BUFFER;
         desc.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
@@ -2435,10 +2456,17 @@ pub const Renderer = struct {
         const create = vtbl.*.CreateBuffer orelse return error.D3DCreateBufferMissing;
 
         const hr = create(dev, &desc, null, @ptrCast(&buf));
-        if (c.FAILED(hr) or buf == null) return error.D3DCreateBufferFailed;
+        if (c.FAILED(hr) or buf == null) {
+            if (isDeviceLost(hr)) self.device_lost = true;
+            return error.D3DCreateBufferFailed;
+        }
 
+        // Publish only after creation succeeds. A transient allocation failure
+        // therefore preserves the old VB and its capacity for the full-paint
+        // retry path.
+        safeRelease(vb_ptr);
         vb_ptr.* = buf;
-        vb_bytes_ptr.* = need_bytes;
+        vb_bytes_ptr.* = new_bytes;
     }
 
     pub fn uploadVertsToVB(
@@ -2455,7 +2483,10 @@ pub const Renderer = struct {
         const res: *c.ID3D11Resource = @ptrCast(vb);
 
         const hr = mapDiscard(ctx, res, &mapped);
-        if (c.FAILED(hr)) return error.D3DMapFailed;
+        if (c.FAILED(hr)) {
+            if (isDeviceLost(hr)) self.device_lost = true;
+            return error.D3DMapFailed;
+        }
 
         const dst_ptr: [*]u8 = @ptrCast(mapped.pData);
         const dst: []u8 = dst_ptr[0..bytes];
@@ -3099,30 +3130,46 @@ pub const Renderer = struct {
     /// clean underlay. Callers use this to keep a fade-out-to-zero paint from
     /// taking the no-damage early return before the final restore.
     pub fn hasScrollbarUnderlay(self: *const Renderer) bool {
-        return self.scrollbar_underlay_valid;
+        return self.scrollbar_underlay_state.valid;
     }
 
     /// Restore the clean pixels saved before the previous scrollbar draw.
     /// The returned rectangle must be included in the next present damage.
     /// Caller must hold lockContext().
-    pub fn restoreScrollbarUnderlay(self: *Renderer) ?c.RECT {
-        if (!self.scrollbar_underlay_valid) return null;
+    pub fn restoreScrollbarUnderlay(self: *Renderer) !?c.RECT {
+        if (!self.scrollbar_underlay_state.valid) return null;
+        errdefer {
+            safeRelease(&self.scrollbar_underlay_tex);
+            self.scrollbar_underlay_state.resourceFailed();
+        }
 
-        const ctx = self.ctx orelse return null;
-        const back_tex = self.back_tex orelse return null;
-        const scratch = self.scrollbar_underlay_tex orelse return null;
-        const back_rtv = self.back_rtv orelse return null;
+        const ctx = self.ctx orelse return error.ScrollbarUnderlayRestoreFailed;
+        const back_tex = self.back_tex orelse return error.ScrollbarUnderlayRestoreFailed;
+        const scratch = self.scrollbar_underlay_tex orelse return error.ScrollbarUnderlayRestoreFailed;
+        const back_rtv = self.back_rtv orelse return error.ScrollbarUnderlayRestoreFailed;
         const rect = self.scrollbar_underlay_rect;
-        if (rect.left < 0 or rect.top < 0 or rect.right <= rect.left or rect.bottom <= rect.top) return null;
+        if (rect.left < 0 or rect.top < 0 or rect.right <= rect.left or rect.bottom <= rect.top) {
+            return error.ScrollbarUnderlayRestoreFailed;
+        }
 
         const rect_w: u32 = @intCast(rect.right - rect.left);
         const rect_h: u32 = @intCast(rect.bottom - rect.top);
-        if (rect_w != self.scrollbar_underlay_w or rect_h != self.scrollbar_underlay_h) return null;
-        if (rect.right > @as(i32, @intCast(self.width)) or rect.bottom > @as(i32, @intCast(self.height))) return null;
+        if (rect_w != self.scrollbar_underlay_state.width or
+            rect_h != self.scrollbar_underlay_state.height)
+        {
+            return error.ScrollbarUnderlayRestoreFailed;
+        }
+        if (rect.right > @as(i32, @intCast(self.width)) or
+            rect.bottom > @as(i32, @intCast(self.height)))
+        {
+            return error.ScrollbarUnderlayRestoreFailed;
+        }
 
         const ctx_vtbl = ctx.*.lpVtbl;
-        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return null;
-        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return null;
+        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse
+            return error.ScrollbarUnderlayRestoreFailed;
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse
+            return error.ScrollbarUnderlayRestoreFailed;
 
         // back_tex may still be bound from the preceding paint. Explicitly
         // unbind it around the copy to avoid an RTV/copy-resource hazard.
@@ -3143,7 +3190,7 @@ pub const Renderer = struct {
         const dst_res: *c.ID3D11Resource = @ptrCast(back_tex);
         const src_res: *c.ID3D11Resource = @ptrCast(scratch);
         copy_sub(ctx, dst_res, 0, @intCast(rect.left), @intCast(rect.top), 0, src_res, 0, &src_box);
-        self.scrollbar_underlay_valid = false;
+        self.scrollbar_underlay_state.restored();
         return rect;
     }
 
@@ -3151,30 +3198,32 @@ pub const Renderer = struct {
     /// draw will cover. The texture is narrow and retained across fade ticks;
     /// it is recreated only when the track geometry changes. Caller must hold
     /// lockContext(), and must restore a prior underlay before capturing again.
-    pub fn captureScrollbarUnderlay(self: *Renderer, raw_rect: c.RECT) bool {
-        if (self.scrollbar_underlay_valid) return false;
+    pub fn captureScrollbarUnderlay(self: *Renderer, raw_rect: c.RECT) !?c.RECT {
+        if (self.scrollbar_underlay_state.valid) {
+            return error.ScrollbarUnderlayAlreadyValid;
+        }
 
-        const rect = self.clampBackDamageRect(raw_rect) orelse return false;
+        const rect = self.clampBackDamageRect(raw_rect) orelse return null;
         const rect_w: u32 = @intCast(rect.right - rect.left);
         const rect_h: u32 = @intCast(rect.bottom - rect.top);
-        const ctx = self.ctx orelse return false;
-        const back_tex = self.back_tex orelse return false;
-        const back_rtv = self.back_rtv orelse return false;
-        const dev = self.device orelse return false;
-
-        const geometry_changed = self.scrollbar_underlay_w != rect_w or
-            self.scrollbar_underlay_h != rect_h;
-        if (self.scrollbar_underlay_tex == null and !geometry_changed and self.scrollbar_underlay_failed) {
-            return false;
+        errdefer {
+            safeRelease(&self.scrollbar_underlay_tex);
+            self.scrollbar_underlay_state.resourceFailed();
         }
+
+        const ctx = self.ctx orelse return error.ScrollbarUnderlayCaptureFailed;
+        const back_tex = self.back_tex orelse return error.ScrollbarUnderlayCaptureFailed;
+        const back_rtv = self.back_rtv orelse return error.ScrollbarUnderlayCaptureFailed;
+        const dev = self.device orelse return error.ScrollbarUnderlayCaptureFailed;
+
+        const geometry_changed = self.scrollbar_underlay_state.geometryChanged(rect_w, rect_h);
         if (self.scrollbar_underlay_tex == null or geometry_changed) {
             safeRelease(&self.scrollbar_underlay_tex);
-            self.scrollbar_underlay_w = rect_w;
-            self.scrollbar_underlay_h = rect_h;
-            self.scrollbar_underlay_failed = false;
+            self.scrollbar_underlay_state.resourceFailed();
 
             var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
-            const get_desc = back_tex.*.lpVtbl.*.GetDesc orelse return false;
+            const get_desc = back_tex.*.lpVtbl.*.GetDesc orelse
+                return error.ScrollbarUnderlayCaptureFailed;
             get_desc(back_tex, &back_desc);
 
             var desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
@@ -3187,24 +3236,28 @@ pub const Renderer = struct {
             desc.Usage = c.D3D11_USAGE_DEFAULT;
             desc.BindFlags = 0;
 
-            const create_tex = dev.*.lpVtbl.*.CreateTexture2D orelse return false;
+            const create_tex = dev.*.lpVtbl.*.CreateTexture2D orelse
+                return error.ScrollbarUnderlayCaptureFailed;
             var scratch: ?*c.ID3D11Texture2D = null;
             const hr = create_tex(dev, &desc, null, @ptrCast(&scratch));
             if (c.FAILED(hr) or scratch == null) {
-                self.scrollbar_underlay_failed = true;
+                if (isDeviceLost(hr)) self.device_lost = true;
                 if (applog.isEnabled()) applog.appLog(
                     "[d3d] scrollbar underlay allocation failed {d}x{d} hr=0x{x}\n",
                     .{ rect_w, rect_h, @as(u32, @bitCast(hr)) },
                 );
-                return false;
+                return error.ScrollbarUnderlayCaptureFailed;
             }
             self.scrollbar_underlay_tex = scratch;
         }
 
-        const scratch = self.scrollbar_underlay_tex orelse return false;
+        const scratch = self.scrollbar_underlay_tex orelse
+            return error.ScrollbarUnderlayCaptureFailed;
         const ctx_vtbl = ctx.*.lpVtbl;
-        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return false;
-        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return false;
+        const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse
+            return error.ScrollbarUnderlayCaptureFailed;
+        const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse
+            return error.ScrollbarUnderlayCaptureFailed;
 
         om_set_rt(ctx, 0, null, null);
         defer {
@@ -3224,8 +3277,8 @@ pub const Renderer = struct {
         const src_res: *c.ID3D11Resource = @ptrCast(back_tex);
         copy_sub(ctx, dst_res, 0, 0, 0, 0, src_res, 0, &src_box);
         self.scrollbar_underlay_rect = rect;
-        self.scrollbar_underlay_valid = true;
-        return true;
+        self.scrollbar_underlay_state.captured(rect_w, rect_h);
+        return rect;
     }
 
     fn ensureGlowTextures(self: *Renderer) void {

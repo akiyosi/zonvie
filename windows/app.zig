@@ -87,6 +87,7 @@ pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
 pub const zonvie_core_retry_flush = core.zonvie_core_retry_flush;
 pub const zonvie_core_flush_had_atlas_corruption = core.zonvie_core_flush_had_atlas_corruption;
 pub const zonvie_core_flush_was_aborted = core.zonvie_core_flush_was_aborted;
+pub const zonvie_core_flush_is_retryable = core.zonvie_core_flush_is_retryable;
 pub const zonvie_core_invalidate_glyph_cache = core.zonvie_core_invalidate_glyph_cache;
 
 // Re-export additional core types used by sub-modules
@@ -422,7 +423,6 @@ pub const SurfaceState = struct {
     row_verts: std.ArrayListUnmanaged(RowVerts) = .empty,
     cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
-    dirty_rows: std.AutoHashMapUnmanaged(u32, void) = .{},
     paint_full: bool = true,
     rows: u32 = 0,
     cols: u32 = 0,
@@ -440,12 +440,17 @@ pub const SurfaceState = struct {
         return true;
     }
 
-    pub fn clearExtraRows(self: *SurfaceState, needed_rows: u32) void {
+    pub fn truncateRows(self: *SurfaceState, alloc: std.mem.Allocator, needed_rows: u32) usize {
         const start: usize = @intCast(needed_rows);
-        if (start >= self.row_verts.items.len) return;
+        if (start >= self.row_verts.items.len) return 0;
+        var removed: usize = 0;
         for (self.row_verts.items[start..]) |*rv| {
-            rv.verts.clearRetainingCapacity();
+            removed += rv.verts.items.len;
+            rv.verts.deinit(alloc);
+            rv.* = .{};
         }
+        self.row_verts.shrinkAndFree(alloc, start);
+        return removed;
     }
 
     pub fn recomputeVertCount(self: *const SurfaceState) usize {
@@ -460,7 +465,6 @@ pub const SurfaceState = struct {
     /// window struct and must be released separately.
     pub fn deinitCpuState(self: *SurfaceState, alloc: std.mem.Allocator) void {
         self.cursor_verts.deinit(alloc);
-        self.dirty_rows.deinit(alloc);
         self.verts.deinit(alloc);
         for (self.row_verts.items) |*rv| {
             rv.verts.deinit(alloc);
@@ -1642,6 +1646,8 @@ pub const RowVB = struct {
     uploaded_ver: u64 = 0,
 };
 
+pub const RowVBPhysicalBudget = render_pipeline_helpers.RowVBPhysicalBudget;
+
 // =========================================================================
 // Slot-based COW types (slot remapping + reference sharing)
 // =========================================================================
@@ -1875,6 +1881,7 @@ pub const ExternalWindow = struct {
     cursor_vb_bytes: usize = 0,
     // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
+    row_vb_retained_bytes: usize = 0,
     // Persistent scratch buffer for shiftRowVBs; sized to abs(vb_shift) before each shift.
     // Owned here (not on stack) so large scrolls never overflow a fixed stack array.
     row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
@@ -1927,7 +1934,11 @@ pub const ExternalWindow = struct {
         self.vert_count = self.surface.recomputeVertCount();
     }
 
-    pub fn deinit(self: *ExternalWindow, alloc: std.mem.Allocator) void {
+    pub fn deinit(
+        self: *ExternalWindow,
+        alloc: std.mem.Allocator,
+        row_vb_budget: *RowVBPhysicalBudget,
+    ) void {
         // Clear user data first to prevent WndProc from accessing App during destruction
         _ = c.SetWindowLongPtrW(self.hwnd, c.GWLP_USERDATA, 0);
 
@@ -1947,9 +1958,11 @@ pub const ExternalWindow = struct {
         }
         self.surface.deinitCpuState(alloc);
         // Release GPU VBs from TBS row_vbs.
-        for (self.row_vbs.items) |*rvb| {
-            if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
-        }
+        releaseRowVBs(
+            self.row_vbs.items,
+            row_vb_budget,
+            &self.row_vb_retained_bytes,
+        );
         self.row_vbs.deinit(alloc);
         // Scratch holds copies of RowVB entries during a shift; the GPU
         // buffers are owned by row_vbs, never by the scratch, so just free
@@ -2096,10 +2109,38 @@ pub fn ensureRowVBReady(
     return false;
 }
 
+fn ensureBudgetedRowVertexBuffer(
+    g: *d3d11.Renderer,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
+    vb_ptr: *?*c.ID3D11Buffer,
+    vb_bytes_ptr: *usize,
+    need_bytes: usize,
+) !void {
+    if (need_bytes == 0) return;
+    if (vb_ptr.* != null and vb_bytes_ptr.* >= need_bytes) return;
+
+    const old_bytes = if (vb_ptr.* != null) vb_bytes_ptr.* else 0;
+    const new_bytes = d3d11.Renderer.plannedExternalVertexBufferCapacity(
+        old_bytes,
+        need_bytes,
+    ) orelse return error.VertexBufferTooLarge;
+    var reservation = try budget.reserveGrowth(
+        surface_retained_bytes.*,
+        old_bytes,
+        new_bytes,
+    );
+    errdefer budget.cancel(&reservation);
+    try g.replaceExternalVertexBuffer(vb_ptr, vb_bytes_ptr, new_bytes);
+    budget.commit(surface_retained_bytes, &reservation);
+}
+
 /// Upload slot vertex data to a separate RowVB, comparing slot identity + version.
 /// Used by TBS-based paint path where CPU verts and GPU VBs are separate arrays.
 pub fn ensureRowVBReadyFromSlot(
     g: *d3d11.Renderer,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
     vb: *RowVB,
     mapping: RowMapping,
     pool: *const SlotPool,
@@ -2111,7 +2152,14 @@ pub fn ensureRowVBReadyFromSlot(
 
     if (vb.uploaded_slot != mapping.slot or vb.uploaded_ver != slot.ver or vb.vb == null or vb.vb_bytes < src.len * @sizeOf(Vertex)) {
         const need_bytes = src.len * @sizeOf(Vertex);
-        try g.ensureExternalVertexBuffer(&vb.vb, &vb.vb_bytes, need_bytes);
+        try ensureBudgetedRowVertexBuffer(
+            g,
+            budget,
+            surface_retained_bytes,
+            &vb.vb,
+            &vb.vb_bytes,
+            need_bytes,
+        );
         try g.uploadVertsToVB(vb.vb.?, src);
         vb.uploaded_slot = mapping.slot;
         vb.uploaded_ver = slot.ver;
@@ -2373,6 +2421,8 @@ pub fn applyScrollShift(
 /// This is the TBS-equivalent of drawSurfaceRowsVB.
 pub fn drawSurfaceRowsVBFromSlots(
     g: *d3d11.Renderer,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
     row_map: []const RowMapping,
     pool: *const SlotPool,
     row_vbs: []RowVB,
@@ -2387,7 +2437,7 @@ pub fn drawSurfaceRowsVBFromSlots(
     row_h_px: i32,
     log_enabled: bool,
     metrics: *SurfaceRowDrawMetrics,
-) void {
+) !void {
     const row_count: usize = if (rows_to_draw) |rows| rows.len else row_map.len;
     var vp_dirty = false;
     var i: usize = 0;
@@ -2444,7 +2494,15 @@ pub fn drawSurfaceRowsVBFromSlots(
         if (vb.uploaded_slot != mapping.slot or vb.uploaded_ver != slot.ver or vb.vb == null or vb.vb_bytes < src.len * @sizeOf(Vertex)) {
             const need_bytes = src.len * @sizeOf(Vertex);
             const t_upload_start = if (log_enabled) core.clock.nowNs() else 0;
-            _ = ensureRowVBReadyFromSlot(g, vb, mapping, pool) catch {
+            _ = ensureRowVBReadyFromSlot(
+                g,
+                budget,
+                surface_retained_bytes,
+                vb,
+                mapping,
+                pool,
+            ) catch |err| {
+                if (err == error.RowVBPhysicalBudgetExceeded) return err;
                 metrics.skipped_empty += 1;
                 metrics.failed_rows += 1;
                 continue;
@@ -2536,6 +2594,8 @@ pub fn drawSurfaceRowsVBFromSlots(
 /// Does NOT hold app_mu during VB upload (lock-free via TBS refcount).
 pub fn drawRowModeSetupAndRowsFromSlots(
     g: *d3d11.Renderer,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
     row_map: []const RowMapping,
     pool: *const SlotPool,
     row_vbs: []RowVB,
@@ -2596,8 +2656,10 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         }
     }
 
-    drawSurfaceRowsVBFromSlots(
+    try drawSurfaceRowsVBFromSlots(
         g,
+        budget,
+        surface_retained_bytes,
         row_map,
         pool,
         row_vbs,
@@ -2649,9 +2711,17 @@ pub fn detachOneSurfaceGpuVB(surface: *SurfaceState) ?*c.ID3D11Buffer {
 
 /// Device-loss recovery: release row-slot GPU buffers and reset their upload
 /// bookkeeping (slot mappings stay valid — they index the CPU-side pool).
-pub fn releaseRowVBs(row_vbs: []RowVB) void {
+pub fn releaseRowVBs(
+    row_vbs: []RowVB,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
+) void {
     for (row_vbs) |*rvb| {
-        if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        if (rvb.vb) |vb| {
+            const bytes = rvb.vb_bytes;
+            _ = vb.lpVtbl.*.Release.?(vb);
+            budget.release(surface_retained_bytes, bytes);
+        }
         rvb.* = .{};
     }
 }
@@ -2664,10 +2734,16 @@ pub fn releaseRowVBs(row_vbs: []RowVB) void {
 pub fn resizeRowVBsForPaint(
     alloc: std.mem.Allocator,
     row_vbs: *std.ArrayListUnmanaged(RowVB),
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
     need_len: usize,
 ) bool {
     if (row_vbs.items.len > need_len) {
-        releaseRowVBs(row_vbs.items[need_len..]);
+        releaseRowVBs(
+            row_vbs.items[need_len..],
+            budget,
+            surface_retained_bytes,
+        );
         row_vbs.items.len = need_len;
         return true;
     }
@@ -2679,11 +2755,17 @@ pub fn resizeRowVBsForPaint(
     return true;
 }
 
-pub fn detachOneRowVB(row_vbs: []RowVB) ?*c.ID3D11Buffer {
+pub const DetachedRowVB = struct {
+    buffer: *c.ID3D11Buffer,
+    bytes: usize,
+};
+
+pub fn detachOneRowVB(row_vbs: []RowVB) ?DetachedRowVB {
     for (row_vbs) |*rvb| {
         if (rvb.vb) |vb| {
+            const bytes = rvb.vb_bytes;
             rvb.* = .{};
-            return vb;
+            return .{ .buffer = vb, .bytes = bytes };
         }
     }
     return null;
@@ -3118,7 +3200,7 @@ pub const CursorOverlayParams = struct {
     row_already_redrawn: bool = false,
 };
 
-pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
+pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     const log_enabled = applog.isEnabled();
 
     if (p.cursor_verts.len == 0) {
@@ -3132,9 +3214,9 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
 
     // 1. Upload cursor verts to VB.
     const need_bytes: usize = p.cursor_verts.len * @sizeOf(Vertex);
-    g.ensureExternalVertexBuffer(p.cursor_vb, p.cursor_vb_bytes, need_bytes) catch return;
-    const vb = p.cursor_vb.* orelse return;
-    g.uploadVertsToVB(vb, p.cursor_verts) catch return;
+    try g.ensureExternalVertexBuffer(p.cursor_vb, p.cursor_vb_bytes, need_bytes);
+    const vb = p.cursor_vb.* orelse return error.CursorVertexBufferMissing;
+    try g.uploadVertsToVB(vb, p.cursor_verts);
 
     // 2. Resolve cursor row: use explicit value or compute from vertex NDC positions.
     const cursor_row: u32 = p.cursor_row orelse blk: {
@@ -3177,43 +3259,47 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) void {
     if (p.row_already_redrawn) {
         if (p.blink_visible) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
-            g.drawVB(vb, p.cursor_verts.len) catch {};
+            try g.drawVB(vb, p.cursor_verts.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
         }
     } else if (p.erase_cursor_row) {
         if (log_enabled) applog.appLog("[cursor-overlay] erase+draw row={d} verts={d} blink={}\n", .{ cursor_row, p.cursor_verts.len, p.blink_visible });
-        g.drawClearRow() catch {};
+        try g.drawClearRow();
         if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
             const rvb = &p.row_vbs[cursor_row];
             const mapping = p.row_map[cursor_row];
             const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
-                    g.drawVB(row_vb, slot_verts_len) catch {};
+                    try g.drawVB(row_vb, slot_verts_len);
                 }
+            } else if (slot_verts_len > 0) {
+                return error.CursorRowVertexBufferMissing;
             }
         }
         if (p.blink_visible) {
-            g.drawVB(vb, p.cursor_verts.len) catch {};
+            try g.drawVB(vb, p.cursor_verts.len);
         }
     } else if (p.blink_visible) {
         if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
-        g.drawVB(vb, p.cursor_verts.len) catch {};
+        try g.drawVB(vb, p.cursor_verts.len);
     } else {
         if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
         // The core represents a genuinely empty row with an empty vertex list.
         // Redrawing that list is a no-op, so first overwrite the scissored row
         // with the default background to erase the previously composited cursor.
-        g.drawClearRow() catch {};
+        try g.drawClearRow();
         if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
             const rvb = &p.row_vbs[cursor_row];
             const mapping = p.row_map[cursor_row];
             const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
-                    g.drawVB(row_vb, slot_verts_len) catch {};
+                    try g.drawVB(row_vb, slot_verts_len);
                 }
+            } else if (slot_verts_len > 0) {
+                return error.CursorRowVertexBufferMissing;
             }
         }
     }
@@ -3234,14 +3320,14 @@ pub fn drawScrollbarOverlay(
     vb_ptr: *?*c.ID3D11Buffer,
     vb_bytes_ptr: *usize,
     scrollbar_verts: []const Vertex,
-) void {
+) !void {
     if (scrollbar_verts.len == 0) return;
     g.setFullViewport();
     const need_bytes = scrollbar_verts.len * @sizeOf(Vertex);
-    g.ensureExternalVertexBuffer(vb_ptr, vb_bytes_ptr, need_bytes) catch return;
-    const vb = vb_ptr.* orelse return;
-    g.uploadVertsToVB(vb, scrollbar_verts) catch return;
-    g.drawVB(vb, scrollbar_verts.len) catch {};
+    try g.ensureExternalVertexBuffer(vb_ptr, vb_bytes_ptr, need_bytes);
+    const vb = vb_ptr.* orelse return error.ScrollbarVertexBufferMissing;
+    try g.uploadVertsToVB(vb, scrollbar_verts);
+    try g.drawVB(vb, scrollbar_verts.len);
 }
 
 /// Draw bloom/glow post-process overlay.
@@ -3521,6 +3607,9 @@ pub const App = struct {
     core_flush_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
+    row_vb_retained_bytes: usize = 0,
+    row_vb_budget: RowVBPhysicalBudget = .{},
+    row_vb_budget_failed: bool = false,
     // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
     row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent destination for linear dirty-row/range union during scroll.
@@ -3633,8 +3722,8 @@ pub const App = struct {
     atlas_full_upload_needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Device-loss recovery state (WM_APP_DEVICE_LOST_RECOVER). `posted`
-    // dedupes the paint-side trigger; `attempts` caps recovery to 3 per
-    // process lifetime before advising a restart.
+    // dedupes the paint-side trigger. Failed attempts drive a bounded
+    // exponential backoff; recovery continues until success or HWND teardown.
     device_lost_recover_posted: bool = false,
     // Durable UI-loop wake when both USER timers and the process timer queue
     // are unavailable during device-loss recovery.
@@ -3642,6 +3731,8 @@ pub const App = struct {
     main_size_replay_needed: bool = false,
     external_size_replay_needed: bool = false,
     device_lost_recover_attempts: u32 = 0,
+    device_lost_recovery_warning_shown: bool = false,
+    device_lost_recovery_cancelled: bool = false,
     // Set for the entire WM_APP_DEVICE_LOST_RECOVER handler (window.zig).
     // Device/D2D/swapchain creation there can pump window messages, which
     // can reenter WM_PAINT/WM_SIZE on this same UI thread — those handlers
@@ -4256,12 +4347,11 @@ pub const App = struct {
         // Triple-buffered surface cleanup (handles slot release + pool deinit)
         self.tbs.deinit(self.alloc);
         // Release GPU VBs for TBS row_vbs
-        for (self.row_vbs.items) |*vb| {
-            if (vb.vb) |p| {
-                const rel = p.*.lpVtbl.*.Release orelse null;
-                if (rel) |f| _ = f(p);
-            }
-        }
+        releaseRowVBs(
+            self.row_vbs.items,
+            &self.row_vb_budget,
+            &self.row_vb_retained_bytes,
+        );
         self.row_vbs.deinit(self.alloc);
         // Scratch holds shallow copies during a shift; GPU buffers belong to
         // row_vbs, so only free the list storage.
@@ -4306,7 +4396,7 @@ pub const App = struct {
         // External windows cleanup
         var ext_it = self.external_windows.iterator();
         while (ext_it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.alloc);
+            entry.value_ptr.*.deinit(self.alloc, &self.row_vb_budget);
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.external_windows.deinit(self.alloc);

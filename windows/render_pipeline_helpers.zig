@@ -4,6 +4,147 @@ pub fn nextBackoffDelayMs(current_ms: u32, max_ms: u32) u32 {
     return @min(current_ms *| 2, max_ms);
 }
 
+pub const device_lost_retry_initial_ms: u32 = 1000;
+pub const device_lost_retry_max_ms: u32 = 30_000;
+pub const device_lost_warning_after_attempts: u32 = 3;
+
+/// Recovery continues for the lifetime of the window, but retries become
+/// infrequent enough that a permanently unavailable adapter cannot spin the
+/// UI thread. `failed_attempts == 0` covers deferrals before device creation.
+pub fn deviceLostRetryDelayMs(failed_attempts: u32) u32 {
+    const exponent: u5 = @intCast(@min(failed_attempts -| 1, 5));
+    return @min(device_lost_retry_initial_ms << exponent, device_lost_retry_max_ms);
+}
+
+pub fn shouldWarnDeviceLostRecovery(failed_attempts: u32, warning_shown: bool) bool {
+    return !warning_shown and failed_attempts > device_lost_warning_after_attempts;
+}
+
+/// Choose a bounded geometric capacity for persistent GPU buffers. The
+/// caller creates the replacement before releasing the old resource, so a
+/// failed grow leaves the last usable buffer intact.
+pub fn geometricBufferCapacity(current_bytes: usize, need_bytes: usize, max_bytes: usize) ?usize {
+    if (need_bytes > max_bytes) return null;
+    if (need_bytes <= current_bytes) return current_bytes;
+    if (need_bytes == 0) return current_bytes;
+
+    var capacity = @max(current_bytes, @min(max_bytes, 4096));
+    while (capacity < need_bytes) {
+        capacity = @min(max_bytes, capacity *| 2);
+        if (capacity < need_bytes and capacity == max_bytes) return null;
+    }
+    return capacity;
+}
+
+pub const row_vb_surface_budget_bytes: usize = 256 * 1024 * 1024;
+pub const row_vb_process_budget_bytes: usize = 512 * 1024 * 1024;
+
+/// Check the physical peak while a replacement D3D buffer is created. The
+/// old buffer remains live until CreateBuffer succeeds, so `new_bytes` is
+/// charged in full in addition to all retained and pending storage.
+pub fn rowVBPhysicalGrowthFits(
+    process_retained_bytes: usize,
+    process_reserved_bytes: usize,
+    surface_retained_bytes: usize,
+    new_bytes: usize,
+    surface_limit_bytes: usize,
+    process_limit_bytes: usize,
+) bool {
+    const surface_peak = std.math.add(usize, surface_retained_bytes, new_bytes) catch return false;
+    const process_with_reservations = std.math.add(
+        usize,
+        process_retained_bytes,
+        process_reserved_bytes,
+    ) catch return false;
+    const process_peak = std.math.add(usize, process_with_reservations, new_bytes) catch return false;
+    return surface_peak <= surface_limit_bytes and process_peak <= process_limit_bytes;
+}
+
+pub const RowVBPhysicalBudget = struct {
+    retained_bytes: usize = 0,
+    reserved_bytes: usize = 0,
+
+    pub const Reservation = struct {
+        old_bytes: usize,
+        new_bytes: usize,
+        active: bool = true,
+    };
+
+    pub fn reserveGrowth(
+        self: *RowVBPhysicalBudget,
+        surface_retained_bytes: usize,
+        old_bytes: usize,
+        new_bytes: usize,
+    ) !Reservation {
+        if (!rowVBPhysicalGrowthFits(
+            self.retained_bytes,
+            self.reserved_bytes,
+            surface_retained_bytes,
+            new_bytes,
+            row_vb_surface_budget_bytes,
+            row_vb_process_budget_bytes,
+        )) return error.RowVBPhysicalBudgetExceeded;
+        self.reserved_bytes = std.math.add(
+            usize,
+            self.reserved_bytes,
+            new_bytes,
+        ) catch return error.RowVBPhysicalBudgetExceeded;
+        return .{ .old_bytes = old_bytes, .new_bytes = new_bytes };
+    }
+
+    pub fn cancel(self: *RowVBPhysicalBudget, reservation: *Reservation) void {
+        if (!reservation.active) return;
+        self.reserved_bytes -|= reservation.new_bytes;
+        reservation.active = false;
+    }
+
+    pub fn commit(
+        self: *RowVBPhysicalBudget,
+        surface_retained_bytes: *usize,
+        reservation: *Reservation,
+    ) void {
+        if (!reservation.active) return;
+        self.reserved_bytes -|= reservation.new_bytes;
+        self.retained_bytes -|= reservation.old_bytes;
+        surface_retained_bytes.* -|= reservation.old_bytes;
+        self.retained_bytes +|= reservation.new_bytes;
+        surface_retained_bytes.* +|= reservation.new_bytes;
+        reservation.active = false;
+    }
+
+    pub fn release(self: *RowVBPhysicalBudget, surface_retained_bytes: *usize, bytes: usize) void {
+        self.retained_bytes -|= bytes;
+        surface_retained_bytes.* -|= bytes;
+    }
+};
+
+/// Resource-independent ownership state for the retained scrollbar underlay.
+/// D3D resource failures reset the geometry as well as validity so the next
+/// paint retries allocation even when the track rectangle is unchanged.
+pub const ScrollbarUnderlayState = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    valid: bool = false,
+
+    pub fn geometryChanged(self: ScrollbarUnderlayState, width: u32, height: u32) bool {
+        return self.width != width or self.height != height;
+    }
+
+    pub fn captured(self: *ScrollbarUnderlayState, width: u32, height: u32) void {
+        self.width = width;
+        self.height = height;
+        self.valid = true;
+    }
+
+    pub fn restored(self: *ScrollbarUnderlayState) void {
+        self.valid = false;
+    }
+
+    pub fn resourceFailed(self: *ScrollbarUnderlayState) void {
+        self.* = .{};
+    }
+};
+
 pub fn retryEpochPending(failure_epoch: u64, success_epoch: u64) bool {
     return failure_epoch > success_epoch;
 }
