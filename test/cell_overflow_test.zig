@@ -374,7 +374,7 @@ test "destroyGrid removes overflow for that grid" {
     try populateOverflow(&g, 1, 50);
     try populateOverflow(&g, 2, 50);
 
-    g.destroyGrid(2);
+    try g.destroyGrid(2);
     try std.testing.expectEqual(@as(u32, 50), countOverflowForGrid(&g, 1));
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 2));
 }

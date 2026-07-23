@@ -88,6 +88,7 @@ pub const FrameReader = struct {
     end: usize = 0,
 
     pub const initial_capacity: usize = 64 * 1024;
+    pub const max_capacity: usize = 64 * 1024 * 1024;
 
     pub fn init(alloc: std.mem.Allocator, file: rpc_transport.Stream) !FrameReader {
         const buf = try alloc.alloc(u8, initial_capacity);
@@ -131,12 +132,9 @@ pub const FrameReader = struct {
     /// Pull more bytes from the pipe into `buf[end..]`. Compacts or grows
     /// the buffer first if the tail is exhausted. Returns 0 on EOF.
     ///
-    /// No hard size cap: the previous `PipeReader` accepted any frame size
-    /// (it read byte-at-a-time and the arena held the materialised Value),
-    /// and imposing one here would regress on large clipboard pastes,
-    /// `msg_history_show`, and wide-grid `grid_line` bursts. Buffer grows
-    /// via power-of-two `realloc`; genuine memory exhaustion surfaces as
-    /// the allocator's `error.OutOfMemory` and is handled by the caller.
+    /// The buffer is capped so an incomplete or malicious frame cannot grow
+    /// process memory without bound. Normal frames are consumed before the
+    /// next fill, so the cap applies to one outstanding wire object.
     pub fn fill(self: *FrameReader) !usize {
         if (self.end == self.buf.len) {
             if (self.pos > 0) {
@@ -145,7 +143,8 @@ pub const FrameReader = struct {
                 self.pos = 0;
                 self.end = live;
             } else {
-                const new_cap = self.buf.len * 2;
+                if (self.buf.len >= max_capacity) return error.FrameTooLarge;
+                const new_cap = @min(self.buf.len * 2, max_capacity);
                 self.buf = try self.alloc.realloc(self.buf, new_cap);
             }
         }
@@ -154,6 +153,12 @@ pub const FrameReader = struct {
         return n;
     }
 };
+
+comptime {
+    // A maximum-sized blob still needs MessagePack and RPC container bytes in
+    // the outstanding wire frame.
+    std.debug.assert((mp.DecodeLimits{}).max_blob_bytes < FrameReader.max_capacity);
+}
 
 /// Reader adapter that feeds `mp.decode` from a `[]const u8` view and tracks
 /// how many bytes were successfully consumed. Used as the bridge between
@@ -504,10 +509,7 @@ pub fn logEnvHints(self: *Core) void {
 
 fn failRedrawRecovery(self: *Core, reason: anyerror) void {
     self.log.write("redraw recovery failed: {any}\n", .{reason});
-    self.redraw_recovery_failed = true;
-    self.pending_resize_mu.lockUncancelable(clock.io());
-    self.ui_attached.store(false, .seq_cst);
-    self.pending_resize_mu.unlock(clock.io());
+    self.failHardRender(reason);
 }
 
 const max_redraw_recovery_attempts: u8 = 2;
@@ -516,14 +518,15 @@ fn handleRedrawFailure(self: *Core, reason: anyerror) void {
     // Reattaching replays the same authoritative Neovim state. A local hard
     // resource limit therefore cannot be healed by an epoch reset and would
     // otherwise produce an unbounded detach/attach loop.
-    switch (reason) {
-        error.GridTooLarge, error.TooManyWindowPlacements => {
-            failRedrawRecovery(self, reason);
-            return;
-        },
-        else => {},
+    if (Core.isHardRenderFailure(reason)) {
+        failRedrawRecovery(self, reason);
+        return;
     }
     beginRedrawRecovery(self);
+}
+
+fn handleRpcStreamFailure(self: *Core, reason: anyerror) void {
+    if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
 }
 
 fn requestRedrawRecoveryAttach(self: *Core) !void {
@@ -554,7 +557,7 @@ fn requestRedrawRecoveryAttach(self: *Core) !void {
 }
 
 fn beginRedrawRecovery(self: *Core) void {
-    if (self.redraw_recovery_failed or self.redraw_recovery_state == .await_detach) return;
+    if (self.redraw_recovery_failed.load(.seq_cst) or self.redraw_recovery_state == .await_detach) return;
     if (self.redraw_recovery_attempts >= max_redraw_recovery_attempts) {
         failRedrawRecovery(self, error.RedrawRecoveryLimitExceeded);
         return;
@@ -713,7 +716,9 @@ fn forceGlowFlush(self: *Core) void {
     while (sg_it.next()) |sg| sg.markAllDirty();
     self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
-    flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch {};
+    flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
+        if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
+    };
     self.redraw_thread_id.store(0, .seq_cst);
     self.grid_mu.unlock(clock.io());
 }
@@ -1320,6 +1325,115 @@ pub fn setupAgentStatus(self: *Core) void {
     self.log.write("agent status reporter installed\n", .{});
 }
 
+fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
+    const self = ctx.core;
+
+    // hl_group_set changes can alter decoration geometry. Resolve them before
+    // vertex generation so the flush that terminates this redraw batch carries
+    // the new glow state.
+    if (self.hl.groups_changed) {
+        self.hl.groups_changed = false;
+        self.resolveGlowGroups();
+        if (self.glow_enabled.load(.acquire)) {
+            self.grid.markAllDirty();
+            var sg_it = self.grid.sub_grids.valueIterator();
+            while (sg_it.next()) |sg| sg.markAllDirty();
+            self.force_ext_cursor_recheck = true;
+        }
+    }
+
+    // Promote an external editor grid before the frontend transaction. A
+    // successful flush must represent the final composition state of the
+    // redraw batch; changing win_pos after commit can otherwise stay invisible
+    // indefinitely when Neovim goes idle.
+    var ext_windows_promoted = false;
+    if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
+        var has_composited_editor_win = false;
+        var only_grid2_composited = true;
+        var wp_it = self.grid.win_pos.keyIterator();
+        while (wp_it.next()) |key_ptr| {
+            const gid = key_ptr.*;
+            if (gid == 1) continue;
+            if (self.grid.win_layer.contains(gid)) continue;
+            if (self.grid.external_grids.contains(gid)) continue;
+            if (!self.grid.grid_win_ids.contains(gid)) continue;
+            has_composited_editor_win = true;
+            if (gid != 2) only_grid2_composited = false;
+        }
+
+        if (has_composited_editor_win and self.grid.composited_win_closed and only_grid2_composited) {
+            try self.grid.hideWin(2);
+            has_composited_editor_win = false;
+            self.log.write("[ext_windows_promote] removed fallback grid 2 (composited_win_closed)\n", .{});
+        }
+        self.grid.composited_win_closed = false;
+
+        if (!has_composited_editor_win) {
+            const PromoteEntry = struct {
+                grid_id: i64,
+                win_id: i64,
+                row: u32,
+                col: u32,
+            };
+            var promote_target: ?PromoteEntry = null;
+            var fallback_target: ?PromoteEntry = null;
+            var ew_it = self.grid.ext_windows_grids.iterator();
+            while (ew_it.next()) |entry| {
+                const gid = entry.key_ptr.*;
+                const ext_info = self.grid.external_grids.get(gid) orelse continue;
+                const candidate: PromoteEntry = .{
+                    .grid_id = gid,
+                    .win_id = entry.value_ptr.*,
+                    .row = if (ext_info.start_row >= 0) @intCast(ext_info.start_row) else 0,
+                    .col = if (ext_info.start_col >= 0) @intCast(ext_info.start_col) else 0,
+                };
+                if (ext_info.start_row >= 0 and ext_info.start_col >= 0) {
+                    promote_target = candidate;
+                    break;
+                }
+                if (fallback_target == null) fallback_target = candidate;
+            }
+            if (promote_target == null) promote_target = fallback_target;
+
+            if (promote_target) |p| {
+                try self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col);
+                _ = self.grid.ext_windows_grids.remove(p.grid_id);
+                _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
+                _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
+                try self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols);
+                try self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols);
+                self.log.write(
+                    "[ext_windows_promote] promoted grid={d} win={d} at ({d},{d}), resized to {d}x{d}\n",
+                    .{ p.grid_id, p.win_id, p.row, p.col, self.grid.rows, self.grid.cols },
+                );
+                ext_windows_promoted = true;
+                self.grid.markAllDirty();
+            }
+        }
+    } else {
+        self.grid.composited_win_closed = false;
+    }
+
+    // Neovim can omit win_pos for the default editor grid with ext_windows.
+    // Install the fallback before vertex generation, unless a promoted editor
+    // grid already occupies the main surface.
+    if (!ext_windows_promoted and
+        !self.grid.win_pos.contains(2) and
+        !self.grid.ext_windows_grids.contains(2))
+    {
+        var has_other_editor_grid = false;
+        var wp_chk = self.grid.win_pos.keyIterator();
+        while (wp_chk.next()) |key_ptr| {
+            const gid = key_ptr.*;
+            if (gid == 1 or gid == 2) continue;
+            if (self.grid.win_layer.contains(gid)) continue;
+            has_other_editor_grid = true;
+            break;
+        }
+        if (!has_other_editor_grid) try self.grid.setWinPos(2, 1000, 0, 0);
+    }
+}
+
 pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
     if (top.len < 3) return;
     if (top[1] != .str or top[2] != .arr) return;
@@ -1333,7 +1447,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // be applied. During await_attach, redraw belongs to the fresh epoch
         // and is intentionally processed before Neovim serializes the attach
         // response.
-        if (self.redraw_recovery_failed or self.redraw_recovery_state == .await_detach) return;
+        if (self.redraw_recovery_failed.load(.seq_cst) or self.redraw_recovery_state == .await_detach) return;
 
         // Lock grid_mu to prevent concurrent access from UI thread during redraw.
         // NOTE: All frontend callbacks invoked below (on_vertices_*, on_guifont,
@@ -1364,6 +1478,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             params,
             &self.log,
             &fctx,
+            prepareRenderStateForFlush,
             flush.FlushCtx.onFlush,
             &fctx,
             flush.FlushCtx.onGuifont,
@@ -1395,23 +1510,6 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // redraw_batch tail latency. Verbose tier: 4 lines per redraw batch
         // add up during scroll bursts; enable [log] verbose to trace them.
         const log_on_notify = self.log.cb != null and self.log.verbose;
-
-        // Update cmdline grid BEFORE checking external windows
-        // (cmdline is rendered as an external grid)
-        const t_notify_cmdline: i128 = if (log_on_notify) clock.nowNs() else 0;
-        self.notifyCmdlineChanges();
-        if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_cmdline), 1000));
-            self.log.write("[perf] notify_cmdline us={d}\n", .{dt});
-        }
-
-        // Handle message changes (ext_messages)
-        const t_notify_msg: i128 = if (log_on_notify) clock.nowNs() else 0;
-        self.notifyMessageChanges();
-        if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_msg), 1000));
-            self.log.write("[perf] notify_message us={d}\n", .{dt});
-        }
 
         // Send config parse error on first redraw (Neovim is ready at this point)
         if (!self.config_error_sent) {
@@ -1515,186 +1613,6 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 }
             }
             self.grid.pending_win_ops.clearRetainingCapacity();
-
-            // ext_windows: Promote external grids back to composited when the main
-            // window has no composited editor windows left.
-            //
-            // This handles the case where the user closes the last composited window
-            // in a split layout (e.g. :close). Neovim sends win_close for the closed
-            // grid and win_pos for the remaining grid(s) in the same redraw batch.
-            // After processing the batch, if no editor windows remain composited in
-            // the main window, we promote external grids back to composited so the
-            // user sees them in the main window instead of only in separate OS windows.
-            //
-            // notifyExternalWindowChanges() (below) naturally detects the removal from
-            // external_grids and fires on_external_window_close so the frontend closes
-            // the external OS window.
-            //
-            // IMPORTANT: This must run BEFORE the grid 2 auto-compositing fallback
-            // below, because win_close removes grid 2 from win_pos, and the fallback
-            // would re-add it — making the promotion check think there's still a
-            // composited editor window and skipping promotion entirely.
-            var ext_windows_promoted = false;
-            if (self.ext_windows_enabled and self.grid.ext_windows_grids.count() > 0) {
-                // Detect whether the global grid has any composited editor windows.
-                // Skip: grid 1 (global/status), floats (in win_layer), external grids,
-                // and grids without a real Neovim window handle (not in grid_win_ids).
-                var has_composited_editor_win = false;
-                var only_grid2_composited = true;
-                {
-                    var wp_it = self.grid.win_pos.keyIterator();
-                    while (wp_it.next()) |key_ptr| {
-                        const gid = key_ptr.*;
-                        if (gid == 1) continue;
-                        if (self.grid.win_layer.contains(gid)) continue;
-                        if (self.grid.external_grids.contains(gid)) continue;
-                        if (!self.grid.grid_win_ids.contains(gid)) continue;
-                        has_composited_editor_win = true;
-                        if (gid != 2) only_grid2_composited = false;
-                    }
-                }
-
-                // If a composited editor window was closed in this batch and the
-                // only remaining composited window is grid 2, treat grid 2 as a
-                // Neovim fallback and remove it so promotion can proceed.
-                // This handles the case where: user closes a promoted window →
-                // Neovim re-composites grid 2 as default → we want to promote the
-                // next external window instead of showing grid 2's empty buffer.
-                if (has_composited_editor_win and self.grid.composited_win_closed and only_grid2_composited) {
-                    self.grid.hideWin(2);
-                    has_composited_editor_win = false;
-                    self.log.write("[ext_windows_promote] removed fallback grid 2 (composited_win_closed)\n", .{});
-                }
-                self.grid.composited_win_closed = false;
-
-                if (!has_composited_editor_win) {
-                    // Main window is empty of editor windows. Collect promotion candidates.
-                    // Only consider grids in BOTH ext_windows_grids AND external_grids.
-                    // ext_windows_grids can contain win_hide'd grids (tab switch) that have
-                    // been removed from external_grids — those must not be promoted.
-                    const PromoteEntry = struct {
-                        grid_id: i64,
-                        win_id: i64,
-                        row: u32,
-                        col: u32,
-                    };
-
-                    // Find ONE grid to promote. Only promote a single grid to avoid
-                    // multiple external grids rendering on top of each other in the
-                    // main window. The remaining external windows stay as separate
-                    // OS windows.
-                    //
-                    // Selection: pick the first candidate that exists in BOTH
-                    // ext_windows_grids AND external_grids, preferring one with a
-                    // valid position (start_row >= 0). If none have valid positions,
-                    // fall back to (0,0).
-                    var promote_target: ?PromoteEntry = null;
-                    var fallback_target: ?PromoteEntry = null;
-                    {
-                        var ew_it = self.grid.ext_windows_grids.iterator();
-                        while (ew_it.next()) |entry| {
-                            const gid = entry.key_ptr.*;
-                            const wid = entry.value_ptr.*;
-
-                            const ext_info = self.grid.external_grids.get(gid) orelse continue;
-
-                            if (ext_info.start_row >= 0 and ext_info.start_col >= 0) {
-                                // First candidate with valid position wins.
-                                promote_target = .{
-                                    .grid_id = gid,
-                                    .win_id = wid,
-                                    .row = @intCast(ext_info.start_row),
-                                    .col = @intCast(ext_info.start_col),
-                                };
-                                break;
-                            } else if (fallback_target == null) {
-                                // Remember first candidate as fallback (position unknown).
-                                fallback_target = .{
-                                    .grid_id = gid,
-                                    .win_id = wid,
-                                    .row = 0,
-                                    .col = 0,
-                                };
-                            }
-                        }
-                    }
-
-                    // Use fallback if no candidate had a valid position.
-                    if (promote_target == null and fallback_target != null) {
-                        promote_target = fallback_target;
-                        self.log.write("[ext_windows_promote] fallback: promoting grid={d} at (0,0) (no valid position)\n", .{fallback_target.?.grid_id});
-                    }
-
-                    // Execute promotion of the single selected grid.
-                    if (promote_target) |p| {
-                        self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col) catch |err| {
-                            self.log.write("[ext_windows_promote] setWinPos grid={d} failed: {any}\n", .{ p.grid_id, err });
-                            postprocess_error = err;
-                            break :postprocess;
-                        };
-                        _ = self.grid.ext_windows_grids.remove(p.grid_id);
-                        _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
-                        _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
-                        self.log.write("[ext_windows_promote] promoted grid={d} win={d} at ({d},{d})\n", .{ p.grid_id, p.win_id, p.row, p.col });
-
-                        // Resize the promoted grid to fill the main window IMMEDIATELY
-                        // so the grid content covers the entire main window (prevents
-                        // "window in a window" visual). New cells are filled with
-                        // spaces (default bg). Neovim will populate them when it
-                        // processes the try_resize_grid request.
-                        self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols) catch |err| {
-                            self.log.write("[ext_windows_promote] resizeGrid grid={d} failed: {any}\n", .{ p.grid_id, err });
-                            postprocess_error = err;
-                            break :postprocess;
-                        };
-                        self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols) catch |err| {
-                            self.log.write("[ext_windows_promote] requestTryResizeGridInternal grid={d} failed: {any}\n", .{ p.grid_id, err });
-                            postprocess_error = err;
-                            break :postprocess;
-                        };
-                        self.log.write("[ext_windows_promote] resized+requested grid={d} to {d}x{d}\n", .{ p.grid_id, self.grid.rows, self.grid.cols });
-
-                        ext_windows_promoted = true;
-                        self.grid.markAllDirty();
-                    }
-                }
-            } else {
-                // Clear the flag even when the promotion block was skipped
-                // (e.g. ext_windows disabled or no ext_windows grids).
-                self.grid.composited_win_closed = false;
-            }
-
-            // ext_windows: ensure grid 2 (default editor window) is composited.
-            // With ext_windows, Neovim may not send win_pos for the default window.
-            // If grid 2 has no win_pos and is not tracked as an ext_windows grid,
-            // auto-position it at (0,0) so it gets rendered in the main window.
-            //
-            // Skip this if:
-            //   - External grids were just promoted in this batch, OR
-            //   - Another non-float editor grid is already composited (e.g. a
-            //     previously promoted grid still occupying the main window).
-            // In both cases grid 2 would overlap the promoted grid.
-            if (!ext_windows_promoted) {
-                if (!self.grid.win_pos.contains(2) and !self.grid.ext_windows_grids.contains(2)) {
-                    var has_other_editor_grid = false;
-                    {
-                        var wp_chk = self.grid.win_pos.keyIterator();
-                        while (wp_chk.next()) |key_ptr| {
-                            const gid = key_ptr.*;
-                            if (gid == 1 or gid == 2) continue;
-                            if (self.grid.win_layer.contains(gid)) continue;
-                            has_other_editor_grid = true;
-                            break;
-                        }
-                    }
-                    if (!has_other_editor_grid) {
-                        self.grid.setWinPos(2, 1000, 0, 0) catch |err| {
-                            postprocess_error = err;
-                            break :postprocess;
-                        };
-                    }
-                }
-            }
         }
 
         if (postprocess_error) |reason| {
@@ -1703,20 +1621,6 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             self.grid_mu.unlock(clock.io());
             handleRedrawFailure(self, reason);
             return;
-        }
-
-        // Check again for external-window changes made by the promotion logic
-        // above, which runs after the redraw batch's final onFlush. Normal grid
-        // lifecycle notification already occurs transactionally inside onFlush;
-        // this post-pass only handles those later promotion mutations. Do NOT
-        // generate vertices here — it runs after commitFlush/atlas-swap.
-        const t_notify_extwin: i128 = if (log_on_notify) clock.nowNs() else 0;
-        if (!self.flush_aborted) {
-            _ = self.notifyExternalWindowChanges();
-        }
-        if (log_on_notify) {
-            const dt: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_notify_extwin), 1000));
-            self.log.write("[perf] notify_extwin us={d}\n", .{dt});
         }
 
         // Check IME off request (from mode_change event)
@@ -1729,22 +1633,9 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             }
         }
 
-        // Glow triggers: resolve under grid_mu (lightweight).
-        // Re-resolve hl IDs on groups_changed (hl_group_set events).
-        // On default_colors_set, only re-request glow config if glow is not yet
-        // configured (initial nil response). Once glow is active, skip re-request
-        // to avoid disruptive async clear+reload cycles.
+        // default_colors_set triggers an asynchronous config reload after the
+        // grid lock is released. hl_group_set was resolved by the pre-flush hook.
         var need_reload_glow_config = false;
-        if (self.hl.groups_changed) {
-            self.hl.groups_changed = false;
-            self.resolveGlowGroups();
-            if (self.glow_enabled.load(.acquire)) {
-                self.grid.markAllDirty();
-                var sg_it = self.grid.sub_grids.valueIterator();
-                while (sg_it.next()) |sg| sg.markAllDirty();
-                self.force_ext_cursor_recheck = true;
-            }
-        }
         if (self.hl.default_colors_changed) {
             self.hl.default_colors_changed = false;
             // Always re-request glow config on colorscheme change.
@@ -2495,6 +2386,7 @@ pub fn runLoop(self: *Core) void {
                         if (log_on_msg) io_wait_ns += clock.nowNs() - t_io;
                         const n = fill_res catch |fe| {
                             self.log.write("pipe read err: {any}\n", .{fe});
+                            handleRpcStreamFailure(self, fe);
                             break :outer;
                         };
                         if (n == 0) {
@@ -2504,6 +2396,7 @@ pub fn runLoop(self: *Core) void {
                         continue;
                     }
                     self.log.write("decode err: {any}\n", .{e});
+                    handleRpcStreamFailure(self, e);
                     break :outer;
                 }
             }
@@ -2520,7 +2413,7 @@ pub fn runLoop(self: *Core) void {
             }
             if (t == 1) {
                 handleRpcResponse(self, top);
-                if (self.redraw_recovery_failed) break :outer;
+                if (self.redraw_recovery_failed.load(.seq_cst)) break :outer;
                 continue;
             }
             if (t == 2) {
@@ -2539,7 +2432,7 @@ pub fn runLoop(self: *Core) void {
                         .{ method_for_log, decode_us, io_wait_us, dispatch_us },
                     );
                 }
-                if (self.redraw_recovery_failed) break :outer;
+                if (self.redraw_recovery_failed.load(.seq_cst)) break :outer;
                 // If the notification queued a restart/connect, decide
                 // whether to break the inner loop NOW or wait for the
                 // natural channel close.
@@ -2580,7 +2473,7 @@ pub fn runLoop(self: *Core) void {
         // its own clean shutdown — channel close (EOF) is just one of
         // the last steps in nvim's exit, not the end. Propagate the
         // term so on_exit can compute the right exit code.
-        const redraw_recovery_failed = self.redraw_recovery_failed;
+        const redraw_recovery_failed = self.redraw_recovery_failed.load(.seq_cst);
         const preserve_recovery_child = redraw_recovery_failed and
             !self.stop_flag.load(.seq_cst);
         self.log.write("session loop: invoking cleanupSession (remote_restart_break={any}, redraw_recovery_failed={any})\n", .{ remote_restart_break, redraw_recovery_failed });
@@ -2953,8 +2846,173 @@ test "redraw recovery retry limit is session fatal" {
 
     beginRedrawRecovery(&core);
 
-    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expectEqual(nvim_core.RedrawRecoveryState.healthy, core.redraw_recovery_state);
+}
+
+test "RPC stream hard limits poison the session" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    handleRpcStreamFailure(&core, error.MessageTooLarge);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(!core.ui_attached.load(.seq_cst));
+
+    core.redraw_recovery_failed.store(false, .seq_cst);
+    core.ui_attached.store(true, .seq_cst);
+    handleRpcStreamFailure(&core, error.FrameTooLarge);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(!core.ui_attached.load(.seq_cst));
+}
+
+test "pre-flush grid 2 fallback is present in the same committed vertices" {
+    const State = struct {
+        saw_grid_2: bool = false,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (verts.?[0..vert_count]) |vertex| {
+                if (vertex.grid_id == 2) self.saw_grid_2 = true;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    try core.grid.resizeGrid(2, 1, 1);
+    core.grid.putCellGrid(2, 0, 0, 'X', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var flush_ctx = flush.FlushCtx{ .core = &core };
+    try prepareRenderStateForFlush(&flush_ctx);
+    try std.testing.expect(core.grid.win_pos.contains(2));
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(state.saw_grid_2);
+}
+
+test "pre-flush glow resolution affects the same committed vertices" {
+    const State = struct {
+        saw_glow: bool = false,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (verts.?[0..vert_count]) |vertex| {
+                if (vertex.deco_flags & c_api.DECO_GLOW != 0) self.saw_glow = true;
+            }
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    core.grid.putCell(0, 0, 'G', 42);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    const group_name = try core.alloc.dupe(u8, "GlowNow");
+    core.glow_group_names.append(core.alloc, group_name) catch |err| {
+        core.alloc.free(group_name);
+        return err;
+    };
+    try core.hl.setGroup("GlowNow", 42);
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = flush.FlushCtx{ .core = &core };
+    try prepareRenderStateForFlush(&flush_ctx);
+    try std.testing.expect(core.glow_enabled.load(.acquire));
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(state.saw_glow);
 }
 
 test "child reaper does not wait for inherited stderr EOF" {

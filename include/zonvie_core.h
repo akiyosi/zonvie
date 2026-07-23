@@ -183,6 +183,15 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
+/* on_vertices_row layers are independent, like on_vertices_partial:
+   - When MAIN is not set, existing row contents must be retained.
+   - CURSOR set carries the complete cursor layer for that grid; vert_count=0
+     clears it. A cursor-only callback must not replace row contents.
+   A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
+   a layout-only zero-cell transition. total_rows/total_cols are authoritative,
+   and at least one is zero. It clears the logical MAIN surface without
+   treating a nonexistent row as row content. */
+
 /* Main row-buffer scroll fast path notification.
    The core calls this when it can preserve previously submitted main-row content
    by shifting existing row buffers instead of resubmitting every reused row.
@@ -1178,7 +1187,8 @@ ZONVIE_API int64_t zonvie_core_try_get_cursor_position(
 ZONVIE_API int64_t zonvie_core_get_win_id(zonvie_core *core, int64_t grid_id);
 
 /* Get current mode name (e.g., "normal", "insert", "terminal").
-   Returns pointer to null-terminated string. Do not free.
+   Returns a thread-local null-terminated snapshot. Do not free. The pointer
+   remains valid until the next call on the same thread.
    Returns empty string if core is null. */
 ZONVIE_API const char* zonvie_core_get_current_mode(zonvie_core *core);
 
@@ -1517,13 +1527,24 @@ ZONVIE_API int32_t zonvie_core_try_cell_has_url(
 ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
 
 /* Abort the current flush cycle.
-   Call from on_flush_begin when the frontend cannot accept this flush
-   (e.g. no free buffer set, or commandBuffer creation failed with pending atlas state).
+   Call from on_flush_begin or on_flush_end when the frontend cannot accept
+   this flush (e.g. no free buffer set, or a late buffer commit failed).
    Sets an internal flag that causes the flush pipeline to skip vertex generation,
-   atlas operations, and vertex submission.
+   atlas operations, and vertex submission when called before those stages.
+   An on_flush_end abort invalidates the current core accounting ledger and
+   restores dirty state before the flush transaction returns.
    on_flush_end is still called (via defer) so the frontend can clean up.
    The aborted flush's dirty state is preserved — next flush retries everything. */
 ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
+
+/* Mark the current UI session failed after a frontend-side fixed physical
+   rendering-resource budget rejects capacity provisioning. Frontend physical
+   storage is independent of the core's logical vertex budgets because
+   buffering and copy-on-write may retain multiple copies. A core-valid frame
+   is therefore not guaranteed to fit every frontend's physical representation.
+   This is terminal for the session; callers must not schedule another flush
+   retry. */
+ZONVIE_API void zonvie_core_fail_render_budget(zonvie_core *core);
 
 /* Returns true when the flush that JUST ran detected an atlas reset during
    the deferred external-grid pass, after main vertices for this same flush
@@ -1549,6 +1570,10 @@ ZONVIE_API bool zonvie_core_flush_had_atlas_corruption(zonvie_core *core);
    resend it. */
 ZONVIE_API bool zonvie_core_flush_was_aborted(zonvie_core *core);
 
+/* Returns false when the last abort was a fixed resource-limit violation.
+   Such a flush must be cancelled but not scheduled for automatic retry. */
+ZONVIE_API bool zonvie_core_flush_is_retryable(zonvie_core *core);
+
 /* Retry a flush that was previously aborted via zonvie_core_abort_flush.
    Flushes are normally driven by incoming Neovim redraw batches; an abort
    preserves dirty state but does NOT by itself cause another flush attempt.
@@ -1570,10 +1595,8 @@ ZONVIE_API void zonvie_core_retry_flush(zonvie_core *core);
 ZONVIE_API void zonvie_core_retry_flush_locked(zonvie_core *core);
 
 /* Force every grid to be treated as dirty on the next flush attempt.
-   For frontend failures only discoverable AFTER onFlush already cleared
-   its dirty state this flush (e.g. a macOS MTLBuffer allocation failing
-   while writing the committed frame) — too late for zonvie_core_abort_flush,
-   whose flag is only consulted during onFlush's own execution. Call
+   For failures discovered outside the on_flush_begin/on_flush_end transaction,
+   after onFlush has returned and already cleared its dirty state. Call
    zonvie_core_retry_flush afterward (or rely on the next Neovim redraw) to
    actually drive the next attempt.
    Takes grid_mu itself — call ONLY from a context that does not already

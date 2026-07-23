@@ -512,6 +512,13 @@ pub const Core = struct {
     scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
     scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
     scroll_cache_rows: u32 = 0,
+    main_vertex_row_counts: std.ArrayListUnmanaged(usize) = .empty,
+    main_surface_vertex_count: usize = 0,
+    main_vertex_row_ledger_valid: bool = true,
+    flush_vertex_count_aggregate: usize = 0,
+    vertex_budget_transaction_active: bool = false,
+    vertex_budget_main_touched: bool = false,
+    vertex_budget_touched_grid_head: ?i64 = null,
 
     // Subgrid layout snapshot for scroll fast path.
     // Stores the (grid_id, row_start, row_end) of every composited subgrid
@@ -555,6 +562,7 @@ pub const Core = struct {
     main_subgrid_row_layout: std.ArrayListUnmanaged(flush.MainSubgridRowLayout) = .empty,
     main_subgrid_row_index_rows: u32 = 0,
     main_subgrid_row_index_valid: bool = false,
+    main_subgrid_row_index_generation: u64 = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
@@ -600,7 +608,7 @@ pub const Core = struct {
     /// a fresh protocol epoch.
     redraw_recovery_state: RedrawRecoveryState = .healthy,
     redraw_recovery_msgid: i64 = 0,
-    redraw_recovery_failed: bool = false,
+    redraw_recovery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     redraw_recovery_attach_rows: u32 = 0,
     redraw_recovery_attach_cols: u32 = 0,
     redraw_recovery_attempts: u8 = 0,
@@ -704,6 +712,9 @@ pub const Core = struct {
     /// When true, the flush pipeline skips vertex generation and atlas operations.
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
+    /// False when aborting cannot be healed by retrying the same state (for
+    /// example, a fixed resource budget was exceeded).
+    flush_retryable: bool = true,
 
     /// Set when an atlas reset is detected during the DEFERRED external-grid
     /// pass (sendExternalGridVertices, runs after on_flush_end's LIFO defer
@@ -829,6 +840,8 @@ pub const Core = struct {
     // flush at 0-1ms intervals under memory pressure.
     msg_show_retry_at: ?i128 = null,
     msg_show_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
+    msg_history_retry_at: ?i128 = null,
+    msg_history_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
 
     // Auto-hide deadlines for ext_float grids (nanos timestamp)
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
@@ -1017,17 +1030,65 @@ pub const Core = struct {
         return @bitCast(self.glow_intensity_bits.load(.acquire));
     }
 
+    pub fn isHardRenderFailure(reason: anyerror) bool {
+        return switch (reason) {
+            error.GridTooLarge,
+            error.TooManySubgrids,
+            error.TooManyWindowPlacements,
+            error.LayoutTooComplex,
+            error.VertexBudgetExceeded,
+            error.MessageTooLarge,
+            error.FrameTooLarge,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Record a fixed rendering/resource violation from any flush driver.
+    /// The RPC loop observes redraw_recovery_failed and terminates this UI
+    /// session instead of retrying state that cannot fit the configured cap.
+    pub fn failHardRender(self: *Core, reason: anyerror) void {
+        self.log.write("render hard failure: {any}\n", .{reason});
+        self.redraw_recovery_failed.store(true, .seq_cst);
+        self.ui_attached.store(false, .seq_cst);
+    }
+
+    /// Wake a FrameReader blocked after an asynchronous frontend hard failure
+    /// without setting stop_flag. The RPC loop must retain ownership of normal
+    /// session cleanup and on_exit delivery.
+    pub fn wakeRpcReaderForHardFailure(self: *Core) void {
+        // Spawn transport: terminating the peer closes its stdout pipe, which
+        // is the only portable way to wake a concurrent blocking pipe read.
+        self.requestChildTermination();
+
+        // Connect transport: no child owns the peer endpoint, so cancel the
+        // local blocking read directly. Keep the Stream published for the RPC
+        // thread's cleanup; shutdown/CancelIoEx do not transfer ownership.
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        defer self.stdin_close_mu.unlock(clock.io());
+        if (self.transport_kind != .socket) return;
+        if (self.stdin_file) |stream| {
+            stream.shutdownIfSocket(true);
+            switch (stream) {
+                .win_pipe => stream.close(),
+                .file => {},
+            }
+        }
+    }
+
     pub fn setGlowIntensity(self: *Core, val: f32) void {
         self.glow_intensity_bits.store(@bitCast(val), .release);
     }
 
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
+        var grid = Grid.init(alloc);
+        grid.setRowIndexBudgetEnabled(cb.on_vertices_row != null);
         return .{
             .alloc = alloc,
             .cb = cb,
             .ctx = ctx,
             .log = .{ .cb = cb.on_log, .ctx = ctx },
-            .grid = Grid.init(alloc),
+            .grid = grid,
             .hl = Highlights.init(alloc),
         };
     }
@@ -1057,6 +1118,7 @@ pub const Core = struct {
         }
         self.scroll_cache.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
+        self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
@@ -1217,7 +1279,7 @@ pub const Core = struct {
             self.clipboard_setup_done = false;
             self.redraw_recovery_state = .healthy;
             self.redraw_recovery_msgid = 0;
-            self.redraw_recovery_failed = false;
+            self.redraw_recovery_failed.store(false, .seq_cst);
             self.redraw_recovery_attach_rows = 0;
             self.redraw_recovery_attach_cols = 0;
             self.redraw_recovery_attempts = 0;
@@ -1343,6 +1405,12 @@ pub const Core = struct {
         self.pre_cmdline_cursor_grid = 1;
         self.pre_cmdline_cursor_row = 0;
         self.pre_cmdline_cursor_col = 0;
+        self.main_surface_vertex_count = 0;
+        self.main_vertex_row_ledger_valid = false;
+        self.flush_vertex_count_aggregate = 0;
+        self.vertex_budget_transaction_active = false;
+        self.vertex_budget_main_touched = false;
+        self.vertex_budget_touched_grid_head = null;
         self.popupmenu_win_id = null;
         self.popupmenu_buf_id = null;
 
@@ -1351,6 +1419,8 @@ pub const Core = struct {
         // session's first message at the old deadline.
         self.msg_show_pending_since = null;
         self.msg_show_retry_at = null;
+        self.msg_history_retry_at = null;
+        self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
         self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
         self.msg_show_auto_hide_at = null;
         self.msg_history_auto_hide_at = null;
@@ -1374,6 +1444,21 @@ pub const Core = struct {
         // Subgrid layout snapshot for scroll fast path: stale entries
         // would reference grid_ids the new session has not (yet) created.
         self.prev_subgrid_snapshots.clearRetainingCapacity();
+
+        // The row buckets describe the previous session's placement maps.
+        // Release their hostile-input high-water capacity together with the
+        // placement maps and force the first new-session row flush to rebuild.
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_offsets = .empty;
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets = .empty;
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_indices = .empty;
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.main_subgrid_row_layout = .empty;
+        self.main_subgrid_row_index_rows = 0;
+        self.main_subgrid_row_index_valid = false;
+        self.main_subgrid_row_index_generation = 0;
 
         // External-float scratch is bounded during a session, but a hostile
         // previous peer may have driven it to that high-water mark. Session
@@ -1621,6 +1706,14 @@ pub const Core = struct {
 
         self.claimChildHandleForCleanup();
 
+        // Frontend retry workers serialize with grid mutation through this
+        // mutex. Threads which can originate callbacks have already joined,
+        // so taking it here cannot invert the RPC/grid lock order. stop_flag
+        // was published before the joins, making late retries no-op before
+        // they can observe the resources released below.
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
+
         self.hl.deinit();
         self.grid.deinit();
 
@@ -1634,6 +1727,7 @@ pub const Core = struct {
         }
         self.scroll_cache.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
+        self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
@@ -1714,7 +1808,9 @@ pub const Core = struct {
     /// Grows or shrinks the per-row vertex lists as needed.
     pub fn ensureScrollCache(self: *Core, target_rows: u32) !void {
         const cur = self.scroll_cache_rows;
-        if (cur == target_rows and self.scroll_cache.items.len == target_rows) return;
+        if (cur == target_rows and
+            self.scroll_cache.items.len == target_rows and
+            self.main_vertex_row_counts.items.len == target_rows) return;
 
         // Shrink: deinit excess row buffers
         if (self.scroll_cache.items.len > target_rows) {
@@ -1727,6 +1823,23 @@ pub const Core = struct {
         // Grow: append empty row buffers
         while (self.scroll_cache.items.len < target_rows) {
             try self.scroll_cache.append(self.alloc, .empty);
+        }
+
+        const old_count_len = self.main_vertex_row_counts.items.len;
+        try self.main_vertex_row_counts.ensureTotalCapacity(self.alloc, target_rows);
+        self.main_vertex_row_counts.items.len = target_rows;
+        if (target_rows > old_count_len) {
+            @memset(self.main_vertex_row_counts.items[old_count_len..], 0);
+        } else if (target_rows < old_count_len and self.main_vertex_row_ledger_valid) {
+            // resize() has already shortened the slice; recompute only on a
+            // structural shrink, never on the per-row hot path.
+            const old_surface_vertex_count = self.main_surface_vertex_count;
+            self.main_surface_vertex_count = 0;
+            for (self.main_vertex_row_counts.items) |count| {
+                self.main_surface_vertex_count +|= count;
+            }
+            self.flush_vertex_count_aggregate -|=
+                old_surface_vertex_count -| self.main_surface_vertex_count;
         }
 
         // Resize the valid bitset
@@ -1753,6 +1866,10 @@ pub const Core = struct {
             self.scroll_cache_valid.unsetAll();
         }
         self.scroll_cache_rows = 0;
+        self.main_vertex_row_counts.clearRetainingCapacity();
+        self.flush_vertex_count_aggregate -|= self.main_surface_vertex_count;
+        self.main_surface_vertex_count = 0;
+        self.main_vertex_row_ledger_valid = true;
 
         // Reset subgrid snapshot so the next flush treats all subgrids as new.
         self.prev_subgrid_snapshots.clearRetainingCapacity();
@@ -4955,7 +5072,7 @@ pub const Core = struct {
     }
 
     pub fn sendMsgHistoryShow(self: *Core) void {
-        flush.sendMsgHistoryShow(self);
+        _ = flush.sendMsgHistoryShow(self);
     }
 
     pub fn hideMsgHistory(self: *Core) void {
@@ -4999,6 +5116,53 @@ pub const Core = struct {
         rpc_session.runLoop(self);
     }
 };
+
+fn checkScrollLedgerResizeAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    try core.ensureScrollCache(2);
+    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22 });
+
+    core.ensureScrollCache(64) catch |err| {
+        try std.testing.expectEqualSlices(
+            usize,
+            &.{ 11, 22 },
+            core.main_vertex_row_counts.items[0..2],
+        );
+        if (core.main_vertex_row_counts.items.len > 2) {
+            for (core.main_vertex_row_counts.items[2..]) |count| {
+                try std.testing.expectEqual(@as(usize, 0), count);
+            }
+        }
+        return err;
+    };
+}
+
+test "scroll ledger resize remains initialized on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkScrollLedgerResizeAllocationFailure,
+        .{},
+    );
+}
+
+test "scroll ledger structural changes keep vertex aggregate synchronized" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.ensureScrollCache(3);
+    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22, 33 });
+    core.main_surface_vertex_count = 66;
+    core.flush_vertex_count_aggregate = 166;
+
+    try core.ensureScrollCache(2);
+    try std.testing.expectEqual(@as(usize, 33), core.main_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 133), core.flush_vertex_count_aggregate);
+
+    core.invalidateScrollCache();
+    try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
+}
 
 const AtlasFailureTestState = struct {
     core: *Core,
@@ -5852,6 +6016,51 @@ test "RPC-thread stop requests shutdown without joining itself" {
     try std.testing.expect(core.waitUntilStopped());
 }
 
+test "asynchronous hard failure wakes a socket RPC reader" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var sockets: [2]std.posix.socket_t = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.socketpair(
+        std.posix.AF.UNIX,
+        std.posix.SOCK.STREAM,
+        0,
+        &sockets,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+
+    const local_file = std.Io.File{ .handle = sockets[0], .flags = .{ .nonblocking = false } };
+    const peer_file = std.Io.File{ .handle = sockets[1], .flags = .{ .nonblocking = false } };
+    defer peer_file.close(clock.io());
+
+    const Reader = struct {
+        fn run(stream: Stream, returned: *std.atomic.Value(bool)) void {
+            var byte: [1]u8 = undefined;
+            _ = stream.read(&byte) catch {};
+            returned.store(true, .release);
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.stdin_file = Stream.fromFile(local_file);
+    core.transport_kind = .socket;
+    var returned = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ core.stdin_file.?, &returned });
+
+    core.failHardRender(error.VertexBudgetExceeded);
+    core.wakeRpcReaderForHardFailure();
+    reader.join();
+    try std.testing.expect(returned.load(.acquire));
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+
+    core.stdin_file = null;
+    local_file.close(clock.io());
+}
+
 test "on_log stop stays non-blocking while teardown mutex is held" {
     const Callback = struct {
         fn log(ctx: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {
@@ -5967,7 +6176,7 @@ test "redraw allocation failure poisons epoch and suppresses batch presentation"
     try std.testing.expectEqual(@as(u32, ' '), core.grid.getCell(0, 1).cp);
     try std.testing.expectEqual(@as(u32, 0), test_ctx.row_callbacks);
     try std.testing.expect(!core.hl.groups.contains("RecoveryTest"));
-    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expect(!core.ui_attached.load(.acquire));
 }
 
@@ -5992,7 +6201,7 @@ test "redraw detach response resets poisoned protocol state before reattach" {
     // The test core has no writer thread, so queueing the fresh attach fails
     // after reset. That still proves the detach-response boundary clears the
     // complete old protocol epoch before any reattach can be attempted.
-    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), core.grid.sub_grids.count());
     try std.testing.expectEqual(@as(usize, 0), core.grid.win_pos.count());
     try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
@@ -6079,7 +6288,7 @@ test "hard redraw resource limit fails the session without epoch retry" {
 
     rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
 
-    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expectEqual(@as(u8, 0), core.redraw_recovery_attempts);
     try std.testing.expectEqual(RedrawRecoveryState.healthy, core.redraw_recovery_state);
 }
@@ -6099,7 +6308,7 @@ test "redraw post-processing failure poisons the attachment" {
 
     // The test core has no writer, so try_resize_grid fails. It must enter the
     // same poisoned-session boundary instead of being logged and ignored.
-    try std.testing.expect(core.redraw_recovery_failed);
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expect(!core.ui_attached.load(.acquire));
 }
 

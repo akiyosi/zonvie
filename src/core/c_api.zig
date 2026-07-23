@@ -5,6 +5,8 @@ pub const config = @import("config.zig");
 const shader_compiler = @import("shader_compiler.zig");
 const rpc_transport = @import("rpc_transport.zig");
 
+threadlocal var current_mode_snapshot: [16]u8 = [_]u8{0} ** 16;
+
 // Process-wide std.Io provider (Zig 0.16). Re-exported so frontend and test
 // code that imports the core package can reach the shared Io and clock.
 pub const clock = @import("clock.zig");
@@ -760,6 +762,46 @@ test "callback destroy can be completed after enclosing API returns" {
     zonvie_core_destroy(p);
 }
 
+test "retry entry points reject work after stop is requested" {
+    const State = struct {
+        callback_count: u32 = 0,
+
+        fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.callback_count += 1;
+        }
+    };
+
+    var state = State{};
+    var callbacks: Callbacks = .{ .on_flush_begin = State.onFlushBegin };
+    const p = zonvie_core_create(&callbacks, @sizeOf(Callbacks), &state) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+    try box.core.grid.resizeGrid(1, 1, 1);
+
+    box.core.stop_flag.store(true, .release);
+    zonvie_core_retry_flush(p);
+    zonvie_core_retry_flush_locked(p);
+    try std.testing.expectEqual(@as(u32, 0), state.callback_count);
+}
+
+test "current mode accessor returns a snapshot independent of core storage" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+
+    @memset(box.core.grid.current_mode_name[0..], 0);
+    @memcpy(box.core.grid.current_mode_name[0..6], "normal");
+    const snapshot = zonvie_core_get_current_mode(p);
+
+    box.core.grid_mu.lockUncancelable(clock.io());
+    @memset(box.core.grid.current_mode_name[0..], 0);
+    @memcpy(box.core.grid.current_mode_name[0..6], "insert");
+    box.core.grid_mu.unlock(clock.io());
+
+    try std.testing.expectEqualStrings("normal", std.mem.span(snapshot));
+}
+
 pub export fn zonvie_core_start(p: ?*zonvie_core, nvim_path_c: ?[*:0]const u8, rows: u32, cols: u32) callconv(.c) i32 {
     if (p == null) return -1;
     const box = asBox(p.?);
@@ -1138,7 +1180,9 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     // generation and external-window lifecycle notification inside the same
     // frontend bracket, so atlas publication and commit are one transaction.
     var fctx = flush_mod.FlushCtx{ .core = &box.core };
-    flush_mod.FlushCtx.onFlush(&fctx, box.core.grid.rows, box.core.grid.cols) catch {};
+    flush_mod.FlushCtx.onFlush(&fctx, box.core.grid.rows, box.core.grid.cols) catch |reason| {
+        if (nvim_core.Core.isHardRenderFailure(reason)) box.core.failHardRender(reason);
+    };
 }
 
 /// Returns milliseconds until the earliest pending message or render-
@@ -1322,15 +1366,16 @@ pub export fn zonvie_core_get_win_id(p: ?*zonvie_core, grid_id: i64) callconv(.c
 }
 
 /// Get current mode name (e.g., "normal", "insert", "terminal").
-/// Returns pointer to null-terminated string. Do not free.
-/// Returns null if core is null.
+/// Returns a thread-local null-terminated snapshot. Do not free.
+/// Returns an empty string if core is null.
 pub export fn zonvie_core_get_current_mode(p: ?*zonvie_core) callconv(.c) [*:0]const u8 {
     if (p == null) return "";
     const box = asBox(p.?);
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
-    // Return pointer to the internal buffer (null-terminated)
-    return @ptrCast(&box.core.grid.current_mode_name);
+    @memcpy(current_mode_snapshot[0..], box.core.grid.current_mode_name[0..]);
+    current_mode_snapshot[current_mode_snapshot.len - 1] = 0;
+    return @ptrCast(&current_mode_snapshot);
 }
 
 /// Check if cursor is visible (false during busy_start, true after busy_stop).
@@ -2087,6 +2132,15 @@ pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     box.core.flush_aborted = true;
 }
 
+// Terminate a rendering session after a frontend-side fixed resource budget
+// rejects capacity provisioning. Safe from the asynchronous provision worker.
+pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void {
+    if (p == null) return;
+    const cp = &asBox(p.?).core;
+    cp.failHardRender(error.VertexBudgetExceeded);
+    cp.wakeRpcReaderForHardFailure();
+}
+
 // Mark every grid (main + all sub_grids/external grids) and the cursor
 // dirty. Shared by zonvie_core_force_resend/_locked below.
 //
@@ -2117,12 +2171,10 @@ fn forceResendAll(cp: *core.Core) void {
 }
 
 // Force every grid to be treated as dirty on the next flush attempt.
-// For a class of frontend failure (e.g. a macOS MTLBuffer allocation
-// failing) that is only discoverable AFTER onFlush already ran its normal
-// dirty-clearing for this flush — too late for zonvie_core_abort_flush,
-// whose flag is only consulted DURING onFlush's own execution — this is the
-// recovery: content the frontend failed to actually store gets regenerated
-// and resent on the next attempt instead of silently staying missing/stale.
+// This is for failures discovered outside the on_flush_begin/on_flush_end
+// transaction, after onFlush returned and can no longer observe
+// zonvie_core_abort_flush. Content the frontend failed to store is then
+// regenerated instead of silently staying missing/stale.
 // Call zonvie_core_retry_flush afterward (or rely on the next Neovim
 // redraw) to actually drive that next attempt.
 //
@@ -2186,6 +2238,13 @@ pub export fn zonvie_core_flush_was_aborted(p: ?*zonvie_core) callconv(.c) bool 
     return box.core.flush_aborted;
 }
 
+/// Whether retrying the just-aborted flush can make progress. Fixed budget
+/// violations are hard failures and must not arm frontend retry loops.
+pub export fn zonvie_core_flush_is_retryable(p: ?*zonvie_core) callconv(.c) bool {
+    if (p == null) return false;
+    return asBox(p.?).core.flush_retryable;
+}
+
 // Retry a flush that was previously aborted by the frontend (backpressure —
 // no free triple-buffer set, all GPU-in-flight — or a mid-flush frontend
 // OOM). Aborting preserves the core's dirty state, but flushes are
@@ -2214,6 +2273,7 @@ pub export fn zonvie_core_flush_was_aborted(p: ?*zonvie_core) callconv(.c) bool 
 // — bounded, since this only runs once per one-shot retry timer fire, not
 // as a repeating poll.
 fn retryFlushLocked(cp: *nvim_core.Core) void {
+    if (cp.stop_flag.load(.acquire) or !cp.flush_retryable) return;
     cp.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
     defer {
         // Clear the owner id while grid_mu is still held. Both callers keep
@@ -2223,13 +2283,16 @@ fn retryFlushLocked(cp: *nvim_core.Core) void {
     }
 
     var fctx = flush_mod.FlushCtx{ .core = cp };
-    flush_mod.FlushCtx.onFlush(&fctx, cp.grid.rows, cp.grid.cols) catch {};
+    flush_mod.FlushCtx.onFlush(&fctx, cp.grid.rows, cp.grid.cols) catch |reason| {
+        if (nvim_core.Core.isHardRenderFailure(reason)) cp.failHardRender(reason);
+    };
 }
 
 pub export fn zonvie_core_retry_flush(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
     const cp = &box.core;
+    if (cp.stop_flag.load(.acquire)) return;
 
     // Acquire grid_mu FIRST, then record the calling thread (here, whatever
     // thread the frontend's retry timer fires on — main/UI, not the usual
@@ -2251,6 +2314,7 @@ pub export fn zonvie_core_retry_flush(p: ?*zonvie_core) callconv(.c) void {
     // clobber a live owner's id.
     cp.grid_mu.lockUncancelable(clock.io());
     defer cp.grid_mu.unlock(clock.io());
+    if (cp.stop_flag.load(.acquire)) return;
     retryFlushLocked(cp);
 }
 

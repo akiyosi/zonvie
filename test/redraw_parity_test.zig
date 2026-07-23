@@ -40,6 +40,7 @@ const testing = std.testing;
 // ---------------------------------------------------------------------------
 
 const Stub = struct {
+    pre_flush_calls: u32 = 0,
     flush_calls: u32 = 0,
     last_flush_rows: u32 = 0,
     last_flush_cols: u32 = 0,
@@ -52,7 +53,11 @@ const Stub = struct {
     restart_calls: u32 = 0,
     connect_calls: u32 = 0,
 
+    fn onPreFlush(ctx: *Stub) anyerror!void {
+        ctx.pre_flush_calls += 1;
+    }
     fn onFlush(ctx: *Stub, rows: u32, cols: u32) anyerror!void {
+        if (ctx.pre_flush_calls != ctx.flush_calls + 1) return error.PreFlushOrder;
         ctx.flush_calls += 1;
         ctx.last_flush_rows = rows;
         ctx.last_flush_cols = cols;
@@ -143,6 +148,7 @@ fn runValueTreePath(frame_bytes: []const u8, w: *World) !void {
         params,
         &w.log,
         &w.stub,
+        Stub.onPreFlush,
         Stub.onFlush,
         &w.stub,
         Stub.onGuifont,
@@ -172,6 +178,7 @@ fn runStreamingPath(frame_bytes: []const u8, w: *World) !void {
         n_events,
         &w.log,
         &w.stub,
+        Stub.onPreFlush,
         Stub.onFlush,
         &w.stub,
         Stub.onGuifont,
@@ -261,6 +268,7 @@ fn expectHlParity(a: *const Highlights, b: *const Highlights) !void {
 }
 
 fn expectStubParity(a: *const Stub, b: *const Stub) !void {
+    try testing.expectEqual(a.pre_flush_calls, b.pre_flush_calls);
     try testing.expectEqual(a.flush_calls, b.flush_calls);
     try testing.expectEqual(a.last_flush_rows, b.last_flush_rows);
     try testing.expectEqual(a.last_flush_cols, b.last_flush_cols);

@@ -95,10 +95,244 @@ pub const MainSubgridRowLayout = struct {
 };
 
 // Keep the persistent materialized row index bounded. Layouts whose total
-// row coverage exceeds this fall back to the allocation-free full subgrid
-// scan; this avoids a hostile collection of tall/narrow (or zero-column)
-// grids retaining hundreds of MiB under grid_mu.
-const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = 8 * 1024 * 1024;
+// row coverage exceeds this limit are rejected: falling back to scanning all
+// subgrids for every dirty row makes CPU time unbounded under grid_mu.
+const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = grid_mod.MAX_MAIN_SUBGRID_ROW_INDEX_BYTES;
+const MAX_VERTEX_BYTES_PER_SURFACE: usize = 128 * 1024 * 1024;
+const MAX_VERTEX_BYTES_AGGREGATE: usize = 256 * 1024 * 1024;
+// A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
+// callback payload limit aligned with that consumer, then bound retained
+// logical surface and process-wide output independently. Counts are charged
+// from generated output, not from a per-cell estimate: blank grids remain
+// cheap while overflow clusters are accounted at their actual glyph count.
+const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 64 * 1024 * 1024;
+const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf(c_api.Vertex);
+const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
+const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
+
+fn vertexBudgetExceeded(core: *Core) error{VertexBudgetExceeded} {
+    core.flush_retryable = false;
+    return error.VertexBudgetExceeded;
+}
+
+fn ensureRowVertexCapacity(
+    core: *Core,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+    max_vertices: usize,
+    additional_vertices: usize,
+) !void {
+    const needed = std.math.add(usize, out.items.len, additional_vertices) catch
+        return vertexBudgetExceeded(core);
+    if (needed > max_vertices) return vertexBudgetExceeded(core);
+    if (needed <= out.capacity) return;
+
+    // ArrayList's normal geometric growth may retain capacity beyond the
+    // callback byte limit. Grow geometrically here, but clamp the precise
+    // allocation itself to the remaining fixed budget.
+    const geometric = std.math.add(usize, out.capacity, out.capacity / 2 + 8) catch max_vertices;
+    const target = @min(max_vertices, @max(needed, geometric));
+    try out.ensureTotalCapacityPrecise(core.alloc, target);
+}
+
+fn ensureRowQuadCapacity(
+    core: *Core,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+    max_vertices: usize,
+    quad_count: usize,
+) !void {
+    const additional = std.math.mul(usize, quad_count, 6) catch
+        return vertexBudgetExceeded(core);
+    try ensureRowVertexCapacity(core, out, max_vertices, additional);
+}
+
+fn syncVertexBudgetAggregate(core: *Core, enforce_limits: bool) !void {
+    const aggregate = std.math.add(
+        usize,
+        core.main_surface_vertex_count,
+        core.grid.subgrid_surface_vertex_count,
+    ) catch return vertexBudgetExceeded(core);
+    if (enforce_limits and
+        (core.main_surface_vertex_count > MAX_VERTICES_PER_SURFACE or
+            aggregate > MAX_VERTICES_AGGREGATE))
+    {
+        return vertexBudgetExceeded(core);
+    }
+    core.flush_vertex_count_aggregate = aggregate;
+}
+
+fn beginVertexBudgetTransaction(core: *Core) !void {
+    if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
+    try syncVertexBudgetAggregate(core, true);
+    core.vertex_budget_main_touched = false;
+    core.vertex_budget_touched_grid_head = null;
+    core.vertex_budget_transaction_active = true;
+}
+
+fn validateCompletedVertexBudget(core: *Core) !void {
+    try syncVertexBudgetAggregate(core, true);
+    if (core.vertex_budget_main_touched and
+        core.main_surface_vertex_count > MAX_VERTICES_PER_SURFACE)
+    {
+        return vertexBudgetExceeded(core);
+    }
+    var grid_id = core.vertex_budget_touched_grid_head;
+    while (grid_id) |current_grid_id| {
+        const sg = core.grid.sub_grids.get(current_grid_id) orelse
+            return vertexBudgetExceeded(core);
+        if (sg.surface_vertex_count > MAX_VERTICES_PER_SURFACE) {
+            return vertexBudgetExceeded(core);
+        }
+        grid_id = sg.vertex_budget_touched_next;
+    }
+    if (core.flush_vertex_count_aggregate > MAX_VERTICES_AGGREGATE) {
+        return vertexBudgetExceeded(core);
+    }
+}
+
+fn touchSubgridVertexBudget(core: *Core, grid_id: i64, sg: *grid_mod.GridBuf) void {
+    if (sg.vertex_budget_touched) return;
+    sg.vertex_budget_touched = true;
+    sg.vertex_budget_touched_next = core.vertex_budget_touched_grid_head;
+    core.vertex_budget_touched_grid_head = grid_id;
+}
+
+fn clearTouchedVertexBudgetSurfaces(core: *Core) void {
+    core.vertex_budget_main_touched = false;
+    var grid_id = core.vertex_budget_touched_grid_head;
+    while (grid_id) |current_grid_id| {
+        const sg = core.grid.sub_grids.getPtr(current_grid_id) orelse {
+            // Grid mutation is serialized by grid_mu, but make invariant
+            // failure cleanup total rather than leaving stale active links.
+            var sg_it = core.grid.sub_grids.valueIterator();
+            while (sg_it.next()) |remaining| {
+                remaining.vertex_budget_touched = false;
+                remaining.vertex_budget_touched_next = null;
+            }
+            core.vertex_budget_touched_grid_head = null;
+            return;
+        };
+        const next = sg.vertex_budget_touched_next;
+        sg.vertex_budget_touched = false;
+        sg.vertex_budget_touched_next = null;
+        grid_id = next;
+    }
+    core.vertex_budget_touched_grid_head = null;
+}
+
+fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
+    if (!core.vertex_budget_transaction_active) return;
+    clearTouchedVertexBudgetSurfaces(core);
+    if (!commit) {
+        // Row ledgers are accounting metadata, not rendered content. Mutate
+        // them in place on the hot path so a one-row flush does O(1) ledger
+        // work and retains no full-size transaction copy. An aborted frontend
+        // transaction already forces every surface dirty; invalidate the
+        // metadata here so that the forced full retry reconstructs exact
+        // counts lazily. No row-sized work is done on a backpressure abort.
+        core.main_surface_vertex_count = 0;
+        core.main_vertex_row_ledger_valid = false;
+        var sg_it = core.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| {
+            sg.surface_vertex_count = 0;
+            sg.vertex_row_ledger_valid = false;
+            sg.markAllDirty();
+        }
+        core.grid.markAllDirty();
+        core.grid.subgrid_surface_vertex_count = 0;
+        core.force_ext_cursor_recheck = true;
+        core.flush_vertex_count_aggregate = 0;
+    }
+    core.vertex_budget_transaction_active = false;
+}
+
+fn prepareMainVertexRowLedgerForWrite(core: *Core) void {
+    if (core.main_vertex_row_ledger_valid) return;
+    core.flush_vertex_count_aggregate -|= core.main_surface_vertex_count;
+    @memset(core.main_vertex_row_counts.items, 0);
+    core.main_surface_vertex_count = 0;
+    core.main_vertex_row_ledger_valid = true;
+}
+
+fn prepareSubgridVertexRowLedgerForWrite(core: *Core, sg: *grid_mod.GridBuf) void {
+    if (sg.vertex_row_ledger_valid) return;
+    core.flush_vertex_count_aggregate -|= sg.surface_vertex_count;
+    core.grid.subgrid_surface_vertex_count -|= sg.surface_vertex_count;
+    @memset(sg.vertex_row_counts, 0);
+    sg.surface_vertex_count = 0;
+    sg.vertex_row_ledger_valid = true;
+}
+
+fn replaceSurfaceRowVertexCount(
+    core: *Core,
+    surface_count: *usize,
+    row_counts: []usize,
+    row: usize,
+    new_count: usize,
+) !void {
+    if (row_counts.len == 0 and new_count == 0) {
+        surface_count.* = 0;
+        return;
+    }
+    if (row >= row_counts.len or new_count > MAX_VERTICES_PER_CALLBACK) {
+        return vertexBudgetExceeded(core);
+    }
+    const old_count = row_counts[row];
+    const without_old = surface_count.* -| old_count;
+    const new_surface = std.math.add(usize, without_old, new_count) catch
+        return vertexBudgetExceeded(core);
+    const aggregate_without_old = core.flush_vertex_count_aggregate -| old_count;
+    const new_aggregate = std.math.add(usize, aggregate_without_old, new_count) catch
+        return vertexBudgetExceeded(core);
+    row_counts[row] = new_count;
+    surface_count.* = new_surface;
+    core.flush_vertex_count_aggregate = new_aggregate;
+}
+
+fn replaceMainSurfaceRowVertexCount(core: *Core, row: usize, new_count: usize) !void {
+    try syncVertexBudgetAggregate(core, false);
+    core.vertex_budget_main_touched = true;
+    prepareMainVertexRowLedgerForWrite(core);
+    try replaceSurfaceRowVertexCount(
+        core,
+        &core.main_surface_vertex_count,
+        core.main_vertex_row_counts.items,
+        row,
+        new_count,
+    );
+}
+
+fn replaceSubgridSurfaceRowVertexCount(core: *Core, grid_id: i64, sg: *grid_mod.GridBuf, row: usize, new_count: usize) !void {
+    try syncVertexBudgetAggregate(core, false);
+    touchSubgridVertexBudget(core, grid_id, sg);
+    prepareSubgridVertexRowLedgerForWrite(core, sg);
+    const old_surface_count = sg.surface_vertex_count;
+    try replaceSurfaceRowVertexCount(
+        core,
+        &sg.surface_vertex_count,
+        sg.vertex_row_counts,
+        row,
+        new_count,
+    );
+    core.grid.subgrid_surface_vertex_count -|= old_surface_count;
+    core.grid.subgrid_surface_vertex_count = std.math.add(
+        usize,
+        core.grid.subgrid_surface_vertex_count,
+        sg.surface_vertex_count,
+    ) catch return vertexBudgetExceeded(core);
+}
+
+fn replaceMainFlatVertexCount(core: *Core, new_count: usize) !void {
+    if (new_count > MAX_VERTICES_PER_CALLBACK or new_count > MAX_VERTICES_PER_SURFACE) {
+        return vertexBudgetExceeded(core);
+    }
+    try syncVertexBudgetAggregate(core, false);
+    core.vertex_budget_main_touched = true;
+    const aggregate_without_main = core.flush_vertex_count_aggregate -| core.main_surface_vertex_count;
+    const new_aggregate = std.math.add(usize, aggregate_without_main, new_count) catch
+        return vertexBudgetExceeded(core);
+    core.main_surface_vertex_count = new_count;
+    core.flush_vertex_count_aggregate = new_aggregate;
+}
 // All persistent external-float composition scratch shares one aggregate
 // 8 MiB budget. Fixed partitions keep the guarantee local and deterministic:
 // no build order or previous high-water capacity can borrow from another
@@ -134,15 +368,68 @@ fn mainSubgridRowIndexByteSize(rows: usize, refs: usize, layouts: usize) ?usize 
     return mainSubgridRowIndexStorageByteSize(offset_count, rows, refs, layouts);
 }
 
+fn clearMainSubgridRowIndexStorage(core: *Core) void {
+    core.main_subgrid_row_offsets.deinit(core.alloc);
+    core.main_subgrid_row_offsets = .empty;
+    core.main_subgrid_row_write_offsets.deinit(core.alloc);
+    core.main_subgrid_row_write_offsets = .empty;
+    core.main_subgrid_row_indices.deinit(core.alloc);
+    core.main_subgrid_row_indices = .empty;
+    core.main_subgrid_row_layout.deinit(core.alloc);
+    core.main_subgrid_row_layout = .empty;
+    core.main_subgrid_row_index_valid = false;
+    core.main_subgrid_row_index_generation = 0;
+}
+
+fn preflightMainSubgridRowIndex(core: *Core, rows: u32) !void {
+    if (core.cb.on_vertices_row == null) return;
+    if (core.main_subgrid_row_index_valid and
+        core.main_subgrid_row_index_rows == rows and
+        core.main_subgrid_row_index_generation == core.grid.layout_generation)
+    {
+        return;
+    }
+    const row_count: usize = rows;
+    const ref_count = core.grid.main_row_index_ref_count;
+    const layout_count = core.grid.main_row_index_layout_count;
+    const needed = core.grid.currentMainRowIndexByteSize() orelse {
+        core.flush_retryable = false;
+        return error.LayoutTooComplex;
+    };
+    if (needed > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) {
+        core.flush_retryable = false;
+        return error.LayoutTooComplex;
+    }
+    const offset_count = std.math.add(usize, row_count, 1) catch {
+        core.flush_retryable = false;
+        return error.LayoutTooComplex;
+    };
+    const retained = mainSubgridRowIndexStorageByteSize(
+        @max(core.main_subgrid_row_offsets.capacity, offset_count),
+        @max(core.main_subgrid_row_write_offsets.capacity, row_count),
+        @max(core.main_subgrid_row_indices.capacity, ref_count),
+        @max(core.main_subgrid_row_layout.capacity, layout_count),
+    ) orelse {
+        core.flush_retryable = false;
+        return error.LayoutTooComplex;
+    };
+    if (retained > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) {
+        // The current layout fits. Drop incompatible high-water allocations
+        // from an older layout instead of treating retained capacity as live
+        // protocol complexity.
+        clearMainSubgridRowIndexStorage(core);
+    }
+}
+
 /// Build persistent per-row buckets in layer order. An exact layout snapshot
 /// lets content-only flushes reuse the buckets, so dirty-row composition is
-/// O(G + C) instead of O(D * G + C). Returns false when materializing the
-/// index would exceed max_bytes; callers then use the old full-scan path.
+/// O(G + C) instead of O(D * G + C). Layouts exceeding max_bytes fail rather
+/// than falling back to an unbounded dirty-row-by-subgrid scan.
 fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid, rows: u32, max_bytes: usize) !bool {
     const row_count: usize = rows;
     if (core.main_subgrid_row_index_valid and
         core.main_subgrid_row_index_rows == rows and
-        core.main_subgrid_row_layout.items.len == cached.len)
+        core.main_subgrid_row_layout.items.len <= cached.len)
     {
         if (mainSubgridRowIndexStorageByteSize(
             core.main_subgrid_row_offsets.capacity,
@@ -152,12 +439,23 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
         )) |index_bytes| {
             if (index_bytes <= max_bytes) {
                 var matches = true;
-                for (cached, core.main_subgrid_row_layout.items) |csg, old| {
+                var old_index: usize = 0;
+                for (cached) |csg| {
+                    const start: usize = @min(@as(usize, csg.row_start), row_count);
+                    const end: usize = @min(@as(usize, csg.row_end), row_count);
+                    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+                    if (old_index >= core.main_subgrid_row_layout.items.len) {
+                        matches = false;
+                        break;
+                    }
+                    const old = core.main_subgrid_row_layout.items[old_index];
                     if (csg.grid_id != old.grid_id or csg.row_start != old.row_start or csg.row_end != old.row_end) {
                         matches = false;
                         break;
                     }
+                    old_index += 1;
                 }
+                if (old_index != core.main_subgrid_row_layout.items.len) matches = false;
                 if (matches) return true;
             }
         }
@@ -166,32 +464,34 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     core.main_subgrid_row_index_valid = false;
 
     var ref_count: usize = 0;
+    var layout_count: usize = 0;
     for (cached) |csg| {
         const start: usize = @min(@as(usize, csg.row_start), row_count);
         const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (start >= end) continue;
+        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        layout_count += 1;
         const coverage = end - start;
-        ref_count = std.math.add(usize, ref_count, coverage) catch return false;
+        ref_count = std.math.add(usize, ref_count, coverage) catch return error.LayoutTooComplex;
     }
-    const index_bytes = mainSubgridRowIndexByteSize(row_count, ref_count, cached.len) orelse return false;
-    if (index_bytes > max_bytes) return false;
-    const offset_count = std.math.add(usize, row_count, 1) catch return false;
+    const index_bytes = mainSubgridRowIndexByteSize(row_count, ref_count, layout_count) orelse return error.LayoutTooComplex;
+    if (index_bytes > max_bytes) return error.LayoutTooComplex;
+    const offset_count = std.math.add(usize, row_count, 1) catch return error.LayoutTooComplex;
     const retained_bytes = mainSubgridRowIndexStorageByteSize(
         @max(core.main_subgrid_row_offsets.capacity, offset_count),
         @max(core.main_subgrid_row_write_offsets.capacity, row_count),
         @max(core.main_subgrid_row_indices.capacity, ref_count),
-        @max(core.main_subgrid_row_layout.capacity, cached.len),
-    ) orelse return false;
-    if (retained_bytes > max_bytes) return false;
+        @max(core.main_subgrid_row_layout.capacity, layout_count),
+    ) orelse return error.LayoutTooComplex;
+    if (retained_bytes > max_bytes) clearMainSubgridRowIndexStorage(core);
 
-    core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count) catch return false;
+    try core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
     core.main_subgrid_row_offsets.items.len = offset_count;
     @memset(core.main_subgrid_row_offsets.items, 0);
 
     for (cached) |csg| {
         const start: usize = @min(@as(usize, csg.row_start), row_count);
         const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (start >= end) continue;
+        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
         for (start..end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
     }
     for (1..core.main_subgrid_row_offsets.items.len) |i| {
@@ -199,9 +499,9 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     }
 
     std.debug.assert(ref_count == core.main_subgrid_row_offsets.items[row_count]);
-    core.main_subgrid_row_indices.ensureTotalCapacityPrecise(core.alloc, ref_count) catch return false;
+    try core.main_subgrid_row_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
     core.main_subgrid_row_indices.items.len = ref_count;
-    core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count) catch return false;
+    try core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
     core.main_subgrid_row_write_offsets.items.len = row_count;
     @memcpy(
         core.main_subgrid_row_write_offsets.items,
@@ -213,7 +513,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     for (cached, 0..) |csg, csg_index| {
         const start: usize = @min(@as(usize, csg.row_start), row_count);
         const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (start >= end) continue;
+        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
         for (start..end) |row| {
             const dst = core.main_subgrid_row_write_offsets.items[row];
             core.main_subgrid_row_indices.items[dst] = csg_index;
@@ -221,10 +521,17 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
         }
     }
 
-    core.main_subgrid_row_layout.ensureTotalCapacityPrecise(core.alloc, cached.len) catch return false;
-    core.main_subgrid_row_layout.items.len = cached.len;
-    for (cached, core.main_subgrid_row_layout.items) |csg, *layout| {
-        layout.* = .{ .grid_id = csg.grid_id, .row_start = csg.row_start, .row_end = csg.row_end };
+    try core.main_subgrid_row_layout.ensureTotalCapacityPrecise(core.alloc, layout_count);
+    core.main_subgrid_row_layout.items.len = 0;
+    for (cached) |csg| {
+        const start: usize = @min(@as(usize, csg.row_start), row_count);
+        const end: usize = @min(@as(usize, csg.row_end), row_count);
+        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        core.main_subgrid_row_layout.appendAssumeCapacity(.{
+            .grid_id = csg.grid_id,
+            .row_start = csg.row_start,
+            .row_end = csg.row_end,
+        });
     }
     core.main_subgrid_row_index_rows = rows;
     core.main_subgrid_row_index_valid = true;
@@ -232,12 +539,21 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
 }
 
 fn ensureMainSubgridRowIndex(core: *Core, cached: []const CachedSubgrid, rows: u32) !bool {
-    return ensureMainSubgridRowIndexWithLimit(
+    if (core.main_subgrid_row_index_valid and
+        core.main_subgrid_row_index_rows == rows and
+        core.main_subgrid_row_index_generation == core.grid.layout_generation)
+    {
+        return true;
+    }
+    core.main_subgrid_row_index_valid = false;
+    const built = try ensureMainSubgridRowIndexWithLimit(
         core,
         cached,
         rows,
         MAX_MAIN_SUBGRID_ROW_INDEX_BYTES,
     );
+    if (built) core.main_subgrid_row_index_generation = core.grid.layout_generation;
+    return built;
 }
 
 fn viewportCellScrollable(
@@ -1025,6 +1341,13 @@ pub fn shiftScrollCacheAndValidate(
     if (core.scroll_cache_rows != total_rows) {
         return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
     }
+    if (core.main_vertex_row_counts.items.len < total_rows) {
+        return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+    }
+    if (!core.main_vertex_row_ledger_valid) {
+        return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
+    }
+    const row_counts = core.main_vertex_row_counts.items;
 
     // Shift cache entries within scroll region.
     // For shift > 1, multiple rows scroll off and multiple rows become vacant.
@@ -1035,16 +1358,19 @@ pub fn shiftScrollCacheAndValidate(
         }
         // Save scrolled-off row buffers for reuse at vacated positions
         var saved_bufs: [64]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        var saved_counts: [64]usize = undefined;
         if (shift > saved_bufs.len) {
             return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
         }
         for (0..shift) |s| {
             saved_bufs[s] = core.scroll_cache.items[scroll_top + s];
+            saved_counts[s] = row_counts[scroll_top + s];
         }
         // Shift: row[i] <- row[i + shift], adjust y
         var i: usize = scroll_top;
         while (i + shift < scroll_bot) : (i += 1) {
             core.scroll_cache.items[i] = core.scroll_cache.items[i + shift];
+            row_counts[i] = row_counts[i + shift];
             if (adjust_vertices) {
                 for (core.scroll_cache.items[i].items) |*v| {
                     v.position[1] += delta_y;
@@ -1060,6 +1386,9 @@ pub fn shiftScrollCacheAndValidate(
         for (0..shift) |s| {
             saved_bufs[s].clearRetainingCapacity();
             core.scroll_cache.items[scroll_bot - shift + s] = saved_bufs[s];
+            row_counts[scroll_bot - shift + s] = 0;
+            core.main_surface_vertex_count -|= saved_counts[s];
+            core.flush_vertex_count_aggregate -|= saved_counts[s];
             core.scroll_cache_valid.unset(scroll_bot - shift + s);
         }
     } else if (scroll_rows_raw < 0) {
@@ -1069,16 +1398,19 @@ pub fn shiftScrollCacheAndValidate(
         }
         // Save scrolled-off row buffers for reuse at vacated positions
         var saved_bufs: [64]std.ArrayListUnmanaged(c_api.Vertex) = undefined;
+        var saved_counts: [64]usize = undefined;
         if (shift > saved_bufs.len) {
             return .{ .fast_path_ok = false, .cached_emit_count = 0, .empty_emit_count = 0 };
         }
         for (0..shift) |s| {
             saved_bufs[s] = core.scroll_cache.items[scroll_bot - 1 - s];
+            saved_counts[s] = row_counts[scroll_bot - 1 - s];
         }
         // Shift: row[i] <- row[i - shift], adjust y
         var i: usize = scroll_bot - 1;
         while (i >= scroll_top + shift) : (i -= 1) {
             core.scroll_cache.items[i] = core.scroll_cache.items[i - shift];
+            row_counts[i] = row_counts[i - shift];
             if (adjust_vertices) {
                 for (core.scroll_cache.items[i].items) |*v| {
                     v.position[1] += delta_y;
@@ -1095,6 +1427,9 @@ pub fn shiftScrollCacheAndValidate(
         for (0..shift) |s| {
             saved_bufs[s].clearRetainingCapacity();
             core.scroll_cache.items[scroll_top + s] = saved_bufs[s];
+            row_counts[scroll_top + s] = 0;
+            core.main_surface_vertex_count -|= saved_counts[s];
+            core.flush_vertex_count_aggregate -|= saved_counts[s];
             core.scroll_cache_valid.unset(scroll_top + s);
         }
     }
@@ -1369,6 +1704,7 @@ pub const RowGenParams = struct {
     background_opacity: f32,
     is_cmdline: bool,
     glow_enabled: bool,
+    max_vertices: usize = MAX_VERTICES_PER_CALLBACK,
 };
 
 /// Stats returned from generateRowVertices for performance tracking.
@@ -1455,6 +1791,7 @@ pub fn generateRowVertices(
     const vh = p.vh;
     var stats = RowGenStats{};
     const log_enabled = core.log.cb != null;
+    if (out_start > p.max_vertices) return vertexBudgetExceeded(core);
     // Pass 3 sub-timing accumulators. Copied into stats before return.
     var atlas_ensure_ns_acc: i64 = 0;
     var quad_emit_ns_acc: i64 = 0;
@@ -1486,6 +1823,7 @@ pub fn generateRowVertices(
                 (if (p.blur_enabled) (if (p.is_cmdline) 0.0 else 0.5) else p.background_opacity)
             else
                 1.0;
+            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
             try VH.pushSolidQuad(out, core.alloc, x0, y0, x1, y1, VH.rgba(run_bg, bg_alpha), vw, vh, run_grid_id, run_deco);
             c = end;
         }
@@ -1544,6 +1882,7 @@ pub fn generateRowVertices(
             if (run_flags & STYLE_UNDERLINE != 0) {
                 const uy0 = row_y + cellH - 2.0;
                 const uy1 = uy0 + 1.0;
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
             }
 
@@ -1552,6 +1891,7 @@ pub fn generateRowVertices(
                 const uy1_1 = uy0_1 + 1.0;
                 const uy0_2 = row_y + cellH - 2.0;
                 const uy1_2 = uy0_2 + 1.0;
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 2);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0_1, x1, uy1_1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0_2, x1, uy1_2, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERLINE | deco_scroll_flag, 0);
             }
@@ -1560,18 +1900,21 @@ pub fn generateRowVertices(
                 const uy0 = row_y + cellH - 4.0;
                 const uy1 = row_y + cellH;
                 const phase: f32 = @floatFromInt(run_start);
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERCURL | deco_scroll_flag, phase);
             }
 
             if (run_flags & STYLE_UNDERDOTTED != 0) {
                 const uy0 = row_y + cellH - 2.0;
                 const uy1 = uy0 + 1.0;
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERDOTTED | deco_scroll_flag, 0);
             }
 
             if (run_flags & STYLE_UNDERDASHED != 0) {
                 const uy0 = row_y + cellH - 2.0;
                 const uy1 = uy0 + 1.0;
+                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                 try VH.pushDecoQuad(out, core.alloc, x0, uy0, x1, uy1, deco_color, vw, vh, run_grid_id, c_api.DECO_UNDERDASHED | deco_scroll_flag, 0);
             }
 
@@ -1610,13 +1953,6 @@ pub fn generateRowVertices(
 
     const t_glyph_start: i128 = if (log_enabled) clock.nowNs() else 0;
     if (has_shaping or ensure_base != null or ensure_styled != null or core.isPhase2Atlas()) {
-        // Pre-allocate vertex capacity for entire row. Worst case is not 1 glyph
-        // quad per column: a block-drawing / legacy-computing glyph (quadrants,
-        // sextants, octants) can emit up to MAX_BLOCK_QUADS sub-rectangles per
-        // cell (block_elements.zig). Reserve for that worst case unconditionally
-        // — the memory cost is small and this is a growth-only ensureCapacity
-        // call, not a per-cell allocation.
-        try out.ensureUnusedCapacity(core.alloc, cols * block_elements.MAX_BLOCK_QUADS * 6);
         var c: u32 = 0;
         while (c < cols) {
             const run_fg = rc.fg_rgbs.items[@intCast(c)];
@@ -1924,11 +2260,6 @@ pub fn generateRowVertices(
                         }
                     } // end !used_ascii_fast_path
 
-                    // Iterate shaped glyphs — ensure capacity for .notdef expansion.
-                    // Reserve MAX_BLOCK_QUADS*6 per scalar (not just 6) because the
-                    // .notdef fallback path (below) can emit multi-rect block-drawing
-                    // glyphs per scalar, same reasoning as the outer per-row budget.
-                    try out.ensureUnusedCapacity(core.alloc, (final_glyph_count + scalar_count) * block_elements.MAX_BLOCK_QUADS * 6);
                     var penX: f32 = baseX;
 
                     // ── ASCII fast emit path ───────────────────────────────────
@@ -2019,6 +2350,7 @@ pub fn generateRowVertices(
                                 // is unconditionally off.
                                 const deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
                                 const t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                 VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, deco);
                                 if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - t_emit));
                             }
@@ -2108,7 +2440,7 @@ pub fn generateRowVertices(
                                     const blk_geo = block_elements.getBlockGeometry(fb_scalar);
                                     if (blk_geo.count > 0) {
                                         const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                        try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
+                                        try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                         for (blk_geo.rects[0..blk_geo.count]) |rect| {
                                             VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
                                         }
@@ -2143,6 +2475,7 @@ pub fn generateRowVertices(
 
                                         const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                         const fb_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                        try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                         VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
                                         if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
                                     }
@@ -2168,7 +2501,7 @@ pub fn generateRowVertices(
                                 const blk_geo = block_elements.getBlockGeometry(sp_scalar);
                                 if (blk_geo.count > 0) {
                                     const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                    try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
+                                    try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
                                         VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
                                     }
@@ -2312,6 +2645,7 @@ pub fn generateRowVertices(
                                         const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_max[1] };
                                         const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                         const mc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                        try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                         VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, vw, vh, run_grid_id, mc_deco);
                                         if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
                                     }
@@ -2402,6 +2736,7 @@ pub fn generateRowVertices(
                             const vert_start = out.items.len;
                             const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                             const sg_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
                             if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - sg_t_emit));
 
@@ -2448,7 +2783,7 @@ pub fn generateRowVertices(
                             const blk_geo = block_elements.getBlockGeometry(scalar);
                             if (blk_geo.count > 0) {
                                 const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
-                                try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
+                                try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                 for (blk_geo.rects[0..blk_geo.count]) |rect| {
                                     VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
                                 }
@@ -2561,6 +2896,7 @@ pub fn generateRowVertices(
                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                             const pc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, pc_glyph_deco);
                             if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - pc_t_emit));
                         }
@@ -2621,6 +2957,7 @@ pub fn generateRowVertices(
 
             const sy0 = row_y + cellH * 0.5 - 0.5;
             const sy1 = sy0 + 1.0;
+            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
             try VH.pushDecoQuad(out, core.alloc, x0, sy0, x1, sy1, deco_color, vw, vh, run_grid_id, c_api.DECO_STRIKETHROUGH | strike_scroll_flag, 0);
 
             c = run_end;
@@ -2663,6 +3000,7 @@ pub fn generateRowVertices(
 
             const oy0 = row_y;
             const oy1 = oy0 + 1.0;
+            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
             try VH.pushDecoQuad(out, core.alloc, x0, oy0, x1, oy1, deco_color, vw, vh, run_grid_id, c_api.DECO_OVERLINE | ol_scroll_flag, 0);
 
             c = run_end;
@@ -2779,7 +3117,9 @@ pub const FlushCtx = struct {
 
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
-        if (n_cells == 0) return;
+        ctx.core.flush_retryable = true;
+        try preflightMainSubgridRowIndex(ctx.core, rows);
+        try beginVertexBudgetTransaction(ctx.core);
         const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
         const last_sent_cursor_rev_before = ctx.core.last_sent_cursor_rev;
 
@@ -2885,6 +3225,7 @@ pub const FlushCtx = struct {
         // Reset flush_aborted BEFORE calling on_flush_begin
         // (the callback may set it via zonvie_core_abort_flush)
         ctx.core.flush_aborted = false;
+        ctx.core.flush_retryable = true;
         ctx.core.flush_atlas_corrupted = false;
 
         // Notify frontend: flush begins (for triple buffer write-set preparation)
@@ -2907,7 +3248,9 @@ pub const FlushCtx = struct {
         // order is intentional: this defer runs after the two defers below.
         defer {
             ctx.core.ext_float_anchor_index_valid = false;
-            if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
+            const vertex_budget_committed = !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted;
+            finishVertexBudgetTransaction(ctx.core, vertex_budget_committed);
+            if (vertex_budget_committed) {
                 ctx.core.finishAtlasMaintenance();
                 ctx.core.grid.clearScrolledGrids();
                 ctx.core.grid.clearScrollState();
@@ -3006,6 +3349,17 @@ pub const FlushCtx = struct {
                     // it instead of assuming it was already delivered.
                     ctx.core.last_sent_cursor_rev -%= 1;
                 }
+            }
+            // This defer runs before on_flush_end. Validate the completed
+            // completed main+external state only after every row was generated,
+            // so moving vertices between rows cannot fail on a mixed old/new
+            // intermediate ledger. A failure cancels the frontend bracket and
+            // the final transaction defer above invalidates its accounting.
+            if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
+                validateCompletedVertexBudget(ctx.core) catch |err| {
+                    ctx.core.flush_aborted = true;
+                    ctx.core.failHardRender(err);
+                };
             }
         }
 
@@ -3147,6 +3501,61 @@ pub const FlushCtx = struct {
         // for one flush and the frontend's first WM_PAINT shows a blank window
         // until the next user event triggers another flush.
         notifyMessageChanges(ctx.core);
+        if (ctx.core.flush_aborted) return;
+
+        // A zero-cell main grid has no rows to generate, but its layout still
+        // has to cross the transaction boundary. Publish it through the
+        // existing row ABI as a layout-only MAIN update, followed by the
+        // independent empty cursor layer. Dirty/revision state is consumed
+        // only after both callbacks accept the bracket.
+        if (n_cells == 0) {
+            const need_main =
+                ctx.core.grid.content_rev != ctx.core.last_sent_content_rev or
+                ctx.core.grid.dirty_all or
+                ctx.core.main_surface_vertex_count != 0;
+            const need_cursor =
+                ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev or need_main;
+
+            if (ctx.core.cb.on_vertices_row) |row_cb| {
+                if (need_main) {
+                    row_cb(
+                        ctx.core.ctx,
+                        1,
+                        0,
+                        0,
+                        null,
+                        0,
+                        c_api.VERT_UPDATE_MAIN,
+                        rows,
+                        cols,
+                    );
+                    if (ctx.core.flush_aborted) return;
+                }
+                if (need_cursor) {
+                    row_cb(
+                        ctx.core.ctx,
+                        1,
+                        0,
+                        0,
+                        null,
+                        0,
+                        c_api.VERT_UPDATE_CURSOR,
+                        rows,
+                        cols,
+                    );
+                    if (ctx.core.flush_aborted) return;
+                }
+                if (need_main) {
+                    ctx.core.invalidateScrollCache();
+                    ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
+                    ctx.core.grid.clearDirty();
+                }
+                if (need_cursor) {
+                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
+                }
+            }
+            return;
+        }
 
         var cursor_out: c_api.Cursor = .{
             .enabled = 0,
@@ -3534,6 +3943,7 @@ pub const FlushCtx = struct {
                     const subgrid_id = ent.grid_id;
                     const pos = ctx.core.grid.win_pos.get(subgrid_id) orelse continue;
                     const sg = ctx.core.grid.sub_grids.get(subgrid_id) orelse continue;
+                    if (sg.rows == 0 or sg.cols == 0) continue;
 
                     // Skip float windows anchored to external grids
                     if (pos.anchor_grid != 1 and ctx.core.grid.external_grids.contains(pos.anchor_grid)) continue;
@@ -3563,7 +3973,7 @@ pub const FlushCtx = struct {
 
                 const use_row_mode = (ctx.core.cb.on_vertices_row != null);
                 if (use_row_mode) {
-                    const use_main_subgrid_row_index = try ensureMainSubgridRowIndex(
+                    _ = try ensureMainSubgridRowIndex(
                         ctx.core,
                         cached_subgrids,
                         rows,
@@ -3713,7 +4123,7 @@ pub const FlushCtx = struct {
                     // for future fast-path reuse.
                     var t_prep_scroll_ensure_start: i128 = 0;
                     if (log_enabled) t_prep_scroll_ensure_start = clock.nowNs();
-                    ctx.core.ensureScrollCache(rows) catch {};
+                    try ctx.core.ensureScrollCache(rows);
                     if (log_enabled) {
                         const t_prep_scroll_ensure_end = clock.nowNs();
                         perf_row_prep_scroll_ensure_us = @intCast(@divTrunc(@max(0, t_prep_scroll_ensure_end - t_prep_scroll_ensure_start), 1000));
@@ -4148,20 +4558,11 @@ pub const FlushCtx = struct {
                                 // Write each overlay's scroll flag while its CachedSubgrid is already
                                 // in hand; a later per-cell lookup would rescan all grids and turn
                                 // many-float composition into O(dirty_rows * cols * grids).
-                                const bucket_start = if (use_main_subgrid_row_index)
-                                    ctx.core.main_subgrid_row_offsets.items[@intCast(r)]
-                                else
-                                    0;
-                                const bucket_end = if (use_main_subgrid_row_index)
-                                    ctx.core.main_subgrid_row_offsets.items[@as(usize, @intCast(r)) + 1]
-                                else
-                                    cached_subgrids.len;
+                                const bucket_start = ctx.core.main_subgrid_row_offsets.items[@intCast(r)];
+                                const bucket_end = ctx.core.main_subgrid_row_offsets.items[@as(usize, @intCast(r)) + 1];
                                 var bucket_pos = bucket_start;
                                 while (bucket_pos < bucket_end) : (bucket_pos += 1) {
-                                    const csg_index = if (use_main_subgrid_row_index)
-                                        ctx.core.main_subgrid_row_indices.items[bucket_pos]
-                                    else
-                                        bucket_pos;
+                                    const csg_index = ctx.core.main_subgrid_row_indices.items[bucket_pos];
                                     const csg = cached_subgrids[csg_index];
                                     if (r < csg.row_start or r >= csg.row_end) continue;
                                     const r2: u32 = r - csg.row_start;
@@ -4244,10 +4645,11 @@ pub const FlushCtx = struct {
                                 .background_opacity = ctx.core.background_opacity,
                                 .is_cmdline = false,
                                 .glow_enabled = glow_enabled,
-                            }, out) catch {
+                            }, out) catch |err| {
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
                                 ctx.core.flush_aborted = true;
+                                if (Core.isHardRenderFailure(err)) ctx.core.failHardRender(err);
                                 break;
                             };
                             had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
@@ -4354,6 +4756,13 @@ pub const FlushCtx = struct {
                             if (log_enabled) {
                                 t_row_post_misc_before_cache_store = clock.nowNs();
                             }
+
+                            // Charge the exact generated row before either
+                            // retaining a scroll-cache copy or invoking the
+                            // frontend. Overflow clusters therefore count all
+                            // emitted glyphs, while blank cells are not charged
+                            // for geometry they did not produce.
+                            try replaceMainSurfaceRowVertexCount(ctx.core, r, out.items.len);
 
                             // Store composed vertices in scroll cache for future reuse
                             if (r < ctx.core.scroll_cache_rows) {
@@ -4702,9 +5111,6 @@ pub const FlushCtx = struct {
                     // generator as row-mode consumers. Keeping one generator
                     // preserves shaping, full-cluster overflow keys, decoration
                     // ordering, and atlas transaction semantics in both modes.
-                    const est_cells: usize = @as(usize, rows) * @as(usize, cols);
-                    try main.ensureTotalCapacity(ctx.core.alloc, est_cells * 12);
-
                     const row_cells = &ctx.core.row_cells;
                     const row_len: usize = @intCast(cols);
                     try row_cells.ensureTotalCapacity(ctx.core.alloc, row_len);
@@ -4715,6 +5121,7 @@ pub const FlushCtx = struct {
                     for (&ctx.core.partial_layer_verts) |*layer| layer.clearRetainingCapacity();
                     const row_scratch = &ctx.core.row_verts;
                     var had_glyph_miss = false;
+                    var generated_vertex_count: usize = 0;
                     var r: u32 = 0;
                     while (r < rows) : (r += 1) {
                         const row_start: usize = @as(usize, r) * row_len;
@@ -4748,12 +5155,24 @@ pub const FlushCtx = struct {
                             .background_opacity = ctx.core.background_opacity,
                             .is_cmdline = false,
                             .glow_enabled = glow_enabled,
-                        }, row_scratch) catch {
+                            .max_vertices = MAX_VERTICES_PER_CALLBACK - generated_vertex_count,
+                        }, row_scratch) catch |err| {
                             main.clearRetainingCapacity();
                             ctx.core.flush_aborted = true;
+                            if (Core.isHardRenderFailure(err)) ctx.core.failHardRender(err);
                             return;
                         };
                         had_glyph_miss = had_glyph_miss or row_stats.had_glyph_miss;
+                        generated_vertex_count = std.math.add(
+                            usize,
+                            generated_vertex_count,
+                            row_scratch.items.len,
+                        ) catch return vertexBudgetExceeded(ctx.core);
+                        if (row_scratch.items.len > MAX_VERTICES_PER_CALLBACK or
+                            generated_vertex_count > MAX_VERTICES_PER_CALLBACK)
+                        {
+                            return vertexBudgetExceeded(ctx.core);
+                        }
 
                         // Keep backgrounds for every row before any glyph or
                         // decoration layer. Appending a complete five-pass row
@@ -4769,6 +5188,7 @@ pub const FlushCtx = struct {
                     for (&ctx.core.partial_layer_verts) |*layer| {
                         try main.appendSlice(ctx.core.alloc, layer.items);
                     }
+                    try replaceMainFlatVertexCount(ctx.core, main.items.len);
 
                     if (had_glyph_miss) {
                         main_retry_required = true;
@@ -5527,17 +5947,17 @@ fn buildExternalFloatRowIndexWithLimits(
         ) orelse continue;
         ref_count = std.math.add(usize, ref_count, range.end - range.start) catch {
             releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-            return generation;
+            return error.LayoutTooComplex;
         };
     }
 
     const required_bytes = externalFloatRowIndexByteSize(row_count, ref_count) orelse {
         releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-        return generation;
+        return error.LayoutTooComplex;
     };
     if (required_bytes > max_index_bytes) {
         releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-        return generation;
+        return error.LayoutTooComplex;
     }
     releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
 
@@ -5749,6 +6169,25 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
     // Early return if no row-based vertices callback
     const row_cb = self.cb.on_vertices_row orelse return;
+    const owns_vertex_budget_transaction = !self.vertex_budget_transaction_active;
+    if (owns_vertex_budget_transaction) {
+        beginVertexBudgetTransaction(self) catch |err| {
+            self.flush_aborted = true;
+            self.failHardRender(err);
+            return;
+        };
+    }
+    defer if (owns_vertex_budget_transaction) {
+        var commit = !self.flush_aborted and !self.flush_atlas_corrupted;
+        if (commit) {
+            validateCompletedVertexBudget(self) catch |err| {
+                self.flush_aborted = true;
+                self.failHardRender(err);
+                commit = false;
+            };
+        }
+        finishVertexBudgetTransaction(self, commit);
+    };
 
     // Reuse row_verts buffer for external grid vertices (per-row)
     var ext_verts = &self.row_verts;
@@ -5945,9 +6384,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             const ext_info = self.grid.external_grids.get(grid_id);
 
             if (!self.ext_float_anchor_index_valid) {
-                buildExternalFloatAnchorIndex(self) catch {
+                buildExternalFloatAnchorIndex(self) catch |err| {
                     ext_had_row_error = true;
                     self.flush_aborted = true;
+                    if (Core.isHardRenderFailure(err)) {
+                        self.flush_retryable = false;
+                        self.failHardRender(err);
+                    }
                     continue;
                 };
                 owns_anchor_index = true;
@@ -5967,9 +6410,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 ext_info,
                 viewport_rows,
                 sg.cols,
-            ) catch {
+            ) catch |err| {
                 ext_had_row_error = true;
                 self.flush_aborted = true;
+                if (Core.isHardRenderFailure(err)) {
+                    self.flush_retryable = false;
+                    self.failHardRender(err);
+                }
                 continue;
             };
 
@@ -6120,9 +6567,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             ext_info,
                             viewport_rows,
                             sg.cols,
-                        ) catch {
+                        ) catch |err| {
                             ext_had_row_error = true;
                             self.flush_aborted = true;
+                            if (Core.isHardRenderFailure(err)) {
+                                self.flush_retryable = false;
+                                self.failHardRender(err);
+                            }
                             break :ext_retry;
                         };
                     }
@@ -6216,32 +6667,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             const ext_start_col: i64 = info.start_col;
                             const ext_cols_i64: i64 = sg.cols;
                             const row_usize: usize = @intCast(row);
-                            const has_row_index = self.ext_float_row_index_valid;
-                            var entry_cursor: usize = if (has_row_index)
-                                self.ext_float_row_offsets.items[row_usize]
-                            else
-                                0;
-                            const entry_end: usize = if (has_row_index)
-                                self.ext_float_row_offsets.items[row_usize + 1]
-                            else
-                                self.ext_float_entries.items.len;
+                            std.debug.assert(self.ext_float_row_index_valid);
+                            var entry_cursor: usize = self.ext_float_row_offsets.items[row_usize];
+                            const entry_end: usize = self.ext_float_row_offsets.items[row_usize + 1];
                             while (entry_cursor < entry_end) : (entry_cursor += 1) {
-                                const entry_index = if (has_row_index)
-                                    self.ext_float_row_entry_indices.items[entry_cursor]
-                                else
-                                    entry_cursor;
+                                const entry_index = self.ext_float_row_entry_indices.items[entry_cursor];
                                 const fent = self.ext_float_entries.items[entry_index];
-                                if (!has_row_index) {
-                                    const visible_rows = externalFloatVisibleRowRange(
-                                        self,
-                                        fent.grid_id,
-                                        ext_start_row,
-                                        ext_start_col,
-                                        viewport_rows,
-                                        sg.cols,
-                                    ) orelse continue;
-                                    if (row_usize < visible_rows.start or row_usize >= visible_rows.end) continue;
-                                }
                                 const float_pos = self.grid.win_pos.get(fent.grid_id) orelse continue;
                                 const float_sg = self.grid.sub_grids.get(fent.grid_id) orelse continue;
                                 const float_margins = self.grid.getViewportMargins(fent.grid_id);
@@ -6312,14 +6743,27 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             .background_opacity = self.background_opacity,
                             .is_cmdline = is_cmdline,
                             .glow_enabled = ext_glow_enabled,
-                        }, ext_verts) catch {
+                        }, ext_verts) catch |err| {
                             ext_verts.clearRetainingCapacity();
                             ext_had_row_error = true;
                             self.flush_aborted = true;
+                            if (Core.isHardRenderFailure(err)) self.failHardRender(err);
                             break :ext_retry;
                         };
                     };
                     ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
+                    replaceSubgridSurfaceRowVertexCount(
+                        self,
+                        grid_id,
+                        sg,
+                        @intCast(row),
+                        ext_verts.items.len,
+                    ) catch |err| {
+                        ext_had_row_error = true;
+                        self.flush_aborted = true;
+                        self.failHardRender(err);
+                        break :ext_retry;
+                    };
                     // Cursor rendering moved to separate layer (after row loop)
 
                     // CHECK: atlas reset happened during glyph processing for this row.
@@ -6346,6 +6790,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             // clear callbacks into a flush that's already being
                             // discarded, matching the abort check elsewhere in this loop.
                             if (self.flush_aborted) break;
+                            replaceSubgridSurfaceRowVertexCount(self, grid_id, sg, clear_ri, 0) catch |err| {
+                                self.flush_aborted = true;
+                                self.failHardRender(err);
+                                break;
+                            };
                             row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
                         }
                         break; // Abort remaining rows
@@ -6354,9 +6803,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     // Send this row's vertices
                     // Pass viewport dimensions (target size) instead of sg dimensions so that
                     // the frontend's scroll offset calculation matches the NDC viewport used here.
-                    if (ext_verts.items.len > 0) {
-                        row_cb(self.ctx, grid_id, row, 1, ext_verts.items.ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
-                    }
+                    const row_ptr = if (ext_verts.items.len == 0) null else ext_verts.items.ptr;
+                    row_cb(self.ctx, grid_id, row, 1, row_ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
                 }
                 break :ext_retry; // Normal exit from retry loop
             }
@@ -7333,7 +7781,10 @@ pub fn sendCmdlineHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.removeSyntheticExternal(cmdline_grid_id);
+    _ = self.grid.removeSyntheticExternal(cmdline_grid_id) catch |err| {
+        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+        return;
+    };
 
     // Fallback: restore cursor to pre-cmdline position if Neovim doesn't send grid_cursor_goto
     // (This is a workaround for possible Neovim bug where cursor position isn't updated after cmdline closes)
@@ -7754,7 +8205,10 @@ pub fn sendPopupmenuHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.removeSyntheticExternal(pum_grid_id);
+    _ = self.grid.removeSyntheticExternal(pum_grid_id) catch |err| {
+        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+        return;
+    };
 
     self.log.write("[popupmenu] hide\n", .{});
 }
@@ -7765,6 +8219,13 @@ fn scheduleMsgRetryDeadline(self: *Core, now: i128) i128 {
     const retry_delay = self.msg_show_retry_delay_ns;
     self.msg_show_retry_delay_ns = @min(retry_delay * 2, 1000 * std.time.ns_per_ms);
     self.log.write("[msg] timer retry scheduled in {d}ms\n", .{@divTrunc(retry_delay, std.time.ns_per_ms)});
+    return now + retry_delay;
+}
+
+fn scheduleMsgHistoryRetryDeadline(self: *Core, now: i128) i128 {
+    const retry_delay = self.msg_history_retry_delay_ns;
+    self.msg_history_retry_delay_ns = @min(retry_delay * 2, 1000 * std.time.ns_per_ms);
+    self.log.write("[msg_history] retry scheduled in {d}ms\n", .{@divTrunc(retry_delay, std.time.ns_per_ms)});
     return now + retry_delay;
 }
 
@@ -7879,6 +8340,9 @@ pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
         if (self.msg_history_auto_hide_at) |hide_at| {
             consider(&earliest, hide_at);
         }
+        if (self.msg_history_retry_at) |retry_at| {
+            consider(&earliest, retry_at);
+        }
     }
     if (self.atlas_negative_retry_at) |retry_at| {
         consider(&earliest, retry_at);
@@ -7905,10 +8369,6 @@ pub fn notifyMessageChanges(self: *Core) void {
     const has_pending_throttle = self.msg_show_pending_since != null;
 
     if (!msg_dirty and !confirm_dirty and !showmode_dirty and !showcmd_dirty and !ruler_dirty and !history_dirty and !has_pending_throttle) return;
-
-    // Note: We don't use defer for clearMessageDirty anymore because msg_dirty
-    // should only be cleared after throttle period expires
-    defer self.grid.clearMsgHistoryDirty();
 
     // Guard: at most one on_msg_clear per flush cycle
     var sent_msg_clear = false;
@@ -8020,7 +8480,16 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     // Handle msg_history_show
     if (history_dirty) {
-        sendMsgHistoryShow(self);
+        const now = clock.nowNs();
+        if (self.msg_history_retry_at == null or now >= self.msg_history_retry_at.?) {
+            if (sendMsgHistoryShow(self)) {
+                self.grid.clearMsgHistoryDirty();
+                self.msg_history_retry_at = null;
+                self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
+            } else if (!self.flush_aborted) {
+                self.msg_history_retry_at = scheduleMsgHistoryRetryDeadline(self, now);
+            }
+        }
     }
 }
 
@@ -8412,7 +8881,10 @@ fn runMsgGridScrollFlush(self: *Core, offset: u32) bool {
     // atlas-corruption state and regenerates main plus all external consumers
     // before one frontend commit, so a cancelled bracket cannot consume dirty.
     var fctx = FlushCtx{ .core = self };
-    FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch return false;
+    FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
+        if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
+        return false;
+    };
     committed = !self.flush_aborted and !self.flush_atlas_corrupted;
     return committed;
 }
@@ -8486,7 +8958,10 @@ pub fn processPendingMsgScroll(self: *Core) void {
 /// Hide msg_show external grid.
 pub fn hideMsgShow(self: *Core) void {
     const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
-    _ = self.grid.removeSyntheticExternal(msg_grid_id);
+    _ = self.grid.removeSyntheticExternal(msg_grid_id) catch |err| {
+        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+        return;
+    };
     // Reset scroll state and invalidate cache
     self.msg_scroll_offset = 0;
     self.msg_total_lines = 0;
@@ -8900,16 +9375,19 @@ pub fn sendMsgRuler(self: *Core) void {
 }
 
 /// Show msg_history as external grid (like popupmenu pattern).
-pub fn sendMsgHistoryShow(self: *Core) void {
+pub fn sendMsgHistoryShow(self: *Core) bool {
     const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
     const entries = self.grid.msg_history_state.entries.items;
 
     if (entries.len == 0) {
         // No entries - hide the history window if visible
-        _ = self.grid.removeSyntheticExternal(history_grid_id);
+        _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
+            if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+            return false;
+        };
         self.msg_history_auto_hide_at = null;
         self.log.write("[msg_history] hide (empty)\n", .{});
-        return;
+        return true;
     }
 
     // Route message using config (use entry count as line count)
@@ -8920,40 +9398,32 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     switch (route_result.view) {
         .none => {
             // Don't show anything
-            _ = self.grid.removeSyntheticExternal(history_grid_id);
+            _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
+                if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+                return false;
+            };
             self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=none, hiding\n", .{});
-            return;
+            return true;
         },
         .mini => {
             // Mini view: send all entries combined to frontend callback
             self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=mini, sending {d} entries to callback\n", .{entries.len});
             sendMsgHistoryCallbackAll(self, entries, route_result.view);
-            return;
+            return true;
         },
         .notification => {
             // Notification view: send all entries combined to frontend callback for OS notification
             self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=notification, sending {d} entries to callback\n", .{entries.len});
             sendMsgHistoryCallbackAll(self, entries, route_result.view);
-            return;
+            return true;
         },
         .split => {
             // Split view: create Neovim split window
             self.msg_history_auto_hide_at = null;
             self.log.write("[msg_history] view=split (auto_dismiss={}), creating split window\n", .{route_result.auto_dismiss});
-
-            // auto_dismiss: send <CR> to clear any pending prompt (e.g. return_prompt)
-            // This allows split view to display without user pressing Enter
-            if (route_result.auto_dismiss) {
-                self.requestInput("<CR>") catch {};
-            }
-
-            // Clear any pending prompt windows on frontend
-            if (self.cb.on_msg_clear) |cb| {
-                cb(self.ctx);
-            }
 
             // Build content string from all entries
             var content_buf: [8192]u8 = undefined;
@@ -8971,10 +9441,18 @@ pub fn sendMsgHistoryShow(self: *Core) void {
                     content_len += 1;
                 }
             }
-            self.createMessageSplit(content_buf[0..content_len], @intCast(entries.len), true, true, null) catch |e| {
+            self.createMessageSplit(
+                content_buf[0..content_len],
+                @intCast(entries.len),
+                true,
+                route_result.auto_dismiss,
+                null,
+            ) catch |e| {
                 self.log.write("[msg_history] createMessageSplit failed: {any}\n", .{e});
+                return false;
             };
-            return;
+            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+            return true;
         },
         else => {
             // Continue to external grid rendering below (ext_float, confirm)
@@ -9007,7 +9485,7 @@ pub fn sendMsgHistoryShow(self: *Core) void {
         line_count += 1;
     }
 
-    if (line_count == 0) return;
+    if (line_count == 0) return true;
 
     // Calculate grid dimensions
     const max_height: u32 = 20;
@@ -9019,7 +9497,8 @@ pub fn sendMsgHistoryShow(self: *Core) void {
     // Create or resize grid
     self.grid.resizeGrid(history_grid_id, height, width) catch |e| {
         self.log.write("[msg_history] resizeGrid failed: {any}\n", .{e});
-        return;
+        self.flush_aborted = true;
+        return false;
     };
     self.grid.clearGrid(history_grid_id);
 
@@ -9051,22 +9530,27 @@ pub fn sendMsgHistoryShow(self: *Core) void {
         .start_col = -2,
     }) catch |e| {
         self.log.write("[msg_history] external_grids.put failed: {any}\n", .{e});
-        return;
+        self.flush_aborted = true;
+        return false;
     };
 
     // Set auto-hide timeout (timeout=0 means no auto-hide)
     if (messageTimeoutNs(route_result.timeout)) |timeout_ns| {
         self.msg_history_auto_hide_at = clock.nowNs() + timeout_ns;
-        self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
+        self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
     } else {
         self.msg_history_auto_hide_at = null;
     }
+    return true;
 }
 
 /// Hide msg_history external grid.
 pub fn hideMsgHistory(self: *Core) void {
     const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
-    _ = self.grid.removeSyntheticExternal(history_grid_id);
+    _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
+        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+        return;
+    };
     self.log.write("[msg_history] hide\n", .{});
 }
 
@@ -9639,6 +10123,411 @@ test "flush begin abort preserves undispatched scroll notification only" {
     try std.testing.expect(!core.grid.main_scroll_notify_pending);
 }
 
+test "zero-sized main still commits external grid transaction" {
+    const State = struct {
+        core: ?*Core = null,
+        begin_calls: u32 = 0,
+        end_calls: u32 = 0,
+        main_layout_calls: u32 = 0,
+        main_cursor_clears: u32 = 0,
+        external_rows: u32 = 0,
+        lifecycle_calls: u32 = 0,
+        last_main_rows: u32 = 0,
+        last_main_cols: u32 = 0,
+        invalid_layout_payload: bool = false,
+        abort_main_layout: bool = false,
+
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.begin_calls += 1;
+        }
+
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.end_calls += 1;
+        }
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1 and (flags & c_api.VERT_UPDATE_MAIN) != 0) {
+                self.main_layout_calls += 1;
+                self.last_main_rows = total_rows;
+                self.last_main_cols = total_cols;
+                self.invalid_layout_payload =
+                    row_start != 0 or row_count != 0 or verts != null or vert_count != 0 or
+                    (total_rows != 0 and total_cols != 0);
+                if (self.abort_main_layout) self.core.?.flush_aborted = true;
+            }
+            if (grid_id == 1 and (flags & c_api.VERT_UPDATE_CURSOR) != 0) {
+                if (row_count == 0 and verts == null and vert_count == 0) {
+                    self.main_cursor_clears += 1;
+                }
+            }
+            if (grid_id == 2) {
+                self.external_rows += 1;
+            }
+        }
+
+        fn onExternal(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            win: i64,
+            rows: u32,
+            cols: u32,
+            start_row: i32,
+            start_col: i32,
+        ) callconv(.c) void {
+            _ = win;
+            _ = rows;
+            _ = cols;
+            _ = start_row;
+            _ = start_col;
+            if (grid_id == 2) {
+                const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                self.lifecycle_calls += 1;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resize(0, 0);
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_begin = State.onBegin;
+    core.cb.on_flush_end = State.onEnd;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_external_window = State.onExternal;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(0, 0);
+    try std.testing.expectEqual(@as(u32, 1), state.begin_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.end_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.main_layout_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.main_cursor_clears);
+    try std.testing.expect(!state.invalid_layout_payload);
+    try std.testing.expectEqual(@as(u32, 1), state.external_rows);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_calls);
+
+    const zero_shapes = [_][2]u32{
+        .{ 3, 0 },
+        .{ 0, 4 },
+    };
+    for (zero_shapes) |shape| {
+        try core.grid.resize(2, 2);
+        try core.grid.resize(shape[0], shape[1]);
+        try flush_ctx.onFlush(shape[0], shape[1]);
+        try std.testing.expectEqual(shape[0], state.last_main_rows);
+        try std.testing.expectEqual(shape[1], state.last_main_cols);
+    }
+    try std.testing.expectEqual(@as(u32, 3), state.main_layout_calls);
+    try std.testing.expectEqual(@as(u32, 3), state.main_cursor_clears);
+    try std.testing.expect(!state.invalid_layout_payload);
+
+    // A synchronous frontend rejection must leave the layout dirty. The
+    // retry publishes the same transition and only then consumes it.
+    try core.grid.resize(2, 2);
+    try core.grid.resize(2, 0);
+    core.main_surface_vertex_count = 12;
+    core.flush_vertex_count_aggregate = 12;
+    state.abort_main_layout = true;
+    try flush_ctx.onFlush(2, 0);
+    try std.testing.expect(core.grid.dirty_all);
+    try std.testing.expect(!core.main_vertex_row_ledger_valid);
+
+    state.abort_main_layout = false;
+    try flush_ctx.onFlush(2, 0);
+    try std.testing.expect(!core.grid.dirty_all);
+    try std.testing.expectEqual(core.grid.content_rev, core.last_sent_content_rev);
+    try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
+    try std.testing.expectEqual(@as(u32, 5), state.main_layout_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.main_cursor_clears);
+}
+
+test "message history allocation failure preserves dirty state for retry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    var routes = [_]config.MsgRoute{
+        .{ .event = .msg_history_show, .view = .ext_float, .timeout = 0 },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var entry: grid_mod.MsgHistoryEntry = .{};
+    defer entry.content.deinit(std.testing.allocator);
+    try entry.content.append(std.testing.allocator, .{ .hl_id = 0, .text = "history" });
+    try core.grid.setMsgHistoryShow(&.{entry}, false);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    notifyMessageChanges(&core);
+    try std.testing.expect(core.grid.msg_history_state.dirty);
+    try std.testing.expect(core.flush_aborted);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    core.flush_aborted = false;
+    core.msg_history_retry_at = null;
+    notifyMessageChanges(&core);
+    try std.testing.expect(!core.grid.msg_history_state.dirty);
+    try std.testing.expect(core.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID));
+}
+
+test "vertex budget does not preflight-reject a normal blank grid" {
+    const State = struct {
+        begin_calls: u32 = 0,
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.begin_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 200, 300);
+    core.grid.clearDirty();
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_flush_begin = State.onBegin;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(200, 300);
+    try std.testing.expectEqual(@as(u32, 1), state.begin_calls);
+    try std.testing.expect(core.flush_retryable);
+}
+
+test "vertex budget uses actual row output and rejects an oversized callback" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.main_vertex_row_counts.resize(core.alloc, 1);
+    core.main_vertex_row_counts.items[0] = 0;
+    try beginVertexBudgetTransaction(&core);
+    defer finishVertexBudgetTransaction(&core, false);
+
+    // More than the old 54-vertices-per-cell estimate is valid when the
+    // actual row payload fits; overflow clusters are charged at this count.
+    try replaceSurfaceRowVertexCount(
+        &core,
+        &core.main_surface_vertex_count,
+        core.main_vertex_row_counts.items,
+        0,
+        96,
+    );
+    try std.testing.expectEqual(@as(usize, 96), core.main_surface_vertex_count);
+
+    try std.testing.expectError(
+        error.VertexBudgetExceeded,
+        replaceSurfaceRowVertexCount(
+            &core,
+            &core.main_surface_vertex_count,
+            core.main_vertex_row_counts.items,
+            0,
+            MAX_VERTICES_PER_CALLBACK + 1,
+        ),
+    );
+    try std.testing.expect(!core.flush_retryable);
+}
+
+test "vertex budget validates completed state and invalidates metadata on abort" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.ensureScrollCache(4);
+
+    const moved_count = MAX_VERTICES_PER_SURFACE / 3;
+    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 0, moved_count, moved_count, moved_count });
+    core.main_surface_vertex_count = moved_count * 3;
+    try beginVertexBudgetTransaction(&core);
+
+    // Updating the destination first produces a mixed old/new total above the
+    // surface cap. The completed frame is small and must remain valid.
+    try replaceMainSurfaceRowVertexCount(&core, 0, moved_count);
+    try replaceMainSurfaceRowVertexCount(&core, 1, 0);
+    try replaceMainSurfaceRowVertexCount(&core, 2, 0);
+    try replaceMainSurfaceRowVertexCount(&core, 3, 0);
+    try validateCompletedVertexBudget(&core);
+    try std.testing.expectEqual(moved_count, core.main_vertex_row_counts.items[0]);
+    try std.testing.expectEqual(moved_count, core.main_surface_vertex_count);
+
+    finishVertexBudgetTransaction(&core, false);
+    try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
+    try std.testing.expect(!core.main_vertex_row_ledger_valid);
+
+    try beginVertexBudgetTransaction(&core);
+    try replaceMainSurfaceRowVertexCount(&core, 0, moved_count);
+    try replaceMainSurfaceRowVertexCount(&core, 1, 0);
+    try replaceMainSurfaceRowVertexCount(&core, 2, 0);
+    try replaceMainSurfaceRowVertexCount(&core, 3, 0);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+    try std.testing.expectEqualSlices(usize, &.{ moved_count, 0, 0, 0 }, core.main_vertex_row_counts.items);
+    try std.testing.expectEqual(moved_count, core.main_surface_vertex_count);
+}
+
+test "vertex budget permits aggregate redistribution across external surfaces" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.ensureScrollCache(2);
+    @memset(core.main_vertex_row_counts.items, MAX_VERTICES_PER_CALLBACK);
+    core.main_surface_vertex_count = MAX_VERTICES_PER_SURFACE;
+
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.resizeGrid(3, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try core.grid.putSyntheticExternal(3, .{ .win = 3, .start_row = 0, .start_col = 0 });
+    const source = core.grid.sub_grids.getPtr(3).?;
+    @memset(source.vertex_row_counts, MAX_VERTICES_PER_CALLBACK);
+    source.surface_vertex_count = MAX_VERTICES_PER_SURFACE;
+    core.grid.subgrid_surface_vertex_count = source.surface_vertex_count;
+
+    try beginVertexBudgetTransaction(&core);
+    const destination = core.grid.sub_grids.getPtr(2).?;
+    try replaceSubgridSurfaceRowVertexCount(&core, 2, destination, 0, MAX_VERTICES_PER_CALLBACK);
+    try replaceSubgridSurfaceRowVertexCount(&core, 3, source, 0, 0);
+    try replaceSubgridSurfaceRowVertexCount(&core, 3, source, 1, 0);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+
+    try std.testing.expectEqual(MAX_VERTICES_PER_CALLBACK, destination.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), source.surface_vertex_count);
+    try std.testing.expectEqual(
+        MAX_VERTICES_PER_SURFACE + MAX_VERTICES_PER_CALLBACK,
+        core.flush_vertex_count_aggregate,
+    );
+}
+
+test "external vertex aggregate follows lifecycle without layout-generation scans" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try beginVertexBudgetTransaction(&core);
+    const surface = core.grid.sub_grids.getPtr(2).?;
+    try replaceSubgridSurfaceRowVertexCount(&core, 2, surface, 0, 10);
+    try replaceSubgridSurfaceRowVertexCount(&core, 2, surface, 1, 20);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+    try std.testing.expectEqual(@as(usize, 30), core.grid.subgrid_surface_vertex_count);
+
+    core.grid.scrollGrid(2, 0, 2, 0, 1, 1, 0);
+    try std.testing.expectEqual(@as(usize, 20), surface.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 20), core.grid.subgrid_surface_vertex_count);
+
+    // Layout order changes do not affect physical surface membership or
+    // require an external-grid rescan at the next transaction boundary.
+    core.grid.layout_generation +%= 1;
+    try beginVertexBudgetTransaction(&core);
+    try std.testing.expectEqual(@as(usize, 20), core.flush_vertex_count_aggregate);
+    finishVertexBudgetTransaction(&core, true);
+
+    try std.testing.expect(try core.grid.removeSyntheticExternal(2));
+    try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 0), surface.surface_vertex_count);
+    try std.testing.expect(!surface.vertex_row_ledger_valid);
+}
+
+test "deferred external pass shares the main vertex budget transaction" {
+    const State = struct {
+        core: *Core,
+        main_rows: u32 = 0,
+        external_rows: u32 = 0,
+        external_saw_shared_transaction: bool = false,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) {
+                self.main_rows += 1;
+            } else if (grid_id == 2) {
+                self.external_rows += 1;
+                self.external_saw_shared_transaction = self.core.vertex_budget_transaction_active;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(1, 1, 1);
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 2,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 1,
+        .cols = 1,
+    });
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+
+    try std.testing.expectEqual(@as(u32, 1), state.main_rows);
+    try std.testing.expectEqual(@as(u32, 1), state.external_rows);
+    try std.testing.expect(state.external_saw_shared_transaction);
+    try std.testing.expect(!core.vertex_budget_transaction_active);
+}
+
+test "sparse vertex ledger update touches only the submitted row" {
+    const row_count = 20_000;
+    const untouched_count: usize = 7;
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.ensureScrollCache(row_count);
+    @memset(core.main_vertex_row_counts.items, untouched_count);
+    core.main_surface_vertex_count = row_count * untouched_count;
+
+    try beginVertexBudgetTransaction(&core);
+    try replaceMainSurfaceRowVertexCount(&core, row_count / 2, 11);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+
+    try std.testing.expectEqual(@as(usize, 11), core.main_vertex_row_counts.items[row_count / 2]);
+    try std.testing.expectEqual(untouched_count, core.main_vertex_row_counts.items[0]);
+    try std.testing.expectEqual(untouched_count, core.main_vertex_row_counts.items[row_count - 1]);
+    try std.testing.expectEqual(row_count * untouched_count + 4, core.main_surface_vertex_count);
+}
+
 test "scroll callback abort consumes only dispatched IDs" {
     const State = struct {
         core: *Core,
@@ -9755,10 +10644,12 @@ test "flush transaction orders begin vertices end and restores state on every ab
             try std.testing.expect(!core.flush_aborted);
             try std.testing.expect(!core.grid.dirty_all);
             try std.testing.expectEqual(core.grid.content_rev, core.last_sent_content_rev);
+            try std.testing.expect(core.main_surface_vertex_count > 0);
         } else {
             try std.testing.expect(core.flush_aborted);
             try std.testing.expect(core.grid.dirty_all);
             try std.testing.expect(core.grid.content_rev != core.last_sent_content_rev or abort_at == .end);
+            try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
         }
     }
 }
@@ -10003,6 +10894,48 @@ test "viewport decoration flags exclude all four margins" {
     try std.testing.expect(!viewportCellScrollable(1, 0, 4, 5, margins));
     try std.testing.expect(!viewportCellScrollable(1, 4, 4, 5, margins));
     try std.testing.expect(viewportCellScrollable(2, 2, 4, 5, margins));
+}
+
+test "row generation rejects before vertex capacity exceeds callback budget" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.row_cells.ensureTotalCapacity(core.alloc, 3);
+    core.row_cells.setLen(3);
+    for (0..3) |col| {
+        core.row_cells.setWithDeco(
+            col,
+            ' ',
+            0xFFFFFF,
+            @intCast(col + 1),
+            highlight.Highlights.SP_NOT_SET,
+            1,
+            0,
+            0,
+            0,
+        );
+        core.row_cells.glow_arr.items[col] = 0;
+    }
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    try std.testing.expectError(error.VertexBudgetExceeded, generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 3,
+        .vw = 3,
+        .vh = 1,
+        .cell_w = 1,
+        .cell_h = 1,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+        .max_vertices = 12,
+    }, &out));
+    try std.testing.expectEqual(@as(usize, 12), out.items.len);
+    try std.testing.expect(out.capacity <= 12);
+    try std.testing.expect(!core.flush_retryable);
 }
 
 test "row generation preserves left and right margin flags in every emitted layer" {
@@ -11483,25 +12416,20 @@ test "external float row index sorts once and buckets visible intersections" {
             MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES,
     );
 
-    const fallback_generation = try buildExternalFloatRowIndexWithLimit(
-        &core,
-        anchor_entries,
-        core.grid.external_grids.get(10),
-        4,
-        5,
-        1,
+    try std.testing.expectError(
+        error.LayoutTooComplex,
+        buildExternalFloatRowIndexWithLimit(
+            &core,
+            anchor_entries,
+            core.grid.external_grids.get(10),
+            4,
+            5,
+            1,
+        ),
     );
-    try std.testing.expectEqual(fallback_generation, core.ext_float_index_generation);
-    try std.testing.expect(fallback_generation != generation);
     try std.testing.expect(!core.ext_float_row_index_valid);
     try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_offsets.capacity);
     try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
-    // The sorted entry list remains available for the allocation-free
-    // per-row full-scan fallback.
-    try std.testing.expectEqualSlices(i64, &.{ 21, 20 }, &.{
-        core.ext_float_entries.items[0].grid_id,
-        core.ext_float_entries.items[1].grid_id,
-    });
 }
 
 test "external float persistent scratch partitions share one 8 MiB cap" {
@@ -11541,25 +12469,53 @@ test "main subgrid row index preserves layer order and updates on layout change"
 
     cached[2].row_start = 3;
     cached[2].row_end = 4;
+    core.grid.layout_generation += 1;
     try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3, 4, 5 }, core.main_subgrid_row_offsets.items);
     try std.testing.expectEqualSlices(usize, &.{ 0, 0, 1, 1, 2 }, core.main_subgrid_row_indices.items);
 
-    // Five row references exceed this test budget, so the layout remains
-    // invalid and the production caller takes the allocation-free full scan.
+    // Five row references exceed this test budget. The layout is rejected;
+    // there is no O(rows * subgrids) fallback.
     const four_ref_budget = mainSubgridRowIndexByteSize(4, 4, cached.len).?;
-    try std.testing.expect(!try ensureMainSubgridRowIndexWithLimit(&core, &cached, 4, four_ref_budget));
+    try std.testing.expectError(
+        error.LayoutTooComplex,
+        ensureMainSubgridRowIndexWithLimit(&core, &cached, 4, four_ref_budget),
+    );
     try std.testing.expect(!core.main_subgrid_row_index_valid);
 
-    // Layout snapshots consume the same total budget even when the grids cover
-    // no visible rows and therefore contribute zero row references.
+    // Zero-area grids do not consume row references or layout snapshots.
     var layout_core = Core.initForTest(std.testing.allocator);
     defer layout_core.deinitForTest();
     var zero_height = cached;
     for (&zero_height) |*csg| csg.row_end = csg.row_start;
     const two_layout_budget = mainSubgridRowIndexByteSize(4, 0, 2).?;
-    try std.testing.expect(!try ensureMainSubgridRowIndexWithLimit(&layout_core, &zero_height, 4, two_layout_budget));
-    try std.testing.expect(!layout_core.main_subgrid_row_index_valid);
+    try std.testing.expect(try ensureMainSubgridRowIndexWithLimit(&layout_core, &zero_height, 4, two_layout_budget));
+    try std.testing.expectEqual(@as(usize, 0), layout_core.main_subgrid_row_layout.items.len);
+    try std.testing.expect(layout_core.main_subgrid_row_index_valid);
+
+    // A previous layout's independent high-water capacities must not reject
+    // a currently bounded layout. Rebuild the storage at the current shape.
+    var high_water_core = Core.initForTest(std.testing.allocator);
+    defer high_water_core.deinitForTest();
+    try high_water_core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(high_water_core.alloc, 64);
+    try high_water_core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(high_water_core.alloc, 64);
+    try high_water_core.main_subgrid_row_indices.ensureTotalCapacityPrecise(high_water_core.alloc, 64);
+    try high_water_core.main_subgrid_row_layout.ensureTotalCapacityPrecise(high_water_core.alloc, 64);
+    const current_budget = mainSubgridRowIndexByteSize(4, 2, 1).?;
+    try std.testing.expect(try ensureMainSubgridRowIndexWithLimit(
+        &high_water_core,
+        cached[0..1],
+        4,
+        current_budget,
+    ));
+    try std.testing.expect(
+        mainSubgridRowIndexStorageByteSize(
+            high_water_core.main_subgrid_row_offsets.capacity,
+            high_water_core.main_subgrid_row_write_offsets.capacity,
+            high_water_core.main_subgrid_row_indices.capacity,
+            high_water_core.main_subgrid_row_layout.capacity,
+        ).? <= current_budget,
+    );
 }
 
 test "subgrid layout diff merges by id and reuses linear row marks" {

@@ -74,7 +74,7 @@ fn decodeStrLen(r: anytype, b0: u8) anyerror!usize {
     if ((b0 & 0xE0) == 0xA0) return @as(usize, b0 & 0x1F);
 
     return switch (b0) {
-        0xd9 => @as(usize, try readIntBig(r, u8)),  // str8
+        0xd9 => @as(usize, try readIntBig(r, u8)), // str8
         0xda => @as(usize, try readIntBig(r, u16)), // str16
         0xdb => @as(usize, try readIntBig(r, u32)), // str32
         else => error.Invalid,
@@ -83,7 +83,7 @@ fn decodeStrLen(r: anytype, b0: u8) anyerror!usize {
 
 fn decodeBinLen(r: anytype, b0: u8) anyerror!usize {
     return switch (b0) {
-        0xc4 => @as(usize, try readIntBig(r, u8)),  // bin8
+        0xc4 => @as(usize, try readIntBig(r, u8)), // bin8
         0xc5 => @as(usize, try readIntBig(r, u16)), // bin16
         0xc6 => @as(usize, try readIntBig(r, u32)), // bin32
         else => error.Invalid,
@@ -120,7 +120,7 @@ fn decodeExtLen(r: anytype, b0: u8) anyerror!usize {
         0xd6 => 4,
         0xd7 => 8,
         0xd8 => 16,
-        0xc7 => @as(usize, try readIntBig(r, u8)),  // ext8
+        0xc7 => @as(usize, try readIntBig(r, u8)), // ext8
         0xc8 => @as(usize, try readIntBig(r, u16)), // ext16
         0xc9 => @as(usize, try readIntBig(r, u32)), // ext32
         else => error.Invalid,
@@ -154,12 +154,45 @@ pub const SliceReader = struct {
 /// risk on any supported target.
 const max_decode_depth: u32 = 512;
 
+pub const DecodeLimits = struct {
+    max_alloc_bytes: usize = 128 * 1024 * 1024,
+    max_values: usize = 1_048_576,
+    max_container_items: usize = 1_048_576,
+    // Leave room for MessagePack and RPC container headers inside
+    // FrameReader's independent 64 MiB wire-frame cap.
+    max_blob_bytes: usize = 63 * 1024 * 1024,
+};
+
+const DecodeBudget = struct {
+    limits: DecodeLimits,
+    alloc_bytes: usize = 0,
+    values: usize = 0,
+
+    fn chargeAlloc(self: *DecodeBudget, count: usize, comptime T: type) !void {
+        const bytes = std.math.mul(usize, count, @sizeOf(T)) catch return error.MessageTooLarge;
+        const total = std.math.add(usize, self.alloc_bytes, bytes) catch return error.MessageTooLarge;
+        if (total > self.limits.max_alloc_bytes) return error.MessageTooLarge;
+        self.alloc_bytes = total;
+    }
+
+    fn chargeValue(self: *DecodeBudget) !void {
+        if (self.values >= self.limits.max_values) return error.MessageTooLarge;
+        self.values += 1;
+    }
+};
+
 pub fn decode(alloc: std.mem.Allocator, r: anytype) anyerror!Value {
-    return decodeDepth(alloc, r, 0);
+    return decodeWithLimits(alloc, r, .{});
 }
 
-fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value {
+pub fn decodeWithLimits(alloc: std.mem.Allocator, r: anytype, limits: DecodeLimits) anyerror!Value {
+    var budget: DecodeBudget = .{ .limits = limits };
+    return decodeDepth(alloc, r, 0, &budget);
+}
+
+fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32, budget: *DecodeBudget) anyerror!Value {
     if (depth > max_decode_depth) return error.TooDeeplyNested;
+    try budget.chargeValue();
 
     const b0 = try readU8(r);
 
@@ -178,6 +211,8 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value 
     // str
     if ((b0 & 0xE0) == 0xA0 or b0 == 0xd9 or b0 == 0xda or b0 == 0xdb) {
         const n = try decodeStrLen(r, b0);
+        if (n > budget.limits.max_blob_bytes) return error.MessageTooLarge;
+        try budget.chargeAlloc(n, u8);
         const s = try alloc.alloc(u8, n);
         try readNoEof(r, s);
         return .{ .str = s };
@@ -186,6 +221,8 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value 
     // bin (Neovim uses msgpack v5 BIN types; store as .str bytes)
     if (b0 == 0xc4 or b0 == 0xc5 or b0 == 0xc6) {
         const n = try decodeBinLen(r, b0);
+        if (n > budget.limits.max_blob_bytes) return error.MessageTooLarge;
+        try budget.chargeAlloc(n, u8);
         const s = try alloc.alloc(u8, n);
         try readNoEof(r, s);
         return .{ .str = s };
@@ -194,10 +231,12 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value 
     // array
     if ((b0 & 0xF0) == 0x90 or b0 == 0xdc or b0 == 0xdd) {
         const n = try decodeArrayLen(r, b0);
+        if (n > budget.limits.max_container_items) return error.MessageTooLarge;
+        try budget.chargeAlloc(n, Value);
         const items = try alloc.alloc(Value, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            items[i] = try decodeDepth(alloc, r, depth + 1);
+            items[i] = try decodeDepth(alloc, r, depth + 1, budget);
         }
         return .{ .arr = items };
     }
@@ -205,12 +244,14 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value 
     // map
     if ((b0 & 0xF0) == 0x80 or b0 == 0xde or b0 == 0xdf) {
         const n = try decodeMapLen(r, b0);
+        if (n > budget.limits.max_container_items) return error.MessageTooLarge;
+        try budget.chargeAlloc(n, Pair);
         const pairs = try alloc.alloc(Pair, n);
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const k = try decodeDepth(alloc, r, depth + 1);
-            const v = try decodeDepth(alloc, r, depth + 1);
+            const k = try decodeDepth(alloc, r, depth + 1, budget);
+            const v = try decodeDepth(alloc, r, depth + 1, budget);
             pairs[i] = .{ .key = k, .val = v };
         }
         return .{ .map = pairs };
@@ -229,6 +270,8 @@ fn decodeDepth(alloc: std.mem.Allocator, r: anytype, depth: u32) anyerror!Value 
         b0 == 0xc7 or b0 == 0xc8 or b0 == 0xc9)
     {
         const n = try decodeExtLen(r, b0);
+        if (n > budget.limits.max_blob_bytes) return error.MessageTooLarge;
+        try budget.chargeAlloc(n, u8);
         const type_code_u8 = try readU8(r);
         const type_code: i8 = @bitCast(type_code_u8);
 

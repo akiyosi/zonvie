@@ -739,6 +739,7 @@ fn streamGridLine(
     in: *mps.InnerDecoder,
     n_tuples: u32,
     log: *Logger,
+    redraw_epoch: u64,
 ) !void {
     if (log.cb != null) log.write("ui_ev grid_line tuples={d}\n", .{n_tuples});
 
@@ -815,7 +816,7 @@ fn streamGridLine(
             grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
         }
 
-        grid.noteGridLine(grid_id);
+        grid.noteGridLine(grid_id, redraw_epoch);
 
         // Resolve once per tuple. Besides avoiding a sub-grid hash probe per
         // cell, this is the trust boundary for hostile col/repeat values.
@@ -958,6 +959,7 @@ pub fn handleRedrawStream(
     n_events: u32,
     log: *Logger,
     flush_ctx: anytype,
+    pre_flush_fn: *const fn (ctx: @TypeOf(flush_ctx)) anyerror!void,
     flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
     opt_ctx: anytype,
     guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
@@ -968,6 +970,11 @@ pub fn handleRedrawStream(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
+    const redraw_epoch = grid.beginRedrawBatch();
+    std.debug.assert(grid.redraw_epoch_override == null);
+    grid.redraw_epoch_override = redraw_epoch;
+    defer grid.redraw_epoch_override = null;
+
     var ei: u32 = 0;
     while (ei < n_events) : (ei += 1) {
         const ev_n = try in.expectArray();
@@ -991,7 +998,7 @@ pub fn handleRedrawStream(
         };
 
         if (tag == .grid_line) {
-            try streamGridLine(grid, in, n_tuples, log);
+            try streamGridLine(grid, in, n_tuples, log, redraw_epoch);
             continue;
         }
 
@@ -1018,6 +1025,7 @@ pub fn handleRedrawStream(
             synth_params,
             log,
             flush_ctx,
+            pre_flush_fn,
             flush_fn,
             opt_ctx,
             guifont_fn,
@@ -1046,6 +1054,7 @@ pub fn handleRedraw(
     params: []mp.Value,
     log: *Logger,
     flush_ctx: anytype,
+    pre_flush_fn: *const fn (ctx: @TypeOf(flush_ctx)) anyerror!void,
     flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
     opt_ctx: anytype,
     guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
@@ -1056,6 +1065,7 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
+    const redraw_epoch = grid.redraw_epoch_override orelse grid.beginRedrawBatch();
 
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
@@ -1222,7 +1232,7 @@ pub fn handleRedraw(
                         log.write("grid_destroy: rejected attempt to destroy main grid (grid_id=1)\n", .{});
                         continue;
                     }
-                    grid.destroyGrid(grid_id);
+                    try grid.destroyGrid(grid_id);
                 }
             },
             .win_split => {
@@ -1389,23 +1399,7 @@ pub fn handleRedraw(
                     // may not send win_resize/win_split for all of them.
                     if (grid.ext_windows_grids.contains(grid_id)) {
                         if (!grid.external_grids.contains(grid_id)) {
-                            // Tab switch: store position in win_pos map first so
-                            // setWinExternalPos can extract it (it reads from win_pos).
-                            if (!grid_mod.windowPlacementInsertFits(
-                                grid.win_pos.count(),
-                                !grid.win_pos.contains(grid_id),
-                            ) or !grid_mod.windowPlacementInsertFits(
-                                grid.grid_win_ids.count(),
-                                !grid.grid_win_ids.contains(grid_id),
-                            ) or !grid_mod.windowPlacementInsertFits(
-                                grid.external_grids.count(),
-                                !grid.external_grids.contains(grid_id),
-                            )) {
-                                log.write("[win_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
-                                return error.TooManyWindowPlacements;
-                            }
-                            try grid.win_pos.put(grid.alloc, grid_id, .{ .row = startrow, .col = startcol });
-                            _ = grid.setWinExternalPos(grid_id, win_id) catch |err| switch (err) {
+                            _ = grid.setWinExternalPosAt(grid_id, win_id, startrow, startcol) catch |err| switch (err) {
                                 error.TooManyWindowPlacements => {
                                     log.write("[win_pos] rejected ext_windows grid={d}: TooManyWindowPlacements\n", .{grid_id});
                                     return error.TooManyWindowPlacements;
@@ -1444,7 +1438,7 @@ pub fn handleRedraw(
                     if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
                         grid.composited_win_closed = true;
                     }
-                    grid.hideWin(grid_id);
+                    try grid.hideWin(grid_id);
                     // On permanent close, remove from ext_windows tracking.
                     // On hide (tab switch), keep tracking so win_pos can restore.
                     if (is_close) {
@@ -2095,7 +2089,7 @@ pub fn handleRedraw(
                     var col = checkedU32(t[2].int) orelse continue;
 
                     // Update order (existing behavior)
-                    grid.noteGridLine(grid_id);
+                    grid.noteGridLine(grid_id, redraw_epoch);
 
                     const cells = t[3].arr;
 
@@ -2712,6 +2706,9 @@ pub fn handleRedraw(
                     });
                     grid.input_trace_flush_logged_seq = grid.input_trace_seq;
                 }
+                // Render-affecting state derived from the completed redraw batch
+                // must be applied before the frontend transaction is committed.
+                try pre_flush_fn(flush_ctx);
                 try flush_fn(flush_ctx, grid.rows, grid.cols);
                 // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
                 // inside onFlush on successful completion. On abort, all state is
