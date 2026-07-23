@@ -26,7 +26,7 @@ private enum ExternalFontResetStateTests {
             for _ in 0..<16 {
                 _ = backoff.takeDelaySeconds()
             }
-            require(backoff.takeDelaySeconds() == 2.0, "flush retry did not saturate at 2s")
+            require(backoff.takeDelaySeconds() == 0.128, "flush retry did not saturate at 128ms")
             backoff.reset()
             require(backoff.takeDelaySeconds() == 0.016, "successful flush did not reset retry delay")
         }

@@ -146,6 +146,7 @@ final class ZonvieCore {
         let delaySeconds = flushRetryBackoff.takeDelaySeconds()
         flushRetryScheduled = true
         os_unfair_lock_unlock(&flushRetryScheduledLock)
+        ZonvieCore.appLog("[scroll_debug] flush_retry_scheduled gen=\(generation) delaySeconds=\(delaySeconds)")
         // A valid retry may wait on grid_mu and then perform a complete flush.
         // Run it on a dedicated serial queue so neither wait nor composition
         // blocks AppKit input/drawing on the main thread.
@@ -160,6 +161,7 @@ final class ZonvieCore {
                 && self.flushRetryScheduled
                 && self.flushRetryGeneration == generation
             os_unfair_lock_unlock(&self.flushRetryScheduledLock)
+            ZonvieCore.appLog("[scroll_debug] flush_retry_fired gen=\(generation) shouldAttempt=\(shouldAttempt)")
             guard shouldAttempt else { return }
             guard let corePtr = self.core else { return }
 
@@ -169,6 +171,7 @@ final class ZonvieCore {
             // full transaction. If a concurrent normal flush still owns a
             // bracket, re-arm with backoff instead of allocating under it.
             let provisionStatus = self.provisionPendingSurfaceRowCapacity()
+            ZonvieCore.appLog("[scroll_debug] flush_retry_provision gen=\(generation) status=\(provisionStatus)")
             if provisionStatus == .hardFailure {
                 os_unfair_lock_lock(&self.flushRetryScheduledLock)
                 let stillCurrent = self.flushRetryAccepting
@@ -201,19 +204,27 @@ final class ZonvieCore {
             // this timer was waiting for grid_mu while an RPC flush committed,
             // on_flush_end has already invalidated the generation by the time
             // this lock is acquired, so no stale full flush is launched.
+            let tGridMuWaitStart = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
             zonvie_core_lock_grid(corePtr)
             defer { zonvie_core_unlock_grid(corePtr) }
+            if ZonvieCore.appLogEnabled {
+                let waitUs = (CFAbsoluteTimeGetCurrent() - tGridMuWaitStart) * 1_000_000
+                ZonvieCore.appLog("[scroll_debug] flush_retry_grid_mu_acquired gen=\(generation) waitUs=\(Int(waitUs))")
+            }
 
             os_unfair_lock_lock(&self.flushRetryScheduledLock)
             guard self.flushRetryAccepting,
                   self.flushRetryScheduled,
                   self.flushRetryGeneration == generation else {
                 os_unfair_lock_unlock(&self.flushRetryScheduledLock)
+                ZonvieCore.appLog("[scroll_debug] flush_retry_stale gen=\(generation)")
                 return
             }
             self.flushRetryScheduled = false
             os_unfair_lock_unlock(&self.flushRetryScheduledLock)
+            ZonvieCore.appLog("[scroll_debug] flush_retry_invoking_core gen=\(generation)")
             zonvie_core_retry_flush_locked(corePtr)
+            ZonvieCore.appLog("[scroll_debug] flush_retry_core_done gen=\(generation)")
         }
     }
 

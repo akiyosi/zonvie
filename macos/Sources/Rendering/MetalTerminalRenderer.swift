@@ -329,7 +329,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             rowCapacityRequiredVertexCounts[capacityRow],
             max(0, vertexCount)
         )
+        let newRequiredRows = rowCapacityRequiredRows
         lock.unlock()
+        ZonvieCore.appLog(
+            "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
+            "vertexCount=\(vertexCount) totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
+        )
         flushFailed = true
         return false
     }
@@ -345,7 +350,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         if rowCapacityBracketOpen || rowCapacityProvisioning ||
             gpuInFlightCount.contains(where: { $0 != 0 }) {
+            let bracketOpen = rowCapacityBracketOpen
+            let provisioning = rowCapacityProvisioning
+            let gpuInFlight = gpuInFlightCount
             lock.unlock()
+            ZonvieCore.appLog(
+                "[scroll_debug] row_capacity_retry_blocked bracketOpen=\(bracketOpen) " +
+                "provisioning=\(provisioning) gpuInFlight=\(gpuInFlight)"
+            )
             return .retry
         }
         guard rowCapacityRequiredRows > 0 else {
@@ -4536,6 +4548,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if setIdx == writeSetIndex {
             precondition(isInFlush, "write-set row buffer allocation is only valid during an active flush")
         }
+        // Synchronous allocation restored (was allowAllocation: false): the
+        // async row-capacity-provisioning detour (417c825) raced its own
+        // requirement snapshot against the row-to-slot remap that a fast,
+        // continuous scroll performs every flush — each retry's provisioned
+        // sizing was already stale by the time grid_mu was reacquired,
+        // which made recovery not converge under sustained scroll (observed:
+        // multi-second display freezes). A same-thread MTLBuffer allocation
+        // here is a small, bounded shared-storage-mode buffer (a handful of
+        // KB), not the atlas texture the no-per-frame-allocation rule in
+        // CLAUDE.md targets; the surfaceMaxProvisionedRow* budget checks
+        // still gate genuinely pathological growth via requirePreparedRowCapacity
+        // below on real allocation failure.
         return ensureSurfaceRowBuffer(
             bufferSet: bufferSets[setIdx],
             sourceSet: bufferSets[flushSourceSetIndex],
@@ -4543,7 +4567,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             row: row,
             vertexCount: vertexCount,
             maxRowBuffers: maxRowBuffers,
-            allowAllocation: false,
             inflightRowBuffers: (inflightRowBuffer(atSlot: row), nil)
         )
     }
@@ -4829,11 +4852,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard rowsDelta != 0 else { return true }
         guard rowStart >= 0, rowEnd > rowStart else { return true }
         guard colStart == 0, colEnd == totalCols else { return true }
-        guard requirePreparedRowCapacity(
-            row: rowEnd - 1,
-            vertexCount: 0,
-            totalRows: totalRows
-        ) else { return false }
+        // No capacity pre-check here (was requirePreparedRowCapacity with
+        // vertexCount: 0, added by 417c825): this call only grows the
+        // logical row-state arrays (rowState.buffers/capacities/counts,
+        // rowLogicalToSlot, etc.) to totalRows, a plain Array append with no
+        // MTLBuffer allocation. remapMainRowSlots and cpuShiftMainRowBuffers
+        // below already perform that growth synchronously via
+        // ensureRowStorageInSet — routing it through the async row-capacity
+        // detour was redundant and (per submitVerticesRowRaw's identical
+        // pattern) prone to not converging under sustained scroll.
         guard prepareMainWriteState() else { return false }
         flushHasStructuralMainChange = true
 
@@ -4910,12 +4937,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // and synchronize that set before resolving the physical capacity
         // slot, otherwise the retry worker grows the source slot forever.
         guard prepareMainWriteState() else { return }
-        guard requirePreparedRowCapacity(
-            row: rowStart,
-            vertexCount: count,
-            totalRows: totalRows,
-            useWriteMapping: true
-        ) else { return }
 
         let perfEnabled = ZonvieCore.appLogEnabled
         let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
@@ -4923,6 +4944,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let changesRowStructure = !sourceSet.rowState.usingRowBuffers
             || (totalRows > 0 && totalRows != sourceSet.knownTotalRows)
             || (totalCols > 0 && totalCols != sourceSet.knownTotalCols)
+        // Allocate synchronously (was gated behind requirePreparedRowCapacity
+        // + allowAllocation: false) — see ensureRowBufferInSet's comment for
+        // why the async pre-provisioning detour doesn't converge under
+        // sustained scroll. requirePreparedRowCapacity is still used below,
+        // but only to record a real allocation failure for the async
+        // recovery path, not as a pre-flight gate on ordinary growth.
         let submitted = submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
             sourceSet: sourceSet,
@@ -4933,10 +4960,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
-            allowAllocation: false,
             inflightRowBuffers: { (self.inflightRowBuffer(atSlot: $0), nil) }
         )
         if !submitted {
+            _ = requirePreparedRowCapacity(
+                row: rowStart,
+                vertexCount: count,
+                totalRows: totalRows,
+                useWriteMapping: true
+            )
             flushFailed = true
         } else if changesRowStructure {
             flushHasStructuralMainChange = true

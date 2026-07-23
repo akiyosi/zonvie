@@ -419,8 +419,14 @@ func clampRowsDelta(_ value: Int) -> Int {
 
 // MARK: - Surface Buffer Helpers
 
-/// Maximum vertex buffer capacity (64 MB).
-private let surfaceMaxVertexBufferCapacity: Int = 64 * 1024 * 1024
+/// Maximum vertex buffer capacity (256 MB). Bounds a single row's vertex
+/// data — normal content stays in the low single-digit MB range even under
+/// extreme display setups (multi-monitor, tiny font); this ceiling mainly
+/// guards against pathological per-cell decoration counts (e.g. heavily
+/// stacked combining-character content). Hitting it terminates the redraw
+/// session (see failHardRender in nvim_core.zig), so this is deliberately
+/// generous headroom, not a tight budget.
+private let surfaceMaxVertexBufferCapacity: Int = 256 * 1024 * 1024
 // Provisioning may hold two private row buffers in each of three sets. Bound
 // both the allocation peak and the IOAccelerator object count independently
 // from the core's logical vertex budget.
