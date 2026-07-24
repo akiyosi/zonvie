@@ -1,4 +1,5 @@
 import Cocoa
+import CoreVideo
 import MetalKit
 
 final class MetalTerminalView: MTKView {
@@ -275,17 +276,34 @@ final class MetalTerminalView: MTKView {
     // input recorded; the FIRST OS auto-repeat proves the key is repeatable
     // (this also keeps press-and-hold/accent-popup behavior intact, since
     // those keys never produce OS repeats) and hands the cadence over to a
-    // render-clock-driven synthesizer. Subsequent OS repeats are swallowed.
-    // The synthesizer fires from the draw callback (main thread, 60Hz in
-    // continuous mode) at the user's configured repeat interval, so held-key
-    // scrolling advances in lockstep with the display: no beats, no holes,
-    // and no per-repeat IME round-trip (~4ms main-thread each).
+    // synthesizer.
+    //
+    // EXPERIMENT (decoupled-key-repeat, tmp/project_scroll_jank_investigation
+    // Run11-12): the synthesizer used to fire from the draw callback (main
+    // thread), tying repeat-send timing to render-loop pacing. That couples
+    // the two: a compositor-side stall in nextDrawable() (unavoidable, see
+    // Run11) delays the next draw(in:) call and, with it, the next repeat
+    // send, one-for-one. A dedicated CVDisplayLink (its own thread, per
+    // Apple's docs) now drives send timing instead, so a render stall no
+    // longer perturbs input cadence — matching how Neovide's OS-driven
+    // (non-synthesized) repeats are unaffected by its own render stalls.
+    // draw(in:)'s tick is kept only for the IME/focus safety-disarm check,
+    // which must run on the main thread (AppKit calls).
+    //
+    // sendInput/sendKeyEvent's Zig-core path is safe for this concurrent
+    // caller: nextMsgId() is atomic and sendRaw() already serializes through
+    // write_queue_mu; only the shared key_buf escape scratch buffer needed a
+    // new lock (key_buf_mu, core-side).
 
     /// What the initial keyDown sent to Neovim; replayed verbatim per repeat.
     private enum HeldKeyAction {
         case text(String)
         case keyEvent(mods: UInt32, characters: String?, charactersIgnoringModifiers: String?)
     }
+    // Guards the fields below: written from the main thread (keyDown/keyUp,
+    // takeOverKeyRepeat, disarmKeyRepeatSynthesis) and read+partially-written
+    // (synthNextFire) from the display-link callback thread.
+    private var keyRepeatLock = os_unfair_lock()
     private var heldKeyCode: UInt16? = nil
     private var heldKeyAction: HeldKeyAction? = nil
     private var synthRepeatActive = false
@@ -293,9 +311,13 @@ final class MetalTerminalView: MTKView {
     private var synthNextFire: Double = 0
     private var synthInterval: Double = 1.0 / 60.0
     // Capture window: set for the duration of a fresh keyDown's processing.
+    // Main thread only (only ever read/written from the real keyDown path,
+    // never from the display-link repeat path — see replayHeldKeyOffMain).
     private var keyRepeatCaptureActive = false
     private var keyRepeatCapturedText: String? = nil
     private var keyRepeatCapturedCount = 0
+
+    private var repeatDisplayLink: CVDisplayLink? = nil
 
     private static func uptimeNow() -> Double {
         return Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000.0
@@ -308,28 +330,38 @@ final class MetalTerminalView: MTKView {
     }
 
     private func disarmKeyRepeatSynthesis(_ reason: String) {
-        if synthRepeatActive {
-            ZonvieCore.appLog("[keyRepeat] disarm (\(reason))")
-        }
+        os_unfair_lock_lock(&keyRepeatLock)
+        let wasActive = synthRepeatActive
         synthRepeatActive = false
         heldKeyCode = nil
         heldKeyAction = nil
+        os_unfair_lock_unlock(&keyRepeatLock)
+        if wasActive {
+            ZonvieCore.appLog("[keyRepeat] disarm (\(reason))")
+        }
+        stopRepeatDisplayLink()
     }
 
     /// First OS auto-repeat observed for the held key: take over the cadence.
     private func takeOverKeyRepeat() {
         // NSEvent.keyRepeatInterval mirrors the user's key-repeat setting.
         // Clamp defensively; 0 would spin and >1s is nonsense for repeats.
-        synthInterval = max(1.0 / 120.0, min(1.0, NSEvent.keyRepeatInterval))
+        let interval = max(1.0 / 120.0, min(1.0, NSEvent.keyRepeatInterval))
+        os_unfair_lock_lock(&keyRepeatLock)
+        synthInterval = interval
         synthRepeatActive = true
-        synthNextFire = Self.uptimeNow() + synthInterval
-        ZonvieCore.appLog("[keyRepeat] takeover keyCode=0x\(String(heldKeyCode ?? 0, radix: 16)) interval_ms=\(String(format: "%.2f", synthInterval * 1000.0))")
+        synthNextFire = Self.uptimeNow() + interval
+        let code = heldKeyCode ?? 0
+        os_unfair_lock_unlock(&keyRepeatLock)
+        ZonvieCore.appLog("[keyRepeat] takeover keyCode=0x\(String(code, radix: 16)) interval_ms=\(String(format: "%.2f", interval * 1000.0))")
         // This OS repeat is replaced by an immediate synthesized one, then
-        // the render clock paces the rest.
+        // the display link paces the rest.
         replayHeldKey()
         activateDrawLoop()
+        startRepeatDisplayLink()
     }
 
+    /// Replay on the main thread (initial takeover, and the safety path).
     private func replayHeldKey() {
         guard let code = heldKeyCode, let action = heldKeyAction else {
             disarmKeyRepeatSynthesis("no held action")
@@ -348,32 +380,97 @@ final class MetalTerminalView: MTKView {
         }
     }
 
+    /// Replay from the display-link callback thread. Must not touch
+    /// keyRepeatCaptureActive/keyRepeatCapturedText (main-thread only; a
+    /// synthesized repeat is never captured) or read AppKit state directly.
+    private func replayHeldKeyOffMain(code: UInt16, action: HeldKeyAction) {
+        switch action {
+        case .text(let t):
+            core?.sendInput(t)
+        case .keyEvent(let mods, let chars, let charsIg):
+            core?.sendKeyEvent(
+                keyCode: UInt32(code),
+                mods: mods,
+                characters: chars,
+                charactersIgnoringModifiers: charsIg
+            )
+        }
+        // Keep the active draw loop alive so the response is drawn promptly.
+        // activeDrawIdleFrames is a best-effort idle heuristic (not a
+        // correctness-sensitive counter), so an async cross-thread reset is
+        // an acceptable trade for not touching main-thread state directly
+        // from this callback.
+        DispatchQueue.main.async { [weak self] in
+            self?.activeDrawIdleFrames = 0
+        }
+    }
+
+    /// Called from the display-link callback (its own thread, per Apple's
+    /// CVDisplayLink docs — not main). Determines whether a repeat is due
+    /// and, if so, sends it directly: this is the whole point of the
+    /// experiment — a main-thread render stall (nextDrawable under
+    /// compositor backpressure) must not delay this send.
+    private func tickKeyRepeatSynthesisOffMain() {
+        os_unfair_lock_lock(&keyRepeatLock)
+        guard synthRepeatActive, let code = heldKeyCode, let action = heldKeyAction else {
+            os_unfair_lock_unlock(&keyRepeatLock)
+            return
+        }
+        let now = Self.uptimeNow()
+        let interval = synthInterval
+        // Mirrors the main-thread tick's half-tick tolerance, but there is no
+        // single well-defined "tick period" off the render clock, so use half
+        // the repeat interval itself as the tolerance window.
+        guard now >= synthNextFire - interval * 0.5 else {
+            os_unfair_lock_unlock(&keyRepeatLock)
+            return
+        }
+        synthNextFire += interval
+        if synthNextFire < now {
+            synthNextFire = now + interval
+        }
+        os_unfair_lock_unlock(&keyRepeatLock)
+        replayHeldKeyOffMain(code: code, action: action)
+    }
+
+    private func startRepeatDisplayLink() {
+        guard repeatDisplayLink == nil else { return }
+        var link: CVDisplayLink?
+        let status = CVDisplayLinkCreateWithActiveCGDisplays(&link)
+        guard status == kCVReturnSuccess, let link else {
+            ZonvieCore.appLog("[keyRepeat] CVDisplayLinkCreateWithActiveCGDisplays failed status=\(status)")
+            return
+        }
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, ctx in
+            guard let ctx else { return kCVReturnSuccess }
+            let view = Unmanaged<MetalTerminalView>.fromOpaque(ctx).takeUnretainedValue()
+            view.tickKeyRepeatSynthesisOffMain()
+            return kCVReturnSuccess
+        }, selfPtr)
+        CVDisplayLinkStart(link)
+        repeatDisplayLink = link
+    }
+
+    private func stopRepeatDisplayLink() {
+        guard let link = repeatDisplayLink else { return }
+        CVDisplayLinkStop(link)
+        repeatDisplayLink = nil
+    }
+
     /// Called from the renderer's draw entry every frame (main thread).
-    /// No-op unless a synthesized repeat is armed.
+    /// No-op unless a synthesized repeat is armed. Only the safety-disarm
+    /// check remains here; send timing is driven by the display link.
     func tickKeyRepeatSynthesis() {
-        guard synthRepeatActive else { return }
+        os_unfair_lock_lock(&keyRepeatLock)
+        let active = synthRepeatActive
+        os_unfair_lock_unlock(&keyRepeatLock)
+        guard active else { return }
         // Safety net: lost keyUps (Cmd-Tab etc.) and IME activation must
         // never leave a key repeating forever.
         if hasMarkedText() || window?.isKeyWindow != true {
             disarmKeyRepeatSynthesis("safety")
-            return
         }
-        let now = Self.uptimeNow()
-        // synthInterval can equal the draw tick period exactly (16.67ms repeat
-        // on the 60Hz loop), making a bare `now >= synthNextFire` a per-tick
-        // race: a tick arriving microseconds early skips an entire frame of
-        // input (visible as a one-frame scroll stall). Fire when the due time
-        // is closer to this tick than to the next one (half-tick tolerance).
-        let tickPeriod = 1.0 / Double(max(1, preferredFramesPerSecond))
-        guard now >= synthNextFire - min(tickPeriod, synthInterval) * 0.5 else { return }
-        replayHeldKey()
-        // At most one send per frame; if we fell behind (loop was paused),
-        // re-anchor instead of bursting catch-up repeats.
-        synthNextFire += synthInterval
-        if synthNextFire < now {
-            synthNextFire = now + synthInterval
-        }
-        activeDrawIdleFrames = 0
     }
 
     override func keyUp(with event: NSEvent) {
