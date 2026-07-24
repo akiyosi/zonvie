@@ -564,6 +564,12 @@ pub const Core = struct {
     main_subgrid_row_index_valid: bool = false,
     main_subgrid_row_index_generation: u64 = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
+    // Guards key_buf: sendInput/sendKeyEvent may now be called from a
+    // frontend-owned display-link thread (macOS key-repeat synthesis) as
+    // well as the normal per-keystroke caller, so the shared scratch buffer
+    // is no longer single-writer. nextMsgId() (atomic) and sendRaw()'s
+    // write_queue_mu are already safe for concurrent callers.
+    key_buf_mu: std.Io.Mutex = .init,
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
 
@@ -2765,6 +2771,12 @@ pub const Core = struct {
         }
 
         if (needs_escape) {
+            // sendInput/sendKeyEvent may be called concurrently now (macOS
+            // key-repeat synthesis calls this from a display-link thread as
+            // well as the normal per-keystroke caller), so key_buf needs a
+            // lock even though requestInput()'s own write path is safe.
+            self.key_buf_mu.lockUncancelable(clock.io());
+            defer self.key_buf_mu.unlock(clock.io());
             self.key_buf.clearRetainingCapacity();
             for (keys) |c| {
                 if (c == '<') {
@@ -3519,7 +3531,12 @@ pub const Core = struct {
     }
 
     pub fn sendKeyEvent(self: *Core, keycode: u32, mods: u32, chars: []const u8, ign: []const u8) void {
-        // Use persistent buffer (zero-allocation hot path)
+        // Use persistent buffer (zero-allocation hot path). Locked for the
+        // whole function (every branch below reads/writes key_buf before
+        // returning): sendInput/sendKeyEvent may now be called concurrently
+        // from macOS key-repeat synthesis's display-link thread.
+        self.key_buf_mu.lockUncancelable(clock.io());
+        defer self.key_buf_mu.unlock(clock.io());
         self.key_buf.clearRetainingCapacity();
 
         // 1) Special keys by keycode (macOS / Win32)
