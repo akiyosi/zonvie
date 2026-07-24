@@ -398,14 +398,11 @@ final class MetalTerminalView: MTKView {
                 charactersIgnoringModifiers: charsIg
             )
         }
-        // Keep the active draw loop alive so the response is drawn promptly.
-        // activeDrawIdleFrames is a best-effort idle heuristic (not a
-        // correctness-sensitive counter), so an async cross-thread reset is
-        // an acceptable trade for not touching main-thread state directly
-        // from this callback.
-        DispatchQueue.main.async { [weak self] in
-            self?.activeDrawIdleFrames = 0
-        }
+        // No activeDrawIdleFrames reset here: notifyDrawIdle() already resets
+        // it every frame while synthRepeatActive is set (checked on the main
+        // thread from the draw loop itself), so a cross-thread async dispatch
+        // from this callback would be redundant. A prior version dispatched
+        // one here per repeat tick (~60/s while held).
     }
 
     /// Called from the display-link callback (its own thread, per Apple's
