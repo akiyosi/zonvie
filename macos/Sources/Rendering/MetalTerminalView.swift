@@ -318,6 +318,9 @@ final class MetalTerminalView: MTKView {
     private var keyRepeatCapturedCount = 0
 
     private var repeatDisplayLink: CVDisplayLink? = nil
+    /// Extra retain on self held while the display link may still fire;
+    /// released in stopRepeatDisplayLink(). See startRepeatDisplayLink().
+    private var repeatDisplayLinkContext: Unmanaged<MetalTerminalView>? = nil
 
     private static func uptimeNow() -> Double {
         return Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000.0
@@ -441,13 +444,21 @@ final class MetalTerminalView: MTKView {
             ZonvieCore.appLog("[keyRepeat] CVDisplayLinkCreateWithActiveCGDisplays failed status=\(status)")
             return
         }
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        // Retained (not passUnretained): the display link's callback runs on
+        // its own thread and may fire at any point until CVDisplayLinkStop
+        // takes effect. An unretained context would dangle if this view were
+        // deallocated (e.g. its tab/window closed) while a repeat was still
+        // armed — deinit had no stopRepeatDisplayLink() call, so the link
+        // could keep running past the view's lifetime. The extra retain here
+        // keeps self alive until stopRepeatDisplayLink() releases it below.
+        let retained = Unmanaged.passRetained(self)
+        repeatDisplayLinkContext = retained
         CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, ctx in
             guard let ctx else { return kCVReturnSuccess }
             let view = Unmanaged<MetalTerminalView>.fromOpaque(ctx).takeUnretainedValue()
             view.tickKeyRepeatSynthesisOffMain()
             return kCVReturnSuccess
-        }, selfPtr)
+        }, retained.toOpaque())
         CVDisplayLinkStart(link)
         repeatDisplayLink = link
     }
@@ -456,6 +467,8 @@ final class MetalTerminalView: MTKView {
         guard let link = repeatDisplayLink else { return }
         CVDisplayLinkStop(link)
         repeatDisplayLink = nil
+        repeatDisplayLinkContext?.release()
+        repeatDisplayLinkContext = nil
     }
 
     /// Called from the renderer's draw entry every frame (main thread).
@@ -735,6 +748,12 @@ final class MetalTerminalView: MTKView {
         } else {
             msgTimer?.invalidate()
             msgTimer = nil
+            // The view is leaving its window (tab/window closed, possibly
+            // while a key is still held): disarm proactively so the
+            // repeat-pacing CVDisplayLink stops and releases its extra
+            // retain on self (see startRepeatDisplayLink) instead of relying
+            // on deinit, which cannot run while that retain is outstanding.
+            disarmKeyRepeatSynthesis("view detached from window")
         }
     }
 
@@ -743,6 +762,11 @@ final class MetalTerminalView: MTKView {
         scrollbarHideTimer = nil
         msgTimer?.invalidate()
         msgTimer = nil
+        // Belt-and-suspenders: viewDidMoveToWindow(nil) already disarms (and
+        // releases the display-link's retain on self) on the normal
+        // detachment path. This covers any path that reaches deinit without
+        // going through that first — a no-op if already stopped.
+        stopRepeatDisplayLink()
     }
 
     // MARK: - Mouse Input
