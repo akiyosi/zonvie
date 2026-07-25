@@ -414,6 +414,7 @@ final class MetalTerminalView: MTKView {
         let stillArmed = synthRepeatActive && keyRepeatGeneration == generation
         os_unfair_lock_unlock(&keyRepeatLock)
         guard stillArmed else { return }
+        FrameTracer.trace(.inputSend, a: UInt64(code))
         switch action {
         case .text(let t):
             core?.sendInput(t)
@@ -651,6 +652,7 @@ final class MetalTerminalView: MTKView {
     }
 
     private func commonInit() {
+        FrameTracer.installDumpHandler()
         guard self.device != nil else {
             ZonvieCore.appLog("[View] Failed to create MTLDevice - Metal not available")
             return

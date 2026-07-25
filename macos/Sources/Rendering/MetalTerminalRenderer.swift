@@ -467,6 +467,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var gpuStatsSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
 
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
+    /// How long a frame may wait for an in-flight commit before giving up and
+    /// dropping itself. Traced waits during a held-key scroll ran 364us at the
+    /// median and 1.2ms at the worst, so 2ms clears the measured distribution
+    /// while staying far inside the 16.67ms frame budget.
+    /// `ZONVIE_COMMIT_GUARD_US` overrides it; 0 disables the wait entirely.
+    static let commitGuardBandNs: UInt64 = {
+        guard let s = ProcessInfo.processInfo.environment["ZONVIE_COMMIT_GUARD_US"],
+              let us = UInt64(s) else { return 2_000_000 }
+        return us * 1_000
+    }()
+
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
@@ -1598,6 +1609,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     @discardableResult
     func commitFlush(drawableW: UInt32, drawableH: UInt32) -> Bool {
         guard isInFlush else { return false }  // Flush was dropped or aborted
+        FrameTracer.trace(.commitFlush)
 
         // Commit staged CPU pixels while holding reader admission only across
         // the actual texture replace. If readers or a prior blit are active,
@@ -2098,6 +2110,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        // Frame-timing trace. Covers every exit path via defer so early
+        // returns (semaphore busy, no drawable, row-capacity gate) still show
+        // up as a bounded draw in the timeline.
+        if FrameTracer.enabled {
+            FrameTracer.trace(.drawBegin)
+        }
+        defer {
+            if FrameTracer.enabled {
+                FrameTracer.trace(.drawEnd)
+            }
+        }
         // Drive key-repeat synthesis off the render clock (main thread; 60Hz
         // while the continuous draw loop is active). No-op unless armed.
         (view as? MetalTerminalView)?.tickKeyRepeatSynthesis()
@@ -2167,6 +2190,45 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
+            // Continuous-scroll guard band.
+            //
+            // Traced measurement (Release, held-key scroll): every dropped
+            // frame was a near miss. The commit landed 0.07-1.1ms (median
+            // ~0.2ms) after this draw had already concluded "nothing changed"
+            // and bailed, so the content sat until the next vsync — the 33ms
+            // on-glass gap that reads as a stutter. draw(in:) spends ~0.3ms of
+            // the 16.67ms budget, so the slack to absorb this is already there.
+            //
+            // Only a frame that would otherwise be dropped can wait, and only
+            // while a scroll is actually in progress, so a genuinely idle
+            // screen still bails immediately. The wait ends the moment the
+            // commit lands; the bound only caps a genuinely late producer.
+            if Self.commitGuardBandNs > 0 {
+                lock.lock()
+                var revision = commitRevision
+                lock.unlock()
+                if revision == lastDrawnRevision, hadRecentCommit(withinNs: 50_000_000) {
+                    let start = FrameTracer.nowNs()
+                    let deadline = start + Self.commitGuardBandNs
+                    while FrameTracer.nowNs() < deadline {
+                        // Short enough to catch a ~200us miss, long enough not
+                        // to spin the main thread hot.
+                        usleep(100)
+                        lock.lock()
+                        revision = commitRevision
+                        lock.unlock()
+                        if revision != lastDrawnRevision { break }
+                    }
+                    if FrameTracer.enabled {
+                        FrameTracer.trace(
+                            .commitGuardBand,
+                            a: revision != lastDrawnRevision ? 1 : 0,
+                            b: FrameTracer.nowNs() - start
+                        )
+                    }
+                }
+            }
+
             // Acquire GPU slot BEFORE marking gpuInFlightCount.
             // This prevents a slot-blocked draw() from inflating gpuInFlightCount,
             // which would cause beginFlush() to incorrectly see all sets as "in-flight".
@@ -2181,6 +2243,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Note: this does NOT remove the acquire-drawable wait further
             // below; CAMetalLayer has no non-blocking nextDrawable.
             if inflightSemaphore.wait(timeout: .now()) != .success {
+                FrameTracer.trace(.drawSkipSemaphore)
                 ZonvieCore.appLogPerf("[perf] draw_semaphore_busy skip=true")
                 (view as? MetalTerminalView)?.didDrawFrame()
                 (view as? MetalTerminalView)?.requestRedraw()
@@ -2220,6 +2283,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             lock.lock()
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
                 lock.unlock()
+                FrameTracer.trace(.drawSkipRowCapacity)
                 inflightSemaphore.signal()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 (view as? MetalTerminalView)?.requestRedraw()
@@ -2294,6 +2358,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let committedMainCount = committed.mainVertexCount
             let committedCursorCount = committedCursor.cursorVertexCount
 
+            if FrameTracer.enabled {
+                FrameTracer.trace(
+                    .frameContent,
+                    a: UInt64(dirtyRows.count),
+                    b: rowMode ? 1 : 0,
+                    seq: UInt32(truncatingIfNeeded: committedMainCount)
+                )
+            }
+
             // All values below (csi, currentCommitRevision, scrollSnapshot, dirtyRows)
             // are local snapshots taken under lock above, so they form a consistent set.
             // committed.* fields are safe because gpuInFlightCount protects the buffer set.
@@ -2340,6 +2413,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // If rowMode, we may not have a single "currentMainCount"; rows drive it.
             if !rowMode && currentMainCount <= 0 && currentCursorCount <= 0 {
+                FrameTracer.trace(.drawSkipNoChange, a: 1)
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
             }
@@ -2386,6 +2460,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                !drawableSizeChanged,
                !anyCustomShaderNeedsAnimation {
                 // Still reset redrawPending so future redraws are not blocked.
+                FrameTracer.trace(.drawSkipNoChange, a: 2)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -2397,6 +2472,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // destroys the backbuffer between GPU-blit scroll frames.
             // Same animation exception as above.
             if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation {
+                FrameTracer.trace(.drawSkipNoChange, a: 3)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
                 return
@@ -2425,6 +2501,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 && currentCursorCount == 0
                 && !anyCustomShaderNeedsAnimation {
                 lastRenderedBlinkState = cursorBlinkStateSnapshot
+                FrameTracer.trace(.drawSkipNoChange, a: 4)
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -3258,7 +3335,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 t_drawable_start = CFAbsoluteTimeGetCurrent()
             }
+            FrameTracer.trace(.drawableAcquireBegin)
             guard let drawable = view.currentDrawable else {
+                FrameTracer.trace(.drawSkipNoDrawable)
                 // Commit the already-encoded persistent-texture work so Metal
                 // can reclaim the command buffer. A full dirty retry heals the
                 // consumed scroll state before the next presentation.
@@ -3276,6 +3355,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 bailWithoutSubmit("no drawable after back-buffer encode")
                 return
             }
+            FrameTracer.trace(.drawableAcquireEnd)
             if ZonvieCore.appLogEnabled {
                 let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
@@ -3502,6 +3582,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cursorEnc.endEncoding()
             }
 
+            if FrameTracer.enabled {
+                // presentedTime shares CACurrentMediaTime's base, which is the
+                // same clock as FrameTracer.nowNs (CLOCK_UPTIME_RAW), so the
+                // on-glass timestamp lines up with the CPU-side events.
+                // a = presentedTime in ns (0 when the frame never reached the
+                // display), b = the drawBegin-side timestamp of this frame.
+                let submitNs = FrameTracer.nowNs()
+                drawable.addPresentedHandler { d in
+                    let t = d.presentedTime
+                    let presentedNs = t > 0 ? UInt64(t * 1_000_000_000.0) : 0
+                    FrameTracer.trace(.presented, a: presentedNs, b: submitNs)
+                }
+            }
             var t_present_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
                 t_present_start = CFAbsoluteTimeGetCurrent()
@@ -3534,7 +3627,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
                 }
             }
+            FrameTracer.trace(.presentCall)
             cmd.present(drawable)
+            FrameTracer.trace(.gpuSubmit)
             // Capture semaphore and lock directly so the signal fires even
             // if the renderer is deallocated before the GPU finishes.
             let sem = inflightSemaphore
@@ -3557,6 +3652,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let frameStatsSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuStatsSlots : []
             let frameStatsBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuStatsSampleBuffer : nil
             cmd.addCompletedHandler { [weak self, weak view] completed in
+                if FrameTracer.enabled {
+                    // a/b = Metal's own GPU start/end in ns, so GPU execution
+                    // can be separated from queue + present scheduling latency.
+                    FrameTracer.trace(
+                        .gpuComplete,
+                        a: UInt64(max(0, completed.gpuStartTime) * 1_000_000_000.0),
+                        b: UInt64(max(0, completed.gpuEndTime) * 1_000_000_000.0)
+                    )
+                }
                 // Always release GPU in-flight mark + semaphore, even if self is gone.
                 lk.lock()
                 self?.completeSurfaceGpuReadLocked(csi)
