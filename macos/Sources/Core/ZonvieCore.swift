@@ -6119,14 +6119,16 @@ final class ZonvieCore {
 
         // Margin (padding) clear: match the grid CONTENT's background so a
         // custom shader with preserve_alpha reaches the padding seamlessly.
-        // - RGB = the RAW resolved bg (NOT adjustedForCmdlineBackground): the
-        //   core generates the cmdline's content cells from the unadjusted
-        //   theme bg, and adjustedForCmdlineBackground lightens dark colors by
-        //   +0.05. A luminance-keyed shader (e.g. hyperspace: show the effect
-        //   only where max(rgb) < ~0.12) treats that +0.05 as foreground and
-        //   hides the effect in the padding while the main window (raw bg)
-        //   still shows it. Using resolvedBg keeps the padding at the same
-        //   luminance as the content and the main window.
+        // - RGB must follow the SAME rule prepareExternalVertexArray applies to
+        //   the content cells, which depends on whether a custom shader is
+        //   loaded. With a shader the cells keep the RAW theme bg (a
+        //   luminance-keyed effect such as hyperspace shows only where
+        //   max(rgb) < ~0.12, and the +0.05 of adjustedForCmdlineBackground
+        //   would read as foreground and hide the effect in the padding while
+        //   the main window still shows it). Without a shader the cells are
+        //   lightened by adjustedForCmdlineBackground, so the padding must be
+        //   lightened too — using the raw bg unconditionally is what made the
+        //   margin visibly darker than the content in the no-shader case.
         // - alpha = the content cells' background alpha: blur on -> 0 (blur
         //   shows through both cells and padding, unchanged); blur off -> 1 so
         //   the padding is opaque like the cells and preserve_alpha keeps the
@@ -6134,11 +6136,13 @@ final class ZonvieCore {
         // Rounded corners stay clipped by the container's masksToBounds, and the
         // cmdline icon is re-stacked above the MTKView, so an opaque padding is
         // safe (see installDecoratedExternalWindowShell).
+        let shaderActive = (terminalView?.renderer?.customShaderPipelines.isEmpty == false)
+        let marginBg = shaderActive ? resolvedBg : adjustedBg
         let marginAlpha = resolveSurfaceBackgroundAlpha(
             blurEnabled: ZonvieConfig.shared.blurEnabled,
             decoratedSurface: true
         )
-        let clearRgb = resolvedBg.usingColorSpace(.deviceRGB)
+        let clearRgb = marginBg.usingColorSpace(.deviceRGB)
         gridView.gridClearColor = MTLClearColor(
             red: Double(clearRgb?.redComponent ?? 0),
             green: Double(clearRgb?.greenComponent ?? 0),
