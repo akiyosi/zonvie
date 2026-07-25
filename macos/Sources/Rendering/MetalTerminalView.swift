@@ -169,6 +169,23 @@ final class MetalTerminalView: MTKView {
     /// eases to epsilon in ~250ms.
     private static let scrollBounceDecayPerFrame: CGFloat = 0.75
 
+    /// Per-60fps-frame decay factor for the keyboard sub-row ease. Neovim
+    /// delivers whole rows, and the moment one lands drifts by a few ms
+    /// against the frame clock, so occasionally a frame gets none and the next
+    /// gets two. Holding the picture back by the scrolled distance and easing
+    /// it forward turns that into fractional motion. Steady-state lag is
+    /// h * d / (1 - d) — one row at 0.5, which is the price of covering the
+    /// jitter without reading as an animation.
+    private static let smoothScrollDecayPerFrame: CGFloat = 0.5
+
+    /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
+    /// a trackpad gesture). Guarded by scrollOffsetLock.
+    private var smoothScrollGrids: Set<Int64> = []
+    /// Scratch for the per-frame seed drain; kept as a field so the tick does
+    /// not allocate a dictionary every frame.
+    private var seedScratch: [Int64: Int] = [:]
+    private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
+
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
     /// renderer clamp (clampVisualScrollOffsetPx) and the rubber-band
     /// resistance curve — they must agree or the band stops responding before
@@ -695,6 +712,8 @@ final class MetalTerminalView: MTKView {
             // This ensures scroll offsets are cleared before vertices are drawn,
             // preventing double-shift glitches in split windows.
             self?.processPendingScrollClears()
+            // Advance the sub-row ease (seed + decay) for keyboard scrolling.
+            self?.tickSmoothScroll()
             // Detect buffer-edge blocked scrolls and run the rubber-band
             // bounce-back animation once the gesture/momentum ends.
             self?.tickScrollEdgeBounce()
@@ -2489,6 +2508,8 @@ final class MetalTerminalView: MTKView {
             let sentCount = pendingSentScroll[gridId] ?? 0
             let currentOffset = scrollOffsetPx[gridId] ?? 0
             if sentCount > 0 {
+                // A trackpad gesture owns this grid's offset again.
+                smoothScrollGrids.remove(gridId)
                 // Consume as many events as we have pending sent scrolls
                 let toConsume = min(sentCount, scrollEventCount)
                 pendingSentScroll[gridId] = sentCount - toConsume
@@ -2515,9 +2536,19 @@ final class MetalTerminalView: MTKView {
                     scrollOffsetPx[gridId] = newOffset
                 }
                 ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) sentCount=\(sentCount) consumed=\(toConsume) offset=\(currentOffset) -> \(newOffset)")
+            } else if smoothScrollGrids.contains(gridId) {
+                pendingSentScrollLock.unlock()
+                // The keyboard ease owns this grid's offset: it is the lag the
+                // ease deliberately holds, not a stale trackpad offset, and
+                // tickSmoothScroll decays it out. Clearing here would snap the
+                // picture back to cell alignment every scrolled frame — this
+                // function also runs on the core thread during vertex
+                // submission, so it cannot see a seed the flush has not
+                // committed yet.
             } else {
                 pendingSentScrollLock.unlock()
                 // Neovim-initiated scroll (j/k keys, etc.) - clear offset
+                smoothScrollGrids.remove(gridId)
                 scrollOffsetPx.removeValue(forKey: gridId)
                 ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) nvim-initiated, clearing offset=\(currentOffset)")
             }
@@ -2525,6 +2556,79 @@ final class MetalTerminalView: MTKView {
         scrollOffsetLock.unlock()
         // Note: updateScrollShaderOffset() is called in onPreDraw, not here,
         // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
+    }
+
+    /// Seed and decay the keyboard sub-row scroll ease. Seeding first and
+    /// decaying second settles at one row of lag; decaying first would settle
+    /// at two, which is past what the retention ring can cover.
+    private func tickSmoothScroll() {
+        guard MetalTerminalRenderer.smoothScrollEnabled else { return }
+        let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        guard rowHeightPx > 0 else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsedFrames = lastSmoothScrollTickTime > 0
+            ? min(max((now - lastSmoothScrollTickTime) * 60.0, 0.0), 3.0)
+            : 1.0
+        lastSmoothScrollTickTime = now
+
+        // A seed exists only for a scroll whose outgoing row was retained, so
+        // an uncaptured scroll (page motion, a non-fast-path redraw) simply
+        // leaves the offset to decay.
+        seedScratch.removeAll(keepingCapacity: true)
+        for seed in renderer.takeSmoothScrollSeeds() {
+            seedScratch[seed.gridId, default: 0] += seed.rowsDelta
+        }
+
+        scrollOffsetLock.lock()
+        let maxOffsetPx = rowHeightPx * CGFloat(MetalTerminalRenderer.maxRetainedScrollRows)
+        for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
+            // Content moved up by rowsDelta rows, so draw it that much lower
+            // and let the decay below carry it up over the next few frames.
+            // Not clamped here: the clamp belongs after the decay, or a frame
+            // that lands two rows at once has its whole jump clipped straight
+            // back onto the glass — the exact case the ease exists for.
+            scrollOffsetPx[gridId] = (scrollOffsetPx[gridId] ?? 0) + CGFloat(rowsDelta) * rowHeightPx
+            smoothScrollGrids.insert(gridId)
+        }
+
+        if !smoothScrollGrids.isEmpty {
+            let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
+            for gridId in Array(smoothScrollGrids) {
+                // Clamped to what the retention ring can cover: past that the
+                // vacated band has no row to show.
+                let decayed = (scrollOffsetPx[gridId] ?? 0) * decay
+                let eased = max(-maxOffsetPx, min(maxOffsetPx, decayed))
+                if abs(eased) < Self.scrollOffsetEpsilon {
+                    scrollOffsetPx.removeValue(forKey: gridId)
+                    smoothScrollGrids.remove(gridId)
+                } else {
+                    scrollOffsetPx[gridId] = eased
+                }
+            }
+        }
+        let easeActive = !smoothScrollGrids.isEmpty
+        let tracedOffsetPx = easeActive
+            ? (smoothScrollGrids.map { abs(scrollOffsetPx[$0] ?? 0) }.max() ?? 0)
+            : 0
+        scrollOffsetLock.unlock()
+
+        if FrameTracer.enabled {
+            // The visual position is content_rows * h - offset, so smoothness
+            // has to be reconstructed from the offset actually applied each
+            // frame; the content row delta alone no longer shows it.
+            FrameTracer.trace(
+                .smoothScrollOffset,
+                a: UInt64(Int64(round(tracedOffsetPx * 1000))),
+                b: UInt64(Int64(round(rowHeightPx * 1000)))
+            )
+        }
+
+        // The last key of a hold produces no further flushes, so the ease
+        // needs the draw clock kept alive to settle.
+        if easeActive && isPaused {
+            activateDrawLoop()
+        }
     }
 
     /// Service shared smooth-scroll state for external windows that reuse the

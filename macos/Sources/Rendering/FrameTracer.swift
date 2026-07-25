@@ -44,6 +44,11 @@ enum FrameTraceTag: UInt32 {
     /// uneven if the per-frame advance is not constant, so this is the
     /// separate question from whether a frame reached the glass at all.
     case scrollAdvance = 18
+    /// Sub-row scroll ease applied for this frame. a = |offset| in milli-
+    /// pixels, b = row height in milli-pixels. Visual position is
+    /// content_rows * h - offset, so scrollAdvance alone stops describing
+    /// perceived motion once the ease is on.
+    case smoothScrollOffset = 19
 }
 
 struct FrameTraceEvent {

@@ -16,6 +16,7 @@ TAG = {
     9: "drawSkipNoDrawable", 10: "drawSkipRowCapacity", 11: "commitFlush",
     12: "inputSend", 13: "encodeEnd", 14: "gpuSubmit", 15: "frameContent",
     16: "drawSkipNoChange", 17: "commitGuardBand", 18: "scrollAdvance",
+    19: "smoothScrollOffset",
 }
 VSYNC_NS = 16_666_667
 
@@ -166,6 +167,45 @@ def main(path):
             print(f"  stalled frames (0 rows): {stalls} = {stalls/span_s:.2f}/s")
             jumps = sum(v for k, v in hist.items() if abs(k) > abs(typical))
             print(f"  jump frames (>|{typical}| rows): {jumps} = {jumps/span_s:.2f}/s")
+
+    # --- visual motion with the sub-row ease applied -----------------------
+    # Once ZONVIE_SMOOTH_SCROLL is on, the row delta above stops describing
+    # what the eye sees: the picture sits at content_rows * h - offset. Replay
+    # both streams in trace order and report the advance of that position.
+    if any(tag == 19 for _, tag, _, _, _ in rows):
+        signs = {1 if d > 0 else -1 for d in adv if d != 0}
+        if len(signs) > 1:
+            print("\nvisual motion: skipped (scroll reverses direction in "
+                  "this capture; the traced offset is unsigned)")
+        else:
+            sign = signs.pop() if signs else 1
+            offset_px = 0.0
+            row_px = 0.0
+            content_px = 0.0
+            prev = None
+            steps = []
+            for _, tag, _, a, b in rows:
+                if tag == 19:
+                    offset_px = a / 1000.0
+                    if b:
+                        row_px = b / 1000.0
+                elif tag == 18 and row_px:
+                    d = a if a < (1 << 63) else a - (1 << 64)
+                    content_px += d * row_px
+                    # Where the picture actually sits this frame.
+                    pos = content_px - sign * offset_px
+                    if prev is not None:
+                        steps.append(pos - prev)
+                    prev = pos
+            if steps and row_px:
+                cells = [s / row_px for s in steps]
+                mean = sum(cells) / len(cells)
+                var = sum((c - mean) ** 2 for c in cells) / len(cells)
+                stalled = sum(1 for c in cells if abs(c) < 0.05)
+                print(f"\nvisual motion (ease applied): {len(cells)} frames, "
+                      f"mean {mean:.3f} rows/frame, sd {var ** 0.5:.3f}")
+                print(f"  frames not moving at all: {stalled} "
+                      f"({stalled*100.0/len(cells):.1f}%) = {stalled/span_s:.2f}/s")
 
     # --- guard band effectiveness -----------------------------------------
     guards = [(a, b) for _, tag, _, a, b in rows if tag == 17]

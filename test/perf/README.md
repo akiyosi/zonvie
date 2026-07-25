@@ -117,6 +117,42 @@ holding `j` walks the cursor down the window and nvim emits no `grid_scroll`
 at all until it reaches the scrolloff boundary. Only isolated zeros inside an
 otherwise scrolling stretch are motion the user actually loses.
 
+## Sub-row smooth scrolling (`ZONVIE_SMOOTH_SCROLL=1`)
+
+Off by default. When set, a keyboard-driven scroll holds the picture back by
+the distance Neovim just scrolled and eases it forward (decay 0.5/frame, about
+one row of steady-state lag), so a frame that receives no row still moves and a
+frame that receives two shows part of the jump now and the rest next frame. The
+outgoing row is copied out of its slot before the scroll rotation reuses it, so
+the vacated band has real content to show.
+
+`scrollAdvance` alone can no longer describe the result: it records content row
+deltas, which are unchanged. The picture sits at `content_rows * h - offset`,
+and the applied offset is traced per frame as `smoothScrollOffset`. `analyze.py`
+reports the combination as **`visual motion (ease applied)`**.
+
+```bash
+ZONVIE_TRACE_CONFIG=Release                        test/perf/run_trace.py buffer 15 tmp/scrollperf/ss_off.csv
+ZONVIE_SMOOTH_SCROLL=1 ZONVIE_TRACE_CONFIG=Release test/perf/run_trace.py buffer 15 tmp/scrollperf/ss_on.csv
+```
+
+Measured back to back (Release, 15s, four captures each side): per-frame advance
+sd 0.205-0.265 -> 0.116-0.134 rows, stalled frames inside a scrolling stretch
+3.1-4.5% -> 0.4%, two-row jumps 10-22 -> 3-4. Cost: the offset forces a full row
+redraw (dirty rows 3 -> 53) for the duration of the scroll, which measured as
+GPU p50 4.8ms of the 16.67ms budget — unchanged from the partial-redraw
+baseline within run-to-run spread — plus one row-sized buffer copy per scrolled
+row.
+
+Two things the harness cannot settle, both of which need a real held key:
+
+- the app's key-repeat synthesis never engages here (see "Limitations")
+- the top/bottom band is where the earlier no-retention attempt broke, and no
+  metric sees it. Check scroll start, scroll end, both buffer edges and a
+  split. Known cosmetic limitation: the vertex shader pins the edge background
+  quad so it stretches into the gap, so within that band the retained row's
+  glyphs are drawn over the neighbouring row's background colour.
+
 ## Discriminating experiments
 
 **Is the drop a race, or was nothing produced?** Raise the producer rate above
