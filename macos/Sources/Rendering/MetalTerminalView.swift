@@ -181,9 +181,15 @@ final class MetalTerminalView: MTKView {
     /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
     /// a trackpad gesture). Guarded by scrollOffsetLock.
     private var smoothScrollGrids: Set<Int64> = []
+    /// How long after the last precise scroll event the ease keeps out of a
+    /// grid's offset. Covers the gap between a gesture's last event and the
+    /// grid_scroll it produced coming back through the flush.
+    private static let smoothScrollGestureGuardSeconds: TimeInterval = 0.2
+
     /// Scratch for the per-frame seed drain; kept as a field so the tick does
     /// not allocate a dictionary every frame.
     private var seedScratch: [Int64: Int] = [:]
+    private var gestureGridsScratch: [Int64] = []
     private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
@@ -2580,9 +2586,33 @@ final class MetalTerminalView: MTKView {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
         }
 
+        // A trackpad gesture drives the offset itself, one pixel at a time, and
+        // the scroll it asks Neovim for arrives back here as an ordinary row
+        // scroll. Seeding the ease from that would add a row of lag on top of
+        // the gesture's own offset and then halve it every frame, which reads
+        // as the sub-cell scrolling having stopped working. The gesture owns
+        // the offset; the ease keeps its hands off until it is over.
+        pendingSentScrollLock.lock()
+        let pendingSent = pendingSentScroll
+        pendingSentScrollLock.unlock()
+        let gestureActive = scrollGestureTouching
+            || scrollMomentumRunning
+            || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
+        gestureGridsScratch.removeAll(keepingCapacity: true)
+
         scrollOffsetLock.lock()
         let maxOffsetPx = rowHeightPx * CGFloat(MetalTerminalRenderer.maxRetainedScrollRows)
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
+            guard !gestureActive, (pendingSent[gridId] ?? 0) == 0 else {
+                // The rows retained for this scroll would otherwise still be
+                // drawn while the gesture's own offset is showing. Dropped
+                // after the lock is released — dropRetainedScrollRows takes
+                // the renderer's lock, which the core thread holds while
+                // capturing.
+                smoothScrollGrids.remove(gridId)
+                gestureGridsScratch.append(gridId)
+                continue
+            }
             // Content moved up by rowsDelta rows, so draw it that much lower
             // and let the decay below carry it up over the next few frames.
             // Not clamped here: the clamp belongs after the decay, or a frame
@@ -2612,6 +2642,10 @@ final class MetalTerminalView: MTKView {
             ? (smoothScrollGrids.map { abs(scrollOffsetPx[$0] ?? 0) }.max() ?? 0)
             : 0
         scrollOffsetLock.unlock()
+
+        for gridId in gestureGridsScratch {
+            renderer.dropRetainedScrollRows(gridId: gridId)
+        }
 
         if FrameTracer.enabled {
             // The visual position is content_rows * h - offset, so smoothness

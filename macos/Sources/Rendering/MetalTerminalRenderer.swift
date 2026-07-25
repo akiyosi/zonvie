@@ -5132,6 +5132,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.unlock()
     }
 
+    /// Discard the rows retained for a grid whose offset the ease does not
+    /// own — a trackpad gesture drives its own sub-cell offset, and a retained
+    /// row drawn against it belongs to nothing.
+    func dropRetainedScrollRows(gridId: Int64) {
+        guard Self.smoothScrollEnabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !retainedScrollRows.isEmpty else { return }
+        retainedScrollRows.removeAll { $0.gridId == gridId }
+    }
+
     /// Drain the ease seeds committed since the last call. The view converts
     /// them into a pixel offset and decays it; the renderer only records which
     /// grid moved by how much, because the vertices it retained carry the grid
