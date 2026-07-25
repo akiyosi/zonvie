@@ -98,8 +98,7 @@ is the app's own repeat synthesis at production cadence, so the whole input
 path is exercised.
 
 ```bash
-ZONVIE_SMOOTH_SCROLL=1 ZONVIE_TRACE_CONFIG=Release \
-  test/perf/run_realkey.py 12 tmp/scrollperf/rk.csv
+ZONVIE_TRACE_CONFIG=Release test/perf/run_realkey.py 12 tmp/scrollperf/rk.csv
 test/perf/holding.py tmp/scrollperf/rk.csv
 ```
 
@@ -155,9 +154,10 @@ holding `j` walks the cursor down the window and nvim emits no `grid_scroll`
 at all until it reaches the scrolloff boundary. Only isolated zeros inside an
 otherwise scrolling stretch are motion the user actually loses.
 
-## Sub-row smooth scrolling (`ZONVIE_SMOOTH_SCROLL=1`)
+## Sub-row smooth scrolling
 
-Off by default. When set, a keyboard-driven scroll holds the picture back by
+On by default; `ZONVIE_SMOOTH_SCROLL=0` turns it off, which is also how you
+capture the other side of an A/B. A keyboard-driven scroll holds the picture back by
 the distance Neovim just scrolled and eases it forward (decay 0.5/frame, about
 one row of steady-state lag), so a frame that receives no row still moves and a
 frame that receives two shows part of the jump now and the rest next frame. The
@@ -170,26 +170,24 @@ and the applied offset is traced per frame as `smoothScrollOffset`. `analyze.py`
 reports the combination as **`visual motion (ease applied)`**.
 
 ```bash
-ZONVIE_TRACE_CONFIG=Release                        test/perf/run_trace.py buffer 15 tmp/scrollperf/ss_off.csv
-ZONVIE_SMOOTH_SCROLL=1 ZONVIE_TRACE_CONFIG=Release test/perf/run_trace.py buffer 15 tmp/scrollperf/ss_on.csv
+ZONVIE_SMOOTH_SCROLL=0 ZONVIE_TRACE_CONFIG=Release test/perf/run_realkey.py 12 tmp/scrollperf/ss_off.csv
+ZONVIE_TRACE_CONFIG=Release                        test/perf/run_realkey.py 12 tmp/scrollperf/ss_on.csv
 ```
 
-Measured back to back (Release, 15s, four captures each side): per-frame advance
-sd 0.205-0.265 -> 0.116-0.134 rows, stalled frames inside a scrolling stretch
-3.1-4.5% -> 0.4%, two-row jumps 10-22 -> 3-4. Cost: the offset forces a full row
-redraw (dirty rows 3 -> 53) for the duration of the scroll, which measured as
-GPU p50 4.8ms of the 16.67ms budget — unchanged from the partial-redraw
-baseline within run-to-run spread — plus one row-sized buffer copy per scrolled
-row.
+Measured on the real input path, back to back (Release, 12s, two captures each
+side): per-frame advance sd 0.334-0.399 -> 0.195-0.198 rows, stalled frames
+inside a scrolling stretch 5.5-8.2% -> 0.4-0.6%. A hand-held capture on a real
+session agrees: sd 0.252 -> 0.144, stalls 3.5% -> 0.6%, two-row jumps 30 -> 0.
+Cost: the offset forces a full row redraw (dirty rows 3 -> 53) for the duration
+of the scroll, which measured as GPU p50 4.8ms of the 16.67ms budget —
+unchanged from the partial-redraw baseline within run-to-run spread — plus one
+row-sized buffer copy per scrolled row.
 
-Two things the harness cannot settle, both of which need a real held key:
-
-- the app's key-repeat synthesis never engages here (see "Limitations")
-- the top/bottom band is where the earlier no-retention attempt broke, and no
-  metric sees it. Check scroll start, scroll end, both buffer edges and a
-  split. Known cosmetic limitation: the vertex shader pins the edge background
-  quad so it stretches into the gap, so within that band the retained row's
-  glyphs are drawn over the neighbouring row's background colour.
+What no metric here settles: the top and bottom band, which is where an earlier
+no-retention attempt broke. Check scroll start, scroll end, both buffer edges
+and a split by eye. Known cosmetic limitation: the vertex shader pins the edge
+background quad so it stretches into the gap, so within that band the retained
+row's glyphs are drawn over the neighbouring row's background colour.
 
 ## Discriminating experiments
 

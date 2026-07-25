@@ -731,11 +731,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         /// mid-ease invalidates their geometry.
         var cellHeightPx: Float
     }
-    /// Default off until a real held-key session confirms it (see
-    /// test/perf/README.md); both earlier retiming attempts measured well and
-    /// looked wrong.
+    /// On by default, with `ZONVIE_SMOOTH_SCROLL=0` as the way back out
+    /// without a rebuild. Two earlier attempts at hiding the row quantisation
+    /// measured well and looked wrong, so the escape hatch stays.
     static let smoothScrollEnabled: Bool =
-        ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL"] == "1"
+        ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL"] != "0"
     /// One entry per row the offset can lag behind by. The ease is clamped to
     /// two rows, so two retained rows always cover the vacated band.
     static let maxRetainedScrollRows = 2
