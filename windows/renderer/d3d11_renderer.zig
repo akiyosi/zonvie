@@ -2423,10 +2423,13 @@ pub const Renderer = struct {
     }
 
     pub fn plannedExternalVertexBufferCapacity(current_bytes: usize, need_bytes: usize) ?usize {
-        // Row callbacks are capped at 64 MiB by the core. Keep the frontend
-        // allocation in the same logical envelope while growing geometrically
-        // to avoid a CreateBuffer/Release pair for every small high-water bump.
-        const max_buffer_bytes: usize = 64 * 1024 * 1024;
+        // Must match MAX_VERTEX_BYTES_PER_CALLBACK in src/core/flush.zig. The
+        // core rejects an oversized row itself (a deliberate, accounted
+        // failure); if this ceiling is lower, the core instead hands us a
+        // payload we cannot allocate and the row fails as a D3D error on every
+        // retry. Growth is geometric to avoid a CreateBuffer/Release pair for
+        // every small high-water bump.
+        const max_buffer_bytes: usize = 256 * 1024 * 1024;
         return render_pipeline_helpers.geometricBufferCapacity(
             current_bytes,
             need_bytes,
@@ -2440,7 +2443,7 @@ pub const Renderer = struct {
         vb_bytes_ptr: *usize,
         new_bytes: usize,
     ) !void {
-        if (new_bytes == 0 or new_bytes > 64 * 1024 * 1024) {
+        if (new_bytes == 0 or new_bytes > 256 * 1024 * 1024) {
             return error.VertexBufferTooLarge;
         }
         const dev = self.device orelse return error.NoDevice;

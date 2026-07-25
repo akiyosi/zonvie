@@ -307,6 +307,14 @@ final class MetalTerminalView: MTKView {
     private var heldKeyCode: UInt16? = nil
     private var heldKeyAction: HeldKeyAction? = nil
     private var synthRepeatActive = false
+    /// Bumped by disarmKeyRepeatSynthesis. The display-link tick snapshots it
+    /// under the lock and replayHeldKeyOffMain re-validates it immediately
+    /// before the send, narrowing (not closing) the window in which a keyUp
+    /// still lets one extra keystroke through. The send must stay OUTSIDE the
+    /// lock: it reaches Core.sendRawClassified, which polls in 50ms steps
+    /// while SSH auth is pending, and the main thread takes this same lock
+    /// every frame in tickKeyRepeatSynthesis().
+    private var keyRepeatGeneration: UInt64 = 0
     /// CLOCK_UPTIME_RAW seconds of the next synthesized fire.
     private var synthNextFire: Double = 0
     private var synthInterval: Double = 1.0 / 60.0
@@ -336,11 +344,12 @@ final class MetalTerminalView: MTKView {
         os_unfair_lock_lock(&keyRepeatLock)
         let wasActive = synthRepeatActive
         synthRepeatActive = false
+        keyRepeatGeneration &+= 1
         heldKeyCode = nil
         heldKeyAction = nil
         os_unfair_lock_unlock(&keyRepeatLock)
         if wasActive {
-            ZonvieCore.appLog("[keyRepeat] disarm (\(reason))")
+            ZonvieCore.appLogScrollMode("[keyRepeat] disarm (\(reason))")
         }
         stopRepeatDisplayLink()
     }
@@ -356,7 +365,7 @@ final class MetalTerminalView: MTKView {
         synthNextFire = Self.uptimeNow() + interval
         let code = heldKeyCode ?? 0
         os_unfair_lock_unlock(&keyRepeatLock)
-        ZonvieCore.appLog("[keyRepeat] takeover keyCode=0x\(String(code, radix: 16)) interval_ms=\(String(format: "%.2f", interval * 1000.0))")
+        ZonvieCore.appLogScrollMode("[keyRepeat] takeover keyCode=0x\(String(code, radix: 16)) interval_ms=\(String(format: "%.2f", interval * 1000.0))")
         // This OS repeat is replaced by an immediate synthesized one, then
         // the display link paces the rest.
         replayHeldKey()
@@ -386,7 +395,25 @@ final class MetalTerminalView: MTKView {
     /// Replay from the display-link callback thread. Must not touch
     /// keyRepeatCaptureActive/keyRepeatCapturedText (main-thread only; a
     /// synthesized repeat is never captured) or read AppKit state directly.
-    private func replayHeldKeyOffMain(code: UInt16, action: HeldKeyAction) {
+    private func replayHeldKeyOffMain(code: UInt16, action: HeldKeyAction, generation: UInt64) {
+        // Last check before the send, and it must be the LAST statement before
+        // it: a keyUp running disarmKeyRepeatSynthesis on the main thread any
+        // time up to this point must suppress the repeat, or the user sees one
+        // extra character. Checking earlier (e.g. straight after the tick's own
+        // critical section) is worthless -- nothing runs in between, so it only
+        // re-observes state the tick already held the lock for.
+        //
+        // This narrows the race to the few instructions between the unlock and
+        // the send; it does not eliminate it. Closing it completely would mean
+        // holding keyRepeatLock across the send, which is not acceptable: the
+        // send reaches Core.sendRawClassified, which sleeps in 50ms steps while
+        // SSH auth is pending (bounded only by the 60s auth timeout), and the
+        // main thread takes this same lock every frame from draw(in:) via
+        // tickKeyRepeatSynthesis().
+        os_unfair_lock_lock(&keyRepeatLock)
+        let stillArmed = synthRepeatActive && keyRepeatGeneration == generation
+        os_unfair_lock_unlock(&keyRepeatLock)
+        guard stillArmed else { return }
         switch action {
         case .text(let t):
             core?.sendInput(t)
@@ -429,8 +456,12 @@ final class MetalTerminalView: MTKView {
         if synthNextFire < now {
             synthNextFire = now + interval
         }
+        let generation = keyRepeatGeneration
         os_unfair_lock_unlock(&keyRepeatLock)
-        replayHeldKeyOffMain(code: code, action: action)
+        // replayHeldKeyOffMain re-validates `generation` immediately before the
+        // send; see its comment for why the check lives there and not here, and
+        // why the send stays outside the lock.
+        replayHeldKeyOffMain(code: code, action: action, generation: generation)
     }
 
     private func startRepeatDisplayLink() {
@@ -438,7 +469,7 @@ final class MetalTerminalView: MTKView {
         var link: CVDisplayLink?
         let status = CVDisplayLinkCreateWithActiveCGDisplays(&link)
         guard status == kCVReturnSuccess, let link else {
-            ZonvieCore.appLog("[keyRepeat] CVDisplayLinkCreateWithActiveCGDisplays failed status=\(status)")
+            ZonvieCore.appLogScrollMode("[keyRepeat] CVDisplayLinkCreateWithActiveCGDisplays failed status=\(status)")
             return
         }
         // Retained (not passUnretained): the display link's callback runs on
@@ -511,7 +542,7 @@ final class MetalTerminalView: MTKView {
         {
             let nowNs = zonvie_core_perf_now_ns()
             let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
-            ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
+            ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
             core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
         }
         redrawScheduler.requestRedraw(rect: rect, bounds: bounds, window: window) { [weak self] redrawRect in
@@ -530,7 +561,7 @@ final class MetalTerminalView: MTKView {
             guard let self, self.window != nil else { return }
             self.activeDrawIdleFrames = 0
             if self.isPaused {
-                ZonvieCore.appLog("[drawloop] activate: switching to continuous rendering")
+                ZonvieCore.appLogScrollMode("[drawloop] activate: switching to continuous rendering")
                 self.isPaused = false
                 self.enableSetNeedsDisplay = false
                 // Kick a draw immediately. Without this, MTKView's internal
@@ -546,7 +577,7 @@ final class MetalTerminalView: MTKView {
     /// Switch back to on-demand rendering (setNeedsDisplay-driven).
     private func deactivateDrawLoop() {
         guard !isPaused else { return }
-        ZonvieCore.appLog("[drawloop] deactivate: switching to on-demand rendering (idle=\(activeDrawIdleFrames))")
+        ZonvieCore.appLogScrollMode("[drawloop] deactivate: switching to on-demand rendering (idle=\(activeDrawIdleFrames))")
         isPaused = true
         enableSetNeedsDisplay = true
     }
@@ -1272,6 +1303,11 @@ final class MetalTerminalView: MTKView {
         maybeResizeCoreGrid()
     }
 
+    /// One-shot retry pending for maybeResizeCoreGrid (main thread only).
+    /// See its call site below: mirrors updateCursorBlinking's
+    /// cursorBlinkRetryScheduled / TIMER_CURSOR_BLINK_RETRY pattern.
+    private var layoutResizeRetryScheduled = false
+
     private func maybeResizeCoreGrid() {
         guard let core else { return }
 
@@ -1281,13 +1317,56 @@ final class MetalTerminalView: MTKView {
         let pxWi = max(1, Int(drawableSize.width))
         let pxHi = max(1, Int(drawableSize.height))
 
+        // Screen width in cells for cmdline max width. Must match the
+        // contentWidth constraint in resizeCmdlineWindow to keep NDC viewport
+        // == drawable size. Computed before the core call so it can ride the
+        // same grid_mu acquisition instead of taking the lock a second time.
+        // TODO: Use window?.screen instead of NSScreen.main for multi-display correctness.
+        //       All cmdline NSScreen.main usage (here and in ZonvieCore.swift) should be
+        //       migrated to window?.screen in a coordinated change.
+        var screenCols: UInt32 = 0
+        if let screen = NSScreen.main {
+            let scale = window?.backingScaleFactor ?? 2.0
+            let cmdlinePad = ZonvieConfig.cmdlinePadding
+            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + ZonvieConfig.cmdlineScreenMargin
+            let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
+            let availableWidthPx = availableWidthPt * scale
+            screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))
+        }
+
         // Move rows/cols decision + suppression to Zig core (shared logic).
-        core.updateLayoutPx(
+        // Non-blocking: a live-resize drag calls this many times per second
+        // on the main thread, and the core thread may be mid-flush holding
+        // grid_mu. Blocking here would stall the whole drag on that flush;
+        // instead retry once shortly (~1 frame) with then-current geometry
+        // rather than dropping this layout update (it's a write, not a
+        // cacheable read, so it must eventually land).
+        //
+        // KNOWN TRADE: the caller already committed the new drawableSize
+        // above. On a busy return the core's drawable_w_px/h_px stay stale
+        // until the retry lands, so the in-flight flush can publish vertices
+        // whose NDC was baked for the old drawable and draw() will present
+        // them into the new one -- one visibly misregistered frame per lost
+        // race, where the blocking call instead stalled and was never wrong
+        // on screen. Accepted because the stall it replaces was unbounded
+        // (a whole flush) and the retry re-reads live geometry so it
+        // converges within ~16ms. If drag-time misregistration is ever
+        // reported, hold the last good frame while the core layout disagrees
+        // with drawableSize rather than reverting to the blocking call.
+        let acquired = core.tryUpdateLayoutPx(
             drawableW: UInt32(pxWi),
             drawableH: UInt32(pxHi),
             cellW: UInt32(cellWi),
-            cellH: UInt32(cellHi)
+            cellH: UInt32(cellHi),
+            screenCols: screenCols
         )
+        if !acquired, !layoutResizeRetryScheduled {
+            layoutResizeRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                self?.layoutResizeRetryScheduled = false
+                self?.maybeResizeCoreGrid()
+            }
+        }
 
         // Unblock the RPC thread's waitForLayoutReady() once we know real
         // dimensions, so nvim_ui_attach is sent with the correct rows/cols
@@ -1321,21 +1400,8 @@ final class MetalTerminalView: MTKView {
             }
         }
 
-        // Set screen width in cells for cmdline max width.
-        // Must match the contentWidth constraint in resizeCmdlineWindow
-        // to keep NDC viewport == drawable size.
-        // TODO: Use window?.screen instead of NSScreen.main for multi-display correctness.
-        //       All cmdline NSScreen.main usage (here and in ZonvieCore.swift) should be
-        //       migrated to window?.screen in a coordinated change.
-        if let screen = NSScreen.main {
-            let scale = window?.backingScaleFactor ?? 2.0
-            let cmdlinePad = ZonvieConfig.cmdlinePadding
-            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + ZonvieConfig.cmdlineScreenMargin
-            let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
-            let availableWidthPx = availableWidthPt * scale
-            let screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))
-            core.setScreenCols(screenCols)
-        }
+        // screenCols was applied above, inside tryUpdateLayoutPx's single
+        // grid_mu acquisition (see its computation before that call).
     }
 
     // Called from C-ABI callback: ensure glyph exists and return uv/metrics.
@@ -1644,7 +1710,7 @@ final class MetalTerminalView: MTKView {
         // evt_ts: NSEvent.timestamp (kernel event time, seconds since boot) in ms.
         // Comparing evt_ts deltas against handler-entry deltas separates the
         // repeat generator's cadence from main-runloop delivery quantization.
-        ZonvieCore.appLog("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
+        ZonvieCore.appLogScrollMode("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
 
         // --- Key repeat synthesis (see MARK above) ---
         if event.isARepeat {
@@ -1695,7 +1761,7 @@ final class MetalTerminalView: MTKView {
             // (e.g. ƒ instead of f).  Neovim will see <A-f>, not <A-ƒ>.
             let chars = optionIsMeta ? event.charactersIgnoringModifiers : event.characters
 
-            ZonvieCore.appLog("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
+            ZonvieCore.appLogScrollMode("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
             core.sendKeyEvent(
                 keyCode: UInt32(event.keyCode),
                 mods: mods,
@@ -1755,10 +1821,10 @@ final class MetalTerminalView: MTKView {
 
         // Let the system handle IME input.
         if let ctx = inputContext, ctx.handleEvent(event) {
-            ZonvieCore.appLog("[keyDown] -> inputContext.handleEvent returned true")
+            ZonvieCore.appLogScrollMode("[keyDown] -> inputContext.handleEvent returned true")
             return
         }
-        ZonvieCore.appLog("[keyDown] -> interpretKeyEvents fallback")
+        ZonvieCore.appLogScrollMode("[keyDown] -> interpretKeyEvents fallback")
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
     }

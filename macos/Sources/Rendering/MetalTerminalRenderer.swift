@@ -331,7 +331,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         )
         let newRequiredRows = rowCapacityRequiredRows
         lock.unlock()
-        ZonvieCore.appLog(
+        ZonvieCore.appLogScrollMode(
             "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
             "vertexCount=\(vertexCount) totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
         )
@@ -354,7 +354,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let provisioning = rowCapacityProvisioning
             let gpuInFlight = gpuInFlightCount
             lock.unlock()
-            ZonvieCore.appLog(
+            ZonvieCore.appLogScrollMode(
                 "[scroll_debug] row_capacity_retry_blocked bracketOpen=\(bracketOpen) " +
                 "provisioning=\(provisioning) gpuInFlight=\(gpuInFlight)"
             )
@@ -416,7 +416,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return .retry
         case .ready(let plan):
             if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
-                ZonvieCore.appLog(
+                ZonvieCore.appLogPerf(
                     "[perf] row_provision created=\(plan.metrics.createdBufferCount) " +
                     "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
                     "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
@@ -1113,10 +1113,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let supportsStage = device.supportsCounterSampling(.atStageBoundary)
         let supportsDraw = device.supportsCounterSampling(.atDrawBoundary)
         let supportsBlit = device.supportsCounterSampling(.atBlitBoundary)
-        ZonvieCore.appLog("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
+        ZonvieCore.appLogPerf("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
 
         guard supportsStage else {
-            ZonvieCore.appLog("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
+            ZonvieCore.appLogPerf("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
             return
         }
         let timestampSet = device.counterSets?.first { cs in
@@ -1125,7 +1125,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             cs.name == MTLCommonCounterSet.timestamp.rawValue
         }
         guard let cs = timestampSet else {
-            ZonvieCore.appLog("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
+            ZonvieCore.appLogPerf("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
             return
         }
         let desc = MTLCounterSampleBufferDescriptor()
@@ -1138,7 +1138,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         do {
             gpuPerfSampleBuffer = try device.makeCounterSampleBuffer(descriptor: desc)
         } catch {
-            ZonvieCore.appLog("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
+            ZonvieCore.appLogPerf("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
             return
         }
         // Calibrate GPU tick → ns. On Apple Silicon timestamps already arrive in
@@ -1156,7 +1156,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             gpuTimestampPeriodNs = cpuDelta / gpuDelta
         }
         gpuPerfSamplingEnabled = true
-        ZonvieCore.appLog("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
+        ZonvieCore.appLogPerf("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
 
         // ── Statistic counter set: fragment invocations for overdraw measurement.
         // Independent enable gate so a partial-support device can still benefit
@@ -1165,7 +1165,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             cs.name == MTLCommonCounterSet.statistic.rawValue
         }
         guard let stCs = statisticSet else {
-            ZonvieCore.appLog("[perf] gpu_overdraw: no statistic counter set; skipping")
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: no statistic counter set; skipping")
             return
         }
         let stDesc = MTLCounterSampleBufferDescriptor()
@@ -1176,9 +1176,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         do {
             gpuStatsSampleBuffer = try device.makeCounterSampleBuffer(descriptor: stDesc)
             gpuStatsSamplingEnabled = true
-            ZonvieCore.appLog("[perf] gpu_overdraw: enabled")
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: enabled")
         } catch {
-            ZonvieCore.appLog("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
         }
     }
 
@@ -1478,7 +1478,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let totalUsStr = String(format: "%.1f", totalUs)
             let atlasPrepareUsStr = String(format: "%.1f", atlasPrepareUs)
             let atlasCommitUsStr = String(format: "%.1f", atlasCommitUs)
-            ZonvieCore.appLog(
+            ZonvieCore.appLogPerf(
                 "[perf] begin_flush_prepare lazyRows=true atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) totalUs=\(totalUsStr)"
             )
         }
@@ -1538,7 +1538,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         if ZonvieCore.appLogEnabled {
             let elapsedUs = (CFAbsoluteTimeGetCurrent() - started) * 1_000_000
-            ZonvieCore.appLog("[perf] lazy_main_prepare src=\(flushSourceSetIndex) dst=\(picked) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(String(format: "%.1f", elapsedUs))")
+            ZonvieCore.appLogPerf("[perf] lazy_main_prepare src=\(flushSourceSetIndex) dst=\(picked) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(String(format: "%.1f", elapsedUs))")
         }
         return true
     }
@@ -1763,9 +1763,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             for i in 0..<rowCount {
                 totalVerts += bs.rowState.counts[i]
             }
-            ZonvieCore.appLog("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
+            ZonvieCore.appLogScrollMode("[scroll_debug] commitFlush set=\(ws) rows=\(rowCount) totalVerts=\(totalVerts) rev=\(rev)")
             // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
-            ZonvieCore.appLog("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
+            ZonvieCore.appLogPerf("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
         return true
     }
@@ -2109,7 +2109,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         {
             let nowNs = zonvie_core_perf_now_ns()
             let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
-            ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
+            ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
             (view as? MetalTerminalView)?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
         }
         // Skip all rendering for minimized windows.
@@ -2181,7 +2181,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Note: this does NOT remove the acquire-drawable wait further
             // below; CAMetalLayer has no non-blocking nextDrawable.
             if inflightSemaphore.wait(timeout: .now()) != .success {
-                ZonvieCore.appLog("[perf] draw_semaphore_busy skip=true")
+                ZonvieCore.appLogPerf("[perf] draw_semaphore_busy skip=true")
                 (view as? MetalTerminalView)?.didDrawFrame()
                 (view as? MetalTerminalView)?.requestRedraw()
                 return
@@ -2299,14 +2299,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // committed.* fields are safe because gpuInFlightCount protects the buffer set.
             if smoothScrolling && ZonvieCore.appLogEnabled {
                 let scrollDesc = scrollSnapshot.map { "g\($0.grid_id):ndc=\(String(format: "%.4f", $0.offset_y))" }.joined(separator: ",")
-                ZonvieCore.appLog("[scroll_debug] draw set=\(csi) rev=\(currentCommitRevision) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) scroll=[\(scrollDesc)]")
+                ZonvieCore.appLogScrollMode("[scroll_debug] draw set=\(csi) rev=\(currentCommitRevision) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) scroll=[\(scrollDesc)]")
             }
 
             // === PERF LOG: lock取得終了 ===
             if ZonvieCore.appLogEnabled {
                 let t_lock_end = CFAbsoluteTimeGetCurrent()
                 let lock_us = (t_lock_end - t_lock_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_lock_fetch us=\(String(format: "%.1f", lock_us))")
+                ZonvieCore.appLogPerf("[perf] draw_lock_fetch us=\(String(format: "%.1f", lock_us))")
             }
 
             ZonvieCore.appLog("draw(fetch): rowMode=\(rowMode) mainCount=\(committedMainCount) cursorCount=\(committedCursorCount) dirtyRectPxOpt=\(String(describing: dirtyRectPxOpt)) dirtyRowsCount=\(dirtyRows.count) hasPresentedOnce=\(hasPresentedOnce) drawableSize=\(view.drawableSize)")
@@ -2628,7 +2628,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
             if ZonvieCore.appLogEnabled {
                 let backbuf_us = (CFAbsoluteTimeGetCurrent() - t_backbuf_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
+                ZonvieCore.appLogPerf("[perf] draw_ensure_backbuffer us=\(String(format: "%.1f", backbuf_us))")
             }
             guard let backTex = backBuffer else {
                 bailWithoutSubmit("no backbuffer")
@@ -3158,7 +3158,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let encode_us = (t_encode_end - t_encode_start) * 1_000_000
                 let encode_finalize_us = (t_encode_end - t_encode_finalize_start) * 1_000_000
                 let dirtyRowCount = dirtyRows.count
-                ZonvieCore.appLog("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us)) setup_us=\(String(format: "%.1f", encode_setup_us)) rows_us=\(String(format: "%.1f", encode_rows_us)) finalize_us=\(String(format: "%.1f", encode_finalize_us)) dirtyRows=\(dirtyRowCount)")
+                ZonvieCore.appLogPerf("[perf] draw_encode rowMode=\(rowMode) us=\(String(format: "%.1f", encode_us)) setup_us=\(String(format: "%.1f", encode_setup_us)) rows_us=\(String(format: "%.1f", encode_rows_us)) finalize_us=\(String(format: "%.1f", encode_finalize_us)) dirtyRows=\(dirtyRowCount)")
             }
             }  // end of `if !skipMainPass`
 
@@ -3278,7 +3278,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             if ZonvieCore.appLogEnabled {
                 let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
+                ZonvieCore.appLogPerf("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
             }
 
             // === PERF LOG: Copy開始 ===
@@ -3388,7 +3388,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 let t_copy_end = CFAbsoluteTimeGetCurrent()
                 let copy_us = (t_copy_end - t_copy_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
+                ZonvieCore.appLogPerf("[perf] draw_copy us=\(String(format: "%.1f", copy_us))")
 
                 // Copy-pass dirty-region opportunity: characterizes how much of the
                 // drawable actually changed this frame so we can quantify Option B
@@ -3442,7 +3442,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     && !blinkStateChanged
                     && hasPresentedOnceSnapshot
                     && !customShaderHandled
-                ZonvieCore.appLog("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
+                ZonvieCore.appLogPerf("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
             }
 
             // Cursor is composited only on the final drawable.
@@ -3517,7 +3517,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     guard ZonvieCore.appLogEnabled else { return }
                     let t = d.presentedTime
                     guard t > 0 else {
-                        ZonvieCore.appLog("[perf] presented skipped=true")
+                        ZonvieCore.appLogPerf("[perf] presented skipped=true")
                         return
                     }
                     var prev: CFTimeInterval = 0
@@ -3528,9 +3528,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         presentLock.unlock()
                     }
                     if prev > 0 {
-                        ZonvieCore.appLog("[perf] presented interval_ms=\(String(format: "%.3f", (t - prev) * 1000.0)) t_ms=\(String(format: "%.3f", t * 1000.0))")
+                        ZonvieCore.appLogPerf("[perf] presented interval_ms=\(String(format: "%.3f", (t - prev) * 1000.0)) t_ms=\(String(format: "%.3f", t * 1000.0))")
                     } else {
-                        ZonvieCore.appLog("[perf] presented first t_ms=\(String(format: "%.3f", t * 1000.0))")
+                        ZonvieCore.appLogPerf("[perf] presented first t_ms=\(String(format: "%.3f", t * 1000.0))")
                     }
                 }
             }
@@ -3567,7 +3567,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 if ZonvieCore.appLogEnabled {
                     let gpu_wall_us = (CFAbsoluteTimeGetCurrent() - t_gpu_submit) * 1_000_000
                     let gpu_exec_us = (completed.gpuEndTime - completed.gpuStartTime) * 1_000_000
-                    ZonvieCore.appLog("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
+                    ZonvieCore.appLogPerf("[perf] gpu_execution exec_us=\(String(format: "%.1f", gpu_exec_us)) wall_us=\(String(format: "%.1f", gpu_wall_us))")
 
                     // Per-pass GPU breakdown via stage-boundary timestamps.
                     // Pairs with gpu_execution: per-pass durations should sum to
@@ -3604,7 +3604,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     let fragUs = fragTicks * frameTickNs / 1000.0
                                     msg += " \(slot.label)_us=\(String(format: "%.1f", fragUs))"
                                 }
-                                ZonvieCore.appLog(msg)
+                                ZonvieCore.appLogPerf(msg)
 
                                 // Detail for full-stage slots: vertex / vfgap /
                                 // fragment / total. vfgap is start_f - end_v —
@@ -3623,7 +3623,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     let gapUs = usOf(eV, sF)
                                     let fUs = usOf(sF, eF)
                                     let totalUs = usOf(sV, eF)
-                                    ZonvieCore.appLog(
+                                    ZonvieCore.appLogPerf(
                                         "[perf] gpu_pass_detail \(slot.label) " +
                                         "vertex_us=\(String(format: "%.1f", vUs)) " +
                                         "vfgap_us=\(String(format: "%.1f", gapUs)) " +
@@ -3652,7 +3652,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     let inv = (e >= s) ? (e &- s) : 0
                                     msg += " \(slot.label)_frags=\(inv)"
                                 }
-                                ZonvieCore.appLog(msg)
+                                ZonvieCore.appLogPerf(msg)
                             }
                         }
                     }
@@ -3707,7 +3707,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             cmd.commit()
             if ZonvieCore.appLogEnabled {
                 let present_commit_us = (CFAbsoluteTimeGetCurrent() - t_present_start) * 1_000_000
-                ZonvieCore.appLog("[perf] draw_present_commit us=\(String(format: "%.1f", present_commit_us))")
+                ZonvieCore.appLogPerf("[perf] draw_present_commit us=\(String(format: "%.1f", present_commit_us))")
             }
             gpuSubmitted = true  // Completion handler handles cleanup; prevent defer
 
@@ -3715,7 +3715,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if ZonvieCore.appLogEnabled {
                 let t_draw_end = CFAbsoluteTimeGetCurrent()
                 let draw_ms = (t_draw_end - t_draw_start) * 1000.0
-                ZonvieCore.appLog("[perf] draw_total rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) ms=\(String(format: "%.2f", draw_ms))")
+                ZonvieCore.appLogPerf("[perf] draw_total rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) ms=\(String(format: "%.2f", draw_ms))")
                 if let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
                    inputTrace.seq != 0,
                    inputTrace.sentNs != 0,
@@ -3723,7 +3723,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 {
                     let nowNs = zonvie_core_perf_now_ns()
                     let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
-                    ZonvieCore.appLog("[perf_input] seq=\(inputTrace.seq) stage=draw_end delta_us=\(deltaUs) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count)")
+                    ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_end delta_us=\(deltaUs) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count)")
                     (view as? MetalTerminalView)?.core?.markInputTraceDrawLogged(seq: inputTrace.seq)
                 }
             }
@@ -4784,7 +4784,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if logEnabled {
             let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
             let usStr = String(format: "%.1f", us)
-            ZonvieCore.appLog("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
+            ZonvieCore.appLogPerf("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
         }
 
         if scroll.rowsDelta > 0 {

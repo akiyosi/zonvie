@@ -5,7 +5,9 @@ import Foundation
 @_cdecl("zonvie_macos_log")
 public func zonvie_macos_log(_ msg: UnsafePointer<CChar>?) {
     guard let msg else { return }
-    ZonvieCore.appLog(String(cString: msg))
+    // Already-rendered line from C: classify by prefix rather than defaulting
+    // to .debug, which perf_only/scroll_only would drop. See appLogRendered.
+    ZonvieCore.appLogRendered(String(cString: msg))
 }
 
 @_cdecl("zonvie_macos_atlas_ensure_glyph")

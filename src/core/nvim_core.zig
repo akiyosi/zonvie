@@ -805,6 +805,7 @@ pub const Core = struct {
     perf_lock_input_trace: LockContentionStat = .{},
     perf_lock_cursor_blink: LockContentionStat = .{},
     perf_lock_viewport: LockContentionStat = .{},
+    perf_lock_layout: LockContentionStat = .{},
     // ensureGlyphPhase2 / ensureGlyphByID wall time, including dispatch
     // overhead, cache check, and the rasterize/upload/pack subset already
     // accounted for above. (atlas_total_ns - rasterize_ns - upload_ns -
@@ -976,6 +977,11 @@ pub const Core = struct {
     transient_glyph_retry_style_rev: u64 = 0,
     transient_glyph_retry_at: ?i128 = null,
     transient_glyph_retry_delay_ns: i128 = TRANSIENT_GLYPH_RETRY_INITIAL_NS,
+    // Starting delay for the NEXT episode. Persists across episodes and grows
+    // when one exhausts its attempts, so a permanently unrasterizable glyph
+    // cannot be re-probed at the minimum delay forever. Only a genuine success
+    // (finishTransientGlyphRetry) returns it to the initial value.
+    transient_glyph_episode_delay_ns: i128 = TRANSIENT_GLYPH_RETRY_INITIAL_NS,
     transient_glyph_retry_attempts: u8 = 0,
     transient_glyph_recovery_armed: bool = false,
 
@@ -2118,17 +2124,49 @@ pub const Core = struct {
         self.transient_glyph_has_negative = false;
         self.transient_glyph_retry_at = null;
         self.transient_glyph_retry_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_episode_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
         self.transient_glyph_retry_attempts = 0;
         self.transient_glyph_recovery_armed = false;
         self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
         self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
     }
 
+    /// Restart after an exhausted episode. Unlike the full reset above, this
+    /// keeps escalating the starting delay. `glyph_working_set_rev` is bumped
+    /// by putCell for every changed cell, so "the working set changed" is in
+    /// practice "the user typed": restarting at the minimum delay each time
+    /// would force a full-screen regeneration (beginNegativeGlyphReprobe
+    /// markAllDirty's every grid and blocks the scroll fast path) roughly
+    /// every 1.5s for as long as one on-screen codepoint stays unrasterizable.
+    ///
+    /// Two known residuals, both accepted rather than solved here:
+    /// 1. The delay saturates at TRANSIENT_GLYPH_RETRY_MAX_NS (4s), so a
+    ///    permanently unrasterizable on-screen codepoint still costs a
+    ///    whole-grid invalidation every 4s while the user types. The
+    ///    atlas-capacity sibling this otherwise resembles caps at 30s, but
+    ///    raising this cap to match would worsen residual 2.
+    /// 2. The delay is per-Core, not per-glyph. While one impossible glyph is
+    ///    outstanding, a genuinely transient miss on an unrelated glyph
+    ///    inherits the escalated delay instead of starting at 250ms, so its
+    ///    cell can stay blank for up to 4s. Fixing this properly needs an
+    ///    identity for the failing-glyph set; there is no cheap one today
+    ///    (the negative entries live scattered across the three glyph caches,
+    ///    see invalidateNegativeGlyphCacheEntries).
+    fn restartTransientGlyphRetryEpisode(self: *Core, now: i128) void {
+        self.transient_glyph_episode_delay_ns = @min(
+            self.transient_glyph_episode_delay_ns * 2,
+            TRANSIENT_GLYPH_RETRY_MAX_NS,
+        );
+        self.transient_glyph_recovery_armed = false;
+        // startTransientGlyphRetryEpisode sets attempts = 1; no reset needed.
+        self.startTransientGlyphRetryEpisode(now);
+    }
+
     fn startTransientGlyphRetryEpisode(self: *Core, now: i128) void {
         self.transient_glyph_has_negative = true;
         self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
         self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
-        self.transient_glyph_retry_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_retry_delay_ns = self.transient_glyph_episode_delay_ns;
         self.transient_glyph_retry_attempts = 1;
         self.transient_glyph_retry_at = retryDeadline(now, self.transient_glyph_retry_delay_ns);
     }
@@ -2166,10 +2204,13 @@ pub const Core = struct {
         if (self.transient_glyph_has_negative) {
             // Before an armed deadline, additional misses belong to the same
             // transaction and must not push it out. After the bounded final
-            // failure, only a new working set starts a fresh retry budget.
+            // failure, only a new working set starts a fresh retry budget --
+            // at an escalated starting delay, since the set changes on every
+            // edit.
             if (self.transient_glyph_retry_at != null or
                 !self.transientGlyphWorkingSetChanged()) return;
-            self.resetTransientGlyphRetryBackoff();
+            self.restartTransientGlyphRetryEpisode(now);
+            return;
         }
 
         self.startTransientGlyphRetryEpisode(now);
@@ -2316,8 +2357,7 @@ pub const Core = struct {
             // Exhausted blanks are still cached, so a changed working set may
             // never call the rasterizer and cannot rely on record...() to
             // restart the budget. Schedule the fresh episode here.
-            self.resetTransientGlyphRetryBackoff();
-            self.startTransientGlyphRetryEpisode(now);
+            self.restartTransientGlyphRetryEpisode(now);
         }
         const retry_at = self.transient_glyph_retry_at orelse return false;
         if (now < retry_at) return false;
@@ -5940,12 +5980,16 @@ test "transient glyph retries are bounded and restart after working-set change" 
     try std.testing.expect(core.transient_glyph_retry_at == null);
 
     // The blank remains cached, so prepare (not another raster callback) must
-    // notice a new working set and restart the bounded budget.
+    // notice a new working set and restart the bounded budget -- but at twice
+    // the previous episode's starting delay, not at the minimum. The working
+    // set changes on every edit (putCell bumps glyph_working_set_rev), so a
+    // restart at the minimum would re-run beginNegativeGlyphReprobe's
+    // full-screen invalidation indefinitely for one unrasterizable codepoint.
     const changed_now = now + 20 * std.time.ns_per_s;
     core.grid.glyph_working_set_rev +%= 1;
     try std.testing.expect(!core.prepareAtlasMaintenanceAt(changed_now));
     try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
-    const restarted_at = changed_now + TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+    const restarted_at = changed_now + 2 * TRANSIENT_GLYPH_RETRY_INITIAL_NS;
     try std.testing.expectEqual(restarted_at, core.transient_glyph_retry_at.?);
     try std.testing.expect(core.prepareAtlasMaintenanceAt(restarted_at));
 
@@ -5956,6 +6000,10 @@ test "transient glyph retries are bounded and restart after working-set change" 
     try std.testing.expect(!core.transient_glyph_recovery_armed);
     try std.testing.expectEqual(@as(u8, 0), core.transient_glyph_retry_attempts);
     try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_INITIAL_NS, core.transient_glyph_retry_delay_ns);
+    // The cross-episode escalation must also be retired by a genuine success,
+    // otherwise it stays elevated for the process lifetime and every later
+    // first-miss reprobe is needlessly slow.
+    try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_INITIAL_NS, core.transient_glyph_episode_delay_ns);
 }
 
 test "maintenance abort rearms capacity and transient retries without consuming attempts" {

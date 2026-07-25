@@ -306,7 +306,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return .retry
         case .ready(let plan):
             if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
-                ZonvieCore.appLog(
+                ZonvieCore.appLogPerf(
                     "[perf] external_row_provision gridId=\(gridId) created=\(plan.metrics.createdBufferCount) " +
                     "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
                     "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
@@ -1084,7 +1084,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if ZonvieCore.appLogEnabled {
             let elapsedUs = (CFAbsoluteTimeGetCurrent() - perfStarted) * 1_000_000
             let elapsedUsString = String(format: "%.1f", elapsedUs)
-            ZonvieCore.appLog("[perf] external_begin_prepare gridId=\(gridId) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(elapsedUsString)")
+            ZonvieCore.appLogPerf("[perf] external_begin_prepare gridId=\(gridId) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(elapsedUsString)")
         }
         // Carry the committed set's cursor forward into the write set.
         // copySurfaceBufferSetRowState copies NO cursor state; without this,
@@ -1365,12 +1365,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         // Consumer-side eligibility: only remap for full-width, single-row scrolls
         guard colStart == 0, colEnd == totalCols else { return }
-        guard requirePreparedRowCapacity(
-            row: rowEnd - 1,
-            vertexCount: 0,
-            totalRows: totalRows,
-            useWriteMapping: true
-        ) else { return }
+        // No capacity pre-check here, matching applyMainRowScrollRaw in
+        // MetalTerminalRenderer: this path only grows the logical row-state
+        // arrays, which remapSurfaceRowSlots does synchronously via
+        // ensureSurfaceRowStorage. The pre-check also required all three
+        // buffer sets' detach-pool and private-slot arrays to be sized, and
+        // those are grown only by the async provisioning plan -- so after an
+        // ordinary row-count growth it failed, set flushFailed, and (via
+        // ZonvieCore's per-view sweep) aborted the whole app's flush including
+        // the main grid, recovering only through the same async detour that
+        // does not converge under sustained scroll.
 
         let ws = bufferSets[writeSetIndex]
         flushHasStructuralRowChange = true
@@ -1576,14 +1580,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return
         }
 
-        let historyReady = requestRowHistoryCapacity(rowCount: totalRows)
-        let rowCapacityReady = requirePreparedRowCapacity(
-            row: rowStart,
-            vertexCount: count,
-            totalRows: totalRows,
-            useWriteMapping: !outOfBracket
-        )
-        guard historyReady && rowCapacityReady else {
+        guard requestRowHistoryCapacity(rowCount: totalRows) else {
             flushFailed = true
             return
         }
@@ -1594,6 +1591,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let structural = !sourceSet.rowState.usingRowBuffers
                 || totalRows != sourceSet.knownTotalRows
                 || totalCols != sourceSet.knownTotalCols
+            // Allocate synchronously (was gated behind requirePreparedRowCapacity
+            // + allowAllocation: false), mirroring submitVerticesRowRaw in
+            // MetalTerminalRenderer: the async pre-provisioning detour does not
+            // converge under sustained scroll. The gate mattered more here than
+            // on the main grid, because ZonvieCore's per-view flushFailed sweep
+            // escalates any external failure into an app-wide abort_flush, so a
+            // float's unprepared capacity stalled the main grid too.
+            // requirePreparedRowCapacity is still used below, but only to record
+            // a real allocation failure for the async recovery path.
             if !submitSurfaceRowVertices(
                 target: bufferSets[writeSetIndex],
                 sourceSet: sourceSet,
@@ -1604,9 +1610,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 maxRowBuffers: maxRowBuffers,
                 totalRows: totalRows,
                 totalCols: totalCols,
-                allowAllocation: false,
                 inflightRowBuffers: { self.inflightRowBuffers(atSlot: $0) }
             ) {
+                _ = requirePreparedRowCapacity(
+                    row: rowStart,
+                    vertexCount: count,
+                    totalRows: totalRows,
+                    useWriteMapping: true
+                )
                 flushFailed = true
             } else {
                 tripleBufferLock.lock()

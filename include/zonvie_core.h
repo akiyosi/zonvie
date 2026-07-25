@@ -1315,6 +1315,32 @@ ZONVIE_API void zonvie_core_update_layout_px(
     uint32_t cell_h_px
 );
 
+// Non-blocking version of zonvie_core_update_layout_px, for callers that must
+// not stall (e.g. drag-resize on the UI thread) if the core thread is
+// mid-flush holding grid_mu. Returns false ("busy", grid_mu not acquired) if
+// the caller must retry shortly -- unlike a read-only trace, a resize is a
+// write that must not be silently dropped on contention. A NULL core returns
+// true (nothing to do); "busy" is reserved for genuine lock contention, so a
+// caller can retry on false without risking an infinite loop.
+//
+// screen_cols folds zonvie_core_set_screen_cols into the same lock: pass 0 to
+// keep the drawable-width-derived value, or a display-derived cell count to
+// override it (macOS cmdline max width). Calling the blocking
+// zonvie_core_set_screen_cols afterwards would re-acquire grid_mu and negate
+// the non-blocking guarantee.
+//
+// Safe to call from a redraw callback on the core thread: that path applies
+// the layout under the already-held grid_mu and skips the flush retry, which
+// the in-progress batch performs anyway.
+ZONVIE_API bool zonvie_core_try_update_layout_px(
+    zonvie_core *core,
+    uint32_t drawable_w_px,
+    uint32_t drawable_h_px,
+    uint32_t cell_w_px,
+    uint32_t cell_h_px,
+    uint32_t screen_cols
+);
+
 // Set screen width in cells (for cmdline max width).
 // This should be called when screen size or cell size changes.
 ZONVIE_API void zonvie_core_set_screen_cols(zonvie_core *core, uint32_t cols);

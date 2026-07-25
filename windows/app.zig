@@ -3519,6 +3519,12 @@ pub const App = struct {
     external_close_drain_needed: bool = false,
     flush_retry_wake_armed: bool = false,
     flush_retry_fallback_wake_issued: bool = false,
+    /// Bumped on every arm. Carried in the WM_APP_FLUSH_RETRY_FALLBACK wParam
+    /// so a stale delivery can be rejected: scheduleReliableWindowMessage has
+    /// no cancellation path, so a fallback armed for an already-serviced retry
+    /// would otherwise consume a newer one early and double-advance the
+    /// backoff. Mirrors PaintRetryState's generation token.
+    flush_retry_wake_generation: u32 = 0,
     flush_retry_delay_ms: u32 = FLUSH_RETRY_INTERVAL_MS,
     flush_retry_deadline_ms: u64 = 0,
     flush_retry_armed_failure_epoch: u64 = 0,

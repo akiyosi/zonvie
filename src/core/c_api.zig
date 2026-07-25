@@ -1029,6 +1029,60 @@ pub export fn zonvie_core_update_layout_px(
     }
 }
 
+/// Non-blocking version of zonvie_core_update_layout_px, for callers that
+/// must not stall the calling thread (e.g. drag-resize on the UI thread)
+/// if the core thread is mid-flush holding grid_mu. Returns false ("busy")
+/// if grid_mu could not be acquired; the caller must retry shortly, since
+/// unlike a read-only trace this is a write that must not be dropped.
+///
+/// `screen_cols` folds zonvie_core_set_screen_cols into the same critical
+/// section: pass 0 to keep the drawable-width-derived value that
+/// updateLayoutPxLocked computes, or a display-derived count to override it.
+/// Taking grid_mu a second time via the blocking set_screen_cols would negate
+/// the whole point of this entry point.
+pub export fn zonvie_core_try_update_layout_px(
+    p: ?*zonvie_core,
+    drawable_w_px: u32,
+    drawable_h_px: u32,
+    cell_w_px: u32,
+    cell_h_px: u32,
+    screen_cols: u32,
+) callconv(.c) bool {
+    // A null handle is permanently unusable, not transiently busy. Returning
+    // "busy" here would make a conforming caller retry forever.
+    if (p == null) return true;
+    const box = asBox(p.?);
+    const cp = &box.core;
+    if (cp.stop_flag.load(.acquire)) return true;
+
+    const current_tid: usize = @intCast(std.Thread.getCurrentId());
+    const redraw_tid = cp.redraw_thread_id.load(.seq_cst);
+    if (redraw_tid != 0 and redraw_tid == current_tid) {
+        // Re-entrant redraw callback: grid_mu is already held by this thread
+        // and the in-progress batch publishes the result. Do NOT retry the
+        // flush here -- that would re-acquire the non-recursive grid_mu this
+        // thread already owns. Same reasoning as the blocking twin above.
+        _ = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+        if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+        return true;
+    }
+
+    const acquired = cp.grid_mu.tryLock();
+    cp.perf_lock_layout.record(acquired);
+    if (!acquired) return false;
+    defer cp.grid_mu.unlock(clock.io());
+    const changed = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+    if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+    if (changed) {
+        // Standalone layout changes must publish main and external vertices
+        // together, still holding the lock tryLock just acquired. Dropping it
+        // and calling zonvie_core_retry_flush would re-acquire grid_mu with an
+        // unbounded blocking wait -- exactly what this entry point avoids.
+        retryFlushLocked(cp);
+    }
+    return true;
+}
+
 /// Set screen width in cells (for cmdline max width).
 /// This should be called when screen size or cell size changes.
 /// Note: On Windows, this is now handled automatically inside updateLayoutPxLocked

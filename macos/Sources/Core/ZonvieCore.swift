@@ -146,7 +146,7 @@ final class ZonvieCore {
         let delaySeconds = flushRetryBackoff.takeDelaySeconds()
         flushRetryScheduled = true
         os_unfair_lock_unlock(&flushRetryScheduledLock)
-        ZonvieCore.appLog("[scroll_debug] flush_retry_scheduled gen=\(generation) delaySeconds=\(delaySeconds)")
+        ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_scheduled gen=\(generation) delaySeconds=\(delaySeconds)")
         // A valid retry may wait on grid_mu and then perform a complete flush.
         // Run it on a dedicated serial queue so neither wait nor composition
         // blocks AppKit input/drawing on the main thread.
@@ -161,7 +161,7 @@ final class ZonvieCore {
                 && self.flushRetryScheduled
                 && self.flushRetryGeneration == generation
             os_unfair_lock_unlock(&self.flushRetryScheduledLock)
-            ZonvieCore.appLog("[scroll_debug] flush_retry_fired gen=\(generation) shouldAttempt=\(shouldAttempt)")
+            ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_fired gen=\(generation) shouldAttempt=\(shouldAttempt)")
             guard shouldAttempt else { return }
             guard let corePtr = self.core else { return }
 
@@ -171,7 +171,7 @@ final class ZonvieCore {
             // full transaction. If a concurrent normal flush still owns a
             // bracket, re-arm with backoff instead of allocating under it.
             let provisionStatus = self.provisionPendingSurfaceRowCapacity()
-            ZonvieCore.appLog("[scroll_debug] flush_retry_provision gen=\(generation) status=\(provisionStatus)")
+            ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_provision gen=\(generation) status=\(provisionStatus)")
             if provisionStatus == .hardFailure {
                 os_unfair_lock_lock(&self.flushRetryScheduledLock)
                 let stillCurrent = self.flushRetryAccepting
@@ -209,7 +209,7 @@ final class ZonvieCore {
             defer { zonvie_core_unlock_grid(corePtr) }
             if ZonvieCore.appLogEnabled {
                 let waitUs = (CFAbsoluteTimeGetCurrent() - tGridMuWaitStart) * 1_000_000
-                ZonvieCore.appLog("[scroll_debug] flush_retry_grid_mu_acquired gen=\(generation) waitUs=\(Int(waitUs))")
+                ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_grid_mu_acquired gen=\(generation) waitUs=\(Int(waitUs))")
             }
 
             os_unfair_lock_lock(&self.flushRetryScheduledLock)
@@ -217,14 +217,14 @@ final class ZonvieCore {
                   self.flushRetryScheduled,
                   self.flushRetryGeneration == generation else {
                 os_unfair_lock_unlock(&self.flushRetryScheduledLock)
-                ZonvieCore.appLog("[scroll_debug] flush_retry_stale gen=\(generation)")
+                ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_stale gen=\(generation)")
                 return
             }
             self.flushRetryScheduled = false
             os_unfair_lock_unlock(&self.flushRetryScheduledLock)
-            ZonvieCore.appLog("[scroll_debug] flush_retry_invoking_core gen=\(generation)")
+            ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_invoking_core gen=\(generation)")
             zonvie_core_retry_flush_locked(corePtr)
-            ZonvieCore.appLog("[scroll_debug] flush_retry_core_done gen=\(generation)")
+            ZonvieCore.appLogScrollMode("[scroll_debug] flush_retry_core_done gen=\(generation)")
         }
     }
 
@@ -296,21 +296,48 @@ final class ZonvieCore {
         return zonvie_core_get_glow_intensity(c)
     }
 
-    /// Allowlist for scroll-analysis mode. Closed forms ("[perf]" / "[perf_")
-    /// to match the core Logger filter; [keyDown] is included so key-repeat
-    /// cadence can be correlated with frame pacing, [drawloop] so continuous/
-    /// on-demand rendering mode transitions are visible around scroll bursts.
-    private static func isScrollModeLine(_ msg: String) -> Bool {
-        return msg.hasPrefix("[perf]") || msg.hasPrefix("[perf_")
-            || msg.hasPrefix("[scroll_debug]") || msg.hasPrefix("[keyDown]")
-            || msg.hasPrefix("[drawloop]") || msg.hasPrefix("[keyRepeat]")
+    /// Which log tiers a line belongs to. The core Logger (src/core/log.zig)
+    /// and the Windows sink (windows/app_log.zig) classify by the format
+    /// string's prefix at comptime, before any formatting happens. Swift
+    /// cannot inspect an @autoclosure without evaluating it, so the tier is
+    /// selected by which entry point the call site uses instead — same
+    /// "decide before you build the string" cost model. Picking the tier
+    /// post-hoc from the rendered message (as this did) means every
+    /// suppressed line still pays for its interpolation.
+    ///
+    /// BEHAVIOR CHANGE: `appLogPerfOnly` was previously forwarded to the core
+    /// but never consulted here, so `perf_only` filtered nothing on the Swift
+    /// side and `--log-perf-only` still produced full frontend logs. It now
+    /// filters, matching src/core/log.zig and windows/app_log.zig. A call site
+    /// whose prefix is `[perf]`/`[perf_` or `[scroll_debug]` MUST use the
+    /// tiered entry points below or it will go silent in those modes; the
+    /// compiler cannot check that correspondence.
+    enum LogTier {
+        /// Debug detail: suppressed by both perf_only and scroll_only.
+        case debug
+        /// "[perf]" / "[perf_" equivalent: passes every mode.
+        case perf
+        /// "[scroll_debug]" equivalent, plus the [keyDown]/[drawloop]/
+        /// [keyRepeat] lines that make scroll traces readable: passes in
+        /// scroll_only, suppressed by perf_only.
+        case scrollMode
     }
 
-    static func appLog(_ message: @autoclosure () -> String) {
+    private static func tierPasses(_ tier: LogTier) -> Bool {
+        if appLogScrollOnly { return tier != .debug }
+        if appLogPerfOnly { return tier == .perf }
+        return true
+    }
+
+    static func appLog(_ message: @autoclosure () -> String, tier: LogTier = .debug) {
+        // Gate BEFORE evaluating the autoclosure: under perf_only/scroll_only
+        // the suppressed tiers must cost nothing. This project has a
+        // documented case of log formatting alone (~1-2ms/flush) pushing
+        // scroll latency past a vsync, so the filter must not be what pays it.
         if !appLogEnabled { return }
+        if !tierPasses(tier) { return }
         autoreleasepool {
             let msg = message()
-            if appLogScrollOnly && !isScrollModeLine(msg) { return }
             // Prefix with elapsed milliseconds since process start for startup
             // latency diagnostics. Sub-millisecond resolution on Apple Silicon.
             let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -325,6 +352,42 @@ final class ZonvieCore {
                 fputs(line, stderr)
             }
         }
+    }
+
+    /// "[perf]" / "[perf_" lines: emitted in every mode while logging is on.
+    static func appLogPerf(_ message: @autoclosure () -> String) {
+        appLog(message(), tier: .perf)
+    }
+
+    /// Tier for an already-rendered line that arrived from C (the Zig core's
+    /// log callback, the glyph-atlas bridge). Selecting the tier by entry
+    /// point is impossible there — one callback carries every prefix — so
+    /// these are classified by prefix at runtime, mirroring
+    /// `shouldEmitBytes` in windows/app_log.zig. The "don't pay for the
+    /// interpolation" argument does not apply: the string already exists, so
+    /// the only cost is a prefix compare.
+    ///
+    /// Without this the core's own already-filtered output (it applies
+    /// src/core/log.zig's tiers before calling us) would arrive as `.debug`
+    /// and be dropped wholesale by perf_only and scroll_only — including
+    /// [perf] grid_lock_contention, the counter this frontend reads to
+    /// measure grid_mu contention.
+    private static func tierForRenderedLine(_ msg: String) -> LogTier {
+        if msg.hasPrefix("[perf]") || msg.hasPrefix("[perf_") { return .perf }
+        if msg.hasPrefix("[scroll_debug]") || msg.hasPrefix("[keyDown]")
+            || msg.hasPrefix("[drawloop]") || msg.hasPrefix("[keyRepeat]") { return .scrollMode }
+        return .debug
+    }
+
+    /// Emit a line that was rendered elsewhere (C callbacks). See
+    /// `tierForRenderedLine`.
+    static func appLogRendered(_ message: String) {
+        appLog(message, tier: tierForRenderedLine(message))
+    }
+
+    /// Lines that scroll-pipeline analysis needs but perf_only should drop.
+    static func appLogScrollMode(_ message: @autoclosure () -> String) {
+        appLog(message(), tier: .scrollMode)
     }
 
     /// Configure logging with file path (called from AppDelegate)
@@ -954,7 +1017,7 @@ final class ZonvieCore {
                     if snap.seq != 0, snap.sentNs != 0, snap.lastFlushEndLoggedSeq != snap.seq {
                         let nowNs = zonvie_core_perf_now_ns()
                         let deltaUs = max(Int64(0), (nowNs - snap.sentNs) / 1_000)
-                        ZonvieCore.appLog("[perf_input] seq=\(snap.seq) stage=flush_end delta_us=\(deltaUs)")
+                        ZonvieCore.appLogPerf("[perf_input] seq=\(snap.seq) stage=flush_end delta_us=\(deltaUs)")
                         me.markInputTraceFlushEndLogged(seq: snap.seq)
                     }
                 }
@@ -2034,7 +2097,7 @@ final class ZonvieCore {
                 inputTraceLastDrawStartLoggedSeq = 0
                 inputTraceLastRequestRedrawLoggedSeq = 0
                 inputTraceLock.unlock()
-                ZonvieCore.appLog("[perf_input] seq=\(traceSeq) stage=input_send_frontend sent_ns=\(traceSentNs)")
+                ZonvieCore.appLogPerf("[perf_input] seq=\(traceSeq) stage=input_send_frontend sent_ns=\(traceSentNs)")
             }
         }
         let data = s.data(using: .utf8) ?? Data()
@@ -2431,6 +2494,20 @@ final class ZonvieCore {
         zonvie_core_update_layout_px(core, drawableW, drawableH, cellW, cellH)
     }
 
+    /// Non-blocking version of updateLayoutPx. Returns false ("busy") if
+    /// grid_mu could not be acquired (core thread mid-flush) -- the caller
+    /// must retry shortly rather than treat this as a no-op, since a resize
+    /// is a write that must not be dropped.
+    ///
+    /// `screenCols` is applied inside the same lock acquisition; pass 0 to
+    /// keep the drawable-width-derived value. Calling
+    /// zonvie_core_set_screen_cols after this would take grid_mu a second time
+    /// and block, defeating the purpose.
+    func tryUpdateLayoutPx(drawableW: UInt32, drawableH: UInt32, cellW: UInt32, cellH: UInt32, screenCols: UInt32) -> Bool {
+        guard let core else { return true }
+        return zonvie_core_try_update_layout_px(core, drawableW, drawableH, cellW, cellH, screenCols)
+    }
+
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
     /// Resize the main window so the terminal area becomes cols x rows cells.
     /// Runs on the core thread with grid_mu held, so the window work is
@@ -2460,12 +2537,6 @@ final class ZonvieCore {
 
             ZonvieCore.appLog("[main_grid_size] rows=\(rows) cols=\(cols) delta=(\(dw),\(dh))")
         }
-    }
-
-    /// Set screen width in cells (for cmdline max width).
-    func setScreenCols(_ cols: UInt32) {
-        guard let core else { return }
-        zonvie_core_set_screen_cols(core, cols)
     }
 
     func setLogEnabledViaCore(_ enabled: Bool) {
@@ -3097,7 +3168,10 @@ final class ZonvieCore {
         autoreleasepool {
             let data = Data(bytes: bytes, count: max(0, len))
             if let s = String(data: data, encoding: .utf8) {
-                ZonvieCore.appLog(s)
+                // The core already applied its own tier filter before calling
+                // us; classify by prefix so perf_only/scroll_only do not drop
+                // what it deliberately let through.
+                ZonvieCore.appLogRendered(s)
             }
         }
     }

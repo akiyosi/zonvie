@@ -426,6 +426,12 @@ func clampRowsDelta(_ value: Int) -> Int {
 /// stacked combining-character content). Hitting it terminates the redraw
 /// session (see failHardRender in nvim_core.zig), so this is deliberately
 /// generous headroom, not a tight budget.
+///
+/// Kept equal to MAX_VERTEX_BYTES_PER_CALLBACK in src/core/flush.zig so the
+/// core never hands over a row this buffer would reject on size alone. It is
+/// not the binding per-row ceiling: surfaceMaxProvisionedRowBytes below is
+/// lower once spread across three sets with two private slots each (~42 MiB
+/// per row), and it is the limit the provisioning path actually enforces.
 private let surfaceMaxVertexBufferCapacity: Int = 256 * 1024 * 1024
 // Provisioning may hold two private row buffers in each of three sets. Bound
 // both the allocation peak and the IOAccelerator object count independently

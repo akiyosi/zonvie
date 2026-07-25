@@ -814,7 +814,7 @@ pub fn serviceDeferredUiRetries(hwnd: c.HWND, app: *App) void {
     }
     if (app.main_size_replay_needed and !app.device_lost_recovering) {
         app.main_size_replay_needed = false;
-        _ = c.SendMessageW(hwnd, c.WM_SIZE, 0, 0);
+        replayMainSize(hwnd, app);
         if (app.pending_destroy_after_active_operation) return;
     }
     external_windows.serviceDeferredSizeReplays(app);
@@ -874,6 +874,54 @@ fn armFlushRetryWake(hwnd: c.HWND, app: *App) void {
     app.flush_retry_wake_armed = true;
     app.flush_retry_armed_failure_epoch = failure_epoch;
     app.flush_retry_fallback_wake_issued = false;
+    app.flush_retry_wake_generation +%= 1;
+    const wake_generation = app.flush_retry_wake_generation;
+    // The deadline above is only consumed by main()'s own message loop, which
+    // stops running for the entire duration of any modal loop DefWindowProc
+    // enters -- notably a resize/move border drag, where WM_SIZE drives the
+    // aborts that armed this retry in the first place. Without an OS-level
+    // wake the frame stays stale until the drag ends. WM_TIMER and a posted
+    // fallback message are both dispatched by the modal loop, so arm one of
+    // them; every sibling retry path (device-lost, paint, external-create,
+    // size-replay) already does. Mirrors scheduleMainPaintRetry.
+    if (c.SetTimer(hwnd, app_mod.TIMER_FLUSH_RETRY, delay_ms, null) != 0) return;
+    if (scheduleReliableWindowMessage(
+        hwnd,
+        app_mod.WM_APP_FLUSH_RETRY_FALLBACK,
+        wake_generation,
+        @bitCast(app.window_wake_cookie),
+        delay_ms,
+    )) {
+        app.flush_retry_fallback_wake_issued = true;
+        return;
+    }
+    // Neither OS wake could be armed. The message-loop deadline remains as
+    // the last resort; invalidate so at least one more loop turn is
+    // guaranteed once the modal loop exits.
+    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+}
+
+/// True when a message-driven flush retry must be deferred. consumeFlushRetryWake
+/// takes grid_mu and runs a complete onFlush, which publishes vertices through
+/// app.mu-taking callbacks. Any operation that pumps messages (device-loss
+/// recovery runs its rebuild unlocked precisely because DXGI/DComposition pump;
+/// Present pumps too) can therefore dispatch a WM_TIMER or the fallback message
+/// into the middle of its own critical section. Every sibling timer guards this
+/// way -- TIMER_CUSTOM_SHADER_ANIM and TIMER_MAIN_SIZE_REPLAY -- and until the
+/// OS wake was armed this path was only ever reached from main()'s own loop,
+/// where nesting was impossible.
+///
+/// deferred_ui_service_in_progress is deliberately NOT included: the polled
+/// deadline in serviceDeferredUiRetries runs with that flag set, and it is the
+/// path that picks the retry back up after this returns true.
+fn flushRetryReentrancyBlocked(app: *const App) bool {
+    return app.wm_paint_in_progress or
+        app.in_present_shader_animation_frame or
+        app.glow_prepare_in_progress or
+        app.device_lost_recovering or
+        app.external_window_create_in_progress or
+        app.main_resize_in_progress or
+        app.main_dpi_change_in_progress;
 }
 
 fn consumeFlushRetryWake(hwnd: c.HWND, app: *App) void {
@@ -912,6 +960,21 @@ fn observeFlushRetrySuccess(hwnd: c.HWND, app: *App) void {
         app.flush_retry_deadline_ms = 0;
         app.flush_retry_armed_failure_epoch = 0;
     }
+}
+
+/// Replay a WM_SIZE that was suppressed while another operation was active.
+/// The real WM_SIZE handler refuses to resize on SIZE_MINIMIZED, because
+/// GetClientRect on a minimized HWND returns 0x0 and the rows/cols derivation
+/// clamps that to 1x1, which destroys split proportions in Neovim. A synthetic
+/// replay always passes SIZE_RESTORED, so it has to make that check itself.
+/// Keep the request pending rather than dropping it; restoring the window also
+/// emits a real WM_SIZE, so this converges either way.
+fn replayMainSize(hwnd: c.HWND, app: *App) void {
+    if (c.IsIconic(hwnd) != 0) {
+        app.main_size_replay_needed = true;
+        return;
+    }
+    _ = c.SendMessageW(hwnd, c.WM_SIZE, 0, 0);
 }
 
 fn scheduleMainSizeReplay(hwnd: c.HWND, app: *App) void {
@@ -4318,7 +4381,7 @@ pub export fn WndProc(
                         scheduleMainSizeReplay(hwnd, app);
                     } else {
                         _ = c.KillTimer(hwnd, app_mod.TIMER_MAIN_SIZE_REPLAY);
-                        _ = c.SendMessageW(hwnd, c.WM_SIZE, 0, 0);
+                        replayMainSize(hwnd, app);
                     }
                 } else {
                     _ = c.KillTimer(hwnd, app_mod.TIMER_MAIN_SIZE_REPLAY);
@@ -4326,9 +4389,22 @@ pub export fn WndProc(
             } else if (wParam == app_mod.TIMER_FLUSH_RETRY) {
                 // One-shot retry after an aborted flush (backpressure or
                 // frontend OOM). No-op core-side if nothing is pending.
-                _ = c.KillTimer(hwnd, app_mod.TIMER_FLUSH_RETRY);
                 if (getApp(hwnd)) |app| {
-                    consumeFlushRetryWake(hwnd, app);
+                    // Do NOT kill the timer before the guard. SetTimer is
+                    // periodic, so leaving it running is what makes a deferral
+                    // recover: the next tick retries until it lands outside a
+                    // pumping operation. Killing it here would drop the only
+                    // OS wake while flush_retry_wake_armed stays true, so
+                    // armFlushRetryWake would early-return forever and the
+                    // retry would wait on serviceDeferredUiRetries -- which
+                    // runs from main()'s loop, the very loop that is not
+                    // turning inside a modal drag. consumeFlushRetryWake kills
+                    // the timer itself once it actually services the retry.
+                    if (!flushRetryReentrancyBlocked(app)) {
+                        consumeFlushRetryWake(hwnd, app);
+                    }
+                } else {
+                    _ = c.KillTimer(hwnd, app_mod.TIMER_FLUSH_RETRY);
                 }
             } else if (wParam == app_mod.TIMER_MSG_SCROLL_RETRY) {
                 _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_SCROLL_RETRY);
@@ -4551,7 +4627,7 @@ pub export fn WndProc(
         app_mod.WM_APP_FLUSH_RETRY_ARM => {
             // Posted from the core thread (onFlushBegin / failFlush) after a
             // flush abort. SetTimer must run on this (UI) thread — that's
-            // why the core thread couldn't arm it directly. Re-posting with
+            // why the core thread couldn't arm it directly. Re-arming with
             // the same timer ID just resets the deadline if another abort
             // arrives before this fires (no double-fire, no extra state).
             if (getApp(hwnd)) |app| armFlushRetryWake(hwnd, app);
@@ -4560,8 +4636,26 @@ pub export fn WndProc(
 
         app_mod.WM_APP_FLUSH_RETRY_FALLBACK => {
             if (getApp(hwnd)) |app| {
-                if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie) {
-                    consumeFlushRetryWake(hwnd, app);
+                // Reject a stale delivery: the timer-queue worker cannot be
+                // cancelled, so a fallback armed for an already-serviced retry
+                // would consume a newer one early and double-advance the
+                // backoff. Same guard shape as WM_APP_PAINT_RETRY_FALLBACK.
+                if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie and
+                    @as(u32, @intCast(wParam & 0xFFFF_FFFF)) == app.flush_retry_wake_generation)
+                {
+                    if (flushRetryReentrancyBlocked(app)) {
+                        // Unlike TIMER_FLUSH_RETRY this delivery is one-shot,
+                        // so deferring it would destroy the only wake. Release
+                        // the armed state so the next armFlushRetryWake issues
+                        // a fresh one instead of coalescing onto a wake that
+                        // will never arrive, and keep the elapsed deadline so
+                        // serviceDeferredUiRetries can still pick it up first.
+                        app.flush_retry_wake_armed = false;
+                        app.flush_retry_fallback_wake_issued = false;
+                        armFlushRetryWake(hwnd, app);
+                    } else {
+                        consumeFlushRetryWake(hwnd, app);
+                    }
                 }
             }
             return 0;
@@ -4610,7 +4704,7 @@ pub export fn WndProc(
         app_mod.WM_APP_SIZE_REPLAY_FALLBACK => {
             if (getApp(hwnd)) |app| {
                 if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie) {
-                    _ = c.SendMessageW(hwnd, c.WM_SIZE, 0, 0);
+                    replayMainSize(hwnd, app);
                 }
             }
             return 0;

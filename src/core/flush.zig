@@ -98,14 +98,35 @@ pub const MainSubgridRowLayout = struct {
 // row coverage exceeds this limit are rejected: falling back to scanning all
 // subgrids for every dirty row makes CPU time unbounded under grid_mu.
 const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = grid_mod.MAX_MAIN_SUBGRID_ROW_INDEX_BYTES;
-const MAX_VERTEX_BYTES_PER_SURFACE: usize = 128 * 1024 * 1024;
-const MAX_VERTEX_BYTES_AGGREGATE: usize = 256 * 1024 * 1024;
+const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
+const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
 // callback payload limit aligned with that consumer, then bound retained
 // logical surface and process-wide output independently. Counts are charged
 // from generated output, not from a per-cell estimate: blank grids remain
 // cheap while overflow clusters are accounted at their actual glyph count.
-const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 64 * 1024 * 1024;
+//
+// These are deliberately generous rather than tight budgets: exceeding any of
+// them sets flush_retryable = false, which routes through failHardRender to
+// requestChildTermination() and kills the nvim child with its unsaved
+// buffers. Normal content stays in the low single-digit MB range even under
+// extreme display setups; the ceiling only guards pathological per-cell
+// decoration counts (heavily stacked combining characters).
+//
+// These bound the CORE's own accounting only. They are matched against the
+// frontends' single-buffer ceilings (surfaceMaxVertexBufferCapacity in
+// macos/Sources/Rendering/MetalTypes.swift, max_buffer_bytes in
+// windows/renderer/d3d11_renderer.zig, both 256 MiB) so that a row the core
+// accepts is never rejected by a frontend purely on per-buffer size.
+//
+// That is NOT a claim that a row the core accepts always allocates. Each
+// frontend also has an AGGREGATE physical budget that binds first and is
+// legitimately lower: Windows row_vb_surface_budget_bytes (256 MiB, checked as
+// retained + new in windows/render_pipeline_helpers.zig), and on macOS
+// surfaceMaxProvisionedRowBytes spread over three sets x two private slots,
+// which works out near 42 MiB per row. Treat the values here as the
+// nvim-killing backstop, not as a promise of frontend capacity.
+const MAX_VERTEX_BYTES_PER_CALLBACK: usize = 256 * 1024 * 1024;
 const MAX_VERTICES_PER_CALLBACK: usize = MAX_VERTEX_BYTES_PER_CALLBACK / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_PER_SURFACE: usize = MAX_VERTEX_BYTES_PER_SURFACE / @sizeOf(c_api.Vertex);
 const MAX_VERTICES_AGGREGATE: usize = MAX_VERTEX_BYTES_AGGREGATE / @sizeOf(c_api.Vertex);
@@ -3169,7 +3190,7 @@ pub const FlushCtx = struct {
                 // these are written from the UI thread, including on the
                 // busy branch where grid_mu itself is NOT held.
                 ctx.core.log.write(
-                    "[perf] grid_lock_contention mode_state_attempts={d} mode_state_busy={d} cursor_pos_attempts={d} cursor_pos_busy={d} msg_timeout_attempts={d} msg_timeout_busy={d} input_trace_attempts={d} input_trace_busy={d} cursor_blink_attempts={d} cursor_blink_busy={d} viewport_attempts={d} viewport_busy={d}\n",
+                    "[perf] grid_lock_contention mode_state_attempts={d} mode_state_busy={d} cursor_pos_attempts={d} cursor_pos_busy={d} msg_timeout_attempts={d} msg_timeout_busy={d} input_trace_attempts={d} input_trace_busy={d} cursor_blink_attempts={d} cursor_blink_busy={d} viewport_attempts={d} viewport_busy={d} layout_attempts={d} layout_busy={d}\n",
                     .{
                         ctx.core.perf_lock_mode_state.attempts.load(.monotonic),
                         ctx.core.perf_lock_mode_state.busy.load(.monotonic),
@@ -3183,6 +3204,8 @@ pub const FlushCtx = struct {
                         ctx.core.perf_lock_cursor_blink.busy.load(.monotonic),
                         ctx.core.perf_lock_viewport.attempts.load(.monotonic),
                         ctx.core.perf_lock_viewport.busy.load(.monotonic),
+                        ctx.core.perf_lock_layout.attempts.load(.monotonic),
+                        ctx.core.perf_lock_layout.busy.load(.monotonic),
                     },
                 );
             }
