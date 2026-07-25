@@ -47,6 +47,8 @@ consistently understates the problem.
 | script | purpose |
 | --- | --- |
 | `run_trace.py` | launches headless nvim + the app, drives the scroll, dumps the trace |
+| `run_realkey.py` | same, but holds a real key so the app's repeat synthesis runs |
+| `holding.py` | motion inside the stretches where a key was genuinely held |
 | `analyze.py` | per-capture summary: on-glass cadence, dropped frames, phase timings |
 | `drops.py` | timeline around each dropped frame, to attribute the cause |
 
@@ -86,7 +88,43 @@ of a few hundred microseconds is a near-miss race — the content existed and
 the renderer looked too early. A distance of many milliseconds means nothing
 was produced for that vsync, which no rendering change can fix.
 
-## Capturing a real held key
+## Capturing a held key without a person
+
+`run_realkey.py` holds the key for you. It launches the same headless nvim plus
+app as `run_trace.py`, then posts three events through `holdkey.swift`: a
+keyDown, a keyDown with the autorepeat flag (which is what the app's takeover
+keys off — `NSEvent.isARepeat`), and a keyUp at the end. Everything in between
+is the app's own repeat synthesis at production cadence, so the whole input
+path is exercised.
+
+```bash
+ZONVIE_SMOOTH_SCROLL=1 ZONVIE_TRACE_CONFIG=Release \
+  test/perf/run_realkey.py 12 tmp/scrollperf/rk.csv
+test/perf/holding.py tmp/scrollperf/rk.csv
+```
+
+A good capture reports `holds: 1` for the full duration, `key sends` at ~60/s
+and `send -> commit` never over one frame — the same signature a hand-held
+capture produces.
+
+**It needs Accessibility permission**, and macOS attributes that to the process
+*responsible* for the driver — the GUI app at the top of the shell's process
+tree, not the driver binary. Grant it to the terminal you run this from. The
+driver prints what it sees (`accessibility-trusted=`) and refuses to post
+without it, rather than producing a capture with no scrolling in it.
+
+Two things to watch for:
+
+- **A run occasionally produces nothing** (~1 in 6 observed): the app logs
+  `error messaging the mach port for IMKCFRunLoopWakeUpReliable`, the first
+  keyDown is lost in the input context, and with no press to replay there is no
+  takeover. `holding.py` reports no holds. Re-run.
+- **The producer is noisier here than in normal use.** These captures contain
+  frames advancing three rows, which a hand-held capture on a real session did
+  not. Do not tune the ease clamp to them without checking the same number on a
+  hand-held trace first.
+
+## Capturing a real held key by hand
 
 `run_trace.py` drives nvim directly, which means the app's own key-repeat
 synthesis never engages. Anything about input timing — the repeat cadence, the
