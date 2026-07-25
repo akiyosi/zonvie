@@ -86,6 +86,37 @@ of a few hundred microseconds is a near-miss race — the content existed and
 the renderer looked too early. A distance of many milliseconds means nothing
 was produced for that vsync, which no rendering change can fix.
 
+## Capturing a real held key
+
+`run_trace.py` drives nvim directly, which means the app's own key-repeat
+synthesis never engages. Anything about input timing — the repeat cadence, the
+phase between a send and the frame that consumes it — can only be measured
+from a real held key. Do it by hand:
+
+```bash
+ZONVIE_TRACE=1 ZONVIE_TRACE_PATH=$PWD/tmp/scrollperf/real.csv \
+  macos/.derived/Build/Products/Release/zonvie.app/Contents/MacOS/zonvie --nofork
+```
+
+Open a long file, hold `j` for ~20s, then from another terminal:
+
+```bash
+kill -USR1 $(pgrep -n -f "Products/Release/zonvie.app")
+test/perf/holding.py tmp/scrollperf/real.csv
+```
+
+**Pass `--nofork`.** Without it the app re-spawns itself with stdout and
+stderr redirected to `/dev/null` (`macos/Sources/App/main.swift`), so the
+`[frametrace] wrote N events` confirmation is swallowed even though the dump
+succeeds. The environment is inherited either way.
+
+`holding.py` isolates the stretches where the key was genuinely held and
+reports motion only there. It also separates two things the raw histogram
+conflates: a long run of zero-advance frames is usually **not** a fault —
+holding `j` walks the cursor down the window and nvim emits no `grid_scroll`
+at all until it reaches the scrolloff boundary. Only isolated zeros inside an
+otherwise scrolling stretch are motion the user actually loses.
+
 ## Discriminating experiments
 
 **Is the drop a race, or was nothing produced?** Raise the producer rate above
@@ -105,6 +136,15 @@ spread and have produced wrong conclusions before:
 ZONVIE_TRACE_CONFIG=Release ZONVIE_COMMIT_GUARD_US=0    test/perf/run_trace.py buffer 15 tmp/scrollperf/off.csv
 ZONVIE_TRACE_CONFIG=Release ZONVIE_COMMIT_GUARD_US=2000 test/perf/run_trace.py buffer 15 tmp/scrollperf/on.csv
 ```
+
+**Is the repeat send landing on a frame boundary?** `holding.py` reports
+`send phase in draw interval`; 1.0 means the send sits exactly on the
+boundary, so Neovim's reply lands where the draw is already sampling. Note
+that shifting that phase by delaying the send through a dispatch timer was
+tried and reverted: it felt worse. The repeat currently goes out directly from
+the display-link callback, giving a cadence measured at a 16.667ms median with
+zero gaps, and a timer's leeway is enough to spoil that — trading a rare
+boundary coin flip for jitter on every frame.
 
 ## Limitations
 

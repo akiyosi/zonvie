@@ -39,6 +39,11 @@ enum FrameTraceTag: UInt32 {
     /// a = 1 when the commit arrived in time, 0 when the wait timed out.
     /// b = nanoseconds actually spent waiting.
     case commitGuardBand = 17
+    /// How far the content actually moved in this frame. a = rowsDelta as a
+    /// two's-complement bit pattern. A steady present cadence still looks
+    /// uneven if the per-frame advance is not constant, so this is the
+    /// separate question from whether a frame reached the glass at all.
+    case scrollAdvance = 18
 }
 
 struct FrameTraceEvent {

@@ -2365,6 +2365,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     b: rowMode ? 1 : 0,
                     seq: UInt32(truncatingIfNeeded: committedMainCount)
                 )
+                FrameTracer.trace(
+                    .scrollAdvance,
+                    a: UInt64(bitPattern: Int64(pendingScroll?.rowsDelta ?? 0))
+                )
             }
 
             // All values below (csi, currentCommitRevision, scrollSnapshot, dirtyRows)

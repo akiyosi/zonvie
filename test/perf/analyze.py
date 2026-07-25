@@ -15,7 +15,7 @@ TAG = {
     5: "presentCall", 6: "presented", 7: "gpuComplete", 8: "drawSkipSemaphore",
     9: "drawSkipNoDrawable", 10: "drawSkipRowCapacity", 11: "commitFlush",
     12: "inputSend", 13: "encodeEnd", 14: "gpuSubmit", 15: "frameContent",
-    16: "drawSkipNoChange", 17: "commitGuardBand",
+    16: "drawSkipNoChange", 17: "commitGuardBand", 18: "scrollAdvance",
 }
 VSYNC_NS = 16_666_667
 
@@ -142,6 +142,30 @@ def main(path):
         for code in sorted(set(skips)):
             n = skips.count(code)
             print(f"  reason {code} ({REASON.get(code,'?')}): {n}")
+
+    # --- motion smoothness ------------------------------------------------
+    # A perfect present cadence still looks uneven if the content does not
+    # advance by the same amount every frame. This is the separate question
+    # from whether frames reached the glass.
+    adv = [a if a < (1 << 63) else a - (1 << 64)
+           for _, tag, _, a, _ in rows if tag == 18]
+    if adv:
+        moving = [d for d in adv if d != 0]
+        if moving:
+            typical = pct(sorted(moving), 50)
+            hist = defaultdict(int)
+            for d in adv:
+                hist[d] += 1
+            print(f"\nmotion: {len(adv)} frames, typical advance {typical} rows/frame")
+            print("  advance histogram: " +
+                  "  ".join(f"{k}:{v}" for k, v in sorted(hist.items())))
+            uneven = sum(v for k, v in hist.items() if k != typical)
+            print(f"  frames not advancing by {typical}: {uneven} "
+                  f"({uneven*100.0/len(adv):.1f}%)  = {uneven/span_s:.2f}/s")
+            stalls = hist.get(0, 0)
+            print(f"  stalled frames (0 rows): {stalls} = {stalls/span_s:.2f}/s")
+            jumps = sum(v for k, v in hist.items() if abs(k) > abs(typical))
+            print(f"  jump frames (>|{typical}| rows): {jumps} = {jumps/span_s:.2f}/s")
 
     # --- guard band effectiveness -----------------------------------------
     guards = [(a, b) for _, tag, _, a, b in rows if tag == 17]
