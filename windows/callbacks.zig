@@ -1547,6 +1547,24 @@ pub fn onVerticesRow(
             }
             if (row < app.tbs.sparse_sync.flush_dirty.bit_length) {
                 if (!app.tbs.markFlushRowChanged(row)) failFlush(app);
+            } else if (ws.rows > app.tbs.sparse_sync.flush_dirty.bit_length) {
+                // The slot was already rebound above, so the write set holds the
+                // new vertices while nothing records the row as changed —
+                // commitFlush would drop it behind the same bounds test and the
+                // paint would skip it, leaving the previous pixels on screen.
+                // Grow the tracking bitmap and mark, mirroring the external-grid
+                // path in onVerticesRow.
+                if (!app.tbs.prepareRowSyncTracking(app.alloc, ws.rows)) {
+                    failFlush(app);
+                    return;
+                }
+                if (row < app.tbs.sparse_sync.flush_dirty.bit_length) {
+                    if (!app.tbs.markFlushRowChanged(row)) failFlush(app);
+                } else {
+                    failFlush(app);
+                }
+            } else {
+                failFlush(app);
             }
         }
     } else if (row_count > 1) {

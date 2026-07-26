@@ -317,9 +317,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
               totalRows >= 0, totalRows <= maxRowBuffers,
               surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
         else {
-            lock.lock()
-            rowCapacityHardFailure = true
-            lock.unlock()
+            // Argument validation only. Fail this flush, but do not latch
+            // rowCapacityHardFailure: that flag is never cleared, so latching it
+            // on a soft condition permanently stops the surface from presenting.
+            // The terminal case is .overBudget below, which pairs with the
+            // documented-terminal zonvie_core_fail_render_budget.
             flushFailed = true
             return false
         }
@@ -475,12 +477,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     static let commitGuardBandNs: UInt64 = {
         guard let s = ProcessInfo.processInfo.environment["ZONVIE_COMMIT_GUARD_US"],
               let us = UInt64(s) else { return 2_000_000 }
-        return us * 1_000
+        // Clamped: this is a main-thread wait, so an unbounded override stalls
+        // input for as long as it names.
+        return min(us, 8_000) * 1_000
     }()
 
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
+    /// Revision whose guard band already ran to its deadline without a commit
+    /// arriving. Render thread only.
+    private var guardBandTimedOutRevision: UInt64 = .max
     private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
     // Tracks whether the most-recently-rendered frame had an active scroll
     // offset. Used to extend smoothScrolling=true for one extra frame after
@@ -731,9 +738,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         /// mid-ease invalidates their geometry.
         var cellHeightPx: Float
     }
-    /// On by default, with `ZONVIE_SMOOTH_SCROLL=0` as the way back out
-    /// without a rebuild. Two earlier attempts at hiding the row quantisation
-    /// measured well and looked wrong, so the escape hatch stays.
+    /// On by default, with `ZONVIE_SMOOTH_SCROLL=0` as the way back out without
+    /// a rebuild. Two earlier attempts at hiding the row quantisation measured
+    /// well and looked wrong, so the escape hatch stays.
+    ///
+    /// The band that made the third attempt wrong on the glass is fixed: the
+    /// shader used to pin the edge row's background quad across the gap the
+    /// offset opens, painting it over the retained row's own background, so the
+    /// band showed one row's glyphs on its neighbour's background colour. The
+    /// stretch is now suppressed (`pin_edges`) for a grid whose whole band is
+    /// covered by retained rows. Checked on screen against rows with differing
+    /// neighbour backgrounds, at both buffer edges, across horizontal and
+    /// vertical splits, and with a float on screen.
     static let smoothScrollEnabled: Bool =
         ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL"] != "0"
     /// One entry per row the offset can lag behind by. The ease is clamped to
@@ -762,6 +778,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var content_top_y: Float    // Top Y of scrollable content (below margin top), in NDC
         var content_bottom_y: Float // Bottom Y of scrollable content (above margin bottom), in NDC
         var move_all: Int32 = 0     // 1 = translate every vertex of this grid (float bodily move)
+        // 1 = stretch the edge row's background across the gap the offset opens.
+        // Cleared for a grid whose vacated band is covered by a retained row: the
+        // stretch paints the edge row's background over the retained row's own,
+        // so the band shows one row's glyphs on its neighbour's background.
+        var pin_edges: Int32 = 1
     }
 
     // FixedFloatRect struct matching Shaders.metal (drawable pixel edges).
@@ -2141,6 +2162,25 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             retainedScrollRows.removeAll { retained in
                 !scrollOffsetData.contains { Int64($0.grid_id) == retained.gridId }
             }
+            // A grid whose vacated band is covered by retained rows must not also
+            // stretch its edge row's background across that band: the stretch
+            // wins over the retained rows' own backgrounds, so the band renders
+            // one row's glyphs on its neighbour's background colour.
+            //
+            // Only when they cover the WHOLE band, though. A step whose row could
+            // not be retained (a row shared with an overlapping float, or a
+            // multi-row jump) still moves the offset, so the retained rows can
+            // fall short of it — and with the stretch also gone the uncovered
+            // part would show through as a gap, which is what the stretch is for.
+            for i in scrollOffsetData.indices {
+                let gid = Int64(scrollOffsetData[i].grid_id)
+                let retained = retainedScrollRows.reduce(0) { $0 + ($1.gridId == gid ? 1 : 0) }
+                guard retained > 0, cellHeightNDC > 0 else { continue }
+                let bandRows = Int(ceil(abs(scrollOffsetData[i].offset_y) / cellHeightNDC - 0.001))
+                if retained >= bandRows {
+                    scrollOffsetData[i].pin_edges = 0
+                }
+            }
         }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
@@ -2286,7 +2326,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 lock.lock()
                 var revision = commitRevision
                 lock.unlock()
-                if revision == lastDrawnRevision, hadRecentCommit(withinNs: 50_000_000) {
+                if revision == lastDrawnRevision, revision != guardBandTimedOutRevision,
+                   hadRecentCommit(withinNs: 50_000_000) {
                     let start = FrameTracer.nowNs()
                     let deadline = start + Self.commitGuardBandNs
                     while FrameTracer.nowNs() < deadline {
@@ -2297,6 +2338,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         revision = commitRevision
                         lock.unlock()
                         if revision != lastDrawnRevision { break }
+                    }
+                    if revision == lastDrawnRevision {
+                        // The band ran out with no commit, so the producer is not
+                        // merely a few hundred microseconds late. hadRecentCommit
+                        // is a trailing window, so without this every frame for
+                        // the rest of it would burn the full band for nothing —
+                        // ~3 frames after each scroll stop at 60Hz.
+                        guardBandTimedOutRevision = revision
                     }
                     if FrameTracer.enabled {
                         FrameTracer.trace(
@@ -2362,11 +2411,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             lock.lock()
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+                let terminal = rowCapacityHardFailure
                 lock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity)
                 inflightSemaphore.signal()
                 (view as? MetalTerminalView)?.didDrawFrame()
-                (view as? MetalTerminalView)?.requestRedraw()
+                // A hard failure is terminal and never cleared, so re-requesting
+                // a draw only spins the display link without ever presenting.
+                if !terminal {
+                    (view as? MetalTerminalView)?.requestRedraw()
+                }
                 return
             }
             csi = committedSetIndex
@@ -5090,9 +5144,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         retainedScrollRingNext = (idx + 1) % Self.retainedScrollRingSize
         var dst = retainedScrollRing[idx]
         if dst == nil || retainedScrollRingCaps[idx] < needed {
-            dst = device.makeBuffer(length: needed, options: .storageModeShared)
+            // Rounded up to the next power of two so scrolling into progressively
+            // wider rows converges after a few steps instead of re-allocating on
+            // every widening — this runs inside the flush bracket while holding
+            // the lock draw() contends for each frame.
+            var alloc = 4096
+            while alloc < needed { alloc <<= 1 }
+            dst = device.makeBuffer(length: alloc, options: .storageModeShared)
             retainedScrollRing[idx] = dst
-            retainedScrollRingCaps[idx] = dst == nil ? 0 : needed
+            retainedScrollRingCaps[idx] = dst == nil ? 0 : alloc
         }
         if !stagedRetainedScrollValid {
             stagedRetainedScrollValid = true

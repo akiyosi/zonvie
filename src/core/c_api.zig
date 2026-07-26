@@ -584,8 +584,13 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .core = undefined,
         .cb = if (cb) |p| blk: {
             var result: Callbacks = .{}; // zero-init: all callbacks null
-            if (callbacks_size == 0 or callbacks_size >= @sizeOf(Callbacks)) {
-                // Current version or unspecified: copy whole struct
+            if (callbacks_size == 0) {
+                // Unspecified size: a whole-struct copy would read past a
+                // smaller caller-side struct, so refuse rather than guess.
+                break :blk result;
+            }
+            if (callbacks_size >= @sizeOf(Callbacks)) {
+                // Current version: copy whole struct
                 result = p.*;
             } else {
                 // Older version with fewer fields: copy only what they provided
@@ -1658,8 +1663,9 @@ pub export fn zonvie_core_get_hl_by_name(
 /// Batched version of zonvie_core_get_hl_by_name: looks up `count` group
 /// names under a single grid_mu acquisition instead of one lock round-trip
 /// per name. names/out_fg_rgb/out_bg_rgb/out_found must each have length
-/// count. A null entry in names is skipped (its out slots are left
-/// untouched). Returns 1 on success, 0 if core/arrays are null.
+/// count. A null entry in names writes 0/0/0 rather than leaving its slots
+/// untouched, so a caller may pass uninitialized out arrays.
+/// Returns 1 on success, 0 if core/arrays are null.
 pub export fn zonvie_core_get_hl_by_names_batch(
     p: ?*zonvie_core,
     names: ?[*]const ?[*:0]const u8,
@@ -1673,7 +1679,15 @@ pub export fn zonvie_core_get_hl_by_names_batch(
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
     for (0..count) |i| {
-        const name_ptr = names.?[i] orelse continue;
+        const name_ptr = names.?[i] orelse {
+            // Written rather than skipped: every caller reads out_found[i]
+            // unconditionally, and skipping left it reading uninitialized memory
+            // while the function still reported success.
+            out_fg_rgb.?[i] = 0;
+            out_bg_rgb.?[i] = 0;
+            out_found.?[i] = 0;
+            continue;
+        };
         const result = box.core.getHlByNameLocked(std.mem.span(name_ptr));
         out_fg_rgb.?[i] = result.fg;
         out_bg_rgb.?[i] = result.bg;
@@ -2375,6 +2389,11 @@ pub export fn zonvie_core_retry_flush(p: ?*zonvie_core) callconv(.c) void {
 // Variant for a frontend that already holds grid_mu. This lets a retry timer
 // acquire grid_mu, revalidate its own generation against a just-completed
 // normal redraw, and only then execute the retry without an unlock/relock race.
+//
+// MUST NOT be called from inside a flush bracket (on_flush_begin/on_flush_end)
+// even though those also run with grid_mu held: the nested onFlush trips
+// beginVertexBudgetTransaction's already-active guard, which is classified as a
+// hard render failure and terminates the nvim child with unsaved buffers.
 pub export fn zonvie_core_retry_flush_locked(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

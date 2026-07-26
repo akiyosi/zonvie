@@ -400,6 +400,7 @@ fn clearMainSubgridRowIndexStorage(core: *Core) void {
     core.main_subgrid_row_layout = .empty;
     core.main_subgrid_row_index_valid = false;
     core.main_subgrid_row_index_generation = 0;
+    core.main_subgrid_row_index_cached_len = 0;
 }
 
 fn preflightMainSubgridRowIndex(core: *Core, rows: u32) !void {
@@ -555,6 +556,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
         });
     }
     core.main_subgrid_row_index_rows = rows;
+    core.main_subgrid_row_index_cached_len = cached.len;
     core.main_subgrid_row_index_valid = true;
     return true;
 }
@@ -562,10 +564,16 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
 fn ensureMainSubgridRowIndex(core: *Core, cached: []const CachedSubgrid, rows: u32) !bool {
     if (core.main_subgrid_row_index_valid and
         core.main_subgrid_row_index_rows == rows and
+        core.main_subgrid_row_index_cached_len == cached.len and
         core.main_subgrid_row_index_generation == core.grid.layout_generation)
     {
         return true;
     }
+    // Deliberate: this also disables the structural fast path inside
+    // ensureMainSubgridRowIndexWithLimit. That path compares layout entries only
+    // and skips zero-coverage ones, so it cannot see a cached_subgrids length
+    // change — the very shift the cached_len key above exists to catch. Enabling
+    // it would need the same key, so it stays off rather than half-guarded.
     core.main_subgrid_row_index_valid = false;
     const built = try ensureMainSubgridRowIndexWithLimit(
         core,
@@ -1812,6 +1820,10 @@ pub fn generateRowVertices(
     const vh = p.vh;
     var stats = RowGenStats{};
     const log_enabled = core.log.cb != null;
+    // Sub-glyph timing costs two clock reads per emitted quad — thousands per
+    // full redraw — and only ever feeds the verbose-tier breakdown, so it is
+    // gated separately from the per-row pass timers above.
+    const log_glyph_timing = log_enabled and core.log.verbose;
     if (out_start > p.max_vertices) return vertexBudgetExceeded(core);
     // Pass 3 sub-timing accumulators. Copied into stats before return.
     var atlas_ensure_ns_acc: i64 = 0;
@@ -2250,6 +2262,8 @@ pub fn generateRowVertices(
                                 shape_callback_fallback = true;
                             }
 
+                            if (shape_callback_fallback) core.perf_shape_fallback_runs +%= 1;
+
                             // Store in cache if result fits
                             if (!shape_callback_fallback and final_glyph_count <= nvim_core.SHAPE_CACHE_MAX_GLYPHS) {
                                 if (core.shape_cache) |sc_cache| {
@@ -2332,9 +2346,9 @@ pub fn generateRowVertices(
                             if (ge_valid[cache_key]) {
                                 ge = ge_cache[cache_key];
                             } else {
-                                const t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 const ge_opt = core.ensureGlyphPhase2(scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens));
+                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens));
                                 if (ge_opt) |entry| {
                                     ge = entry;
                                     ge_cache[cache_key] = entry;
@@ -2370,10 +2384,10 @@ pub fn generateRowVertices(
                                 // entered for color emoji bitmaps, so DECO_COLOR_EMOJI
                                 // is unconditionally off.
                                 const deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                const t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                 VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, deco);
-                                if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - t_emit));
+                                if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - t_emit));
                             }
 
                             penX += cell_advance;
@@ -2448,6 +2462,12 @@ pub fn generateRowVertices(
                             // .notdef glyph — per-scalar fallback
                             var ci: u32 = this_cluster;
                             var fallback_base_x = penX;
+                            // src_col of the emoji cluster whose base scalar has
+                            // already been composed in this cluster, or null.
+                            // Set once the base is processed, whether or not it
+                            // produced a quad — a tail must not re-compose either
+                            // way.
+                            var composed_emoji_src_col: ?u32 = null;
                             while (ci < next_cluster) : (ci += 1) {
                                 const fb_scalar = core.shaping_scalars.items[@intCast(ci)];
                                 const fb_col_w = core.shaping_col_widths.items[@intCast(ci)];
@@ -2474,13 +2494,27 @@ pub fn generateRowVertices(
                                 const fb_src_col = core.shaping_src_cols.items[@intCast(ci)];
                                 const fb_is_emoji = isEmojiPresentation(fb_scalar) or cellIsEmojiCluster(core, rc, r, fb_src_col);
                                 if (fb_is_emoji) {
+                                    // Continuation scalars of an emoji cluster (ZWJ,
+                                    // VS16, the trailing symbols of a ZWJ sequence)
+                                    // are appended with col_width 0 and the base
+                                    // cell's src_col. The base scalar already composed
+                                    // and drew the whole cluster, and fallback_base_x
+                                    // does not advance for zero-width scalars, so
+                                    // re-composing from a tail would rebuild a bogus
+                                    // cluster and draw it over the real one.
+                                    if (fb_col_w == 0) {
+                                        if (composed_emoji_src_col) |base_col| {
+                                            if (base_col == fb_src_col) continue;
+                                        }
+                                    }
                                     setEmojiClusterFromOverflow(core, rc, r, fb_src_col, fb_scalar);
+                                    composed_emoji_src_col = fb_src_col;
                                 }
                                 defer core.emoji_cluster_len = 0;
 
-                                const fb_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const fb_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 const fb_ge_opt = core.ensureGlyphPhase2(fb_scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_ens));
+                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_ens));
                                 if (fb_ge_opt) |fb_ge| {
                                     if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
                                         const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
@@ -2495,10 +2529,10 @@ pub fn generateRowVertices(
                                         const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
 
                                         const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const fb_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                        const fb_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                         try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                         VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, vw, vh, run_grid_id, fb_glyph_deco);
-                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
+                                        if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
                                     }
                                 } else {
                                     if (core.flush_aborted) return error.FlushAborted;
@@ -2555,9 +2589,9 @@ pub fn generateRowVertices(
                                     ge = glyph_cache_id.?[hit_idx];
                                     break :gid_blk true;
                                 }
-                                const t_ens_gid1: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const t_ens_gid1: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 const ent1_opt = core.ensureGlyphByID(gid, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid1));
+                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid1));
                                 if (ent1_opt) |entry| {
                                     ge = entry;
                                     glyph_cache_id.?[probe.insert] = entry;
@@ -2567,9 +2601,9 @@ pub fn generateRowVertices(
                                 if (core.flush_aborted) return error.FlushAborted;
                                 break :gid_blk false;
                             }
-                            const t_ens_gid2: i128 = if (log_enabled) clock.nowNs() else 0;
+                            const t_ens_gid2: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                             const ent2_opt = core.ensureGlyphByID(gid, c_style);
-                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid2));
+                            if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - t_ens_gid2));
                             if (ent2_opt) |entry| {
                                 ge = entry;
                                 break :gid_blk true;
@@ -2650,9 +2684,9 @@ pub fn generateRowVertices(
                                     penX += @as(f32, @floatFromInt(mc_col_w)) * cellW;
                                     continue;
                                 }
-                                const mc_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const mc_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 const mc_ge_opt = core.ensureGlyphPhase2(mc_scalar, c_style);
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_ens));
+                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_ens));
                                 if (mc_ge_opt) |mc_ge| {
                                     if (mc_ge.bbox_size_px[0] > 0 and mc_ge.bbox_size_px[1] > 0) {
                                         const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
@@ -2665,10 +2699,10 @@ pub fn generateRowVertices(
                                         const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_max[1] };
                                         const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_max[1] };
                                         const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const mc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                                        const mc_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                         try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                                         VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, vw, vh, run_grid_id, mc_deco);
-                                        if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
+                                        if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
                                     }
                                 } else {
                                     if (core.flush_aborted) return error.FlushAborted;
@@ -2756,10 +2790,10 @@ pub fn generateRowVertices(
                             // Record quad for potential retroactive suppression by later glyphs
                             const vert_start = out.items.len;
                             const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const sg_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                            const sg_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                             try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, glyph_deco);
-                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - sg_t_emit));
+                            if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - sg_t_emit));
 
                             recent_quads[recent_quad_total % RECENT_CAP] = .{
                                 .vert_start = vert_start,
@@ -2839,7 +2873,7 @@ pub fn generateRowVertices(
                                         ge = glyph_cache_ascii.?[cache_key];
                                         break :blk true;
                                     }
-                                    const a_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                                    const a_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                     const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                         const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                             @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2847,7 +2881,7 @@ pub fn generateRowVertices(
                                     } else if (ensure_base) |ensure| cb: {
                                         break :cb ensure(core.ctx, scalar, &ge) != 0;
                                     } else false;
-                                    if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - a_t_ens));
+                                    if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - a_t_ens));
                                     if (ok) {
                                         glyph_cache_ascii.?[cache_key] = ge;
                                         glyph_valid_ascii.?[cache_key] = true;
@@ -2863,7 +2897,7 @@ pub fn generateRowVertices(
                                     ge = glyph_cache_non_ascii.?[hit_idx];
                                     break :blk true;
                                 }
-                                const na_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                                const na_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                 const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                     const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                         @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2871,14 +2905,14 @@ pub fn generateRowVertices(
                                 } else if (ensure_base) |ensure| cb: {
                                     break :cb ensure(core.ctx, scalar, &ge) != 0;
                                 } else false;
-                                if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - na_t_ens));
+                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - na_t_ens));
                                 if (ok) {
                                     glyph_cache_non_ascii.?[probe.insert] = ge;
                                     glyph_keys_non_ascii.?[probe.insert] = key;
                                 }
                                 break :blk ok;
                             }
-                            const lf_t_ens: i128 = if (log_enabled) clock.nowNs() else 0;
+                            const lf_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                             const ok = if (style_mask != 0 and ensure_styled != null) cb: {
                                 const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                                     @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
@@ -2886,7 +2920,7 @@ pub fn generateRowVertices(
                             } else if (ensure_base) |ensure| cb: {
                                 break :cb ensure(core.ctx, scalar, &ge) != 0;
                             } else false;
-                            if (log_enabled) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - lf_t_ens));
+                            if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - lf_t_ens));
                             break :blk ok;
                         };
                         if (!glyph_ok) {
@@ -2916,10 +2950,10 @@ pub fn generateRowVertices(
 
                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const pc_t_emit: i128 = if (log_enabled) clock.nowNs() else 0;
+                            const pc_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                             try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
                             VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, vw, vh, run_grid_id, pc_glyph_deco);
-                            if (log_enabled) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - pc_t_emit));
+                            if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - pc_t_emit));
                         }
 
                         penX += cellW;
@@ -3174,13 +3208,14 @@ pub const FlushCtx = struct {
                 // path (packAndUploadBitmap's shelf packer running out of
                 // room) actually fires in real usage.
                 ctx.core.log.write(
-                    "[perf] atlas raster_calls={d} raster_ns={d} upload_calls={d} upload_ns={d} pack_ns={d} create_calls={d} create_ns={d} total_calls={d} total_ns={d} full_reset_count={d}\n",
+                    "[perf] atlas raster_calls={d} raster_ns={d} upload_calls={d} upload_ns={d} pack_ns={d} create_calls={d} create_ns={d} total_calls={d} total_ns={d} full_reset_count={d} shape_fallback_runs={d}\n",
                     .{
                         ctx.core.perf_rasterize_calls,       ctx.core.perf_rasterize_ns_total,
                         ctx.core.perf_upload_calls,          ctx.core.perf_upload_ns_total,
                         ctx.core.perf_pack_ns_total,         ctx.core.perf_atlas_create_calls,
                         ctx.core.perf_atlas_create_ns_total, ctx.core.perf_atlas_total_calls,
                         ctx.core.perf_atlas_total_ns_total,  ctx.core.perf_atlas_full_reset_count,
+                        ctx.core.perf_shape_fallback_runs,
                     },
                 );
                 // Cumulative (never reset) grid_mu tryLock contention for the
@@ -4915,6 +4950,8 @@ pub const FlushCtx = struct {
                         // isolate glyph-emit cost. max_glyph_row pinpoints worst row.
                         // ensure_sum_ns and quad_emit_sum_ns sub-divide glyph_sum_ns;
                         // residual (glyph - shape*1000 - ensure - quad) ≈ cache lookup.
+                        // Those two cost two clock reads per emitted quad, so they are
+                        // only measured in the verbose tier and report -1 otherwise.
                         ctx.core.log.write(
                             "[perf] row_mode_pass_breakdown rows={d} bg_sum_ns={d} under_sum_ns={d} glyph_sum_ns={d} strike_sum_ns={d} overline_sum_ns={d} max_glyph_row={d} max_glyph_ns={d} ensure_sum_ns={d} quad_emit_sum_ns={d}\n",
                             .{
@@ -4926,8 +4963,8 @@ pub const FlushCtx = struct {
                                 perf_row_pass_overline_sum_ns,
                                 perf_row_pass_glyph_max_idx,
                                 perf_row_pass_glyph_max_ns,
-                                perf_row_atlas_ensure_sum_ns,
-                                perf_row_quad_emit_sum_ns,
+                                if (ctx.core.log.verbose) perf_row_atlas_ensure_sum_ns else -1,
+                                if (ctx.core.log.verbose) perf_row_quad_emit_sum_ns else -1,
                             },
                         );
                         ctx.core.log.write(

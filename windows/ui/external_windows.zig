@@ -2295,6 +2295,36 @@ pub export fn ExternalWndProc(
             }
         },
 
+        c.WM_CAPTURECHANGED => {
+            // WM_LBUTTONUP never arrives once capture is stolen, and that is the
+            // only place the scrollbar track repeat is killed — without this it
+            // keeps issuing page scrolls indefinitely.
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    const ew = entry.value_ptr.*;
+                    if (ew.hwnd != hwnd) continue;
+                    // The drag is cancelled rather than committed: its pending
+                    // line was never confirmed by a mouse-up. Leaving
+                    // scrollbar_dragging set would make every later
+                    // button-up-less WM_MOUSEMOVE scroll the buffer.
+                    if (ew.scrollbar_dragging) {
+                        ew.scrollbar_dragging = false;
+                        ew.scrollbar_pending_line = -1;
+                    }
+                    if (ew.scrollbar_repeat_timer != 0 or ew.scrollbar_repeat_dir != 0) {
+                        _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
+                        ew.scrollbar_repeat_timer = 0;
+                        ew.scrollbar_repeat_dir = 0;
+                    }
+                    break;
+                }
+                app.mu.unlock(core.clock.io());
+            }
+            return 0;
+        },
+
         c.WM_LBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());

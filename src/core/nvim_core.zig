@@ -563,6 +563,12 @@ pub const Core = struct {
     main_subgrid_row_index_rows: u32 = 0,
     main_subgrid_row_index_valid: bool = false,
     main_subgrid_row_index_generation: u64 = 0,
+    // The buckets store positions into the per-flush cached_subgrids slice, so
+    // reuse additionally requires that slice to have the same length. A grid
+    // clipped entirely off the bottom of the main grid contributes nothing to
+    // the layout accounting, so a resize that adds or drops one changes the
+    // slice without advancing layout_generation.
+    main_subgrid_row_index_cached_len: usize = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
@@ -784,6 +790,11 @@ pub const Core = struct {
     // it's accurate even if logging is later enabled after resets already
     // happened; only emitting it in the [perf] atlas line is log-gated.
     perf_atlas_full_reset_count: u64 = 0,
+    // Runs whose shaping degraded to the per-scalar fallback (no shape callback,
+    // callback failure, or an oversized cluster). A frontend shaper regression
+    // silently drops every non-ASCII run onto that path, so it needs a signal.
+    // Incremented unconditionally; only its [perf] line is log-gated.
+    perf_shape_fallback_runs: u64 = 0,
     // Bumped by EVERY resetCoreAtlas() call, regardless of why (packer-full
     // during packAndUploadBitmap, explicit zonvie_core_invalidate_glyph_cache,
     // onGuifont, DPI/backing-scale change). perf_atlas_full_reset_count only
@@ -1471,6 +1482,7 @@ pub const Core = struct {
         self.main_subgrid_row_index_rows = 0;
         self.main_subgrid_row_index_valid = false;
         self.main_subgrid_row_index_generation = 0;
+        self.main_subgrid_row_index_cached_len = 0;
 
         // External-float scratch is bounded during a session, but a hostile
         // previous peer may have driven it to that high-water mark. Session

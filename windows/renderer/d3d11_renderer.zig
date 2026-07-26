@@ -1945,9 +1945,11 @@ pub const Renderer = struct {
 
         // Recreate texture if size changed
         if (self.tabline_tex == null or self.tabline_width != width or self.tabline_height != height) {
-            // Release old resources
-            safeRelease(&self.tabline_srv);
-            safeRelease(&self.tabline_tex);
+            // The old resources are released only once both creates below have
+            // succeeded — publish-after-create, as the vertex buffers already
+            // do. Releasing first left the tabline blank for every frame after
+            // a transient allocation failure (the post-TDR window in
+            // particular), until an unrelated size change happened to succeed.
 
             // Create new texture
             var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
@@ -1997,6 +1999,8 @@ pub const Renderer = struct {
                 return error.CreateSRVFailed;
             }
 
+            safeRelease(&self.tabline_srv);
+            safeRelease(&self.tabline_tex);
             self.tabline_tex = tex;
             self.tabline_srv = srv;
             self.tabline_width = width;
@@ -2095,9 +2099,7 @@ pub const Renderer = struct {
         const ctx = self.ctx orelse return error.NoContext;
 
         if (self.sidebar_tex == null or self.sidebar_width_tex != width or self.sidebar_height_tex != height) {
-            safeRelease(&self.sidebar_srv);
-            safeRelease(&self.sidebar_tex);
-
+            // Publish-after-create: see updateTablineTexture.
             var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
             tex_desc.Width = width;
             tex_desc.Height = height;
@@ -2144,6 +2146,8 @@ pub const Renderer = struct {
                 return error.CreateSRVFailed;
             }
 
+            safeRelease(&self.sidebar_srv);
+            safeRelease(&self.sidebar_tex);
             self.sidebar_tex = tex;
             self.sidebar_srv = srv;
             self.sidebar_width_tex = width;

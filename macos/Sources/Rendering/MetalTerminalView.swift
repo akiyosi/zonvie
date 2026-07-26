@@ -2622,6 +2622,20 @@ final class MetalTerminalView: MTKView {
             smoothScrollGrids.insert(gridId)
         }
 
+        if gestureActive, !smoothScrollGrids.isEmpty {
+            // The gesture owns scrollOffsetPx from here. Decaying it fights the
+            // finger: the equilibrium sits near the per-frame delta, which stays
+            // above scrollOffsetEpsilon (so the grid never leaves the set) while
+            // never reaching rowHeightPx (so no scroll is sent, so no seed comes
+            // back to clear it) — the damping then lasts the whole gesture, not
+            // one decay tail. Retained rows go with it: they were captured for
+            // the keyboard scroll this gesture is taking over from.
+            for gridId in smoothScrollGrids where !gestureGridsScratch.contains(gridId) {
+                gestureGridsScratch.append(gridId)
+            }
+            smoothScrollGrids.removeAll(keepingCapacity: true)
+        }
+
         if !smoothScrollGrids.isEmpty {
             let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
             for gridId in Array(smoothScrollGrids) {
@@ -2638,9 +2652,14 @@ final class MetalTerminalView: MTKView {
             }
         }
         let easeActive = !smoothScrollGrids.isEmpty
-        let tracedOffsetPx = easeActive
-            ? (smoothScrollGrids.map { abs(scrollOffsetPx[$0] ?? 0) }.max() ?? 0)
-            : 0
+        // Computed only when the tracer will consume it: the reduction allocates,
+        // and this runs every eased frame.
+        var tracedOffsetPx: CGFloat = 0
+        if FrameTracer.enabled, easeActive {
+            for gridId in smoothScrollGrids {
+                tracedOffsetPx = max(tracedOffsetPx, abs(scrollOffsetPx[gridId] ?? 0))
+            }
+        }
         scrollOffsetLock.unlock()
 
         for gridId in gestureGridsScratch {

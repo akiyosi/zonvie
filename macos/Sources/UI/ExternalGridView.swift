@@ -221,9 +221,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
               totalRows >= 0, totalRows <= maxRowBuffers,
               surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
         else {
-            if !lockHeld { tripleBufferLock.lock() }
-            rowCapacityHardFailure = true
-            if !lockHeld { tripleBufferLock.unlock() }
+            // Argument validation only. Fail this flush, but do not latch
+            // rowCapacityHardFailure: it is never cleared, so latching it on a
+            // soft condition permanently stops this view from presenting.
             flushFailed = true
             return false
         }
@@ -1143,13 +1143,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let structural = !src.rowState.usingRowBuffers
                         || rowStagingTotalRows != src.knownTotalRows
                         || rowStagingTotalCols != src.knownTotalCols
-                    if !requirePreparedRowCapacity(
-                        row: row,
-                        vertexCount: verts.count,
-                        totalRows: rowStagingTotalRows,
-                        lockHeld: true,
-                        useWriteMapping: true
-                    ) || !submitSurfaceRowVertices(
+                    // Allocate synchronously, finishing the revert b83ff29 began
+                    // and 4b1ad75 applied to submitVerticesRowRaw above: the
+                    // pre-provisioning gate does not converge, and a per-view
+                    // failure here escalates through ZonvieCore's flushFailed
+                    // sweep into an app-wide abort_flush. requirePreparedRowCapacity
+                    // now only records a real allocation failure for recovery.
+                    if !submitSurfaceRowVertices(
                         target: cursorDst,
                         sourceSet: src,
                         device: mtlDevice,
@@ -1159,9 +1159,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         maxRowBuffers: maxRowBuffers,
                         totalRows: rowStagingTotalRows,
                         totalCols: rowStagingTotalCols,
-                        allowAllocation: false,
                         inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
                     ) {
+                        _ = requirePreparedRowCapacity(
+                            row: row,
+                            vertexCount: verts.count,
+                            totalRows: rowStagingTotalRows,
+                            lockHeld: true,
+                            useWriteMapping: true
+                        )
                         flushFailed = true
                     } else {
                         recordGeneratedRowsLocked(
@@ -2065,16 +2071,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let committedFontIsCurrent: Bool
             tripleBufferLock.lock()
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+                let terminal = rowCapacityHardFailure
                 tripleBufferLock.unlock()
                 inflightSemaphore.signal()
                 redrawScheduler.didDrawFrame()
                 finishedRedraw = true
-                DispatchQueue.main.async { [weak self] in
-                    self?.requestRedraw()
+                // A hard failure is terminal and never cleared, so re-requesting
+                // a draw only spins without ever presenting.
+                if !terminal {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.requestRedraw()
+                    }
                 }
                 return
             }
             csi = committedSetIndex
+            // Set when the staged replay below raises rowCapacityRequiredRows, so
+            // provisioning can be driven after tripleBufferLock is released.
+            var recordedRowCapacityShortfall = false
             // Apply staged out-of-bracket ROW updates once ALL sets are idle
             // (row buffers are COW-shared across sets, so csi-idle alone is
             // not sufficient — see rowStaging doc comment) AND no bracket is
@@ -2113,6 +2127,43 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     if submitted {
                         pendingDirtyRows.insert(row)
                         appliedRows.append(row)
+                    } else {
+                        // Record the requirement, or the ledger stays at zero,
+                        // provisionPendingRowCapacity short-circuits without
+                        // allocating, and this replay fails identically on every
+                        // subsequent draw while stagingPending keeps re-arming
+                        // requestRedraw.
+                        //
+                        // Recorded inline rather than through
+                        // requirePreparedRowCapacity for two reasons: the replay
+                        // targets bufferSets[csi], which is neither the write set
+                        // nor the flush source set that helper maps through, so it
+                        // would name a different physical slot; and it latches
+                        // flushFailed, which on_flush_end escalates into an
+                        // app-wide abort_flush — wrong for a draw-time shortfall
+                        // on one view, outside any bracket.
+                        let capacityRow = surfacePhysicalCapacityRow(
+                            logicalRow: row,
+                            logicalToSlot: bufferSets[csi].rowLogicalToSlot
+                        )
+                        if capacityRow >= 0, capacityRow < maxRowBuffers,
+                           rowStagingTotalRows >= 0, rowStagingTotalRows <= maxRowBuffers,
+                           surfaceSafeNeededBytes(vertexCount: max(0, verts.count)) != nil {
+                            rowCapacityRequiredRows = max(
+                                max(rowCapacityRequiredRows, rowStagingTotalRows),
+                                capacityRow + 1
+                            )
+                            rowCapacityRequiredVertexCounts[capacityRow] = max(
+                                rowCapacityRequiredVertexCounts[capacityRow],
+                                max(0, verts.count)
+                            )
+                            // A raised ledger gates the top of draw(), so it needs
+                            // a driver: provisionPendingRowCapacity runs only from
+                            // the flush-retry queue, and nothing on this path
+                            // schedules one. Without it the view would stop
+                            // presenting and spin the display link instead.
+                            recordedRowCapacityShortfall = true
+                        }
                     }
                 }
                 for row in appliedRows {
@@ -2185,6 +2236,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 DispatchQueue.main.async { [weak self] in
                     self?.requestRedraw()
                 }
+            }
+
+            // Drive the provisioner for the shortfall recorded above. Done after
+            // the lock is released: scheduleFlushRetry runs the worker on its own
+            // queue, which re-enters this view through provisionPendingRowCapacity
+            // and takes tripleBufferLock itself.
+            if recordedRowCapacityShortfall {
+                mainTerminalView?.core?.scheduleFlushRetry()
             }
 
             // Snapshot the previous-frame gate state BEFORE draw() overwrites

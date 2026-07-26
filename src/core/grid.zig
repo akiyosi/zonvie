@@ -284,6 +284,11 @@ pub const MsgChunk = struct {
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_MESSAGE_CHUNKS: usize = 256;
 
+// cmdline_show carries a peer-supplied nesting level that keys a map with no
+// other bound. Real nesting is a handful deep; this only stops a malformed or
+// hostile stream from growing the map without limit.
+const MAX_CMDLINE_LEVELS: usize = 64;
+
 const MessageTailRef = struct {
     hl_id: u32,
     text: []const u8,
@@ -3620,6 +3625,17 @@ pub const Grid = struct {
         level: u32,
         prompt_hl_id: u32,
     ) !void {
+        if (!self.cmdline_states.contains(level) and
+            self.cmdline_states.count() >= MAX_CMDLINE_LEVELS)
+        {
+            // Dropped, not raised as an error: an error here propagates out of
+            // handleRedraw and, not being classified as a hard render failure,
+            // drives a detach/reattach cycle that ends in session termination
+            // after two attempts. The sibling caps in this file (message bytes
+            // and chunks) drop or truncate for the same reason.
+            self.cmdline_dirty = true;
+            return;
+        }
         const gop = try self.cmdline_states.getOrPut(self.alloc, level);
         if (!gop.found_existing) {
             gop.value_ptr.* = CmdlineState{};
@@ -3679,6 +3695,19 @@ pub const Grid = struct {
             state.special_char_len = 0;
             state.special_shift = false;
             state.scroll_offset = 0;
+            // Release the duped text too: the entry itself is kept so lookups
+            // still see a hidden level, but a hidden cmdline held its content
+            // and prompt until the next cmdline_show for the same level, which
+            // for a level that never returns is never.
+            for (state.content.items) |chunk| {
+                if (chunk.text.len > 0) self.alloc.free(chunk.text);
+            }
+            state.content.clearRetainingCapacity();
+            state.pos = 0;
+            if (state.prompt.len > 0) {
+                self.alloc.free(state.prompt);
+                state.prompt = "";
+            }
         }
         self.cmdline_dirty = true;
     }

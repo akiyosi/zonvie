@@ -118,21 +118,37 @@ fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
         return 1;
     }
 
-    var it = std.unicode.Utf8Iterator{ .bytes = utf8, .i = 0 };
+    // Cell text arrives as unvalidated wire bytes, so the sequence length is
+    // probed before the cursor advances: Utf8Iterator.nextCodepointSlice traps
+    // on an invalid start byte and slices out of bounds on a truncated tail.
+    var i: usize = 0;
     var count: u32 = 0;
 
-    while (count < buf.len) {
-        const slice = it.nextCodepointSlice() orelse break;
-        const cp = std.unicode.utf8Decode(slice) catch {
+    while (count < buf.len and i < utf8.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(utf8[i]) catch {
             buf[count] = 0xFFFD;
             count += 1;
+            i += 1;
+            continue;
+        };
+        if (i + cp_len > utf8.len) {
+            buf[count] = 0xFFFD;
+            count += 1;
+            i = utf8.len;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(utf8[i .. i + cp_len]) catch {
+            buf[count] = 0xFFFD;
+            count += 1;
+            i += cp_len;
             continue;
         };
         buf[count] = @as(u32, cp);
         count += 1;
+        i += cp_len;
     }
 
-    if (count == buf.len and it.nextCodepointSlice() != null) {
+    if (count == buf.len and i < utf8.len) {
         return error.CellClusterTooLong;
     }
 

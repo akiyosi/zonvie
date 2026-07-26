@@ -883,6 +883,10 @@ void zonvie_core_set_blur_enabled(zonvie_core *core, int enabled);
  * When enabled, child process inherits parent's CWD instead of $HOME. */
 void zonvie_core_set_inherit_cwd(zonvie_core *core, int enabled);
 
+/* Set the window background opacity used for the default background colour.
+ * Clamped to [0.0, 1.0]; 1.0 (fully opaque) is the default. */
+void zonvie_core_set_background_opacity(zonvie_core *core, float opacity);
+
 /* Set glyph cache sizes for performance tuning.
  * ascii_size: cache size for ASCII chars (0-127) × 4 style combinations (default: 512, min: 128)
  * non_ascii_size: hash table size for non-ASCII chars (default: 256, min: 64)
@@ -899,6 +903,8 @@ void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
    callbacks_size: sizeof(zonvie_callbacks) as seen by the caller.
                    Allows the core to safely handle callers compiled
                    against an older (smaller) struct layout.
+                   Must be non-zero when cb is non-NULL: a zero size cannot
+                   bound the read, so the core installs no callbacks at all.
    ctx:            opaque frontend context forwarded to all callbacks. */
 zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
 /* Must be called from a lifecycle thread which is not currently executing a
@@ -1358,8 +1364,9 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
 // Batched version of zonvie_core_get_hl_by_name: looks up `count` group
 // names under a single grid_mu acquisition instead of one lock round-trip
 // per name. names/out_fg_rgb/out_bg_rgb/out_found must each have length
-// count. A null entry in names is skipped (its out slots are left
-// untouched). Returns 1 on success, 0 if core/arrays are null.
+// count. A null entry in names writes 0/0/0 to its out slots rather than
+// leaving them untouched, so the out arrays may be passed uninitialized.
+// Returns 1 on success, 0 if core/arrays are null.
 ZONVIE_API int zonvie_core_get_hl_by_names_batch(
     zonvie_core *core,
     const char *const *names,

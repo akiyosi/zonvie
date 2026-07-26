@@ -6873,6 +6873,22 @@ pub export fn WndProc(
         c.WM_CAPTURECHANGED => {
             // Mouse capture lost - cancel any tabline/sidebar drag or button press
             if (getApp(hwnd)) |app| {
+                // Scrollbar drag and track-repeat are both armed on button-down
+                // and cleared only in scrollbarMouseUp. With capture stolen,
+                // WM_LBUTTONUP never arrives here: the repeat timer would keep
+                // issuing page scrolls, and scrollbar_dragging would leave every
+                // later button-up-less WM_MOUSEMOVE scrolling the buffer. The
+                // drag is cancelled rather than committed — its pending line was
+                // never confirmed by a mouse-up.
+                if (app.scrollbar_dragging) {
+                    app.scrollbar_dragging = false;
+                    app.scrollbar_pending_line = -1;
+                }
+                if (app.scrollbar_repeat_timer != 0 or app.scrollbar_repeat_dir != 0) {
+                    _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
+                    app.scrollbar_repeat_timer = 0;
+                    app.scrollbar_repeat_dir = 0;
+                }
                 if (app.ext_tabline_enabled) {
                     const had_state = app.tabline_state.dragging_tab != null or
                         app.tabline_state.close_button_pressed != null or

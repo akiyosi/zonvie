@@ -45,6 +45,9 @@ struct ScrollOffset {
     float content_bottom_y; // Bottom Y of scrollable content (above margin bottom), in NDC
     int move_all;           // 1 = translate every vertex of this grid (ignore DECO_SCROLLABLE);
                             // used for float windows that move bodily with their parent's scroll
+    int pin_edges;          // 1 = stretch the edge row's background across the gap the offset
+                            // opens. 0 when a retained row already covers that gap with its own
+                            // background, which the stretch would otherwise paint over.
 };
 
 // Drawable size for NDC conversion in fragment shader
@@ -120,7 +123,7 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
             // move_all grids translate uniformly (no edge pinning): their content
             // bounds span the screen so nothing is clipped, and the whole float
             // including margins must shift together.
-            if (is_plain_bg && !move_all) {
+            if (is_plain_bg && !move_all && scroll.pin_edges != 0) {
                 // Background quads at content area edges: keep the boundary vertex
                 // pinned so the edge row stretches to fill the gap left by scrolling.
                 // This prevents transparent gaps at top/bottom during smooth scroll.

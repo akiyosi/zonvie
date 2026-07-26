@@ -461,7 +461,10 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.scrollbarMinKnobHeight(app.dpi_scale), knob_height);
+    // Per-window DPI, matching the geometry above: on a mixed-DPI setup the
+    // global scale gives the drag a different knob_travel from the drawn knob,
+    // so the knob jumps away from the cursor whenever the clamp is active.
+    knob_height = @max(app_mod.scrollbarMinKnobHeight(ext_win.dpi_scale), knob_height);
     const knob_travel = track_height - knob_height;
     if (knob_travel <= 0) return;
 
@@ -683,8 +686,11 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             // Page up - execute immediately and start repeat timer
             if (applog.isEnabled()) applog.appLog("[scrollbar] track_above: executing page scroll up\n", .{});
             scrollbarPageScroll(app, -1);
-            app.scrollbar_repeat_dir = -1;
+            // Armed after SetCapture: it synchronously delivers
+            // WM_CAPTURECHANGED to whichever window held capture, and that
+            // handler clears the repeat state.
             _ = c.SetCapture(hwnd);
+            app.scrollbar_repeat_dir = -1;
             app.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_DELAY, null);
             showScrollbar(hwnd, app);
             return true;
@@ -693,8 +699,9 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             // Page down - execute immediately and start repeat timer
             if (applog.isEnabled()) applog.appLog("[scrollbar] track_below: executing page scroll down\n", .{});
             scrollbarPageScroll(app, 1);
-            app.scrollbar_repeat_dir = 1;
+            // Armed after SetCapture — see track_above.
             _ = c.SetCapture(hwnd);
+            app.scrollbar_repeat_dir = 1;
             app.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_DELAY, null);
             showScrollbar(hwnd, app);
             return true;
@@ -832,6 +839,11 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
             // cursor may already be back on the main grid. Retry shortly
             // instead of silently dropping the main-window scrollbar update
             // (mirrors the viewport-read retry a few lines below).
+            // Deliberately not re-posted on SetTimer failure: the message would
+            // re-enter this same handler with no delay, and the condition that
+            // fails SetTimer (USER handle pressure) persists, so it spins the
+            // message loop ahead of WM_PAINT. Losing one cosmetic scrollbar
+            // update is the milder failure.
             _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
         }
         return;
@@ -847,6 +859,7 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
             // this one-shot WM_APP_UPDATE_SCROLLBAR (already consumed), so
             // acting on it would silently drop the post-scroll show/repaint.
             // Retry shortly instead (mirrors macOS's 16ms timer re-arm).
+            // Not re-posted on SetTimer failure — see the note above.
             _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
             return;
         },

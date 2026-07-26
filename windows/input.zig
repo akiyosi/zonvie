@@ -1008,7 +1008,10 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
             // while the core thread still holds grid_mu, so contention here
             // is structurally common; acting on the stale pre-seeded values
             // would silently drop the new blink settings. Retry shortly
-            // (mirrors macOS's 16ms timer re-arm).
+            // (mirrors macOS's 16ms timer re-arm). Deliberately not re-posted if
+            // SetTimer fails: the message would re-enter this handler with no
+            // delay while the condition that failed SetTimer persists, spinning
+            // the message loop ahead of WM_PAINT.
             _ = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
             return;
         }

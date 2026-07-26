@@ -1668,11 +1668,15 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // Draw hover background (circular) if hovered
         if (app.tabline_state.hovered_new_tab_btn) {
             const plus_hover_brush = c.CreateSolidBrush(pal.glyph_hover_bg);
-            _ = c.SelectObject(hdc, plus_hover_brush);
+            // The previous brush is restored before DeleteObject: GDI refuses to
+            // delete an object still selected into a DC, so deleting it while
+            // selected silently leaks the handle.
+            const old_brush_hover = c.SelectObject(hdc, plus_hover_brush);
             const null_pen = c.GetStockObject(c.NULL_PEN);
             const old_pen_hover = c.SelectObject(hdc, null_pen);
             _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_size);
             _ = c.SelectObject(hdc, old_pen_hover);
+            _ = c.SelectObject(hdc, old_brush_hover);
             _ = c.DeleteObject(plus_hover_brush);
         }
 

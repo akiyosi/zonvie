@@ -8,6 +8,41 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 
+/// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
+/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
+/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
+/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
+fn utf8ToUtf16Lossy(dst: []u16, src: []const u8) usize {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len and out < dst.len) {
+        var cp: u21 = 0xFFFD;
+        const cp_len = std.unicode.utf8ByteSequenceLength(src[i]) catch {
+            i += 1;
+            dst[out] = 0xFFFD;
+            out += 1;
+            continue;
+        };
+        if (i + cp_len > src.len) {
+            dst[out] = 0xFFFD;
+            out += 1;
+            break;
+        }
+        cp = std.unicode.utf8Decode(src[i .. i + cp_len]) catch 0xFFFD;
+        i += cp_len;
+        if (cp > 0xFFFF) {
+            if (out + 1 >= dst.len) break;
+            dst[out] = @as(u16, @intCast((cp - 0x10000) >> 10)) + 0xD800;
+            dst[out + 1] = @as(u16, @intCast((cp - 0x10000) & 0x3FF)) + 0xDC00;
+            out += 2;
+        } else {
+            dst[out] = @intCast(cp);
+            out += 1;
+        }
+    }
+    return out;
+}
+
 pub fn onMsgShow(
     ctx: ?*anyopaque,
     view: app_mod.zonvie_msg_view_type,
@@ -1092,26 +1127,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
 
     // Convert text to UTF-16 using proper UTF-8 decoding
     var text_utf16: [4096]u16 = undefined;
-    var text_utf16_len: usize = 0;
-    const utf8_view = std.unicode.Utf8View.initUnchecked(msg_win.text[0..msg_win.text_len]);
-    var utf8_iter = utf8_view.iterator();
-    while (utf8_iter.nextCodepoint()) |codepoint| {
-        if (text_utf16_len >= text_utf16.len - 1) break;
-        // Handle surrogate pairs for codepoints > 0xFFFF
-        if (codepoint > 0xFFFF) {
-            const high = @as(u16, @intCast((codepoint - 0x10000) >> 10)) + 0xD800;
-            const low = @as(u16, @intCast((codepoint - 0x10000) & 0x3FF)) + 0xDC00;
-            text_utf16[text_utf16_len] = high;
-            text_utf16_len += 1;
-            if (text_utf16_len < text_utf16.len) {
-                text_utf16[text_utf16_len] = low;
-                text_utf16_len += 1;
-            }
-        } else {
-            text_utf16[text_utf16_len] = @intCast(codepoint);
-            text_utf16_len += 1;
-        }
-    }
+    const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, msg_win.text[0..msg_win.text_len]);
 
     // Draw text with padding
     const padding: c_int = app.scalePx(12);
@@ -1224,14 +1240,10 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
     // Convert text to UTF-16
+    // Decoded, not byte-zero-extended: showmode/showcmd/ruler carry non-ASCII
+    // (e.g. "-- 挿入 --"), which zero-extension renders as mojibake.
     var text_utf16: [256]u16 = undefined;
-    var text_utf16_len: usize = 0;
-    for (text_buf[0..text_len]) |byte| {
-        if (text_utf16_len < text_utf16.len) {
-            text_utf16[text_utf16_len] = byte;
-            text_utf16_len += 1;
-        }
-    }
+    const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
 
     // Draw text centered
     const mini_pad = app.scalePx(4);
