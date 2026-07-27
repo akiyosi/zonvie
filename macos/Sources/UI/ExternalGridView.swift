@@ -238,6 +238,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         return false
     }
 
+    /// True while this surface still owes a provisioning pass, or is in the
+    /// middle of one. The scheduled flush retry is that pass's only driver, so
+    /// a commit elsewhere must not disarm the retry while this holds.
+    /// `rowCapacityProvisioning` has to count: the provisioner zeroes the
+    /// ledger before it allocates outside the lock, and a commit landing in
+    /// that window would otherwise see nothing owed and cancel the very retry
+    /// that is doing the work — after which an allocation failure restores the
+    /// ledger with no driver left to act on it.
+    var hasPendingRowCapacityWork: Bool {
+        tripleBufferLock.lock()
+        defer { tripleBufferLock.unlock() }
+        return rowCapacityRequiredRows > 0 || rowCapacityProvisioning
+    }
+
     /// Called from the flush-retry queue before it acquires core grid_mu.
     func provisionPendingRowCapacity() -> SurfaceRowProvisionStatus {
         tripleBufferLock.lock()
@@ -245,14 +259,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             tripleBufferLock.unlock()
             return .hardFailure
         }
+        // Nothing owed: answer ready regardless of what this surface is
+        // currently doing. Asked before the busy check because a float
+        // presenting at refresh rate almost always has a frame in flight, and
+        // the caller folds any one surface's .retry into an app-wide verdict —
+        // an idle ledger would otherwise keep the whole retry re-arming.
+        guard rowCapacityRequiredRows > 0 else {
+            tripleBufferLock.unlock()
+            return .ready
+        }
         if bracketOpen || rowCapacityProvisioning ||
             gpuInFlightCount.contains(where: { $0 != 0 }) {
             tripleBufferLock.unlock()
             return .retry
-        }
-        guard rowCapacityRequiredRows > 0 else {
-            tripleBufferLock.unlock()
-            return .ready
         }
         rowCapacityProvisioning = true
         let requiredRows = rowCapacityRequiredRows

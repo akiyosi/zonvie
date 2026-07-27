@@ -106,6 +106,29 @@ final class ZonvieCore {
     private let flushRetryQueue = DispatchQueue(label: "com.zonvie.flush-retry", qos: .userInitiated)
     private let flushRetryQueueKey = DispatchSpecificKey<UInt8>()
 
+    /// Snapshot buffer for the poll below. Reused so the flush path does not
+    /// allocate; separate from extViewsScratch, which the flush-end closure
+    /// still owns while this runs.
+    private var pendingCapacityScratch: [ExternalGridView] = []
+
+    /// True while any surface still owes a row-capacity provisioning pass.
+    /// Snapshots under the map lock and releases it before asking any view, so
+    /// externalGridViewsLock is never held across a surface lock.
+    private func hasPendingSurfaceRowCapacityWork() -> Bool {
+        if let renderer = terminalView?.renderer, renderer.hasPendingRowCapacityWork {
+            return true
+        }
+        externalGridViewsLock.lock()
+        pendingCapacityScratch.removeAll(keepingCapacity: true)
+        pendingCapacityScratch.append(contentsOf: externalGridViews.values)
+        externalGridViewsLock.unlock()
+        defer { pendingCapacityScratch.removeAll(keepingCapacity: true) }
+        for gridView in pendingCapacityScratch where gridView.hasPendingRowCapacityWork {
+            return true
+        }
+        return false
+    }
+
     /// Provision row metadata and Metal buffers without holding core grid_mu.
     /// Views gate new flush brackets while their plans are being published.
     private func provisionPendingSurfaceRowCapacity() -> SurfaceRowProvisionStatus {
@@ -232,7 +255,32 @@ final class ZonvieCore {
     /// asyncAfter closure must not launch another full flush or schedule a new
     /// retry after the content it was meant to recover already committed.
     private func cancelScheduledFlushRetry() {
+        // Runs on every successful flush, so ask the cheap question first:
+        // with no retry armed there is nothing to disarm, and polling every
+        // surface would put a lock round-trip per surface on the flush path.
         os_unfair_lock_lock(&flushRetryScheduledLock)
+        let armed = flushRetryScheduled
+        os_unfair_lock_unlock(&flushRetryScheduledLock)
+
+        // A surface that recorded a row-capacity shortfall is driven only by
+        // the scheduled retry: its draw path short-circuits ahead of the
+        // replay that would record the shortfall again, so nothing re-arms
+        // once this generation is invalidated. A commit on another surface
+        // says nothing about that one, and disarming here would leave it
+        // unable to present at all.
+        if armed && hasPendingSurfaceRowCapacityWork() { return }
+
+        os_unfair_lock_lock(&flushRetryScheduledLock)
+        // The sample above and this disarm are separate acquisitions, and a
+        // surface raises its ledger before it arms. A retry that appeared in
+        // between was therefore armed for work this pass never looked at;
+        // killing it would strand exactly the surface the poll exists to
+        // protect. Leave it, and leave the backoff alone — the fresh arm has
+        // already taken its delay from it.
+        if flushRetryScheduled && !armed {
+            os_unfair_lock_unlock(&flushRetryScheduledLock)
+            return
+        }
         flushRetryScheduled = false
         flushRetryGeneration &+= 1
         flushRetryBackoff.reset()
