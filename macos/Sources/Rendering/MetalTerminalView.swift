@@ -115,11 +115,17 @@ final class MetalTerminalView: MTKView {
     // main thread — the same thread as the tick — so it never under-reports
     // an active bounce.
     private var scrollEdgeBlockedHint = false
-    // Trackpad gesture lifecycle (main thread only): true while fingers are
-    // on the pad. Gates the bounce-back animation so a held overscroll stays
-    // put until the fingers lift (native rubber-band feel). Momentum does NOT
-    // gate the bounce: like the native one, it starts as soon as the edge is
-    // hit and swallows the remaining momentum.
+    // Trackpad gesture lifecycle: true while a scroll gesture is running, i.e.
+    // from .began/.changed until .ended/.cancelled. Fingers merely resting
+    // (.mayBegin) do NOT set it — that carries no delta and can be resolved by
+    // .cancelled without one, and treating it as a gesture let a resting hand
+    // claim every grid's scrolls with no expiry. Gates the bounce-back so a
+    // held overscroll stays put until the fingers lift (native rubber-band
+    // feel); a hand put back on the pad mid-bounce no longer freezes it.
+    // Momentum does NOT gate the bounce: like the native one, it starts as
+    // soon as the edge is hit and swallows the remaining momentum.
+    // Written on the main thread, read on the core thread — see
+    // noteScrollGesturePhase for the lock that covers both.
     private var scrollGestureTouching = false
     // True while a momentum phase is running. Only used to keep momentum
     // events from refreshing lastPreciseScrollInputTime, which would gate the
@@ -128,6 +134,26 @@ final class MetalTerminalView: MTKView {
     // Last precise scroll input timestamp: fallback gate for phase-less
     // precise events (devices without a gesture lifecycle).
     private var lastPreciseScrollInputTime: CFAbsoluteTime = 0
+    // Grid the current gesture is driving. The three fields above describe the
+    // pad, not a grid, so scroll ownership must additionally match this id: a
+    // grid Neovim scrolls on its own is not the finger's just because a
+    // gesture is running elsewhere. Cleared when the fingers lift so a later
+    // gesture cannot inherit it; during the momentum that follows, ownership
+    // rests on the in-flight count and the lookahead set until the first
+    // momentum event re-establishes the id.
+    private var gestureScrollGridId: Int64?
+    // Grids the reconciliation already cancelled a scroll against. The seed
+    // guard infers "the gesture settled this grid" from the in-flight count
+    // and the lookahead set, but the reconciliation drains both on its way
+    // out, so after it runs those two cannot distinguish "already paid" from
+    // "never involved" — and the seed would pay the same row a second time.
+    // Recorded under scrollOffsetLock, which both sites already hold.
+    // Lifetime is one tickSmoothScroll, not one flush: the reconciliation also
+    // drains from the core thread's vertex callbacks, so a mark can outlive
+    // the commit that set it when several commits land between two draws. The
+    // failure that costs is over-suppression — one row loses its ease — never
+    // the double payment this exists to prevent.
+    private var reconciledThisTick: Set<Int64> = []
     // Last tick timestamp: dedupes multiple tick callers in the same frame
     // and scales the bounce decay by actual elapsed time.
     private var lastScrollEdgeTickTime: CFAbsoluteTime = 0
@@ -1981,14 +2007,30 @@ final class MetalTerminalView: MTKView {
     /// soon as they lift. Called from scrollWheel of this view and of external
     /// grid views (shared scroll state).
     func noteScrollGesturePhase(_ event: NSEvent) {
+        // Written on the main thread, read on the core thread by
+        // processPendingScrollClears when it decides who owns a scroll — so
+        // the writes take the same lock that read is already holding.
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
         let phase = event.phase
-        if phase.contains(.mayBegin) || phase.contains(.began) || phase.contains(.changed) {
+        // .mayBegin is fingers landing, not a scroll: it carries no delta and
+        // may be resolved by .cancelled without one. Treating it as an active
+        // gesture let a resting hand claim every grid's scrolls and hold the
+        // keyboard ease off for as long as the fingers stayed down — the only
+        // term here with no expiry of its own.
+        if phase.contains(.began) || phase.contains(.changed) {
             scrollGestureTouching = true
         } else if phase.contains(.ended) || phase.contains(.cancelled) {
             scrollGestureTouching = false
             // Lift: drop the recent-input window so a blocked offset starts
             // its bounce-back on the very next tick.
             lastPreciseScrollInputTime = 0
+            // The gesture is over, so it no longer speaks for any grid: a
+            // later gesture on a different grid must not inherit this id.
+            // The momentum that follows still owns whatever it has in flight
+            // through the in-flight count and the lookahead set, and its first
+            // event re-establishes the id.
+            gestureScrollGridId = nil
         }
         let momentum = event.momentumPhase
         if momentum.contains(.began) || momentum.contains(.changed) {
@@ -2377,6 +2419,9 @@ final class MetalTerminalView: MTKView {
             // a blocked edge. Bounce-back is gated on gesture/momentum state
             // instead, so it never fights active user input.
             scrollOffsetPx[gridId] = newOffset
+            // This is the grid the pad is driving; gesture ownership of an
+            // incoming grid_scroll is decided against it.
+            gestureScrollGridId = gridId
             scrollOffsetLock.unlock()
 
             if FrameTracer.enabled {
@@ -2597,6 +2642,19 @@ final class MetalTerminalView: MTKView {
 
         scrollOffsetLock.lock()
         for gridId in external {
+            // A reconciliation in the same batch carries the distance the
+            // content actually moved and settles the offset itself; dropping
+            // it here first would leave that reconciliation adding a full row
+            // to zero and displace the grid.
+            //
+            // This only covers the co-drained case. An external window appends
+            // its clear during vertex generation, while a reconciliation is
+            // staged until this view's commit — so a drain landing between the
+            // two, or a flush that aborts before committing, still sees the
+            // clear alone. Pairing them properly needs the external clear to
+            // be timed against the external window's own commit, which this
+            // view cannot observe.
+            if pending.contains(where: { $0.gridId == gridId }) { continue }
             smoothScrollGrids.remove(gridId)
             gestureLookaheadGrids.remove(gridId)
             scrollOffsetPx.removeValue(forKey: gridId)
@@ -2619,11 +2677,21 @@ final class MetalTerminalView: MTKView {
             // occurrence, which is what remained after the lookahead landed.
             // A grid still holding lookahead compensation, or one whose gesture
             // is still live, stays the gesture's.
+            //
+            // The pad-state terms describe the pad, not a grid, so they only
+            // speak for the grid the gesture is actually driving. Without that
+            // qualification a resting finger makes every scroll look like the
+            // gesture's: a keyboard scroll would have a row added to its
+            // offset instead of cleared, with the ease seed suppressed and
+            // nothing left to decay it, and an unrelated split scrolled by
+            // Neovim would pick up a phantom row of its own.
+            let gestureDrivesThisGrid = gestureScrollGridId == gridId
+                && (scrollGestureTouching
+                    || scrollMomentumRunning
+                    || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
             let gestureOwns = sentCount > 0
                 || gestureLookaheadGrids.contains(gridId)
-                || scrollGestureTouching
-                || scrollMomentumRunning
-                || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
+                || gestureDrivesThisGrid
             if gestureOwns {
                 // These rows are the lookahead the gesture asked for before the
                 // finger got there.
@@ -2641,6 +2709,15 @@ final class MetalTerminalView: MTKView {
                 if abs(newOffset) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     gestureLookaheadGrids.remove(gridId)
+                    // Settling here erases both signals the seed guard reads,
+                    // so record the payment explicitly. Only this branch needs
+                    // it: the else below keeps the grid in the lookahead set,
+                    // which already blocks the seed. Recorded under exactly the
+                    // conditions tickSmoothScroll needs to reach its clear, so
+                    // a mark can never outlive the only thing that erases it.
+                    if MetalTerminalRenderer.smoothScrollEnabled, rowHeightPx > 0 {
+                        reconciledThisTick.insert(gridId)
+                    }
                 } else {
                     scrollOffsetPx[gridId] = newOffset
                     gestureLookaheadGrids.insert(gridId)
@@ -2721,7 +2798,8 @@ final class MetalTerminalView: MTKView {
             // could retain a row for. Seeding it as well would pay twice.
             guard !gestureActive,
                   (pendingSent[gridId] ?? 0) == 0,
-                  !gestureLookaheadGrids.contains(gridId) else { continue }
+                  !gestureLookaheadGrids.contains(gridId),
+                  !reconciledThisTick.contains(gridId) else { continue }
             // Content moved up by rowsDelta rows, so draw it that much lower
             // and let the decay below carry it up over the next few frames.
             // Not clamped here: the clamp belongs after the decay, or a frame
@@ -2730,6 +2808,11 @@ final class MetalTerminalView: MTKView {
             scrollOffsetPx[gridId] = (scrollOffsetPx[gridId] ?? 0) + CGFloat(rowsDelta) * rowHeightPx
             smoothScrollGrids.insert(gridId)
         }
+        // A payment is only good against the seed published alongside it, so
+        // the record lives exactly one tick. A grid marked without a seed
+        // arriving (the renderer retains no row for a multi-row scroll) simply
+        // clears here.
+        reconciledThisTick.removeAll(keepingCapacity: true)
 
         // Once the gesture and its momentum are over, whatever compensation the
         // finger did not consume is handed to the ease: the row it stands for
