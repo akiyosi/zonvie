@@ -1869,8 +1869,6 @@ pub const ExternalWindow = struct {
     // rasterization, which remains driven solely by the shared app.atlas
     // (see ExternalWndProc's WM_DPICHANGED case for why).
     dpi_scale: f32 = 1.0,
-    scroll_accum: i16 = 0, // Accumulated vertical scroll delta for high-resolution scrolling
-    h_scroll_accum: i16 = 0, // Accumulated horizontal scroll delta
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     is_float_external: bool = false, // True if float-origin external (nvim_open_win external=true)
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
@@ -3832,10 +3830,6 @@ pub const App = struct {
     cursor_blink_wait_ms: u32 = 0,
     cursor_blink_on_ms: u32 = 0,
     cursor_blink_off_ms: u32 = 0,
-
-    // Scroll accumulators for high-resolution scrolling
-    scroll_accum: i16 = 0,
-    h_scroll_accum: i16 = 0,
 
     // Scrollbar state (custom D3D11 overlay scrollbar)
     scrollbar_visible: bool = false,

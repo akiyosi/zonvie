@@ -2232,7 +2232,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.scroll_accum, false);
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, false);
 
                     // Show scrollbar on scroll if in scroll mode
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
@@ -2262,7 +2262,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, &ext_window.?.h_scroll_accum, true);
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, true);
                 }
                 return 0;
             }

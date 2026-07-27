@@ -232,18 +232,11 @@ pub fn handleMouseWheel(
     lParam: c.LPARAM,
     app: *App,
     grid_id: i64,
-    scroll_accum: *i16,
     horizontal: bool,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
     if (delta == 0) return;
-
-    // One scroll event per WHEEL_DELTA (120) so a physical wheel notch maps
-    // to exactly one Neovim wheel event ('mousescroll' then decides the line
-    // count). Touchpads send smaller deltas, but the accumulator below
-    // preserves their total scroll amount across events.
-    const SCROLL_THRESHOLD: i16 = 120;
 
     // Get mouse position (in screen coordinates)
     const x_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
@@ -308,30 +301,22 @@ pub fn handleMouseWheel(
     // Build modifier string from wParam flags and GetKeyState
     const mod_buf = buildMouseModifiers(wParam);
 
-    // Accumulate scroll delta (saturating: a hostile/buggy delta near i16 max
-    // must not wrap the accumulator and flip the scroll direction)
-    scroll_accum.* +|= delta;
-
     // Determine scroll direction
     // Vertical: positive delta = scroll up (wheel away from user)
     // Horizontal: positive delta = scroll right (wheel tilt right)
     const direction: [*:0]const u8 = if (horizontal)
-        (if (scroll_accum.* > 0) "right" else "left")
+        (if (delta > 0) "right" else "left")
     else
-        (if (scroll_accum.* > 0) "up" else "down");
+        (if (delta > 0) "up" else "down");
 
-    // Send scroll events for each threshold accumulated
-    var sent = false;
-    while (scroll_accum.* >= SCROLL_THRESHOLD or scroll_accum.* <= -SCROLL_THRESHOLD) {
-        app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
-        sent = true;
-        if (scroll_accum.* > 0) {
-            scroll_accum.* -= SCROLL_THRESHOLD;
-        } else {
-            scroll_accum.* += SCROLL_THRESHOLD;
-        }
-    }
-    if (sent and target_grid_id == app_mod.MESSAGE_GRID_ID) {
+    // One scroll event per wheel message, with no WHEEL_DELTA accumulation: a
+    // high-resolution touchpad moves the view on every delta it reports rather
+    // than staying still until a full notch has built up. 'mousescroll' decides
+    // how many lines each event travels, so a device that reports finely now
+    // scrolls proportionally faster.
+    app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
+
+    if (target_grid_id == app_mod.MESSAGE_GRID_ID) {
         if (app.hwnd) |main_hwnd| {
             _ = c.SetTimer(main_hwnd, app_mod.TIMER_MSG_SCROLL_RETRY, app_mod.MSG_SCROLL_RETRY_INTERVAL_MS, null);
         }
