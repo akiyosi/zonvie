@@ -2738,6 +2738,10 @@ pub const Grid = struct {
                         self.shiftTouchedRows(rows, top, bot, p.row);
                         // Saturating: see shiftTouchedRows' guard above.
                         self.markDirtyRect(p.row +| top, p.row +| bot);
+                        // Record here as well as on the fallthrough below: the
+                        // notification carries the distance the content moved,
+                        // and every accumulated scroll of this region moves it.
+                        self.recordScrolledGrid(grid_id, rows);
                         ps.rows = std.math.add(i32, ps.rows, rows) catch {
                             self.scroll_fast_path_blocked = true;
                             self.scroll_touched_count = 0;

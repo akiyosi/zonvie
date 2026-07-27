@@ -126,6 +126,33 @@ test "second scrollGrid accumulates when same grid and region" {
     try std.testing.expectEqual(@as(i32, 2), g.pending_scroll.?.rows);
 }
 
+test "accumulated same-region subgrid scrolls all reach the notification" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+
+    // The notification reports the distance the content moved, so every
+    // accumulated scroll of the region has to be summed into it — not just
+    // the one that installed pending_scroll.
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+    g.scrollGrid(2, 1, 42, 0, 80, 1, 0);
+    try std.testing.expectEqual(@as(i32, 2), g.scrolledGridNotifyRows(2));
+
+    // Opposite directions cancel, matching the content's net travel.
+    g.scrollGrid(2, 1, 42, 0, 80, -2, 0);
+    try std.testing.expectEqual(@as(i32, 0), g.scrolledGridNotifyRows(2));
+}
+
+test "accumulated same-region main-grid scrolls all reach the notification" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 42, 80, 42, 80);
+    defer g.deinit();
+
+    g.scrollGrid(1, 1, 42, 0, 80, 1, 0);
+    g.scrollGrid(1, 1, 42, 0, 80, 1, 0);
+    try std.testing.expectEqual(@as(i32, 2), g.scrolledGridNotifyRows(1));
+}
+
 test "pending scroll aggregate overflow blocks fast path" {
     const alloc = std.testing.allocator;
     var g = try setupGridWithSubgrid(alloc, 4, 4, 4, 4);
