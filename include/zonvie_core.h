@@ -722,10 +722,18 @@ typedef struct zonvie_callbacks {
     zonvie_on_tabline_hide_fn on_tabline_hide;
 
     /* Grid scroll notification callback.
-       Called when a grid receives a grid_scroll event from Neovim.
-       Frontend should clear any pixel-based smooth scroll offset for this grid
-       to prevent double-shifting (grid_scroll moves content by rows, pixel offset remains). */
-    void (*on_grid_scroll)(void* ctx, int64_t grid_id);
+       Called when a grid receives a grid_scroll event from Neovim, so a
+       frontend holding a pixel-based smooth scroll offset can reconcile it
+       against content that has already moved (leaving both applied would
+       double-shift the picture).
+
+       rows_delta is the signed distance the content moved, in rows, positive
+       when it moved up. Several scrolls of one grid within a redraw batch
+       produce a single notification, and rows_delta is their sum — it is not
+       always +/-1, and the count of notifications does not describe how far
+       the content travelled. Reconcile against this value, not against the
+       number of calls. */
+    void (*on_grid_scroll)(void* ctx, int64_t grid_id, int32_t rows_delta);
 
     /* IME off notification callback.
        Called when IME should be turned off (e.g., on mode change when

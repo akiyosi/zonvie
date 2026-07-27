@@ -976,7 +976,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // The actual clearing happens in draw() via processPendingScrollClears() + updateScrollShaderOffset()
         // to ensure proper synchronization with rendering
         if let main = mainTerminalView, main.getScrollOffset(gridId: gridId) != 0 {
-            main.clearScrollOffsetForGrid(gridId)
+            main.clearScrollOffsetForExternalGrid(gridId)
         }
 
         lock.lock()

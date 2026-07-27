@@ -461,8 +461,10 @@ pub const Callbacks = extern struct {
 
     on_tabline_hide: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
-    // Grid scroll notification (for clearing smooth scroll pixel offset)
-    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+    // Grid scroll notification (for reconciling a smooth scroll pixel offset).
+    // rows_delta is the signed distance the content moved, summed over every
+    // scroll of that grid in the batch this notification stands for.
+    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void = null,
 
     // IME off notification (for mode change or RPC zonvie_ime_off)
     on_ime_off: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,

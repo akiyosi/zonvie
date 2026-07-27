@@ -69,14 +69,31 @@ final class MetalTerminalView: MTKView {
     // "just went empty" transition call that clears the renderer's state.
     private var hadScrollOffsetsLastCall = false
 
-    // Track scroll commands sent to Neovim (to distinguish frontend vs Neovim-initiated scrolls)
-    // When we send a scroll, we increment this; when grid_scroll arrives, we decrement.
-    // If count > 0, it's a response to our scroll (keep offset); if 0, it's Neovim-initiated (clear offset).
+    // Scroll commands sent to Neovim and not yet answered. Incremented on send,
+    // decremented by the rows a grid_scroll reports. It bounds how far the
+    // lookahead may run and feeds the buffer-edge detection (requests that stop
+    // being answered) — it is NOT proof of who scrolled: one notification can
+    // carry several rows and take the count to zero mid-gesture.
     private var pendingSentScroll: [Int64: Int] = [:]
     private let pendingSentScrollLock = NSLock()
 
-    // Thread-safe pending scroll clear set (for grid_scroll events from Zig thread)
-    private var pendingScrollClear = [Int64: Int]()  // gridId → count of grid_scroll events
+    // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
+    // thread), carrying the signed distance the content moved in rows.
+    //
+    // The event arrives while its own flush is still running, and the vertices
+    // that actually move those rows are published by that flush's commit — so
+    // it is staged here and released to the drain only when the commit lands
+    // (renderer.onCommitPublished). Reconciling earlier moves the picture back
+    // by a row for one frame and forward again the next, which is what a
+    // trackpad scroll showed as judder. This mirrors how the smooth-scroll row
+    // retention is published: with the vertices it belongs to, never ahead.
+    private var stagedScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
+    private var pendingScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
+    /// Grids an external window reported new content for. Those vertices are
+    /// committed by that window's own renderer, so this view's commit cannot
+    /// time them — and it reports a content change rather than a measured
+    /// scroll, so the offset is simply dropped, as it always was.
+    private var pendingExternalScrollClear: [Int64] = []
     private let pendingScrollClearLock = NSLock()
 
     // Stale scroll detection: timestamp of the first unanswered tick per grid.
@@ -181,6 +198,14 @@ final class MetalTerminalView: MTKView {
     /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
     /// a trackpad gesture). Guarded by scrollOffsetLock.
     private var smoothScrollGrids: Set<Int64> = []
+
+    /// Grids whose offset is the lookahead compensation of a trackpad gesture:
+    /// Neovim has already scrolled a row the finger has not travelled yet, and
+    /// the offset holds the picture where the finger says it should be. The
+    /// finger consumes it pixel by pixel, so it must not decay while the
+    /// gesture lasts. Guarded by scrollOffsetLock.
+    private var gestureLookaheadGrids: Set<Int64> = []
+
     /// How long after the last precise scroll event the ease keeps out of a
     /// grid's offset. Covers the gap between a gesture's last event and the
     /// grid_scroll it produced coming back through the flush.
@@ -189,7 +214,6 @@ final class MetalTerminalView: MTKView {
     /// Scratch for the per-frame seed drain; kept as a field so the tick does
     /// not allocate a dictionary every frame.
     private var seedScratch: [Int64: Int] = [:]
-    private var gestureGridsScratch: [Int64] = []
     private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
@@ -711,6 +735,16 @@ final class MetalTerminalView: MTKView {
             // Resize external windows to match new cell metrics
             self.core?.resizeExternalWindows(cellWidthPx: CGFloat(newCellW), cellHeightPx: CGFloat(newCellH))
             // Do not request redraw here; Neovim will redraw on the next "flush" after resize.
+        }
+
+        renderer.onCommitPublished = { [weak self] in
+            self?.publishStagedScrollClears()
+        }
+
+        renderer.onBeforeCommittedSnapshot = { [weak self] in
+            guard let self else { return }
+            self.processPendingScrollClears()
+            self.updateScrollShaderOffset()
         }
 
         renderer.onPreDraw = { [weak self] in
@@ -2116,6 +2150,18 @@ final class MetalTerminalView: MTKView {
             renderer.updateFixedFloatRects([])
         }
 
+        if FrameTracer.enabled {
+            var maxOffsetPx: Float = 0
+            for info in scrollOffsetInfoScratch {
+                maxOffsetPx = max(maxOffsetPx, abs(info.offsetYPx))
+            }
+            FrameTracer.trace(
+                .gestureScrollOffset,
+                a: UInt64(Int64(round(Double(maxOffsetPx) * 1000))),
+                b: UInt64(Int64(round(Double(cellHeightPx) * 1000)))
+            )
+        }
+
         renderer.updateScrollOffsets(scrollOffsetInfoScratch, drawableHeight: drawableHeight, cellHeightPx: cellHeightPx)
 
         if !scrollOffsetInfoScratch.isEmpty {
@@ -2292,21 +2338,31 @@ final class MetalTerminalView: MTKView {
 
                 newOffset = currentOffset + deltaYPx
 
-                // When accumulated offset reaches row height, emit nvim_input_mouse.
-                // Don't consume offset here — wait for grid_scroll response in
-                // processPendingScrollClears to keep visual offset synchronized
-                // with actual content movement (prevents flickering).
-                var checkOffset = newOffset
-                while abs(checkOffset) >= rowHeightPx && canSendNow && scrollCount < 3 {
-                    let direction = checkOffset > 0 ? "up" : "down"
-                    core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+                // Keep Neovim one row ahead of the finger rather than asking for
+                // a row only once the finger has travelled a whole one. The row
+                // that comes back is cancelled against the distance grid_scroll
+                // reports (processPendingScrollClears), so the picture does not
+                // move when it lands; the finger then consumes that
+                // compensation pixel by pixel and the row appears exactly as it
+                // is crossed. Asking at the threshold instead leaves the
+                // crossing racing an asynchronous commit, which is what a
+                // trackpad scroll showed as judder.
+                //
+                // The offset is not consumed here either way: what the picture
+                // owes is settled against content that actually arrived.
+                let sendDirection: CGFloat = deltaYPx > 0 ? 1 : -1
+                // A row already asked for but not yet landed is already ahead.
+                var lookaheadPx = newOffset - sendDirection * rowHeightPx * CGFloat(alreadyPending)
+                while lookaheadPx * sendDirection > 0 && canSendNow && scrollCount < 3 {
+                    core.sendMouseScroll(
+                        gridId: gridId,
+                        row: row,
+                        col: col,
+                        direction: sendDirection > 0 ? "up" : "down",
+                        modifier: modifier
+                    )
                     scrollCount += 1
-
-                    if checkOffset > 0 {
-                        checkOffset -= rowHeightPx
-                    } else {
-                        checkOffset += rowHeightPx
-                    }
+                    lookaheadPx -= sendDirection * rowHeightPx
                 }
             }
 
@@ -2322,6 +2378,19 @@ final class MetalTerminalView: MTKView {
             // instead, so it never fights active user input.
             scrollOffsetPx[gridId] = newOffset
             scrollOffsetLock.unlock()
+
+            if FrameTracer.enabled {
+                var packed = UInt64(min(scrollCount, 255))
+                packed |= UInt64(min(alreadyPending, 255)) << 8
+                if blockedSign != 0 { packed |= 1 << 16 }
+                if pushingIntoEdge { packed |= 1 << 17 }
+                FrameTracer.trace(
+                    .gestureScrollInput,
+                    a: UInt64(bitPattern: Int64(round(deltaYPx * 1000))),
+                    b: packed,
+                    seq: UInt32(truncatingIfNeeded: gridId)
+                )
+            }
 
             // Track how many scroll commands we sent (outside scrollOffsetLock)
             if scrollCount > 0 {
@@ -2387,12 +2456,34 @@ final class MetalTerminalView: MTKView {
         return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(renderer.cellHeightPx))
     }
 
-    /// Mark a grid for scroll offset clearing (thread-safe, can be called from any thread).
-    /// Called from ZonvieCore when Neovim sends grid_scroll event.
-    /// Each call increments the count so multiple grid_scroll events are not collapsed.
-    func clearScrollOffsetForGrid(_ gridId: Int64) {
+    /// Record how far a grid's content just moved (thread-safe, callable from
+    /// any thread). Called from ZonvieCore on grid_scroll. rowsDelta is signed
+    /// and already summed over the scrolls the notification stands for, so it
+    /// is the distance to reconcile — the number of calls is not.
+    /// Staged until the flush carrying those rows commits.
+    func clearScrollOffsetForGrid(_ gridId: Int64, rowsDelta: Int) {
+        guard rowsDelta != 0 else { return }
         pendingScrollClearLock.lock()
-        pendingScrollClear[gridId, default: 0] += 1
+        stagedScrollClear.append((gridId: gridId, rowsDelta: rowsDelta))
+        pendingScrollClearLock.unlock()
+    }
+
+    /// Release everything staged during the flush that just committed. Called
+    /// from the renderer on the core thread with no renderer lock held.
+    func publishStagedScrollClears() {
+        pendingScrollClearLock.lock()
+        if !stagedScrollClear.isEmpty {
+            pendingScrollClear.append(contentsOf: stagedScrollClear)
+            stagedScrollClear.removeAll(keepingCapacity: true)
+        }
+        pendingScrollClearLock.unlock()
+    }
+
+    /// An external window published new content for a grid whose scroll offset
+    /// this view holds. See pendingExternalScrollClear.
+    func clearScrollOffsetForExternalGrid(_ gridId: Int64) {
+        pendingScrollClearLock.lock()
+        pendingExternalScrollClear.append(gridId)
         pendingScrollClearLock.unlock()
     }
 
@@ -2495,15 +2586,22 @@ final class MetalTerminalView: MTKView {
     func processPendingScrollClears() {
         pendingScrollClearLock.lock()
         let pending = pendingScrollClear
-        pendingScrollClear.removeAll()
+        pendingScrollClear.removeAll(keepingCapacity: true)
+        let external = pendingExternalScrollClear
+        pendingExternalScrollClear.removeAll(keepingCapacity: true)
         pendingScrollClearLock.unlock()
 
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty || !external.isEmpty else { return }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
 
         scrollOffsetLock.lock()
-        for (gridId, scrollEventCount) in pending {
+        for gridId in external {
+            smoothScrollGrids.remove(gridId)
+            gestureLookaheadGrids.remove(gridId)
+            scrollOffsetPx.removeValue(forKey: gridId)
+        }
+        for (gridId, rowsDelta) in pending {
             // grid_scroll received — reset stale tracking for this grid.
             // A response also proves the grid is not blocked at a buffer edge.
             scrollStaleSince.removeValue(forKey: gridId)
@@ -2513,35 +2611,49 @@ final class MetalTerminalView: MTKView {
             pendingSentScrollLock.lock()
             let sentCount = pendingSentScroll[gridId] ?? 0
             let currentOffset = scrollOffsetPx[gridId] ?? 0
-            if sentCount > 0 {
-                // A trackpad gesture owns this grid's offset again.
+            // The in-flight count is bookkeeping for how many requests are
+            // outstanding, not proof of who scrolled: one notification can
+            // carry several rows and take the count to zero while the gesture
+            // is still going. Treating what follows as Neovim's own scroll
+            // would drop the offset instead of cancelling it — a jump per
+            // occurrence, which is what remained after the lookahead landed.
+            // A grid still holding lookahead compensation, or one whose gesture
+            // is still live, stays the gesture's.
+            let gestureOwns = sentCount > 0
+                || gestureLookaheadGrids.contains(gridId)
+                || scrollGestureTouching
+                || scrollMomentumRunning
+                || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
+            if gestureOwns {
+                // These rows are the lookahead the gesture asked for before the
+                // finger got there.
                 smoothScrollGrids.remove(gridId)
-                // Consume as many events as we have pending sent scrolls
-                let toConsume = min(sentCount, scrollEventCount)
+                let toConsume = min(sentCount, abs(rowsDelta))
                 pendingSentScroll[gridId] = sentCount - toConsume
                 pendingSentScrollLock.unlock()
 
-                // Consume rowHeightPx per grid_scroll event from stored offset.
-                // This synchronizes visual offset reduction with actual content movement.
-                var newOffset = currentOffset
-                for _ in 0..<toConsume {
-                    if newOffset > 0 {
-                        newOffset -= rowHeightPx
-                    } else if newOffset < 0 {
-                        newOffset += rowHeightPx
-                    }
-                }
-                // If there were more scroll events than sent scrolls,
-                // the remaining are Neovim-initiated - clear offset
-                if scrollEventCount > toConsume {
-                    newOffset = 0
-                }
+                // Cancel exactly the distance the content travelled, so the
+                // picture stays where the finger left it. What is left is the
+                // compensation the finger then consumes pixel by pixel — the
+                // row appears as it is crossed, with no frame in which the
+                // content has moved and the offset has not.
+                let newOffset = currentOffset + CGFloat(rowsDelta) * rowHeightPx
                 if abs(newOffset) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: gridId)
+                    gestureLookaheadGrids.remove(gridId)
                 } else {
                     scrollOffsetPx[gridId] = newOffset
+                    gestureLookaheadGrids.insert(gridId)
                 }
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) sentCount=\(sentCount) consumed=\(toConsume) offset=\(currentOffset) -> \(newOffset)")
+                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) sentCount=\(sentCount) offset=\(currentOffset) -> \(newOffset)")
+                if FrameTracer.enabled {
+                    FrameTracer.trace(
+                        .gestureScrollClear,
+                        a: UInt64(bitPattern: Int64(rowsDelta)),
+                        b: UInt64(max(0, sentCount - toConsume)),
+                        seq: UInt32(truncatingIfNeeded: gridId)
+                    )
+                }
             } else if smoothScrollGrids.contains(gridId) {
                 pendingSentScrollLock.unlock()
                 // The keyboard ease owns this grid's offset: it is the lag the
@@ -2555,8 +2667,9 @@ final class MetalTerminalView: MTKView {
                 pendingSentScrollLock.unlock()
                 // Neovim-initiated scroll (j/k keys, etc.) - clear offset
                 smoothScrollGrids.remove(gridId)
+                gestureLookaheadGrids.remove(gridId)
                 scrollOffsetPx.removeValue(forKey: gridId)
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) events=\(scrollEventCount) nvim-initiated, clearing offset=\(currentOffset)")
+                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) nvim-initiated, clearing offset=\(currentOffset)")
             }
         }
         scrollOffsetLock.unlock()
@@ -2586,33 +2699,29 @@ final class MetalTerminalView: MTKView {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
         }
 
-        // A trackpad gesture drives the offset itself, one pixel at a time, and
-        // the scroll it asks Neovim for arrives back here as an ordinary row
-        // scroll. Seeding the ease from that would add a row of lag on top of
-        // the gesture's own offset and then halve it every frame, which reads
-        // as the sub-cell scrolling having stopped working. The gesture owns
-        // the offset; the ease keeps its hands off until it is over.
+        // A trackpad gesture asks Neovim for a row before the finger has
+        // travelled it, and the row arrives back here as an ordinary row scroll.
+        // Its seed is applied the same way either way — it is what stops the
+        // picture jumping when the row lands — but the gesture's compensation is
+        // consumed by the finger rather than by the decay, so the two owners are
+        // told apart below.
         pendingSentScrollLock.lock()
         let pendingSent = pendingSentScroll
         pendingSentScrollLock.unlock()
         let gestureActive = scrollGestureTouching
             || scrollMomentumRunning
             || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
-        gestureGridsScratch.removeAll(keepingCapacity: true)
 
         scrollOffsetLock.lock()
         let maxOffsetPx = rowHeightPx * CGFloat(MetalTerminalRenderer.maxRetainedScrollRows)
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
-            guard !gestureActive, (pendingSent[gridId] ?? 0) == 0 else {
-                // The rows retained for this scroll would otherwise still be
-                // drawn while the gesture's own offset is showing. Dropped
-                // after the lock is released — dropRetainedScrollRows takes
-                // the renderer's lock, which the core thread holds while
-                // capturing.
-                smoothScrollGrids.remove(gridId)
-                gestureGridsScratch.append(gridId)
-                continue
-            }
+            // A gesture-owned grid is already square: its rows were cancelled
+            // against the distance the notification reported, which exists for
+            // every scroll — where a seed only exists for one the renderer
+            // could retain a row for. Seeding it as well would pay twice.
+            guard !gestureActive,
+                  (pendingSent[gridId] ?? 0) == 0,
+                  !gestureLookaheadGrids.contains(gridId) else { continue }
             // Content moved up by rowsDelta rows, so draw it that much lower
             // and let the decay below carry it up over the next few frames.
             // Not clamped here: the clamp belongs after the decay, or a frame
@@ -2622,18 +2731,15 @@ final class MetalTerminalView: MTKView {
             smoothScrollGrids.insert(gridId)
         }
 
-        if gestureActive, !smoothScrollGrids.isEmpty {
-            // The gesture owns scrollOffsetPx from here. Decaying it fights the
-            // finger: the equilibrium sits near the per-frame delta, which stays
-            // above scrollOffsetEpsilon (so the grid never leaves the set) while
-            // never reaching rowHeightPx (so no scroll is sent, so no seed comes
-            // back to clear it) — the damping then lasts the whole gesture, not
-            // one decay tail. Retained rows go with it: they were captured for
-            // the keyboard scroll this gesture is taking over from.
-            for gridId in smoothScrollGrids where !gestureGridsScratch.contains(gridId) {
-                gestureGridsScratch.append(gridId)
+        // Once the gesture and its momentum are over, whatever compensation the
+        // finger did not consume is handed to the ease: the row it stands for
+        // has already been scrolled, so the picture animates the rest of the way
+        // instead of sitting part-way into a row.
+        if !gestureActive, !gestureLookaheadGrids.isEmpty {
+            for gridId in gestureLookaheadGrids {
+                smoothScrollGrids.insert(gridId)
             }
-            smoothScrollGrids.removeAll(keepingCapacity: true)
+            gestureLookaheadGrids.removeAll(keepingCapacity: true)
         }
 
         if !smoothScrollGrids.isEmpty {
@@ -2661,10 +2767,6 @@ final class MetalTerminalView: MTKView {
             }
         }
         scrollOffsetLock.unlock()
-
-        for gridId in gestureGridsScratch {
-            renderer.dropRetainedScrollRows(gridId: gridId)
-        }
 
         if FrameTracer.enabled {
             // The visual position is content_rows * h - offset, so smoothness

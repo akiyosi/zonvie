@@ -3477,7 +3477,7 @@ pub const FlushCtx = struct {
         if (ctx.core.cb.on_grid_scroll) |cb| {
             if (scrolled_overflow) {
                 if (ctx.core.grid.main_scroll_notify_pending) {
-                    cb(ctx.core.ctx, 1);
+                    cb(ctx.core.ctx, 1, ctx.core.grid.main_scroll_notify_rows);
                     ctx.core.grid.consumeScrolledGridNotification(1);
                 }
                 if (!ctx.core.flush_aborted) {
@@ -3485,7 +3485,7 @@ pub const FlushCtx = struct {
                     while (sg_it.next()) |entry| {
                         if (entry.value_ptr.scroll_notify_pending) {
                             const grid_id = entry.key_ptr.*;
-                            cb(ctx.core.ctx, grid_id);
+                            cb(ctx.core.ctx, grid_id, entry.value_ptr.scroll_notify_rows);
                             ctx.core.grid.consumeScrolledGridNotification(grid_id);
                             if (ctx.core.flush_aborted) break;
                         }
@@ -3494,7 +3494,7 @@ pub const FlushCtx = struct {
             } else {
                 while (ctx.core.grid.scrolled_grid_count != 0) {
                     const grid_id = ctx.core.grid.scrolled_grid_ids[0];
-                    cb(ctx.core.ctx, grid_id);
+                    cb(ctx.core.ctx, grid_id, ctx.core.grid.scrolledGridNotifyRows(grid_id));
                     ctx.core.grid.consumeScrolledGridNotification(grid_id);
                     if (ctx.core.flush_aborted) break;
                 }
@@ -10156,8 +10156,9 @@ test "flush begin abort preserves undispatched scroll notification only" {
             if (self.abort_begin) self.core.flush_aborted = true;
         }
 
-        fn onScroll(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+        fn onScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = rows_delta;
             if (grid_id == 1) self.scroll_calls += 1;
         }
     };
@@ -10595,8 +10596,9 @@ test "scroll callback abort consumes only dispatched IDs" {
         scroll_calls: u32 = 0,
         ids: [2]i64 = .{ 0, 0 },
 
-        fn onScroll(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+        fn onScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = rows_delta;
             self.ids[self.scroll_calls] = grid_id;
             self.scroll_calls += 1;
             if (self.abort_scroll) self.core.flush_aborted = true;

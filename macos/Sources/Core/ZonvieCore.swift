@@ -846,10 +846,10 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onTablineHide()
             },
-            on_grid_scroll: { ctx, gridId in
+            on_grid_scroll: { ctx, gridId, rowsDelta in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onGridScroll(gridId: gridId)
+                me.onGridScroll(gridId: gridId, rowsDelta: Int(rowsDelta))
             },
             on_ime_off: { ctx in
                 guard let ctx else { return }
@@ -8255,14 +8255,14 @@ final class ZonvieCore {
 
     // MARK: - Grid scroll callback
 
-    nonisolated private func onGridScroll(gridId: Int64) {
-        // Mark grid for scroll offset clearing (thread-safe).
-        // The actual clearing happens in processPendingScrollClears() which is called
-        // from MetalTerminalRenderer.onPreDraw before each frame is rendered.
-        // This ensures scroll offsets are cleared atomically with vertex rendering,
-        // preventing double-shift glitches in split windows.
-        ZonvieCore.appLog("[on_grid_scroll] gridId=\(gridId)")
-        terminalView?.clearScrollOffsetForGrid(gridId)
+    nonisolated private func onGridScroll(gridId: Int64, rowsDelta: Int) {
+        // Queue the distance the content moved for this grid (thread-safe).
+        // The offset is reconciled against it in processPendingScrollClears(),
+        // called from MetalTerminalRenderer.onPreDraw before each frame is
+        // rendered, so the reduction and the vertices that moved the rows reach
+        // the glass together instead of a frame apart.
+        ZonvieCore.appLog("[on_grid_scroll] gridId=\(gridId) rowsDelta=\(rowsDelta)")
+        terminalView?.clearScrollOffsetForGrid(gridId, rowsDelta: rowsDelta)
     }
 
     // MARK: - IME Off

@@ -761,6 +761,7 @@ pub const GridBuf = struct {
     dirty_rows: std.DynamicBitSetUnmanaged = .{}, // Row-level dirty tracking for partial updates
     last_scroll_op: ?ScrollDelta = null, // Per-GridBuf scroll tracking for on_grid_row_scroll
     scroll_notify_pending: bool = false, // Independent of row-shift provenance; survives a pre-dispatch flush abort
+    scroll_notify_rows: i32 = 0, // Signed rows accumulated for the pending notification; one event can cover several scrolls
     row_scroll_notify_pending: bool = false, // Consumed separately from on_grid_scroll notification delivery
     scroll_fast_path_blocked: bool = false, // True when multiple scrolls in same batch
     prev_cursor_row: ?u32 = null, // Previous cursor row (grid-relative) for erasing old cursor
@@ -1347,6 +1348,7 @@ pub const Grid = struct {
     scrolled_grid_ids: [16]i64 = [_]i64{0} ** 16,
     scrolled_grid_count: u8 = 0,
     main_scroll_notify_pending: bool = false,
+    main_scroll_notify_rows: i32 = 0,
     // More than 16 distinct grids can scroll in one redraw batch (many
     // external windows/floats). In that case flush derives the complete set
     // from the allocation-free per-grid scroll_notify_pending bits instead of
@@ -1717,9 +1719,11 @@ pub const Grid = struct {
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
         self.main_scroll_notify_pending = false;
+        self.main_scroll_notify_rows = 0;
         var scroll_it = self.sub_grids.valueIterator();
         while (scroll_it.next()) |sg| {
             sg.scroll_notify_pending = false;
+            sg.scroll_notify_rows = 0;
             sg.row_scroll_notify_pending = false;
         }
         self.scroll_touched_count = 0;
@@ -2663,7 +2667,7 @@ pub const Grid = struct {
                     // Shift previously-recorded touched rows by the new scroll amount.
                     self.shiftTouchedRows(rows, top, bot, 0);
                     self.scroll(top, bot, left, right, rows, cols);
-                    self.recordScrolledGrid(grid_id);
+                    self.recordScrolledGrid(grid_id, rows);
                     ps.rows = std.math.add(i32, ps.rows, rows) catch {
                         self.scroll_fast_path_blocked = true;
                         self.scroll_touched_count = 0;
@@ -2676,7 +2680,7 @@ pub const Grid = struct {
                 self.scroll_touched_count = 0;
             }
             self.scroll(top, bot, left, right, rows, cols);
-            self.recordScrolledGrid(grid_id);
+            self.recordScrolledGrid(grid_id, rows);
             self.pending_scroll = .{
                 .grid_id = grid_id,
                 .top = top,
@@ -2722,7 +2726,7 @@ pub const Grid = struct {
                     while (r < bot) : (r += 1) {
                         self.dirtyCompositedRow(p, r);
                     }
-                    self.recordScrolledGrid(grid_id);
+                    self.recordScrolledGrid(grid_id, rows);
                     return;
                 }
                 self.content_rev +%= 1;
@@ -2764,17 +2768,23 @@ pub const Grid = struct {
             // External grids (not in win_pos) do not affect global grid
             // content_rev, dirty state, or pending_scroll.
 
-            self.recordScrolledGrid(grid_id);
+            self.recordScrolledGrid(grid_id, rows);
         }
     }
 
     /// Record that a grid received a scroll event (for frontend pixel offset clearing).
-    /// Avoids duplicates within the same flush batch.
-    fn recordScrolledGrid(self: *Grid, grid_id: i64) void {
+    /// Avoids duplicates within the same flush batch: several scrolls of the
+    /// same grid produce one notification, so the rows they moved are summed
+    /// into it. A frontend holding a sub-cell scroll offset has to give back
+    /// exactly the distance the content travelled, which the notification alone
+    /// could not tell it.
+    fn recordScrolledGrid(self: *Grid, grid_id: i64, rows_delta: i32) void {
         if (grid_id == 1) {
             self.main_scroll_notify_pending = true;
+            self.main_scroll_notify_rows +|= rows_delta;
         } else if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll_notify_pending = true;
+            sg.scroll_notify_rows +|= rows_delta;
             sg.row_scroll_notify_pending = true;
         }
 
@@ -2793,14 +2803,25 @@ pub const Grid = struct {
         }
     }
 
+    /// Signed rows accumulated for a grid's pending scroll notification.
+    /// Zero for a grid with nothing pending, which is also what a caller that
+    /// asks about an unknown grid gets.
+    pub fn scrolledGridNotifyRows(self: *const Grid, grid_id: i64) i32 {
+        if (grid_id == 1) return self.main_scroll_notify_rows;
+        if (self.sub_grids.get(grid_id)) |sg| return sg.scroll_notify_rows;
+        return 0;
+    }
+
     /// Clear scrolled grid tracking (called after flush notification).
     pub fn clearScrolledGrids(self: *Grid) void {
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
         self.main_scroll_notify_pending = false;
+        self.main_scroll_notify_rows = 0;
         var sg_it = self.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
             sg.scroll_notify_pending = false;
+            sg.scroll_notify_rows = 0;
             sg.row_scroll_notify_pending = false;
         }
     }
@@ -2812,8 +2833,10 @@ pub const Grid = struct {
     pub fn consumeScrolledGridNotification(self: *Grid, grid_id: i64) void {
         if (grid_id == 1) {
             self.main_scroll_notify_pending = false;
+            self.main_scroll_notify_rows = 0;
         } else if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.scroll_notify_pending = false;
+            sg.scroll_notify_rows = 0;
         }
 
         var index: usize = 0;

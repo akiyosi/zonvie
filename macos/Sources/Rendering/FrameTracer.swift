@@ -49,6 +49,25 @@ enum FrameTraceTag: UInt32 {
     /// content_rows * h - offset, so scrollAdvance alone stops describing
     /// perceived motion once the ease is on.
     case smoothScrollOffset = 19
+    /// One precise (trackpad) scroll event. a = signed deltaY in millipixels,
+    /// b = packed: bits 0-7 scrolls sent for it, 8-15 scrolls already pending,
+    /// bit 16 edge blocked, bit 17 pushing into that edge. The gesture drives
+    /// the offset itself, so neither scrollAdvance nor smoothScrollOffset
+    /// describes what the picture did during one.
+    case gestureScrollInput = 20
+    /// Scroll offset handed to the shader for this frame. a = |offset| in
+    /// millipixels (largest across the grids carrying one), b = row height in
+    /// millipixels.
+    case gestureScrollOffset = 21
+    /// A grid_scroll reconciled against the offset. a = signed rows_delta the
+    /// core reported, b = scrolls still in flight for that grid. seq = grid id.
+    case gestureScrollClear = 22
+    /// How a main-grid row scroll was carried. a = |rowsDelta| | path << 8,
+    /// where path is 1 GPU copy, 2 CPU shift, 3 refused (not full width),
+    /// 4 refused (degenerate range). b = colStart | colEnd << 16 |
+    /// totalCols << 32. A grid_scroll with no event here never reached the
+    /// row-scroll fast path at all — the core resent the rows instead.
+    case mainRowScrollPath = 23
 }
 
 struct FrameTraceEvent {

@@ -577,6 +577,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Used to process pending scroll clears from grid_scroll events.
     var onPreDraw: (() -> Void)?
 
+    /// Called immediately before the committed vertex set is latched for this
+    /// frame, after the guard band has had its chance to catch a commit that
+    /// was still arriving. onPreDraw runs too early to see such a commit: the
+    /// scroll reconciliation it carries would land a frame after the rows it
+    /// pays for. A no-op on a frame where nothing was published in between.
+    var onBeforeCommittedSnapshot: (() -> Void)?
+
+    /// Called at the end of a successful commitFlush, on the core thread with
+    /// no renderer lock held. A scroll reconciliation is staged while the flush
+    /// runs and released here, so it reaches the first drawn frame that shows
+    /// the rows it accounts for — not an earlier one, which moves the picture
+    /// back for a frame, and not a later one, which overshoots by a row.
+    var onCommitPublished: (() -> Void)?
+
     private var lastCellWidthPx: Float = 0
     private var lastCellHeightPx: Float = 0
 
@@ -1868,6 +1882,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
             ZonvieCore.appLogPerf("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
+        onCommitPublished?()
         return true
     }
 
@@ -2377,6 +2392,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 (view as? MetalTerminalView)?.requestRedraw()
                 return
             }
+
+            // Take in any reconciliation published since onPreDraw ran — most
+            // of all the one the guard band just waited for. Its rows are in
+            // the set latched below, so it belongs to this frame.
+            onBeforeCommittedSnapshot?()
 
             // === PERF LOG: lock取得開始 ===
             var t_lock_start: CFAbsoluteTime = 0
@@ -5192,16 +5212,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.unlock()
     }
 
-    /// Discard the rows retained for a grid whose offset the ease does not
-    /// own — a trackpad gesture drives its own sub-cell offset, and a retained
-    /// row drawn against it belongs to nothing.
-    func dropRetainedScrollRows(gridId: Int64) {
-        guard Self.smoothScrollEnabled else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !retainedScrollRows.isEmpty else { return }
-        retainedScrollRows.removeAll { $0.gridId == gridId }
-    }
 
     /// Drain the ease seeds committed since the last call. The view converts
     /// them into a pixel offset and decays it; the renderer only records which
@@ -5237,6 +5247,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return true
         }
         guard rowsDelta != 0 else { return true }
+        if FrameTracer.enabled {
+            let geom = UInt64(UInt32(bitPattern: Int32(colStart)))
+                | (UInt64(UInt32(bitPattern: Int32(colEnd))) << 16)
+                | (UInt64(UInt32(bitPattern: Int32(totalCols))) << 32)
+            if !(rowStart >= 0 && rowEnd > rowStart) {
+                FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (4 << 8), b: geom)
+            } else if !(colStart == 0 && colEnd == totalCols) {
+                FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (3 << 8), b: geom)
+            }
+        }
         guard rowStart >= 0, rowEnd > rowStart else { return true }
         guard colStart == 0, colEnd == totalCols else { return true }
         // No capacity pre-check here (was requirePreparedRowCapacity with
@@ -5269,8 +5289,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             )
             // pendingScrollAccum is accumulated in commitFlush() (not here)
             // to ensure draw() never sees a delta ahead of committed vertex data.
+            FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (1 << 8))
             return true
         } else {
+            FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (2 << 8))
             bufferSets[s].pendingScroll = nil
             let ok = cpuShiftMainRowBuffers(
                 setIdx: s,

@@ -292,9 +292,12 @@ pub const Callbacks = struct {
     /// background-tab agent still updates).
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 
-    /// Called when a grid receives a grid_scroll event.
-    /// Frontend should clear pixel-based smooth scroll offset for this grid.
-    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+    /// Called when a grid receives a grid_scroll event. rows_delta is the
+    /// signed distance the content moved, summed over every scroll of that grid
+    /// in the batch this notification stands for — a frontend holding a
+    /// sub-cell scroll offset has to give back exactly that distance, and one
+    /// notification can stand for several scrolls.
+    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void = null,
 
     /// Called when IME should be turned off (mode change with ime.disable_on_modechange,
     /// or RPC zonvie_ime_off notification).
