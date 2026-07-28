@@ -28,6 +28,12 @@ pub const Stream = rpc_transport.Stream;
 pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
 
 pub const GLYPH_CACHE_INVALID_KEY: u64 = std.math.maxInt(u64);
+
+/// Flushes a shifted-out row stays in the reclamation liveness set. macOS keeps
+/// at most two retained scroll rows and shifts them one flush at a time; one
+/// flush of slack covers the hand-off. An expired shadow only ever delays
+/// reclamation, so erring high is the safe direction.
+pub const retained_shadow_expiry: u8 = 3;
 const TRANSIENT_GLYPH_RETRY_INITIAL_NS: i128 = 250 * std.time.ns_per_ms;
 const TRANSIENT_GLYPH_RETRY_MAX_NS: i128 = 4 * std.time.ns_per_s;
 const TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS: u8 = 5;
@@ -515,6 +521,26 @@ pub const Core = struct {
     scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
     scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
     scroll_cache_rows: u32 = 0,
+    /// The row buffer currently being composed, while it is being composed.
+    /// A row only reaches scroll_cache once it is finished, so without this the
+    /// mid-flush collection cannot see the quads the in-progress row has
+    /// already emitted and would reclaim the shelves they point into. Held as a
+    /// pointer, not a slice: the list grows as the row is built.
+    inflight_row_verts: ?*const std.ArrayListUnmanaged(c_api.Vertex) = null,
+    /// Set when the frontend declined to publish a frame this core had already
+    /// regenerated rows for. scroll_cache then holds the refused frame while
+    /// the screen still shows the previous one, so it no longer describes what
+    /// is displayed and cannot be used to prove a shelf is unreferenced.
+    /// Cleared by the next accepted publication.
+    display_mirror_stale: bool = false,
+    /// Copies of the rows the scroll fast path most recently shifted out of the
+    /// viewport. macOS retains those rows in a renderer-owned buffer ring to
+    /// ease a scroll sub-row, and keeps drawing them for a few frames after
+    /// this core has already overwritten their cache slots. That ring is
+    /// invisible here, so reclamation would see their glyphs as unreferenced.
+    retained_shadow: [2]std.ArrayListUnmanaged(c_api.Vertex) = .{ .empty, .empty },
+    retained_shadow_age: [2]u8 = .{ retained_shadow_expiry, retained_shadow_expiry },
+    retained_shadow_next: usize = 0,
     main_vertex_row_counts: std.ArrayListUnmanaged(usize) = .empty,
     main_surface_vertex_count: usize = 0,
     main_vertex_row_ledger_valid: bool = true,
@@ -1162,6 +1188,7 @@ pub const Core = struct {
             row_cache.deinit(self.alloc);
         }
         self.scroll_cache.deinit(self.alloc);
+        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
         self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
@@ -1774,6 +1801,7 @@ pub const Core = struct {
             row_cache.deinit(self.alloc);
         }
         self.scroll_cache.deinit(self.alloc);
+        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
         self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
@@ -2606,24 +2634,22 @@ pub const Core = struct {
         };
     }
 
-    /// Mark the shelf a UV pair points into as still referenced. Both corners
-    /// are marked because a glyph quad's lower edge may land exactly on the
-    /// next shelf's first row; over-marking only delays reclamation.
+    /// Mark the shelf a vertex's UV points into as still referenced. One lookup
+    /// per vertex covers both edges of the quad: the six vertices carry
+    /// uv_min[1] and uv_max[1] between them, so a glyph whose lower edge lands
+    /// on the next shelf's first row is marked by its own bottom vertices.
     fn markShelfLiveForUv(
         packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
         live: *[shelf_packer.max_shelves]bool,
-        uv_y_min: f32,
-        uv_y_max: f32,
+        uv_y: f32,
     ) void {
-        if (uv_y_min <= 0 and uv_y_max <= 0) return;
+        if (uv_y <= 0 or uv_y > 1) return;
         const h_f: f32 = @floatFromInt(packer.height);
-        for ([2]f32{ uv_y_min, uv_y_max }) |uv| {
-            if (uv <= 0 or uv > 1) continue;
-            const y_f = uv * h_f;
-            if (y_f < 0) continue;
-            const y: u32 = @intFromFloat(@min(y_f, h_f - 1));
-            if (packer.shelfIndexForY(y)) |idx| live[idx] = true;
-        }
+        const y_f = uv_y * h_f;
+        if (y_f < 0) return;
+        const y: u32 = @intFromFloat(@min(y_f, h_f - 1));
+        if (packer.shelfIndexForYOrdered(order, y)) |idx| live[idx] = true;
     }
 
     /// True when every main-grid row the frontend is currently showing is
@@ -2669,7 +2695,34 @@ pub const Core = struct {
     /// glyphs it had just packed looked unreferenced, were reclaimed, and had
     /// to be rasterized all over again on the next pass — the atlas never held
     /// a screenful for longer than one flush.
+    /// Keep a copy of a row the scroll fast path is about to drop from the
+    /// cache, so reclamation still counts the glyphs a frontend-retained copy
+    /// of that row may keep drawing. Failing to copy costs reclamation accuracy
+    /// only, never the scroll, so it is not reported to the caller.
+    pub fn captureRetainedShadow(self: *Core, verts: []const c_api.Vertex) void {
+        if (verts.len == 0) return;
+        const slot = self.retained_shadow_next % self.retained_shadow.len;
+        const buf = &self.retained_shadow[slot];
+        buf.clearRetainingCapacity();
+        buf.ensureTotalCapacity(self.alloc, verts.len) catch {
+            self.retained_shadow_age[slot] = retained_shadow_expiry;
+            return;
+        };
+        buf.appendSliceAssumeCapacity(verts);
+        self.retained_shadow_age[slot] = 0;
+        self.retained_shadow_next = (slot + 1) % self.retained_shadow.len;
+    }
+
+    fn ageRetainedShadows(self: *Core) void {
+        for (&self.retained_shadow_age, &self.retained_shadow) |*age, *buf| {
+            if (age.* >= retained_shadow_expiry) continue;
+            age.* += 1;
+            if (age.* >= retained_shadow_expiry) buf.clearRetainingCapacity();
+        }
+    }
+
     pub fn collectAtlasGarbageIfNeeded(self: *Core) void {
+        self.ageRetainedShadows();
         if (self.atlas_packer == null) return;
         const packer = &(self.atlas_packer.?);
         const total: u64 = @as(u64, packer.width) * packer.height;
@@ -2682,7 +2735,9 @@ pub const Core = struct {
         // Ordinary pressure is handled by the collection inside
         // packAndUploadBitmap, which reclaims exactly as much as the flush
         // needs instead of dropping cache entries it is about to want back.
-        if (packer.freeAreaPx() * 64 < total) _ = self.collectAtlasGarbage();
+        // free/total < 1/8. The multiplier is the reciprocal of the fraction
+        // above, so it has to move with the comment.
+        if (packer.freeAreaPx() * 8 < total) _ = self.collectAtlasGarbage();
         // Everything packed from here on belongs to this flush and stays
         // off-limits to the mid-flush collection.
         if (self.atlas_packer) |*p| p.beginEpoch();
@@ -2692,17 +2747,23 @@ pub const Core = struct {
         const log_on = self.log.cb != null;
         if (!self.isPhase2Atlas()) return false;
         if (self.atlas_packer == null) return false;
-        // A sub-grid the frontend owns a surface for (external window, float,
-        // popupmenu) retains its own rows, and this core keeps no vertex
-        // mirror of them. Sub-grids that are only composited into the main
-        // grid are already covered by the main-row scan below.
-        {
-            var it = self.grid.sub_grids.keyIterator();
-            while (it.next()) |id| {
-                if (!self.known_external_grids.contains(id.*)) continue;
-                if (log_on) self.log.write("[perf] atlas_gc skip=external_grid id={d}\n", .{id.*});
-                return false;
-            }
+        // A grid the frontend owns a surface for (external window, float,
+        // popupmenu) retains its own rows, and this core keeps no vertex mirror
+        // of them. Keyed on the ownership map itself rather than on its
+        // intersection with sub_grids: a grid can lose its GridBuf while the
+        // surface is still on screen, and intersecting missed exactly that
+        // window. Grids only composited into the main grid are covered by the
+        // main-row scan below.
+        if (self.known_external_grids.count() > 0) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=external_grid count={d}\n",
+                .{self.known_external_grids.count()},
+            );
+            return false;
+        }
+        if (self.display_mirror_stale) {
+            if (log_on) self.log.write("[perf] atlas_gc skip=display_mirror_stale\n", .{});
+            return false;
         }
         if (!self.mainRowsAccountedForCollect()) {
             if (log_on) self.log.write(
@@ -2713,7 +2774,15 @@ pub const Core = struct {
         }
 
         const packer = &(self.atlas_packer.?);
-        if (packer.shelf_overflow or packer.shelf_count == 0) {
+        // Overflow means some bands were never recorded, not that the recorded
+        // ones are unsafe to reclaim: an unrecorded band resolves to no shelf
+        // index, so it marks nothing live (markShelfLiveForUv) and is never
+        // dropped from the cache (entryLivesInDeadShelf), and
+        // recycleDeadShelves only touches recorded shelves. Disqualifying the
+        // whole collection here instead left reclamation off for the rest of
+        // the session after a single overflow, because this is the only path
+        // that can free tracking slots.
+        if (packer.shelf_count == 0) {
             if (log_on) self.log.write(
                 "[perf] atlas_gc skip=shelves count={d} overflow={any}\n",
                 .{ packer.shelf_count, packer.shelf_overflow },
@@ -2723,16 +2792,38 @@ pub const Core = struct {
 
         var live: [shelf_packer.max_shelves]bool = @splat(false);
 
+        // Resolving a UV to a shelf happens once per glyph vertex on screen and
+        // again per cached entry, so the ordering is built once here and shared
+        // by both passes. Valid until mergeAdjacentRecycled renumbers shelves.
+        var y_order: [shelf_packer.max_shelves]u16 = undefined;
+        const order = y_order[0..packer.buildYOrder(&y_order)];
+
         const rows = self.scroll_cache_rows;
         var r: u32 = 0;
         while (r < rows) : (r += 1) {
             if (!self.scroll_cache_valid.isSet(r)) continue;
             for (self.scroll_cache.items[r].items) |v| {
-                markShelfLiveForUv(packer, &live, v.texCoord[1], v.texCoord[1]);
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
             }
         }
         for (self.cursor_verts.items) |v| {
-            markShelfLiveForUv(packer, &live, v.texCoord[1], v.texCoord[1]);
+            markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+        }
+        // The row this flush is composing right now. Its quads are not in
+        // scroll_cache yet, and a glyph it took from the cache was allocated in
+        // an earlier epoch, so the epoch guard does not cover it either.
+        if (self.inflight_row_verts) |row| {
+            for (row.items) |v| {
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            }
+        }
+        // Rows the frontend may still be drawing out of its own retained copy,
+        // whose cache slots this core has already reused.
+        for (self.retained_shadow_age, &self.retained_shadow) |age, *buf| {
+            if (age >= retained_shadow_expiry) continue;
+            for (buf.items) |v| {
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            }
         }
 
         const recycled = packer.recycleDeadShelves(&live);
@@ -2756,12 +2847,12 @@ pub const Core = struct {
                 const len = @min(cache.len, valid.len);
                 for (cache[0..len], valid[0..len]) |entry, *is_valid| {
                     if (!is_valid.*) continue;
-                    if (self.entryLivesInDeadShelf(packer, &live, entry)) is_valid.* = false;
+                    if (self.entryLivesInDeadShelf(packer, order, &live, entry)) is_valid.* = false;
                 }
             }
         }
-        self.dropKeyedEntriesInDeadShelves(packer, &live, self.glyph_cache_non_ascii, self.glyph_keys_non_ascii);
-        self.dropKeyedEntriesInDeadShelves(packer, &live, self.glyph_cache_by_id, self.glyph_keys_by_id);
+        self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_non_ascii, self.glyph_keys_non_ascii);
+        self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_by_id, self.glyph_keys_by_id);
         // Only now that no cache entry names a reclaimed shelf can shelves be
         // renumbered. Fusing the free runs is what lets a tall glyph land in
         // space vacated by short ones.
@@ -2772,6 +2863,7 @@ pub const Core = struct {
     fn entryLivesInDeadShelf(
         self: *Core,
         packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
         live: *const [shelf_packer.max_shelves]bool,
         entry: c_api.GlyphEntry,
     ) bool {
@@ -2781,13 +2873,14 @@ pub const Core = struct {
         if (uv_y <= 0 or uv_y > 1) return false;
         const h_f: f32 = @floatFromInt(packer.height);
         const y: u32 = @intFromFloat(@min(uv_y * h_f, h_f - 1));
-        const idx = packer.shelfIndexForY(y) orelse return false;
+        const idx = packer.shelfIndexForYOrdered(order, y) orelse return false;
         return !live[idx];
     }
 
     fn dropKeyedEntriesInDeadShelves(
         self: *Core,
         packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
         live: *const [shelf_packer.max_shelves]bool,
         cache_opt: ?[]c_api.GlyphEntry,
         keys_opt: ?[]u64,
@@ -2797,7 +2890,7 @@ pub const Core = struct {
         const len = @min(cache.len, keys.len);
         for (cache[0..len], keys[0..len]) |entry, *key| {
             if (key.* == GLYPH_CACHE_INVALID_KEY) continue;
-            if (self.entryLivesInDeadShelf(packer, live, entry)) key.* = GLYPH_CACHE_INVALID_KEY;
+            if (self.entryLivesInDeadShelf(packer, order, live, entry)) key.* = GLYPH_CACHE_INVALID_KEY;
         }
     }
 
@@ -6878,4 +6971,89 @@ test "cmdline rendering consumes normalized hostile position and indent" {
     try std.testing.expect(core.grid.sub_grids.contains(grid_mod.CMDLINE_GRID_ID));
     try std.testing.expectEqual(@as(u32, 3), core.grid.getCmdlineState(1).?.pos);
     try std.testing.expectEqual(@as(u32, 8), core.grid.getCmdlineState(1).?.indent);
+}
+
+// ---------------------------------------------------------------------------
+// Atlas reclamation eligibility
+// ---------------------------------------------------------------------------
+
+const AtlasGcTestCallbacks = struct {
+    fn rasterize(_: ?*anyopaque, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+        return 0;
+    }
+    fn upload(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: *const c_api.GlyphBitmap) callconv(.c) void {}
+    fn create(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {}
+};
+
+/// A core whose main rows are all mirrored and empty, over a packer holding
+/// closed shelves from a previous epoch. Nothing references those shelves, so a
+/// collection that is allowed to run reclaims them.
+fn initCoreForAtlasGcTest(core: *Core, rows: u32) !void {
+    core.cb.on_rasterize_glyph = AtlasGcTestCallbacks.rasterize;
+    core.cb.on_atlas_upload = AtlasGcTestCallbacks.upload;
+    core.cb.on_atlas_create = AtlasGcTestCallbacks.create;
+
+    try core.grid.resize(rows, 4);
+    try core.ensureScrollCache(rows);
+    var r: u32 = 0;
+    while (r < rows) : (r += 1) core.scroll_cache_valid.set(r);
+
+    var packer = shelf_packer.ShelfPacker.init(16, 4096);
+    _ = packer.alloc(12, 1).?;
+    _ = packer.alloc(12, 1).?;
+    _ = packer.alloc(12, 1).?;
+    packer.beginEpoch();
+    core.atlas_packer = packer;
+}
+
+fn recycledShelfCount(core: *Core) u32 {
+    const packer = &(core.atlas_packer.?);
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while (i < packer.shelf_count) : (i += 1) {
+        if (packer.shelves[i].recycled) n += 1;
+    }
+    return n;
+}
+
+test "atlas reclamation runs when the frontend owns no surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(recycledShelfCount(&core) > 0);
+}
+
+test "atlas reclamation stands down for a frontend-owned surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    // The ordinary shape of a float: cell storage, placement, and a frontend
+    // surface the core was told about.
+    try core.grid.resizeGrid(7, 2, 2);
+    try core.grid.external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0 });
+    try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+
+    try std.testing.expect(!core.collectAtlasGarbage());
+    try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}
+
+test "atlas reclamation stands down for a surface that outlived its grid buffer" {
+    // grid_destroy can drop the GridBuf while the frontend surface is still on
+    // screen. Deriving eligibility from sub_grids missed exactly that window
+    // and reclaimed shelves the surface was still drawing from.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    try std.testing.expect(!core.grid.sub_grids.contains(7));
+
+    try std.testing.expect(!core.collectAtlasGarbage());
+    try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
 }

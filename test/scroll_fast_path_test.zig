@@ -705,6 +705,46 @@ fn populateRow(core: *zonvie_core.nvim_core.Core, r: usize, total_rows: u32) !vo
     core.scroll_cache_valid.set(r);
 }
 
+test "a row shifted out of the viewport stays in the reclamation liveness set" {
+    // The frontend may keep drawing a retained copy of the departed row to ease
+    // the scroll sub-row, after this core has reused its cache slot. Atlas
+    // reclamation reads the core's own mirror, so the departed content has to
+    // survive there too or its shelves look unreferenced.
+    const alloc = std.testing.allocator;
+    const nvim_core_mod = zonvie_core.nvim_core;
+    var core = nvim_core_mod.Core.initForTest(alloc);
+    defer core.deinitForTest();
+
+    const total_rows: u32 = 5;
+    try core.ensureScrollCache(total_rows);
+    for (0..total_rows) |r| {
+        try populateRow(&core, r, total_rows);
+    }
+
+    // Region [1..5) scrolling down by one: row 1 leaves the viewport.
+    const departing_y = core.scroll_cache.items[1].items[0].position[1];
+    const delta_y: f32 = 1.0 * 20.0 / 100.0 * 2.0;
+    const regen = [_]u32{4};
+    _ = flush_mod.shiftScrollCacheAndValidate(&core, 1, 5, 1, delta_y, total_rows, &regen, true);
+
+    var found = false;
+    for (core.retained_shadow_age, core.retained_shadow) |age, buf| {
+        if (age >= nvim_core_mod.retained_shadow_expiry) continue;
+        for (buf.items) |v| {
+            if (v.position[1] == departing_y) found = true;
+        }
+    }
+    try std.testing.expect(found);
+
+    // It must not pin those shelves forever: the retained copy is handed back
+    // within a couple of flushes, and each flush ages the shadow.
+    for (0..nvim_core_mod.retained_shadow_expiry) |_| core.collectAtlasGarbageIfNeeded();
+    for (core.retained_shadow_age, core.retained_shadow) |age, buf| {
+        try std.testing.expect(age >= nvim_core_mod.retained_shadow_expiry);
+        try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    }
+}
+
 test "valid cache: cached rows emitted after shift (scroll down)" {
     // 5 rows, scroll region [1..5), scroll_rows=1, regen={4} (new bottom row)
     // After shift: row1←row2, row2←row3, row3←row4, row4=vacant(invalid)

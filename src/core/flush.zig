@@ -276,8 +276,13 @@ fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
 /// accounting and only the rows this attempt consumed are owed again.
 fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_main_ledger: bool) void {
     if (!core.vertex_budget_transaction_active) return;
+    // scroll_cache mirrors the displayed frame only while publications are
+    // being accepted; a refusal leaves it describing a frame that never
+    // reached the screen. Atlas reclamation reads it, so it has to know.
+    if (commit) core.display_mirror_stale = false;
     clearTouchedVertexBudgetSurfaces(core);
     if (!commit and restore_main_ledger and restoreMainVertexRowLedger(core)) {
+        core.display_mirror_stale = true;
         // Sub-grid surfaces keep the conservative recovery: this core holds no
         // vertex mirror of what their frontend surfaces retained.
         var sg_it = core.grid.sub_grids.valueIterator();
@@ -1462,6 +1467,7 @@ pub fn shiftScrollCacheAndValidate(
         }
         // Vacated rows at region bottom: reuse saved buffers, mark invalid
         for (0..shift) |s| {
+            core.captureRetainedShadow(saved_bufs[s].items);
             saved_bufs[s].clearRetainingCapacity();
             core.scroll_cache.items[scroll_bot - shift + s] = saved_bufs[s];
             row_counts[scroll_bot - shift + s] = 0;
@@ -1503,6 +1509,7 @@ pub fn shiftScrollCacheAndValidate(
         }
         // Vacated rows at region top: reuse saved buffers, mark invalid
         for (0..shift) |s| {
+            core.captureRetainedShadow(saved_bufs[s].items);
             saved_bufs[s].clearRetainingCapacity();
             core.scroll_cache.items[scroll_top + s] = saved_bufs[s];
             row_counts[scroll_top + s] = 0;
@@ -1858,6 +1865,11 @@ pub fn generateRowVertices(
     p: RowGenParams,
     out: *std.ArrayListUnmanaged(c_api.Vertex),
 ) !RowGenStats {
+    // Publish the buffer to the mid-flush atlas collection for as long as this
+    // row is being composed; see Core.inflight_row_verts.
+    core.inflight_row_verts = out;
+    defer core.inflight_row_verts = null;
+
     const rc = &core.row_cells;
     const out_start = out.items.len;
     const r = p.row;
