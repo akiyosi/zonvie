@@ -38,6 +38,30 @@ test/perf/drops.py   tmp/scrollperf/rel.csv
 A real app window opens and scrolls for the duration of the capture. Output
 goes under `tmp/`, which is gitignored.
 
+## Automated 60 fps regression test
+
+Build the Release app, keep its window visible, then run:
+
+```bash
+ZONVIE_TRACE_CONFIG=Release test/perf/test_60fps.py
+```
+
+This drives the real app at 60 updates/s over a no-wrap, high-cardinality CJK
+buffer whose 160-character lines stay populated past the viewport's right
+edge. It fails unless committed core flush p95 stays within the 16.67ms frame
+budget, committed content and on-glass presentation both sustain at least
+58fps, on-glass slips stay at or below 1/s, and visually stalled frames stay
+below 10%. The core flush bracket includes frontend admission, vertex
+generation, atlas work, and publication, so merely presenting the same stale
+content at 60fps cannot hide an abort/retry loop that turns sparse scrolling
+into a full-row rebuild.
+
+To re-check an existing capture without opening the app:
+
+```bash
+test/perf/test_60fps.py --trace tmp/scrollperf/60fps.csv
+```
+
 **Use Release for anything you plan to act on.** Its `draw(in:)` finishes
 sooner than Debug's, which makes it *lose* the commit race more often. Debug
 consistently understates the problem.

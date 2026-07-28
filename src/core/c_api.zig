@@ -2199,7 +2199,7 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
 pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.flush_aborted = true;
+    box.core.abortFlushHere();
 }
 
 // Terminate a rendering session after a frontend-side fixed resource budget

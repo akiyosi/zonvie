@@ -68,6 +68,23 @@ enum FrameTraceTag: UInt32 {
     /// totalCols << 32. A grid_scroll with no event here never reached the
     /// row-scroll fast path at all — the core resent the rows instead.
     case mainRowScrollPath = 23
+    /// Core flush callback bracket. These run on the core thread and include
+    /// frontend admission, vertex generation, atlas work and publication.
+    /// coreFlushEnd.a is 1 when the transaction was aborted, 0 when committed.
+    case coreFlushBegin = 24
+    case coreFlushEnd = 25
+    /// Per-flush attribution for the bracket above. a = rasterize calls |
+    /// upload calls << 20 | atlas recreations << 40 | main-grid rows submitted
+    /// << 48. b = nanoseconds spent inside glyph rasterization. Distinguishes
+    /// "the core regenerated the whole viewport" from "the frontend spent the
+    /// budget rasterizing glyphs the atlas had thrown away".
+    case coreFlushDetail = 26
+    /// A frontend rejection that aborts an in-progress flush. a = 1 atlas
+    /// upload deferred behind the reader gate, 2 atlas upload needs a rebuild,
+    /// 3 atlas texture recreation failed, 4 on_flush_end refused to publish.
+    /// Each of these costs a full-viewport resend on the retry, so their rate
+    /// matters as much as the cost of the flush they interrupt.
+    case flushRejected = 27
 }
 
 struct FrameTraceEvent {
@@ -93,6 +110,35 @@ enum FrameTracer {
         p.initialize(repeating: FrameTraceEvent(tNs: 0, a: 0, b: 0, tag: 0, seq: 0), count: capacity)
         return p
     }()
+
+    /// Per-flush attribution accumulators. Written only from the core thread
+    /// between one `coreFlushBegin` and its `coreFlushEnd`, and only while
+    /// `enabled`, so they need no synchronization of their own.
+    static var flushRasterCalls: UInt64 = 0
+    static var flushRasterNs: UInt64 = 0
+    static var flushUploadCalls: UInt64 = 0
+    static var flushAtlasCreates: UInt64 = 0
+    static var flushMainRows: UInt64 = 0
+
+    @inline(__always)
+    static func resetFlushCounters() {
+        guard enabled else { return }
+        flushRasterCalls = 0
+        flushRasterNs = 0
+        flushUploadCalls = 0
+        flushAtlasCreates = 0
+        flushMainRows = 0
+    }
+
+    @inline(__always)
+    static func traceFlushCounters() {
+        guard enabled else { return }
+        let packed = (flushRasterCalls & 0xF_FFFF)
+            | ((flushUploadCalls & 0xF_FFFF) << 20)
+            | ((flushAtlasCreates & 0xFF) << 40)
+            | ((flushMainRows & 0xFFFF) << 48)
+        trace(.coreFlushDetail, a: packed, b: flushRasterNs)
+    }
 
     private static var writeIndex: UInt64 = 0
     private static var indexLock = os_unfair_lock()

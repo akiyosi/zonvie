@@ -727,6 +727,20 @@ pub const Core = struct {
     /// When true, the flush pipeline skips vertex generation and atlas operations.
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
+    /// Temporary diagnostic: return address of the site that set flush_aborted.
+    flush_abort_ra: usize = 0,
+    /// Main-grid dirty state as it stood when the current flush started.
+    /// A frontend that refuses to publish (atlas back-sync still in flight,
+    /// no free buffer set) leaves the previously committed frame on screen,
+    /// so the retry only owes the rows this attempt consumed — restoring
+    /// this is what keeps a rejection from costing a whole-viewport resend.
+    flush_dirty_snapshot: grid_mod.DirtySnapshot = .{},
+    /// Main row ledger as it stood when the current flush started, paired with
+    /// flush_dirty_snapshot. Restoring both makes the core's accounting match
+    /// the frame the frontend still has on screen after it declined to commit.
+    flush_row_counts_snapshot: std.ArrayListUnmanaged(usize) = .empty,
+    flush_main_vertex_count_snapshot: usize = 0,
+    flush_row_ledger_snapshot_valid: bool = false,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -1138,6 +1152,8 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        self.flush_dirty_snapshot.deinit(self.alloc);
+        self.flush_row_counts_snapshot.deinit(self.alloc);
         for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
@@ -1748,6 +1764,8 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        self.flush_dirty_snapshot.deinit(self.alloc);
+        self.flush_row_counts_snapshot.deinit(self.alloc);
         for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
@@ -1984,6 +2002,10 @@ pub const Core = struct {
     /// Called when the frontend atlas is invalidated (e.g. guifont change),
     /// so that the next flush re-queries all glyphs via callbacks.
     pub fn resetGlyphCacheFlags(self: *Core) void {
+        if (self.log.cb != null) self.log.write(
+            "[perf] glyph_cache_cleared ra={x} anchor={x}\n",
+            .{ @returnAddress(), @intFromPtr(&Core.abortFlushHere) },
+        );
         if (self.glyph_valid_ascii) |buf| {
             @memset(buf, false);
         }
@@ -2307,7 +2329,17 @@ pub const Core = struct {
         self.finishTransientGlyphRetry();
     }
 
+    /// Temporary diagnostic: records which call site first aborted this flush.
+    pub fn abortFlushHere(self: *Core) void {
+        if (!self.flush_aborted) self.flush_abort_ra = @returnAddress();
+        self.flush_aborted = true;
+    }
+
     fn beginNegativeGlyphReprobe(self: *Core) void {
+        if (self.log.cb != null) self.log.write(
+            "[perf] negative_glyph_reprobe capacity={any} transient={any}\n",
+            .{ self.atlas_negative_recovery_armed, self.transient_glyph_recovery_armed },
+        );
         self.invalidateNegativeGlyphCacheEntries();
         self.invalidateScrollCache();
         self.grid.markAllDirty();
@@ -2475,10 +2507,16 @@ pub const Core = struct {
         // Try to pack.
         var packer = &(self.atlas_packer.?);
         const t_pack: i128 = if (log_on) clock.nowNs() else 0;
-        var packer_before_alloc = packer.*;
         var alloc_reset_seq = self.atlas_reset_seq;
         var rect = packer.alloc(bm.width, bm.height);
-        if (rect == null) packer.* = packer_before_alloc;
+
+        // Fallback for a flush that exhausts the atlas despite the
+        // start-of-flush collection: reclaim what earlier flushes left behind.
+        // Shelves this flush already filled are protected by the epoch, so the
+        // rows it has composed keep their UVs.
+        if (rect == null and self.collectAtlasGarbage()) {
+            rect = packer.alloc(bm.width, bm.height);
+        }
 
         // A full atlas grows geometrically up to the configured/frontend-safe
         // maximum. At the maximum, permit one same-size reset for a fresh
@@ -2497,7 +2535,6 @@ pub const Core = struct {
             self.resetCoreAtlas();
             if (self.flush_aborted) return null;
             packer = &(self.atlas_packer.?);
-            packer_before_alloc = packer.*;
             alloc_reset_seq = self.atlas_reset_seq;
             rect = packer.alloc(bm.width, bm.height);
         } else if (rect == null and
@@ -2510,12 +2547,14 @@ pub const Core = struct {
             self.resetCoreAtlas();
             if (self.flush_aborted) return null;
             packer = &(self.atlas_packer.?);
-            packer_before_alloc = packer.*;
             alloc_reset_seq = self.atlas_reset_seq;
             rect = packer.alloc(bm.width, bm.height);
         }
         if (rect == null) {
-            packer.* = packer_before_alloc;
+            if (log_on) self.log.write(
+                "[perf] atlas_capacity_negative glyph={d}x{d} shelves={d} overflow={any}\n",
+                .{ bm.width, bm.height, packer.shelf_count, packer.shelf_overflow },
+            );
             self.recordAtlasCapacityNegative();
             return blankGlyphEntry(bm);
         }
@@ -2554,9 +2593,9 @@ pub const Core = struct {
             // shelf cursor only while it still names the same atlas generation;
             // an invalidate callback may already have replaced the packer.
             if (self.atlas_reset_seq == alloc_reset_seq and self.atlas_packer != null) {
-                self.atlas_packer.? = packer_before_alloc;
+                self.atlas_packer.?.undoLastAlloc();
             }
-            if (self.atlas_reset_seq != alloc_reset_seq) self.flush_aborted = true;
+            if (self.atlas_reset_seq != alloc_reset_seq) self.abortFlushHere();
             return null;
         }
 
@@ -2580,6 +2619,201 @@ pub const Core = struct {
             .descent_px = bm.descent_px,
             .bytes_per_pixel = bm.bytes_per_pixel,
         };
+    }
+
+    /// Mark the shelf a UV pair points into as still referenced. Both corners
+    /// are marked because a glyph quad's lower edge may land exactly on the
+    /// next shelf's first row; over-marking only delays reclamation.
+    fn markShelfLiveForUv(
+        packer: *const shelf_packer.ShelfPacker,
+        live: *[shelf_packer.max_shelves]bool,
+        uv_y_min: f32,
+        uv_y_max: f32,
+    ) void {
+        if (uv_y_min <= 0 and uv_y_max <= 0) return;
+        const h_f: f32 = @floatFromInt(packer.height);
+        for ([2]f32{ uv_y_min, uv_y_max }) |uv| {
+            if (uv <= 0 or uv > 1) continue;
+            const y_f = uv * h_f;
+            if (y_f < 0) continue;
+            const y: u32 = @intFromFloat(@min(y_f, h_f - 1));
+            if (packer.shelfIndexForY(y)) |idx| live[idx] = true;
+        }
+    }
+
+    /// True when every main-grid row the frontend is currently showing is
+    /// either mirrored in scroll_cache (so its atlas references are readable
+    /// here) or already dirty (so this flush regenerates it before publishing).
+    /// Without this, a retained row whose vertices the core cannot inspect
+    /// could keep a glyph that garbage collection would recycle underneath it.
+    fn mainRowsAccountedForCollect(self: *Core) bool {
+        const rows = self.scroll_cache_rows;
+        if (rows == 0 or rows != self.grid.rows) return false;
+        if (self.scroll_cache.items.len < rows) return false;
+        if (self.scroll_cache_valid.bit_length < rows) return false;
+        if (self.grid.dirty_all) return true;
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            if (self.scroll_cache_valid.isSet(r)) continue;
+            if (r < self.grid.dirty_rows.bit_length and self.grid.dirty_rows.isSet(r)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    /// Reclaim atlas shelves that nothing on screen references any more.
+    ///
+    /// The high-cardinality case this exists for is a full-width CJK buffer:
+    /// every entering row brings a screenful-fraction of never-seen glyphs, so
+    /// a bump-only atlas fills within seconds and the only previous recovery
+    /// was a full reset — which clears every glyph cache, forces a whole
+    /// viewport rebuild, and refills the atlas immediately, i.e. it spirals.
+    ///
+    /// Liveness comes from the vertices the frontend is actually holding
+    /// (scroll_cache mirrors the retained main rows; cursor_verts mirrors the
+    /// cursor layer), never from glyph-cache reachability — a cache entry can
+    /// be displaced by a hash collision while its glyph stays on screen, so
+    /// "no cache entry points here" does not mean "nothing draws this".
+    ///
+    /// Returns true when at least one shelf became reusable.
+    /// Reclaim atlas space before this flush generates anything, while
+    /// scroll_cache still mirrors exactly what the frontend is showing.
+    ///
+    /// Collecting mid-generation instead was actively harmful: the rows this
+    /// flush had already recomposed were not in scroll_cache yet, so the
+    /// glyphs it had just packed looked unreferenced, were reclaimed, and had
+    /// to be rasterized all over again on the next pass — the atlas never held
+    /// a screenful for longer than one flush.
+    pub fn collectAtlasGarbageIfNeeded(self: *Core) void {
+        if (self.atlas_packer == null) return;
+        const packer = &(self.atlas_packer.?);
+        const total: u64 = @as(u64, packer.width) * packer.height;
+        if (total == 0) return;
+        // One eighth of the texture is roughly two screenfuls of CJK ink at
+        // the sizes this path sees; below that a flush can exhaust the atlas
+        // mid-generation, which costs a full reset.
+        // Collect up front only when the atlas is close enough to exhaustion
+        // that this flush would otherwise hit the reset path mid-generation.
+        // Ordinary pressure is handled by the collection inside
+        // packAndUploadBitmap, which reclaims exactly as much as the flush
+        // needs instead of dropping cache entries it is about to want back.
+        if (packer.freeAreaPx() * 64 < total) _ = self.collectAtlasGarbage();
+        // Everything packed from here on belongs to this flush and stays
+        // off-limits to the mid-flush collection.
+        if (self.atlas_packer) |*p| p.beginEpoch();
+    }
+
+    fn collectAtlasGarbage(self: *Core) bool {
+        const log_on = self.log.cb != null;
+        if (!self.isPhase2Atlas()) return false;
+        if (self.atlas_packer == null) return false;
+        // A sub-grid the frontend owns a surface for (external window, float,
+        // popupmenu) retains its own rows, and this core keeps no vertex
+        // mirror of them. Sub-grids that are only composited into the main
+        // grid are already covered by the main-row scan below.
+        {
+            var it = self.grid.sub_grids.keyIterator();
+            while (it.next()) |id| {
+                if (!self.known_external_grids.contains(id.*)) continue;
+                if (log_on) self.log.write("[perf] atlas_gc skip=external_grid id={d}\n", .{id.*});
+                return false;
+            }
+        }
+        if (!self.mainRowsAccountedForCollect()) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=rows scroll_cache_rows={d} grid_rows={d} dirty_all={any}\n",
+                .{ self.scroll_cache_rows, self.grid.rows, self.grid.dirty_all },
+            );
+            return false;
+        }
+
+        const packer = &(self.atlas_packer.?);
+        if (packer.shelf_overflow or packer.shelf_count == 0) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=shelves count={d} overflow={any}\n",
+                .{ packer.shelf_count, packer.shelf_overflow },
+            );
+            return false;
+        }
+
+        var live: [shelf_packer.max_shelves]bool = @splat(false);
+
+        const rows = self.scroll_cache_rows;
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            if (!self.scroll_cache_valid.isSet(r)) continue;
+            for (self.scroll_cache.items[r].items) |v| {
+                markShelfLiveForUv(packer, &live, v.texCoord[1], v.texCoord[1]);
+            }
+        }
+        for (self.cursor_verts.items) |v| {
+            markShelfLiveForUv(packer, &live, v.texCoord[1], v.texCoord[1]);
+        }
+
+        const recycled = packer.recycleDeadShelves(&live);
+        if (log_on) {
+            var live_count: u32 = 0;
+            for (live[0..packer.shelf_count]) |l| {
+                if (l) live_count += 1;
+            }
+            self.log.write(
+                "[perf] atlas_gc shelves={d} live={d} recycled={d}\n",
+                .{ packer.shelf_count, live_count, recycled },
+            );
+        }
+        if (recycled == 0) return false;
+
+        // Every cached entry that pointed into a reclaimed shelf must go: the
+        // space is about to hold a different glyph, and a surviving entry
+        // would be a permanent cache hit returning the wrong UVs.
+        if (self.glyph_cache_ascii) |cache| {
+            if (self.glyph_valid_ascii) |valid| {
+                const len = @min(cache.len, valid.len);
+                for (cache[0..len], valid[0..len]) |entry, *is_valid| {
+                    if (!is_valid.*) continue;
+                    if (self.entryLivesInDeadShelf(packer, &live, entry)) is_valid.* = false;
+                }
+            }
+        }
+        self.dropKeyedEntriesInDeadShelves(packer, &live, self.glyph_cache_non_ascii, self.glyph_keys_non_ascii);
+        self.dropKeyedEntriesInDeadShelves(packer, &live, self.glyph_cache_by_id, self.glyph_keys_by_id);
+        // Only now that no cache entry names a reclaimed shelf can shelves be
+        // renumbered. Fusing the free runs is what lets a tall glyph land in
+        // space vacated by short ones.
+        packer.mergeAdjacentRecycled();
+        return true;
+    }
+
+    fn entryLivesInDeadShelf(
+        self: *Core,
+        packer: *const shelf_packer.ShelfPacker,
+        live: *const [shelf_packer.max_shelves]bool,
+        entry: c_api.GlyphEntry,
+    ) bool {
+        _ = self;
+        if (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) return false;
+        const uv_y = entry.uv_min[1];
+        if (uv_y <= 0 or uv_y > 1) return false;
+        const h_f: f32 = @floatFromInt(packer.height);
+        const y: u32 = @intFromFloat(@min(uv_y * h_f, h_f - 1));
+        const idx = packer.shelfIndexForY(y) orelse return false;
+        return !live[idx];
+    }
+
+    fn dropKeyedEntriesInDeadShelves(
+        self: *Core,
+        packer: *const shelf_packer.ShelfPacker,
+        live: *const [shelf_packer.max_shelves]bool,
+        cache_opt: ?[]c_api.GlyphEntry,
+        keys_opt: ?[]u64,
+    ) void {
+        const cache = cache_opt orelse return;
+        const keys = keys_opt orelse return;
+        const len = @min(cache.len, keys.len);
+        for (cache[0..len], keys[0..len]) |entry, *key| {
+            if (key.* == GLYPH_CACHE_INVALID_KEY) continue;
+            if (self.entryLivesInDeadShelf(packer, live, entry)) key.* = GLYPH_CACHE_INVALID_KEY;
+        }
     }
 
     /// Ensure atlas is lazily initialized.

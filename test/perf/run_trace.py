@@ -11,7 +11,7 @@ compiled in; `ZONVIE_TRACE=1` arms it). On SIGUSR1 the app dumps its ring
 buffer to CSV, which analyze.py and drops.py read.
 
 Usage:
-    test/perf/run_trace.py <buffer|tig> [seconds] [out.csv] [producer_ms]
+    test/perf/run_trace.py <buffer|atlas|tig> [seconds] [out.csv] [producer_ms]
 
 Environment:
     ZONVIE_TRACE_CONFIG     Debug (default) or Release. Release is the honest
@@ -85,6 +85,8 @@ def remote_expr(expr):
 
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "buffer"
+    if scenario not in ("buffer", "atlas", "tig"):
+        sys.exit(f"unknown scenario: {scenario} (expected buffer, atlas, or tig)")
     secs = float(sys.argv[2]) if len(sys.argv) > 2 else 15.0
     out = sys.argv[3] if len(sys.argv) > 3 else str(WORK / "trace.csv")
     # Producer period in ms. The display consumes at 60Hz; driving the producer
@@ -132,6 +134,34 @@ def main():
     # Let the UI attach, size itself and settle.
     time.sleep(5)
 
+    if scenario == "atlas":
+        # Keep every visible row full through the right edge while exceeding
+        # the fixed non-ASCII glyph cache working set. Sparse scrolling should
+        # shape/rasterize only the entering row; a begin-abort recovery that
+        # spuriously marks the full viewport dirty churns the cache and misses
+        # the 60 Hz frame budget.
+        setup_lua = (
+            "(function() local lines = {}; "
+            "for row = 0, 3999 do local chars = {}; "
+            "for col = 0, 159 do "
+            "chars[#chars + 1] = vim.fn.nr2char("
+            "0x4E00 + ((row * 160 + col) % 20902)); "
+            "end; lines[#lines + 1] = table.concat(chars); end; "
+            "vim.api.nvim_buf_set_lines(0, 0, -1, false, lines); "
+            "vim.api.nvim_win_set_cursor(0, {1, 0}); "
+            "vim.opt_local.wrap = false; "
+            "vim.cmd('syntax off'); return 1 end)()"
+        )
+        r = remote_expr(f'luaeval("{setup_lua}")')
+        if r.returncode != 0:
+            print("failed to create atlas stress buffer:", r.stderr, file=sys.stderr)
+            app_proc.terminate()
+            nvim_proc.terminate()
+            return 1
+        # Exclude initial full-viewport glyph population from the continuous
+        # scroll window selected by the checker.
+        time.sleep(4)
+
     if scenario == "tig":
         commit = biggest_recent_commit()
         remote_expr(f"execute('terminal cd {REPO} && tig show {commit}')")
@@ -171,6 +201,8 @@ def main():
     else:
         sys.exit("NO TRACE PRODUCED")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

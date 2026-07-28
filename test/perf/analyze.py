@@ -17,6 +17,9 @@ TAG = {
     12: "inputSend", 13: "encodeEnd", 14: "gpuSubmit", 15: "frameContent",
     16: "drawSkipNoChange", 17: "commitGuardBand", 18: "scrollAdvance",
     19: "smoothScrollOffset",
+    20: "gestureScrollInput", 21: "gestureScrollOffset",
+    22: "gestureScrollClear", 23: "mainRowScrollPath",
+    24: "coreFlushBegin", 25: "coreFlushEnd",
 }
 VSYNC_NS = 16_666_667
 
@@ -122,6 +125,29 @@ def main(path):
 
     gpu = [b - a for _, tag, _, a, b in rows if tag == 7 and b > a]
     summarize("GPU execution", gpu)
+
+    # --- core flush duration ----------------------------------------------
+    # The callback bracket includes frontend admission, core vertex/atlas
+    # work, and frontend publication. This is the producer-side 16.67ms
+    # budget that an on-glass cadence alone cannot attribute.
+    flush_dur, committed_flush_dur, aborted_flush_dur = [], [], []
+    flush_begin = None
+    for t, tag, _, a, _ in rows:
+        if tag == 24:
+            flush_begin = t
+        elif tag == 25 and flush_begin is not None:
+            duration = t - flush_begin
+            flush_dur.append(duration)
+            if a == 0:
+                committed_flush_dur.append(duration)
+            else:
+                aborted_flush_dur.append(duration)
+            flush_begin = None
+    if flush_dur:
+        print("\ncore flush pipeline:")
+        summarize("all flushes", flush_dur)
+        summarize("committed flushes", committed_flush_dur)
+        summarize("aborted flushes", aborted_flush_dur)
 
     # --- content per frame ------------------------------------------------
     fc = [(a, b, seq) for _, tag, seq, a, b in rows if tag == 15]

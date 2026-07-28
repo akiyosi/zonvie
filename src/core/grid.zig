@@ -1189,6 +1189,18 @@ pub const ScrollOp = struct {
     win_pos_row: u32,
 };
 
+/// Main-grid dirty state remembered across one flush attempt, so a frontend
+/// rejection can restore exactly what that flush consumed.
+pub const DirtySnapshot = struct {
+    dirty_all: bool = false,
+    rows: std.DynamicBitSetUnmanaged = .{},
+
+    pub fn deinit(self: *DirtySnapshot, alloc: std.mem.Allocator) void {
+        self.rows.deinit(alloc);
+        self.rows = .{};
+    }
+};
+
 pub const Grid = struct {
     // Capacity of scroll_touched_rows below (declarations cannot be
     // interspersed between container fields, so this lives at the top of
@@ -1228,6 +1240,11 @@ pub const Grid = struct {
     screen_cols: u32 = 0,
     // Dirty tracking (global grid only)
     dirty_all: bool = true,
+    /// Temporary diagnostic: return address of the markAllDirty() caller that
+    /// most recently raised dirty_all from false.
+    dirty_all_ra: usize = 0,
+    /// Temporary diagnostic: why the main scroll fast path was last blocked.
+    scroll_fast_path_block_reason: u8 = 0,
     dirty_rows: std.DynamicBitSetUnmanaged = .{},
 
     cells: []Cell = &[_]Cell{},
@@ -2043,6 +2060,7 @@ pub const Grid = struct {
 
     pub fn markAllDirty(self: *Grid) void {
         // Fast path: avoid setting all bits; dirty_all dominates.
+        if (!self.dirty_all) self.dirty_all_ra = @returnAddress();
         self.dirty_all = true;
     }
 
@@ -2094,6 +2112,7 @@ pub const Grid = struct {
         // path to shift by the wrong amount.
         if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
             self.scroll_fast_path_blocked = true;
+            self.scroll_fast_path_block_reason = 1;
             return;
         }
 
@@ -2106,6 +2125,39 @@ pub const Grid = struct {
         // Make all bits clean.
         if (self.dirty_rows.bit_length != 0) {
             self.dirty_rows.unsetAll();
+        }
+    }
+
+    /// Copy the current main-grid dirty state into `out`, growing it only when
+    /// the row count changed. Used to remember what a flush consumed so a
+    /// frontend rejection can restore exactly that instead of resending every
+    /// row. Allocation happens on layout change only, never per flush.
+    pub fn snapshotDirty(self: *const Grid, alloc: std.mem.Allocator, out: *DirtySnapshot) !void {
+        out.dirty_all = self.dirty_all;
+        const len = self.dirty_rows.bit_length;
+        if (out.rows.bit_length != len) {
+            out.rows.deinit(alloc);
+            out.rows = .{};
+            out.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
+        } else if (len != 0) {
+            out.rows.unsetAll();
+        }
+        if (len == 0) return;
+        var it = self.dirty_rows.iterator(.{});
+        while (it.next()) |bit| out.rows.set(bit);
+    }
+
+    /// Re-apply a snapshot on top of the current state. Bits set since the
+    /// snapshot stay set: a rejected flush must resend what it consumed plus
+    /// anything that changed afterwards.
+    pub fn restoreDirty(self: *Grid, snapshot: *const DirtySnapshot) void {
+        if (snapshot.dirty_all) self.dirty_all = true;
+        if (snapshot.rows.bit_length == 0 or self.dirty_rows.bit_length == 0) return;
+        const len = @min(snapshot.rows.bit_length, self.dirty_rows.bit_length);
+        var it = snapshot.rows.iterator(.{});
+        while (it.next()) |bit| {
+            if (bit >= len) break;
+            self.dirty_rows.set(bit);
         }
     }
 
@@ -2670,6 +2722,7 @@ pub const Grid = struct {
                     self.recordScrolledGrid(grid_id, rows);
                     ps.rows = std.math.add(i32, ps.rows, rows) catch {
                         self.scroll_fast_path_blocked = true;
+                        self.scroll_fast_path_block_reason = 2;
                         self.scroll_touched_count = 0;
                         return;
                     };
@@ -2677,6 +2730,7 @@ pub const Grid = struct {
                 }
                 // Different grid or region: block fast path.
                 self.scroll_fast_path_blocked = true;
+                self.scroll_fast_path_block_reason = 3;
                 self.scroll_touched_count = 0;
             }
             self.scroll(top, bot, left, right, rows, cols);
@@ -2744,6 +2798,7 @@ pub const Grid = struct {
                         self.recordScrolledGrid(grid_id, rows);
                         ps.rows = std.math.add(i32, ps.rows, rows) catch {
                             self.scroll_fast_path_blocked = true;
+                            self.scroll_fast_path_block_reason = 4;
                             self.scroll_touched_count = 0;
                             return;
                         };
@@ -2751,6 +2806,7 @@ pub const Grid = struct {
                     }
                     // Different grid or region: block fast path.
                     self.scroll_fast_path_blocked = true;
+                    self.scroll_fast_path_block_reason = 5;
                     self.scroll_touched_count = 0;
                 }
                 // Saturating: see shiftTouchedRows' guard above.
