@@ -2727,17 +2727,22 @@ pub const Core = struct {
         const packer = &(self.atlas_packer.?);
         const total: u64 = @as(u64, packer.width) * packer.height;
         if (total == 0) return;
-        // One eighth of the texture is roughly two screenfuls of CJK ink at
-        // the sizes this path sees; below that a flush can exhaust the atlas
-        // mid-generation, which costs a full reset.
-        // Collect up front only when the atlas is close enough to exhaustion
-        // that this flush would otherwise hit the reset path mid-generation.
-        // Ordinary pressure is handled by the collection inside
+        // free/total < 1/64: collect up front only when the atlas is close
+        // enough to exhaustion that this flush would otherwise hit the reset
+        // path mid-generation. The multiplier is the reciprocal of that
+        // fraction, so the two move together.
+        //
+        // A collection is not cheap: it walks every glyph vertex on screen and
+        // both 16384-entry glyph tables. Raising the trigger to 1/8 — which an
+        // earlier version of this comment described, against a constant that
+        // has always meant 1/64 — costs more than it saves. Measured on
+        // test/perf/test_60fps.py, Release, against this same tree: p50
+        // 2.09/2.12ms -> 2.53/2.85ms, p95 6.29/6.96ms -> 10.68/12.28ms,
+        // on-glass slips 0.169/0.252/s -> 0.422/1.014/s, with no improvement
+        // in p99. Ordinary pressure is handled by the collection inside
         // packAndUploadBitmap, which reclaims exactly as much as the flush
         // needs instead of dropping cache entries it is about to want back.
-        // free/total < 1/8. The multiplier is the reciprocal of the fraction
-        // above, so it has to move with the comment.
-        if (packer.freeAreaPx() * 8 < total) _ = self.collectAtlasGarbage();
+        if (packer.freeAreaPx() * 64 < total) _ = self.collectAtlasGarbage();
         // Everything packed from here on belongs to this flush and stays
         // off-limits to the mid-flush collection.
         if (self.atlas_packer) |*p| p.beginEpoch();
