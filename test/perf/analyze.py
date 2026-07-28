@@ -232,6 +232,15 @@ def main(path):
                       f"mean {mean:.3f} rows/frame, sd {var ** 0.5:.3f}")
                 print(f"  frames not moving at all: {stalled} "
                       f"({stalled*100.0/len(cells):.1f}%) = {stalled/span_s:.2f}/s")
+                # A frame that renders advanced content without the ease seed
+                # jumps a full row forward, and the next frame applies the seed
+                # and steps back. The reversal is what the eye catches, and it
+                # hides inside the sd above, so count it directly. Threshold is
+                # a twentieth of a row to stay clear of decay rounding.
+                back = [c for c in cells if c < -0.05]
+                worst = min(back) if back else 0.0
+                print(f"  frames moving backwards: {len(back)} "
+                      f"= {len(back)/span_s:.3f}/s, worst {worst:.3f} rows")
 
     # --- guard band effectiveness -----------------------------------------
     guards = [(a, b) for _, tag, _, a, b in rows if tag == 17]
