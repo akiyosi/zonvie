@@ -49,13 +49,6 @@ public func zonvie_macos_rasterize_glyph(
     guard let ctx, let outBitmap else { return 0 }
     let zc = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
     guard let view = zc.terminalView else { return 0 }
-    if FrameTracer.enabled {
-        let started = FrameTracer.nowNs()
-        let ok = view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap)
-        FrameTracer.flushRasterNs &+= FrameTracer.nowNs() &- started
-        FrameTracer.flushRasterCalls &+= 1
-        return ok ? 1 : 0
-    }
     return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
 }
 
@@ -71,13 +64,11 @@ public func zonvie_macos_atlas_upload(
     guard let ctx, let bitmap else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
     guard let view = core.terminalView else { return }
-    if FrameTracer.enabled { FrameTracer.flushUploadCalls &+= 1 }
     let result = view.renderer.uploadAtlasRegion(destX: destX, destY: destY, width: width, height: height, bitmap: bitmap)
     switch result {
     case .uploaded:
         break
     case .retryAfterReaderDrain:
-        FrameTracer.trace(.flushRejected, a: 1)
         // Reader contention is transient and leaves both atlas textures
         // intact. Abort so packAndUploadBitmap does not publish/cache the new
         // UV, but preserve the current atlas generation for the retry instead
@@ -86,7 +77,6 @@ public func zonvie_macos_atlas_upload(
             zonvie_core_abort_flush(corePtr)
         }
     case .requiresRebuild:
-        FrameTracer.trace(.flushRejected, a: 2)
         // on_atlas_upload's C ABI is void, so the core otherwise has no way
         // to see this failure -- it unconditionally builds and returns a
         // GlyphEntry with UVs pointing at the just-requested (but
@@ -116,9 +106,7 @@ public func zonvie_macos_atlas_create(
     guard let ctx else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
     guard let view = core.terminalView else { return }
-    if FrameTracer.enabled { FrameTracer.flushAtlasCreates &+= 1 }
     guard !view.renderer.recreateAtlasTexture(width: atlasW, height: atlasH) else { return }
-    FrameTracer.trace(.flushRejected, a: 3)
     // Keep the old committed front texture and reject this transaction. The
     // core checks flush_aborted immediately after this void callback, so it
     // cannot compute/cache new UVs or publish the write set against the old

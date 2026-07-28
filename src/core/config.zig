@@ -292,7 +292,9 @@ pub const Config = struct {
 
     pub const PerformanceConfig = struct {
         glyph_cache_ascii_size: u32 = 512,
-        glyph_cache_non_ascii_size: u32 = 512,
+        // NOTE: default must match nvim_core.zig glyph_cache_non_ascii_size,
+        // which documents why a screenful of CJK needs this much.
+        glyph_cache_non_ascii_size: u32 = 16384,
         hl_cache_size: u32 = 2048, // NOTE: default must match nvim_core.zig hl_cache_size
         shape_cache_size: u32 = 4096,
         atlas_size: u32 = atlas_size_default,

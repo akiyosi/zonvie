@@ -548,7 +548,6 @@ final class ZonvieCore {
                 if gridId == 1 {
                     // Main window
                     guard let view = core.terminalView else { return }
-                    if FrameTracer.enabled { FrameTracer.flushMainRows &+= UInt64(rowCount) }
                     view.submitVerticesRowRaw(
                         rowStart: Int(rowStart),
                         rowCount: Int(rowCount),
@@ -924,7 +923,6 @@ final class ZonvieCore {
             on_flush_begin: { ctx in
                 guard let ctx else { return }
                 FrameTracer.trace(.coreFlushBegin)
-                FrameTracer.resetFlushCounters()
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 if ZonvieCore.appLogEnabled, !me.loggedFirstFlushBegin {
                     me.loggedFirstFlushBegin = true
@@ -940,7 +938,6 @@ final class ZonvieCore {
                     // Frontend cannot accept this flush — tell core to skip vertex/atlas work.
                     zonvie_core_abort_flush(corePtr)
                     me.externalFlushAborted = true
-                    FrameTracer.trace(.flushRejected, a: 5)
                     // Backpressure (no free buffer set): retry once a GPU
                     // frame likely completed, or this content stays unflushed
                     // forever if Neovim sends no further redraw.
@@ -959,7 +956,6 @@ final class ZonvieCore {
                         renderer.abortFlush()
                         zonvie_core_abort_flush(corePtr)
                         me.externalFlushAborted = true
-                        FrameTracer.trace(.flushRejected, a: 6)
                         me.scheduleFlushRetry()
                     }
                 case .proceed:
@@ -977,7 +973,6 @@ final class ZonvieCore {
                 defer {
                     if FrameTracer.enabled {
                         let aborted = me.core.map { zonvie_core_flush_was_aborted($0) } ?? true
-                        FrameTracer.traceFlushCounters()
                         FrameTracer.trace(.coreFlushEnd, a: aborted ? 1 : 0)
                     }
                 }
@@ -1025,12 +1020,6 @@ final class ZonvieCore {
                     anyFailed = true
                 }
                 if anyFailed {
-                    FrameTracer.trace(
-                        .flushRejected,
-                        a: 4,
-                        b: (me.externalFlushAborted ? 1 : 0) | (mainFailed ? 2 : 0)
-                            | ((me.core.map { zonvie_core_flush_was_aborted($0) } ?? false) ? 4 : 0)
-                    )
                     if let corePtr = me.core {
                         // on_flush_end is the frontend's commit decision.
                         // Propagate a late renderer rejection into the same
@@ -3860,7 +3849,6 @@ final class ZonvieCore {
             return true
         case .failed:
             externalFlushAborted = true
-            FrameTracer.trace(.flushRejected, a: 7)
             terminalView?.renderer.abortFlush()
             if let core {
                 zonvie_core_abort_flush(core)

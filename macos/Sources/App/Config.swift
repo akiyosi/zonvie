@@ -139,7 +139,10 @@ struct ZonvieConfig {
 
         /// Glyph cache size for non-ASCII characters (hash table)
         /// Default: 512, Minimum: 64
-        var glyphCacheNonAsciiSize: Int = 512
+        // Must match the core default (src/core/config.zig): a screenful of
+        // distinct CJK does not fit in a smaller table, and a table that
+        // cannot hold the working set makes every regeneration re-rasterize.
+        var glyphCacheNonAsciiSize: Int = 16384
 
         /// Highlight attribute cache size for flush vertex generation
         /// Default: 512, Range: 64-2048

@@ -727,8 +727,6 @@ pub const Core = struct {
     /// When true, the flush pipeline skips vertex generation and atlas operations.
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
-    /// Temporary diagnostic: return address of the site that set flush_aborted.
-    flush_abort_ra: usize = 0,
     /// Main-grid dirty state as it stood when the current flush started.
     /// A frontend that refuses to publish (atlas back-sync still in flight,
     /// no free buffer set) leaves the previously committed frame on screen,
@@ -923,7 +921,12 @@ pub const Core = struct {
     // ASCII cache: 128 * 4 = 512 entries (codepoint 0-127 × 4 style combinations)
     // Non-ASCII cache: hash table for Unicode chars >= 128
     glyph_cache_ascii_size: u32 = 512, // default: 128 ASCII × 4 styles
-    glyph_cache_non_ascii_size: u32 = 512, // default: 512 entries (reduces preRasterizeAscii collisions; was guaranteed >=124 evictions at 256)
+    // Default sized for a full screen of distinct non-ASCII glyphs: a
+    // 53x196 viewport of CJK holds ~5,200, and the 2-way probe needs the
+    // table to stay well under half full to keep them. At 512 the working
+    // set could not fit at all, so every regeneration re-rasterized the
+    // whole screen. ~1.8MB across this and the same-sized by-ID table.
+    glyph_cache_non_ascii_size: u32 = 16384,
 
     // Highlight cache size for flush vertex generation (configurable via [performance] in config.toml)
     hl_cache_size: u32 = 2048, // NOTE: default must match config.zig PerformanceConfig.hl_cache_size
@@ -2002,10 +2005,6 @@ pub const Core = struct {
     /// Called when the frontend atlas is invalidated (e.g. guifont change),
     /// so that the next flush re-queries all glyphs via callbacks.
     pub fn resetGlyphCacheFlags(self: *Core) void {
-        if (self.log.cb != null) self.log.write(
-            "[perf] glyph_cache_cleared ra={x} anchor={x}\n",
-            .{ @returnAddress(), @intFromPtr(&Core.abortFlushHere) },
-        );
         if (self.glyph_valid_ascii) |buf| {
             @memset(buf, false);
         }
@@ -2329,17 +2328,7 @@ pub const Core = struct {
         self.finishTransientGlyphRetry();
     }
 
-    /// Temporary diagnostic: records which call site first aborted this flush.
-    pub fn abortFlushHere(self: *Core) void {
-        if (!self.flush_aborted) self.flush_abort_ra = @returnAddress();
-        self.flush_aborted = true;
-    }
-
     fn beginNegativeGlyphReprobe(self: *Core) void {
-        if (self.log.cb != null) self.log.write(
-            "[perf] negative_glyph_reprobe capacity={any} transient={any}\n",
-            .{ self.atlas_negative_recovery_armed, self.transient_glyph_recovery_armed },
-        );
         self.invalidateNegativeGlyphCacheEntries();
         self.invalidateScrollCache();
         self.grid.markAllDirty();
@@ -2551,10 +2540,6 @@ pub const Core = struct {
             rect = packer.alloc(bm.width, bm.height);
         }
         if (rect == null) {
-            if (log_on) self.log.write(
-                "[perf] atlas_capacity_negative glyph={d}x{d} shelves={d} overflow={any}\n",
-                .{ bm.width, bm.height, packer.shelf_count, packer.shelf_overflow },
-            );
             self.recordAtlasCapacityNegative();
             return blankGlyphEntry(bm);
         }
@@ -2595,7 +2580,7 @@ pub const Core = struct {
             if (self.atlas_reset_seq == alloc_reset_seq and self.atlas_packer != null) {
                 self.atlas_packer.?.undoLastAlloc();
             }
-            if (self.atlas_reset_seq != alloc_reset_seq) self.abortFlushHere();
+            if (self.atlas_reset_seq != alloc_reset_seq) self.flush_aborted = true;
             return null;
         }
 

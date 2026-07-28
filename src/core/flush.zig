@@ -2561,8 +2561,39 @@ pub fn generateRowVertices(
                                 }
                                 defer core.emoji_cluster_len = 0;
 
+                                // Cache this scalar like the single-cluster
+                                // fallback below does. A script the primary
+                                // font does not cover (CJK in a Latin font)
+                                // shapes to .notdef for EVERY cell, so without
+                                // this every occurrence of every glyph was
+                                // rasterized again on every regeneration —
+                                // a full-viewport pass cost thousands of
+                                // rasterizations that the atlas already held.
+                                // Emoji keep the uncached path: their bitmap
+                                // depends on cluster context set just above.
+                                const fb_extras = getOverflowForCell(core, rc, r, fb_src_col);
+                                const fb_cache_key = clusterCacheKey(fb_scalar, style_index, fb_extras);
+                                const fb_cache_hash = clusterCacheHash(fb_scalar, style_index, fb_extras);
+                                const fb_cacheable = !fb_is_emoji and
+                                    glyph_cache_non_ascii != null and
+                                    glyph_keys_non_ascii != null and
+                                    GLYPH_CACHE_NON_ASCII_SIZE > 0;
+                                var fb_ge_opt: ?c_api.GlyphEntry = null;
+                                if (fb_cacheable) {
+                                    const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_cache_key, fb_cache_hash);
+                                    if (probe.hit) |hit_idx| fb_ge_opt = glyph_cache_non_ascii.?[hit_idx];
+                                }
                                 const fb_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                const fb_ge_opt = core.ensureGlyphPhase2(fb_scalar, c_style);
+                                if (fb_ge_opt == null) {
+                                    fb_ge_opt = core.ensureGlyphPhase2(fb_scalar, c_style);
+                                    if (fb_cacheable) {
+                                        if (fb_ge_opt) |entry| {
+                                            const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_cache_key, fb_cache_hash);
+                                            glyph_cache_non_ascii.?[probe.insert] = entry;
+                                            glyph_keys_non_ascii.?[probe.insert] = fb_cache_key;
+                                        }
+                                    }
+                                }
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_ens));
                                 if (fb_ge_opt) |fb_ge| {
                                     if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
@@ -3316,20 +3347,9 @@ pub const FlushCtx = struct {
             var dirty_count: u32 = 0;
             var dr_iter = ctx.core.grid.dirty_rows.iterator(.{});
             while (dr_iter.next()) |_| dirty_count += 1;
-            var occupied: u32 = 0;
-            if (ctx.core.glyph_keys_non_ascii) |keys| {
-                for (keys) |k| {
-                    if (k != nvim_core.GLYPH_CACHE_INVALID_KEY) occupied += 1;
-                }
-            }
-            ctx.core.log.write("[perf] glyph_cache_occupancy n={d}\n", .{occupied});
             ctx.core.log.write(
-                "[perf] flush_dirty rows={d} dirty_rows={d} dirty_all={d} content_rev={d} dirty_all_ra={x} anchor={x}\n",
-                .{
-                    rows,                                    dirty_count,
-                    @intFromBool(ctx.core.grid.dirty_all),    ctx.core.grid.content_rev,
-                    ctx.core.grid.dirty_all_ra,               @intFromPtr(&grid_mod.Grid.markAllDirty),
-                },
+                "[perf] flush_dirty rows={d} dirty_rows={d} dirty_all={d} content_rev={d}\n",
+                .{ rows, dirty_count, @intFromBool(ctx.core.grid.dirty_all), ctx.core.grid.content_rev },
             );
         }
 
@@ -3351,7 +3371,6 @@ pub const FlushCtx = struct {
         // Reset flush_aborted BEFORE calling on_flush_begin
         // (the callback may set it via zonvie_core_abort_flush)
         ctx.core.flush_aborted = false;
-        ctx.core.flush_abort_ra = 0;
         ctx.core.flush_retryable = true;
         ctx.core.flush_atlas_corrupted = false;
 
@@ -3409,14 +3428,6 @@ pub const FlushCtx = struct {
                 // state. A callback abort can return before the normal reset
                 // checks consume it.
                 ctx.core.atlas_reset_during_flush = false;
-                if (perf_enabled) ctx.core.log.write(
-                    "[perf] flush_abort_recovery aborted={any} corrupted={any} at_begin={any} ra={x} anchor={x}\n",
-                    .{
-                        ctx.core.flush_aborted,   ctx.core.flush_atlas_corrupted,
-                        aborted_at_flush_begin,   ctx.core.flush_abort_ra,
-                        @intFromPtr(&Core.abortFlushHere),
-                    },
-                );
                 if (!aborted_at_flush_begin) {
                     // on_flush_end itself may reject the transaction after main
                     // and external generation already cleared dirty flags.
@@ -3525,7 +3536,7 @@ pub const FlushCtx = struct {
             // the final transaction defer above invalidates its accounting.
             if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                 validateCompletedVertexBudget(ctx.core) catch |err| {
-                    ctx.core.abortFlushHere();
+                    ctx.core.flush_aborted = true;
                     ctx.core.failHardRender(err);
                 };
             }
@@ -3545,7 +3556,7 @@ pub const FlushCtx = struct {
         // flush_aborted, and zonvie_core_flush_was_aborted() lets both
         // frontends' on_flush_end handlers detect this and cancel their
         // bracket instead of committing.
-        errdefer ctx.core.abortFlushHere();
+        errdefer ctx.core.flush_aborted = true;
 
         // If frontend aborted, skip all vertex/atlas work.
         // Grid scroll events are NOT dispatched or cleared — they are preserved
@@ -4300,7 +4311,6 @@ pub const FlushCtx = struct {
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
                     var used_scroll_fast_path: bool = false;
-                    ctx.core.grid.scroll_fast_path_block_reason = 0;
 
                     // Dirty-row composition uses persistent per-row buckets.
                     // Content-only flushes validate the layout in O(G), then
@@ -4398,10 +4408,6 @@ pub const FlushCtx = struct {
                         var regen_rows: [48]u32 = undefined; // SCROLL_TOUCHED_ROWS_CAP touched + cursor + non-scroll dirty rows
                         var regen_count: u32 = 0;
                         var use_scroll_fast_path = scroll_check.eligible and !atlas_retried;
-                        if (!use_scroll_fast_path) {
-                            ctx.core.grid.scroll_fast_path_block_reason =
-                                if (atlas_retried) 16 else 15;
-                        }
 
                         if (use_scroll_fast_path) {
                             var t_prep_regen_build_start: i128 = 0;
@@ -4480,7 +4486,6 @@ pub const FlushCtx = struct {
                                     if (!found) {
                                         if (regen_count >= regen_rows.len) {
                                             use_scroll_fast_path = false;
-                                            ctx.core.grid.scroll_fast_path_block_reason = 10;
                                             break;
                                         }
                                         regen_rows[regen_count] = dr;
@@ -4503,13 +4508,11 @@ pub const FlushCtx = struct {
                                     // may have overflowed — fall back to full regen.
                                     if (diff_count >= diff_buf.len) {
                                         use_scroll_fast_path = false;
-                                        ctx.core.grid.scroll_fast_path_block_reason = 11;
                                     }
                                     if (use_scroll_fast_path) {
                                         for (diff_buf[0..diff_count]) |row| {
                                             if (regen_count >= regen_rows.len) {
                                                 use_scroll_fast_path = false;
-                                                ctx.core.grid.scroll_fast_path_block_reason = 12;
                                                 break;
                                             }
                                             regen_rows[regen_count] = row;
@@ -4547,7 +4550,6 @@ pub const FlushCtx = struct {
                                 }
                                 if (!shift_result.fast_path_ok) {
                                     use_scroll_fast_path = false;
-                                    ctx.core.grid.scroll_fast_path_block_reason = 13;
                                     if (log_enabled) {
                                         ctx.core.log.write("[scroll_debug] fast_path cancelled: non-regen rows have invalid cache\n", .{});
                                     }
@@ -4557,7 +4559,6 @@ pub const FlushCtx = struct {
                             // Record final fast path decision for perf logging
                             used_scroll_fast_path = use_scroll_fast_path and cache_ready;
                             if (use_scroll_fast_path and !cache_ready) {
-                                ctx.core.grid.scroll_fast_path_block_reason = 14;
                             }
 
                             // Frontends that support main-row scroll shifting can update their
@@ -4826,13 +4827,9 @@ pub const FlushCtx = struct {
                                 .is_cmdline = false,
                                 .glow_enabled = glow_enabled,
                             }, out) catch |err| {
-                                if (log_enabled) ctx.core.log.write(
-                                    "[perf] row_gen_error row={d} err={s}\n",
-                                    .{ r, @errorName(err) },
-                                );
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
-                                ctx.core.abortFlushHere();
+                                ctx.core.flush_aborted = true;
                                 if (Core.isHardRenderFailure(err)) ctx.core.failHardRender(err);
                                 break;
                             };
@@ -5011,10 +5008,6 @@ pub const FlushCtx = struct {
                     // unrelated future edit happens to touch the same rows.
                     if (!ctx.core.flush_aborted) ctx.core.grid.clearDirty();
                     if (had_glyph_miss or saw_atlas_reset) {
-                        if (ctx.core.log.cb != null) ctx.core.log.write(
-                            "[perf] row_mode_full_resend glyph_miss={any} atlas_reset={any}\n",
-                            .{ had_glyph_miss, saw_atlas_reset },
-                        );
                         main_retry_required = true;
                         ctx.core.grid.markAllDirty();
                         // Atlas reset invalidates cached UVs in scroll cache — but only
@@ -5057,13 +5050,8 @@ pub const FlushCtx = struct {
                         const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
-                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any} block_reason={d}\n",
-                            .{
-                                rows,    cols,
-                                log_dirty_rows, ctx.core.grid_entries.items.len,
-                                dur_us,  used_scroll_fast_path,
-                                ctx.core.grid.scroll_fast_path_block_reason,
-                            },
+                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any}\n",
+                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us, used_scroll_fast_path },
                         );
                         ctx.core.log.write(
                             "[perf] row_mode_breakdown rows={d} compose_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_cb_row={d} max_cb_us={d}\n",
@@ -5353,7 +5341,7 @@ pub const FlushCtx = struct {
                             .max_vertices = MAX_VERTICES_PER_CALLBACK - generated_vertex_count,
                         }, row_scratch) catch |err| {
                             main.clearRetainingCapacity();
-                            ctx.core.abortFlushHere();
+                            ctx.core.flush_aborted = true;
                             if (Core.isHardRenderFailure(err)) ctx.core.failHardRender(err);
                             return;
                         };
@@ -5873,7 +5861,7 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
             // and then failing to record it, which would otherwise cause
             // duplicate opens and lost closes on later retries.
             self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch {
-                self.abortFlushHere();
+                self.flush_aborted = true;
                 return new_grids_added;
             };
         }
@@ -6367,7 +6355,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const owns_vertex_budget_transaction = !self.vertex_budget_transaction_active;
     if (owns_vertex_budget_transaction) {
         beginVertexBudgetTransaction(self) catch |err| {
-            self.abortFlushHere();
+            self.flush_aborted = true;
             self.failHardRender(err);
             return;
         };
@@ -6376,7 +6364,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         var commit = !self.flush_aborted and !self.flush_atlas_corrupted;
         if (commit) {
             validateCompletedVertexBudget(self) catch |err| {
-                self.abortFlushHere();
+                self.flush_aborted = true;
                 self.failHardRender(err);
                 commit = false;
             };
@@ -6581,7 +6569,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             if (!self.ext_float_anchor_index_valid) {
                 buildExternalFloatAnchorIndex(self) catch |err| {
                     ext_had_row_error = true;
-                    self.abortFlushHere();
+                    self.flush_aborted = true;
                     if (Core.isHardRenderFailure(err)) {
                         self.flush_retryable = false;
                         self.failHardRender(err);
@@ -6607,7 +6595,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 sg.cols,
             ) catch |err| {
                 ext_had_row_error = true;
-                self.abortFlushHere();
+                self.flush_aborted = true;
                 if (Core.isHardRenderFailure(err)) {
                     self.flush_retryable = false;
                     self.failHardRender(err);
@@ -6764,7 +6752,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             sg.cols,
                         ) catch |err| {
                             ext_had_row_error = true;
-                            self.abortFlushHere();
+                            self.flush_aborted = true;
                             if (Core.isHardRenderFailure(err)) {
                                 self.flush_retryable = false;
                                 self.failHardRender(err);
@@ -6807,7 +6795,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         // silently missing. Stop composing further rows for this
                         // grid; the outer grid loop's flush_aborted check stops
                         // further grids too.
-                        self.abortFlushHere();
+                        self.flush_aborted = true;
                         break :ext_retry;
                     };
 
@@ -6815,7 +6803,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     self.row_cells.clearRetainingCapacity();
                     self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
                         ext_had_row_error = true;
-                        self.abortFlushHere();
+                        self.flush_aborted = true;
                         break :ext_retry;
                     };
                     self.row_cells.setLen(sg.cols);
@@ -6851,7 +6839,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     self.flush_float_overlay_buf.clearRetainingCapacity();
                     self.flush_float_overlay_buf.ensureTotalCapacity(self.alloc, sg.cols) catch {
                         ext_had_row_error = true;
-                        self.abortFlushHere();
+                        self.flush_aborted = true;
                         break :ext_retry;
                     };
 
@@ -6941,7 +6929,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         }, ext_verts) catch |err| {
                             ext_verts.clearRetainingCapacity();
                             ext_had_row_error = true;
-                            self.abortFlushHere();
+                            self.flush_aborted = true;
                             if (Core.isHardRenderFailure(err)) self.failHardRender(err);
                             break :ext_retry;
                         };
@@ -6955,7 +6943,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         ext_verts.items.len,
                     ) catch |err| {
                         ext_had_row_error = true;
-                        self.abortFlushHere();
+                        self.flush_aborted = true;
                         self.failHardRender(err);
                         break :ext_retry;
                     };
@@ -6986,7 +6974,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             // discarded, matching the abort check elsewhere in this loop.
                             if (self.flush_aborted) break;
                             replaceSubgridSurfaceRowVertexCount(self, grid_id, sg, clear_ri, 0) catch |err| {
-                                self.abortFlushHere();
+                                self.flush_aborted = true;
                                 self.failHardRender(err);
                                 break;
                             };
@@ -7017,7 +7005,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     ext_verts.clearRetainingCapacity();
                     // Estimate: 6 cursor bg + 6 cursor text + block element quads
                     ext_verts.ensureTotalCapacity(self.alloc, 48) catch {
-                        self.abortFlushHere();
+                        self.flush_aborted = true;
                         return;
                     };
 
@@ -7088,7 +7076,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                             self.hl.default_bg;
                                         const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
                                         ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
-                                            self.abortFlushHere();
+                                            self.flush_aborted = true;
                                             return;
                                         };
                                         for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
@@ -7123,7 +7111,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     if (self.isPhase2Atlas()) {
                                         const overflow = self.grid.getOverflow(grid_id, cur_row, cursor_col);
                                         const cached_entry = ensureCachedPhase2Glyph(self, cursor_cell.cp, ext_cursor_c_style, overflow) catch blk: {
-                                            self.abortFlushHere();
+                                            self.flush_aborted = true;
                                             break :blk null;
                                         };
                                         if (cached_entry) |entry| {
@@ -7286,7 +7274,7 @@ fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
     // Synthetic grid builders run inside the frontend flush bracket. They
     // retain their source dirty flag on failure; aborting prevents the
     // partially rebuilt grid from being committed before that retry.
-    self.abortFlushHere();
+    self.flush_aborted = true;
     self.log.write("[{s}] overflow map update failed: {any}\n", .{ scope, err });
 }
 
@@ -8770,12 +8758,12 @@ pub fn sendMsgShow(self: *Core) bool {
         self.log.write("[msg] sendMsgShow: view=ext_float, rendering message grid\n", .{});
         if (!buildMsgLineCache(self)) {
             self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
-            self.abortFlushHere();
+            self.flush_aborted = true;
             return false;
         }
         self.msg_scroll_offset = 0;
         if (!renderMsgGridFromCache(self, 0)) {
-            self.abortFlushHere();
+            self.flush_aborted = true;
             return false;
         }
 
@@ -9692,7 +9680,7 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
     // Create or resize grid
     self.grid.resizeGrid(history_grid_id, height, width) catch |e| {
         self.log.write("[msg_history] resizeGrid failed: {any}\n", .{e});
-        self.abortFlushHere();
+        self.flush_aborted = true;
         return false;
     };
     self.grid.clearGrid(history_grid_id);
@@ -9725,7 +9713,7 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
         .start_col = -2,
     }) catch |e| {
         self.log.write("[msg_history] external_grids.put failed: {any}\n", .{e});
-        self.abortFlushHere();
+        self.flush_aborted = true;
         return false;
     };
 

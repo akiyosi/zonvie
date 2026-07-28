@@ -1240,11 +1240,6 @@ pub const Grid = struct {
     screen_cols: u32 = 0,
     // Dirty tracking (global grid only)
     dirty_all: bool = true,
-    /// Temporary diagnostic: return address of the markAllDirty() caller that
-    /// most recently raised dirty_all from false.
-    dirty_all_ra: usize = 0,
-    /// Temporary diagnostic: why the main scroll fast path was last blocked.
-    scroll_fast_path_block_reason: u8 = 0,
     dirty_rows: std.DynamicBitSetUnmanaged = .{},
 
     cells: []Cell = &[_]Cell{},
@@ -2060,7 +2055,6 @@ pub const Grid = struct {
 
     pub fn markAllDirty(self: *Grid) void {
         // Fast path: avoid setting all bits; dirty_all dominates.
-        if (!self.dirty_all) self.dirty_all_ra = @returnAddress();
         self.dirty_all = true;
     }
 
@@ -2112,7 +2106,6 @@ pub const Grid = struct {
         // path to shift by the wrong amount.
         if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
             self.scroll_fast_path_blocked = true;
-            self.scroll_fast_path_block_reason = 1;
             return;
         }
 
@@ -2722,7 +2715,6 @@ pub const Grid = struct {
                     self.recordScrolledGrid(grid_id, rows);
                     ps.rows = std.math.add(i32, ps.rows, rows) catch {
                         self.scroll_fast_path_blocked = true;
-                        self.scroll_fast_path_block_reason = 2;
                         self.scroll_touched_count = 0;
                         return;
                     };
@@ -2730,7 +2722,6 @@ pub const Grid = struct {
                 }
                 // Different grid or region: block fast path.
                 self.scroll_fast_path_blocked = true;
-                self.scroll_fast_path_block_reason = 3;
                 self.scroll_touched_count = 0;
             }
             self.scroll(top, bot, left, right, rows, cols);
@@ -2798,7 +2789,6 @@ pub const Grid = struct {
                         self.recordScrolledGrid(grid_id, rows);
                         ps.rows = std.math.add(i32, ps.rows, rows) catch {
                             self.scroll_fast_path_blocked = true;
-                            self.scroll_fast_path_block_reason = 4;
                             self.scroll_touched_count = 0;
                             return;
                         };
@@ -2806,7 +2796,6 @@ pub const Grid = struct {
                     }
                     // Different grid or region: block fast path.
                     self.scroll_fast_path_blocked = true;
-                    self.scroll_fast_path_block_reason = 5;
                     self.scroll_touched_count = 0;
                 }
                 // Saturating: see shiftTouchedRows' guard above.
