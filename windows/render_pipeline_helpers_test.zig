@@ -617,3 +617,77 @@ test "damage compaction preserves disjoint rectangles" {
     try std.testing.expectEqual(Rect{ .left = 0, .top = 0, .right = 10, .bottom = 10 }, rects[0]);
     try std.testing.expectEqual(Rect{ .left = 20, .top = 20, .right = 30, .bottom = 30 }, rects[1]);
 }
+
+// ---------------------------------------------------------------------------
+// DWrite cluster-map inversion
+//
+// include/zonvie_core.h states the contract: out_clusters[i] is the index of
+// the FIRST input scalar that produced glyph i. The macOS bridge satisfies it
+// by forwarding HarfBuzz's cluster values directly; these cases pin the same
+// contract for the DWrite side, which has to invert the map itself.
+// ---------------------------------------------------------------------------
+
+fn expectInversion(
+    cluster_map: []const u16,
+    scalar_idx: []const u32,
+    glyph_count: usize,
+    expected: []const u32,
+) !void {
+    var out: [8]u32 = @splat(0);
+    helpers.invertClusterMap(cluster_map, scalar_idx, glyph_count, &out);
+    try std.testing.expectEqualSlices(u32, expected, out[0..glyph_count]);
+}
+
+test "cluster inversion: one glyph per scalar" {
+    try expectInversion(
+        &.{ 0, 1, 2, 3 },
+        &.{ 0, 1, 2, 3 },
+        4,
+        &.{ 0, 1, 2, 3 },
+    );
+}
+
+test "cluster inversion: one scalar producing several glyphs" {
+    // A single position whose cluster covers two glyphs: both name that scalar.
+    try expectInversion(&.{0}, &.{0}, 2, &.{ 0, 0 });
+}
+
+test "cluster inversion: a surrogate pair is one scalar" {
+    // Both UTF-16 units carry the same scalar index, so the cluster's first and
+    // last position resolve identically. This case is immune by construction.
+    try expectInversion(&.{ 0, 0 }, &.{ 0, 0 }, 1, &.{0});
+}
+
+test "cluster inversion: many scalars to one glyph at the start of a run" {
+    // Positions 0-1 fold into glyph 0. The contract names scalar 0, not 1.
+    try expectInversion(
+        &.{ 0, 0, 1, 2 },
+        &.{ 0, 1, 2, 3 },
+        3,
+        &.{ 0, 2, 3 },
+    );
+}
+
+test "cluster inversion: many scalars to one glyph mid-run" {
+    // Positions 1-2 fold into glyph 1. This is the case shapeClustersValid
+    // cannot catch: [0,2,3] starts at zero and is monotonic, so a wrong answer
+    // here reaches vertex generation instead of falling back safely.
+    try expectInversion(
+        &.{ 0, 1, 1, 2 },
+        &.{ 0, 1, 2, 3 },
+        3,
+        &.{ 0, 1, 3 },
+    );
+}
+
+test "cluster inversion: a variation-selector emoji mid-run" {
+    // "a" followed by U+26A0 U+FE0F shaped as one glyph. Naming the last scalar
+    // makes the cluster look single-scalar and hands the rasterizer the
+    // invisible selector as the cluster's base.
+    try expectInversion(
+        &.{ 0, 1, 1 },
+        &.{ 0, 1, 2 },
+        2,
+        &.{ 0, 1 },
+    );
+}

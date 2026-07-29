@@ -3352,14 +3352,12 @@ pub const Renderer = struct {
                 out_x_offset[i] = 0;
                 out_y_offset[i] = 0;
             }
-            // Cluster map inversion
-            var char_ptr: usize = 0;
-            for (0..gcount) |gi| {
-                while (char_ptr + 1 < utf16_len and cluster_map[char_ptr + 1] <= @as(c.UINT16, @intCast(gi))) {
-                    char_ptr += 1;
-                }
-                out_clusters[gi] = utf16_to_scalar_idx[char_ptr];
-            }
+            render_pipeline_helpers.invertClusterMap(
+                cluster_map[0..utf16_len],
+                utf16_to_scalar_idx[0..utf16_len],
+                gcount,
+                out_clusters[0..gcount],
+            );
             return gcount;
         };
 
@@ -3400,17 +3398,15 @@ pub const Renderer = struct {
             // DEBUG: log non-ASCII glyph results from DWrite shaping
         }
 
-        // Cluster map inversion: DWrite cluster_map[char_j] → first glyph for char j
-        // Core needs out_clusters[glyph_i] → source scalar index
-        {
-            var char_ptr: usize = 0;
-            for (0..gcount) |gi| {
-                while (char_ptr + 1 < utf16_len and cluster_map[char_ptr + 1] <= @as(c.UINT16, @intCast(gi))) {
-                    char_ptr += 1;
-                }
-                out_clusters[gi] = utf16_to_scalar_idx[char_ptr];
-            }
-        }
+        // DWrite maps text position → first glyph; the core's contract is the
+        // inverse, naming the cluster's first source scalar. See
+        // render_pipeline_helpers.invertClusterMap for the cases.
+        render_pipeline_helpers.invertClusterMap(
+            cluster_map[0..utf16_len],
+            utf16_to_scalar_idx[0..utf16_len],
+            gcount,
+            out_clusters[0..gcount],
+        );
 
         return gcount;
     }

@@ -724,3 +724,36 @@ pub fn compactDamageRects(comptime Rect: type, rects: []Rect) usize {
     rects[out_len] = merged;
     return out_len + 1;
 }
+
+/// Invert DWrite's cluster map into the core's shaping-callback contract.
+///
+/// DWrite gives `cluster_map[text_pos] = first glyph index for that position`.
+/// `include/zonvie_core.h` requires the opposite direction, and specifically
+/// the FIRST source scalar of the cluster that produced each glyph (HarfBuzz
+/// convention, which the macOS bridge forwards directly).
+///
+/// Text positions sharing a `cluster_map` value form one cluster, and glyph
+/// `gi` belongs to the last cluster whose first glyph index is <= `gi`.
+pub fn invertClusterMap(
+    cluster_map: []const u16,
+    utf16_to_scalar_idx: []const u32,
+    glyph_count: usize,
+    out_clusters: []u32,
+) void {
+    if (cluster_map.len == 0) return;
+    const utf16_len = cluster_map.len;
+    var char_ptr: usize = 0;
+    var gi: usize = 0;
+    while (gi < glyph_count and gi < out_clusters.len) : (gi += 1) {
+        while (char_ptr + 1 < utf16_len and cluster_map[char_ptr + 1] <= @as(u16, @intCast(gi))) {
+            char_ptr += 1;
+        }
+        // char_ptr is the LAST position of the covering cluster. Walk back to
+        // its first: for a many-to-one cluster the two differ, and naming the
+        // last scalar both shifts placement by the cluster's width and hands
+        // the by-scalar fallback the wrong character.
+        var first = char_ptr;
+        while (first > 0 and cluster_map[first - 1] == cluster_map[char_ptr]) first -= 1;
+        out_clusters[gi] = utf16_to_scalar_idx[first];
+    }
+}
