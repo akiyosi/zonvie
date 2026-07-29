@@ -2581,13 +2581,27 @@ pub fn generateRowVertices(
                                 // rasterized again on every regeneration —
                                 // a full-viewport pass cost thousands of
                                 // rasterizations that the atlas already held.
-                                // Emoji keep the uncached path: their bitmap
-                                // depends on cluster context set just above.
+                                //
+                                // Emoji are cached on the same key, which is
+                                // sound because the key already names
+                                // everything the bitmap depends on. The
+                                // rasterizer receives either fb_scalar alone or
+                                // the cluster buildEmojiCluster assembles from
+                                // (fb_scalar, fb_extras); which of the two is
+                                // chosen is fb_is_emoji, and that is
+                                // isEmojiPresentation(fb_scalar) or
+                                // extrasMarkEmojiCluster(fb_extras). Both
+                                // branches, and the choice between them, are
+                                // therefore functions of the same values the
+                                // key folds in — equal keys cannot name
+                                // different pictures. Pinned by the cluster-key
+                                // and rasterizer-input tests at the end of this
+                                // file, and on the glass by the test/gui
+                                // scenario visual/emoji_cluster_cache.
                                 const fb_extras = getOverflowForCell(core, rc, r, fb_src_col);
                                 const fb_cache_key = clusterCacheKey(fb_scalar, style_index, fb_extras);
                                 const fb_cache_hash = clusterCacheHash(fb_scalar, style_index, fb_extras);
-                                const fb_cacheable = !fb_is_emoji and
-                                    glyph_cache_non_ascii != null and
+                                const fb_cacheable = glyph_cache_non_ascii != null and
                                     glyph_keys_non_ascii != null and
                                     GLYPH_CACHE_NON_ASCII_SIZE > 0;
                                 var fb_ge_opt: ?c_api.GlyphEntry = null;
@@ -2720,7 +2734,12 @@ pub fn generateRowVertices(
                                 const fb_key = clusterCacheKey(first_scalar, style_index, overflow_extras);
                                 const fb_hash = clusterCacheHash(first_scalar, style_index, overflow_extras);
 
-                                const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) blk: {
+                                // No single-scalar restriction: the key folds in
+                                // the cell's overflow extras, which is exactly
+                                // what buildEmojiCluster hands the rasterizer
+                                // below, so a multi-scalar cluster keys as
+                                // precisely as a single-scalar one.
+                                const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) blk: {
                                     const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
                                     if (probe.hit) |hit_idx| {
                                         ge = glyph_cache_non_ascii.?[hit_idx];
@@ -2743,7 +2762,7 @@ pub fn generateRowVertices(
                                         ge = fb_ge;
                                         glyph_ok = true;
                                         // Store in non-ASCII cache for subsequent rows
-                                        if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0 and next_cluster == this_cluster + 1) {
+                                        if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
                                             const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
                                             glyph_cache_non_ascii.?[probe.insert] = fb_ge;
                                             glyph_keys_non_ascii.?[probe.insert] = fb_key;
@@ -9784,12 +9803,23 @@ pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, co
 /// (VS16 U+FE0F, ZWJ U+200D, or skin tone modifiers U+1F3FB..1F3FF).
 /// Any of these indicate the cell is part of a multi-codepoint emoji cluster
 /// that needs color emoji rendering.
-pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) bool {
-    const extras = getOverflowForCell(core, rc, comp_row, comp_col) orelse return false;
+/// Whether a cluster's tail marks it as needing color-emoji rendering.
+///
+/// Split out from cellIsEmojiCluster because the fallback glyph cache depends
+/// on this being a function of the extras and nothing else: the extras are in
+/// the cache key, so if this answer could vary for identical extras, one key
+/// would name two different bitmaps. Keeping it callable on a plain slice is
+/// what makes that property testable.
+pub fn extrasMarkEmojiCluster(extras: []const u32) bool {
     for (extras) |extra| {
         if (extra == 0xFE0F or extra == 0x200D or (extra >= 0x1F3FB and extra <= 0x1F3FF)) return true;
     }
     return false;
+}
+
+pub fn cellIsEmojiCluster(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) bool {
+    const extras = getOverflowForCell(core, rc, comp_row, comp_col) orelse return false;
+    return extrasMarkEmojiCluster(extras);
 }
 
 /// Build a cache key for a cell's full cluster (base scalar + overflow extras + style).
@@ -9962,18 +9992,29 @@ fn ensureCachedPhase2Glyph(
 }
 
 /// Populate core.emoji_cluster_buf from a cell's base scalar + overflow extras.
-fn setEmojiClusterFromOverflow(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32, base_scalar: u32) void {
-    core.emoji_cluster_buf[0] = base_scalar;
+/// Lay a cluster out for the frontend rasterizer: base scalar first, then the
+/// cell's overflow tail, truncated to the buffer. Returns the length written.
+///
+/// This is the entire input the rasterizer sees, and it is built from exactly
+/// the two values the fallback cache key folds in. Extracted so that pairing
+/// can be asserted directly rather than inferred from the two call sites.
+pub fn buildEmojiCluster(buf: []u32, base_scalar: u32, extras: ?[]const u32) u8 {
+    buf[0] = base_scalar;
     var len: u8 = 1;
-    if (getOverflowForCell(core, rc, comp_row, comp_col)) |extras| {
-        for (extras) |extra| {
-            if (len < core.emoji_cluster_buf.len) {
-                core.emoji_cluster_buf[len] = extra;
+    if (extras) |ex| {
+        for (ex) |extra| {
+            if (len < buf.len) {
+                buf[len] = extra;
                 len += 1;
             }
         }
     }
-    core.emoji_cluster_len = len;
+    return len;
+}
+
+fn setEmojiClusterFromOverflow(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32, base_scalar: u32) void {
+    const extras = getOverflowForCell(core, rc, comp_row, comp_col);
+    core.emoji_cluster_len = buildEmojiCluster(&core.emoji_cluster_buf, base_scalar, extras);
 }
 
 /// Result of scanning one emoji/grapheme cluster from a UTF-8 string.
@@ -12991,4 +13032,136 @@ test "message timeout conversion rejects invalid values and saturates" {
     try std.testing.expectEqual(std.math.maxInt(u32), messageTimeoutMs(1.0e30));
     try std.testing.expectEqual(@as(?i128, 4 * std.time.ns_per_s), messageTimeoutNs(4.0));
     try std.testing.expectEqual(@as(?i128, null), messageTimeoutNs(std.math.nan(f32)));
+}
+
+// ---------------------------------------------------------------------------
+// Emoji cluster caching: equal keys must name equal pictures
+//
+// The fallback glyph cache stores a rasterized cluster under
+// clusterCacheKey(base_scalar, style_index, overflow_extras), while the
+// rasterizer is handed whatever buildEmojiCluster assembles. Caching is only
+// sound if the second is a function of the first, so these pin the chain:
+//
+//   key  ⇒ (base_scalar, style, extras)      -- cluster key tests
+//        ⇒ emoji-vs-plain branch              -- extrasMarkEmojiCluster
+//        ⇒ exact scalars handed to rasterize  -- buildEmojiCluster
+//        ⇒ bitmap
+//
+// A key coarser than the bitmap renders one emoji as another, and nothing
+// below the glass notices: the hit is a hit and the vertices are well-formed.
+// The test/gui scenario visual/emoji_cluster_cache checks the same property on
+// real pixels; these check it where no screen — and no screen-recording
+// permission — is required, which is the only place a build host can.
+// ---------------------------------------------------------------------------
+
+const ZWJ: u32 = 0x200D;
+const VS16: u32 = 0xFE0F;
+const WOMAN: u32 = 0x1F469;
+const LAPTOP: u32 = 0x1F4BB;
+const MICROSCOPE: u32 = 0x1F52C;
+const HEART: u32 = 0x2764;
+const WARNING: u32 = 0x26A0;
+
+test "cluster key separates a bare base from the same base with a ZWJ tail" {
+    // 👩 vs 👩‍💻: a key built from the base scalar alone collapses these.
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, null) !=
+        clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }));
+}
+
+test "cluster key separates two ZWJ sequences sharing base and joiner" {
+    // 👩‍💻 vs 👩‍🔬 — the pair flush.zig's own key comment names.
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
+}
+
+test "cluster key separates text and emoji presentation of one scalar" {
+    // ❤ vs ❤️ differ only by a variation selector carried in the overflow map.
+    const text = clusterCacheKey(HEART, 0, null);
+    try std.testing.expect(text != clusterCacheKey(HEART, 0, &.{VS16}));
+    // An empty tail must agree with no tail: both mean the rasterizer receives
+    // the base scalar alone, so they must not occupy separate entries.
+    try std.testing.expectEqual(text, clusterCacheKey(HEART, 0, &.{}));
+}
+
+test "cluster key depends on tail order, not just the multiset" {
+    // Distinct grapheme clusters can share codepoints in a different order; a
+    // commutative fold would hand them one bitmap.
+    try std.testing.expect(clusterCacheKey(WOMAN, 0, &.{ ZWJ, LAPTOP, ZWJ, MICROSCOPE }) !=
+        clusterCacheKey(WOMAN, 0, &.{ ZWJ, MICROSCOPE, ZWJ, LAPTOP }));
+}
+
+test "cluster key separates styles and bases" {
+    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
+        clusterCacheKey(HEART, 0, &.{VS16}));
+    try std.testing.expect(clusterCacheKey(WARNING, 0, &.{VS16}) !=
+        clusterCacheKey(WARNING, 1, &.{VS16}));
+}
+
+test "cluster hash tracks the key across the same distinctions" {
+    // The hash only picks the probe slot, so a collision costs a miss rather
+    // than a wrong glyph — but a hash ignoring the tail would send every
+    // sequence sharing a base to one slot and evict them in a loop.
+    try std.testing.expect(clusterCacheHash(WOMAN, 0, &.{ ZWJ, LAPTOP }) !=
+        clusterCacheHash(WOMAN, 0, &.{ ZWJ, MICROSCOPE }));
+    try std.testing.expect(clusterCacheHash(HEART, 0, null) !=
+        clusterCacheHash(HEART, 0, &.{VS16}));
+}
+
+test "the emoji branch is decided by the tail alone" {
+    // Same extras must give the same answer no matter which cell they came
+    // from — the key carries the extras but not the cell.
+    try std.testing.expect(extrasMarkEmojiCluster(&.{VS16}));
+    try std.testing.expect(extrasMarkEmojiCluster(&.{ ZWJ, LAPTOP }));
+    try std.testing.expect(extrasMarkEmojiCluster(&.{0x1F3FB})); // skin tone
+    try std.testing.expect(!extrasMarkEmojiCluster(&.{}));
+    try std.testing.expect(!extrasMarkEmojiCluster(&.{0x0301})); // combining acute
+    const tail = [_]u32{ ZWJ, MICROSCOPE };
+    try std.testing.expectEqual(extrasMarkEmojiCluster(&tail), extrasMarkEmojiCluster(&tail));
+}
+
+test "the cluster handed to the rasterizer is base scalar then tail" {
+    var buf: [16]u32 = undefined;
+    const len = buildEmojiCluster(&buf, WOMAN, &.{ ZWJ, LAPTOP });
+    try std.testing.expectEqual(@as(u8, 3), len);
+    try std.testing.expectEqualSlices(u32, &.{ WOMAN, ZWJ, LAPTOP }, buf[0..len]);
+
+    const bare = buildEmojiCluster(&buf, HEART, null);
+    try std.testing.expectEqual(@as(u8, 1), bare);
+    try std.testing.expectEqualSlices(u32, &.{HEART}, buf[0..bare]);
+
+    // An empty tail must be indistinguishable from no tail, matching the key.
+    try std.testing.expectEqual(bare, buildEmojiCluster(&buf, HEART, &.{}));
+}
+
+test "clusters that key differently are handed different scalars" {
+    // Carried one step past the key tests: distinct keys must also mean
+    // distinct rasterizer input. A key finer than the picture merely wastes
+    // entries; a key coarser than it is the defect this guards.
+    const cases = [_]struct { base: u32, extras: ?[]const u32 }{
+        .{ .base = WOMAN, .extras = null },
+        .{ .base = WOMAN, .extras = &.{ ZWJ, LAPTOP } },
+        .{ .base = WOMAN, .extras = &.{ ZWJ, MICROSCOPE } },
+        .{ .base = HEART, .extras = null },
+        .{ .base = HEART, .extras = &.{VS16} },
+    };
+    var buf_a: [16]u32 = undefined;
+    var buf_b: [16]u32 = undefined;
+    for (cases, 0..) |a, i| {
+        for (cases, 0..) |b, j| {
+            if (i == j) continue;
+            try std.testing.expect(clusterCacheKey(a.base, 0, a.extras) !=
+                clusterCacheKey(b.base, 0, b.extras));
+            const la = buildEmojiCluster(&buf_a, a.base, a.extras);
+            const lb = buildEmojiCluster(&buf_b, b.base, b.extras);
+            try std.testing.expect(!std.mem.eql(u32, buf_a[0..la], buf_b[0..lb]));
+        }
+    }
+}
+
+test "a tail longer than the cluster buffer truncates instead of overrunning" {
+    var buf: [4]u32 = undefined;
+    const long = [_]u32{ ZWJ, LAPTOP, ZWJ, MICROSCOPE, ZWJ, HEART };
+    const len = buildEmojiCluster(&buf, WOMAN, &long);
+    try std.testing.expectEqual(@as(u8, 4), len);
+    try std.testing.expectEqualSlices(u32, &.{ WOMAN, ZWJ, LAPTOP, ZWJ }, buf[0..len]);
 }
