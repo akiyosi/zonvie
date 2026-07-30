@@ -1520,15 +1520,36 @@ func ensureSurfaceRowBuffer(
         //   can leave the same buffer object shared into a set that is
         //   in-flight while src already holds a detached replacement, so
         //   comparing against src alone misses it (torn row mid-scroll).
+        //
+        // Reuse deliberately accepts storage larger than this row needs. An
+        // oversize rejection here belongs to 91bb4ad's async provisioning
+        // design, which reached this function with allowAllocation: false, so
+        // the rejection returned nil and the provisioner refilled the slot off
+        // the redraw callback. de6c402 restored synchronous allocation at the
+        // hot sites, so the same rejection now lands as device.makeBuffer()
+        // inside the redraw callback instead. The provisioner still exists as
+        // the allocation-failure fallback.
+        //
+        // Whether it fires depends on how the row widths a slot sees line up
+        // with the pool-and-ring cycle, not on any single width ratio: four
+        // rotating widths measured 45 allocations per flush where two or three
+        // measured none. Worst case is a flush that re-submits every row
+        // (base grid, multi-row or batched scroll, a split overlapping the
+        // scroll region), where a slot warmed to its widest demand then misses
+        // on every narrower row: 26.7 makeBuffer per flush against 0.02, and
+        // resident growth unbounded against flat. When the scroll fast path is
+        // available only the vacated rows are resubmitted and the same effect
+        // is 0.77 against 0.06.
+        //
+        // Oversize storage is reclaimed by the retire* helpers on layout
+        // contraction, not here. Content narrowing at a constant window size
+        // is never reclaimed; that costs a per-slot high-water mark, measured
+        // at 12.5 MB retained for 60x200.
         var reused = false
         if row < bufferSet.detachPoolRowBuffers.count,
            let poolBuf = bufferSet.detachPoolRowBuffers[row],
            row < bufferSet.detachPoolRowCapacities.count,
            bufferSet.detachPoolRowCapacities[row] >= nextCap,
-           !surfaceCapacityIsOversized(
-               bufferSet.detachPoolRowCapacities[row],
-               neededBytes: neededBytes
-           ),
            poolBuf !== srcRowBuffer,
            poolBuf !== inflightRowBuffers.0,
            poolBuf !== inflightRowBuffers.1
@@ -1578,7 +1599,6 @@ func ensureSurfaceRowBuffer(
                 let buf = (slot == 0) ? bufferSet.privateRowBuffers0[row] : bufferSet.privateRowBuffers1[row]
                 let cap = (slot == 0) ? bufferSet.privateRowCapacities0[row] : bufferSet.privateRowCapacities1[row]
                 if let priv = buf, cap >= nextCap, priv !== srcRowBuffer,
-                   !surfaceCapacityIsOversized(cap, neededBytes: neededBytes),
                    priv !== inflightRowBuffers.0, priv !== inflightRowBuffers.1 {
                     pickedSlotIdx = slot
                     bufferSet.rowState.buffers[row] = priv

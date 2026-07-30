@@ -232,6 +232,175 @@ private enum SurfaceRowProvisionTests {
         require(sets[2].mainVertexCount == 1, "narrow main count was not published")
     }
 
+    private static func verifyOversizedRowReuseAvoidsAllocation(device: MTLDevice) {
+        // Row bytes track ink length, so a single slot cycles wide -> medium ->
+        // narrow as source lines scroll past it. Once the slot has been warmed
+        // to its widest demand, every narrower demand must reuse that storage:
+        // rejecting it as oversize here lands as device.makeBuffer() inside the
+        // synchronous redraw callback, one allocation per row per flush.
+        let set = SurfaceBufferSet()
+        let cycle = [1_024, 64, 1]
+        var identities = Set<ObjectIdentifier>()
+        var warmBuffer: MTLBuffer?
+
+        for step in 0..<12 {
+            let vertexCount = cycle[step % cycle.count]
+            guard let neededBytes = surfaceSafeNeededBytes(vertexCount: vertexCount) else {
+                require(false, "cycle step \(step) byte size overflowed")
+                return
+            }
+            guard let buffer = ensureSurfaceRowBuffer(
+                bufferSet: set,
+                sourceSet: nil,
+                device: device,
+                row: 0,
+                vertexCount: vertexCount,
+                maxRowBuffers: 16
+            ) else {
+                require(false, "row buffer was refused at cycle step \(step)")
+                return
+            }
+            require(
+                buffer.length >= neededBytes,
+                "reused row buffer is smaller than the row it must hold"
+            )
+            require(
+                set.rowState.capacities[0] <= buffer.length,
+                "published row capacity exceeded the reused buffer"
+            )
+            identities.insert(ObjectIdentifier(buffer))
+            if warmBuffer == nil {
+                warmBuffer = buffer
+            }
+            require(
+                buffer === warmBuffer,
+                "cycle step \(step) replaced the warm row buffer instead of reusing it"
+            )
+        }
+
+        require(
+            identities.count == 1,
+            "wide/narrow cycling allocated \(identities.count) row buffers on the redraw path"
+        )
+    }
+
+    private static func verifyRowReuseHonoursAliasGuards(device: MTLDevice) {
+        // Reuse must stay blocked for storage the GPU or the committed set can
+        // still read. These are the only remaining rejections in the detach and
+        // private-slot guards, so nothing else keeps a torn row out.
+        let source = SurfaceBufferSet()
+        let target = SurfaceBufferSet()
+        let wideVertexCount = 1_024
+
+        guard let ownBuffer = ensureSurfaceRowBuffer(
+            bufferSet: target,
+            sourceSet: nil,
+            device: device,
+            row: 0,
+            vertexCount: wideVertexCount,
+            maxRowBuffers: 16
+        ) else {
+            require(false, "alias-guard target seeding failed")
+            return
+        }
+        guard let committed = ensureSurfaceRowBuffer(
+            bufferSet: source,
+            sourceSet: nil,
+            device: device,
+            row: 0,
+            vertexCount: wideVertexCount,
+            maxRowBuffers: 16
+        ) else {
+            require(false, "alias-guard source seeding failed")
+            return
+        }
+        source.rowState.counts[0] = wideVertexCount
+        source.knownTotalRows = 1
+        source.knownTotalCols = 1_000
+        target.knownTotalRows = 1
+        target.knownTotalCols = 1_000
+
+        copySurfaceBufferSetRowState(from: source, to: target)
+        require(
+            target.rowState.buffers[0] === committed,
+            "shallow copy did not share the committed row buffer"
+        )
+        require(
+            target.detachPoolRowBuffers[0] === ownBuffer,
+            "shallow copy did not stage the detach-pool candidate"
+        )
+
+        // The detach candidate is now wide enough for this narrow row and is no
+        // longer oversize-rejected, so only the in-flight guard can exclude it.
+        guard let detached = ensureSurfaceRowBuffer(
+            bufferSet: target,
+            sourceSet: source,
+            device: device,
+            row: 0,
+            vertexCount: 1,
+            maxRowBuffers: 16,
+            inflightRowBuffers: (ownBuffer, nil)
+        ) else {
+            require(false, "alias-guarded detach failed to produce a writable row")
+            return
+        }
+        require(detached !== committed, "detach wrote into the committed row buffer")
+        require(detached !== ownBuffer, "detach wrote into a GPU in-flight row buffer")
+        require(
+            target.rowState.buffers[0] === detached,
+            "detached row buffer was not published to the write set"
+        )
+    }
+
+    private static func verifyPrivateSlotReuseHonoursAliasGuards(device: MTLDevice) {
+        // The private 2-slot ring is where most reuse now lands, and with the
+        // oversize rejection gone the src and in-flight identity checks are its
+        // only remaining rejections. Warm both slots, then declare both to be
+        // GPU in-flight: the row must allocate rather than write into either.
+        let set = SurfaceBufferSet()
+
+        // Allocation targets nextSlot and then toggles it, so two passes with
+        // the active buffer cleared and a growing demand land one fresh buffer
+        // in each ring slot: the second pass outgrows slot 0 and cannot reuse
+        // it, which is what drives the allocation into slot 1.
+        for (pass, vertexCount) in [512, 1_024].enumerated() {
+            guard ensureSurfaceRowBuffer(
+                bufferSet: set,
+                sourceSet: nil,
+                device: device,
+                row: 0,
+                vertexCount: vertexCount,
+                maxRowBuffers: 16
+            ) != nil else {
+                require(false, "ring warm pass \(pass) was refused")
+                return
+            }
+            set.rowState.buffers[0] = nil
+            set.rowState.capacities[0] = 0
+        }
+
+        guard let slot0 = set.privateRowBuffers0[0], let slot1 = set.privateRowBuffers1[0] else {
+            require(false, "both private ring slots were not warmed")
+            return
+        }
+        require(slot0 !== slot1, "private ring slots share one buffer")
+
+        guard let fresh = ensureSurfaceRowBuffer(
+            bufferSet: set,
+            sourceSet: nil,
+            device: device,
+            row: 0,
+            vertexCount: 1,
+            maxRowBuffers: 16,
+            inflightRowBuffers: (slot0, slot1)
+        ) else {
+            require(false, "row was refused while both ring slots were in flight")
+            return
+        }
+        require(fresh !== slot0, "narrow row wrote into an in-flight ring slot 0")
+        require(fresh !== slot1, "narrow row wrote into an in-flight ring slot 1")
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
@@ -243,6 +412,9 @@ private enum SurfaceRowProvisionTests {
         verifyInFlightZeroRetirement(device: device, owner: "main")
         verifyInFlightZeroRetirement(device: device, owner: "external")
         verifyFlatMainZeroRetirement(device: device)
+        verifyOversizedRowReuseAvoidsAllocation(device: device)
+        verifyRowReuseHonoursAliasGuards(device: device)
+        verifyPrivateSlotReuseHonoursAliasGuards(device: device)
         for shape in [(3, 0), (0, 4), (0, 0)] {
             let layoutSet = SurfaceBufferSet()
             require(
