@@ -76,6 +76,11 @@ pub const Highlights = struct {
     alloc: std.mem.Allocator,
     map: std.AutoHashMap(u32, Attr),
 
+    // Changes only when the bold/italic rasterization inputs for an hl_id
+    // change. Atlas-capacity recovery uses this to distinguish a genuinely
+    // new glyph working set from color-only highlight updates.
+    glyph_style_rev: u64 = 0,
+
     // For "hl_group_set"
     groups: std.StringHashMap(u32),
 
@@ -104,6 +109,23 @@ pub const Highlights = struct {
         self.groups.deinit();
 
         self.map.deinit();
+    }
+
+    /// Drop all state owned by one Neovim UI attachment while retaining map
+    /// capacity. The next ui_attach sends the complete highlight table again.
+    pub fn reset(self: *Highlights) void {
+        var it = self.groups.iterator();
+        while (it.next()) |e| {
+            self.alloc.free(@constCast(e.key_ptr.*));
+        }
+        self.groups.clearRetainingCapacity();
+        self.map.clearRetainingCapacity();
+        self.glyph_style_rev +%= 1;
+        self.default_fg = 0x00FFFFFF;
+        self.default_bg = 0x00000000;
+        self.default_sp = 0x00000000;
+        self.groups_changed = false;
+        self.default_colors_changed = false;
     }
 
     pub fn setDefaults(self: *Highlights, fg: ?u32, bg: ?u32, sp: ?u32) void {
@@ -154,7 +176,11 @@ pub const Highlights = struct {
             .overline = styles.overline,
             .has_url = has_url,
         };
+        const old = self.map.get(id);
         try self.map.put(id, a);
+        if (old == null or old.?.bold != a.bold or old.?.italic != a.italic) {
+            self.glyph_style_rev +%= 1;
+        }
     }
 
     // NOTE: get() remains unchanged (returns fg/bg only) because the current

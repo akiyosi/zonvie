@@ -26,20 +26,20 @@ fn setupGridWithSubgrid(alloc: std.mem.Allocator, main_rows: u32, main_cols: u32
 }
 
 /// Populate N overflow entries for a given grid_id, row 0, cols 0..N-1.
-fn populateOverflow(g: *Grid, grid_id: i64, count: u32) void {
+fn populateOverflow(g: *Grid, grid_id: i64, count: u32) !void {
     var col: u32 = 0;
     while (col < count) : (col += 1) {
-        g.putOverflow(grid_id, 0, col, &[_]u32{0xFE0F});
+        try g.putCellGridCluster(grid_id, 0, col, 'X', 0, &.{0xFE0F});
     }
 }
 
 /// Populate N overflow entries across multiple rows.
-fn populateOverflowRows(g: *Grid, grid_id: i64, row_start: u32, row_end: u32, cols: u32) void {
+fn populateOverflowRows(g: *Grid, grid_id: i64, row_start: u32, row_end: u32, cols: u32) !void {
     var row = row_start;
     while (row < row_end) : (row += 1) {
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
-            g.putOverflow(grid_id, row, col, &[_]u32{0xFE0F});
+            try g.putCellGridCluster(grid_id, row, col, 'X', 0, &.{0xFE0F});
         }
     }
 }
@@ -63,7 +63,7 @@ test "put and get overflow" {
     var g = try setupGrid(alloc, 10, 80);
     defer g.deinit();
 
-    g.putOverflow(1, 0, 5, &[_]u32{ 0xFE0F, 0x200D });
+    try g.putCellGridCluster(1, 0, 5, 'X', 0, &.{ 0xFE0F, 0x200D });
 
     const extras = g.getOverflow(1, 0, 5);
     try std.testing.expect(extras != null);
@@ -80,7 +80,7 @@ test "remove overflow" {
     var g = try setupGrid(alloc, 10, 80);
     defer g.deinit();
 
-    g.putOverflow(1, 3, 7, &[_]u32{0xFE0F});
+    try g.putCellGridCluster(1, 3, 7, 'X', 0, &.{0xFE0F});
     try std.testing.expect(g.getOverflow(1, 3, 7) != null);
 
     g.removeOverflow(1, 3, 7);
@@ -95,8 +95,8 @@ test "put overwrites existing overflow" {
     var g = try setupGrid(alloc, 10, 80);
     defer g.deinit();
 
-    g.putOverflow(1, 0, 0, &[_]u32{0xFE0F});
-    g.putOverflow(1, 0, 0, &[_]u32{ 0xFE0E, 0x200D });
+    try g.putCellGridCluster(1, 0, 0, 'X', 0, &.{0xFE0F});
+    try g.putCellGridCluster(1, 0, 0, 'X', 0, &.{ 0xFE0E, 0x200D });
 
     const extras = g.getOverflow(1, 0, 0);
     try std.testing.expect(extras != null);
@@ -114,7 +114,7 @@ test "clearOverflowForGrid handles >64 entries without double-free" {
     defer g.deinit();
 
     // Populate 100 overflow entries for grid 1
-    populateOverflow(&g, 1, 100);
+    try populateOverflow(&g, 1, 100);
     try std.testing.expectEqual(@as(u32, 100), countOverflowForGrid(&g, 1));
 
     g.clearOverflowForGrid(1);
@@ -128,8 +128,8 @@ test "clearOverflowForGrid does not affect other grids" {
     defer g.deinit();
 
     // 80 entries for grid 1, 80 for grid 2
-    populateOverflow(&g, 1, 80);
-    populateOverflow(&g, 2, 80);
+    try populateOverflow(&g, 1, 80);
+    try populateOverflow(&g, 2, 80);
     try std.testing.expectEqual(@as(u32, 160), g.cell_overflow.count());
 
     g.clearOverflowForGrid(1);
@@ -146,7 +146,7 @@ test "clearGrid removes overflow entries" {
     var g = try setupGrid(alloc, 10, 200);
     defer g.deinit();
 
-    populateOverflow(&g, 1, 100);
+    try populateOverflow(&g, 1, 100);
     g.clearGrid(1);
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 1));
 }
@@ -157,7 +157,7 @@ test "resizeGrid preserves overflow in overlap region and trims out-of-bounds" {
     defer g.deinit();
 
     // 100 entries at row 0, cols 0..99
-    populateOverflow(&g, 1, 100);
+    try populateOverflow(&g, 1, 100);
     try std.testing.expectEqual(@as(u32, 100), countOverflowForGrid(&g, 1));
 
     // Resize to 20 rows, 50 cols → cols 50..99 are out of bounds
@@ -179,7 +179,7 @@ test "resizeGrid shrinking rows trims overflow" {
     defer g.deinit();
 
     // Entries at rows 0..19, col 0
-    populateOverflowRows(&g, 1, 0, 20, 1);
+    try populateOverflowRows(&g, 1, 0, 20, 1);
     try std.testing.expectEqual(@as(u32, 20), countOverflowForGrid(&g, 1));
 
     // Shrink to 10 rows → rows 10..19 out of bounds
@@ -201,7 +201,7 @@ test "scrollOverflow moves entries correctly (scroll up)" {
     // Put overflow at rows 5..14 (10 rows), col 0
     var row: u32 = 5;
     while (row < 15) : (row += 1) {
-        g.putOverflow(1, row, 0, &[_]u32{0xFE0F});
+        try g.putCellGridCluster(1, row, 0, 'X', 0, &.{0xFE0F});
     }
     try std.testing.expectEqual(@as(u32, 10), countOverflowForGrid(&g, 1));
 
@@ -230,8 +230,8 @@ test "scrollOverflow moves entries correctly (scroll down)" {
     var g = try setupGrid(alloc, 100, 80);
     defer g.deinit();
 
-    g.putOverflow(1, 2, 0, &[_]u32{0xFE0F});
-    g.putOverflow(1, 3, 0, &[_]u32{0xFE0F});
+    try g.putCellGridCluster(1, 2, 0, 'X', 0, &.{0xFE0F});
+    try g.putCellGridCluster(1, 3, 0, 'X', 0, &.{0xFE0F});
 
     // Scroll down by 5 in region [0, 20)
     g.scrollOverflow(1, 0, 20, 0, 80, -5);
@@ -249,7 +249,7 @@ test "scrollOverflow handles >64 entries" {
     defer g.deinit();
 
     // 100 entries across rows 10..19, cols 0..9
-    populateOverflowRows(&g, 1, 10, 20, 10);
+    try populateOverflowRows(&g, 1, 10, 20, 10);
     try std.testing.expectEqual(@as(u32, 100), countOverflowForGrid(&g, 1));
 
     // Scroll up by 5 in region [0, 100)
@@ -273,7 +273,7 @@ test "scrollOverflow discards scrolled-out entries (>64)" {
     defer g.deinit();
 
     // 100 entries at rows 0..9, cols 0..9
-    populateOverflowRows(&g, 1, 0, 10, 10);
+    try populateOverflowRows(&g, 1, 0, 10, 10);
     try std.testing.expectEqual(@as(u32, 100), countOverflowForGrid(&g, 1));
 
     // Scroll up by 10 in region [0, 20) → all entries scrolled out
@@ -291,13 +291,54 @@ test "global grid scroll with shift >= height clears overflow" {
     var g = try setupGrid(alloc, 50, 80);
     defer g.deinit();
 
-    populateOverflow(&g, 1, 70);
+    try populateOverflow(&g, 1, 70);
     try std.testing.expectEqual(@as(u32, 70), countOverflowForGrid(&g, 1));
 
     // Scroll up by 50 in region [0, 50) — shift >= height → early return path
     g.scroll(0, 50, 0, 80, 50, 0);
 
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 1));
+}
+
+test "scrollGrid normalizes extreme delta and clears subgrid overflow with cells" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 4, 4, 4, 4);
+    defer g.deinit();
+
+    try g.putCellGridCluster(2, 1, 1, 'X', 3, &.{0xFE0F});
+    try g.putCellGridCluster(2, 3, 3, 'Y', 4, &.{0x200D});
+
+    g.scrollGrid(2, 0, std.math.maxInt(u32), 0, std.math.maxInt(u32), -10, 0);
+
+    const sg = g.sub_grids.get(2).?;
+    for (sg.cells) |cell| {
+        try std.testing.expectEqual(@as(u32, ' '), cell.cp);
+        try std.testing.expectEqual(@as(u32, 0), cell.hl);
+    }
+    try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 2));
+    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.top);
+    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.bot);
+    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.left);
+    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.right);
+    try std.testing.expectEqual(@as(i32, -4), g.pending_scroll.?.rows);
+}
+
+test "scrollGrid rejects reversed normalized region without touching overflow" {
+    const alloc = std.testing.allocator;
+    var g = try setupGridWithSubgrid(alloc, 4, 4, 4, 4);
+    defer g.deinit();
+
+    try g.putCellGridCluster(2, 1, 1, 'X', 3, &.{0xFE0F});
+    const content_rev = g.content_rev;
+
+    g.scrollGrid(2, 3, 1, 0, std.math.maxInt(u32), std.math.minInt(i32), 0);
+
+    try std.testing.expect(g.pending_scroll == null);
+    try std.testing.expectEqual(content_rev, g.content_rev);
+    const cell = g.sub_grids.get(2).?.cells[5];
+    try std.testing.expectEqual(@as(u32, 'X'), cell.cp);
+    try std.testing.expectEqual(@as(u32, 3), cell.hl);
+    try std.testing.expect(g.getOverflow(2, 1, 1) != null);
 }
 
 // ============================================================================
@@ -310,7 +351,7 @@ test "clearOverflowRect handles >64 entries" {
     defer g.deinit();
 
     // 100 entries at row 0, cols 0..99
-    populateOverflow(&g, 1, 100);
+    try populateOverflow(&g, 1, 100);
 
     // Clear rect covering cols 0..49 (50 entries)
     g.clearOverflowRect(1, 0, 1, 0, 50);
@@ -330,10 +371,10 @@ test "destroyGrid removes overflow for that grid" {
     var g = try setupGridWithSubgrid(alloc, 10, 200, 10, 200);
     defer g.deinit();
 
-    populateOverflow(&g, 1, 50);
-    populateOverflow(&g, 2, 50);
+    try populateOverflow(&g, 1, 50);
+    try populateOverflow(&g, 2, 50);
 
-    g.destroyGrid(2);
+    try g.destroyGrid(2);
     try std.testing.expectEqual(@as(u32, 50), countOverflowForGrid(&g, 1));
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 2));
 }
@@ -411,7 +452,7 @@ test "getOverflowForCell prefers float overlay over persistent map" {
 
     // Set up ext grid (id=5) with VS16 overflow at (2, 3)
     try core.grid.resizeGrid(5, 10, 80);
-    core.grid.putOverflow(5, 2, 3, &[_]u32{0xFE0F});
+    try core.grid.putCellGridCluster(5, 2, 3, 0x26A0, 0, &.{0xFE0F});
 
     // Set up RenderCells with grid_id=5 (simulating ext grid row composition)
     var rc = try setupRenderCells(alloc, 80, 5);
@@ -455,7 +496,7 @@ test "cellIsEmojiCluster with float overlay" {
     defer core.deinitForTest();
 
     try core.grid.resizeGrid(5, 10, 80);
-    core.grid.putOverflow(5, 0, 0, &[_]u32{0xFE0F}); // base has VS16
+    try core.grid.putCellGridCluster(5, 0, 0, 0x26A0, 0, &.{0xFE0F}); // base has VS16
 
     var rc = try setupRenderCells(alloc, 80, 5);
     defer rc.deinit(alloc);
@@ -487,19 +528,19 @@ test "cellIsEmojiCluster detects ZWJ in overflow" {
     defer rc.deinit(alloc);
 
     // ZWJ sequence: 👩‍💻 = U+1F469 + U+200D + U+1F4BB
-    core.grid.putOverflow(5, 0, 0, &[_]u32{ 0x200D, 0x1F4BB });
+    try core.grid.putCellGridCluster(5, 0, 0, 0x1F469, 0, &.{ 0x200D, 0x1F4BB });
     try std.testing.expect(flush_mod.cellIsEmojiCluster(&core, &rc, 0, 0));
 
     // Skin tone modifier: 👩🏽 = U+1F469 + U+1F3FD
-    core.grid.putOverflow(5, 0, 1, &[_]u32{0x1F3FD});
+    try core.grid.putCellGridCluster(5, 0, 1, 0x1F469, 0, &.{0x1F3FD});
     try std.testing.expect(flush_mod.cellIsEmojiCluster(&core, &rc, 0, 1));
 
     // Non-emoji combining: U+0308 (combining diaeresis) → NOT emoji
-    core.grid.putOverflow(5, 0, 2, &[_]u32{0x0308});
+    try core.grid.putCellGridCluster(5, 0, 2, 'a', 0, &.{0x0308});
     try std.testing.expect(!flush_mod.cellIsEmojiCluster(&core, &rc, 0, 2));
 
     // VS16 still works
-    core.grid.putOverflow(5, 0, 3, &[_]u32{0xFE0F});
+    try core.grid.putCellGridCluster(5, 0, 3, 0x26A0, 0, &.{0xFE0F});
     try std.testing.expect(flush_mod.cellIsEmojiCluster(&core, &rc, 0, 3));
 }
 

@@ -4,7 +4,6 @@ const app_mod = @import("app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
-const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
 const dialogs = @import("ui/dialogs.zig");
 const window = @import("window.zig");
@@ -32,8 +31,8 @@ fn makeIntResource(id: u16) ?*const anyopaque {
 /// argument nor the returned handle is forced through an alignment assertion.
 extern "user32" fn LoadIconW(hInstance: c.HINSTANCE, lpIconName: ?*const anyopaque) callconv(.winapi) c.HICON;
 
-/// Custom panic handler for debug builds that prints stack traces.
-/// In release builds, falls back to std default behavior.
+/// Custom panic handler that never writes synchronously to stderr or the
+/// configured log sink. Either may be a stopped pipe during teardown.
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
@@ -41,35 +40,15 @@ pub fn panic(
 ) noreturn {
     @branchHint(.cold);
 
-    // In release builds, just use the default behavior
-    if (builtin.mode != .Debug) {
-        std.debug.defaultPanic(msg, ret_addr);
-    }
+    applog.appLogEmergency("\n=== ZONVIE PANIC ===\n", .{});
+    applog.appLogEmergency("Panic: {s}\n", .{msg});
 
-    // Print panic message using std.debug.print (unbuffered to stderr)
-    std.debug.print("\n=== ZONVIE PANIC (Debug Build) ===\n", .{});
-    std.debug.print("Panic: {s}\n", .{msg});
-
-    // Also log to app log if enabled
-    if (applog.isEnabled()) {
-        applog.appLog("\n=== ZONVIE PANIC (Debug Build) ===\n", .{});
-        applog.appLog("Panic: {s}\n", .{msg});
-    }
-
-    // Print error return trace if available
     if (error_return_trace) |trace| {
-        std.debug.print("\nError return trace:\n", .{});
-        if (applog.isEnabled()) {
-            applog.appLog("\nError return trace:\n", .{});
-        }
+        applog.appLogEmergency("\nError return trace:\n", .{});
         printStackTraceAddresses(trace);
     }
 
-    // Print stack trace from current location
-    std.debug.print("\nStack trace:\n", .{});
-    if (applog.isEnabled()) {
-        applog.appLog("\nStack trace:\n", .{});
-    }
+    applog.appLogEmergency("\nStack trace:\n", .{});
     // 0.16: std.debug.StackIterator is no longer pub. Use the supported
     // captureCurrentStackTrace API, which fills the address buffer and
     // returns a StackTrace; first_address omits frames up to ret_addr,
@@ -79,29 +58,22 @@ pub fn panic(
         .first_address = ret_addr,
     }, &addr_buf);
 
-    // Print addresses
     for (trace.return_addresses) |addr| {
-        std.debug.print("  0x{x:0>16}\n", .{addr});
-        if (applog.isEnabled()) {
-            applog.appLog("  0x{x:0>16}\n", .{addr});
-        }
+        applog.appLogEmergency("  0x{x:0>16}\n", .{addr});
     }
 
-    std.debug.print("\n=== END PANIC ===\n", .{});
-    if (applog.isEnabled()) {
-        applog.appLog("\n=== END PANIC ===\n", .{});
-    }
+    applog.appLogEmergency("\n=== END PANIC ===\n", .{});
 
     // Show message box so user can see the error on Windows
     const wide_title = comptime blk: {
-        const title = "Zonvie Panic (Debug)";
+        const title = "Zonvie Panic";
         var buf: [title.len + 1]u16 = undefined;
         for (title, 0..) |ch, i| buf[i] = ch;
         buf[title.len] = 0;
         break :blk buf;
     };
     const wide_msg = comptime blk: {
-        const m = "A panic occurred. Check stderr/log for stack trace.";
+        const m = "A panic occurred. Check the debugger or log for the stack trace.";
         var buf: [m.len + 1]u16 = undefined;
         for (m, 0..) |ch, i| buf[i] = ch;
         buf[m.len] = 0;
@@ -114,10 +86,7 @@ pub fn panic(
 
 fn printStackTraceAddresses(trace: *std.builtin.StackTrace) void {
     for (trace.instruction_addresses[0..@min(trace.index, trace.instruction_addresses.len)]) |addr| {
-        std.debug.print("  0x{x:0>16}\n", .{addr});
-        if (applog.isEnabled()) {
-            applog.appLog("  0x{x:0>16}\n", .{addr});
-        }
+        applog.appLogEmergency("  0x{x:0>16}\n", .{addr});
     }
 }
 
@@ -217,6 +186,7 @@ fn forwardFilesToInstance(
 
 pub fn main() u8 {
     clock.init();
+    defer applog.deinit();
 
     // Enable Per-Monitor DPI Awareness V2 before any window creation.
     // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
@@ -709,13 +679,17 @@ pub fn main() u8 {
         }
     }
 
+    // Apply frontend filters before enabling the sink so perf/scroll modes
+    // reject non-matching lines before formatting or enqueueing.
+    applog.setFilters(config.log.perf_only, config.log.scroll_only, config.log.verbose);
+
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
-        applog.setEnabled(true);
         applog.setLogPath(path);
-    } else if (config.log.enabled) {
         applog.setEnabled(true);
+    } else if (config.log.enabled) {
         applog.setLogPath(config.log.path);
+        applog.setEnabled(true);
     }
 
     // Validate --nvim path (reject quote characters that break shell/Zig parser quoting)
@@ -780,6 +754,7 @@ pub fn main() u8 {
     // size; exact-size LoadImageW is not worth a startup crash.
     wc.hIconSm = LoadIconW(wc.hInstance, makeIntResource(1));
     wc.hbrBackground = null;
+    wc.cbWndExtra = @sizeOf(isize);
     wc.lpszClassName = @ptrCast(class_name.ptr);
 
     if (c.RegisterClassExW(&wc) == 0) return 1;
@@ -946,6 +921,7 @@ pub fn main() u8 {
 
     app.* = .{
         .alloc = alloc,
+        .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .config = config,
         .ext_cmdline_enabled = ext_cmdline_enabled,
         .ext_messages_enabled = ext_messages_enabled,
@@ -1006,14 +982,44 @@ pub fn main() u8 {
         }
         return 1;
     }
+    if (!window.installWindowWakeCookie(hwnd.?, app.window_wake_cookie)) {
+        _ = c.DestroyWindow(hwnd.?);
+        return 1;
+    }
 
     var msg: c.MSG = undefined;
-    while (c.GetMessageW(&msg, null, 0, 0) > 0) {
-        // Route TAB / ENTER / ESC to the startup connection dialog while it is
-        // open (`--dialog`), so it navigates like a real dialog.
-        if (dialogs.connectionDialogPreTranslate(&msg)) continue;
-        _ = c.TranslateMessage(&msg);
-        _ = c.DispatchMessageW(&msg);
+    message_loop: while (true) {
+        // WM_NCDESTROY may free the original App before WM_QUIT reaches the
+        // head of the queue. Never carry the startup pointer across loop
+        // iterations; GWLP_USERDATA is cleared before App destruction.
+        if (app_mod.getApp(hwnd.?)) |live_app| {
+            window.serviceDeferredUiRetries(hwnd.?, live_app);
+        }
+
+        if (c.PeekMessageW(&msg, null, 0, 0, c.PM_REMOVE) != 0) {
+            if (msg.message == c.WM_QUIT) break :message_loop;
+            // Route TAB / ENTER / ESC to the startup connection dialog while it is
+            // open (`--dialog`), so it navigates like a real dialog.
+            if (dialogs.connectionDialogPreTranslate(&msg)) continue;
+            _ = c.TranslateMessage(&msg);
+            _ = c.DispatchMessageW(&msg);
+            continue;
+        }
+
+        // A deadline is the allocation-free final retry driver when both
+        // SetTimer and CreateTimerQueueTimer are unavailable. With no pending
+        // retry this is INFINITE and retains GetMessage-style idle behavior.
+        const timeout_ms = if (app_mod.getApp(hwnd.?)) |live_app|
+            window.nextDeferredUiRetryTimeoutMs(live_app)
+        else
+            c.INFINITE;
+        _ = c.MsgWaitForMultipleObjectsEx(
+            0,
+            null,
+            timeout_ms,
+            c.QS_ALLINPUT,
+            c.MWMO_INPUTAVAILABLE,
+        );
     }
 
     // Return nvim's exit code (Nvy style - return from main instead of ExitProcess)

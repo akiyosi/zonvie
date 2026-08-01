@@ -183,6 +183,15 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
+/* on_vertices_row layers are independent, like on_vertices_partial:
+   - When MAIN is not set, existing row contents must be retained.
+   - CURSOR set carries the complete cursor layer for that grid; vert_count=0
+     clears it. A cursor-only callback must not replace row contents.
+   A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
+   a layout-only zero-cell transition. total_rows/total_cols are authoritative,
+   and at least one is zero. It clears the logical MAIN surface without
+   treating a nonexistent row as row content. */
+
 /* Main row-buffer scroll fast path notification.
    The core calls this when it can preserve previously submitted main-row content
    by shifting existing row buffers instead of resubmitting every reused row.
@@ -630,10 +639,18 @@ typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t
 
 /* Called to get clipboard content.
    register_name: "+" or "*" (system clipboard register)
-   out_buf: output buffer for clipboard content (UTF-8)
-   out_len: output length written
-   max_len: maximum buffer size
-   Returns: 1 on success, 0 on failure */
+   out_buf: output buffer for clipboard content (UTF-8); may be NULL when
+            max_len is 0, in which case nothing is written and only the size
+            is reported.
+   out_len: on success, the TOTAL number of bytes available — not the number
+            written. The implementation writes min(*out_len, max_len) bytes.
+   max_len: capacity of out_buf in bytes
+   Returns: 1 on success, 0 on failure
+
+   Reporting the full size rather than the clamped one lets the caller detect
+   truncation (*out_len > max_len) and retry with a large enough buffer, so a
+   register bigger than any fixed staging buffer is delivered whole instead of
+   being silently cut. Implementations must not clamp *out_len to max_len. */
 typedef int (*zonvie_on_clipboard_get_fn)(
     void* ctx,
     const char* register_name,
@@ -713,10 +730,18 @@ typedef struct zonvie_callbacks {
     zonvie_on_tabline_hide_fn on_tabline_hide;
 
     /* Grid scroll notification callback.
-       Called when a grid receives a grid_scroll event from Neovim.
-       Frontend should clear any pixel-based smooth scroll offset for this grid
-       to prevent double-shifting (grid_scroll moves content by rows, pixel offset remains). */
-    void (*on_grid_scroll)(void* ctx, int64_t grid_id);
+       Called when a grid receives a grid_scroll event from Neovim, so a
+       frontend holding a pixel-based smooth scroll offset can reconcile it
+       against content that has already moved (leaving both applied would
+       double-shift the picture).
+
+       rows_delta is the signed distance the content moved, in rows, positive
+       when it moved up. Several scrolls of one grid within a redraw batch
+       produce a single notification, and rows_delta is their sum — it is not
+       always +/-1, and the count of notifications does not describe how far
+       the content travelled. Reconcile against this value, not against the
+       number of calls. */
+    void (*on_grid_scroll)(void* ctx, int64_t grid_id, int32_t rows_delta);
 
     /* IME off notification callback.
        Called when IME should be turned off (e.g., on mode change when
@@ -816,6 +841,14 @@ void zonvie_core_set_log_perf_only(zonvie_core *core, int enabled);
  * logging for any output to appear. */
 void zonvie_core_set_log_scroll_only(zonvie_core *core, int enabled);
 
+/* Verbose tier: when enabled is non-zero, the highest-frequency per-row /
+ * per-glyph log lines ([perf] row_mode / row_mode_post, [shape_dump],
+ * [glyph_quad]) are also emitted. Off by default because their formatting
+ * and I/O cost is heavy enough to perturb the measured pipeline (~1-2ms per
+ * flush). Independent of zonvie_core_set_log_enabled — caller must still
+ * enable logging for any output to appear. */
+void zonvie_core_set_log_verbose(zonvie_core *core, int enabled);
+
 /* Enable ext_cmdline UI extension (must call before zonvie_core_start).
  * When enabled, cmdline is rendered as a separate external window. */
 void zonvie_core_set_ext_cmdline(zonvie_core *core, int enabled);
@@ -839,16 +872,23 @@ void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
-/* Check if msg_show throttle timeout has expired and process pending messages.
- * Frontend should call this periodically (e.g., every frame or 16ms) to ensure
- * messages are displayed even when Neovim is waiting for user input. */
+/* Process due message timeouts and render-maintenance retries. Frontends
+ * normally drive this from the one-shot deadline returned below so messages
+ * and transient glyph failures recover while Neovim is idle. */
 void zonvie_core_tick_msg_throttle(zonvie_core *core);
 
-/* Returns milliseconds until the earliest pending msg_show/msg_history timeout
- * (throttle or auto-hide), clamped to >= 0. Returns -1 if no timeout is armed.
- * Lets the frontend schedule a single one-shot timer instead of calling
- * zonvie_core_tick_msg_throttle every frame. */
+/* Returns milliseconds until the earliest pending message or render-
+ * maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
+ * Lets the frontend schedule a single one-shot timer instead of calling the
+ * tick function every frame. */
 int64_t zonvie_core_next_msg_timeout_ms(zonvie_core *core);
+
+/* Non-blocking version of zonvie_core_next_msg_timeout_ms.
+ * Returns the same values on success, or -2 if the core's grid lock could
+ * not be acquired without blocking. -2 must NOT be treated as "nothing
+ * pending" (that is -1, a real answer) -- on -2 the caller should re-arm
+ * its timer for a short fixed retry instead of trusting a stale value. */
+int64_t zonvie_core_try_next_msg_timeout_ms(zonvie_core *core);
 
 /* Enable blur transparency for background (macOS only).
  * When enabled, default background uses semi-transparent alpha for blur effect.
@@ -858,6 +898,10 @@ void zonvie_core_set_blur_enabled(zonvie_core *core, int enabled);
 /* Set inherit_cwd flag (must call before zonvie_core_start).
  * When enabled, child process inherits parent's CWD instead of $HOME. */
 void zonvie_core_set_inherit_cwd(zonvie_core *core, int enabled);
+
+/* Set the window background opacity used for the default background colour.
+ * Clamped to [0.0, 1.0]; 1.0 (fully opaque) is the default. */
+void zonvie_core_set_background_opacity(zonvie_core *core, float opacity);
 
 /* Set glyph cache sizes for performance tuning.
  * ascii_size: cache size for ASCII chars (0-127) × 4 style combinations (default: 512, min: 128)
@@ -875,8 +919,21 @@ void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
    callbacks_size: sizeof(zonvie_callbacks) as seen by the caller.
                    Allows the core to safely handle callers compiled
                    against an older (smaller) struct layout.
+                   Must be non-zero when cb is non-NULL: a zero size cannot
+                   bound the read, so the core installs no callbacks at all.
    ctx:            opaque frontend context forwarded to all callbacks. */
 zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
+/* Must be called from a lifecycle thread which is not currently executing a
+   Zonvie callback. Calling destroy re-entrantly from a callback only requests
+   shutdown and retains the handle to avoid self-join and callback-context
+   use-after-free; the frontend must call destroy again later from its
+   lifecycle thread to release the handle. That final call must occur only
+   after the callback and the enclosing Core API invocation have both fully
+   returned, with no other Core API call in flight. It must have exactly one
+   externally serialized owner; concurrent lifecycle destroy calls are
+   unsupported. No new API call may start after the callback-thread request,
+   and no API may use the handle after a valid lifecycle-thread destroy
+   returns. */
 void zonvie_core_destroy(zonvie_core *core);
 
 int  zonvie_core_start(zonvie_core *core, const char *nvim_path, unsigned rows, unsigned cols);
@@ -901,6 +958,8 @@ int  zonvie_core_start_connect(
     const uint8_t *listen_addr, size_t listen_addr_len,
     unsigned rows, unsigned cols);
 
+/* Callback-safe. A callback-thread call requests shutdown without waiting;
+   resource teardown is completed by a later lifecycle-thread stop/destroy. */
 void zonvie_core_stop(zonvie_core *core);
 
 /* Notify the core that actual layout dimensions are ready.
@@ -925,7 +984,8 @@ void zonvie_core_unlock_grid(zonvie_core *core);
 
 /* updateLayoutPx variant for callers that already hold grid_mu via
    zonvie_core_lock_grid. Skips the redraw_thread_id check and the
-   internal grid_mu acquisition that the regular API performs. */
+   internal grid_mu acquisition that the regular API performs. A standalone
+   caller must request a full core flush after releasing grid_mu. */
 void zonvie_core_update_layout_px_locked(
     zonvie_core *core,
     unsigned drawable_w_px,
@@ -946,6 +1006,17 @@ ZONVIE_API const char *zonvie_version(void);
 
 /* Record the latest frontend input trace marker for redraw/flush correlation. */
 ZONVIE_API void zonvie_core_note_input_trace(
+    zonvie_core *core,
+    uint64_t seq,
+    int64_t sent_ns
+);
+
+/* Non-blocking version of zonvie_core_note_input_trace. Drops the sample
+   (no [perf_input] trace line for this seq) if the core's grid lock could
+   not be acquired without blocking, rather than blocking the input-send
+   path with the very lock this trace exists to measure contention on.
+   Returns true if the sample was recorded. */
+ZONVIE_API bool zonvie_core_try_note_input_trace(
     zonvie_core *core,
     uint64_t seq,
     int64_t sent_ns
@@ -1093,10 +1164,40 @@ ZONVIE_API int32_t zonvie_core_try_get_visible_grids(
     size_t max_count
 );
 
+/* Non-blocking complete visible-grid snapshot for fixed-capacity caches.
+   On success, returns the number of initialized entries in out_grids and
+   writes the total visible-grid count from the same grid-lock snapshot to
+   out_total_count. A return value smaller than *out_total_count means the
+   output was truncated. max_count may be zero with out_grids=NULL for a
+   count-only query, and must not exceed INT32_MAX.
+
+   Returns -1 when the grid lock is busy or any argument is invalid. On -1,
+   out_grids and *out_total_count are left unchanged. There is deliberately no
+   blocking counterpart: render/input callers should retain their last complete
+   cache rather than stall behind redraw. */
+ZONVIE_API int32_t zonvie_core_try_get_visible_grids_complete(
+    zonvie_core *core,
+    zonvie_grid_info *out_grids,
+    size_t max_count,
+    size_t *out_total_count
+);
+
 /* Get current cursor position.
    Returns cursor row and column (0-based) in out_row and out_col.
    Returns the grid_id of the cursor (1 = global grid). */
 ZONVIE_API int64_t zonvie_core_get_cursor_position(
+    zonvie_core *core,
+    int32_t *out_row,
+    int32_t *out_col
+);
+
+/* Non-blocking version of zonvie_core_get_cursor_position.
+   Returns the grid_id of the cursor on success, or -2 if the core's grid
+   lock could not be acquired without blocking, or if core is null
+   (grid_id is always >= 1, so -2 is unambiguous either way). Note this
+   differs from the blocking zonvie_core_get_cursor_position above, which
+   reserves -1 specifically for a null core. */
+ZONVIE_API int64_t zonvie_core_try_get_cursor_position(
     zonvie_core *core,
     int32_t *out_row,
     int32_t *out_col
@@ -1108,7 +1209,8 @@ ZONVIE_API int64_t zonvie_core_get_cursor_position(
 ZONVIE_API int64_t zonvie_core_get_win_id(zonvie_core *core, int64_t grid_id);
 
 /* Get current mode name (e.g., "normal", "insert", "terminal").
-   Returns pointer to null-terminated string. Do not free.
+   Returns a thread-local null-terminated snapshot. Do not free. The pointer
+   remains valid until the next call on the same thread.
    Returns empty string if core is null. */
 ZONVIE_API const char* zonvie_core_get_current_mode(zonvie_core *core);
 
@@ -1121,12 +1223,44 @@ ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value)
    Returns false during busy_start, true after busy_stop. */
 ZONVIE_API bool zonvie_core_is_cursor_visible(zonvie_core *core);
 
+/* Non-blocking combined read of current mode name + cursor visibility.
+   Copies the null-terminated mode name into out_mode_buf (truncated to fit
+   buf_len, including the terminator) and writes cursor visibility to
+   *out_cursor_visible. Unlike zonvie_core_get_current_mode, the string is
+   copied while the lock is held rather than returning a pointer into core
+   memory that could be concurrently rewritten after unlock.
+   Returns 1 on success, -1 if the core's grid lock could not be acquired
+   without blocking (caller should keep using its last-known cached
+   mode/visibility in that case). -1 is also returned for invalid arguments
+   (null core, null out_mode_buf, buf_len == 0, or null out_cursor_visible)
+   -- these share the busy sentinel rather than a distinct value since no
+   caller is expected to pass invalid arguments in practice. */
+ZONVIE_API int32_t zonvie_core_try_get_mode_state(
+    zonvie_core *core,
+    char *out_mode_buf,
+    size_t buf_len,
+    bool *out_cursor_visible
+);
+
 /* Get current cursor blink parameters (in milliseconds).
    Returns 0 for all values if blinking is disabled.
    blink_wait: time before blink starts (0 = no blink)
    blink_on: cursor visible time during blink cycle
    blink_off: cursor hidden time during blink cycle */
 ZONVIE_API void zonvie_core_get_cursor_blink(
+    zonvie_core *core,
+    uint32_t *out_blink_wait_ms,
+    uint32_t *out_blink_on_ms,
+    uint32_t *out_blink_off_ms
+);
+
+/* Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
+   all three out params and returns true. On busy, leaves every out param
+   UNTOUCHED (no "safe default" is written) -- callers should pre-seed the
+   out params with their own last-known values before calling, so an
+   untouched param naturally means "serve the cached value". Returns false
+   if the lock could not be acquired without blocking, or core is null. */
+ZONVIE_API bool zonvie_core_try_get_cursor_blink(
     zonvie_core *core,
     uint32_t *out_blink_wait_ms,
     uint32_t *out_blink_on_ms,
@@ -1171,6 +1305,12 @@ ZONVIE_API void zonvie_core_process_pending_msg_scroll(
     zonvie_core *core
 );
 
+/* Same operation, returning true while an aborted/throttled update still
+   needs another frontend timer retry. */
+ZONVIE_API bool zonvie_core_process_pending_msg_scroll_retry_needed(
+    zonvie_core *core
+);
+
 /* Send mouse input event to Neovim (click, drag, release).
    button: "left", "right", "middle", "x1", "x2"
    action: "press", "drag", "release"
@@ -1197,6 +1337,32 @@ ZONVIE_API void zonvie_core_update_layout_px(
     uint32_t cell_h_px
 );
 
+// Non-blocking version of zonvie_core_update_layout_px, for callers that must
+// not stall (e.g. drag-resize on the UI thread) if the core thread is
+// mid-flush holding grid_mu. Returns false ("busy", grid_mu not acquired) if
+// the caller must retry shortly -- unlike a read-only trace, a resize is a
+// write that must not be silently dropped on contention. A NULL core returns
+// true (nothing to do); "busy" is reserved for genuine lock contention, so a
+// caller can retry on false without risking an infinite loop.
+//
+// screen_cols folds zonvie_core_set_screen_cols into the same lock: pass 0 to
+// keep the drawable-width-derived value, or a display-derived cell count to
+// override it (macOS cmdline max width). Calling the blocking
+// zonvie_core_set_screen_cols afterwards would re-acquire grid_mu and negate
+// the non-blocking guarantee.
+//
+// Safe to call from a redraw callback on the core thread: that path applies
+// the layout under the already-held grid_mu and skips the flush retry, which
+// the in-progress batch performs anyway.
+ZONVIE_API bool zonvie_core_try_update_layout_px(
+    zonvie_core *core,
+    uint32_t drawable_w_px,
+    uint32_t drawable_h_px,
+    uint32_t cell_w_px,
+    uint32_t cell_h_px,
+    uint32_t screen_cols
+);
+
 // Set screen width in cells (for cmdline max width).
 // This should be called when screen size or cell size changes.
 ZONVIE_API void zonvie_core_set_screen_cols(zonvie_core *core, uint32_t cols);
@@ -1209,6 +1375,21 @@ ZONVIE_API int zonvie_core_get_hl_by_name(
     const char* name,
     uint32_t* fg_rgb,
     uint32_t* bg_rgb
+);
+
+// Batched version of zonvie_core_get_hl_by_name: looks up `count` group
+// names under a single grid_mu acquisition instead of one lock round-trip
+// per name. names/out_fg_rgb/out_bg_rgb/out_found must each have length
+// count. A null entry in names writes 0/0/0 to its out slots rather than
+// leaving them untouched, so the out arrays may be passed uninitialized.
+// Returns 1 on success, 0 if core/arrays are null.
+ZONVIE_API int zonvie_core_get_hl_by_names_batch(
+    zonvie_core *core,
+    const char *const *names,
+    uint32_t *out_fg_rgb,
+    uint32_t *out_bg_rgb,
+    int *out_found,
+    size_t count
 );
 
 // Return Neovim default background color as 0x00RRGGBB.
@@ -1340,6 +1521,7 @@ typedef struct zonvie_config_values {
     const char* log_path;             /* NULL if not set */
     bool log_perf_only;               /* true = drop non-[perf...] lines */
     bool log_scroll_only;             /* true = [perf...] + [scroll_debug] only */
+    bool log_verbose;                 /* true = also emit per-row/per-glyph lines */
     // performance
     int32_t perf_glyph_cache_ascii;
     int32_t perf_glyph_cache_non_ascii;
@@ -1394,13 +1576,88 @@ ZONVIE_API int32_t zonvie_core_try_cell_has_url(
 ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
 
 /* Abort the current flush cycle.
-   Call from on_flush_begin when the frontend cannot accept this flush
-   (e.g. no free buffer set, or commandBuffer creation failed with pending atlas state).
+   Call from on_flush_begin or on_flush_end when the frontend cannot accept
+   this flush (e.g. no free buffer set, or a late buffer commit failed).
    Sets an internal flag that causes the flush pipeline to skip vertex generation,
-   atlas operations, and vertex submission.
+   atlas operations, and vertex submission when called before those stages.
+   An on_flush_end abort invalidates the current core accounting ledger and
+   restores dirty state before the flush transaction returns.
    on_flush_end is still called (via defer) so the frontend can clean up.
    The aborted flush's dirty state is preserved — next flush retries everything. */
 ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
+
+/* Mark the current UI session failed after a frontend-side fixed physical
+   rendering-resource budget rejects capacity provisioning. Frontend physical
+   storage is independent of the core's logical vertex budgets because
+   buffering and copy-on-write may retain multiple copies. A core-valid frame
+   is therefore not guaranteed to fit every frontend's physical representation.
+   This is terminal for the session; callers must not schedule another flush
+   retry. */
+ZONVIE_API void zonvie_core_fail_render_budget(zonvie_core *core);
+
+/* Returns true when the flush that JUST ran detected an atlas reset during
+   the deferred external-grid pass, after main vertices for this same flush
+   were already dispatched with pre-reset UVs. Call from on_flush_end,
+   BEFORE committing, while grid_mu is still held. When true, the frontend
+   must cancel this flush's commit entirely (same handling as an allocation
+   failure: cancel brackets instead of publishing) — committing would
+   present main-grid vertices sampling the wrong (freshly repacked) atlas
+   for one frame. The core has already scheduled a corrected full resend for
+   the next flush; cancelling here only prevents showing the corrupted
+   frame, no data is lost. */
+ZONVIE_API bool zonvie_core_flush_had_atlas_corruption(zonvie_core *core);
+
+/* Returns true when the flush that JUST ran was aborted — either by an
+   explicit frontend zonvie_core_abort_flush() call, or by an internal Zig
+   error (e.g. OOM growing a persistent composition buffer) caught inside
+   onFlush itself. Call from on_flush_end, BEFORE committing, while grid_mu
+   is still held. When true, the frontend must cancel this flush's commit —
+   whatever partial write-set was composed before the abort is incomplete
+   and must not be presented as a full frame. Dirty state is preserved
+   either way, so cancelling loses no data; call zonvie_core_retry_flush
+   once frontend capacity recovers (or after an internal-error backoff) to
+   resend it. */
+ZONVIE_API bool zonvie_core_flush_was_aborted(zonvie_core *core);
+
+/* Returns false when the last abort was a fixed resource-limit violation.
+   Such a flush must be cancelled but not scheduled for automatic retry. */
+ZONVIE_API bool zonvie_core_flush_is_retryable(zonvie_core *core);
+
+/* Retry a flush that was previously aborted via zonvie_core_abort_flush.
+   Flushes are normally driven by incoming Neovim redraw batches; an abort
+   preserves dirty state but does NOT by itself cause another flush attempt.
+   If the condition that caused the abort (no free buffer set, OOM) clears
+   with no further redraw event arriving, content would stay unflushed
+   forever without this. Call once frontend capacity is recovered — a
+   one-shot retry timer armed right after the abort (matching the existing
+   grid_mu-contention retry idiom) is the expected usage pattern.
+   Calls onFlush() unconditionally — it already short-circuits into
+   near-zero work when nothing is actually dirty (main, cursor, or any
+   subgrid/external state), same as any no-op Neovim redraw batch. */
+ZONVIE_API void zonvie_core_retry_flush(zonvie_core *core);
+
+/* Same effect as zonvie_core_retry_flush, for a caller that ALREADY holds
+   grid_mu via zonvie_core_lock_grid. This allows a frontend retry timer to
+   acquire grid_mu, revalidate that its retry generation is still current,
+   and execute the flush without reopening a race against a normal redraw.
+   The caller must release grid_mu with zonvie_core_unlock_grid afterward. */
+ZONVIE_API void zonvie_core_retry_flush_locked(zonvie_core *core);
+
+/* Force every grid to be treated as dirty on the next flush attempt.
+   For failures discovered outside the on_flush_begin/on_flush_end transaction,
+   after onFlush has returned and already cleared its dirty state. Call
+   zonvie_core_retry_flush afterward (or rely on the next Neovim redraw) to
+   actually drive the next attempt.
+   Takes grid_mu itself — call ONLY from a context that does not already
+   hold it (e.g. a main-thread retry timer). Do NOT call from
+   on_flush_begin/on_flush_end (core/RPC thread, grid_mu held for the
+   entire handleRedraw duration) — use zonvie_core_force_resend_locked
+   there instead, or this self-deadlocks on the non-recursive grid_mu. */
+ZONVIE_API void zonvie_core_force_resend(zonvie_core *core);
+
+/* Same effect as zonvie_core_force_resend, for callers that ALREADY hold
+   grid_mu — specifically on_flush_begin/on_flush_end. */
+ZONVIE_API void zonvie_core_force_resend_locked(zonvie_core *core);
 
 /* ========================================================================
    Custom shader cross-compilation (Shadertoy / Ghostty compatible GLSL)
@@ -1414,7 +1671,7 @@ typedef enum {
 /* Per-frame uniforms made available to custom shaders. Layout mirrors the
    `layout(std140, binding = 1) uniform ZonvieShaderUniforms { ... }` block
    declared by the Shadertoy preamble in `src/core/shader_compiler.zig`.
-   Frontends populate this struct in place and upload 80 bytes to the
+   Frontends populate this struct in place and upload 160 bytes to the
    uniform buffer each frame.
 
    Field order and offsets are load-bearing; do not reorder. std140 lays

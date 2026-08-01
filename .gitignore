@@ -21,3 +21,4 @@ build/
 .claude
 CLAUDE.local.md
 AGENTS.md
+__pycache__/

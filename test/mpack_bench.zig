@@ -320,6 +320,7 @@ test "bench: redraw grid_line decode paths" {
 
 const NoopCtx = struct {};
 
+fn noopPreFlush(_: *NoopCtx) anyerror!void {}
 fn noopFlush(_: *NoopCtx, _: u32, _: u32) anyerror!void {}
 fn noopGuifont(_: *NoopCtx, _: []const u8) anyerror!void {}
 fn noopLinespace(_: *NoopCtx, _: i32) anyerror!void {}
@@ -350,6 +351,7 @@ fn runOldFull(
         params,
         log,
         ctx,
+        noopPreFlush,
         noopFlush,
         ctx,
         noopGuifont,
@@ -388,6 +390,7 @@ fn runNewFull(
         n_events,
         log,
         ctx,
+        noopPreFlush,
         noopFlush,
         ctx,
         noopGuifont,

@@ -154,7 +154,7 @@ final class CustomShaderPipeline {
 
     /// Encode a single fullscreen pass: sample `input`, draw to `output`.
     /// `copyVertexBuffer` is the same 6-vertex fullscreen quad used by the
-    /// existing `vs_copy` bloom passes. `uniforms` is the 64-byte
+    /// existing `vs_copy` bloom passes. `uniforms` is the 160-byte
     /// `zonvie_shader_uniforms` block passed inline via
     /// `setFragmentBytes(_:length:index:)` at index 1 — matches the
     /// Shadertoy preamble's `layout(std140, binding = 1)`. Inlining
@@ -167,12 +167,12 @@ final class CustomShaderPipeline {
         copyVertexBuffer: MTLBuffer,
         sampler: MTLSamplerState,
         uniforms: zonvie_shader_uniforms
-    ) {
+    ) -> Bool {
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = output
         rpd.colorAttachments[0].loadAction = .dontCare
         rpd.colorAttachments[0].storeAction = .store
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
         enc.label = "CustomShader.encode"
         enc.setRenderPipelineState(pipelineState)
         enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
@@ -182,5 +182,6 @@ final class CustomShaderPipeline {
         enc.setFragmentBytes(&u, length: MemoryLayout<zonvie_shader_uniforms>.size, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         enc.endEncoding()
+        return true
     }
 }

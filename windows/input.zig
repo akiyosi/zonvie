@@ -10,10 +10,38 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 // Keyboard constants and input helpers
 // =========================================================================
 
-pub const MOD_CTRL  = 1 << 0; // same bit layout as header comment
-pub const MOD_ALT   = 1 << 1;
+pub const MOD_CTRL = 1 << 0; // same bit layout as header comment
+pub const MOD_ALT = 1 << 1;
 pub const MOD_SHIFT = 1 << 2;
 // Windows has no "Command", leave it unused.
+
+/// Non-blocking cursor position query with cache fallback (mirrors macOS's
+/// getCursorPositionNonBlocking). The IME candidate-window paths used to
+/// block on the core's grid lock on every WM_IME_STARTCOMPOSITION and every
+/// WM_PAINT during composition. Returns the grid_id and fills out_row/
+/// out_col on success (fresh or cached, at most one flush stale); -1 with
+/// out_row/out_col = -1 if there is no cursor position available at all
+/// (never queried successfully and no cache entry yet) -- callers must not
+/// use the coordinates without a >= 0 check. Shared by the IME paths here
+/// and the scrollbar update path (ui/scrollbar.zig).
+/// out_stale, if non-null, is set to true when the result was served from
+/// the cache (lock busy) rather than freshly read -- the IME call sites
+/// below pass null since a stale IME position self-heals within a frame;
+/// the scrollbar call site needs this to decide whether to retry instead of
+/// silently dropping a one-shot scrollbar-update message.
+pub fn getCursorPositionNonBlocking(app: *App, corep: *app_mod.zonvie_core, out_row: *i32, out_col: *i32, out_stale: ?*bool) i64 {
+    const result = app_mod.zonvie_core_try_get_cursor_position(corep, out_row, out_col);
+    if (result != -2) {
+        app.cursor_pos_cache = .{ .grid_id = result, .row = out_row.*, .col = out_col.* };
+        if (out_stale) |s| s.* = false;
+        return result;
+    }
+    // Lock busy -- serve the cached value.
+    out_row.* = app.cursor_pos_cache.row;
+    out_col.* = app.cursor_pos_cache.col;
+    if (out_stale) |s| s.* = true;
+    return app.cursor_pos_cache.grid_id;
+}
 
 pub fn keyIsDown(vk: c_int) bool {
     // GetKeyState returns SHORT. High-order bit set => key down.
@@ -23,8 +51,8 @@ pub fn keyIsDown(vk: c_int) bool {
 pub fn queryMods() u32 {
     var m: u32 = 0;
     if (keyIsDown(c.VK_CONTROL)) m |= MOD_CTRL;
-    if (keyIsDown(c.VK_MENU))    m |= MOD_ALT;   // Alt
-    if (keyIsDown(c.VK_SHIFT))   m |= MOD_SHIFT;
+    if (keyIsDown(c.VK_MENU)) m |= MOD_ALT; // Alt
+    if (keyIsDown(c.VK_SHIFT)) m |= MOD_SHIFT;
     return m;
 }
 
@@ -136,12 +164,32 @@ pub fn toUnicodePairUtf8(
 
 pub fn isSpecialVk(vk: u32) bool {
     return switch (vk) {
-        c.VK_LEFT, c.VK_RIGHT, c.VK_UP, c.VK_DOWN,
-        c.VK_HOME, c.VK_END, c.VK_PRIOR, c.VK_NEXT,
-        c.VK_INSERT, c.VK_DELETE,
-        c.VK_BACK, c.VK_TAB, c.VK_RETURN, c.VK_ESCAPE,
-        c.VK_F1, c.VK_F2, c.VK_F3, c.VK_F4, c.VK_F5, c.VK_F6,
-        c.VK_F7, c.VK_F8, c.VK_F9, c.VK_F10, c.VK_F11, c.VK_F12,
+        c.VK_LEFT,
+        c.VK_RIGHT,
+        c.VK_UP,
+        c.VK_DOWN,
+        c.VK_HOME,
+        c.VK_END,
+        c.VK_PRIOR,
+        c.VK_NEXT,
+        c.VK_INSERT,
+        c.VK_DELETE,
+        c.VK_BACK,
+        c.VK_TAB,
+        c.VK_RETURN,
+        c.VK_ESCAPE,
+        c.VK_F1,
+        c.VK_F2,
+        c.VK_F3,
+        c.VK_F4,
+        c.VK_F5,
+        c.VK_F6,
+        c.VK_F7,
+        c.VK_F8,
+        c.VK_F9,
+        c.VK_F10,
+        c.VK_F11,
+        c.VK_F12,
         => true,
         else => false,
     };
@@ -184,18 +232,11 @@ pub fn handleMouseWheel(
     lParam: c.LPARAM,
     app: *App,
     grid_id: i64,
-    scroll_accum: *i16,
     horizontal: bool,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
     if (delta == 0) return;
-
-    // One scroll event per WHEEL_DELTA (120) so a physical wheel notch maps
-    // to exactly one Neovim wheel event ('mousescroll' then decides the line
-    // count). Touchpads send smaller deltas, but the accumulator below
-    // preserves their total scroll amount across events.
-    const SCROLL_THRESHOLD: i16 = 120;
 
     // Get mouse position (in screen coordinates)
     const x_screen: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
@@ -243,7 +284,7 @@ pub fn handleMouseWheel(
         if (corep) |cp| {
             const vg = app.getVisibleGridsCached(cp);
             var best_zindex: i64 = -1;
-            for (vg.grids[0..vg.count]) |g| {
+            for (vg) |g| {
                 if (row >= g.start_row and row < g.start_row + g.rows and
                     col >= g.start_col and col < g.start_col + g.cols and
                     g.zindex > best_zindex)
@@ -260,25 +301,24 @@ pub fn handleMouseWheel(
     // Build modifier string from wParam flags and GetKeyState
     const mod_buf = buildMouseModifiers(wParam);
 
-    // Accumulate scroll delta (saturating: a hostile/buggy delta near i16 max
-    // must not wrap the accumulator and flip the scroll direction)
-    scroll_accum.* +|= delta;
-
     // Determine scroll direction
     // Vertical: positive delta = scroll up (wheel away from user)
     // Horizontal: positive delta = scroll right (wheel tilt right)
     const direction: [*:0]const u8 = if (horizontal)
-        (if (scroll_accum.* > 0) "right" else "left")
+        (if (delta > 0) "right" else "left")
     else
-        (if (scroll_accum.* > 0) "up" else "down");
+        (if (delta > 0) "up" else "down");
 
-    // Send scroll events for each threshold accumulated
-    while (scroll_accum.* >= SCROLL_THRESHOLD or scroll_accum.* <= -SCROLL_THRESHOLD) {
-        app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
-        if (scroll_accum.* > 0) {
-            scroll_accum.* -= SCROLL_THRESHOLD;
-        } else {
-            scroll_accum.* += SCROLL_THRESHOLD;
+    // One scroll event per wheel message, with no WHEEL_DELTA accumulation: a
+    // high-resolution touchpad moves the view on every delta it reports rather
+    // than staying still until a full notch has built up. 'mousescroll' decides
+    // how many lines each event travels, so a device that reports finely now
+    // scrolls proportionally faster.
+    app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
+
+    if (target_grid_id == app_mod.MESSAGE_GRID_ID) {
+        if (app.hwnd) |main_hwnd| {
+            _ = c.SetTimer(main_hwnd, app_mod.TIMER_MSG_SCROLL_RETRY, app_mod.MSG_SCROLL_RETRY_INTERVAL_MS, null);
         }
     }
 }
@@ -360,7 +400,12 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
 
     var row: i32 = 0;
     var col: i32 = 0;
-    const grid_id = app_mod.zonvie_core_get_cursor_position(corep, &row, &col);
+    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
+
+    // A cold cache under lock contention yields (-1,-1); skip positioning
+    // rather than placing the candidate window at negative coordinates
+    // (macOS counterpart checks cursor.row >= 0 the same way).
+    if (row < 0 or col < 0) return;
 
     // Check if cursor is on an external window's grid (e.g. ext-cmdline).
     // If so, we need to calculate screen coordinates via that window, then convert
@@ -414,7 +459,7 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
         var screen_row: i32 = row;
         var screen_col: i32 = col;
 
-        for (cached.grids[0..cached.count]) |grid| {
+        for (cached) |grid| {
             if (grid.grid_id == grid_id) {
                 screen_row = grid.start_row + row;
                 screen_col = grid.start_col + col;
@@ -560,7 +605,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
 
     var row: i32 = 0;
     var col: i32 = 0;
-    const grid_id = app_mod.zonvie_core_get_cursor_position(corep, &row, &col);
+    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
 
     // Check if hwnd is an external window (use grid-local coords) or main window (use screen coords)
     var is_external_window = false;
@@ -569,7 +614,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         defer app.mu.unlock(core.clock.io());
         var ext_it = app.external_windows.iterator();
         while (ext_it.next()) |entry| {
-            if (entry.value_ptr.hwnd == hwnd) {
+            if (entry.value_ptr.*.hwnd == hwnd) {
                 is_external_window = true;
                 break;
             }
@@ -585,7 +630,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         // Get grid info to calculate screen position (non-blocking)
         const cached = app.getVisibleGridsCached(corep.?);
 
-        for (cached.grids[0..cached.count]) |grid| {
+        for (cached) |grid| {
             if (grid.grid_id == grid_id) {
                 screen_row = grid.start_row + row;
                 screen_col = grid.start_col + col;
@@ -601,6 +646,10 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         }
         return;
     }
+
+    // A cold cursor-position cache under lock contention yields (-1,-1);
+    // keep the overlay's previous position rather than drawing off-window.
+    if (row < 0 or col < 0) return;
 
     // Create a memory DC and font first to measure actual text width
     const screen_dc = c.GetDC(null);
@@ -902,7 +951,10 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
         updateExternalWindowsBlinkState(app);
 
         // Request repaint for cursor area
-        if (app.last_cursor_rect_px) |rect| {
+        app.mu.lockUncancelable(core.clock.io());
+        const cursor_rect_snapshot = app.last_cursor_rect_px;
+        app.mu.unlock(core.clock.io());
+        if (cursor_rect_snapshot) |rect| {
             _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
         } else {
             _ = c.InvalidateRect(hwnd, null, c.FALSE);
@@ -928,12 +980,26 @@ pub fn stopCursorBlinking(hwnd: c.HWND, app: *App) void {
 
 /// Update cursor blinking based on current cursor settings from core
 pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
-    var wait_ms: u32 = 0;
-    var on_ms: u32 = 0;
-    var off_ms: u32 = 0;
+    // Pre-seed with the last-known values: try_get_cursor_blink leaves its
+    // out params untouched on lock contention, so a busy lock here
+    // naturally reads back as "unchanged since last time" below.
+    var wait_ms: u32 = app.cursor_blink_wait_ms;
+    var on_ms: u32 = app.cursor_blink_on_ms;
+    var off_ms: u32 = app.cursor_blink_off_ms;
 
     if (app.corep) |core_ptr| {
-        app_mod.zonvie_core_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms);
+        if (!app_mod.zonvie_core_try_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms)) {
+            // Lock busy. WM_APP_UPDATE_CURSOR_BLINK is one-shot and posted
+            // while the core thread still holds grid_mu, so contention here
+            // is structurally common; acting on the stale pre-seeded values
+            // would silently drop the new blink settings. Retry shortly
+            // (mirrors macOS's 16ms timer re-arm). Deliberately not re-posted if
+            // SetTimer fails: the message would re-enter this handler with no
+            // delay while the condition that failed SetTimer persists, spinning
+            // the message loop ahead of WM_PAINT.
+            _ = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
+            return;
+        }
     }
 
     if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink_wait_ms, app.cursor_blink_on_ms, app.cursor_blink_off_ms });
@@ -968,7 +1034,7 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
 pub fn updateExternalWindowsBlinkState(app: *App) void {
     var it = app.external_windows.iterator();
     while (it.next()) |entry| {
-        const ext_win = entry.value_ptr;
+        const ext_win = entry.value_ptr.*;
         ext_win.cursor_blink_state = app.cursor_blink_state;
         if (ext_win.hwnd) |ext_hwnd| {
             _ = c.InvalidateRect(ext_hwnd, null, c.FALSE);

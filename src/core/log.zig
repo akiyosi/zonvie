@@ -1,12 +1,33 @@
 const std = @import("std");
 
+// Frontend callbacks may synchronously call zonvie_core_stop(). Track the
+// callback context per thread so stop() can request cancellation without
+// attempting to join the stack which is currently inside the callback.
+threadlocal var callback_depth: usize = 0;
+
+pub inline fn enterCallback() void {
+    callback_depth += 1;
+}
+
+pub inline fn leaveCallback() void {
+    std.debug.assert(callback_depth > 0);
+    callback_depth -= 1;
+}
+
+pub inline fn isInCallback() bool {
+    return callback_depth != 0;
+}
+
 pub const Logger = struct {
     cb: ?*const fn (ctx: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void = null,
     ctx: ?*anyopaque = null,
-    /// Per-cell / per-glyph hot-path debug logs (e.g. [shape_dump], [glyph_quad]).
-    /// Off by default: enabling them produces thousands of lines per second on
-    /// active editing, which dominates RSS measurement noise via Foundation
-    /// allocation churn. Toggle to true only for targeted shaping/atlas debug.
+    /// Per-cell / per-row / per-glyph hot-path logs ([shape_dump],
+    /// [glyph_quad], [perf] row_mode / row_mode_post). Off by default:
+    /// enabling them produces thousands of lines per second on active
+    /// editing; the formatting + I/O alone measurably perturbs the pipeline
+    /// (~1-2ms per flush — enough to push scroll latency past a vsync).
+    /// Settable via config.toml `[log] verbose = true` or
+    /// zonvie_core_set_log_verbose.
     verbose: bool = false,
     /// When true, only messages whose format string starts with "[perf]" or
     /// "[perf_" are emitted (e.g. [perf_input]). Lets users enable timing
@@ -34,6 +55,8 @@ pub const Logger = struct {
 
         var buf: [1024]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        enterCallback();
+        defer leaveCallback();
         self.cb.?(self.ctx, msg.ptr, msg.len);
     }
 

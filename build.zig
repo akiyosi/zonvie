@@ -20,6 +20,7 @@ fn gitVersion(b: *std.Build) []const u8 {
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const host_os = @import("builtin").os.tag;
 
     // TOML parser dependency
     const zig_toml = b.dependency("zig-toml", .{
@@ -195,8 +196,73 @@ pub fn build(b: *std.Build) !void {
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
+    // Win32 contract test for the top-level HWND wake cookie storage. Compile
+    // it with every Windows frontend build; execute it when the build host can
+    // create a real Win32 window.
+    const wake_state_test_mod = b.createModule(.{
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = true,
+        .root_source_file = b.path("test/windows/wake_state_integration.zig"),
+    });
+    wake_state_test_mod.linkSystemLibrary("user32", .{});
+    wake_state_test_mod.linkSystemLibrary("kernel32", .{});
+    const wake_state_tests = b.addTest(.{
+        .name = "zonvie-wake-state-test",
+        .root_module = wake_state_test_mod,
+    });
+    windows_step.dependOn(&wake_state_tests.step);
+    const wake_state_test_step = b.step("windows-wake-state-test", "Build the top-level HWND wake-state integration test");
+    wake_state_test_step.dependOn(&b.addInstallArtifact(wake_state_tests, .{}).step);
+
     // Unit tests
     const test_step = b.step("test", "Run unit tests");
+    if (host_os == .windows and target.result.os.tag == .windows) {
+        test_step.dependOn(&b.addRunArtifact(wake_state_tests).step);
+    }
+
+    // macOS external-grid font reset intersection test. It uses barriers to
+    // force the notification/commit ordering that previously erased freshly
+    // committed row counts.
+    if (target.result.os.tag == .macos) {
+        const compile_font_reset_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_font_reset_test.addArgs(&.{
+            "-sanitize=thread",
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_font_reset_test.addFileArg(b.path("macos/Sources/Rendering/ExternalFontResetState.swift"));
+        compile_font_reset_test.addFileArg(b.path("macos/Sources/Core/FlushRetryBackoff.swift"));
+        compile_font_reset_test.addFileArg(b.path("macos/Tests/ExternalFontResetStateTests.swift"));
+        compile_font_reset_test.addArg("-o");
+        const font_reset_test_exe = compile_font_reset_test.addOutputFileArg("external-font-reset-tests");
+        const run_font_reset_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_font_reset_test.addFileArg(font_reset_test_exe);
+        test_step.dependOn(&run_font_reset_test.step);
+
+        // Metal row provisioning must retain each successful private-buffer
+        // prefix across retries while committed row content remains untouched.
+        const compile_row_provision_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_row_provision_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_row_provision_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
+        compile_row_provision_test.addFileArg(b.path("macos/Tests/SurfaceRowProvisionTests.swift"));
+        compile_row_provision_test.addArg("-o");
+        const row_provision_test_exe = compile_row_provision_test.addOutputFileArg("surface-row-provision-tests");
+        const run_row_provision_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_row_provision_test.addFileArg(row_provision_test_exe);
+        test_step.dependOn(&run_row_provision_test.step);
+    }
+
+    // Core inline tests (c_api.zig and its relative imports, including the
+    // redraw/flush/atlas transaction tests). Test files that import the core
+    // as a separate module do not execute the dependency module's own tests.
+    const core_tests = b.addTest(.{
+        .root_module = core_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     // Key input tests
     const key_test_mod = b.createModule(.{
@@ -312,6 +378,32 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
 
+    // Platform-independent Windows damage compaction regression tests.
+    const windows_render_helpers_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/render_pipeline_helpers_test.zig"),
+    });
+    const windows_render_helpers_tests = b.addTest(.{
+        .root_module = windows_render_helpers_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
+
+    // Platform-independent coverage for the Windows frontend's lossy,
+    // non-blocking logging queue.
+    const windows_app_log_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/app_log.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+        },
+    });
+    const windows_app_log_tests = b.addTest(.{
+        .root_module = windows_app_log_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(windows_app_log_tests).step);
+
     // Cell overflow map tests
     const overflow_test_mod = b.createModule(.{
         .target = target,
@@ -399,7 +491,6 @@ pub fn build(b: *std.Build) !void {
     // app against a shared `nvim --listen` server and observes OS windows
     // (CGWindowList / EnumWindows). Local-only (real windows appear);
     // `zig build gui-test` on the respective host.
-    const host_os = @import("builtin").os.tag;
     if (host_os == .macos or host_os == .windows) {
         const gui_step = b.step("gui-test", "Run GUI tests against the real zonvie app (local only)");
         const gui_mod = b.createModule(.{

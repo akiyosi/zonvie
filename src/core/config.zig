@@ -283,11 +283,18 @@ pub const Config = struct {
         // Scroll-pipeline analysis mode: [perf...] plus [scroll_debug] lines
         // only. Takes precedence over perf_only when both are set.
         scroll_only: bool = false,
+        // Verbose tier: also emit the highest-frequency per-row / per-glyph
+        // lines ([perf] row_mode / row_mode_post, [shape_dump], [glyph_quad]).
+        // Off by default because their formatting + I/O cost is heavy enough
+        // to perturb the measured pipeline (measured ~1-2ms per flush).
+        verbose: bool = false,
     };
 
     pub const PerformanceConfig = struct {
         glyph_cache_ascii_size: u32 = 512,
-        glyph_cache_non_ascii_size: u32 = 256,
+        // NOTE: default must match nvim_core.zig glyph_cache_non_ascii_size,
+        // which documents why a screenful of CJK needs this much.
+        glyph_cache_non_ascii_size: u32 = 16384,
         hl_cache_size: u32 = 2048, // NOTE: default must match nvim_core.zig hl_cache_size
         shape_cache_size: u32 = 4096,
         atlas_size: u32 = atlas_size_default,
@@ -551,6 +558,7 @@ pub const Config = struct {
             if (l.path) |p| self.log.path = alloc.dupe(u8, p) catch null;
             if (l.perf_only) |po| self.log.perf_only = po;
             if (l.scroll_only) |so| self.log.scroll_only = so;
+            if (l.verbose) |v| self.log.verbose = v;
         }
 
         if (cfg.performance) |p| {
@@ -907,6 +915,7 @@ const TomlLog = struct {
     path: ?[]const u8 = null,
     perf_only: ?bool = null,
     scroll_only: ?bool = null,
+    verbose: ?bool = null,
 };
 
 const TomlPerformance = struct {

@@ -73,6 +73,68 @@ pub const Stream = union(enum) {
         };
     }
 
+    /// Prepare a spawned child's stdin for cancellation without closing its
+    /// descriptor out from under the writer thread. POSIX pipe writes become
+    /// non-blocking; writerThreadFn then polls its cancellation flag between
+    /// bounded write attempts. Windows synchronous pipe writes are canceled
+    /// by Core.cancelWriterIo() using the writer thread handle.
+    pub fn preparePipeWriter(self: Stream) !Stream {
+        if (builtin.os.tag == .windows) return self;
+        return switch (self) {
+            .file => |file| blk: {
+                var flags: usize = while (true) {
+                    const rc = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(usize, 0));
+                    switch (std.posix.errno(rc)) {
+                        .SUCCESS => break @intCast(rc),
+                        .INTR => continue,
+                        else => |err| return std.posix.unexpectedErrno(err),
+                    }
+                };
+                flags |= @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+                while (true) {
+                    switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.SETFL, flags))) {
+                        .SUCCESS => break,
+                        .INTR => continue,
+                        else => |err| return std.posix.unexpectedErrno(err),
+                    }
+                }
+                var nonblocking_file = file;
+                nonblocking_file.flags.nonblocking = true;
+                break :blk .{ .file = nonblocking_file };
+            },
+            .win_pipe => unreachable,
+        };
+    }
+
+    /// Write all bytes while honoring teardown cancellation. Only POSIX pipe
+    /// streams use the retry loop; other streams retain their existing I/O
+    /// implementation and are actively canceled by Core.cancelWriterIo().
+    pub fn writeAllCancelable(self: Stream, bytes: []const u8, canceled: *const std.atomic.Value(bool)) !void {
+        if (builtin.os.tag != .windows) switch (self) {
+            .file => |file| if (file.flags.nonblocking) {
+                var offset: usize = 0;
+                var retry_ns: u64 = 2 * std.time.ns_per_ms;
+                while (offset < bytes.len) {
+                    if (canceled.load(.acquire)) return error.OperationAborted;
+                    const written = file.writeStreaming(clock.io(), &.{}, &.{bytes[offset..]}, 1) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            std.Io.sleep(clock.io(), .{ .nanoseconds = retry_ns }, .awake) catch {};
+                            retry_ns = @min(retry_ns * 2, 32 * std.time.ns_per_ms);
+                            continue;
+                        },
+                        else => |other| return other,
+                    };
+                    offset += written;
+                    retry_ns = 2 * std.time.ns_per_ms;
+                }
+                return;
+            },
+            .win_pipe => unreachable,
+        };
+        if (canceled.load(.acquire)) return error.OperationAborted;
+        return self.writeAll(bytes);
+    }
+
     /// Cancel pending I/O on the underlying transport so any blocked
     /// read/write returns. Semantics differ by backend:
     ///   - `.file`: closes the fd/HANDLE outright. Self-contained.
@@ -122,7 +184,11 @@ pub const Stream = union(enum) {
     /// Errors are swallowed — at teardown we only care that the
     /// blocked thread is woken; a SocketNotConnected or
     /// ConnectionResetByPeer is acceptable noise.
-    pub fn shutdownIfSocket(self: Stream, is_socket: bool) void {
+    /// Errors are returned rather than swallowed: a failed shutdown means a
+    /// concurrently blocked reader or writer is never released, which
+    /// presents as a hang with no other symptom. Callers own a logger; make
+    /// them say so.
+    pub fn shutdownIfSocket(self: Stream, is_socket: bool) !void {
         if (!is_socket) return;
         // Windows `.file` is only used for spawn-mode pipe transport in
         // this codebase — connect-mode socket equivalent is `.win_pipe`

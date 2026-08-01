@@ -97,7 +97,7 @@ fn rasterizeAgentEmoji(d2d_factory: *c.ID2D1Factory, dwrite_factory: *c.IDWriteF
     var bits: ?*anyopaque = null;
     const hbm = c.CreateDIBSection(hdc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0);
     if (hbm == null or bits == null) return null;
-    _ = c.SelectObject(hdc, hbm);
+    const old_hbm = c.SelectObject(hdc, hbm);
 
     const ok = blk: {
         const rtp = c.D2D1_RENDER_TARGET_PROPERTIES{
@@ -164,6 +164,9 @@ fn rasterizeAgentEmoji(d2d_factory: *c.ID2D1Factory, dwrite_factory: *c.IDWriteF
         break :blk true;
     };
 
+    // A selected bitmap cannot be deleted. Restore the DC before either the
+    // failure cleanup or returning ownership to the cache.
+    _ = c.SelectObject(hdc, old_hbm);
     if (!ok) {
         _ = c.DeleteObject(hbm);
         return null;
@@ -534,9 +537,7 @@ pub fn contentWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
             return 0;
         },
         // Forward mouse/keyboard events to parent window
-        c.WM_LBUTTONDOWN, c.WM_LBUTTONUP, c.WM_RBUTTONDOWN, c.WM_RBUTTONUP,
-        c.WM_MBUTTONDOWN, c.WM_MBUTTONUP, c.WM_MOUSEMOVE, c.WM_MOUSEWHEEL,
-        c.WM_KEYDOWN, c.WM_KEYUP, c.WM_SYSKEYDOWN, c.WM_SYSKEYUP, c.WM_CHAR => {
+        c.WM_LBUTTONDOWN, c.WM_LBUTTONUP, c.WM_RBUTTONDOWN, c.WM_RBUTTONUP, c.WM_MBUTTONDOWN, c.WM_MBUTTONUP, c.WM_MOUSEMOVE, c.WM_MOUSEWHEEL, c.WM_KEYDOWN, c.WM_KEYUP, c.WM_SYSKEYDOWN, c.WM_SYSKEYUP, c.WM_CHAR => {
             const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
             if (v != 0) {
                 const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
@@ -868,8 +869,8 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
                     // Close button - record pressed state, action on mouseUp
                     if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
                     app.tabline_state.close_button_pressed = i;
-                    _ = c.SetCapture(hwnd);  // Capture to get mouseUp even if mouse leaves
-                    _ = c.InvalidateRect(hwnd, null, 0);  // Redraw for pressed state
+                    _ = c.SetCapture(hwnd); // Capture to get mouseUp even if mouse leaves
+                    _ = c.InvalidateRect(hwnd, null, 0); // Redraw for pressed state
                     return;
                 }
 
@@ -1220,11 +1221,20 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
 
                     // Create DPI-scaled font
                     const hfont = c.CreateFontW(
-                        app.scalePx(-12), 0, 0, 0,
-                        c.FW_NORMAL, 0, 0, 0,
-                        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS,
+                        app.scalePx(-12),
+                        0,
+                        0,
+                        0,
+                        c.FW_NORMAL,
+                        0,
+                        0,
+                        0,
+                        c.DEFAULT_CHARSET,
+                        c.OUT_DEFAULT_PRECIS,
                         c.CLIP_DEFAULT_PRECIS,
-                        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+                        c.CLEARTYPE_QUALITY,
+                        c.DEFAULT_PITCH | c.FF_DONTCARE,
+                        null,
                     );
                     const old_font = c.SelectObject(hdc, hfont);
 
@@ -1276,6 +1286,51 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
     }
 }
 
+/// Normalize an optional index for deterministic hashing (optional padding
+/// bytes are undefined and must not enter the signature).
+fn sigOptIdx(v: ?usize) u64 {
+    return if (v) |x| @as(u64, x) else std.math.maxInt(u64);
+}
+
+fn sigOptByte(v: ?u8) u64 {
+    return if (v) |x| @as(u64, x) else std.math.maxInt(u64);
+}
+
+/// Hash of everything drawTablineContent draws for the titlebar strip.
+/// Used by renderTablineToD3D to skip byte-identical re-renders.
+fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
+    const ts = &app.tabline_state;
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&width));
+    h.update(std.mem.asBytes(&height));
+    h.update(std.mem.asBytes(&app.dpi_scale));
+    h.update(std.mem.asBytes(&window_mod.g_os_dark_theme_cached));
+    h.update(std.mem.asBytes(&ts.tab_count));
+    h.update(std.mem.asBytes(&ts.current_tab));
+    for (ts.tabs[0..ts.tab_count]) |*tab| {
+        h.update(std.mem.asBytes(&tab.handle));
+        h.update(tab.name[0..tab.name_len]);
+    }
+    var opt_fields = [_]u64{
+        sigOptIdx(ts.hovered_tab),
+        sigOptIdx(ts.hovered_close),
+        sigOptByte(ts.hovered_window_btn),
+        @intFromBool(ts.hovered_new_tab_btn),
+        sigOptIdx(ts.dragging_tab),
+        @as(u64, @bitCast(@as(i64, ts.drag_current_x))),
+        sigOptIdx(ts.drop_target_index),
+        sigOptIdx(ts.close_button_pressed),
+        @intFromBool(ts.new_tab_button_pressed),
+        sigOptByte(ts.pressed_window_btn),
+        @as(u64, ts.spinner_frame),
+        @as(u64, ts.agent_count),
+    };
+    h.update(std.mem.sliceAsBytes(opt_fields[0..]));
+    h.update(std.mem.asBytes(&ts.agent_handles));
+    h.update(std.mem.asBytes(&ts.agent_states));
+    return h.final();
+}
+
 /// Render tabline to D3D11 texture via offscreen GDI bitmap.
 /// This avoids DWM composition issues by keeping GDI rendering offscreen
 /// and only using D3D11 for final display.
@@ -1283,6 +1338,15 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer == null) return;
     if (app.tabline_state.tab_count == 0) return;
     if (width == 0 or height == 0) return;
+
+    // Change gate: WM_PAINT calls this unconditionally, but the tab strip
+    // rarely changes between paints. A full re-render costs a fresh
+    // width*height*4 DIB allocation, dozens of GDI object creations, a CPU
+    // pass over every pixel and a full-texture GPU upload — per keystroke
+    // repaint and per cursor-blink toggle. Skip when the drawn content is
+    // byte-identical to what the D3D texture already holds.
+    const sig = tablineRenderSignature(app, width, height);
+    if (sig == app.tabline_render_sig) return;
 
     // Create memory DC and DIB section
     const screen_dc = c.GetDC(null);
@@ -1326,7 +1390,11 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer) |*g| {
         g.updateTablineTexture(width, height, pixel_data) catch |e| {
             if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
+            return;
         };
+        // Only record the signature after a successful upload so a failed
+        // upload retries on the next paint.
+        app.tabline_render_sig = sig;
     }
 }
 
@@ -1452,9 +1520,20 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
     // Font
     const font = c.CreateFontW(
-        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
-        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
-        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+        app.scalePx(-12),
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.CLEARTYPE_QUALITY,
+        c.DEFAULT_PITCH | c.FF_DONTCARE,
+        null,
     );
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
@@ -1589,11 +1668,15 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // Draw hover background (circular) if hovered
         if (app.tabline_state.hovered_new_tab_btn) {
             const plus_hover_brush = c.CreateSolidBrush(pal.glyph_hover_bg);
-            _ = c.SelectObject(hdc, plus_hover_brush);
+            // The previous brush is restored before DeleteObject: GDI refuses to
+            // delete an object still selected into a DC, so deleting it while
+            // selected silently leaks the handle.
+            const old_brush_hover = c.SelectObject(hdc, plus_hover_brush);
             const null_pen = c.GetStockObject(c.NULL_PEN);
             const old_pen_hover = c.SelectObject(hdc, null_pen);
             _ = c.Ellipse(hdc, plus_x, plus_y, plus_x + plus_btn_size, plus_y + plus_btn_size);
             _ = c.SelectObject(hdc, old_pen_hover);
+            _ = c.SelectObject(hdc, old_brush_hover);
             _ = c.DeleteObject(plus_hover_brush);
         }
 
@@ -1798,7 +1881,7 @@ pub fn onTablineUpdate(
         app.tabline_state.visible = tab_count > 0;
 
         if (tabs) |t| {
-            const count = @min(tab_count, 32);  // Max 32 tabs
+            const count = @min(tab_count, 32); // Max 32 tabs
             for (0..count) |i| {
                 app.tabline_state.tabs[i].handle = t[i].tab_handle;
                 const name_len = @min(t[i].name_len, 255);
@@ -1874,7 +1957,7 @@ pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
     const plus_offset = app.scalePx(8);
     const plus_btn_size = app.scalePx(20);
 
-    if (y >= bar_height) return false;  // Below tab bar
+    if (y >= bar_height) return false; // Below tab bar
 
     // Get client width
     var rect: c.RECT = undefined;
@@ -2261,9 +2344,20 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
     // Font
     const font = c.CreateFontW(
-        app.scalePx(-12), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
-        c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
-        c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+        app.scalePx(-12),
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.CLEARTYPE_QUALITY,
+        c.DEFAULT_PITCH | c.FF_DONTCARE,
+        null,
     );
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
@@ -2400,9 +2494,20 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         // "New Tab" text
         _ = c.SetTextColor(hdc, new_tab_color);
         const small_font = c.CreateFontW(
-            app.scalePx(-11), 0, 0, 0, c.FW_NORMAL, 0, 0, 0,
-            c.DEFAULT_CHARSET, c.OUT_DEFAULT_PRECIS, c.CLIP_DEFAULT_PRECIS,
-            c.CLEARTYPE_QUALITY, c.DEFAULT_PITCH | c.FF_DONTCARE, null,
+            app.scalePx(-11),
+            0,
+            0,
+            0,
+            c.FW_NORMAL,
+            0,
+            0,
+            0,
+            c.DEFAULT_CHARSET,
+            c.OUT_DEFAULT_PRECIS,
+            c.CLIP_DEFAULT_PRECIS,
+            c.CLEARTYPE_QUALITY,
+            c.DEFAULT_PITCH | c.FF_DONTCARE,
+            null,
         );
         const old_small_font = c.SelectObject(hdc, small_font);
         const new_tab_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
@@ -2739,13 +2844,11 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
                     applog.appLog(
                         "[sidebar-drag] screen=({d},{d}) sidebar=({d},{d},{d},{d}) threshold={d} outside={d} client_x={d} sidebar_w={d}\n",
                         .{
-                            screen_pt.x,           screen_pt.y,
-                            sidebar_rect.left,     sidebar_rect.top,
-                            sidebar_rect.right,    sidebar_rect.bottom,
-                            threshold,
-                            @as(i32, @intFromBool(is_outside)),
-                            x,
-                            sidebar_w,
+                            screen_pt.x,        screen_pt.y,
+                            sidebar_rect.left,  sidebar_rect.top,
+                            sidebar_rect.right, sidebar_rect.bottom,
+                            threshold,          @as(i32, @intFromBool(is_outside)),
+                            x,                  sidebar_w,
                         },
                     );
                 }

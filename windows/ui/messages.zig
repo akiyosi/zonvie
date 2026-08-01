@@ -8,6 +8,41 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 
+/// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
+/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
+/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
+/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
+fn utf8ToUtf16Lossy(dst: []u16, src: []const u8) usize {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < src.len and out < dst.len) {
+        var cp: u21 = 0xFFFD;
+        const cp_len = std.unicode.utf8ByteSequenceLength(src[i]) catch {
+            i += 1;
+            dst[out] = 0xFFFD;
+            out += 1;
+            continue;
+        };
+        if (i + cp_len > src.len) {
+            dst[out] = 0xFFFD;
+            out += 1;
+            break;
+        }
+        cp = std.unicode.utf8Decode(src[i .. i + cp_len]) catch 0xFFFD;
+        i += cp_len;
+        if (cp > 0xFFFF) {
+            if (out + 1 >= dst.len) break;
+            dst[out] = @as(u16, @intCast((cp - 0x10000) >> 10)) + 0xD800;
+            dst[out + 1] = @as(u16, @intCast((cp - 0x10000) & 0x3FF)) + 0xDC00;
+            out += 2;
+        } else {
+            dst[out] = @intCast(cp);
+            out += 1;
+        }
+    }
+    return out;
+}
+
 pub fn onMsgShow(
     ctx: ?*anyopaque,
     view: app_mod.zonvie_msg_view_type,
@@ -67,6 +102,7 @@ pub fn onMsgShow(
 
     app.pending_messages.append(app.alloc, req) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
+        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
         return;
     };
 
@@ -164,6 +200,7 @@ pub fn handleMsgMiniOrExtFloat(
 
             app.pending_messages.append(app.alloc, req) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
+                if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
                 return;
             };
 
@@ -282,6 +319,7 @@ pub fn onMsgHistoryShow(
 
     app.pending_messages.append(app.alloc, req) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to queue history message: {any}\n", .{e});
+        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
         return;
     };
 
@@ -291,7 +329,7 @@ pub fn onMsgHistoryShow(
     }
 }
 
-pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage) void {
+pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
     if (applog.isEnabled()) applog.appLog("[win] showMessageWindowOnUIThread: text_len={d} kind={s}\n", .{ msg.text_len, msg.kind[0..msg.kind_len] });
 
     // Build combined content from display_messages stack
@@ -304,6 +342,19 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage) void 
         }
         const copy_len = @min(dm.text_len, combined_text.len - combined_len);
         @memcpy(combined_text[combined_len..][0..copy_len], dm.text[0..copy_len]);
+        combined_len += copy_len;
+    }
+    // Allocation failure while extending display_messages must not make the
+    // current message disappear. The caller requests this fixed-buffer
+    // fallback when the append failed (and for split messages, which are not
+    // stored in the display stack at all).
+    if (include_msg and combined_len < combined_text.len) {
+        if (combined_len > 0 and combined_len < combined_text.len - 1) {
+            combined_text[combined_len] = '\n';
+            combined_len += 1;
+        }
+        const copy_len = @min(msg.text_len, combined_text.len - combined_len);
+        @memcpy(combined_text[combined_len..][0..copy_len], msg.text[0..copy_len]);
         combined_len += copy_len;
     }
 
@@ -515,7 +566,7 @@ pub fn hideMessageWindow(app: *App) void {
 pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
-    const ext_win = app.external_windows.getPtr(grid_id) orelse {
+    const ext_win = app.external_windows.get(grid_id) orelse {
         app.mu.unlock(core.clock.io());
         return;
     };
@@ -575,6 +626,21 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
 
     if (applog.isEnabled()) applog.appLog("[win] resizeExternalWindowDeferred: grid_id={d} window=({d},{d}) at ({d},{d})\n", .{ grid_id, window_w, window_h, pos_x, pos_y });
 
+    // Suppress the WM_SIZE -> nvim_ui_try_resize_grid feedback loop for this
+    // programmatic resize. Set here, immediately before SetWindowPos and
+    // after every early-return above, so a bail-out (e.g. GetWindowRect
+    // failure) can never leave this flag stuck true. Cleared below once
+    // SetWindowPos (and the synchronous WM_SIZE it triggers) has completed.
+    // Without this, every programmatic resize (font/linespace change,
+    // popupmenu auto-size) unconditionally sends a resize RPC, including for
+    // synthetic grid_ids (cmdline/popupmenu/msg_show/msg_history) that don't
+    // exist in nvim.
+    app.mu.lockUncancelable(core.clock.io());
+    if (app.external_windows.get(grid_id)) |ew| {
+        ew.suppress_resize_callback = true;
+    }
+    app.mu.unlock(core.clock.io());
+
     // Resize window (outside lock, safe from deadlock).
     // SetWindowPos sends WM_SIZE synchronously - suppress_resize_callback prevents feedback loop.
     _ = c.SetWindowPos(
@@ -590,7 +656,7 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Clear suppress_resize_callback after SetWindowPos completes.
     // (SetWindowPos sends WM_SIZE synchronously, so by this point it's already handled.)
     app.mu.lockUncancelable(core.clock.io());
-    if (app.external_windows.getPtr(grid_id)) |ew| {
+    if (app.external_windows.get(grid_id)) |ew| {
         ew.suppress_resize_callback = false;
     }
     // Clear saved cmdline position after programmatic resize (e.g. font change).
@@ -621,8 +687,8 @@ pub fn updateExtFloatPositions(app: *App) void {
     const cell_h = app.cell_h_px + app.linespace_px;
     const pos_mode = app.config.messages.msg_pos.ext_float;
     const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
-    const msg_show_entry = app.external_windows.getPtr(app_mod.MESSAGE_GRID_ID);
-    const msg_history_entry = app.external_windows.getPtr(app_mod.MSG_HISTORY_GRID_ID);
+    const msg_show_entry = app.external_windows.get(app_mod.MESSAGE_GRID_ID);
+    const msg_history_entry = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
     const corep = app.corep;
 
     // Copy window info
@@ -693,8 +759,8 @@ pub fn updateExtFloatPositions(app: *App) void {
 
                 if (corep) |cp| {
                     const cached = app.getVisibleGridsCached(cp);
-                    if (cached.count > 0) {
-                        for (cached.grids[0..cached.count]) |grid| {
+                    if (cached.len > 0) {
+                        for (cached) |grid| {
                             if (grid.grid_id == cursor_grid) {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
@@ -861,8 +927,8 @@ pub fn updateMiniWindows(app: *App) void {
                 // Try to get grid bounds from core (non-blocking)
                 if (app.corep) |corep| {
                     const cached = app.getVisibleGridsCached(corep);
-                    if (cached.count > 0) {
-                        for (cached.grids[0..cached.count]) |grid| {
+                    if (cached.len > 0) {
+                        for (cached) |grid| {
                             if (grid.grid_id == cursor_grid) {
                                 const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
                                 const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
@@ -1061,26 +1127,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
 
     // Convert text to UTF-16 using proper UTF-8 decoding
     var text_utf16: [4096]u16 = undefined;
-    var text_utf16_len: usize = 0;
-    const utf8_view = std.unicode.Utf8View.initUnchecked(msg_win.text[0..msg_win.text_len]);
-    var utf8_iter = utf8_view.iterator();
-    while (utf8_iter.nextCodepoint()) |codepoint| {
-        if (text_utf16_len >= text_utf16.len - 1) break;
-        // Handle surrogate pairs for codepoints > 0xFFFF
-        if (codepoint > 0xFFFF) {
-            const high = @as(u16, @intCast((codepoint - 0x10000) >> 10)) + 0xD800;
-            const low = @as(u16, @intCast((codepoint - 0x10000) & 0x3FF)) + 0xDC00;
-            text_utf16[text_utf16_len] = high;
-            text_utf16_len += 1;
-            if (text_utf16_len < text_utf16.len) {
-                text_utf16[text_utf16_len] = low;
-                text_utf16_len += 1;
-            }
-        } else {
-            text_utf16[text_utf16_len] = @intCast(codepoint);
-            text_utf16_len += 1;
-        }
-    }
+    const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, msg_win.text[0..msg_win.text_len]);
 
     // Draw text with padding
     const padding: c_int = app.scalePx(12);
@@ -1193,14 +1240,10 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
     // Convert text to UTF-16
+    // Decoded, not byte-zero-extended: showmode/showcmd/ruler carry non-ASCII
+    // (e.g. "-- 挿入 --"), which zero-extension renders as mojibake.
     var text_utf16: [256]u16 = undefined;
-    var text_utf16_len: usize = 0;
-    for (text_buf[0..text_len]) |byte| {
-        if (text_utf16_len < text_utf16.len) {
-            text_utf16[text_utf16_len] = byte;
-            text_utf16_len += 1;
-        }
-    }
+    const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
 
     // Draw text centered
     const mini_pad = app.scalePx(4);

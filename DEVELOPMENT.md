@@ -228,6 +228,66 @@ This matters for correctness:
 - layout-dependent rendering must stay synchronized with the dimensions used during flush
 - COW detach must not create unbounded MTLBuffer allocations (pool-alias safety)
 
+Rendering resource limits are split between logical core accounting and
+frontend-owned physical storage:
+
+- The core rejects a single vertex callback above 256 MiB, a completed surface
+  above 256 MiB, or all completed surfaces above 512 MiB. Surface and aggregate
+  limits are evaluated against the completed flush state, so replacing old
+  rows cannot fail only because old and new counts temporarily coexist. The
+  per-callback figure must equal both frontends' row-buffer ceilings
+  (`surfaceMaxVertexBufferCapacity`, `max_buffer_bytes`); a lower frontend
+  ceiling turns an accounted core rejection into a repeating allocation error.
+- Main-grid row-to-subgrid indexing is limited to 8 MiB. Layout mutations that
+  would exceed the limit fail before publication and preserve the previous
+  layout. An unchanged layout generation reuses the existing index.
+- Frontends must separately bound their physical GPU allocations. Buffering and
+  copy-on-write can require more storage than the core's logical totals. Core
+  acceptance does not promise that every frontend can represent the frame. If
+  a fixed frontend budget cannot provision a flush, it must call
+  `zonvie_core_fail_render_budget`; that failure is a deliberate terminal UI
+  session outcome, not retryable backpressure.
+- macOS row storage has a 256 MiB per-surface peak and a 512 MiB process-wide
+  peak shared by the main renderer and all external windows. Both limits count
+  unique live MTLBuffer objects plus replacement reservations. **They are
+  charged only by the provisioning planner, which since b83ff29 runs on the
+  allocation-failure recovery path.** Ordinary row submission on both the main
+  grid and external grids allocates directly and consults neither, so these are
+  recovery-path bounds, not a cap on live traffic. With three
+  sets and two private slots per set, a fresh 42 MiB row fits the per-surface
+  byte limit while a 44 MiB row is rejected even though it remains below the
+  core's logical 256 MiB callback limit; the boundary is covered by the Metal
+  provisioning test. This provisioning budget, not the core callback limit, is
+  the binding per-row ceiling on the recovery path.
+- Windows row vertex buffers use the same 256 MiB per-surface and 512 MiB
+  process-wide physical byte limits. Growth reserves the complete replacement
+  buffer while the old buffer is still live, commits accounting only after
+  `CreateBuffer` succeeds, and releases ownership on row shrink, surface
+  destruction, or device loss. Exceeding either fixed limit terminates the UI
+  session through `zonvie_core_fail_render_budget`.
+- Windows scrollbar underlay capture and restore are part of the paint
+  transaction. A missing D3D resource or function stops Present, clears the
+  saved-underlay state, and requests a full retry; unchanged track geometry
+  does not suppress a later allocation attempt.
+- Completed external-surface vertex totals are maintained incrementally across
+  membership, resize, scroll, and row replacement. A layout-generation change
+  therefore does not scan every external grid at flush begin. Abort recovery
+  still visits all surfaces to invalidate their row ledgers and request the
+  necessarily full resend.
+- macOS contraction provisioning replaces private row buffers whose capacity
+  exceeds twice the current row demand. The newly committed set retires its own
+  oversized detach/private storage while retaining active content. Zero is a
+  valid known column count; a zero-column commit also retires the newly
+  committed active row storage. Three-set rotation then converges storage to a
+  later narrow demand. Note this describes the provisioning path only: ordinary
+  row submission on both the main grid and external grids allocates
+  synchronously inside the redraw callback, because the asynchronous
+  pre-provisioning gate did not converge under sustained scroll. Provisioning
+  now runs only to recover from a genuine allocation failure.
+- Windows device-loss recovery continues until the device is rebuilt or the
+  main HWND is torn down. Retries use exponential backoff capped at 30 seconds;
+  after three failed attempts Zonvie warns once without terminating recovery.
+
 ## Development Features To Be Aware Of
 
 The current codebase includes development-sensitive behavior for:

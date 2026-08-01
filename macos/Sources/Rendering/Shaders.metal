@@ -45,6 +45,9 @@ struct ScrollOffset {
     float content_bottom_y; // Bottom Y of scrollable content (above margin bottom), in NDC
     int move_all;           // 1 = translate every vertex of this grid (ignore DECO_SCROLLABLE);
                             // used for float windows that move bodily with their parent's scroll
+    int pin_edges;          // 1 = stretch the edge row's background across the gap the offset
+                            // opens. 0 when a retained row already covers that gap with its own
+                            // background, which the stretch would otherwise paint over.
 };
 
 // Drawable size for NDC conversion in fragment shader
@@ -72,60 +75,80 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
     o.content_bottom_y = -2.0; // Below screen
     o.was_content = 0.0;
 
-    // Apply scroll offset for matching grid_id, using DECO_SCROLLABLE flag
-    // instead of position-based bounds. The flag is set by the Zig core during
-    // vertex generation for content rows (not margin rows like tabline/statusline).
-    // This avoids quad deformation when glyph vertices extend beyond cell boundaries.
-    for (uint i = 0; i < scrollOffsetCount; i++) {
-        if (scrollOffsets[i].grid_id == in.grid_id) {
-            // Pass content bounds to fragment shader for clipping
-            o.content_top_y = scrollOffsets[i].content_top_y;
-            o.content_bottom_y = scrollOffsets[i].content_bottom_y;
-
-            // Float windows (move_all) translate as a whole, including their border
-            // rows which are viewport-margin rows and therefore lack DECO_SCROLLABLE.
-            bool move_all = scrollOffsets[i].move_all != 0;
-
-            // Scroll vertices flagged as scrollable (content area, not margins), or
-            // every vertex when move_all is set.
-            if (move_all || (in.deco_flags & DECO_SCROLLABLE)) {
-                float offset = scrollOffsets[i].offset_y;
-
-                // Check if this is a plain background quad (uv.x < 0, no deco/cursor flags).
-                // Check visual decoration flags; if none set → plain background.
-                bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & DECO_VISUAL_MASK) == 0);
-
-                // move_all grids translate uniformly (no edge pinning): their content
-                // bounds span the screen so nothing is clipped, and the whole float
-                // including margins must shift together.
-                if (is_plain_bg && !move_all) {
-                    // Background quads at content area edges: keep the boundary vertex
-                    // pinned so the edge row stretches to fill the gap left by scrolling.
-                    // This prevents transparent gaps at top/bottom during smooth scroll.
-                    // Glyph/decoration vertices always scroll uniformly (no deformation).
-                    if (offset > 0.0) {
-                        // Scrolling up: gap at bottom → pin bottom-boundary vertex
-                        bool at_bottom = abs(pos.y - scrollOffsets[i].content_bottom_y) < 0.001;
-                        if (!at_bottom) {
-                            pos.y += offset;
-                        }
-                    } else if (offset < 0.0) {
-                        // Scrolling down: gap at top → pin top-boundary vertex
-                        bool at_top = abs(pos.y - scrollOffsets[i].content_top_y) < 0.001;
-                        if (!at_top) {
-                            pos.y += offset;
-                        }
-                    }
-                } else {
-                    // Glyph/decoration: uniform scroll (no deformation)
-                    pos.y += offset;
-                }
-                // 2.0 marks bodily-moved float content (move_all); 1.0 marks
-                // window-scrolled content. The fixed-float bleed guard targets
-                // only window content so it never discards a moving float.
-                o.was_content = move_all ? 2.0 : 1.0;
+    // scrollOffsets is sorted by grid_id on the CPU. Binary search keeps this
+    // per-vertex lookup bounded when many windows/floats scroll together.
+    uint matchIndex = scrollOffsetCount;
+    if (scrollOffsetCount == 1u) {
+        // One scrolled grid is the common case; avoid doing both the
+        // lower-bound comparison and the equality check for one entry.
+        if (scrollOffsets[0].grid_id == in.grid_id) matchIndex = 0u;
+    } else if (scrollOffsetCount > 1u) {
+        uint lo = 0u;
+        uint hi = scrollOffsetCount;
+        while (lo < hi) {
+            uint mid = lo + ((hi - lo) >> 1u);
+            if (scrollOffsets[mid].grid_id < in.grid_id) {
+                lo = mid + 1u;
+            } else {
+                hi = mid;
             }
-            break;
+        }
+        if (lo < scrollOffsetCount && scrollOffsets[lo].grid_id == in.grid_id) {
+            matchIndex = lo;
+        }
+    }
+
+    // Apply the matching offset using DECO_SCROLLABLE rather than
+    // position-based bounds. The core sets the flag on content rows (not
+    // margins), avoiding quad deformation when glyphs cross cell boundaries.
+    if (matchIndex < scrollOffsetCount) {
+        constant ScrollOffset& scroll = scrollOffsets[matchIndex];
+        // Pass content bounds to fragment shader for clipping
+        o.content_top_y = scroll.content_top_y;
+        o.content_bottom_y = scroll.content_bottom_y;
+
+        // Float windows (move_all) translate as a whole, including their border
+        // rows which are viewport-margin rows and therefore lack DECO_SCROLLABLE.
+        bool move_all = scroll.move_all != 0;
+
+        // Scroll vertices flagged as scrollable (content area, not margins), or
+        // every vertex when move_all is set.
+        if (move_all || (in.deco_flags & DECO_SCROLLABLE)) {
+            float offset = scroll.offset_y;
+
+            // Check if this is a plain background quad (uv.x < 0, no deco/cursor flags).
+            // Check visual decoration flags; if none set → plain background.
+            bool is_plain_bg = (in.texCoord.x < 0.0) && ((in.deco_flags & DECO_VISUAL_MASK) == 0);
+
+            // move_all grids translate uniformly (no edge pinning): their content
+            // bounds span the screen so nothing is clipped, and the whole float
+            // including margins must shift together.
+            if (is_plain_bg && !move_all && scroll.pin_edges != 0) {
+                // Background quads at content area edges: keep the boundary vertex
+                // pinned so the edge row stretches to fill the gap left by scrolling.
+                // This prevents transparent gaps at top/bottom during smooth scroll.
+                // Glyph/decoration vertices always scroll uniformly (no deformation).
+                if (offset > 0.0) {
+                    // Scrolling up: gap at bottom → pin bottom-boundary vertex
+                    bool at_bottom = abs(pos.y - scroll.content_bottom_y) < 0.001;
+                    if (!at_bottom) {
+                        pos.y += offset;
+                    }
+                } else if (offset < 0.0) {
+                    // Scrolling down: gap at top → pin top-boundary vertex
+                    bool at_top = abs(pos.y - scroll.content_top_y) < 0.001;
+                    if (!at_top) {
+                        pos.y += offset;
+                    }
+                }
+            } else {
+                // Glyph/decoration: uniform scroll (no deformation)
+                pos.y += offset;
+            }
+            // 2.0 marks bodily-moved float content (move_all); 1.0 marks
+            // window-scrolled content. The fixed-float bleed guard targets
+            // only window content so it never discards a moving float.
+            o.was_content = move_all ? 2.0 : 1.0;
         }
     }
 
@@ -137,24 +160,50 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
     return o;
 }
 
-// Screen rectangle (NDC) of a fixed, non-following float. Scrolled content must
-// not bleed over it when an adjacent row is shifted by the smooth-scroll offset.
-struct FixedFloatRect {
-    float x0;     // left edge, NDC
-    float x1;     // right edge, NDC
-    float top;    // top edge, NDC (higher value)
-    float bottom; // bottom edge, NDC (lower value)
+// Exact union of fixed-float rectangles in drawable pixel coordinates. Bands
+// are disjoint and sorted top-to-bottom. Each band points at a disjoint,
+// left-to-right interval slice.
+struct FixedFloatBand {
+    float top;
+    float bottom;
+    uint interval_start;
+    uint interval_count;
 };
 
-// True if a scrolled fragment at (ndc_x, ndc_y) lies inside any fixed,
-// non-following float — such fragments are discarded so the scrolled buffer
-// content does not bleed over the float's (unscrolled) cells.
-static inline bool insideFixedFloat(float ndc_x, float ndc_y,
-                                    constant FixedFloatRect* rects, uint count) {
-    for (uint i = 0u; i < count; i++) {
-        constant FixedFloatRect& r = rects[i];
-        if (ndc_x >= r.x0 && ndc_x <= r.x1 && ndc_y <= r.top && ndc_y >= r.bottom) {
-            return true;
+struct FixedFloatInterval {
+    float x0;
+    float x1;
+};
+
+// Two-level binary search: O(log bands + log intervals), replacing the old
+// O(floats) test executed for every fragment (and for both blur passes).
+static inline bool insideFixedFloat(float pixel_x, float pixel_y,
+                                    constant FixedFloatBand* bands, uint band_count,
+                                    constant FixedFloatInterval* intervals) {
+    uint lo = 0u;
+    uint hi = band_count;
+    while (lo < hi) {
+        uint mid = lo + ((hi - lo) >> 1u);
+        constant FixedFloatBand& band = bands[mid];
+        if (pixel_y < band.top) {
+            hi = mid;
+        } else if (pixel_y > band.bottom) {
+            lo = mid + 1u;
+        } else {
+            uint xlo = band.interval_start;
+            uint xhi = xlo + band.interval_count;
+            while (xlo < xhi) {
+                uint xmid = xlo + ((xhi - xlo) >> 1u);
+                constant FixedFloatInterval& interval = intervals[xmid];
+                if (pixel_x < interval.x0) {
+                    xhi = xmid;
+                } else if (pixel_x > interval.x1) {
+                    xlo = xmid + 1u;
+                } else {
+                    return true;
+                }
+            }
+            return false;
         }
     }
     return false;
@@ -166,8 +215,9 @@ fragment float4 ps_main(VSOut in [[stage_in]],
                         constant DrawableSize& drawableSize [[buffer(0)]],
                         constant float& backgroundAlpha [[buffer(1)]],
                         constant uint& cursorBlinkVisible [[buffer(2)]],
-                        constant FixedFloatRect* fixedFloats [[buffer(3)]],
-                        constant uint& fixedFloatCount [[buffer(4)]]) {
+                        constant FixedFloatBand* fixedFloatBands [[buffer(3)]],
+                        constant uint& fixedFloatBandCount [[buffer(4)]],
+                        constant FixedFloatInterval* fixedFloatIntervals [[buffer(5)]]) {
 
     // Discard cursor vertices when cursor blink is off
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
@@ -186,9 +236,8 @@ fragment float4 ps_main(VSOut in [[stage_in]],
         }
         // Only window content (was_content ~1.0) is guarded against bleeding over
         // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
-            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
-            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
+            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -275,10 +324,13 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     // Do not flip V here (causes vertical flip)
     float2 uv = in.uv;
 
-    // Color emoji: sample RGBA directly (premultiplied alpha)
+    // Color emoji: the atlas stores CG-rasterized PREMULTIPLIED RGBA, but
+    // this pipeline blends with straight-alpha factors (srcAlpha,
+    // 1-srcAlpha). Unpremultiply here so alpha is not applied twice
+    // (double-multiply darkens antialiased emoji edges).
     if (in.deco_flags & DECO_COLOR_EMOJI) {
         float4 emoji = tex.sample(samp, uv);
-        return float4(emoji.rgb, emoji.a);
+        return float4(saturate(emoji.rgb / max(emoji.a, 1e-4)), emoji.a);
     }
 
     // Grayscale glyph: RGBA atlas stores coverage in .r (all channels equal)
@@ -307,8 +359,9 @@ fragment float4 ps_background(VSOut in [[stage_in]],
                                sampler samp [[sampler(0)]],
                                constant DrawableSize& drawableSize [[buffer(0)]],
                                constant float& backgroundAlpha [[buffer(1)]],
-                               constant FixedFloatRect* fixedFloats [[buffer(3)]],
-                               constant uint& fixedFloatCount [[buffer(4)]]) {
+                               constant FixedFloatBand* fixedFloatBands [[buffer(3)]],
+                               constant uint& fixedFloatBandCount [[buffer(4)]],
+                               constant FixedFloatInterval* fixedFloatIntervals [[buffer(5)]]) {
 
     // Clip scrolled content in margin area (same as ps_main)
     float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
@@ -318,9 +371,8 @@ fragment float4 ps_background(VSOut in [[stage_in]],
         }
         // Only window content (was_content ~1.0) is guarded against bleeding over
         // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
-            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
-            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
+            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -336,10 +388,11 @@ fragment float4 ps_background(VSOut in [[stage_in]],
         discard_fragment();
     }
 
-    // If backgroundAlpha is 0, don't draw any background (fully transparent)
-    // This allows underlying views (NSVisualEffectView/paddingView) to show through
+    // A partial redraw can load old glyph pixels. Overwrite them with a fully
+    // transparent background instead of discarding, while still allowing the
+    // underlying NSVisualEffectView/paddingView to show through.
     if (backgroundAlpha <= 0.0) {
-        discard_fragment();
+        return float4(in.color.rgb, 0.0);
     }
 
     // Regular solid color background
@@ -360,8 +413,9 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
                           constant DrawableSize& drawableSize [[buffer(0)]],
                           constant float& backgroundAlpha [[buffer(1)]],
                           constant uint& cursorBlinkVisible [[buffer(2)]],
-                          constant FixedFloatRect* fixedFloats [[buffer(3)]],
-                          constant uint& fixedFloatCount [[buffer(4)]]) {
+                          constant FixedFloatBand* fixedFloatBands [[buffer(3)]],
+                          constant uint& fixedFloatBandCount [[buffer(4)]],
+                          constant FixedFloatInterval* fixedFloatIntervals [[buffer(5)]]) {
 
     // Discard cursor vertices when cursor blink is off
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
@@ -376,9 +430,8 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
         }
         // Only window content (was_content ~1.0) is guarded against bleeding over
         // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
-            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
-            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
+            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -447,10 +500,11 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
     // Glyph rendering: sample from atlas
     float2 uv = in.uv;
 
-    // Color emoji: sample RGBA directly
+    // Color emoji: atlas is premultiplied, pipeline blend is straight-alpha —
+    // unpremultiply to avoid double-multiplying alpha (see ps_main).
     if (in.deco_flags & DECO_COLOR_EMOJI) {
         float4 emoji = tex.sample(samp, uv);
-        return float4(emoji.rgb, emoji.a);
+        return float4(saturate(emoji.rgb / max(emoji.a, 1e-4)), emoji.a);
     }
 
     // Grayscale glyph: coverage in .r
@@ -478,8 +532,9 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
                                  constant DrawableSize& drawableSize [[buffer(0)]],
                                  constant float& backgroundAlpha [[buffer(1)]],
                                  constant uint& cursorBlinkVisible [[buffer(2)]],
-                                 constant FixedFloatRect* fixedFloats [[buffer(3)]],
-                                 constant uint& fixedFloatCount [[buffer(4)]]) {
+                                 constant FixedFloatBand* fixedFloatBands [[buffer(3)]],
+                                 constant uint& fixedFloatBandCount [[buffer(4)]],
+                                 constant FixedFloatInterval* fixedFloatIntervals [[buffer(5)]]) {
     // ── Common discards (apply to every quad type) ─────────────────────
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
         discard_fragment();
@@ -491,9 +546,8 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         }
         // Only window content (was_content ~1.0) is guarded against bleeding over
         // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatCount > 0u) {
-            float ndc_x = (in.position.x / drawableSize.width) * 2.0 - 1.0;
-            if (insideFixedFloat(ndc_x, ndc_y, fixedFloats, fixedFloatCount)) {
+        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
+            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -513,10 +567,9 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         // Background path: overwrite tile with new bg color (matches the
         // previous (one, zero) blend behavior of ps_background).
         if (backgroundAlpha <= 0.0) {
-            // Same semantics as ps_background's discard: don't paint over
-            // the underlying NSVisualEffectView. Returning `current` keeps
-            // tile content untouched under our overwrite-blend pipeline.
-            return current;
+            // Do not preserve a loaded glyph pixel. A zero-alpha overwrite
+            // remains transparent to the underlying NSVisualEffectView.
+            return float4(in.color.rgb, 0.0);
         }
         if (backgroundAlpha >= 1.0) {
             return float4(in.color.rgb, 1.0);
@@ -575,8 +628,10 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
     float2 uv = in.uv;
     float4 src;
     if (in.deco_flags & DECO_COLOR_EMOJI) {
+        // Atlas is premultiplied; the manual mix() below applies straight
+        // alpha — unpremultiply to avoid double-multiplying (see ps_main).
         float4 emoji = tex.sample(samp, uv);
-        src = float4(emoji.rgb, emoji.a);
+        src = float4(saturate(emoji.rgb / max(emoji.a, 1e-4)), emoji.a);
     } else {
         float cov = tex.sample(samp, uv).r;
         src = float4(in.color.rgb, in.color.a * cov);

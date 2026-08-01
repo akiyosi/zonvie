@@ -32,6 +32,34 @@ const SliceReader = struct {
     }
 };
 
+test "decode rejects oversized string header before allocation" {
+    const data = [_]u8{ 0xdb, 0x00, 0x00, 0x10, 0x00 };
+    var reader = SliceReader{ .data = &data };
+    try std.testing.expectError(error.MessageTooLarge, mp.decodeWithLimits(std.testing.allocator, &reader, .{
+        .max_alloc_bytes = 1024,
+        .max_blob_bytes = 1024,
+    }));
+}
+
+test "default blob limit leaves room inside the wire frame cap" {
+    try std.testing.expectEqual(@as(usize, 63 * 1024 * 1024), (mp.DecodeLimits{}).max_blob_bytes);
+
+    const frame_sized_blob = [_]u8{ 0xdb, 0x04, 0x00, 0x00, 0x00 };
+    var rejected_reader = SliceReader{ .data = &frame_sized_blob };
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        mp.decode(std.testing.allocator, &rejected_reader),
+    );
+}
+
+test "decode rejects oversized container header before allocation" {
+    const data = [_]u8{ 0xdd, 0x00, 0x10, 0x00, 0x00 };
+    var reader = SliceReader{ .data = &data };
+    try std.testing.expectError(error.MessageTooLarge, mp.decodeWithLimits(std.testing.allocator, &reader, .{
+        .max_container_items = 1024,
+    }));
+}
+
 // ============================================================================
 // Encoding Tests: packNil
 // ============================================================================

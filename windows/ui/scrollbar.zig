@@ -1,8 +1,100 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
+const input = @import("../input.zig");
+
+pub const ViewportRead = enum { fresh, cached, none };
+
+/// Non-blocking viewport query with cache fallback (mirrors macOS's
+/// getViewportNonBlocking / ZonvieCore.swift's cachedViewports). Every
+/// scrollbar call site here used to block on the core's grid lock every
+/// WM_PAINT/flush/mouse-move; this lets the UI thread never wait on the
+/// core thread's handleRedraw. Fills out_vp and returns .fresh on tryLock
+/// success, .cached when the lock was busy and a previously cached value
+/// (at most one flush stale) was served, .none when there is no viewport
+/// info available at all (grid genuinely has none, and no prior cached
+/// value exists for it). Callers that were triggered by a one-shot message
+/// must treat .cached as "the triggering change may not be visible yet"
+/// and schedule a retry rather than dropping the update.
+fn getViewportNonBlocking(app: *App, grid_id: i64, out_vp: *app_mod.ViewportInfo) ViewportRead {
+    const corep = app.corep orelse return .none;
+    const result = app_mod.zonvie_core_try_get_viewport(corep, grid_id, out_vp);
+    if (result == 1) {
+        app.viewport_cache.put(app.alloc, grid_id, out_vp.*) catch {};
+        return .fresh;
+    }
+    if (result == 0) {
+        // Grid genuinely has no viewport info -- drop any stale cache entry.
+        _ = app.viewport_cache.remove(grid_id);
+        return .none;
+    }
+    // result == -1: core's grid lock was busy -- serve the cached value.
+    if (app.viewport_cache.get(grid_id)) |cached| {
+        out_vp.* = cached;
+        return .cached;
+    }
+    return .none;
+}
+
+fn trackDamageRect(client_width: i32, client_height: i32, dpi_scale: f32, top_offset_px: f32) ?c.RECT {
+    if (client_width <= 0 or client_height <= 0) return null;
+
+    const cw: f32 = @floatFromInt(client_width);
+    const ch: f32 = @floatFromInt(client_height);
+    const margin = app_mod.scrollbarMargin(dpi_scale);
+    const width = app_mod.scrollbarWidth(dpi_scale);
+
+    var left: i32 = @intFromFloat(@floor(cw - width - margin));
+    var right: i32 = @intFromFloat(@ceil(cw - margin));
+    var top: i32 = @intFromFloat(@floor(margin + top_offset_px));
+    var bottom: i32 = @intFromFloat(@ceil(ch - margin));
+    left = @max(0, left);
+    right = @min(client_width, right);
+    top = @max(0, top);
+    bottom = @min(client_height, bottom);
+    if (right <= left or bottom <= top) return null;
+    return .{ .left = left, .top = top, .right = right, .bottom = bottom };
+}
+
+/// Pixel damage covered by the main scrollbar track. This deliberately does
+/// not query the core viewport: it is also needed once fade-out reaches zero,
+/// when only the previously saved overlay must be restored.
+pub fn getScrollbarTrackRect(app: *App, client_width: i32, client_height: i32) ?c.RECT {
+    const tabbar_offset: f32 = if (app.ext_tabline_enabled and
+        app.tabline_style == .titlebar and
+        app.content_hwnd == null)
+        @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
+    else
+        0;
+    return trackDamageRect(client_width, client_height, app.dpi_scale, tabbar_offset);
+}
+
+pub fn getScrollbarTrackRectForExternal(client_width: i32, client_height: i32, dpi_scale: f32) ?c.RECT {
+    return trackDamageRect(client_width, client_height, dpi_scale, 0);
+}
+
+fn invalidateScrollbarTrack(hwnd: c.HWND, app: *App) void {
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    if (getScrollbarTrackRect(app, client.right - client.left, client.bottom - client.top)) |rect| {
+        _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
+    } else {
+        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    }
+}
+
+fn invalidateScrollbarTrackForExternal(hwnd: c.HWND, dpi_scale: f32) void {
+    var client: c.RECT = undefined;
+    _ = c.GetClientRect(hwnd, &client);
+    if (getScrollbarTrackRectForExternal(client.right - client.left, client.bottom - client.top, dpi_scale)) |rect| {
+        _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
+    } else {
+        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    }
+}
 
 pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) struct {
     track_left: f32,
@@ -13,19 +105,8 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
     knob_bottom: f32,
     is_scrollable: bool,
 } {
-    const corep = app.corep;
-    if (corep == null) return .{
-        .track_left = 0,
-        .track_top = 0,
-        .track_right = 0,
-        .track_bottom = 0,
-        .knob_top = 0,
-        .knob_bottom = 0,
-        .is_scrollable = false,
-    };
-
     var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) == 0) return .{
+    if (getViewportNonBlocking(app, -1, &vp) == .none) return .{
         .track_left = 0,
         .track_top = 0,
         .track_right = 0,
@@ -41,8 +122,11 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
-    // When ext_tabline is enabled, scrollbar should start below the tabbar
-    const tabbar_offset: f32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
+    // Only titlebar mode occupies vertical space above the terminal; sidebar
+    // mode shifts content horizontally and must keep the track at the top.
+    const tabbar_offset: f32 = if (app.ext_tabline_enabled and
+        app.tabline_style == .titlebar and
+        app.content_hwnd == null)
         @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         0;
@@ -97,20 +181,9 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) st
     };
 }
 
-pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
-    const corep = app.corep;
-    if (corep == null) return .{
-        .track_left = 0,
-        .track_top = 0,
-        .track_right = 0,
-        .track_bottom = 0,
-        .knob_top = 0,
-        .knob_bottom = 0,
-        .is_scrollable = false,
-    };
-
+pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32, dpi_scale: f32) app_mod.ScrollbarGeometry {
     var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return .{
+    if (getViewportNonBlocking(app, grid_id, &vp) == .none) return .{
         .track_left = 0,
         .track_top = 0,
         .track_right = 0,
@@ -126,8 +199,11 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
-    // DPI-scaled scrollbar dimensions
-    const dpi = app.dpi_scale;
+    // DPI-scaled scrollbar dimensions. Use the caller-supplied per-window
+    // dpi_scale (this window's own monitor DPI, may differ from
+    // app.dpi_scale on a mixed-DPI multi-monitor setup — see MED-5 in the
+    // fix-plan doc) rather than the global app.dpi_scale.
+    const dpi = dpi_scale;
     const sb_width = app_mod.scrollbarWidth(dpi);
     const sb_margin = app_mod.scrollbarMargin(dpi);
     const sb_min_knob = app_mod.scrollbarMinKnobHeight(dpi);
@@ -184,11 +260,12 @@ pub fn generateScrollbarVerticesForExternal(
     client_width: i32,
     client_height: i32,
     out_verts: *[12]app_mod.Vertex,
+    dpi_scale: f32,
 ) usize {
     if (!app.config.scrollbar.enabled) return 0;
     if (scrollbar_alpha <= 0.001) return 0;
 
-    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height);
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale);
     if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
 
     const cw: f32 = @floatFromInt(client_width);
@@ -258,10 +335,11 @@ pub fn scrollbarHitTestForExternal(
     client_height: i32,
     mouse_x: i32,
     mouse_y: i32,
+    dpi_scale: f32,
 ) enum { none, knob, track_above, track_below } {
     if (!app.config.scrollbar.enabled) return .none;
 
-    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height);
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale);
     if (!geom.is_scrollable) return .none;
 
     const mx: f32 = @floatFromInt(mouse_x);
@@ -319,9 +397,9 @@ pub fn scrollbarMouseDownForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
 
-    const hit = scrollbarHitTestForExternal(app, grid_id, client.right, client.bottom, mouse_x, mouse_y);
+    const hit = scrollbarHitTestForExternal(app, grid_id, client.right, client.bottom, mouse_x, mouse_y, ext_win.dpi_scale);
 
-    const corep = app.corep orelse return false;
+    if (app.corep == null) return false;
 
     switch (hit) {
         .knob => {
@@ -330,7 +408,7 @@ pub fn scrollbarMouseDownForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
             ext_win.scrollbar_drag_start_y = mouse_y;
 
             var vp: app_mod.ViewportInfo = undefined;
-            if (app_mod.zonvie_core_get_viewport(corep, grid_id, &vp) != 0) {
+            if (getViewportNonBlocking(app, grid_id, &vp) != .none) {
                 ext_win.scrollbar_drag_start_topline = vp.topline;
             }
 
@@ -368,11 +446,11 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
 
-    const geom = getScrollbarGeometryForExternal(app, grid_id, client.right, client.bottom);
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client.right, client.bottom, ext_win.dpi_scale);
     if (!geom.is_scrollable) return;
 
     var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, grid_id, &vp) == 0) return;
+    if (getViewportNonBlocking(app, grid_id, &vp) == .none) return;
 
     const visible_lines = vp.botline - vp.topline;
     if (visible_lines <= 0) return;
@@ -383,7 +461,10 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
     const knob_proportion = @min(1.0, visible_f / total_f);
     var knob_height = track_height * knob_proportion;
-    knob_height = @max(app_mod.scrollbarMinKnobHeight(app.dpi_scale), knob_height);
+    // Per-window DPI, matching the geometry above: on a mixed-DPI setup the
+    // global scale gives the drag a different knob_travel from the drawn knob,
+    // so the knob jumps away from the cursor whenever the clamp is active.
+    knob_height = @max(app_mod.scrollbarMinKnobHeight(ext_win.dpi_scale), knob_height);
     const knob_travel = track_height - knob_height;
     if (knob_travel <= 0) return;
 
@@ -444,7 +525,7 @@ pub fn scrollbarMouseUpForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.Ex
 }
 
 /// Update scrollbar fade animation for external window
-pub fn updateScrollbarFadeForExternal(hwnd: c.HWND, _: *App, ext_win: *app_mod.ExternalWindow) void {
+pub fn updateScrollbarFadeForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow) void {
     const delta: f32 = 0.1; // Fade step
     var changed = false;
 
@@ -457,7 +538,12 @@ pub fn updateScrollbarFadeForExternal(hwnd: c.HWND, _: *App, ext_win: *app_mod.E
     }
 
     if (changed) {
-        _ = c.InvalidateRect(hwnd, null, 0);
+        // Row-mode paint restores the narrow saved scrollbar underlay before
+        // drawing the new alpha. No terminal rows need to be regenerated.
+        app.mu.lockUncancelable(core.clock.io());
+        ext_win.needs_redraw = true;
+        app.mu.unlock(core.clock.io());
+        invalidateScrollbarTrackForExternal(hwnd, ext_win.dpi_scale);
     }
 
     // Check if we've reached target
@@ -465,11 +551,12 @@ pub fn updateScrollbarFadeForExternal(hwnd: c.HWND, _: *App, ext_win: *app_mod.E
         ext_win.scrollbar_alpha = ext_win.scrollbar_target_alpha;
         _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_FADE);
 
-        // Force full repaint when scrollbar hidden
         if (ext_win.scrollbar_alpha <= 0.0) {
             ext_win.scrollbar_visible = false;
+            app.mu.lockUncancelable(core.clock.io());
             ext_win.needs_redraw = true;
-            _ = c.InvalidateRect(hwnd, null, 0);
+            app.mu.unlock(core.clock.io());
+            invalidateScrollbarTrackForExternal(hwnd, ext_win.dpi_scale);
         }
     }
 }
@@ -574,13 +661,12 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
     const hit = scrollbarHitTest(app, client.right, client.bottom, mouse_x, mouse_y);
 
     if (applog.isEnabled()) applog.appLog("[scrollbar] mouseDown x={d} y={d} client=({d},{d}) track=({d:.0},{d:.0})-({d:.0},{d:.0}) knob=({d:.0},{d:.0}) hit={s}\n", .{
-        mouse_x, mouse_y, client.right, client.bottom,
-        geom.track_left, geom.track_top, geom.track_right, geom.track_bottom,
-        geom.knob_top, geom.knob_bottom,
-        @tagName(hit),
+        mouse_x,         mouse_y,          client.right,     client.bottom,
+        geom.track_left, geom.track_top,   geom.track_right, geom.track_bottom,
+        geom.knob_top,   geom.knob_bottom, @tagName(hit),
     });
 
-    const corep = app.corep orelse return false;
+    if (app.corep == null) return false;
 
     switch (hit) {
         .knob => {
@@ -589,7 +675,7 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             app.scrollbar_drag_start_y = mouse_y;
 
             var vp: app_mod.ViewportInfo = undefined;
-            if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) != 0) {
+            if (getViewportNonBlocking(app, -1, &vp) != .none) {
                 app.scrollbar_drag_start_topline = vp.topline;
             }
 
@@ -600,8 +686,11 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             // Page up - execute immediately and start repeat timer
             if (applog.isEnabled()) applog.appLog("[scrollbar] track_above: executing page scroll up\n", .{});
             scrollbarPageScroll(app, -1);
-            app.scrollbar_repeat_dir = -1;
+            // Armed after SetCapture: it synchronously delivers
+            // WM_CAPTURECHANGED to whichever window held capture, and that
+            // handler clears the repeat state.
             _ = c.SetCapture(hwnd);
+            app.scrollbar_repeat_dir = -1;
             app.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_DELAY, null);
             showScrollbar(hwnd, app);
             return true;
@@ -610,8 +699,9 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             // Page down - execute immediately and start repeat timer
             if (applog.isEnabled()) applog.appLog("[scrollbar] track_below: executing page scroll down\n", .{});
             scrollbarPageScroll(app, 1);
-            app.scrollbar_repeat_dir = 1;
+            // Armed after SetCapture — see track_above.
             _ = c.SetCapture(hwnd);
+            app.scrollbar_repeat_dir = 1;
             app.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_DELAY, null);
             showScrollbar(hwnd, app);
             return true;
@@ -633,7 +723,7 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
     if (!geom.is_scrollable) return;
 
     var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) == 0) return;
+    if (getViewportNonBlocking(app, -1, &vp) == .none) return;
 
     const visible_lines = vp.botline - vp.topline;
     if (visible_lines <= 0) return;
@@ -736,12 +826,44 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     // Skip main window scrollbar update when cursor is on an external grid.
     // External windows have their own scrollbar; the main window scrollbar
     // should only reflect viewports of grids composited on the main window.
-    const cursor_grid = app_mod.zonvie_core_get_cursor_position(corep, null, null);
-    if (cursor_grid > 1 and app.external_windows.contains(cursor_grid)) return;
+    // Non-blocking: on lock contention this serves the cached position; a
+    // cold cache (-1) simply falls through to the main-window update below.
+    var cur_row: i32 = 0;
+    var cur_col: i32 = 0;
+    var cursor_stale = false;
+    const cursor_grid = input.getCursorPositionNonBlocking(app, corep.?, &cur_row, &cur_col, &cursor_stale);
+    if (cursor_grid > 1 and app.external_windows.contains(cursor_grid)) {
+        if (cursor_stale) {
+            // The cached "on an external grid" position may predate the
+            // flush that posted this one-shot WM_APP_UPDATE_SCROLLBAR; the
+            // cursor may already be back on the main grid. Retry shortly
+            // instead of silently dropping the main-window scrollbar update
+            // (mirrors the viewport-read retry a few lines below).
+            // Deliberately not re-posted on SetTimer failure: the message would
+            // re-enter this same handler with no delay, and the condition that
+            // fails SetTimer (USER handle pressure) persists, so it spins the
+            // message loop ahead of WM_PAINT. Losing one cosmetic scrollbar
+            // update is the milder failure.
+            _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
+        }
+        return;
+    }
 
     // Get current viewport info
     var vp: app_mod.ViewportInfo = undefined;
-    if (app_mod.zonvie_core_get_viewport(corep, -1, &vp) == 0) return;
+    switch (getViewportNonBlocking(app, -1, &vp)) {
+        .fresh => {},
+        .none => return,
+        .cached => {
+            // Lock busy: the cached viewport predates the flush that posted
+            // this one-shot WM_APP_UPDATE_SCROLLBAR (already consumed), so
+            // acting on it would silently drop the post-scroll show/repaint.
+            // Retry shortly instead (mirrors macOS's 16ms timer re-arm).
+            // Not re-posted on SetTimer failure — see the note above.
+            _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
+            return;
+        },
+    }
 
     // Check if viewport changed
     const viewport_changed = vp.topline != app.last_viewport_topline or
@@ -769,7 +891,7 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     }
 
     // Request repaint for scrollbar area
-    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    invalidateScrollbarTrack(hwnd, app);
 }
 
 /// Show scrollbar with fade-in animation
@@ -828,13 +950,9 @@ pub fn updateScrollbarFade(hwnd: c.HWND, app: *App) void {
 
         if (app.scrollbar_alpha <= 0.0) {
             app.scrollbar_visible = false;
-            // Force full repaint to clear the scrollbar area from the back buffer.
-            // This is necessary because the scrollbar may overlap the gutter area
-            // (outside the grid), which is not redrawn by row updates.
-            app.need_full_seed.store(true, .seq_cst);
         }
     }
 
     // Request repaint
-    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+    invalidateScrollbarTrack(hwnd, app);
 }

@@ -11,6 +11,9 @@ final class GlyphAtlas {
     // Use os_unfair_lock instead of NSLock for better performance
     // os_unfair_lock is a low-level spin lock that's faster for short critical sections
     private var mu = os_unfair_lock()
+    // Serializes zeroChunk use and texture zero-fill without extending mu
+    // across Metal allocation/replace calls.
+    private var textureCreateLock = os_unfair_lock()
 
     struct Entry {
         let uvMin: SIMD2<Float>
@@ -59,9 +62,6 @@ final class GlyphAtlas {
         return pointSize
     }
 
-    private(set) var ascentPx: Float = 0
-    private(set) var descentPx: Float = 0
-
     // Double-buffered atlas textures: textures[frontIndex] = draw reads,
     // textures[1 - frontIndex] = flush writes (uploadRegion).
     private var textures: [MTLTexture?] = [nil, nil]
@@ -73,6 +73,19 @@ final class GlyphAtlas {
     private var pendingBackSyncRect: AtlasDirtyRect? = nil // mu protected: dirty union behind the next front->back sync
     private var flushHadRecreate: Bool = false // mu protected: recreateTexture called during current flush
     private var flushDirtyRect: AtlasDirtyRect? = nil // mu protected: dirty union for uploads during current flush
+    /// Full logical atlas image used to batch cold-glyph uploads. Allocated
+    /// only at initialization or an atlas resize; uploadRegion writes glyph
+    /// pixels into this persistent storage and the flush boundary performs one
+    /// texture replace for the staged union.
+    private var atlasShadow: [UInt8] = [] // mu protected
+    private var stagedUploadRect: AtlasDirtyRect? = nil // mu protected
+    // mu protected: set when recreateTexture()'s makeTexture() call fails (e.g. an
+    // MTLTexture allocation failure under memory pressure). prepareBackTexture()
+    // retries the allocation for this slot on every subsequent beginFlush() until
+    // it succeeds, instead of leaving the slot permanently nil -- which would
+    // otherwise wedge every future flush once frontIndex swaps onto the nil slot
+    // (see prepareBackTexture's front/back guard).
+    private var pendingTextureRecreate: (index: Int, width: Int, height: Int)? = nil
 
     // Atlas dimensions (updated by recreateTexture when core sets atlas_size).
     private var atlasW: Int = 2048
@@ -80,11 +93,15 @@ final class GlyphAtlas {
 
     // HarfBuzz+FreeType backend handle (base font).
     private var hbftFont: OpaquePointer?
+    private var hbftFontData: NSData?
 
     // HarfBuzz+FreeType handles for font variants
     private var hbftBold: OpaquePointer?
     private var hbftItalic: OpaquePointer?
     private var hbftBoldItalic: OpaquePointer?
+    private var hbftBoldData: NSData?
+    private var hbftItalicData: NSData?
+    private var hbftBoldItalicData: NSData?
 
     // --- Fallback font support ---
     // We must avoid collisions: same glyphID can exist across different fonts.
@@ -97,6 +114,7 @@ final class GlyphAtlas {
     private struct HbFtFace {
         let ctFont: CTFont
         let url: URL
+        let fontData: NSData
         let hbft: OpaquePointer
         let key: UInt64
         var accessOrder: UInt64 = 0  // LRU tracking: higher = more recent
@@ -105,11 +123,15 @@ final class GlyphAtlas {
     // base face is represented by (font, hbftFont). Fallback faces are cached by URL string.
     private var fallbackFacesByURL: [String: HbFtFace] = [:]
     private var fallbackAccessCounter: UInt64 = 0
+    private var fallbackLoadLock = os_unfair_lock()
+    private var fontGeneration: UInt64 = 0
 
-    // Maximum number of concurrent fallback font faces held in memory.
-    // Each CJK face holds ~15-20 MB (font_bytes_owned in hbft).
-    // Cap at 4 to bound RSS growth from fallback fonts to ~60-80 MB.
-    private let maxFallbackFaces = 4
+    // Maximum number of concurrent fallback font faces held in memory. Four is
+    // below normal mixed-script workloads (CJK + symbols + math + icon fonts),
+    // causing repeated mmap/HarfBuzz destruction and reload in the glyph hot
+    // path. Font data is mmap-backed, so a still-bounded 16-face working set is
+    // a better CPU/RSS tradeoff while retaining the LRU escape hatch.
+    private let maxFallbackFaces = 16
 
     // Cache for CTFontCreateForString results to avoid expensive per-glyph lookups.
     // Keyed by (base font pointer, scalar) to avoid returning a bold fallback
@@ -124,9 +146,19 @@ final class GlyphAtlas {
     // Key: (scalar, styleFlags). Cleared when font settings change.
     private var failedScalarCache: Set<UInt64> = []
 
+    // Cache key for scalarToGlyphIDCache. A raw UInt64 built as (fontKey << 32 | scalar)
+    // would silently truncate the pointer's high 32 bits, risking a collision between
+    // two concurrently-live CTFont objects (base/bold/italic/fallback all coexist) whose
+    // addresses share the same low 32 bits. A struct with Swift's synthesized Hashable
+    // combines both fields without truncation -- same pattern as GlyphKey/FallbackCacheKey above.
+    private struct GlyphIDCacheKey: Hashable {
+        let fontKey: UInt64   // pointer address of the CTFont (full 64 bits, not truncated)
+        let scalar: UInt32
+    }
+
     // Cache for scalar → glyphID mapping to avoid CTFontGetGlyphsForCharacters calls.
-    // Key: (fontKey << 32) | scalar, Value: glyphID. Cleared when font settings change.
-    private var scalarToGlyphIDCache: [UInt64: UInt32] = [:]
+    // Key: (fontKey, scalar), Value: glyphID. Cleared when font settings change.
+    private var scalarToGlyphIDCache: [GlyphIDCacheKey: UInt32] = [:]
 
     // Maximum entries for scalar-level caches. When exceeded, the entire cache is
     // cleared to bound memory growth from large Unicode workloads. Entries are small
@@ -172,10 +204,14 @@ final class GlyphAtlas {
         }
     }
 
-    /// Persistent zero-clear buffer for makeTexture (one row of atlas width).
-    private var zeroRow: [UInt8] = []
-    /// Scratch buffer for CPU-side atlas region sync (front -> back).
-    private var backSyncScratch: [UInt8] = []
+    /// Persistent zero-clear buffer for makeTexture (up to zeroClearChunkRows
+    /// rows of atlas width; grown lazily, never shrunk).
+    private var zeroChunk: [UInt8] = []
+    /// Rows zero-cleared per makeTexture replace() call. Chunking (instead of
+    /// one call per row, or one call for the whole texture) bounds the
+    /// scratch buffer to a fixed handful of MB while cutting the call count
+    /// from atlasH to atlasH/zeroClearChunkRows.
+    private let zeroClearChunkRows = 128
 
     /// Separate scratch buffer for rasterizeOnly (Phase 2).
     /// Must not share with `scratch` which is used by uploadRegion.
@@ -191,8 +227,388 @@ final class GlyphAtlas {
     private(set) var cellWidthPx: Float = 9
     private(set) var cellHeightPx: Float = 18
 
-    init(device: MTLDevice, fontName: String = "Menlo", pointSize: CGFloat = 14.0, atlasSize: Int = 2048) {
+    private(set) var ascentPx: Float = 0
+    private(set) var descentPx: Float = 0
+
+    /// Synchronized snapshot of all four font metrics. setFont()/
+    /// setBackingScale() write these fields under `mu` from the core/RPC
+    /// thread; the render thread must read them together under the same
+    /// lock to avoid combining a fresh value in one field with a stale
+    /// value in another for one frame.
+    func fontMetricsSnapshot() -> (width: Float, height: Float, ascent: Float, descent: Float) {
+        os_unfair_lock_lock(&mu)
+        defer { os_unfair_lock_unlock(&mu) }
+        return (cellWidthPx, cellHeightPx, ascentPx, descentPx)
+    }
+
+    // Cross-command-queue read/write synchronization for the shared atlas
+    // textures. Each ExternalGridView owns its own MTLCommandQueue (see
+    // ExternalGridView.swift), so Metal's automatic hazard tracking — which
+    // only orders command buffers within the SAME queue — does not protect
+    // this texture from being blitted (prepareBackTexture/encodeBackTextureBlit)
+    // or CPU-written (uploadRegion's replace()) while an external queue's
+    // render pass is still sampling it.
+    //
+    // Uses a DispatchGroup (enter/leave pair count), NOT an MTLSharedEvent
+    // with per-read sequence numbers: multiple independent ExternalGridView
+    // queues signaling one shared event with monotonically-assigned values
+    // is unsound, because signaledValue is a cross-queue high-water mark —
+    // a LATER-issued value from one queue can be signaled before an
+    // EARLIER-issued value from another queue actually completes, so
+    // waiting on "signaledValue >= target" can return true while a
+    // still-in-flight read (assigned a lower target) hasn't finished.
+    // DispatchGroup has no such ordering assumption: wait() only returns
+    // once every enter() has a matching leave(), regardless of order.
+    //
+    // An ExternalGridView calls beginExternalRead() right before encoding a
+    // render pass that reads the atlas, and endExternalRead() from that same
+    // command buffer's existing completion handler (which must strongly
+    // capture whatever it needs to call endExternalRead() — a [weak self]
+    // capture of the view would silently drop the matching leave() if the
+    // view is deallocated before the GPU completion fires, permanently
+    // wedging the group and making every future beginAtlasWrite() time out).
+    //
+    // A DispatchGroup alone only lets a writer wait for ALREADY-ADMITTED
+    // reads to drain — it does not stop a NEW beginExternalRead() from
+    // being admitted while that wait is in progress or while the mutation
+    // itself is running, which reopens the exact race this exists to close
+    // (writer sees count 0 -> new reader enters -> writer mutates while
+    // that reader's GPU work samples the texture). `gateLock` closes that
+    // window: beginExternalRead() must acquire it (briefly) to enter, and
+    // beginAtlasWrite() holds it for the writer's entire critical section
+    // (wait-for-drain through the actual mutation), so no new reader can be
+    // admitted until the writer calls endAtlasWrite().
+    private let gateLock = NSLock()
+    // Published before a writer waits for gateLock. Readers check it before
+    // and after a non-blocking gate try, so NSLock unfairness cannot let a
+    // stream of main-thread readers starve an already-waiting writer.
+    private var writerIntentLock = os_unfair_lock()
+    private var writerIntentPublished = false
+    private let externalReadsGroup = DispatchGroup()
+    // gateLock protected. Persists across a failed writer attempt so newly
+    // arriving external frames cannot continuously replace the readers that
+    // the writer is waiting to drain.
+    private var atlasWriterPending = false
+    // gateLock protected. A failed writer keeps admission closed until either
+    // a later writer succeeds or a successful atlas transaction proves that
+    // no mutation is needed for the committed frame. In the latter case this
+    // flag lets the last already-admitted reader release the stale intent
+    // without reopening admission before that successful transaction exists.
+    private var atlasWriterIntentReleaseArmed = false
+    // gateLock protected. DispatchGroup notifications cannot be cancelled, so
+    // a generation invalidates a queued notification when a real writer starts
+    // before it runs. Registration only occurs on the rare recovery path.
+    private var atlasWriterIntentNotifyGeneration: UInt64 = 0
+    private var atlasWriterIntentNotifyRegistered = false
+    // Core-thread only hint. It keeps the ordinary successful-flush path from
+    // taking gateLock unless a failed writer actually needs resolution. The
+    // asynchronous notification deliberately leaves this conservative; the
+    // next core transaction may take one harmless lock and clear the hint.
+    private var atlasWriterIntentNeedsTransactionResolution = false
+
+    private func setWriterIntentPublished(_ value: Bool) {
+        os_unfair_lock_lock(&writerIntentLock)
+        writerIntentPublished = value
+        os_unfair_lock_unlock(&writerIntentLock)
+    }
+
+    private func writerIntentBlocksReader() -> Bool {
+        // Main-thread admission must stay non-blocking even for this tiny
+        // intent flag. A contended flag is conservatively treated as intent.
+        guard os_unfair_lock_trylock(&writerIntentLock) else { return true }
+        let value = writerIntentPublished
+        os_unfair_lock_unlock(&writerIntentLock)
+        return value
+    }
+
+    /// Registers an external read, lets the caller capture a value (e.g. a
+    /// texture reference already frozen in a SurfaceBufferSet at commit
+    /// time), captures the current blit generation, and encodes a GPU-side
+    /// wait for that generation on the reader's own command buffer — all
+    /// under one `gateLock` hold, so registration, snapshot, and generation
+    /// capture happen as one atomic step relative to any writer.
+    ///
+    /// A frozen field reference does not remove the race: freezing an
+    /// MTLTexture reference doesn't make its CONTENTS immutable, so if the
+    /// caller read `committed.atlasTextureSnapshot` before calling this, a
+    /// writer's beginAtlasWrite() could see zero admitted reads and start
+    /// blitting into that exact texture object (once it cycles back to
+    /// being the back buffer on a later flush) before this read is ever
+    /// registered.
+    ///
+    /// Capturing the blit generation as a step SEPARATE from admission has
+    /// the same flaw: a writer holds `gateLock` for its entire blit (see
+    /// beginAtlasWrite), so once this call has entered the reader group and
+    /// captured `blitGeneration` while STILL holding `gateLock`, no writer
+    /// can start a new blit (and bump the generation) until this whole
+    /// sequence releases the lock — meaning the generation this reader waits
+    /// on is guaranteed to cover any blit that could still race its read.
+    /// Reading the generation only after releasing the lock (or before
+    /// acquiring it) would let a writer's blit land in the gap, leaving the
+    /// reader waiting on a stale, already-satisfied value while sampling a
+    /// texture a newer, un-waited-for blit is still writing.
+    ///
+    /// The caller must encode this before creating any render encoder that
+    /// samples the atlas (encodeWaitForEvent cannot be issued while an
+    /// encoder is open). Admission is non-blocking because this runs on
+    /// AppKit's main thread. If `snapshot()` returns nil, no reader is
+    /// registered.
+    func beginExternalRead<T>(commandBuffer cmd: MTLCommandBuffer, snapshot: () -> T?) -> T? {
+        if writerIntentBlocksReader() || !gateLock.try() {
+            return nil
+        }
+        if writerIntentBlocksReader() || atlasWriterPending {
+            gateLock.unlock()
+            return nil
+        }
+        guard let value = snapshot() else {
+            gateLock.unlock()
+            return nil
+        }
+        externalReadsGroup.enter()
+        let gen = blitGeneration
+        gateLock.unlock()
+        cmd.encodeWaitForEvent(blitCompletionEvent, value: gen)
+        return value
+    }
+
+    func endExternalRead() {
+        externalReadsGroup.leave()
+    }
+
+    /// Closes the reader-admission gate (new beginExternalRead() calls are
+    /// rejected until the writer completes), then checks whether every
+    /// already-admitted read has left without blocking. Call before any atlas
+    /// texture mutation (CPU replace() or GPU blit submission); always
+    /// pair with endAtlasWrite() (e.g. via defer) so the gate reopens on
+    /// every exit path, including early returns.
+    ///
+    /// Returns false while an admitted read remains undrained. The gate is
+    /// still closed in that case (`gateLock` is still held) — callers MUST
+    /// treat this as fail-CLOSED: call endAtlasWrite()
+    /// and abort/drop the write attempt instead of mutating the texture
+    /// anyway. Proceeding on timeout would silently reintroduce the exact
+    /// concurrent-read-vs-write race this gate exists to prevent, for the
+    /// sake of a rare, already-abnormal (GPU-stalled or leaked) condition —
+    /// dropping one upload/blit attempt is far cheaper than a corrupted
+    /// frame, and the core's existing retry paths recover it later.
+    ///
+    /// Must NOT be called while already holding `mu` (does not touch it
+    /// directly, but blocks the calling thread, which would stall anything
+    /// else waiting on `mu` for the timeout duration).
+    func beginAtlasWrite() -> Bool {
+        setWriterIntentPublished(true)
+        gateLock.lock()
+        atlasWriterPending = true
+        // An actual writer supersedes cancellation armed by an earlier
+        // no-write transaction. If this attempt is still blocked, preserve its
+        // intent until another successful writer/transaction resolves it.
+        atlasWriterIntentReleaseArmed = false
+        invalidateWriterIntentNotificationLocked()
+        // The caller holds core grid_mu. Never wait for a GPU/external queue
+        // while holding it. Keep writer intent set across the failed attempt:
+        // after endAtlasWrite reopens the lock, beginExternalRead rejects new
+        // admissions, so the already-admitted group drains and the next flush
+        // retry cannot be starved by a continuous stream of external frames.
+        if externalReadsGroup.wait(timeout: .now()) == .timedOut {
+            atlasWriterIntentNeedsTransactionResolution = true
+            ZonvieCore.appLog("[GlyphAtlas] beginAtlasWrite: external reads active — deferring write")
+            return false
+        }
+        atlasWriterPending = false
+        atlasWriterIntentNeedsTransactionResolution = false
+        return true
+    }
+
+    /// Reopens the reader-admission gate closed by beginAtlasWrite().
+    func endAtlasWrite() {
+        if !atlasWriterPending {
+            setWriterIntentPublished(false)
+        }
+        gateLock.unlock()
+    }
+
+    /// Complete a writer intent that was left pending by a failed write attempt
+    /// once a brand-new texture has actually become the committed front.
+    ///
+    /// Existing external readers may still be sampling the old texture object;
+    /// that is safe because publishing a fresh object does not mutate their
+    /// snapshot. New readers can therefore be admitted immediately. Any later
+    /// mutation (including syncing the new front into the old back texture) must
+    /// still call beginAtlasWrite(), which closes the gate and drains those
+    /// readers again before touching either object.
+    ///
+    /// Call only after the front-index swap has succeeded, and never while
+    /// holding `mu`: the established lock order is gateLock -> mu.
+    private func completeWriterIntentAfterFreshTexturePublication() {
+        gateLock.lock()
+        atlasWriterPending = false
+        setWriterIntentPublished(false)
+        atlasWriterIntentReleaseArmed = false
+        invalidateWriterIntentNotificationLocked()
+        atlasWriterIntentNeedsTransactionResolution = false
+        gateLock.unlock()
+    }
+
+    /// Resolve stale writer intent after a successful transaction that did not
+    /// publish a brand-new texture. Unlike the fresh-texture path above, the
+    /// old texture objects may still be sampled by admitted readers, so reader
+    /// admission remains closed until the DispatchGroup actually drains.
+    ///
+    /// Must be called after the atlas transaction has committed and without
+    /// holding `mu` (lock order remains gateLock -> mu).
+    private func completeWriterIntentAfterSuccessfulTransaction() {
+        guard atlasWriterIntentNeedsTransactionResolution else { return }
+        var notifyGeneration: UInt64? = nil
+        gateLock.lock()
+        if atlasWriterPending {
+            atlasWriterIntentReleaseArmed = true
+            if externalReadsGroup.wait(timeout: .now()) == .success {
+                atlasWriterPending = false
+                setWriterIntentPublished(false)
+                atlasWriterIntentReleaseArmed = false
+                invalidateWriterIntentNotificationLocked()
+            } else if !atlasWriterIntentNotifyRegistered {
+                atlasWriterIntentNotifyGeneration &+= 1
+                atlasWriterIntentNotifyRegistered = true
+                notifyGeneration = atlasWriterIntentNotifyGeneration
+            }
+        } else {
+            setWriterIntentPublished(false)
+            atlasWriterIntentReleaseArmed = false
+            invalidateWriterIntentNotificationLocked()
+        }
+        atlasWriterIntentNeedsTransactionResolution = false
+        gateLock.unlock()
+
+        if let notifyGeneration {
+            registerWriterIntentDrainNotification(generation: notifyGeneration)
+        }
+    }
+
+    /// gateLock must be held.
+    private func invalidateWriterIntentNotificationLocked() {
+        guard atlasWriterIntentNotifyRegistered else { return }
+        atlasWriterIntentNotifyGeneration &+= 1
+        atlasWriterIntentNotifyRegistered = false
+    }
+
+    /// Register only after releasing gateLock. If the group drained in the
+    /// small gap before registration, DispatchGroup schedules the notification
+    /// immediately; the generation check still rejects superseded callbacks.
+    private func registerWriterIntentDrainNotification(generation: UInt64) {
+        externalReadsGroup.notify(queue: .global(qos: .userInitiated)) { [weak self] in
+            self?.handleWriterIntentDrainNotification(generation: generation)
+        }
+    }
+
+    private func handleWriterIntentDrainNotification(generation: UInt64) {
+        var replacementGeneration: UInt64? = nil
+        gateLock.lock()
+        guard atlasWriterIntentNotifyRegistered,
+              atlasWriterIntentNotifyGeneration == generation else {
+            gateLock.unlock()
+            return
+        }
+
+        atlasWriterIntentNotifyRegistered = false
+        if atlasWriterPending, atlasWriterIntentReleaseArmed {
+            if externalReadsGroup.wait(timeout: .now()) == .success {
+                atlasWriterPending = false
+                setWriterIntentPublished(false)
+                atlasWriterIntentReleaseArmed = false
+            } else {
+                // Defensive against a future caller admitting a new group
+                // epoch between notification scheduling and execution.
+                atlasWriterIntentNotifyGeneration &+= 1
+                atlasWriterIntentNotifyRegistered = true
+                replacementGeneration = atlasWriterIntentNotifyGeneration
+            }
+        }
+        gateLock.unlock()
+
+        if let replacementGeneration {
+            registerWriterIntentDrainNotification(generation: replacementGeneration)
+        }
+    }
+
+    // GPU-side completion sync for the async blit path (encodeBackTextureBlit).
+    // beginAtlasWrite/endAtlasWrite close the CPU-side admission window during
+    // cmd.commit(), but the blit itself finishes on the GPU strictly AFTER
+    // commit() returns — endAtlasWrite() reopening the gate does not mean the
+    // texture mutation is done. A reader admitted right after endAtlasWrite()
+    // can still get scheduled on the GPU before the blit's writes land, since
+    // separate queues have no automatic ordering. Blocking the core thread on
+    // waitUntilCompleted() here is not an option (measured regression, see
+    // beginFlush's blit path). Instead: single-producer event — only this
+    // blit path ever signals it, so (unlike the per-read MTLSharedEvent design
+    // rejected earlier for having MULTIPLE producers) there is no cross-queue
+    // high-water-mark ambiguity. Every reader encodes a GPU-side wait on its
+    // OWN command buffer before touching the atlas texture, which costs no
+    // CPU blocking on either side.
+    //
+    // Uses MTLSharedEvent rather than plain MTLEvent specifically so
+    // recoverFailedBlit() below can force-advance the signaled value from
+    // the CPU: if the blit command buffer errors out before the GPU reaches
+    // encodeSignalEvent, a plain MTLEvent would never reach that generation,
+    // permanently hanging any reader already GPU-blocked waiting for it (see
+    // recoverFailedBlit's doc comment).
+    private let blitCompletionEvent: MTLSharedEvent
+    // Protected by gateLock. Readers capture it while admitted under the gate;
+    // the sole writer increments it while beginAtlasWrite() holds that gate.
+    private var blitGeneration: UInt64 = 0
+
+    /// Called by the writer (MetalTerminalRenderer.beginFlush's blit path)
+    /// on the SAME command buffer as encodeBackTextureBlit, right before
+    /// cmd.commit(). Must be called while still holding the write critical
+    /// section (i.e. before endAtlasWrite()). Returns the generation encoded,
+    /// so the caller can pass it to recoverFailedBlit() from that same
+    /// command buffer's completion handler if the buffer does not complete
+    /// successfully.
+    func encodeBlitCompletionSignal(into cmd: MTLCommandBuffer) -> UInt64 {
+        blitGeneration += 1
+        let gen = blitGeneration
+        cmd.encodeSignalEvent(blitCompletionEvent, value: gen)
+        return gen
+    }
+
+    /// Called from the writer's blit command buffer's own completion handler
+    /// when `status != .completed` (GPU error, device loss, etc.). Per
+    /// Apple's docs, encodeSignalEvent's value is only applied once the GPU
+    /// actually reaches that command — a command buffer that errors out
+    /// before then leaves the event at the PREVIOUS generation forever. Any
+    /// reader already GPU-blocked in encodeWaitForEvent(value: generation)
+    /// would hang permanently: its own completion handler never fires, which
+    /// leaks its externalReadsGroup entry and wedges every future
+    /// beginAtlasWrite() in a timeout loop — this is strictly worse than the
+    /// alternative, since no external window would ever render again.
+    ///
+    /// Force-advancing the shared event unblocks those readers immediately.
+    /// This does not make the sampled atlas region correct — the blit never
+    /// finished, so the region may be stale or partially written — but that
+    /// is bounded to exactly the frame(s) already in flight when the error
+    /// occurred, and setting needsAtlasRebuild here ensures every subsequent
+    /// flush discards this atlas and rebuilds from scratch rather than
+    /// continuing to read from it. Guarded by signaledValue comparison so a
+    /// late-firing completion handler can never move the event BACKWARD past
+    /// a generation a later, successful blit already signaled.
+    func recoverFailedBlit(generation: UInt64) {
+        if blitCompletionEvent.signaledValue < generation {
+            blitCompletionEvent.signaledValue = generation
+        }
+        os_unfair_lock_lock(&mu)
+        needsAtlasRebuild = true
+        os_unfair_lock_unlock(&mu)
+        ZonvieCore.appLog("[GlyphAtlas] WARNING: blit command buffer failed before reaching completion signal (generation=\(generation)) — force-advanced event and scheduled atlas rebuild")
+    }
+
+    init?(device: MTLDevice, fontName: String = "Menlo", pointSize: CGFloat = 14.0, atlasSize: Int = 2048) {
+        guard let event = device.makeSharedEvent() else {
+            ZonvieCore.appLog("[GlyphAtlas] init failed: device.makeSharedEvent() returned nil")
+            return nil
+        }
         self.device = device
+        self.blitCompletionEvent = event
         self.fontName = fontName
         self.pointSize = pointSize
         self.font = CTFontCreateWithName(fontName as CFString, pointSize, nil) // temporary
@@ -202,12 +618,17 @@ final class GlyphAtlas {
         // an extra Atlas RESET on the startup hot path.
         self.atlasW = atlasSize
         self.atlasH = atlasSize
+        self.atlasShadow = Array<UInt8>(repeating: 0, count: atlasSize * atlasSize * 4)
 
+        let initialFront = makeTexture(device: device, w: atlasW, h: atlasH)
+        let initialBack = makeTexture(device: device, w: atlasW, h: atlasH)
+        guard initialFront != nil, initialBack != nil else { return nil }
         os_unfair_lock_lock(&mu)
-        // rebuildFont_locked → resetAtlas_locked creates textures[1 - frontIndex] (back).
         rebuildFont_locked()
-        // Create front as a separate zeroed texture.
-        textures[frontIndex] = makeTexture(device: device, w: atlasW, h: atlasH)
+        textures[frontIndex] = initialFront
+        textures[1 - frontIndex] = initialBack
+        pendingTextureRecreate = nil
+        needsAtlasRebuild = false
         // Both textures exist, are distinct objects, and are zeroed.
         backDirty = false
         atlasModified = false
@@ -246,6 +667,13 @@ final class GlyphAtlas {
         ZonvieCore.appLog("[GlyphAtlas.setFont] name='\(name)' pt=\(pointSize) features_str='\(features)' parsed_count=\(self.fontFeatures.count) hasFeatures=\(hasFeatures)")
         rebuildFont_locked()
         atlasModified = true  // atlas generation changed, ensure commit swaps
+    }
+
+    func fontGenerationSnapshot() -> UInt64 {
+        os_unfair_lock_lock(&mu)
+        let generation = fontGeneration
+        os_unfair_lock_unlock(&mu)
+        return generation
     }
 
     /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
@@ -411,6 +839,7 @@ final class GlyphAtlas {
     private var variableFontHint: CTFont?
 
     private func rebuildFontAndMetrics_locked() {
+        fontGeneration &+= 1
         let size = pointSize * backingScale
 
         // `font` is always the default-weight CTFont.  It is used for glyph ID
@@ -509,91 +938,77 @@ final class GlyphAtlas {
 
 
 
+    private struct LoadedHbFtFont {
+        let handle: OpaquePointer
+        let data: NSData
+    }
+
     private func rebuildHbFtFont_locked() {
-        // Clean up existing handles
-        if let hbftFont {
-            zonvie_ft_hb_font_destroy(hbftFont)
-            self.hbftFont = nil
-        }
-        if let hbftBold {
-            zonvie_ft_hb_font_destroy(hbftBold)
-            self.hbftBold = nil
-        }
-        if let hbftItalic {
-            zonvie_ft_hb_font_destroy(hbftItalic)
-            self.hbftItalic = nil
-        }
-        if let hbftBoldItalic {
-            zonvie_ft_hb_font_destroy(hbftBoldItalic)
-            self.hbftBoldItalic = nil
-        }
-
+        let generation = fontGeneration
         let px = UInt32(ceil(pointSize * backingScale))
+        let baseFont = font
+        let hint = variableFontHint
+        let bold = boldFont
+        let italic = italicFont
+        let boldItalic = boldItalicFont
+        let features = fontFeatures
+        let logFontName = fontName
 
-        // Build base font.  When a variableFontHint exists, use its URL to get
-        // the variable font file.  Mask out the upper 16 bits of the face index
-        // (FreeType named-instance index) so we always open the base instance;
-        // set_variations will apply the user's coordinates explicitly.
-        if let hint = variableFontHint {
-            let rawIdx = ctFontFaceIndex(hint)
-            let baseFaceIdx = rawIdx & 0xFFFF  // strip named-instance bits
-            self.hbftFont = createHbFtFont_locked(for: hint, px: px, faceIndex: baseFaceIdx)
+        // Full font-file mapping and FreeType/HarfBuzz construction can take
+        // tens of milliseconds. Build all four independent handles without
+        // holding the atlas mutex; old handles remain valid for readers until
+        // the generation-checked publication below.
+        os_unfair_lock_unlock(&mu)
+        var newBase: LoadedHbFtFont?
+        if let hint {
+            let baseFaceIdx = ctFontFaceIndex(hint) & 0xFFFF
+            newBase = createHbFtFontBorrowed(for: hint, px: px, faceIndex: baseFaceIdx)
         }
-        if self.hbftFont == nil {
-            self.hbftFont = createHbFtFont_locked(for: font, px: px)
+        if newBase == nil {
+            newBase = createHbFtFontBorrowed(for: baseFont, px: px)
         }
-        if self.hbftFont == nil {
-            ZonvieCore.appLog("[rebuildHbFtFont] WARNING: hbft create failed for base font '\(fontName)' px=\(px)")
+        let newBold = bold.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
+        let newItalic = italic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
+        let newBoldItalic = boldItalic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
+
+        for loaded in [newBase, newBold, newItalic, newBoldItalic] {
+            guard let loaded, !features.isEmpty else { continue }
+            features.withUnsafeBufferPointer { buf in
+                zonvie_ft_hb_font_set_variations(loaded.handle, buf.baseAddress, buf.count)
+                zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+            }
+        }
+        os_unfair_lock_lock(&mu)
+
+        // Another font/scale update won while the mutex was released. Its
+        // handles are authoritative; destroy this stale generation only.
+        if fontGeneration != generation {
+            for loaded in [newBase, newBold, newItalic, newBoldItalic] {
+                if let loaded { zonvie_ft_hb_font_destroy(loaded.handle) }
+            }
+            return
         }
 
-        // Build bold variant
-        if let boldFont {
-            self.hbftBold = createHbFtFont_locked(for: boldFont, px: px)
-        }
+        if let hbftFont { zonvie_ft_hb_font_destroy(hbftFont) }
+        if let hbftBold { zonvie_ft_hb_font_destroy(hbftBold) }
+        if let hbftItalic { zonvie_ft_hb_font_destroy(hbftItalic) }
+        if let hbftBoldItalic { zonvie_ft_hb_font_destroy(hbftBoldItalic) }
 
-        // Build italic variant
-        if let italicFont {
-            self.hbftItalic = createHbFtFont_locked(for: italicFont, px: px)
-        }
+        hbftFont = newBase?.handle
+        hbftFontData = newBase?.data
+        hbftBold = newBold?.handle
+        hbftBoldData = newBold?.data
+        hbftItalic = newItalic?.handle
+        hbftItalicData = newItalic?.data
+        hbftBoldItalic = newBoldItalic?.handle
+        hbftBoldItalicData = newBoldItalic?.data
 
-        // Build bold+italic variant
-        if let boldItalicFont {
-            self.hbftBoldItalic = createHbFtFont_locked(for: boldItalicFont, px: px)
-        }
-
-        // Apply variation axes to ALL handles so that axes like wdth, opsz,
-        // and custom axes (MONO, CASL, …) are consistent across styled variants.
-        // For static font faces, set_variations is a harmless no-op (no fvar).
-        applyVariations_locked(to: self.hbftFont)
-        applyVariations_locked(to: self.hbftBold)
-        applyVariations_locked(to: self.hbftItalic)
-        applyVariations_locked(to: self.hbftBoldItalic)
-
-        // OpenType features (liga, ss01, …) apply to all variants.
-        applyFeatures_locked(to: self.hbftFont)
-        applyFeatures_locked(to: self.hbftBold)
-        applyFeatures_locked(to: self.hbftItalic)
-        applyFeatures_locked(to: self.hbftBoldItalic)
-    }
-
-    /// Apply stored variation axes to a HarfBuzz font handle.
-    /// Tags that do not match any fvar axis are silently ignored by the C layer.
-    private func applyVariations_locked(to hbft: OpaquePointer?) {
-        guard let hbft = hbft, !fontFeatures.isEmpty else { return }
-        fontFeatures.withUnsafeBufferPointer { buf in
-            zonvie_ft_hb_font_set_variations(hbft, buf.baseAddress, buf.count)
-        }
-    }
-
-    /// Apply stored font features to a HarfBuzz font handle.
-    private func applyFeatures_locked(to hbft: OpaquePointer?) {
-        guard let hbft = hbft, !fontFeatures.isEmpty else { return }
-        fontFeatures.withUnsafeBufferPointer { buf in
-            zonvie_ft_hb_font_set_features(hbft, buf.baseAddress, buf.count)
+        if hbftFont == nil {
+            ZonvieCore.appLog("[rebuildHbFtFont] WARNING: hbft create failed for base font '\(logFontName)' px=\(px)")
         }
     }
 
-    private func createHbFtFont_locked(for ctFont: CTFont, px: UInt32, faceIndex override: UInt32? = nil) -> OpaquePointer? {
+    private func createHbFtFontBorrowed(for ctFont: CTFont, px: UInt32, faceIndex override: UInt32? = nil) -> LoadedHbFtFont? {
         let ctName = CTFontCopyPostScriptName(ctFont) as String
         let desc = CTFontCopyFontDescriptor(ctFont)
         guard let url = CTFontDescriptorCopyAttribute(desc, kCTFontURLAttribute) as? URL else {
@@ -601,23 +1016,25 @@ final class GlyphAtlas {
             return nil
         }
 
-        guard let data = try? Data(contentsOf: url) else {
+        guard let data = try? NSData(contentsOf: url, options: .mappedIfSafe) else {
             ZonvieCore.appLog("[createHbFtFont] failed to read font file '\(url.path)' for '\(ctName)'")
             return nil
         }
 
         let faceIndex = override ?? ctFontFaceIndex(ctFont)
-
-        let created: OpaquePointer? = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OpaquePointer? in
-            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
-            return zonvie_ft_hb_font_create(base, raw.count, px, faceIndex)
-        }
+        guard data.length > 0 else { return nil }
+        let created = zonvie_ft_hb_font_create_borrowed(
+            data.bytes.assumingMemoryBound(to: UInt8.self),
+            data.length,
+            px,
+            faceIndex
+        )
 
         if created == nil {
             ZonvieCore.appLog("[createHbFtFont] FAILED for '\(ctName)'")
+            return nil
         }
-
-        return created
+        return LoadedHbFtFont(handle: created!, data: data)
     }
 
     private func ctFontFaceIndex(_ ctFont: CTFont) -> UInt32 {
@@ -659,30 +1076,74 @@ final class GlyphAtlas {
             return nil
         }
 
-        let loadStart = CFAbsoluteTimeGetCurrent()
-        guard let data = try? Data(contentsOf: url) else {
-            failedHbftURLs.insert(urlKey)
+        let generation = fontGeneration
+        let px = UInt32(ceil(pointSize * backingScale))
+        let features = fontFeatures
+
+        // Font files can be hundreds of MiB. Keep mapping and FreeType/HarfBuzz
+        // construction outside the atlas mutex so texture upload/readback and
+        // cached glyph hits are not blocked by filesystem I/O. Serialize loaders
+        // separately to avoid duplicate first-use mappings for the same fallback.
+        os_unfair_lock_unlock(&mu)
+        os_unfair_lock_lock(&fallbackLoadLock)
+
+        // Another loader may have populated this face while we waited.
+        os_unfair_lock_lock(&mu)
+        if var cached = fallbackFacesByURL[urlKey] {
+            fallbackAccessCounter += 1
+            cached.accessOrder = fallbackAccessCounter
+            fallbackFacesByURL[urlKey] = cached
+            os_unfair_lock_unlock(&fallbackLoadLock)
+            return cached
+        }
+        if failedHbftURLs.contains(urlKey) {
+            os_unfair_lock_unlock(&fallbackLoadLock)
             return nil
         }
+        if fontGeneration != generation {
+            os_unfair_lock_unlock(&fallbackLoadLock)
+            return ensureHbFtFace_locked(for: ctFont)
+        }
+        os_unfair_lock_unlock(&mu)
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let data = try? NSData(contentsOf: url, options: .mappedIfSafe)
         let loadEnd = CFAbsoluteTimeGetCurrent()
 
-        let px = UInt32(ceil(pointSize * backingScale))
-
         // IMPORTANT: make the closure explicitly return OpaquePointer?
-        let created: OpaquePointer? = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OpaquePointer? in
-            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
-            return zonvie_ft_hb_font_create(base, raw.count, px, faceIndex)
+        let created: OpaquePointer? = data.flatMap { mapped in
+            guard mapped.length > 0 else { return nil }
+            return zonvie_ft_hb_font_create_borrowed(
+                mapped.bytes.assumingMemoryBound(to: UInt8.self),
+                mapped.length,
+                px,
+                faceIndex
+            )
         }
         let createEnd = CFAbsoluteTimeGetCurrent()
+
+        if let hbft = created, !features.isEmpty {
+            features.withUnsafeBufferPointer { buf in
+                zonvie_ft_hb_font_set_features(hbft, buf.baseAddress, buf.count)
+            }
+        }
+
+        os_unfair_lock_lock(&mu)
+        os_unfair_lock_unlock(&fallbackLoadLock)
+
+        // A concurrent font/scale change invalidates the captured pixel size
+        // and features. Destroy the stale handle and retry against the new
+        // generation; the function contract still returns with mu held.
+        if fontGeneration != generation {
+            if let created { zonvie_ft_hb_font_destroy(created) }
+            return ensureHbFtFace_locked(for: ctFont)
+        }
 
         guard let hbft = created else {
             ZonvieCore.appLog("[Atlas] hbft create FAILED for \(url.lastPathComponent) (cached as failed)")
             failedHbftURLs.insert(urlKey)
             return nil
         }
-
-        // Apply OpenType features to fallback font handle too
-        applyFeatures_locked(to: hbft)
 
         let loadMs = (loadEnd - loadStart) * 1000
         let createMs = (createEnd - loadEnd) * 1000
@@ -695,7 +1156,12 @@ final class GlyphAtlas {
 
         fallbackAccessCounter += 1
         let key = UInt64(UInt(bitPattern: hbft))
-        let face = HbFtFace(ctFont: ctFont, url: url, hbft: hbft, key: key, accessOrder: fallbackAccessCounter)
+        guard let fontData = data else {
+            zonvie_ft_hb_font_destroy(hbft)
+            failedHbftURLs.insert(urlKey)
+            return nil
+        }
+        let face = HbFtFace(ctFont: ctFont, url: url, fontData: fontData, hbft: hbft, key: key, accessOrder: fallbackAccessCounter)
         fallbackFacesByURL[urlKey] = face
         return face
     }
@@ -850,7 +1316,7 @@ final class GlyphAtlas {
     private func glyphID(in ctFont: CTFont, scalar: UInt32) -> UInt32? {
         // Build cache key from font pointer and scalar
         let fontKey = UInt64(UInt(bitPattern: Unmanaged.passUnretained(ctFont as AnyObject).toOpaque()))
-        let cacheKey = (fontKey << 32) | UInt64(scalar)
+        let cacheKey = GlyphIDCacheKey(fontKey: fontKey, scalar: scalar)
 
         // Check cache first
         if let cached = scalarToGlyphIDCache[cacheKey] {
@@ -958,9 +1424,13 @@ final class GlyphAtlas {
         nextX = 1
         nextY = 1
         rowH = 0
-        textures[bi] = makeTexture(device: device, w: atlasW, h: atlasH)
+        textures[bi] = nil
+        pendingTextureRecreate = (index: bi, width: atlasW, height: atlasH)
+        needsAtlasRebuild = true
         flushHadRecreate = true
         flushDirtyRect = nil
+        stagedUploadRect = nil
+        flushUploadTransactionOpen = false
         // NOTE: does NOT set atlasModified.
         // Callers that need swap must set it explicitly:
         //   - setFont: sets atlasModified = true after rebuildFont_locked
@@ -968,6 +1438,8 @@ final class GlyphAtlas {
     }
 
     private func makeTexture(device: MTLDevice, w: Int, h: Int) -> MTLTexture? {
+        os_unfair_lock_lock(&textureCreateLock)
+        defer { os_unfair_lock_unlock(&textureCreateLock) }
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
             width: w,
@@ -982,14 +1454,22 @@ final class GlyphAtlas {
             return nil
         }
 
-        // Zero-clear
+        // Zero-clear, chunked (was one replace() call per row -- atlasH of
+        // them -- with no explanation for the per-row granularity; a single
+        // full-texture call would require a w*h*4 scratch allocation on this
+        // per-flush-reachable path instead).
         let rowBytes = w * 4
-        if zeroRow.count < rowBytes { zeroRow = Array<UInt8>(repeating: 0, count: rowBytes) }
-        zeroRow.withUnsafeBytes { raw in
+        let chunkRows = min(h, zeroClearChunkRows)
+        let chunkBytes = rowBytes * chunkRows
+        if zeroChunk.count < chunkBytes { zeroChunk = Array<UInt8>(repeating: 0, count: chunkBytes) }
+        zeroChunk.withUnsafeBytes { raw in
             guard let ptr = raw.baseAddress else { return }
-            for row in 0..<h {
-                tex.replace(region: MTLRegionMake2D(0, row, w, 1),
+            var row = 0
+            while row < h {
+                let rows = min(chunkRows, h - row)
+                tex.replace(region: MTLRegionMake2D(0, row, w, rows),
                             mipmapLevel: 0, withBytes: ptr, bytesPerRow: rowBytes)
+                row += rows
             }
         }
         return tex
@@ -1514,6 +1994,18 @@ final class GlyphAtlas {
             outBitmap.pointee.bearing_y = top
             outBitmap.pointee.advance_26_6 = adv26_6
             if r2 != 0 || w <= 0 || h <= 0 || bufPtr == nil {
+                // Distinguish a genuine rasterization failure (FreeType/hbft
+                // returned a nonzero error code from either attempt above) from a
+                // legitimately empty glyph (e.g. real whitespace, which returns
+                // r == 0 / r2 == 0 with w == 0 / h == 0). Both are cached
+                // identically as a permanently-blank glyph by the core
+                // (ensureGlyphPhase2 -> packAndUploadBitmap in nvim_core.zig) --
+                // this log does not change that caching behavior, it only makes
+                // transient rasterization failures observable for future
+                // debugging.
+                if r != 0 || r2 != 0 {
+                    ZonvieCore.appLog("[Atlas] rasterizeOnly: FreeType/hbft error (color_r=\(r) gray_r=\(r2)) for glyphID=\(resolved.glyphID) scalar=\(scalar) -- caching as permanently blank, no retry")
+                }
                 outBitmap.pointee.pixels = nil
                 outBitmap.pointee.width = 0
                 outBitmap.pointee.height = 0
@@ -1732,35 +2224,76 @@ final class GlyphAtlas {
         return true
     }
 
-    /// Phase 2: Upload glyph bitmap data to atlas texture at the specified position.
-    func uploadRegion(destX: Int, destY: Int, width: Int, height: Int, bitmap: UnsafePointer<zonvie_glyph_bitmap>) {
+    enum UploadResult {
+        case uploaded
+        /// No texture state is corrupt. Abort the current flush and retry after
+        /// already-admitted external readers or an asynchronous back-sync blit
+        /// completes; rebuilding the atlas here would create avoidable churn.
+        case retryAfterReaderDrain
+        /// The back texture or its synchronization failed. The core must abort
+        /// this flush and invalidate its glyph cache before retrying.
+        case requiresRebuild
+    }
+
+    /// Phase 2: Upload glyph bitmap data to atlas texture at the specified
+    /// position. Returns a classified failure if the upload did NOT actually
+    /// happen (the caller must treat the just-computed GlyphEntry's UVs as invalid —
+    /// on_atlas_upload's C ABI is void, so the core has no way to see this
+    /// return value directly; the caller is responsible for propagating
+    /// failure through zonvie_core_abort_flush(), and invalidate the glyph
+    /// cache only for a terminal rebuild failure, since core's
+    /// glyph_cache_by_id/glyph_cache_non_ascii are PERSISTENT across
+    /// flushes — an uncorrected bad entry would be cached as a permanent
+    /// hit, not just missed on "the next cache miss").
+    @discardableResult
+    func uploadRegion(destX: Int, destY: Int, width: Int, height: Int, bitmap: UnsafePointer<zonvie_glyph_bitmap>) -> UploadResult {
+        // Rasterization and CPU-shadow staging do not mutate either Metal
+        // texture. Keep them outside the external-reader gate; the short
+        // texture replace in endFlushUploadTransaction() is the only upload
+        // operation that needs writer admission.
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
         let tex = textures[1 - frontIndex]  // always write to back
-        guard let tex, let pixels = bitmap.pointee.pixels else { return }
+        guard let tex, let pixels = bitmap.pointee.pixels else { return .requiresRebuild }
+
+        // Defensive: bounds-check the destination region against the actual texture
+        // dimensions before touching it, and require strictly positive width/height.
+        // Positivity matters: a NEGATIVE width and height pair would slip through
+        // the other checks (needed = width * height * 4 is positive when both are
+        // negative, and destX + width <= tex.width trivially holds for negative
+        // width) and then trap at the `for row in 0..<height`-derived loop below.
+        // Unreachable today (the sole caller, packAndUploadBitmap in nvim_core.zig,
+        // always passes a region that fits inside the atlas it just packed into),
+        // but this is a C ABI boundary and nothing on the Swift side enforces the
+        // invariant.
+        guard width > 0, height > 0, destX >= 0, destY >= 0, destX + width <= tex.width, destY + height <= tex.height else {
+            ZonvieCore.appLog("[GlyphAtlas] uploadRegion: destination region (\(destX),\(destY) \(width)x\(height)) out of bounds for texture \(tex.width)x\(tex.height), skipping upload")
+            return .requiresRebuild
+        }
+
         let pitch = Int(bitmap.pointee.pitch)
         let absPitch = abs(pitch)
         let bpp = Int(bitmap.pointee.bytes_per_pixel)
-        let needed = width * height * 4  // RGBA atlas
-        if needed <= 0 { return }
-
-        if scratch.count < needed {
-            scratch = Array<UInt8>(repeating: 0, count: needed)
-        } else {
-            scratch.withUnsafeMutableBufferPointer { buf in
-                guard let base = buf.baseAddress else { return }
-                memset(base, 0, needed)
-            }
+        let shadowRowBytes = atlasW * 4
+        guard atlasShadow.count == shadowRowBytes * atlasH else {
+            ZonvieCore.appLog("[GlyphAtlas] uploadRegion: CPU shadow size mismatch; forcing rebuild")
+            needsAtlasRebuild = true
+            return .requiresRebuild
         }
 
-        scratch.withUnsafeMutableBufferPointer { dst in
-            guard let dstBase = dst.baseAddress else { return }
+        atlasShadow.withUnsafeMutableBufferPointer { dst in
+            guard let shadowBase = dst.baseAddress else { return }
             let srcWidth = min(width, Int(bitmap.pointee.width))
+            let srcHeight = min(height, Int(bitmap.pointee.height))
             for row in 0..<height {
-                let srcRow = pitch >= 0 ? row : (height - 1 - row)
+                let dstRow = shadowBase.advanced(by: (destY + row) * shadowRowBytes + destX * 4)
+                memset(dstRow, 0, width * 4)
+            }
+            for row in 0..<srcHeight {
+                let srcRow = pitch >= 0 ? row : (srcHeight - 1 - row)
                 let src = pixels.advanced(by: srcRow * absPitch)
-                let dstRow = dstBase.advanced(by: row * width * 4)
+                let dstRow = shadowBase.advanced(by: (destY + row) * shadowRowBytes + destX * 4)
                 if bpp >= 4 {
                     // RGBA data (already BGRA→RGBA converted by rasterizeOnly)
                     memcpy(dstRow, src, srcWidth * 4)
@@ -1778,36 +2311,112 @@ final class GlyphAtlas {
             }
         }
 
-        scratch.withUnsafeBytes { raw in
-            guard let baseAddr = raw.baseAddress else { return }
-            let region = MTLRegionMake2D(destX, destY, width, height)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: width * 4)
-        }
-
         atlasModified = true
+        if var rect = stagedUploadRect {
+            rect.union(x: destX, y: destY, width: width, height: height)
+            stagedUploadRect = rect
+        } else {
+            stagedUploadRect = AtlasDirtyRect(x: destX, y: destY, width: width, height: height)
+        }
         if var rect = flushDirtyRect {
             rect.union(x: destX, y: destY, width: width, height: height)
             flushDirtyRect = rect
         } else {
             flushDirtyRect = AtlasDirtyRect(x: destX, y: destY, width: width, height: height)
         }
+        flushUploadTransactionOpen = true
+        return .uploaded
+    }
+
+    /// Flush all staged glyph pixels with one driver call. Reader admission is
+    /// closed only for the actual texture replace, never for rasterization,
+    /// fallback font resolution, bitmap copies, or vertex generation.
+    ///
+    /// Returns false without discarding staged CPU pixels when a prior blit or
+    /// external reader is still active. The renderer aborts presentation and a
+    /// later retry commits the same staging, preserving core glyph-cache UVs.
+    @discardableResult
+    func endFlushUploadTransaction() -> Bool {
+        guard flushUploadTransactionOpen else { return true }
+        switch pollPendingBackBlit() {
+        case .ready:
+            break
+        case .pending:
+            return false
+        case .failed:
+            os_unfair_lock_lock(&mu)
+            stagedUploadRect = nil
+            flushUploadTransactionOpen = false
+            os_unfair_lock_unlock(&mu)
+            return false
+        }
+
+        guard beginAtlasWrite() else {
+            endAtlasWrite()
+            return false
+        }
+        defer { endAtlasWrite() }
+
+        os_unfair_lock_lock(&mu)
+        var committed = true
+        if let rect = stagedUploadRect,
+           let tex = textures[1 - frontIndex] {
+            atlasShadow.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                let byteOffset = (rect.y * atlasW + rect.x) * 4
+                tex.replace(
+                    region: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height),
+                    mipmapLevel: 0,
+                    withBytes: base.advanced(by: byteOffset),
+                    bytesPerRow: atlasW * 4
+                )
+            }
+            stagedUploadRect = nil
+        } else if stagedUploadRect != nil {
+            needsAtlasRebuild = true
+            stagedUploadRect = nil
+            committed = false
+        }
+        if committed { flushUploadTransactionOpen = false }
+        os_unfair_lock_unlock(&mu)
+        return committed
     }
 
     /// Phase 2: Recreate atlas texture with the given dimensions.
-    func recreateTexture(width: Int, height: Int) {
+    @discardableResult
+    func recreateTexture(width: Int, height: Int) -> Bool {
+        let newTex = makeTexture(device: device, w: width, h: height)
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
         let bi = 1 - frontIndex
-        guard let newTex = makeTexture(device: device, w: width, h: height) else {
-            textures[bi] = nil
-            ZonvieCore.appLog("[GlyphAtlas] recreateTexture: makeTexture failed, back invalidated, will retry next flush")
-            return
+        guard let newTex else {
+            pendingTextureRecreate = (index: bi, width: width, height: height)
+            // Route the failure into the existing scale-path
+            // abort-until-repaired loop (prepareBackTexture consumes this flag
+            // first thing and returns needsCoreInvalidation; ZonvieCore's
+            // on_flush_begin then re-runs the invalidation dance and aborts
+            // the flush while the flag is still set). This also invalidates
+            // the core's cached glyph entries whose UVs were never uploaded
+            // (their uploadRegion calls were silently dropped into the nil
+            // slot), which a bare allocation retry cannot do.
+            needsAtlasRebuild = true
+            ZonvieCore.appLog("[GlyphAtlas] recreateTexture: makeTexture failed for slot \(bi), will retry via needsAtlasRebuild + slot repair on next beginFlush")
+            return false
         }
+        if pendingTextureRecreate?.index == bi { pendingTextureRecreate = nil }
         textures[bi] = newTex
         // Update atlas dimensions to match core-configured size
         atlasW = width
         atlasH = height
+        let shadowBytes = width * height * 4
+        if atlasShadow.count != shadowBytes {
+            atlasShadow = Array<UInt8>(repeating: 0, count: shadowBytes)
+        } else {
+            atlasShadow.withUnsafeMutableBytes { raw in
+                if let base = raw.baseAddress { memset(base, 0, raw.count) }
+            }
+        }
         // Reset local packer state (core manages packing in Phase 2)
         nextX = 1
         nextY = 1
@@ -1817,11 +2426,12 @@ final class GlyphAtlas {
         atlasModified = true
         flushHadRecreate = true
         flushDirtyRect = nil
-        // needsAtlasRebuild cleared here because recreateTexture() is the terminal
-        // point of the scale-change invalidation path (setBackingScale → prepareBackTexture
-        // → core invalidation → on_atlas_create → recreateTexture). This flag is
-        // scale-change-only; setFont uses rebuildFont_locked() which does not touch it.
+        stagedUploadRect = nil
+        flushUploadTransactionOpen = false
+        // The successfully allocated slot completes the rebuild requested by
+        // setBackingScale, setFont, or a prior allocation/command failure.
         needsAtlasRebuild = false
+        return true
     }
 
     // MARK: - Double-Buffer Lifecycle
@@ -1841,13 +2451,110 @@ final class GlyphAtlas {
     private var pendingBlitWasRecreate: Bool = false
     private var pendingBlitRect: AtlasDirtyRect?
 
+    // Committed-but-unresolved blit command buffer. A later flush polls it
+    // during preflight, while an actual CPU upload or front publication waits
+    // for it before touching the back texture.
+    private var pendingBlitCmdLock = os_unfair_lock()
+    private var pendingBlitCmd: MTLCommandBuffer?
+
+    // Core-thread-only. True while CPU-shadow pixels still need one batched
+    // texture replace. It does not imply ownership of the reader/writer gate.
+    private var flushUploadTransactionOpen = false
+
+    /// Record the committed (not yet completed) blit command buffer.
+    func setPendingBackBlit(_ cmd: MTLCommandBuffer) {
+        os_unfair_lock_lock(&pendingBlitCmdLock)
+        pendingBlitCmd = cmd
+        os_unfair_lock_unlock(&pendingBlitCmdLock)
+    }
+
+    enum PendingBlitResolution: Equatable {
+        case ready
+        case pending
+        case failed
+    }
+
+    /// Poll a deferred front->back blit and mark the back texture synced once
+    /// complete. This never waits: every caller runs while core grid_mu is held,
+    /// so in-flight work must abort/retry instead of blocking the redraw thread.
+    /// A terminal command failure forces a full rebuild.
+    @discardableResult
+    func pollPendingBackBlit() -> PendingBlitResolution {
+        os_unfair_lock_lock(&pendingBlitCmdLock)
+        let cmd = pendingBlitCmd
+        pendingBlitCmd = nil
+        os_unfair_lock_unlock(&pendingBlitCmdLock)
+        guard let cmd else { return .ready }
+
+        if cmd.status == .completed {
+            markBackSynced()
+            return .ready
+        }
+        if cmd.status == .notEnqueued || cmd.status == .enqueued ||
+           cmd.status == .committed || cmd.status == .scheduled {
+            os_unfair_lock_lock(&pendingBlitCmdLock)
+            if pendingBlitCmd == nil { pendingBlitCmd = cmd }
+            os_unfair_lock_unlock(&pendingBlitCmdLock)
+            return .pending
+        }
+        ZonvieCore.appLog("[WARNING] GlyphAtlas: deferred back blit failed (status=\(cmd.status.rawValue)); forcing atlas rebuild")
+        os_unfair_lock_lock(&mu)
+        needsAtlasRebuild = true
+        os_unfair_lock_unlock(&mu)
+        return .failed
+    }
+
     /// Phase 1: Called from beginFlush() on core thread.
     /// Handles atlas rebuild, CPU sync, and no-op cases WITHOUT a command buffer.
     /// If GPU blit is needed, returns needsGpuBlit=true and the caller should
     /// create a command buffer and call encodeBackTextureBlit().
     func prepareBackTexture() -> PrepareResult {
+        // Resolve a still-pending blit from the PREVIOUS flush first: the
+        // decisions below (backDirty, CPU-sync replace) require its result.
+        guard pollPendingBackBlit() == .ready else {
+            return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: false)
+        }
+
+        // Allocate/zero a missing or wrong-sized slot without holding mu.
+        os_unfair_lock_lock(&mu)
+        let repair = pendingTextureRecreate
+        let repairWillBeRecreatedByInvalidation = needsAtlasRebuild && repair?.index == (1 - frontIndex)
+        os_unfair_lock_unlock(&mu)
+        // A pending rebuild asks the core invalidation callback to recreate
+        // the current back slot. Do not allocate that same slot once here and
+        // immediately replace it again in recreateTexture(). A missing front
+        // slot still needs this independent repair because recreateTexture()
+        // deliberately targets only the back slot.
+        if !repairWillBeRecreatedByInvalidation,
+           let repair,
+           let retryTex = makeTexture(device: device, w: repair.width, h: repair.height) {
+            os_unfair_lock_lock(&mu)
+            if let current = pendingTextureRecreate,
+               current.index == repair.index,
+               current.width == repair.width,
+               current.height == repair.height {
+                textures[repair.index] = retryTex
+                pendingTextureRecreate = nil
+                ZonvieCore.appLog("[GlyphAtlas] prepareBackTexture: repaired texture slot \(repair.index)")
+            }
+            os_unfair_lock_unlock(&mu)
+        }
         os_unfair_lock_lock(&mu)
 
+        // Repair a previously-failed recreateTexture() allocation FIRST, before
+        // either early return below. Placement matters twice over:
+        //  - it must run before the `guard backDirty` return: in the
+        //    failed-before-any-upload case no swap happened and backDirty stays
+        //    false, so a retry placed any later would never be reached and
+        //    uploads would keep silently dropping into the nil slot forever;
+        //  - it must run before the needsAtlasRebuild consume: after a
+        //    mid-flush front-swap the nil slot can be frontIndex, which the
+        //    invalidation path's recreateTexture (always targeting
+        //    1 - frontIndex) structurally never repairs — this block is the
+        //    only thing that can fix that slot.
+        // A repaired slot holds a fresh empty texture; the needsAtlasRebuild
+        // half of this fix (set alongside pendingTextureRecreate on failure)
+        // takes care of invalidating the core's stale cached glyphs.
         // Apply deferred atlas rebuild (from setBackingScale)
         if needsAtlasRebuild {
             clearCaches_locked()
@@ -1865,41 +2572,34 @@ final class GlyphAtlas {
         let bi = 1 - frontIndex
         let syncedWasRecreate = pendingBackSyncWasRecreate
         let syncedRect = pendingBackSyncRect
-        guard let front = textures[fi], var back = textures[bi] else {
+        guard let front = textures[fi], let back = textures[bi] else {
             os_unfair_lock_unlock(&mu)
             return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
         }
 
         // Defensive: recreate back if size mismatch
         if back.width != front.width || back.height != front.height {
-            guard let newBack = makeTexture(device: device, w: front.width, h: front.height) else {
-                os_unfair_lock_unlock(&mu)
-                return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
-            }
-            textures[bi] = newBack
-            back = newBack
+            pendingTextureRecreate = (index: bi, width: front.width, height: front.height)
+            os_unfair_lock_unlock(&mu)
+            return PrepareResult(needsGpuBlit: false, didCpuSync: false, needsCoreInvalidation: false, shouldAbort: true, syncedWasRecreate: syncedWasRecreate)
         }
 
-        // Try CPU sync path first (small dirty rect)
-        if !syncedWasRecreate, let rect = syncedRect {
-            let bytesPerRow = rect.width * 4
-            let totalBytes = rect.width * rect.height * 4
-            if totalBytes > 0 {
-                if backSyncScratch.count < totalBytes {
-                    backSyncScratch = Array<UInt8>(repeating: 0, count: totalBytes)
-                }
-                backSyncScratch.withUnsafeMutableBytes { raw in
-                    guard let base = raw.baseAddress else { return }
-                    front.getBytes(base, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height), mipmapLevel: 0)
-                    back.replace(region: MTLRegionMake2D(rect.x, rect.y, rect.width, rect.height), mipmapLevel: 0, withBytes: base, bytesPerRow: bytesPerRow)
-                }
-                backDirty = false
-                pendingBackSyncWasRecreate = false
-                pendingBackSyncRect = nil
-                os_unfair_lock_unlock(&mu)
-                return PrepareResult(needsGpuBlit: false, didCpuSync: true, needsCoreInvalidation: false, shouldAbort: false, syncedWasRecreate: syncedWasRecreate)
-            }
-        }
+        // Front->back sync always goes through a GPU blit. A CPU
+        // getBytes/replace fast path used to handle small dirty rects here,
+        // but CPU access to a texture that a still-in-flight command buffer
+        // (encoded before the last swap, when this back texture was front)
+        // may be sampling is unsynchronized per Metal's docs — it was only
+        // masked by append-only/byte-identical invariants. A blit command on
+        // the same queue is hazard-tracked against those in-flight reads,
+        // and completion is polled by a later flush, so the GPU route never
+        // blocks the core thread. That automatic
+        // ordering is scoped to the main renderer's OWN MTLCommandQueue --
+        // it does not cover ExternalGridView's reads, each of which runs on
+        // its own separate MTLCommandQueue. The caller (MetalTerminalRenderer's
+        // beginFlush, right before committing this blit's command buffer)
+        // calls beginAtlasWrite()/endAtlasWrite() to close that gap explicitly instead
+        // of relying solely on the append-only/byte-identical/fresh-texture
+        // invariants documented in uploadRegion() above.
 
         // GPU blit needed — save state for encodeBackTextureBlit()
         pendingBlitFront = front
@@ -1980,23 +2680,61 @@ final class GlyphAtlas {
         return result
     }
 
+    struct CommitResult {
+        let texture: MTLTexture?
+        let committed: Bool
+    }
+
     /// Called from commitFlush() on core thread.
     /// If atlas was modified during this flush, swaps front/back and returns new front.
     /// If not modified, returns current front without swap.
-    func commitAndSnapshotFrontTexture() -> MTLTexture? {
+    func commitAndSnapshotFrontTexture() -> CommitResult {
+        // If this flush modified the atlas, a deferred back blit must complete
+        // before back becomes front. Poll only: commitFlush runs with grid_mu
+        // held and must abort/retry rather than waiting on the GPU.
+        os_unfair_lock_lock(&mu)
+        let wasModified = atlasModified
+        os_unfair_lock_unlock(&mu)
+        let blitResolution = wasModified ? pollPendingBackBlit() : .ready
+        let blitOk = blitResolution == .ready
+        var publishedFreshTexture = false
         os_unfair_lock_lock(&mu)
         if atlasModified {
-            pendingBackSyncWasRecreate = flushHadRecreate
-            pendingBackSyncRect = flushDirtyRect
-            frontIndex = 1 - frontIndex   // swap: back (with new content) becomes front
-            backDirty = true              // old front (now back) is behind
-            atlasModified = false
-            flushHadRecreate = false
-            flushDirtyRect = nil
+            if !blitOk {
+                // A terminal blit failure keeps both the old front and the
+                // uncommitted modification for a later rebuild/retry.
+            } else {
+                // `resetAtlas_locked()` also sets flushHadRecreate while the
+                // replacement slot is still nil. Only reopen readers when a
+                // real fresh texture is about to become the committed front.
+                publishedFreshTexture = flushHadRecreate && textures[1 - frontIndex] != nil
+                pendingBackSyncWasRecreate = flushHadRecreate
+                pendingBackSyncRect = flushDirtyRect
+                frontIndex = 1 - frontIndex   // swap: back (with new content) becomes front
+                backDirty = true              // old front (now back) is behind
+                atlasModified = false
+                flushHadRecreate = false
+                flushDirtyRect = nil
+            }
         }
         let tex = textures[frontIndex]
         os_unfair_lock_unlock(&mu)
-        return tex
+        if publishedFreshTexture {
+            // A failed upload can leave writer intent armed while the retry
+            // rebuilds and commits an empty/background-only atlas. With no
+            // upload or back-sync in that retry, there would otherwise be no
+            // later beginAtlasWrite() call to clear the intent, permanently
+            // rejecting every external reader despite the fresh publication.
+            completeWriterIntentAfterFreshTexturePublication()
+        } else if blitOk {
+            // A retry can commit successfully without touching the atlas when
+            // the glyph that triggered reader contention disappeared before
+            // the retry. Do not treat the existing texture as fresh: keep the
+            // gate closed until every reader admitted before the failed writer
+            // has actually completed.
+            completeWriterIntentAfterSuccessfulTransaction()
+        }
+        return CommitResult(texture: tex, committed: blitOk)
     }
 
     /// Returns the committed front texture under lock.

@@ -8,7 +8,8 @@ const highlight = @import("highlight.zig");
 const Highlights = highlight.Highlights;
 const ResolvedAttrWithStyles = highlight.ResolvedAttrWithStyles;
 pub const redraw = @import("redraw_handler.zig");
-const Logger = @import("log.zig").Logger;
+const log_mod = @import("log.zig");
+const Logger = log_mod.Logger;
 const config = @import("config.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
@@ -25,6 +26,44 @@ pub const Stream = rpc_transport.Stream;
 /// changes in anchor position (e.g. popupmenu re-show) and re-fire
 /// on_external_window so the frontend can update window position.
 pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, rows: u32, cols: u32 };
+
+pub const GLYPH_CACHE_INVALID_KEY: u64 = std.math.maxInt(u64);
+
+/// Flushes a shifted-out row stays in the reclamation liveness set. macOS keeps
+/// at most two retained scroll rows and shifts them one flush at a time; one
+/// flush of slack covers the hand-off. An expired shadow only ever delays
+/// reclamation, so erring high is the safe direction.
+pub const retained_shadow_expiry: u8 = 3;
+const TRANSIENT_GLYPH_RETRY_INITIAL_NS: i128 = 250 * std.time.ns_per_ms;
+const TRANSIENT_GLYPH_RETRY_MAX_NS: i128 = 4 * std.time.ns_per_s;
+const TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS: u8 = 5;
+
+pub const GlyphCacheProbe = struct {
+    hit: ?usize,
+    insert: usize,
+};
+
+/// Two-choice, allocation-free probe for the fixed-size glyph caches. Two
+/// keys that collide at the primary index can coexist at independent secondary
+/// indices; when both are occupied a stable hash bit selects the victim.
+pub fn glyphCacheProbe(keys: []const u64, key: u64, hash: u64) GlyphCacheProbe {
+    std.debug.assert(keys.len > 0);
+    const primary: usize = @intCast(hash % keys.len);
+    var mixed = hash ^ key ^ 0x9E3779B97F4A7C15;
+    mixed ^= mixed >> 30;
+    mixed *%= 0xBF58476D1CE4E5B9;
+    mixed ^= mixed >> 27;
+    mixed *%= 0x94D049BB133111EB;
+    mixed ^= mixed >> 31;
+    var secondary: usize = @intCast(mixed % keys.len);
+    if (secondary == primary and keys.len > 1) secondary = (secondary + 1) % keys.len;
+
+    if (keys[primary] == key) return .{ .hit = primary, .insert = primary };
+    if (keys[secondary] == key) return .{ .hit = secondary, .insert = secondary };
+    if (keys[primary] == GLYPH_CACHE_INVALID_KEY) return .{ .hit = null, .insert = primary };
+    if (keys[secondary] == GLYPH_CACHE_INVALID_KEY) return .{ .hit = null, .insert = secondary };
+    return .{ .hit = null, .insert = if ((mixed >> 63) == 0) primary else secondary };
+}
 
 /// Backing transport for the current RPC session.
 pub const TransportKind = enum {
@@ -259,9 +298,12 @@ pub const Callbacks = struct {
     /// background-tab agent still updates).
     on_agent_status: ?*const fn (ctx: ?*anyopaque, tab_handle: i64, state: u8, title: [*]const u8, title_len: usize) callconv(.c) void = null,
 
-    /// Called when a grid receives a grid_scroll event.
-    /// Frontend should clear pixel-based smooth scroll offset for this grid.
-    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+    /// Called when a grid receives a grid_scroll event. rows_delta is the
+    /// signed distance the content moved, summed over every scroll of that grid
+    /// in the batch this notification stands for — a frontend holding a
+    /// sub-cell scroll offset has to give back exactly that distance, and one
+    /// notification can stand for several scrolls.
+    on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void = null,
 
     /// Called when IME should be turned off (mode change with ime.disable_on_modechange,
     /// or RPC zonvie_ime_off notification).
@@ -334,7 +376,6 @@ const PipeReader = rpc_session.PipeReader;
 const CwdOwner = rpc_session.CwdOwner;
 
 const GridEntry = flush.GridEntry;
-const MAX_CACHED_SUBGRIDS = flush.MAX_CACHED_SUBGRIDS;
 const CachedSubgrid = flush.CachedSubgrid;
 const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
@@ -407,8 +448,30 @@ pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
     return if (h == 0) 1 else h;
 }
 
+/// Cumulative attempt/busy counters for a single grid_mu tryLock call site.
+/// See the perf_lock_* fields on Core for why these must be atomic.
+pub const LockContentionStat = struct {
+    attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    busy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn record(self: *LockContentionStat, acquired: bool) void {
+        _ = self.attempts.fetchAdd(1, .monotonic);
+        if (!acquired) _ = self.busy.fetchAdd(1, .monotonic);
+    }
+};
+
+pub const RedrawRecoveryState = enum {
+    healthy,
+    await_detach,
+    await_attach,
+};
+
 pub const Core = struct {
     const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
+    const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
+    const MAX_TOTAL_WRITE_QUEUE_SIZE: usize = MAX_WRITE_QUEUE_SIZE + UI_STATE_WRITE_RESERVE_SIZE;
+    const UI_STATE_RPC_STACK_SIZE: usize = 256;
+    const WriteClass = enum { normal, ui_state };
 
     alloc: std.mem.Allocator,
     cb: Callbacks,
@@ -418,6 +481,16 @@ pub const Core = struct {
     last_sent_cursor_rev: u64 = 0,
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
+    // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
+    // sendExternalGridVerticesFiltered to treat EVERY external grid as
+    // cursor_affected for one flush, regardless of last_ext_cursor_grid.
+    // A failed flush can leave last_ext_cursor_grid pointing at the NEW
+    // cursor grid even though the frontend never actually committed an empty
+    // cursor for the OLD one (the two are tracked independently — see
+    // sendExternalGridVerticesFiltered's abort-skip defer) — force resend
+    // cannot know which specific grid that was, so instead of relying on
+    // last_ext_cursor_grid it just re-checks every external grid once.
+    force_ext_cursor_recheck: bool = false,
     pre_cmdline_cursor_grid: i64 = 1, // Cursor grid before cmdline was shown (for restoring after cmdline closes)
     pre_cmdline_cursor_row: u32 = 0,
     pre_cmdline_cursor_col: u32 = 0,
@@ -431,6 +504,15 @@ pub const Core = struct {
     cursor_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
 
     row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
+    // Partial-only main submission preserves global five-pass ordering by
+    // accumulating under-decoration, glyph, strike, and overline layers here.
+    // Capacities are retained across flushes; no per-frame buffers are created.
+    partial_layer_verts: [4]std.ArrayListUnmanaged(c_api.Vertex) = .{
+        .empty,
+        .empty,
+        .empty,
+        .empty,
+    },
 
     // Scroll-aware flush: per-row vertex cache.
     // Each entry holds the last emitted vertices for that row.
@@ -439,20 +521,90 @@ pub const Core = struct {
     scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
     scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
     scroll_cache_rows: u32 = 0,
+    /// The row buffer currently being composed, while it is being composed.
+    /// A row only reaches scroll_cache once it is finished, so without this the
+    /// mid-flush collection cannot see the quads the in-progress row has
+    /// already emitted and would reclaim the shelves they point into. Held as a
+    /// pointer, not a slice: the list grows as the row is built.
+    inflight_row_verts: ?*const std.ArrayListUnmanaged(c_api.Vertex) = null,
+    /// Set when the frontend declined to publish a frame this core had already
+    /// regenerated rows for. scroll_cache then holds the refused frame while
+    /// the screen still shows the previous one, so it no longer describes what
+    /// is displayed and cannot be used to prove a shelf is unreferenced.
+    /// Cleared by the next accepted publication.
+    display_mirror_stale: bool = false,
+    /// Copies of the rows the scroll fast path most recently shifted out of the
+    /// viewport. macOS retains those rows in a renderer-owned buffer ring to
+    /// ease a scroll sub-row, and keeps drawing them for a few frames after
+    /// this core has already overwritten their cache slots. That ring is
+    /// invisible here, so reclamation would see their glyphs as unreferenced.
+    retained_shadow: [2]std.ArrayListUnmanaged(c_api.Vertex) = .{ .empty, .empty },
+    retained_shadow_age: [2]u8 = .{ retained_shadow_expiry, retained_shadow_expiry },
+    retained_shadow_next: usize = 0,
+    main_vertex_row_counts: std.ArrayListUnmanaged(usize) = .empty,
+    main_surface_vertex_count: usize = 0,
+    main_vertex_row_ledger_valid: bool = true,
+    flush_vertex_count_aggregate: usize = 0,
+    vertex_budget_transaction_active: bool = false,
+    vertex_budget_main_touched: bool = false,
+    vertex_budget_touched_grid_head: ?i64 = null,
 
     // Subgrid layout snapshot for scroll fast path.
     // Stores the (grid_id, row_start, row_end) of every composited subgrid
     // from the previous successful flush. Compared against the current layout
     // to detect position changes, additions, and removals that invalidate
     // cached row vertices inside the scroll region.
-    prev_subgrid_snapshots: [MAX_CACHED_SUBGRIDS]SubgridSnapshot = undefined,
-    prev_subgrid_snapshot_count: u32 = 0,
+    prev_subgrid_snapshots: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
+    // Current-layout normalization and row-dedup scratch for the subgrid
+    // scroll-cache diff. Capacities persist across flushes.
+    subgrid_diff_current: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
+    subgrid_diff_row_marks: std.ArrayListUnmanaged(u32) = .empty,
+    subgrid_diff_row_generation: u32 = 0,
 
     // Reusable scratch buffers (zero-allocation hot path)
     tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
     grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    // Sort scratch for float overlays anchored to an external grid — same
+    // (zindex, compindex, order, grid_id) ordering as grid_entries, but kept
+    // separate since it's populated by a different function
+    // (sendExternalGridVerticesFiltered) that can run within the same flush
+    // cycle as the main composite path that owns grid_entries.
+    ext_float_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    // One win_pos scan per flush, grouped by external anchor and layer order.
+    ext_float_anchor_entries: std.ArrayListUnmanaged(flush.ExternalFloatAnchorEntry) = .empty,
+    ext_float_anchor_index_valid: bool = false,
+    // Flush-local row index for floats composited into an external grid.
+    // Entries are built once per anchor grid, sorted once, then referenced by
+    // per-row buckets so dirty rows never rescan/sort the full win_pos map.
+    ext_float_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_entry_indices: std.ArrayListUnmanaged(usize) = .empty,
+    ext_float_row_index_valid: bool = false,
+    ext_float_index_generation: u64 = 0,
+    cached_subgrids_buf: std.ArrayListUnmanaged(flush.CachedSubgrid) = .empty,
+    // Persistent main-composition row buckets. The exact layout snapshot
+    // avoids rebuilding these on content-only flushes.
+    main_subgrid_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_indices: std.ArrayListUnmanaged(usize) = .empty,
+    main_subgrid_row_layout: std.ArrayListUnmanaged(flush.MainSubgridRowLayout) = .empty,
+    main_subgrid_row_index_rows: u32 = 0,
+    main_subgrid_row_index_valid: bool = false,
+    main_subgrid_row_index_generation: u64 = 0,
+    // The buckets store positions into the per-flush cached_subgrids slice, so
+    // reuse additionally requires that slice to have the same length. A grid
+    // clipped entirely off the bottom of the main grid contributes nothing to
+    // the layout accounting, so a resize that adds or drops one changes the
+    // slice without advancing layout_generation.
+    main_subgrid_row_index_cached_len: usize = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
+    // Guards key_buf: sendInput/sendKeyEvent may now be called from a
+    // frontend-owned display-link thread (macOS key-repeat synthesis) as
+    // well as the normal per-keystroke caller, so the shared scratch buffer
+    // is no longer single-writer. nextMsgId() (atomic) and sendRaw()'s
+    // write_queue_mu are already safe for concurrent callers.
+    key_buf_mu: std.Io.Mutex = .init,
 
     msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
 
@@ -462,9 +614,18 @@ pub const Core = struct {
     write_queue_mu: std.Io.Mutex = .init,
     write_queue_cond: std.Io.Condition = .init,
     write_queue: std.ArrayListUnmanaged(u8) = .empty,
+    // The writer swaps the active FIFO with this spare and performs transport
+    // I/O without holding write_queue_mu. Both buffers permanently reserve
+    // UI_STATE_WRITE_RESERVE_SIZE bytes so focus/resize can join the same FIFO
+    // without allocation even when normal traffic reaches its 4 MiB cap.
+    write_spare_queue: std.ArrayListUnmanaged(u8) = .empty,
+    write_queue_normal_bytes: usize = 0,
+    write_queue_ui_state_bytes: usize = 0,
     write_queue_closed: bool = false,
     writer_failed: bool = false,
     writer_thread: ?std.Thread = null,
+    writer_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    writer_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
     // Mutex to protect grid state access from concurrent RPC and UI threads.
     grid_mu: std.Io.Mutex = .init,
@@ -475,14 +636,37 @@ pub const Core = struct {
     stdin_close_mu: std.Io.Mutex = .init,
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // stop() owns all Core resource teardown, not just thread shutdown.  It can
+    // therefore run exactly once even though the public C API permits the
+    // common stop(); destroy(); sequence.  Values: 0 = active, 1 = teardown in
+    // progress, 2 = teardown complete.
+    stop_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     /// Set to true after nvim_ui_attach completes successfully.
     ui_attached: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// RPC-thread-owned redraw recovery state. A failed batch poisons the
+    /// current UI attachment until a tracked detach/reset/attach cycle creates
+    /// a fresh protocol epoch.
+    redraw_recovery_state: RedrawRecoveryState = .healthy,
+    redraw_recovery_msgid: i64 = 0,
+    redraw_recovery_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    redraw_recovery_attach_rows: u32 = 0,
+    redraw_recovery_attach_cols: u32 = 0,
+    redraw_recovery_attempts: u8 = 0,
     /// Stores pending focus state when setFocus is called before ui_attach.
     /// 0 = no pending, 1 = pending focus gained, 2 = pending focus lost.
     pending_focus: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    pending_focus_sequence: u64 = 0,
     thread: ?std.Thread = null,
+    // Stable identity of the RPC run-loop thread. redraw_thread_id only covers
+    // the intervals which hold grid_mu; callbacks such as on_exit run outside
+    // those intervals and must still avoid joining their own thread in stop().
+    rpc_thread_id: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    // Serializes publication, signaling, and withdrawal of child_handle.
+    // cleanup claims the handle before Child.wait()/kill() can reap/close it,
+    // so a concurrent stop can never signal a recycled PID/HANDLE.
+    child_handle_mu: std.Io.Mutex = .init,
     child_handle: ?std.process.Child.Id = null,
     stdin_file: ?Stream = null,
     stdout_file: ?Stream = null,
@@ -495,8 +679,14 @@ pub const Core = struct {
     /// pump might outlive Core (`:connect` orphan path). Always null
     /// it after detach / join — the pump destroys the struct itself.
     stderr_pump: ?*rpc_session.StderrPump = null,
+    /// POSIX-only wait service allocated and started with each spawned child.
+    /// Preserved children transfer waitpid ownership here without allocating
+    /// during cleanup or depending on stderr EOF.
+    child_reaper: ?*rpc_session.ChildReaper = null,
+    child_reaper_thread: ?std.Thread = null,
 
-    /// Transport mode of the current session.
+    /// Transport mode of the current session. Protected by stdin_close_mu;
+    /// teardown must retain a snapshot before releasing that mutex.
     /// .pipes: spawned child + 3 pipes (stdin/stdout/stderr separate handles).
     /// .socket: connected to a running nvim via TCP/Unix socket. In this mode
     /// stdin_file and stdout_file alias the same fd; close() must run only
@@ -563,6 +753,36 @@ pub const Core = struct {
     /// When true, the flush pipeline skips vertex generation and atlas operations.
     /// Reset at the start of each flush cycle before on_flush_begin is called.
     flush_aborted: bool = false,
+    /// Main-grid dirty state as it stood when the current flush started.
+    /// A frontend that refuses to publish (atlas back-sync still in flight,
+    /// no free buffer set) leaves the previously committed frame on screen,
+    /// so the retry only owes the rows this attempt consumed — restoring
+    /// this is what keeps a rejection from costing a whole-viewport resend.
+    flush_dirty_snapshot: grid_mod.DirtySnapshot = .{},
+    /// Main row ledger as it stood when the current flush started, paired with
+    /// flush_dirty_snapshot. Restoring both makes the core's accounting match
+    /// the frame the frontend still has on screen after it declined to commit.
+    flush_row_counts_snapshot: std.ArrayListUnmanaged(usize) = .empty,
+    flush_main_vertex_count_snapshot: usize = 0,
+    flush_row_ledger_snapshot_valid: bool = false,
+    /// False when aborting cannot be healed by retrying the same state (for
+    /// example, a fixed resource budget was exceeded).
+    flush_retryable: bool = true,
+
+    /// Set when an atlas reset is detected during the DEFERRED external-grid
+    /// pass (sendExternalGridVertices, runs after on_flush_end's LIFO defer
+    /// ordering puts it before the callback but after the main row-mode loop
+    /// already dispatched this flush's main vertices with pre-reset UVs).
+    /// markAllDirty() alone only schedules a correct resend for the NEXT
+    /// flush — it cannot undo already-dispatched on_vertices_row calls for
+    /// THIS flush, whose vertices would otherwise be committed alongside the
+    /// just-reset (differently-packed) atlas texture: one frame of visible
+    /// glyph corruption. Read by frontends via
+    /// zonvie_core_flush_had_atlas_corruption() (while grid_mu is still
+    /// held, from on_flush_end) to cancel the current flush's commit
+    /// entirely instead of presenting it. Reset at the start of each flush
+    /// cycle, same as flush_aborted.
+    flush_atlas_corrupted: bool = false,
 
     init_rows: u32 = 24,
     init_cols: u32 = 80,
@@ -578,9 +798,20 @@ pub const Core = struct {
 
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
+    // Serializes ui_attached publication and deferred focus/resize state.
+    // Lock order when both are needed:
+    // pending_resize_mu -> write_queue_mu.
+    pending_resize_mu: std.Io.Mutex = .init,
     pending_resize_rows: u32 = 0,
     pending_resize_cols: u32 = 0,
     pending_resize_valid: bool = false,
+    pending_resize_sequence: u64 = 0,
+    pending_ui_state_sequence: u64 = 0,
+    // Latest layout requested by the frontend, retained even after a resize
+    // was successfully enqueued. A reconnect may discard the old session's
+    // writer queue, so resetSessionState seeds the new attach from this value.
+    desired_resize_rows: u32 = 0,
+    desired_resize_cols: u32 = 0,
     missing_glyph_log_count: u32 = 0,
 
     // Per-flush atlas/callback aggregation (reset at flush start, dumped at flush end).
@@ -593,6 +824,40 @@ pub const Core = struct {
     perf_upload_calls: u32 = 0,
     perf_atlas_create_calls: u32 = 0,
     perf_atlas_create_ns_total: u64 = 0,
+    // Cumulative (never reset per-flush, unlike the counters above) count of
+    // atlas-full resets specifically -- i.e. packAndUploadBitmap's shelf
+    // packer running out of room mid-flush, as opposed to a reset caused by
+    // font/scale change. Incremented unconditionally (cheap integer add) so
+    // it's accurate even if logging is later enabled after resets already
+    // happened; only emitting it in the [perf] atlas line is log-gated.
+    perf_atlas_full_reset_count: u64 = 0,
+    // Runs whose shaping degraded to the per-scalar fallback (no shape callback,
+    // callback failure, or an oversized cluster). A frontend shaper regression
+    // silently drops every non-ASCII run onto that path, so it needs a signal.
+    // Incremented unconditionally; only its [perf] line is log-gated.
+    perf_shape_fallback_runs: u64 = 0,
+    // Bumped by EVERY resetCoreAtlas() call, regardless of why (packer-full
+    // during packAndUploadBitmap, explicit zonvie_core_invalidate_glyph_cache,
+    // onGuifont, DPI/backing-scale change). perf_atlas_full_reset_count only
+    // covers the packer-full case — callers that need to detect "did the
+    // atlas get reset at all" (e.g. runMsgGridScrollFlush's abort check) must
+    // use this instead, or they silently miss the other reset paths.
+    atlas_reset_seq: u64 = 0,
+
+    // Cumulative contention stats for the 5 grid_mu tryLock conversions on
+    // the input path (mode/cursor-visible, cursor position, msg timeout,
+    // note_input_trace, cursor blink). Atomic: these are updated from the
+    // UI thread, including on the busy branch where grid_mu itself is NOT
+    // held, so an unsynchronized field would race against the core thread's
+    // periodic log read below. Read via .load(.monotonic) when emitting the
+    // log line; never reset, so the log shows contention rate since app start.
+    perf_lock_mode_state: LockContentionStat = .{},
+    perf_lock_cursor_pos: LockContentionStat = .{},
+    perf_lock_msg_timeout: LockContentionStat = .{},
+    perf_lock_input_trace: LockContentionStat = .{},
+    perf_lock_cursor_blink: LockContentionStat = .{},
+    perf_lock_viewport: LockContentionStat = .{},
+    perf_lock_layout: LockContentionStat = .{},
     // ensureGlyphPhase2 / ensureGlyphByID wall time, including dispatch
     // overhead, cache check, and the rasterize/upload/pack subset already
     // accounted for above. (atlas_total_ns - rasterize_ns - upload_ns -
@@ -629,6 +894,13 @@ pub const Core = struct {
     // noice.nvim uses 1000/30 = ~33ms throttle by default
     msg_show_pending_since: ?i128 = null, // nanos timestamp when first msg_dirty was set
     msg_show_throttle_ns: i128 = 33 * std.time.ns_per_ms, // 33ms default throttle (matches noice.nvim)
+    // Allocation/render failures are retried by the frontend timer. Keep a
+    // separate deadline so an already-expired throttle does not spin a full
+    // flush at 0-1ms intervals under memory pressure.
+    msg_show_retry_at: ?i128 = null,
+    msg_show_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
+    msg_history_retry_at: ?i128 = null,
+    msg_history_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
 
     // Auto-hide deadlines for ext_float grids (nanos timestamp)
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
@@ -640,9 +912,15 @@ pub const Core = struct {
     msg_cached_max_width: u32 = 0, // Cached max line width for grid sizing
     msg_scroll_pending: bool = false, // Pending scroll update (for throttling)
     msg_scroll_last_send: i128 = 0, // Last vertex send time (nanos)
+    // Allocation-free latency samples for the full message-scroll
+    // transaction (core regeneration + all frontend flush callbacks).
+    msg_scroll_perf_us: [256]u32 = .{0} ** 256,
+    msg_scroll_perf_count: u16 = 0,
+    msg_scroll_perf_aborted: u16 = 0,
 
     // Cached line data for msg_show scrolling (avoids re-parsing on every scroll)
     msg_line_cache: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
+    msg_line_cache_build: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_cache_valid: bool = false,
 
     // Track last executed command for split view label
@@ -669,7 +947,12 @@ pub const Core = struct {
     // ASCII cache: 128 * 4 = 512 entries (codepoint 0-127 × 4 style combinations)
     // Non-ASCII cache: hash table for Unicode chars >= 128
     glyph_cache_ascii_size: u32 = 512, // default: 128 ASCII × 4 styles
-    glyph_cache_non_ascii_size: u32 = 256, // default: 256 entries hash table
+    // Default sized for a full screen of distinct non-ASCII glyphs: a
+    // 53x196 viewport of CJK holds ~5,200, and the 2-way probe needs the
+    // table to stay well under half full to keep them. At 512 the working
+    // set could not fit at all, so every regeneration re-rasterized the
+    // whole screen. ~1.8MB across this and the same-sized by-ID table.
+    glyph_cache_non_ascii_size: u32 = 16384,
 
     // Highlight cache size for flush vertex generation (configurable via [performance] in config.toml)
     hl_cache_size: u32 = 2048, // NOTE: default must match config.zig PerformanceConfig.hl_cache_size
@@ -728,6 +1011,36 @@ pub const Core = struct {
     atlas_h: u32 = 2048,
     atlas_initialized: bool = false,
     atlas_reset_during_flush: bool = false,
+    // At the maximum texture size, permit one same-size repack for a fresh
+    // capacity observation or an armed delayed recovery. A second full
+    // condition in the same transaction is negative-cached to converge.
+    atlas_full_resets_this_flush: u8 = 0,
+    // A blank GlyphEntry was cached because the maximum-size atlas could not
+    // hold it. While that capacity-negative episode is pending, new glyph
+    // misses must remain stable until its scheduled recovery deadline. Do not
+    // reset eagerly from coarse content revisions: cursor movement, color-only
+    // edits, and scrolls would otherwise recreate a maximum atlas every frame.
+    atlas_has_capacity_negative: bool = false,
+    atlas_negative_retry_grid_rev: u64 = 0,
+    atlas_negative_retry_style_rev: u64 = 0,
+    atlas_negative_retry_at: ?i128 = null,
+    atlas_negative_retry_delay_ns: i128 = 250 * std.time.ns_per_ms,
+    atlas_negative_recovery_armed: bool = false,
+    // Rasterizer callback failures are independent from atlas capacity. They
+    // receive a bounded sequence of idle retries so a temporarily busy
+    // frontend recovers, while a permanently unsupported glyph converges.
+    transient_glyph_has_negative: bool = false,
+    transient_glyph_retry_grid_rev: u64 = 0,
+    transient_glyph_retry_style_rev: u64 = 0,
+    transient_glyph_retry_at: ?i128 = null,
+    transient_glyph_retry_delay_ns: i128 = TRANSIENT_GLYPH_RETRY_INITIAL_NS,
+    // Starting delay for the NEXT episode. Persists across episodes and grows
+    // when one exhausts its attempts, so a permanently unrasterizable glyph
+    // cannot be re-probed at the minimum delay forever. Only a genuine success
+    // (finishTransientGlyphRetry) returns it to the initial value.
+    transient_glyph_episode_delay_ns: i128 = TRANSIENT_GLYPH_RETRY_INITIAL_NS,
+    transient_glyph_retry_attempts: u8 = 0,
+    transient_glyph_recovery_armed: bool = false,
 
     // Set to true after successful start(); prevents post-start setter calls
     started: bool = false,
@@ -786,17 +1099,68 @@ pub const Core = struct {
         return @bitCast(self.glow_intensity_bits.load(.acquire));
     }
 
+    pub fn isHardRenderFailure(reason: anyerror) bool {
+        return switch (reason) {
+            error.GridTooLarge,
+            error.TooManySubgrids,
+            error.TooManyWindowPlacements,
+            error.LayoutTooComplex,
+            error.VertexBudgetExceeded,
+            error.MessageTooLarge,
+            error.FrameTooLarge,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Record a fixed rendering/resource violation from any flush driver.
+    /// The RPC loop observes redraw_recovery_failed and terminates this UI
+    /// session instead of retrying state that cannot fit the configured cap.
+    pub fn failHardRender(self: *Core, reason: anyerror) void {
+        self.log.write("render hard failure: {any}\n", .{reason});
+        self.redraw_recovery_failed.store(true, .seq_cst);
+        self.ui_attached.store(false, .seq_cst);
+    }
+
+    /// Wake a FrameReader blocked after an asynchronous frontend hard failure
+    /// without setting stop_flag. The RPC loop must retain ownership of normal
+    /// session cleanup and on_exit delivery.
+    pub fn wakeRpcReaderForHardFailure(self: *Core) void {
+        // Spawn transport: terminating the peer closes its stdout pipe, which
+        // is the only portable way to wake a concurrent blocking pipe read.
+        self.requestChildTermination();
+
+        // Connect transport: no child owns the peer endpoint, so cancel the
+        // local blocking read directly. Keep the Stream published for the RPC
+        // thread's cleanup; shutdown/CancelIoEx do not transfer ownership.
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        defer self.stdin_close_mu.unlock(clock.io());
+        if (self.transport_kind != .socket) return;
+        if (self.stdin_file) |stream| {
+            stream.shutdownIfSocket(true) catch |e| self.log.write(
+                "hard-failure wake: socket shutdown failed: {any} (RPC reader stays blocked)\n",
+                .{e},
+            );
+            switch (stream) {
+                .win_pipe => stream.close(),
+                .file => {},
+            }
+        }
+    }
+
     pub fn setGlowIntensity(self: *Core, val: f32) void {
         self.glow_intensity_bits.store(@bitCast(val), .release);
     }
 
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
+        var grid = Grid.init(alloc);
+        grid.setRowIndexBudgetEnabled(cb.on_vertices_row != null);
         return .{
             .alloc = alloc,
             .cb = cb,
             .ctx = ctx,
             .log = .{ .cb = cb.on_log, .ctx = ctx },
-            .grid = Grid.init(alloc),
+            .grid = grid,
             .hl = Highlights.init(alloc),
         };
     }
@@ -820,16 +1184,35 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        self.flush_dirty_snapshot.deinit(self.alloc);
+        self.flush_row_counts_snapshot.deinit(self.alloc);
+        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
         }
         self.scroll_cache.deinit(self.alloc);
+        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
+        self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.cached_subgrids_buf.deinit(self.alloc);
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.prev_subgrid_snapshots.deinit(self.alloc);
+        self.subgrid_diff_current.deinit(self.alloc);
+        self.subgrid_diff_row_marks.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
+        self.write_spare_queue.deinit(self.alloc);
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
@@ -884,7 +1267,7 @@ pub const Core = struct {
     ///     The new server never sends grid_destroy for grid_ids it does
     ///     not know about, so leftover entries would be rendered as
     ///     stale floats (flush.zig:rebuildMain) and reported as visible
-    ///     by getVisibleGridsLocked (hit-testing).
+    ///     by getVisibleGridsSnapshotLocked (hit-testing).
     ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
     ///     tabline_state / message_state / msg_history_state. The new
     ///     server does not send hide events for overlays it never
@@ -908,7 +1291,6 @@ pub const Core = struct {
     ///     them via grid_resize + grid_line right after attach. The
     ///     frontend's last committed frame keeps the screen visually
     ///     stable in the gap (no flush runs between sessions).
-    ///   - hl table: hl_ids are redefined by hl_attr_define on attach.
     ///   - atlas / glyph caches / shape cache: keyed by content + style
     ///     + font_generation; valid as long as font is unchanged.
     ///   - mode info / cursor shape / cursor_visible: replaced by the
@@ -928,52 +1310,80 @@ pub const Core = struct {
     /// MUST be called only from the RPC thread, after the previous
     /// session's writer thread has been joined and pipes/sockets closed.
     pub fn resetSessionState(self: *Core) void {
-        // UI attachment must be re-issued after reconnect.
-        self.ui_attached.store(false, .seq_cst);
+        self.resetProtocolState(true);
+    }
 
-        // Channel-bound state.
-        self.clipboard_setup_done = false;
+    /// Reset a poisoned redraw attachment without touching the live RPC
+    /// transport or writer queue. Called only after nvim_ui_detach has replied,
+    /// so no event from the old UI epoch can race this reset.
+    pub fn resetRedrawProtocolState(self: *Core) void {
+        self.resetProtocolState(false);
+    }
+
+    fn resetProtocolState(self: *Core, reset_transport: bool) void {
+        // UI attachment must be re-issued after reconnect.
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        self.ui_attached.store(false, .seq_cst);
+        const desired_rows = if (self.desired_resize_rows != 0)
+            self.desired_resize_rows
+        else
+            self.last_layout_rows;
+        const desired_cols = if (self.desired_resize_cols != 0)
+            self.desired_resize_cols
+        else
+            self.last_layout_cols;
+        if (desired_rows != 0 and desired_cols != 0) {
+            self.pending_resize_rows = desired_rows;
+            self.pending_resize_cols = desired_cols;
+            self.pending_resize_valid = true;
+            self.pending_resize_sequence = self.nextPendingUiStateSequenceLocked();
+        }
+        if (reset_transport) {
+            self.pending_focus.store(0, .seq_cst);
+            self.pending_focus_sequence = 0;
+        }
+        self.pending_resize_mu.unlock(clock.io());
 
         // Preedit highlight groups and namespace live in the dead session;
         // re-define them and re-place the extmark on the next composition.
         self.preedit_setup_done.store(false, .monotonic);
         self.preedit_visible.store(false, .monotonic);
 
-        // In-flight RPC IDs from the dead channel — drop tracking so any
-        // stale response from the new server (very unlikely; new msgid
-        // counter starts fresh on the nvim side) does not match.
-        self.get_api_info_msgid = null;
-        self.quit_request_msgid.store(0, .release);
-        self.glow_request_msgid.store(0, .release);
+        if (reset_transport) {
+            // Channel-bound state.
+            self.clipboard_setup_done = false;
+            self.redraw_recovery_state = .healthy;
+            self.redraw_recovery_msgid = 0;
+            self.redraw_recovery_failed.store(false, .seq_cst);
+            self.redraw_recovery_attach_rows = 0;
+            self.redraw_recovery_attach_cols = 0;
+            self.redraw_recovery_attempts = 0;
 
-        // Re-arm the glow startup probe so it queries vim.g.zonvie_glow on
-        // the new server (the user's init.lua may set it again, identically
-        // or differently).
-        self.glow_startup_retries = 30;
+            // In-flight RPC IDs from the dead channel — drop tracking so any
+            // stale response from the new server cannot match.
+            self.get_api_info_msgid = null;
+            self.quit_request_msgid.store(0, .release);
+            self.glow_request_msgid.store(0, .release);
 
-        // Pending focus state from before the reconnect should not leak —
-        // the new server has its own initial focus state.
-        self.pending_focus.store(0, .seq_cst);
+            self.glow_startup_retries = 30;
+            self.ssh_auth_pending.store(false, .seq_cst);
+            self.ssh_auth_done.store(false, .seq_cst);
 
-        // SSH auth flags only apply to spawn-mode SSH sessions; reset so a
-        // future spawn-mode session (re-spawn fallback) starts unauthenticated.
-        self.ssh_auth_pending.store(false, .seq_cst);
-        self.ssh_auth_done.store(false, .seq_cst);
+            // Transport handles are already closed by cleanupSession.
+            self.stdin_close_mu.lockUncancelable(clock.io());
+            self.transport_kind = .pipes;
+            self.stdin_close_mu.unlock(clock.io());
 
-        // Transport handles are cleaned up by the caller (closed and nulled);
-        // here we only flip the kind tag for clarity until the next session
-        // re-assigns it.
-        self.transport_kind = .pipes;
-
-        // Re-arm the writer queue: the previous session's cleanup set
-        // write_queue_closed=true so the writer thread would drain and exit.
-        // Clearing it now allows startWriterThread() to succeed for the
-        // next session.
-        self.write_queue_mu.lockUncancelable(clock.io());
-        self.write_queue_closed = false;
-        self.writer_failed = false;
-        self.write_queue.clearRetainingCapacity();
-        self.write_queue_mu.unlock(clock.io());
+            // Re-arm the writer queue for the next session.
+            self.write_queue_mu.lockUncancelable(clock.io());
+            self.write_queue_closed = false;
+            self.writer_failed = false;
+            self.write_queue.clearRetainingCapacity();
+            self.write_spare_queue.clearRetainingCapacity();
+            self.write_queue_normal_bytes = 0;
+            self.write_queue_ui_state_bytes = 0;
+            self.write_queue_mu.unlock(clock.io());
+        }
 
         // === Grid-protected critical section ===
         //
@@ -1013,10 +1423,12 @@ pub const Core = struct {
                     cb(self.ctx, grid_id_ptr.*);
                 }
             }
-            self.known_external_grids.clearRetainingCapacity();
             self.log.write("resetSessionState: closed {d} external windows from previous session\n", .{closed_count});
         }
-        self.grid.external_grids.clearRetainingCapacity();
+        self.known_external_grids.deinit(self.alloc);
+        self.known_external_grids = .{};
+        self.grid.external_grids.deinit(self.alloc);
+        self.grid.external_grids = .{};
         // ext_windows_grids: grid_id -> win_id mapping. Without clearing,
         // a fresh win_pos for the same grid_id on the new server hits
         // the redraw_handler.zig stale-detection path that re-promotes
@@ -1039,6 +1451,7 @@ pub const Core = struct {
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
         self.grid.resetForNewSession();
+        self.hl.reset();
 
         // Frontend overlay teardown for paths not covered by the external
         // window cleanup above. The cmdline / popupmenu / message external
@@ -1067,6 +1480,12 @@ pub const Core = struct {
         self.pre_cmdline_cursor_grid = 1;
         self.pre_cmdline_cursor_row = 0;
         self.pre_cmdline_cursor_col = 0;
+        self.main_surface_vertex_count = 0;
+        self.main_vertex_row_ledger_valid = false;
+        self.flush_vertex_count_aggregate = 0;
+        self.vertex_budget_transaction_active = false;
+        self.vertex_budget_main_touched = false;
+        self.vertex_budget_touched_grid_head = null;
         self.popupmenu_win_id = null;
         self.popupmenu_buf_id = null;
 
@@ -1074,6 +1493,10 @@ pub const Core = struct {
         // msg_show events; carrying it across would auto-hide the new
         // session's first message at the old deadline.
         self.msg_show_pending_since = null;
+        self.msg_show_retry_at = null;
+        self.msg_history_retry_at = null;
+        self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
+        self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
         self.msg_show_auto_hide_at = null;
         self.msg_history_auto_hide_at = null;
         self.msg_scroll_offset = 0;
@@ -1084,6 +1507,8 @@ pub const Core = struct {
         self.msg_cache_valid = false;
         // MsgCachedLine has only fixed-size buffers (no heap-owned strings).
         self.msg_line_cache.clearRetainingCapacity();
+        self.msg_line_cache_build.clearRetainingCapacity();
+        self.resetAtlasMaintenanceBackoff();
 
         // Last command tracking for the split-view label was a snapshot
         // of the old session's :commands.
@@ -1093,9 +1518,42 @@ pub const Core = struct {
 
         // Subgrid layout snapshot for scroll fast path: stale entries
         // would reference grid_ids the new session has not (yet) created.
-        self.prev_subgrid_snapshot_count = 0;
+        self.prev_subgrid_snapshots.clearRetainingCapacity();
 
-        self.log.write("resetSessionState: cleared session-scoped state\n", .{});
+        // The row buckets describe the previous session's placement maps.
+        // Release their hostile-input high-water capacity together with the
+        // placement maps and force the first new-session row flush to rebuild.
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_offsets = .empty;
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets = .empty;
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_indices = .empty;
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.main_subgrid_row_layout = .empty;
+        self.main_subgrid_row_index_rows = 0;
+        self.main_subgrid_row_index_valid = false;
+        self.main_subgrid_row_index_generation = 0;
+        self.main_subgrid_row_index_cached_len = 0;
+
+        // External-float scratch is bounded during a session, but a hostile
+        // previous peer may have driven it to that high-water mark. Session
+        // changes are cold paths, so release rather than retain these buffers.
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries = .empty;
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_entries = .empty;
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_offsets = .empty;
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets = .empty;
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.ext_float_row_entry_indices = .empty;
+        self.ext_float_anchor_index_valid = false;
+        self.ext_float_row_index_valid = false;
+        self.ext_float_index_generation +%= 1;
+
+        self.log.write("resetProtocolState: cleared UI protocol state (transport_reset={any})\n", .{reset_transport});
     }
 
     /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
@@ -1106,6 +1564,10 @@ pub const Core = struct {
         self.ui_attach_mutex.lockUncancelable(clock.io());
         defer self.ui_attach_mutex.unlock(clock.io());
         if (self.ui_attach_ready) return;
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        self.desired_resize_rows = rows;
+        self.desired_resize_cols = cols;
+        self.pending_resize_mu.unlock(clock.io());
         self.ui_attach_rows = rows;
         self.ui_attach_cols = cols;
         // Pre-set last_layout to suppress a redundant resize after attach.
@@ -1116,7 +1578,122 @@ pub const Core = struct {
         self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
     }
 
+    /// True when synchronous teardown would either join the caller itself or
+    /// wait for an RPC thread which is blocked in a callback on the caller.
+    pub fn isCurrentThreadUnsafeForTeardown(self: *const Core) bool {
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        return log_mod.isInCallback() or
+            self.rpc_thread_id.load(.acquire) == current_tid or
+            self.redraw_thread_id.load(.acquire) == current_tid;
+    }
+
     pub fn stop(self: *Core) void {
+        // A callback running on the RPC/redraw thread cannot synchronously
+        // join its own stack. Request shutdown but leave teardown unclaimed so
+        // a later safe-thread stop/destroy can own it synchronously.
+        if (self.isCurrentThreadUnsafeForTeardown()) {
+            self.requestStopWithoutJoining();
+            return;
+        }
+
+        // Claim teardown ownership.  A concurrent/re-entrant caller must not
+        // wait here: the owner may be joining a thread whose callback made the
+        // re-entrant call.  zonvie_core_destroy uses waitUntilStopped() after
+        // this returns so it still cannot release CoreBox/GPA early.
+        if (self.stop_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
+        self.stopTeardownOwned();
+    }
+
+    /// Best-effort, idempotent shutdown request for callback-thread stop.
+    /// It intentionally does not wait for a mutex: a callback can originate
+    /// while the lifecycle owner holds that mutex and joins this callback's
+    /// worker. Raw resources remain owned until lifecycle-thread teardown.
+    fn requestStopWithoutJoining(self: *Core) void {
+        self.stop_flag.store(true, .seq_cst);
+
+        // std.Io.Condition is atomic and permits signaling without its
+        // associated mutex. The waiter rechecks stop_flag after every wake.
+        self.ui_attach_cond.broadcast(clock.io());
+        self.write_queue_cond.broadcast(clock.io());
+
+        // A writer blocked on a POSIX/Windows spawn pipe owns a copy of the
+        // raw descriptor/HANDLE. Terminate the peer first; never close that
+        // raw resource until a lifecycle-thread teardown has joined writer.
+        // A socket session has no published child, so this is a cheap no-op.
+        // Avoid reading transport_kind outside stdin_close_mu while the RPC
+        // thread may still be publishing a freshly-created transport.
+        self.tryRequestChildTermination();
+
+        // Do not wait behind cleanup/teardown: that owner may be joining the
+        // worker currently executing this callback. If the locks are free,
+        // publish queue closure and cancel socket I/O immediately. Otherwise
+        // the lock owner is already transitioning the same resources.
+        if (self.write_queue_mu.tryLock()) {
+            self.write_queue_closed = true;
+            self.write_queue_cond.broadcast(clock.io());
+            self.write_queue_mu.unlock(clock.io());
+        }
+        if (self.stdin_close_mu.tryLock()) {
+            if (self.stdin_file) |f| {
+                if (self.transport_kind == .socket) {
+                    f.shutdownIfSocket(true) catch |e| self.log.write(
+                        "stop: socket shutdown failed: {any} (reader stays blocked)\n",
+                        .{e},
+                    );
+                    switch (f) {
+                        .win_pipe => f.close(), // CancelIoEx; no HANDLE close.
+                        .file => {},
+                    }
+                }
+            }
+            self.stdin_close_mu.unlock(clock.io());
+        }
+    }
+
+    /// Ask the spawned child to terminate without waiting or releasing its
+    /// process handle. Safe to call before taking stdin_close_mu so it can wake
+    /// another teardown owner which is joining a pipe-blocked writer.
+    pub fn requestChildTermination(self: *Core) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.signalPublishedChildLocked();
+    }
+
+    fn tryRequestChildTermination(self: *Core) void {
+        if (!self.child_handle_mu.tryLock()) return;
+        defer self.child_handle_mu.unlock(clock.io());
+        self.signalPublishedChildLocked();
+    }
+
+    fn signalPublishedChildLocked(self: *Core) void {
+        if (self.child_handle) |child_id| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                _ = std.os.windows.ntdll.NtTerminateProcess(child_id, @enumFromInt(1));
+            } else {
+                const pid: std.posix.pid_t = @intCast(child_id);
+                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            }
+        }
+    }
+
+    /// Publish a newly spawned child for cancellation by stop().
+    pub fn publishChildHandle(self: *Core, child_id: ?std.process.Child.Id) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.child_handle = child_id;
+    }
+
+    /// Withdraw the shared cancellation handle before Child.kill()/wait()
+    /// reaps the PID or closes the Windows process HANDLE.
+    pub fn claimChildHandleForCleanup(self: *Core) void {
+        self.child_handle_mu.lockUncancelable(clock.io());
+        defer self.child_handle_mu.unlock(clock.io());
+        self.child_handle = null;
+    }
+
+    fn stopTeardownOwned(self: *Core) void {
+        defer self.stop_state.store(2, .release);
+
         self.stop_flag.store(true, .seq_cst);
 
         // Unblock RPC thread if it is waiting on ui_attach_cond
@@ -1127,81 +1704,58 @@ pub const Core = struct {
             self.ui_attach_cond.signal(clock.io());
         }
 
-        // Signal writer thread to stop and capture thread handle under lock
-        var wt: ?std.Thread = null;
-        {
-            self.write_queue_mu.lockUncancelable(clock.io());
-            self.write_queue_closed = true;
-            wt = self.writer_thread;
-            self.writer_thread = null;
-            self.write_queue_cond.signal(clock.io());
-            self.write_queue_mu.unlock(clock.io());
-        }
+        // A pipe writer owns a by-value copy of the raw fd/HANDLE. Closing the
+        // Core's copy before join permits fd reuse while that thread is still
+        // inside writeAll(). A published child always belongs to a pipe
+        // session, so signal it without racing on transport_kind before
+        // waiting for transport ownership.
+        self.requestChildTermination();
 
-        // Unblock writer thread's writeAll() if blocked on transport I/O.
-        // Transport-specific semantics of Stream.close():
-        //   - POSIX (.file): closes the fd outright. For socket transport
-        //     (connect mode) stdin_file and stdout_file alias the same fd;
-        //     a second close would close an unrelated fd that the kernel
-        //     may have already recycled, so we null the alias to skip
-        //     cleanupSession's stdout close.
-        //   - Windows named pipe (.win_pipe): calls closeHandles() which
-        //     only fires CancelIoEx — the pipe HANDLE itself stays alive
-        //     until session_pipe.destroy() runs in cleanupSession (after
-        //     all threads holding a Stream value have been joined). We
-        //     still null the stdout alias to keep the cleanupSession path
-        //     symmetric: closeHandles is idempotent under its swap()
-        //     guard, but skipping the duplicate call is clearer.
-        // Serialize with cleanupSession() (rpc_session.zig) to prevent
-        // a race where both threads close the same fd. For POSIX .socket
-        // transport (where stdin/stdout alias the same fd), double-close
-        // causes EBADF signal 6. Whichever thread gets the lock first wins;
-        // the other thread's `if (self.stdin_file)` check then sees null.
-        // Hold stdin_close_mu ONLY across the close-and-null critical
-        // section, NOT across the thread joins below. cleanupSession()
-        // runs on the runLoop thread and also takes this mutex; if stop()
-        // held it while joining that thread (self.thread join below), the
-        // runLoop thread would block on the mutex inside cleanupSession
-        // while stop() blocks on the join — a deadlock that hangs every
-        // teardown. Releasing here preserves the double-close protection
-        // (whoever nulls stdin_file first wins; the other sees null and
-        // skips) without the lock-ordering hazard.
         self.stdin_close_mu.lockUncancelable(clock.io());
-        if (self.stdin_file) |f| {
-            // For POSIX .socket transport (connect mode, where stdin/
-            // stdout alias the same fd) close() alone does not wake
-            // the reader/writer thread blocked on the fd. Issue
-            // shutdown(SHUT_RDWR) first so those threads return EOF /
-            // EPIPE and can be join()ed below; otherwise stop() would
-            // hang waiting on self.thread / writer thread join.
-            f.shutdownIfSocket(self.transport_kind == .socket);
-            f.close();
-            self.stdin_file = null;
-            if (self.transport_kind == .socket) {
-                self.stdout_file = null;
+        const transport_kind = self.transport_kind;
+        // Close the narrow publication race where the RPC thread published a
+        // child after the first signal but before we acquired stdin_close_mu.
+        // This must precede writer join because that writer may be blocked in
+        // the freshly-published child's pipe.
+        self.requestChildTermination();
+        var wt: ?std.Thread = null;
+        self.write_queue_mu.lockUncancelable(clock.io());
+        self.write_queue_closed = true;
+        wt = self.writer_thread;
+        self.writer_thread = null;
+        self.write_queue_cond.signal(clock.io());
+        self.write_queue_mu.unlock(clock.io());
+
+        const stdin = self.stdin_file;
+        const defer_posix_socket_close = if (stdin) |f|
+            transport_kind == .socket and switch (f) {
+                .file => true,
+                .win_pipe => false,
             }
+        else
+            false;
+        self.cancelWriterIo(wt, stdin, transport_kind);
+        if (!defer_posix_socket_close) {
+            if (stdin) |f| f.close();
+            self.stdin_file = null;
+            if (transport_kind == .socket) self.stdout_file = null;
         }
         self.stdin_close_mu.unlock(clock.io());
 
-        // Join writer thread. It exits via:
-        //   - clean shutdown: write_queue_closed observed with empty queue
-        //   - I/O error: POSIX broken-pipe from the stdin close above, or
-        //     OperationAborted from CancelIoEx on the Windows pipe HANDLE
-        if (wt) |t| t.join();
-
-        if (self.child_handle) |_| {
-            // On Windows targets, std.posix.kill is not available.
-            // We rely on closing stdin + the child termination path in runLoop().
-            if (comptime @import("builtin").os.tag != .windows) {
-                // Keep POSIX behavior.
-                // NOTE: Child.Id is pid_t on POSIX.
-                const pid: std.posix.pid_t = @intCast(self.child_handle.?);
-                _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-            }
-        }
-
         if (self.thread) |t| t.join();
         self.thread = null;
+
+        // The POSIX socket fd is also held by the RPC reader. shutdown above
+        // wakes it, but raw close waits until that thread is joined so its
+        // by-value Stream can never observe a recycled descriptor. Normally
+        // cleanupSession already performed this close on the RPC thread.
+        if (defer_posix_socket_close) {
+            self.stdin_close_mu.lockUncancelable(clock.io());
+            if (self.stdin_file) |f| f.close();
+            self.stdin_file = null;
+            self.stdout_file = null;
+            self.stdin_close_mu.unlock(clock.io());
+        }
 
         // Defensive: if a stderr pump is still pointing at Core (e.g., a
         // failure path bypassed cleanupSession), detach it now so its
@@ -1210,6 +1764,7 @@ pub const Core = struct {
         // freed when the pump thread releases its own. Normal flows
         // have cleanupSession already null both fields by this point.
         if (self.stderr_pump) |p| {
+            p.finishCleanupDecision();
             p.detachFromCore();
             p.release();
             self.stderr_pump = null;
@@ -1217,12 +1772,26 @@ pub const Core = struct {
         if (self.stderr_thread) |t2| t2.join();
         self.stderr_thread = null;
 
+        if (self.child_reaper) |reaper| reaper.finishWithoutChild();
+        if (self.child_reaper_thread) |reaper_thread| reaper_thread.join();
+        self.child_reaper_thread = null;
+        if (self.child_reaper) |reaper| reaper.release();
+        self.child_reaper = null;
+
         if (self.stdout_file) |f| f.close();
         if (self.stderr_file) |f| f.close();
         self.stdout_file = null;
         self.stderr_file = null;
 
-        self.child_handle = null;
+        self.claimChildHandleForCleanup();
+
+        // Frontend retry workers serialize with grid mutation through this
+        // mutex. Threads which can originate callbacks have already joined,
+        // so taking it here cannot invert the RPC/grid lock order. stop_flag
+        // was published before the joins, making late retries no-op before
+        // they can observe the resources released below.
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
 
         self.hl.deinit();
         self.grid.deinit();
@@ -1231,16 +1800,35 @@ pub const Core = struct {
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
+        self.flush_dirty_snapshot.deinit(self.alloc);
+        self.flush_row_counts_snapshot.deinit(self.alloc);
+        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
         for (self.scroll_cache.items) |*row_cache| {
             row_cache.deinit(self.alloc);
         }
         self.scroll_cache.deinit(self.alloc);
+        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
+        self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
+        self.ext_float_entries.deinit(self.alloc);
+        self.ext_float_anchor_entries.deinit(self.alloc);
+        self.ext_float_row_offsets.deinit(self.alloc);
+        self.ext_float_row_write_offsets.deinit(self.alloc);
+        self.ext_float_row_entry_indices.deinit(self.alloc);
+        self.cached_subgrids_buf.deinit(self.alloc);
+        self.main_subgrid_row_offsets.deinit(self.alloc);
+        self.main_subgrid_row_write_offsets.deinit(self.alloc);
+        self.main_subgrid_row_indices.deinit(self.alloc);
+        self.main_subgrid_row_layout.deinit(self.alloc);
+        self.prev_subgrid_snapshots.deinit(self.alloc);
+        self.subgrid_diff_current.deinit(self.alloc);
+        self.subgrid_diff_row_marks.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
+        self.write_spare_queue.deinit(self.alloc);
 
         // Free nvim path copy
         if (self.nvim_path_owned) |p| {
@@ -1274,6 +1862,8 @@ pub const Core = struct {
         self.known_external_grids = .{};
         self.msg_line_cache.deinit(self.alloc);
         self.msg_line_cache = .empty;
+        self.msg_line_cache_build.deinit(self.alloc);
+        self.msg_line_cache_build = .empty;
         self.msg_config.deinit();
         self.msg_config = .{};
 
@@ -1282,11 +1872,27 @@ pub const Core = struct {
         self.deinitGlyphCache();
     }
 
+    /// Wait until the single stop() owner has released every Core-owned
+    /// allocation.  Only destruction needs this synchronization; ordinary
+    /// duplicate stop calls remain non-blocking to avoid callback/join cycles.
+    pub fn waitUntilStopped(self: *Core) bool {
+        if (self.isCurrentThreadUnsafeForTeardown()) return false;
+        while (true) {
+            switch (self.stop_state.load(.acquire)) {
+                2 => return true,
+                else => {},
+            }
+            std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+        }
+    }
+
     /// Ensure scroll_cache has exactly `target_rows` entries.
     /// Grows or shrinks the per-row vertex lists as needed.
     pub fn ensureScrollCache(self: *Core, target_rows: u32) !void {
         const cur = self.scroll_cache_rows;
-        if (cur == target_rows and self.scroll_cache.items.len == target_rows) return;
+        if (cur == target_rows and
+            self.scroll_cache.items.len == target_rows and
+            self.main_vertex_row_counts.items.len == target_rows) return;
 
         // Shrink: deinit excess row buffers
         if (self.scroll_cache.items.len > target_rows) {
@@ -1299,6 +1905,23 @@ pub const Core = struct {
         // Grow: append empty row buffers
         while (self.scroll_cache.items.len < target_rows) {
             try self.scroll_cache.append(self.alloc, .empty);
+        }
+
+        const old_count_len = self.main_vertex_row_counts.items.len;
+        try self.main_vertex_row_counts.ensureTotalCapacity(self.alloc, target_rows);
+        self.main_vertex_row_counts.items.len = target_rows;
+        if (target_rows > old_count_len) {
+            @memset(self.main_vertex_row_counts.items[old_count_len..], 0);
+        } else if (target_rows < old_count_len and self.main_vertex_row_ledger_valid) {
+            // resize() has already shortened the slice; recompute only on a
+            // structural shrink, never on the per-row hot path.
+            const old_surface_vertex_count = self.main_surface_vertex_count;
+            self.main_surface_vertex_count = 0;
+            for (self.main_vertex_row_counts.items) |count| {
+                self.main_surface_vertex_count +|= count;
+            }
+            self.flush_vertex_count_aggregate -|=
+                old_surface_vertex_count -| self.main_surface_vertex_count;
         }
 
         // Resize the valid bitset
@@ -1325,9 +1948,13 @@ pub const Core = struct {
             self.scroll_cache_valid.unsetAll();
         }
         self.scroll_cache_rows = 0;
+        self.main_vertex_row_counts.clearRetainingCapacity();
+        self.flush_vertex_count_aggregate -|= self.main_surface_vertex_count;
+        self.main_surface_vertex_count = 0;
+        self.main_vertex_row_ledger_valid = true;
 
         // Reset subgrid snapshot so the next flush treats all subgrids as new.
-        self.prev_subgrid_snapshot_count = 0;
+        self.prev_subgrid_snapshots.clearRetainingCapacity();
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)
@@ -1369,6 +1996,14 @@ pub const Core = struct {
     pub fn initGlyphCache(self: *Core) !void {
         if (self.glyph_cache_initialized) return;
 
+        // Partial failure must not leak: the row-mode flush retries this on
+        // EVERY flush with the error swallowed, and each retry's `try alloc`
+        // would overwrite the still-live pointers from the previous partial
+        // attempt — unbounded growth exactly when memory is already scarce.
+        // deinitGlyphCache frees-and-nulls every field, so it is a safe
+        // rollback for any prefix of the allocations below.
+        errdefer self.deinitGlyphCache();
+
         const ascii_size = self.glyph_cache_ascii_size;
         const non_ascii_size = self.glyph_cache_non_ascii_size;
 
@@ -1380,7 +2015,7 @@ pub const Core = struct {
         // Initialize valid flags to false
         @memset(self.glyph_valid_ascii.?, false);
         // Initialize keys to invalid sentinel
-        const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
+        const INVALID_KEY = GLYPH_CACHE_INVALID_KEY;
         @memset(self.glyph_keys_non_ascii.?, INVALID_KEY);
 
         // Phase B: glyph-ID cache (same size as non-ASCII cache)
@@ -1432,6 +2067,7 @@ pub const Core = struct {
     /// Called once after font change. No-op if callback is not registered.
     /// Returns true if tables were loaded (or already valid).
     pub fn loadAsciiTables(self: *Core) bool {
+        if (self.flush_aborted) return false;
         if (self.ascii_tables_valid) return true;
         const cb = self.cb.on_get_ascii_table orelse return false;
 
@@ -1449,14 +2085,18 @@ pub const Core = struct {
                 &self.ascii_lig_triggers[i],
             );
             if (ok == 0) all_ok = false;
+            if (self.flush_aborted) {
+                all_ok = false;
+                break;
+            }
         }
 
         const t1: i128 = if (log_active) clock.nowNs() else 0;
 
-        self.ascii_tables_valid = all_ok;
         if (all_ok) {
-            self.preRasterizeAscii();
+            all_ok = self.preRasterizeAscii();
         }
+        self.ascii_tables_valid = all_ok;
 
         if (log_active) {
             const t2 = clock.nowNs();
@@ -1522,45 +2162,420 @@ pub const Core = struct {
             self.cb.on_atlas_create != null;
     }
 
-    /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
-    /// Handles whitespace, oversized glyphs, atlas-full reset, UV computation.
-    /// Returns null only if the glyph cannot fit even after atlas reset.
-    fn packAndUploadBitmap(self: *Core, bm: *const c_api.GlyphBitmap) ?c_api.GlyphEntry {
-        // Whitespace / zero-size glyph → return entry with zero UVs
-        if (bm.width == 0 or bm.height == 0) {
-            const adv: f32 = @as(f32, @floatFromInt(bm.advance_26_6)) / 64.0;
-            return c_api.GlyphEntry{
-                .uv_min = .{ 0, 0 },
-                .uv_max = .{ 0, 0 },
-                .bbox_origin_px = .{ 0, 0 },
-                .bbox_size_px = .{ 0, 0 },
-                .advance_px = adv,
-                .ascent_px = bm.ascent_px,
-                .descent_px = bm.descent_px,
-                .bytes_per_pixel = bm.bytes_per_pixel,
-            };
+    fn recordAtlasCapacityNegative(self: *Core) void {
+        if (!self.atlas_has_capacity_negative) {
+            if (self.atlas_negative_recovery_armed) {
+                // The delayed reprobe still could not fit the visible working
+                // set. Do not poll an unchanged impossible set; retain a larger
+                // delay for the next genuine working-set/style change.
+                self.atlas_negative_retry_delay_ns = @min(
+                    self.atlas_negative_retry_delay_ns * 2,
+                    30 * std.time.ns_per_s,
+                );
+                self.atlas_negative_recovery_armed = false;
+            }
+            self.atlas_negative_retry_at = null;
+            self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+        }
+        self.atlas_has_capacity_negative = true;
+    }
+
+    fn retryDeadline(now: i128, delay_ns: i128) i128 {
+        return std.math.add(i128, now, delay_ns) catch std.math.maxInt(i128);
+    }
+
+    fn transientGlyphWorkingSetChanged(self: *const Core) bool {
+        return self.transient_glyph_retry_grid_rev != self.grid.glyph_working_set_rev or
+            self.transient_glyph_retry_style_rev != self.hl.glyph_style_rev;
+    }
+
+    fn resetTransientGlyphRetryBackoff(self: *Core) void {
+        self.transient_glyph_has_negative = false;
+        self.transient_glyph_retry_at = null;
+        self.transient_glyph_retry_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_episode_delay_ns = TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+        self.transient_glyph_retry_attempts = 0;
+        self.transient_glyph_recovery_armed = false;
+        self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+    }
+
+    /// Restart after an exhausted episode. Unlike the full reset above, this
+    /// keeps escalating the starting delay. `glyph_working_set_rev` is bumped
+    /// by putCell for every changed cell, so "the working set changed" is in
+    /// practice "the user typed": restarting at the minimum delay each time
+    /// would force a full-screen regeneration (beginNegativeGlyphReprobe
+    /// markAllDirty's every grid and blocks the scroll fast path) roughly
+    /// every 1.5s for as long as one on-screen codepoint stays unrasterizable.
+    ///
+    /// Two known residuals, both accepted rather than solved here:
+    /// 1. The delay saturates at TRANSIENT_GLYPH_RETRY_MAX_NS (4s), so a
+    ///    permanently unrasterizable on-screen codepoint still costs a
+    ///    whole-grid invalidation every 4s while the user types. The
+    ///    atlas-capacity sibling this otherwise resembles caps at 30s, but
+    ///    raising this cap to match would worsen residual 2.
+    /// 2. The delay is per-Core, not per-glyph. While one impossible glyph is
+    ///    outstanding, a genuinely transient miss on an unrelated glyph
+    ///    inherits the escalated delay instead of starting at 250ms, so its
+    ///    cell can stay blank for up to 4s. Fixing this properly needs an
+    ///    identity for the failing-glyph set; there is no cheap one today
+    ///    (the negative entries live scattered across the three glyph caches,
+    ///    see invalidateNegativeGlyphCacheEntries).
+    fn restartTransientGlyphRetryEpisode(self: *Core, now: i128) void {
+        self.transient_glyph_episode_delay_ns = @min(
+            self.transient_glyph_episode_delay_ns * 2,
+            TRANSIENT_GLYPH_RETRY_MAX_NS,
+        );
+        self.transient_glyph_recovery_armed = false;
+        // startTransientGlyphRetryEpisode sets attempts = 1; no reset needed.
+        self.startTransientGlyphRetryEpisode(now);
+    }
+
+    fn startTransientGlyphRetryEpisode(self: *Core, now: i128) void {
+        self.transient_glyph_has_negative = true;
+        self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+        self.transient_glyph_retry_delay_ns = self.transient_glyph_episode_delay_ns;
+        self.transient_glyph_retry_attempts = 1;
+        self.transient_glyph_retry_at = retryDeadline(now, self.transient_glyph_retry_delay_ns);
+    }
+
+    /// Record a rasterizer miss that may be transient (for example while the
+    /// frontend is temporarily unable to produce the glyph). The callback ABI
+    /// reports both unsupported glyphs and temporary busy states as zero, so a
+    /// finite exponential sequence recovers the latter without polling the
+    /// former forever. Capacity misses have separate state: neither retry
+    /// budget can suppress the other.
+    pub fn recordTransientGlyphNegativeAt(self: *Core, now: i128) void {
+        if (self.transient_glyph_recovery_armed) {
+            self.transient_glyph_recovery_armed = false;
+            self.transient_glyph_has_negative = true;
+            self.transient_glyph_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.transient_glyph_retry_style_rev = self.hl.glyph_style_rev;
+
+            // The fifth delayed reprobe is the bounded final attempt. Leave
+            // the blank cached with no timer until a genuinely different
+            // working set encounters another rasterizer miss.
+            if (self.transient_glyph_retry_attempts >= TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS) {
+                self.transient_glyph_retry_at = null;
+                return;
+            }
+
+            self.transient_glyph_retry_delay_ns = @min(
+                self.transient_glyph_retry_delay_ns * 2,
+                TRANSIENT_GLYPH_RETRY_MAX_NS,
+            );
+            self.transient_glyph_retry_attempts += 1;
+            self.transient_glyph_retry_at = retryDeadline(now, self.transient_glyph_retry_delay_ns);
+            return;
         }
 
-        // Reject glyphs larger than the atlas (can never fit)
+        if (self.transient_glyph_has_negative) {
+            // Before an armed deadline, additional misses belong to the same
+            // transaction and must not push it out. After the bounded final
+            // failure, only a new working set starts a fresh retry budget --
+            // at an escalated starting delay, since the set changes on every
+            // edit.
+            if (self.transient_glyph_retry_at != null or
+                !self.transientGlyphWorkingSetChanged()) return;
+            self.restartTransientGlyphRetryEpisode(now);
+            return;
+        }
+
+        self.startTransientGlyphRetryEpisode(now);
+    }
+
+    pub fn recordTransientGlyphNegative(self: *Core) void {
+        self.recordTransientGlyphNegativeAt(clock.nowNs());
+    }
+
+    fn invalidateNegativeGlyphCacheEntries(self: *Core) void {
+        if (self.glyph_cache_ascii) |cache| {
+            if (self.glyph_valid_ascii) |valid| {
+                const len = @min(cache.len, valid.len);
+                for (cache[0..len], valid[0..len]) |entry, *is_valid| {
+                    if (is_valid.* and (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0)) {
+                        is_valid.* = false;
+                    }
+                }
+            }
+        }
+        if (self.glyph_cache_non_ascii) |cache| {
+            if (self.glyph_keys_non_ascii) |keys| {
+                const len = @min(cache.len, keys.len);
+                for (cache[0..len], keys[0..len]) |entry, *key| {
+                    if (key.* != GLYPH_CACHE_INVALID_KEY and
+                        (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0))
+                    {
+                        key.* = GLYPH_CACHE_INVALID_KEY;
+                    }
+                }
+            }
+        }
+        if (self.glyph_cache_by_id) |cache| {
+            if (self.glyph_keys_by_id) |keys| {
+                const len = @min(cache.len, keys.len);
+                for (cache[0..len], keys[0..len]) |entry, *key| {
+                    if (key.* != GLYPH_CACHE_INVALID_KEY and
+                        (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0))
+                    {
+                        key.* = GLYPH_CACHE_INVALID_KEY;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn resetAtlasCapacityRetryBackoff(self: *Core) void {
+        self.atlas_has_capacity_negative = false;
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+        self.atlas_negative_recovery_armed = false;
+        self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+        self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+    }
+
+    pub fn resetAtlasMaintenanceBackoff(self: *Core) void {
+        self.resetAtlasCapacityRetryBackoff();
+        self.resetTransientGlyphRetryBackoff();
+    }
+
+    /// Complete a reprobe after every frontend consumer accepted the flush.
+    /// Absence of a renewed capacity-negative means the old missing glyph left
+    /// the visible set (or the repack succeeded), so future episodes start at
+    /// the minimum delay.
+    pub fn finishAtlasCapacityRetry(self: *Core) void {
+        if (!self.atlas_negative_recovery_armed or self.atlas_has_capacity_negative) return;
+        self.atlas_negative_recovery_armed = false;
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+    }
+
+    fn finishTransientGlyphRetry(self: *Core) void {
+        if (!self.transient_glyph_recovery_armed or self.transient_glyph_has_negative) return;
+        self.resetTransientGlyphRetryBackoff();
+    }
+
+    pub fn finishAtlasMaintenance(self: *Core) void {
+        self.finishAtlasCapacityRetry();
+        self.finishTransientGlyphRetry();
+    }
+
+    fn beginNegativeGlyphReprobe(self: *Core) void {
+        self.invalidateNegativeGlyphCacheEntries();
+        self.invalidateScrollCache();
+        self.grid.markAllDirty();
+        self.grid.scroll_fast_path_blocked = true;
+        var sg_it = self.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| {
+            sg.markAllDirty();
+            sg.scroll_fast_path_blocked = true;
+        }
+        self.grid.cursor_rev +%= 1;
+    }
+
+    /// Schedule/execute a selective retry for cached capacity misses. One real
+    /// working-set or glyph-style change arms an absolute deadline, allowing the
+    /// existing frontend one-shot timer to drive a reprobe even when Neovim is
+    /// otherwise idle. An unchanged impossible set has no deadline and therefore
+    /// causes no atlas churn.
+    fn armAtlasCapacityRetryAt(self: *Core, now: i128) bool {
+        if (!self.atlas_has_capacity_negative) {
+            return false;
+        }
+
+        if (self.atlas_negative_retry_grid_rev != self.grid.glyph_working_set_rev or
+            self.atlas_negative_retry_style_rev != self.hl.glyph_style_rev)
+        {
+            self.atlas_negative_retry_grid_rev = self.grid.glyph_working_set_rev;
+            self.atlas_negative_retry_style_rev = self.hl.glyph_style_rev;
+            if (self.atlas_negative_retry_at == null) {
+                self.atlas_negative_retry_at = retryDeadline(now, self.atlas_negative_retry_delay_ns);
+            }
+        }
+
+        const retry_at = self.atlas_negative_retry_at orelse return false;
+        if (now < retry_at) return false;
+
+        self.atlas_negative_retry_at = null;
+        self.atlas_negative_recovery_armed = true;
+        // Start a fresh observation window. markAllDirty below guarantees that
+        // every visible invalidated negative is reprobed. If none recur, the
+        // old missing glyph left the working set and the next flush can retire
+        // the episode instead of forcing another full redraw on every edit.
+        self.atlas_has_capacity_negative = false;
+        return true;
+    }
+
+    pub fn prepareAtlasCapacityRetryAt(self: *Core, now: i128) bool {
+        if (!self.armAtlasCapacityRetryAt(now)) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasCapacityRetry(self: *Core) bool {
+        return self.prepareAtlasCapacityRetryAt(clock.nowNs());
+    }
+
+    fn armTransientGlyphRetryAt(self: *Core, now: i128) bool {
+        if (!self.transient_glyph_has_negative) return false;
+        if (self.transient_glyph_retry_at == null and
+            self.transient_glyph_retry_attempts >= TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS and
+            self.transientGlyphWorkingSetChanged())
+        {
+            // Exhausted blanks are still cached, so a changed working set may
+            // never call the rasterizer and cannot rely on record...() to
+            // restart the budget. Schedule the fresh episode here.
+            self.restartTransientGlyphRetryEpisode(now);
+        }
+        const retry_at = self.transient_glyph_retry_at orelse return false;
+        if (now < retry_at) return false;
+
+        self.transient_glyph_retry_at = null;
+        self.transient_glyph_recovery_armed = true;
+        self.transient_glyph_has_negative = false;
+        return true;
+    }
+
+    pub fn prepareTransientGlyphRetryAt(self: *Core, now: i128) bool {
+        if (!self.armTransientGlyphRetryAt(now)) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasMaintenanceAt(self: *Core, now: i128) bool {
+        const capacity_due = self.armAtlasCapacityRetryAt(now);
+        const transient_due = self.armTransientGlyphRetryAt(now);
+        if (!capacity_due and !transient_due) return false;
+        self.beginNegativeGlyphReprobe();
+        return true;
+    }
+
+    pub fn prepareAtlasMaintenance(self: *Core) bool {
+        return self.prepareAtlasMaintenanceAt(clock.nowNs());
+    }
+
+    /// Restore a due reprobe after a frontend consumer rejected the flush.
+    /// The attempt did not complete, so neither retry budget is consumed.
+    pub fn rearmAtlasMaintenanceAfterAbort(self: *Core, retry_at: i128) void {
+        if (self.atlas_negative_recovery_armed and self.atlas_negative_retry_at == null) {
+            self.atlas_negative_recovery_armed = false;
+            self.atlas_has_capacity_negative = true;
+            self.atlas_negative_retry_at = retry_at;
+        }
+        if (self.transient_glyph_recovery_armed and self.transient_glyph_retry_at == null) {
+            self.transient_glyph_recovery_armed = false;
+            self.transient_glyph_has_negative = true;
+            self.transient_glyph_retry_at = retry_at;
+        }
+    }
+
+    fn blankGlyphEntry(bitmap: *const c_api.GlyphBitmap) c_api.GlyphEntry {
+        const adv: f32 = @as(f32, @floatFromInt(bitmap.advance_26_6)) / 64.0;
+        return c_api.GlyphEntry{
+            .uv_min = .{ 0, 0 },
+            .uv_max = .{ 0, 0 },
+            .bbox_origin_px = .{ 0, 0 },
+            .bbox_size_px = .{ 0, 0 },
+            .advance_px = adv,
+            .ascent_px = bitmap.ascent_px,
+            .descent_px = bitmap.descent_px,
+            .bytes_per_pixel = bitmap.bytes_per_pixel,
+        };
+    }
+
+    /// Common helper: pack a rasterized bitmap into the atlas, upload, and build a GlyphEntry.
+    /// Handles whitespace, oversized glyphs, bounded atlas growth, UV computation.
+    /// A glyph that cannot fit at the maximum atlas size returns a zero-bbox
+    /// entry so callers can negative-cache it instead of forcing a full-screen
+    /// retry on every flush.
+    fn packAndUploadBitmap(self: *Core, bm: *const c_api.GlyphBitmap) ?c_api.GlyphEntry {
+        // Whitespace / zero-size glyph → return entry with zero UVs.
+        if (bm.width == 0 or bm.height == 0) {
+            return blankGlyphEntry(bm);
+        }
+
         const pad2 = self.atlas_packer.?.padding * 2;
-        if (bm.width + pad2 > self.atlas_w or bm.height + pad2 > self.atlas_h) {
-            return null;
+        // Dimensions cross the C ABI and are therefore hostile input. Check
+        // every addition before ShelfPacker.alloc performs the same arithmetic
+        // with ordinary u32 operators. An unrepresentable bitmap can never fit
+        // a frontend texture, so it is a stable blank rather than an upload.
+        const packed_w = std.math.add(u32, bm.width, pad2) catch return blankGlyphEntry(bm);
+        const packed_h = std.math.add(u32, bm.height, pad2) catch return blankGlyphEntry(bm);
+        const packed_h_with_border = std.math.add(u32, packed_h, 1) catch return blankGlyphEntry(bm);
+
+        // Grow before packing when a single glyph cannot fit the current
+        // texture. Growth invalidates every old UV, exactly like a reset.
+        while ((packed_w > self.atlas_w or packed_h_with_border > self.atlas_h) and
+            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
+        {
+            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
+            self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
+            self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
+        }
+
+        // Still oversized at the frontend-supported maximum: preserve the
+        // existing texture and cache a permanent miss for this atlas/font
+        // generation.
+        if (packed_w > self.atlas_w or packed_h_with_border > self.atlas_h) {
+            return blankGlyphEntry(bm);
         }
 
         const log_on = self.log.cb != null;
 
-        // Try to pack
+        // Try to pack.
         var packer = &(self.atlas_packer.?);
         const t_pack: i128 = if (log_on) clock.nowNs() else 0;
+        var alloc_reset_seq = self.atlas_reset_seq;
         var rect = packer.alloc(bm.width, bm.height);
 
-        // Atlas full → reset and retry once.
-        if (rect == null) {
-            self.atlas_reset_during_flush = true;
-            self.resetCoreAtlas();
-            packer = &(self.atlas_packer.?);
+        // Fallback for a flush that exhausts the atlas despite the
+        // start-of-flush collection: reclaim what earlier flushes left behind.
+        // Shelves this flush already filled are protected by the epoch, so the
+        // rows it has composed keep their UVs.
+        if (rect == null and self.collectAtlasGarbage()) {
             rect = packer.alloc(bm.width, bm.height);
-            if (rect == null) return null;
+        }
+
+        // A full atlas grows geometrically up to the configured/frontend-safe
+        // maximum. At the maximum, permit one same-size reset for a fresh
+        // capacity observation or an armed delayed recovery. Once a capacity
+        // miss is negative-cached, ordinary flushes must wait for that
+        // episode's deadline instead of recreating the texture for every new
+        // glyph edit. If an allowed repack also fills, subsequent misses in
+        // this flush become negative entries and the row retry converges.
+        if (rect == null and
+            (self.atlas_w < config.atlas_size_max or self.atlas_h < config.atlas_size_max))
+        {
+            self.atlas_w = @min(config.atlas_size_max, self.atlas_w *| 2);
+            self.atlas_h = @min(config.atlas_size_max, self.atlas_h *| 2);
+            self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
+            self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
+            packer = &(self.atlas_packer.?);
+            alloc_reset_seq = self.atlas_reset_seq;
+            rect = packer.alloc(bm.width, bm.height);
+        } else if (rect == null and
+            self.atlas_full_resets_this_flush == 0 and
+            (!self.atlas_has_capacity_negative or self.atlas_negative_recovery_armed))
+        {
+            self.atlas_full_resets_this_flush = 1;
+            self.atlas_reset_during_flush = true;
+            self.perf_atlas_full_reset_count +%= 1;
+            self.resetCoreAtlas();
+            if (self.flush_aborted) return null;
+            packer = &(self.atlas_packer.?);
+            alloc_reset_seq = self.atlas_reset_seq;
+            rect = packer.alloc(bm.width, bm.height);
+        }
+        if (rect == null) {
+            self.recordAtlasCapacityNegative();
+            return blankGlyphEntry(bm);
         }
         if (log_on) {
             const dt: u64 = @intCast(@max(0, clock.nowNs() - t_pack));
@@ -1578,6 +2593,29 @@ pub const Core = struct {
                 self.perf_upload_ns_total +%= dt;
                 self.perf_upload_calls +%= 1;
             }
+        }
+
+        // on_atlas_upload's C ABI is void, so a frontend that discovers the
+        // upload didn't actually land (e.g. macOS GlyphAtlas dropping it on
+        // a reader-gate timeout or a failed pending blit) has no return
+        // value to report that through -- it signals failure by calling
+        // zonvie_core_abort_flush (and zonvie_core_invalidate_glyph_cache)
+        // synchronously from inside the callback above instead. Checking
+        // flush_aborted here and returning null (skipping the UV
+        // computation and GlyphEntry below) is what actually stops the
+        // caller from re-caching a bad entry: the cache invalidation the
+        // callback already did happens BEFORE this point, so without this
+        // check the entry built below would be written right back into the
+        // just-cleared glyph_cache_by_id/glyph_cache_non_ascii, undoing it.
+        if (self.flush_aborted or self.atlas_reset_seq != alloc_reset_seq) {
+            // A rejected upload did not consume texture space. Restore the
+            // shelf cursor only while it still names the same atlas generation;
+            // an invalidate callback may already have replaced the packer.
+            if (self.atlas_reset_seq == alloc_reset_seq and self.atlas_packer != null) {
+                self.atlas_packer.?.undoLastAlloc();
+            }
+            if (self.atlas_reset_seq != alloc_reset_seq) self.flush_aborted = true;
+            return null;
         }
 
         // Compute UVs (excluding padding)
@@ -1602,8 +2640,273 @@ pub const Core = struct {
         };
     }
 
+    /// Mark the shelf a vertex's UV points into as still referenced. One lookup
+    /// per vertex covers both edges of the quad: the six vertices carry
+    /// uv_min[1] and uv_max[1] between them, so a glyph whose lower edge lands
+    /// on the next shelf's first row is marked by its own bottom vertices.
+    fn markShelfLiveForUv(
+        packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
+        live: *[shelf_packer.max_shelves]bool,
+        uv_y: f32,
+    ) void {
+        if (uv_y <= 0 or uv_y > 1) return;
+        const h_f: f32 = @floatFromInt(packer.height);
+        const y_f = uv_y * h_f;
+        if (y_f < 0) return;
+        const y: u32 = @intFromFloat(@min(y_f, h_f - 1));
+        if (packer.shelfIndexForYOrdered(order, y)) |idx| live[idx] = true;
+    }
+
+    /// True when every main-grid row the frontend is currently showing is
+    /// either mirrored in scroll_cache (so its atlas references are readable
+    /// here) or already dirty (so this flush regenerates it before publishing).
+    /// Without this, a retained row whose vertices the core cannot inspect
+    /// could keep a glyph that garbage collection would recycle underneath it.
+    fn mainRowsAccountedForCollect(self: *Core) bool {
+        const rows = self.scroll_cache_rows;
+        if (rows == 0 or rows != self.grid.rows) return false;
+        if (self.scroll_cache.items.len < rows) return false;
+        if (self.scroll_cache_valid.bit_length < rows) return false;
+        if (self.grid.dirty_all) return true;
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            if (self.scroll_cache_valid.isSet(r)) continue;
+            if (r < self.grid.dirty_rows.bit_length and self.grid.dirty_rows.isSet(r)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    /// Reclaim atlas shelves that nothing on screen references any more.
+    ///
+    /// The high-cardinality case this exists for is a full-width CJK buffer:
+    /// every entering row brings a screenful-fraction of never-seen glyphs, so
+    /// a bump-only atlas fills within seconds and the only previous recovery
+    /// was a full reset — which clears every glyph cache, forces a whole
+    /// viewport rebuild, and refills the atlas immediately, i.e. it spirals.
+    ///
+    /// Liveness comes from the vertices the frontend is actually holding
+    /// (scroll_cache mirrors the retained main rows; cursor_verts mirrors the
+    /// cursor layer), never from glyph-cache reachability — a cache entry can
+    /// be displaced by a hash collision while its glyph stays on screen, so
+    /// "no cache entry points here" does not mean "nothing draws this".
+    ///
+    /// Returns true when at least one shelf became reusable.
+    /// Reclaim atlas space before this flush generates anything, while
+    /// scroll_cache still mirrors exactly what the frontend is showing.
+    ///
+    /// Collecting mid-generation instead was actively harmful: the rows this
+    /// flush had already recomposed were not in scroll_cache yet, so the
+    /// glyphs it had just packed looked unreferenced, were reclaimed, and had
+    /// to be rasterized all over again on the next pass — the atlas never held
+    /// a screenful for longer than one flush.
+    /// Keep a copy of a row the scroll fast path is about to drop from the
+    /// cache, so reclamation still counts the glyphs a frontend-retained copy
+    /// of that row may keep drawing. Failing to copy costs reclamation accuracy
+    /// only, never the scroll, so it is not reported to the caller.
+    pub fn captureRetainedShadow(self: *Core, verts: []const c_api.Vertex) void {
+        if (verts.len == 0) return;
+        const slot = self.retained_shadow_next % self.retained_shadow.len;
+        const buf = &self.retained_shadow[slot];
+        buf.clearRetainingCapacity();
+        buf.ensureTotalCapacity(self.alloc, verts.len) catch {
+            self.retained_shadow_age[slot] = retained_shadow_expiry;
+            return;
+        };
+        buf.appendSliceAssumeCapacity(verts);
+        self.retained_shadow_age[slot] = 0;
+        self.retained_shadow_next = (slot + 1) % self.retained_shadow.len;
+    }
+
+    fn ageRetainedShadows(self: *Core) void {
+        for (&self.retained_shadow_age, &self.retained_shadow) |*age, *buf| {
+            if (age.* >= retained_shadow_expiry) continue;
+            age.* += 1;
+            if (age.* >= retained_shadow_expiry) buf.clearRetainingCapacity();
+        }
+    }
+
+    pub fn collectAtlasGarbageIfNeeded(self: *Core) void {
+        self.ageRetainedShadows();
+        if (self.atlas_packer == null) return;
+        const packer = &(self.atlas_packer.?);
+        const total: u64 = @as(u64, packer.width) * packer.height;
+        if (total == 0) return;
+        // free/total < 1/64: collect up front only when the atlas is close
+        // enough to exhaustion that this flush would otherwise hit the reset
+        // path mid-generation. The multiplier is the reciprocal of that
+        // fraction, so the two move together.
+        //
+        // A collection is not cheap: it walks every glyph vertex on screen and
+        // both 16384-entry glyph tables. Raising the trigger to 1/8 — which an
+        // earlier version of this comment described, against a constant that
+        // has always meant 1/64 — costs more than it saves. Measured on
+        // test/perf/test_60fps.py, Release, against this same tree: p50
+        // 2.09/2.12ms -> 2.53/2.85ms, p95 6.29/6.96ms -> 10.68/12.28ms,
+        // on-glass slips 0.169/0.252/s -> 0.422/1.014/s, with no improvement
+        // in p99. Ordinary pressure is handled by the collection inside
+        // packAndUploadBitmap, which reclaims exactly as much as the flush
+        // needs instead of dropping cache entries it is about to want back.
+        if (packer.freeAreaPx() * 64 < total) _ = self.collectAtlasGarbage();
+        // Everything packed from here on belongs to this flush and stays
+        // off-limits to the mid-flush collection.
+        if (self.atlas_packer) |*p| p.beginEpoch();
+    }
+
+    fn collectAtlasGarbage(self: *Core) bool {
+        const log_on = self.log.cb != null;
+        if (!self.isPhase2Atlas()) return false;
+        if (self.atlas_packer == null) return false;
+        // A grid the frontend owns a surface for (external window, float,
+        // popupmenu) retains its own rows, and this core keeps no vertex mirror
+        // of them. Keyed on the ownership map itself rather than on its
+        // intersection with sub_grids: a grid can lose its GridBuf while the
+        // surface is still on screen, and intersecting missed exactly that
+        // window. Grids only composited into the main grid are covered by the
+        // main-row scan below.
+        if (self.known_external_grids.count() > 0) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=external_grid count={d}\n",
+                .{self.known_external_grids.count()},
+            );
+            return false;
+        }
+        if (self.display_mirror_stale) {
+            if (log_on) self.log.write("[perf] atlas_gc skip=display_mirror_stale\n", .{});
+            return false;
+        }
+        if (!self.mainRowsAccountedForCollect()) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=rows scroll_cache_rows={d} grid_rows={d} dirty_all={any}\n",
+                .{ self.scroll_cache_rows, self.grid.rows, self.grid.dirty_all },
+            );
+            return false;
+        }
+
+        const packer = &(self.atlas_packer.?);
+        // Overflow means some bands were never recorded, not that the recorded
+        // ones are unsafe to reclaim: an unrecorded band resolves to no shelf
+        // index, so it marks nothing live (markShelfLiveForUv) and is never
+        // dropped from the cache (entryLivesInDeadShelf), and
+        // recycleDeadShelves only touches recorded shelves. Disqualifying the
+        // whole collection here instead left reclamation off for the rest of
+        // the session after a single overflow, because this is the only path
+        // that can free tracking slots.
+        if (packer.shelf_count == 0) {
+            if (log_on) self.log.write(
+                "[perf] atlas_gc skip=shelves count={d} overflow={any}\n",
+                .{ packer.shelf_count, packer.shelf_overflow },
+            );
+            return false;
+        }
+
+        var live: [shelf_packer.max_shelves]bool = @splat(false);
+
+        // Resolving a UV to a shelf happens once per glyph vertex on screen and
+        // again per cached entry, so the ordering is built once here and shared
+        // by both passes. Valid until mergeAdjacentRecycled renumbers shelves.
+        var y_order: [shelf_packer.max_shelves]u16 = undefined;
+        const order = y_order[0..packer.buildYOrder(&y_order)];
+
+        const rows = self.scroll_cache_rows;
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            if (!self.scroll_cache_valid.isSet(r)) continue;
+            for (self.scroll_cache.items[r].items) |v| {
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            }
+        }
+        for (self.cursor_verts.items) |v| {
+            markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+        }
+        // The row this flush is composing right now. Its quads are not in
+        // scroll_cache yet, and a glyph it took from the cache was allocated in
+        // an earlier epoch, so the epoch guard does not cover it either.
+        if (self.inflight_row_verts) |row| {
+            for (row.items) |v| {
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            }
+        }
+        // Rows the frontend may still be drawing out of its own retained copy,
+        // whose cache slots this core has already reused.
+        for (self.retained_shadow_age, &self.retained_shadow) |age, *buf| {
+            if (age >= retained_shadow_expiry) continue;
+            for (buf.items) |v| {
+                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            }
+        }
+
+        const recycled = packer.recycleDeadShelves(&live);
+        if (log_on) {
+            var live_count: u32 = 0;
+            for (live[0..packer.shelf_count]) |l| {
+                if (l) live_count += 1;
+            }
+            self.log.write(
+                "[perf] atlas_gc shelves={d} live={d} recycled={d}\n",
+                .{ packer.shelf_count, live_count, recycled },
+            );
+        }
+        if (recycled == 0) return false;
+
+        // Every cached entry that pointed into a reclaimed shelf must go: the
+        // space is about to hold a different glyph, and a surviving entry
+        // would be a permanent cache hit returning the wrong UVs.
+        if (self.glyph_cache_ascii) |cache| {
+            if (self.glyph_valid_ascii) |valid| {
+                const len = @min(cache.len, valid.len);
+                for (cache[0..len], valid[0..len]) |entry, *is_valid| {
+                    if (!is_valid.*) continue;
+                    if (self.entryLivesInDeadShelf(packer, order, &live, entry)) is_valid.* = false;
+                }
+            }
+        }
+        self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_non_ascii, self.glyph_keys_non_ascii);
+        self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_by_id, self.glyph_keys_by_id);
+        // Only now that no cache entry names a reclaimed shelf can shelves be
+        // renumbered. Fusing the free runs is what lets a tall glyph land in
+        // space vacated by short ones.
+        packer.mergeAdjacentRecycled();
+        return true;
+    }
+
+    fn entryLivesInDeadShelf(
+        self: *Core,
+        packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
+        live: *const [shelf_packer.max_shelves]bool,
+        entry: c_api.GlyphEntry,
+    ) bool {
+        _ = self;
+        if (entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) return false;
+        const uv_y = entry.uv_min[1];
+        if (uv_y <= 0 or uv_y > 1) return false;
+        const h_f: f32 = @floatFromInt(packer.height);
+        const y: u32 = @intFromFloat(@min(uv_y * h_f, h_f - 1));
+        const idx = packer.shelfIndexForYOrdered(order, y) orelse return false;
+        return !live[idx];
+    }
+
+    fn dropKeyedEntriesInDeadShelves(
+        self: *Core,
+        packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
+        live: *const [shelf_packer.max_shelves]bool,
+        cache_opt: ?[]c_api.GlyphEntry,
+        keys_opt: ?[]u64,
+    ) void {
+        const cache = cache_opt orelse return;
+        const keys = keys_opt orelse return;
+        const len = @min(cache.len, keys.len);
+        for (cache[0..len], keys[0..len]) |entry, *key| {
+            if (key.* == GLYPH_CACHE_INVALID_KEY) continue;
+            if (self.entryLivesInDeadShelf(packer, order, live, entry)) key.* = GLYPH_CACHE_INVALID_KEY;
+        }
+    }
+
     /// Ensure atlas is lazily initialized.
-    fn ensureAtlasInit(self: *Core) void {
+    fn ensureAtlasInit(self: *Core) bool {
         if (!self.atlas_initialized) {
             self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
             if (self.cb.on_atlas_create) |f| {
@@ -1616,63 +2919,119 @@ pub const Core = struct {
                     self.perf_atlas_create_calls +%= 1;
                 }
             }
+            if (self.flush_aborted) {
+                self.atlas_packer = null;
+                return false;
+            }
             self.atlas_initialized = true;
         }
+        return true;
     }
 
     /// Pre-rasterize printable ASCII (0x20-0x7E) for all style combos
     /// to eliminate cold-cache DWrite spikes on first flush.
     /// Called once after loadAsciiTables() succeeds (on font init).
-    pub fn preRasterizeAscii(self: *Core) void {
+    pub fn preRasterizeAscii(self: *Core) bool {
+        if (self.flush_aborted) return false;
         // Guard: required callbacks must be set (ensureGlyphByID unwraps .?)
-        if (self.cb.on_rasterize_glyph_by_id == null) return;
-        if (self.cb.on_atlas_upload == null) return;
-        if (self.cb.on_atlas_create == null) return;
+        if (self.cb.on_rasterize_glyph_by_id == null) return true;
+        if (self.cb.on_atlas_upload == null) return true;
+        if (self.cb.on_atlas_create == null) return true;
 
-        self.initGlyphCache() catch return;
-        const cache = self.glyph_cache_by_id orelse return;
-        const keys = self.glyph_keys_by_id orelse return;
-        const CACHE_SIZE = self.glyph_cache_non_ascii_size;
-        if (CACHE_SIZE == 0) return;
+        self.initGlyphCache() catch return false;
+        const cache = self.glyph_cache_by_id orelse return false;
+        const keys = self.glyph_keys_by_id orelse return false;
+        const scalar_cache = self.glyph_cache_ascii orelse return false;
+        const scalar_valid = self.glyph_valid_ascii orelse return false;
+        // Modulus MUST be the physical hash-table length, not the mutable size field.
+        // glyph_cache_non_ascii_size can drift from the allocated arrays (a concurrent
+        // setGlyphCacheSize updates the size field before the arrays are reallocated),
+        // and hashing with a larger modulus then indexes past the end of `keys`/`cache`
+        // -> "index out of bounds". Deriving the modulus from keys.len can never do that.
+        const CACHE_SIZE = @as(u32, @intCast(keys.len));
+        if (CACHE_SIZE == 0) return false;
 
-        const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
         const style_combos = [4]u32{ 0, c_api.STYLE_BOLD, c_api.STYLE_ITALIC, c_api.STYLE_BOLD | c_api.STYLE_ITALIC };
 
         var rasterized: u32 = 0;
         var skipped: u32 = 0;
 
         for (0..4) |si| {
+            if (self.flush_aborted) return false;
             const gids = &self.ascii_glyph_ids[si];
             const c_style = style_combos[si];
 
             for (0x20..0x7F) |scalar| {
+                if (self.flush_aborted) return false;
                 const gid = gids[scalar];
                 if (gid == 0) continue; // .notdef
 
                 const key = (@as(u64, gid) << 2) | @as(u64, si);
                 const hash_val = (gid *% 2654435761) ^ @as(u32, @intCast(si));
-                const hash_idx = @as(usize, hash_val % CACHE_SIZE);
+                const probe = glyphCacheProbe(keys, key, hash_val);
+                const scalar_index = scalar * 4 + si;
 
-                // Already cached → skip
-                if (keys[hash_idx] != INVALID_KEY and keys[hash_idx] == key) {
+                // Already cached by glyph ID. Mirror it into the canonical
+                // scalar*4+style slot used by both row and cursor fast paths.
+                // A blank by-ID entry may be a normal primary-face miss, so
+                // resolve the scalar fallback before publishing that slot.
+                if (probe.hit) |hit| {
+                    var scalar_entry = cache[hit];
+                    var can_mirror = scalar_entry.bbox_size_px[0] > 0 and scalar_entry.bbox_size_px[1] > 0;
+                    if ((scalar_entry.bbox_size_px[0] <= 0 or scalar_entry.bbox_size_px[1] <= 0) and
+                        self.cb.on_rasterize_glyph != null)
+                    {
+                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                            if (self.flush_aborted) return false;
+                            skipped += 1;
+                            continue;
+                        };
+                        can_mirror = true;
+                    }
+                    if (can_mirror and scalar_index < scalar_cache.len and scalar_index < scalar_valid.len) {
+                        scalar_cache[scalar_index] = scalar_entry;
+                        scalar_valid[scalar_index] = true;
+                    }
                     skipped += 1;
                     continue;
                 }
 
                 // Rasterize + pack + upload
                 if (self.ensureGlyphByID(gid, c_style)) |entry| {
-                    cache[hash_idx] = entry;
-                    keys[hash_idx] = key;
+                    cache[probe.insert] = entry;
+                    keys[probe.insert] = key;
+                    var scalar_entry = entry;
+                    var can_mirror = entry.bbox_size_px[0] > 0 and entry.bbox_size_px[1] > 0;
+                    if ((entry.bbox_size_px[0] <= 0 or entry.bbox_size_px[1] <= 0) and
+                        self.cb.on_rasterize_glyph != null)
+                    {
+                        scalar_entry = self.ensureGlyphPhase2(@intCast(scalar), c_style) orelse {
+                            if (self.flush_aborted) return false;
+                            rasterized += 1;
+                            continue;
+                        };
+                        can_mirror = true;
+                    }
+                    if (can_mirror and scalar_index < scalar_cache.len and scalar_index < scalar_valid.len) {
+                        scalar_cache[scalar_index] = scalar_entry;
+                        scalar_valid[scalar_index] = true;
+                    }
                     rasterized += 1;
+                } else if (self.flush_aborted) {
+                    return false;
                 }
             }
         }
 
         self.log.write("[perf] preRasterizeAscii rasterized={d} skipped={d}\n", .{ rasterized, skipped });
+        return true;
     }
 
     /// Phase 2 glyph resolution: rasterize → pack → upload → build GlyphEntry.
-    /// Returns null on unrecoverable failure (rasterize callback returned 0).
+    /// A non-aborting rasterizer miss returns a blank negative-cache entry and
+    /// arms bounded maintenance retries. Upload/create failures use
+    /// flush_aborted and still return null, immediately rejecting the whole
+    /// transaction rather than publishing a blank.
     pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
@@ -1682,7 +3041,7 @@ pub const Core = struct {
             self.perf_atlas_total_calls +%= 1;
         };
 
-        self.ensureAtlasInit();
+        if (!self.ensureAtlasInit()) return null;
 
         // Ask frontend to rasterize (no packing / UV)
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
@@ -1693,13 +3052,20 @@ pub const Core = struct {
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
-        if (ok == 0) return null;
+        if (self.flush_aborted) return null;
+        if (ok == 0) {
+            self.recordTransientGlyphNegative();
+            return blankGlyphEntry(&bm);
+        }
 
         return self.packAndUploadBitmap(&bm);
     }
 
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
     /// Similar to ensureGlyphPhase2 but uses on_rasterize_glyph_by_id callback.
+    /// A zero result is a cacheable blank but does not itself arm maintenance:
+    /// primary-face misses commonly succeed through the caller's scalar/fallback
+    /// font path. Only a final scalar miss starts the bounded retry episode.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
@@ -1709,7 +3075,7 @@ pub const Core = struct {
             self.perf_atlas_total_calls +%= 1;
         };
 
-        self.ensureAtlasInit();
+        if (!self.ensureAtlasInit()) return null;
 
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
@@ -1719,20 +3085,27 @@ pub const Core = struct {
             self.perf_rasterize_ns_total +%= dt;
             self.perf_rasterize_calls +%= 1;
         }
-        if (ok == 0) return null;
+        if (self.flush_aborted) return null;
+        if (ok == 0) {
+            return blankGlyphEntry(&bm);
+        }
 
         return self.packAndUploadBitmap(&bm);
     }
 
     /// Reset core atlas: clear packer, invalidate cache, recreate texture.
     pub fn resetCoreAtlas(self: *Core) void {
-        if (self.atlas_packer) |*p| {
-            p.reset();
-        } else {
-            // Packer not yet created (e.g. onGuifont before first glyph render).
-            // Create it now so atlas_initialized=true is safe.
-            self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
+        const capacity_reprobe_in_progress = self.atlas_negative_recovery_armed;
+        self.atlas_reset_seq +%= 1;
+        self.atlas_has_capacity_negative = false;
+        self.atlas_negative_retry_at = null;
+        if (!capacity_reprobe_in_progress) {
+            self.atlas_negative_retry_delay_ns = 250 * std.time.ns_per_ms;
+            self.atlas_negative_recovery_armed = false;
         }
+        // Reinitialize rather than merely reset: atlas_w/h can grow when a
+        // full atlas is encountered.
+        self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
         self.resetGlyphCacheFlags();
         self.atlas_initialized = true;
         if (self.cb.on_atlas_create) |f| {
@@ -1744,6 +3117,10 @@ pub const Core = struct {
                 self.perf_atlas_create_ns_total +%= dt;
                 self.perf_atlas_create_calls +%= 1;
             }
+        }
+        if (self.flush_aborted) {
+            self.atlas_packer = null;
+            self.atlas_initialized = false;
         }
     }
 
@@ -1772,6 +3149,12 @@ pub const Core = struct {
         }
 
         if (needs_escape) {
+            // sendInput/sendKeyEvent may be called concurrently now (macOS
+            // key-repeat synthesis calls this from a display-link thread as
+            // well as the normal per-keystroke caller), so key_buf needs a
+            // lock even though requestInput()'s own write path is safe.
+            self.key_buf_mu.lockUncancelable(clock.io());
+            defer self.key_buf_mu.unlock(clock.io());
             self.key_buf.clearRetainingCapacity();
             for (keys) |c| {
                 if (c == '<') {
@@ -1793,6 +3176,24 @@ pub const Core = struct {
     pub fn noteInputTrace(self: *Core, seq: u64, sent_ns: i64) void {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        self.noteInputTraceLocked(seq, sent_ns);
+    }
+
+    /// Non-blocking version of noteInputTrace. Drops the sample (this seq's
+    /// [perf_input] trace line simply won't appear) if grid_mu could not be
+    /// acquired, rather than blocking the input-send path -- this trace
+    /// exists only to measure input latency and must not itself add to it.
+    /// Returns true if the sample was recorded.
+    pub fn tryNoteInputTrace(self: *Core, seq: u64, sent_ns: i64) bool {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_input_trace.record(acquired);
+        if (!acquired) return false;
+        defer self.grid_mu.unlock(clock.io());
+        self.noteInputTraceLocked(seq, sent_ns);
+        return true;
+    }
+
+    fn noteInputTraceLocked(self: *Core, seq: u64, sent_ns: i64) void {
         self.grid.noteInputTrace(seq, sent_ns);
         if (self.log.cb != null) {
             self.log.write("[perf_input] seq={d} stage=input_send sent_ns={d}\n", .{ seq, sent_ns });
@@ -1802,6 +3203,10 @@ pub const Core = struct {
     /// Send raw data to child process stdin (for SSH password input).
     /// Signals ssh_auth_done after writing.
     pub fn sendStdinData(self: *Core, data: []const u8) void {
+        if (self.stop_flag.load(.seq_cst)) return;
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        defer self.stdin_close_mu.unlock(clock.io());
+        if (self.stop_flag.load(.seq_cst)) return;
         if (self.stdin_file) |f| {
             f.writeAll(data) catch |e| {
                 self.log.write("sendStdinData write err: {any}\n", .{e});
@@ -1873,7 +3278,7 @@ pub const Core = struct {
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
-        return self.getVisibleGridsLocked(out);
+        return self.getVisibleGridsSnapshotLocked(out, false).written;
     }
 
     /// Non-blocking version of getVisibleGrids.
@@ -1881,100 +3286,123 @@ pub const Core = struct {
     pub fn tryGetVisibleGrids(self: *Core, out: []c_api.GridInfo) ?usize {
         if (!self.grid_mu.tryLock()) return null;
         defer self.grid_mu.unlock(clock.io());
-        return self.getVisibleGridsLocked(out);
+        return self.getVisibleGridsSnapshotLocked(out, false).written;
     }
 
-    /// Internal: get visible grids assuming grid_mu is already held.
-    fn getVisibleGridsLocked(self: *Core, out: []c_api.GridInfo) usize {
-        var count: usize = 0;
+    pub const VisibleGridsSnapshot = struct {
+        written: usize,
+        total: usize,
+    };
+
+    /// Non-blocking complete snapshot. `total` counts every visible grid from
+    /// the same locked state even when `out` is too small; `written` is the
+    /// initialized prefix of out.
+    pub fn tryGetVisibleGridsComplete(self: *Core, out: []c_api.GridInfo) ?VisibleGridsSnapshot {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock(clock.io());
+        return self.getVisibleGridsSnapshotLocked(out, true);
+    }
+
+    /// Internal: snapshot visible grids assuming grid_mu is already held.
+    /// `count_all` preserves the legacy APIs' stop-at-capacity hot path while
+    /// the complete API scans the same locked state to detect truncation.
+    fn getVisibleGridsSnapshotLocked(self: *Core, out: []c_api.GridInfo, count_all: bool) VisibleGridsSnapshot {
+        var written: usize = 0;
+        var total: usize = 0;
 
         // Always include global grid first
-        if (count < out.len) {
+        if (written < out.len) {
             const m1 = self.grid.getViewportMargins(1);
-            out[count] = .{
+            out[written] = .{
                 .grid_id = 1,
                 .zindex = 0, // global grid has lowest zindex
                 .start_row = 0,
                 .start_col = 0,
-                .rows = @intCast(self.grid.rows),
-                .cols = @intCast(self.grid.cols),
-                .margin_top = @intCast(m1.top),
-                .margin_bottom = @intCast(m1.bottom),
-                .margin_left = @intCast(m1.left),
-                .margin_right = @intCast(m1.right),
+                .rows = grid_mod.saturatingI32FromU32(self.grid.rows),
+                .cols = grid_mod.saturatingI32FromU32(self.grid.cols),
+                .margin_top = grid_mod.saturatingI32FromU32(m1.top),
+                .margin_bottom = grid_mod.saturatingI32FromU32(m1.bottom),
+                .margin_left = grid_mod.saturatingI32FromU32(m1.left),
+                .margin_right = grid_mod.saturatingI32FromU32(m1.right),
                 .line_count = if (self.grid.getViewport(1)) |vp| vp.line_count else 0,
                 .anchor_grid = 1,
                 .follows_scroll = 0,
                 .is_external = 0,
             };
-            count += 1;
+            written += 1;
         }
+        total += 1;
+        if (!count_all and written == out.len) return .{ .written = written, .total = total };
 
         // Add sub-grids (floating windows)
         var it = self.grid.win_pos.iterator();
         while (it.next()) |entry| {
-            if (count >= out.len) break;
-
             const gid = entry.key_ptr.*;
             if (gid == 1) continue; // skip global grid (already added)
 
             const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
-            const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
-                .zindex = 0,
-                .compindex = 0,
-                .order = 0,
-            };
-            const margins = self.grid.getViewportMargins(gid);
+            if (written < out.len) {
+                const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
+                    .zindex = 0,
+                    .compindex = 0,
+                    .order = 0,
+                };
+                const margins = self.grid.getViewportMargins(gid);
 
-            out[count] = .{
-                .grid_id = gid,
-                .zindex = layer.zindex,
-                .start_row = @intCast(pos.row),
-                .start_col = @intCast(pos.col),
-                .rows = @intCast(sg.rows),
-                .cols = @intCast(sg.cols),
-                .margin_top = @intCast(margins.top),
-                .margin_bottom = @intCast(margins.bottom),
-                .margin_left = @intCast(margins.left),
-                .margin_right = @intCast(margins.right),
-                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                .anchor_grid = pos.anchor_grid,
-                .follows_scroll = if (pos.follows_scroll) 1 else 0,
-                .is_external = 0,
-            };
-            count += 1;
+                out[written] = .{
+                    .grid_id = gid,
+                    .zindex = layer.zindex,
+                    .start_row = grid_mod.saturatingI32FromU32(pos.row),
+                    .start_col = grid_mod.saturatingI32FromU32(pos.col),
+                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
+                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
+                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
+                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
+                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
+                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
+                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                    .anchor_grid = pos.anchor_grid,
+                    .follows_scroll = if (pos.follows_scroll) 1 else 0,
+                    .is_external = 0,
+                };
+                written += 1;
+            }
+            total += 1;
+            if (!count_all and written == out.len) return .{ .written = written, .total = total };
         }
 
         // Add external grids (separate top-level windows)
         var ext_it = self.grid.external_grids.keyIterator();
         while (ext_it.next()) |key_ptr| {
-            if (count >= out.len) break;
-
             const gid = key_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
-            const margins = self.grid.getViewportMargins(gid);
+            if (written < out.len) {
+                const margins = self.grid.getViewportMargins(gid);
 
-            out[count] = .{
-                .grid_id = gid,
-                .zindex = 0, // External grids have their own window, zindex doesn't apply
-                .start_row = 0, // External grids start at (0,0) in their own window
-                .start_col = 0,
-                .rows = @intCast(sg.rows),
-                .cols = @intCast(sg.cols),
-                .margin_top = @intCast(margins.top),
-                .margin_bottom = @intCast(margins.bottom),
-                .margin_left = @intCast(margins.left),
-                .margin_right = @intCast(margins.right),
-                .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                .anchor_grid = 1,
-                .follows_scroll = 0,
-                .is_external = 1,
-            };
-            count += 1;
+                out[written] = .{
+                    .grid_id = gid,
+                    .zindex = 0, // External grids have their own window, zindex doesn't apply
+                    .start_row = 0, // External grids start at (0,0) in their own window
+                    .start_col = 0,
+                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
+                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
+                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
+                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
+                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
+                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
+                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+                    .anchor_grid = 1,
+                    .follows_scroll = 0,
+                    .is_external = 1,
+                };
+                written += 1;
+            }
+            total += 1;
+            if (!count_all and written == out.len) return .{ .written = written, .total = total };
         }
 
-        return count;
+        return .{ .written = written, .total = total };
     }
 
     pub const CursorPosition = struct {
@@ -1987,12 +3415,50 @@ pub const Core = struct {
         // Lock grid_mu to prevent concurrent modification from RPC thread.
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        return self.getCursorPositionLocked();
+    }
 
+    /// Non-blocking version of getCursorPosition.
+    /// Returns null if grid_mu could not be acquired (another thread holds it).
+    pub fn tryGetCursorPosition(self: *Core) ?CursorPosition {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_cursor_pos.record(acquired);
+        if (!acquired) return null;
+        defer self.grid_mu.unlock(clock.io());
+        return self.getCursorPositionLocked();
+    }
+
+    /// Internal: get cursor position assuming grid_mu is already held.
+    fn getCursorPositionLocked(self: *Core) CursorPosition {
         return .{
             .grid_id = self.grid.cursor_grid,
-            .row = @intCast(self.grid.cursor_row),
-            .col = @intCast(self.grid.cursor_col),
+            .row = grid_mod.saturatingI32FromU32(self.grid.cursor_row),
+            .col = grid_mod.saturatingI32FromU32(self.grid.cursor_col),
         };
+    }
+
+    /// Internal: copy the current mode name into a caller-provided buffer
+    /// (truncated + null-terminated to fit) and read cursor visibility,
+    /// assuming grid_mu is already held.
+    fn getModeStateLocked(self: *Core, out_mode_buf: [*]u8, buf_len: usize, out_cursor_visible: *bool) void {
+        const name = &self.grid.current_mode_name;
+        const raw_len = std.mem.indexOfScalar(u8, name, 0) orelse name.len;
+        const n = @min(buf_len -| 1, raw_len);
+        @memcpy(out_mode_buf[0..n], name[0..n]);
+        out_mode_buf[n] = 0;
+        out_cursor_visible.* = self.grid.cursor_visible;
+    }
+
+    /// Non-blocking combined read of current mode name + cursor visibility.
+    /// Returns false if grid_mu could not be acquired (another thread holds
+    /// it) -- caller should keep its last-known cached values in that case.
+    pub fn tryGetModeState(self: *Core, out_mode_buf: [*]u8, buf_len: usize, out_cursor_visible: *bool) bool {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_mode_state.record(acquired);
+        if (!acquired) return false;
+        defer self.grid_mu.unlock(clock.io());
+        self.getModeStateLocked(out_mode_buf, buf_len, out_cursor_visible);
+        return true;
     }
 
     /// Get viewport info for a specific grid (for scrollbar rendering).
@@ -2006,7 +3472,9 @@ pub const Core = struct {
     /// Non-blocking version of getViewportInfo.
     /// Returns null if grid_mu could not be acquired (another thread holds it).
     pub fn tryGetViewportInfo(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) ?i32 {
-        if (!self.grid_mu.tryLock()) return null;
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_viewport.record(acquired);
+        if (!acquired) return null;
         defer self.grid_mu.unlock(clock.io());
         return self.getViewportInfoLocked(grid_id, out);
     }
@@ -2041,7 +3509,13 @@ pub const Core = struct {
     pub fn getHlByName(self: *Core, name: []const u8) HlColors {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
+        return self.getHlByNameLocked(name);
+    }
 
+    /// Internal: look up a highlight group by name assuming grid_mu is
+    /// already held. Lets a caller batch several lookups under one lock
+    /// acquisition instead of one lockUncancelable per name.
+    pub fn getHlByNameLocked(self: *Core, name: []const u8) HlColors {
         // Look up hl_id from group name
         const hl_id = self.hl.groups.get(name) orelse {
             // Not found - return default colors
@@ -2061,21 +3535,29 @@ pub const Core = struct {
         };
     }
 
-    pub fn resize(self: *Core, rows: u32, cols: u32) void {
-        self.requestTryResize(rows, cols) catch |e| {
-            self.pending_resize_rows = rows;
-            self.pending_resize_cols = cols;
-            self.pending_resize_valid = true;
-            self.log.write(
-                "resize err: {any} -> pending_resize rows={d} cols={d}\n",
-                .{ e, rows, cols },
-            );
-            return;
-        };
+    pub fn resize(self: *Core, rows: u32, cols: u32) bool {
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        defer self.pending_resize_mu.unlock(clock.io());
 
-        if (self.pending_resize_valid and self.pending_resize_rows == rows and self.pending_resize_cols == cols) {
-            self.pending_resize_valid = false;
+        // Retain the desired dimensions independently of delivery. An enqueue
+        // to the old writer can succeed immediately before reconnect cleanup
+        // drops that queue; resetSessionState republishes this latest value.
+        self.desired_resize_rows = rows;
+        self.desired_resize_cols = cols;
+        const sequence = self.nextPendingUiStateSequenceLocked();
+        self.pending_resize_rows = rows;
+        self.pending_resize_cols = cols;
+        self.pending_resize_valid = true;
+        self.pending_resize_sequence = sequence;
+
+        // nvim_ui_try_resize is invalid before nvim_ui_attach. Publish the
+        // newest layout for the attach thread to drain atomically instead.
+        if (!self.ui_attached.load(.acquire)) {
+            return false;
         }
+
+        self.flushPendingUiStateLocked();
+        return !self.pending_resize_valid or self.pending_resize_sequence != sequence;
     }
 
     pub fn updateLayoutPx(
@@ -2084,7 +3566,7 @@ pub const Core = struct {
         drawable_h_px: u32,
         cell_w_px: u32,
         cell_h_px: u32,
-    ) void {
+    ) bool {
         // If called from within handleRedraw (via callback) on the SAME thread,
         // grid_mu is already held, so we can call the locked version directly.
         // This ensures cell dimensions are updated BEFORE the flush generates vertices.
@@ -2093,15 +3575,15 @@ pub const Core = struct {
         const current_tid: usize = @intCast(std.Thread.getCurrentId());
         const redraw_tid = self.redraw_thread_id.load(.seq_cst);
         if (redraw_tid != 0 and redraw_tid == current_tid) {
-            self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
-            return;
+            _ = self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+            return false;
         }
 
         // Called from UI thread - acquire grid_mu to protect grid state access.
         self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-
-        self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+        const changed = self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
+        self.grid_mu.unlock(clock.io());
+        return changed;
     }
 
     // Internal implementation: assumes grid_mu is already held or we're in a safe context.
@@ -2113,7 +3595,7 @@ pub const Core = struct {
         drawable_h_px: u32,
         cell_w_px: u32,
         cell_h_px: u32,
-    ) void {
+    ) bool {
         // All inputs are already integer pixels (UI measured & rounded).
         // Keep core logic deterministic across macOS/Windows.
         const cw = if (cell_w_px == 0) 1 else cell_w_px;
@@ -2121,11 +3603,14 @@ pub const Core = struct {
         const dw = if (drawable_w_px == 0) 1 else drawable_w_px;
         const dh = if (drawable_h_px == 0) 1 else drawable_h_px;
 
-        // Track whether cell dimensions changed (affects vertex positions).
+        // NDC positions depend on both cell and drawable dimensions.
+        const drawable_dims_changed = (dw != self.drawable_w_px or dh != self.drawable_h_px);
         const cell_dims_changed = (cw != self.cell_w_px or ch != self.cell_h_px);
 
         const cols = @max(@as(u32, 1), dw / cw);
         const rows = @max(@as(u32, 1), dh / ch);
+        const grid_dims_changed = (rows != self.last_layout_rows or cols != self.last_layout_cols);
+        const vertex_geometry_changed = drawable_dims_changed or cell_dims_changed or grid_dims_changed;
 
         self.drawable_w_px = dw;
         self.drawable_h_px = dh;
@@ -2139,26 +3624,32 @@ pub const Core = struct {
         // This is done here to avoid a separate lock acquisition in setScreenCols.
         self.grid.screen_cols = cols;
 
-        // If cell dimensions changed, mark grid dirty to force vertex regeneration.
-        // This handles linespace changes where rows/cols may not change but
-        // vertex positions need recalculation.
-        if (cell_dims_changed) {
+        // Any geometry input change invalidates baked NDC positions, including
+        // drawable-only resizes and row/column changes at the same cell size.
+        if (vertex_geometry_changed) {
             self.grid.markAllDirty();
-            // Also mark all external grids dirty so they get regenerated with new cell size
-            var sg_it = self.grid.sub_grids.valueIterator();
-            while (sg_it.next()) |sg| {
-                sg.dirty = true;
+            // Cursor geometry is submitted independently of row vertices.
+            self.grid.cursor_rev +%= 1;
+            // External-grid NDC uses each external drawable/viewport, not the
+            // main drawable dimensions. Regenerate them only when shared cell
+            // metrics change; a one-pixel main live-resize must stay O(main).
+            if (cell_dims_changed) {
+                var sg_it = self.grid.sub_grids.valueIterator();
+                while (sg_it.next()) |sg| {
+                    sg.markAllDirty();
+                }
             }
-            // Immediately send external grid vertices with new cell size
-            // (don't wait for next flush from Neovim)
-            self.sendExternalGridVertices(true);
         }
 
-        if (rows == self.last_layout_rows and cols == self.last_layout_cols) return;
-        self.last_layout_rows = rows;
-        self.last_layout_cols = cols;
-        // Use existing resize path (already catches/logs errors).
-        self.resize(rows, cols);
+        if (!grid_dims_changed) return vertex_geometry_changed;
+
+        // Only suppress a future resize after the RPC was accepted. A failed
+        // send remains pending and the same dimensions must be retried.
+        if (self.resize(rows, cols)) {
+            self.last_layout_rows = rows;
+            self.last_layout_cols = cols;
+        }
+        return vertex_geometry_changed;
     }
 
     /// Set screen width in cells (for cmdline max width).
@@ -2191,8 +3682,12 @@ pub const Core = struct {
     fn firstCodepointUtf8(s: []const u8) ?u32 {
         if (s.len == 0) return null;
         var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
-        if (it.nextCodepoint()) |cp| return @as(u32, cp);
-        return null;
+        // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
+        // UTF-8 (it uses utf8Decode(slice) catch unreachable) — see the same
+        // hazard documented in redraw_handler.zig's firstCodepoint().
+        const slice = it.nextCodepointSlice() orelse return null;
+        const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
+        return @as(u32, cp);
     }
 
     fn appendModPrefix(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, mods: u32) !void {
@@ -2226,19 +3721,19 @@ pub const Core = struct {
     pub fn winSpecialName(vk: u32) ?[]const u8 {
         // Win32 Virtual-Key mapping -> Neovim special key names.
         return switch (vk) {
-            0x25 => "Left",    // VK_LEFT
-            0x26 => "Up",      // VK_UP
-            0x27 => "Right",   // VK_RIGHT
-            0x28 => "Down",    // VK_DOWN
-            0x24 => "Home",    // VK_HOME
-            0x23 => "End",     // VK_END
-            0x21 => "PageUp",  // VK_PRIOR
-            0x22 => "PageDown",// VK_NEXT
-            0x08 => "BS",      // VK_BACK
-            0x2E => "Del",     // VK_DELETE
-            0x0D => "CR",      // VK_RETURN
-            0x09 => "Tab",     // VK_TAB
-            0x1B => "Esc",     // VK_ESCAPE
+            0x25 => "Left", // VK_LEFT
+            0x26 => "Up", // VK_UP
+            0x27 => "Right", // VK_RIGHT
+            0x28 => "Down", // VK_DOWN
+            0x24 => "Home", // VK_HOME
+            0x23 => "End", // VK_END
+            0x21 => "PageUp", // VK_PRIOR
+            0x22 => "PageDown", // VK_NEXT
+            0x08 => "BS", // VK_BACK
+            0x2E => "Del", // VK_DELETE
+            0x0D => "CR", // VK_RETURN
+            0x09 => "Tab", // VK_TAB
+            0x1B => "Esc", // VK_ESCAPE
             else => null,
         };
     }
@@ -2414,7 +3909,12 @@ pub const Core = struct {
     }
 
     pub fn sendKeyEvent(self: *Core, keycode: u32, mods: u32, chars: []const u8, ign: []const u8) void {
-        // Use persistent buffer (zero-allocation hot path)
+        // Use persistent buffer (zero-allocation hot path). Locked for the
+        // whole function (every branch below reads/writes key_buf before
+        // returning): sendInput/sendKeyEvent may now be called concurrently
+        // from macOS key-repeat synthesis's display-link thread.
+        self.key_buf_mu.lockUncancelable(clock.io());
+        defer self.key_buf_mu.unlock(clock.io());
         self.key_buf.clearRetainingCapacity();
 
         // 1) Special keys by keycode (macOS / Win32)
@@ -2542,21 +4042,20 @@ pub const Core = struct {
     ///
     /// Called from the redraw thread (grid_mu held).
     pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
-        // Drop any previously queued restart (only the latest matters).
-        if (self.restart_pending_addr) |old| {
-            self.alloc.free(old);
-            self.restart_pending_addr = null;
-        }
-
         const owned = self.alloc.dupe(u8, listen_addr) catch |e| {
             self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        self.restart_pending_addr = owned;
+        const old = self.restart_pending_addr;
         // Explicit reset in case a prior :connect queued (then aborted) left
         // the hot-swap flag set; :restart is NOT a hot-swap (the old nvim
         // dies), so spawn fallback on connect failure is the desired recovery.
         self.restart_pending_is_connect_hotswap = false;
+        self.connect_keeps_child_alive = false;
+        // Publish the address last so any observer that sees a pending restart
+        // also sees the restart (not hot-swap) cleanup policy above.
+        self.restart_pending_addr = owned;
+        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
 
@@ -2578,18 +4077,15 @@ pub const Core = struct {
     /// (`:connect`, old server stays alive headless) from a server
     /// replacement (`:restart`, old server dies).
     pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
-        if (self.restart_pending_addr) |old| {
-            self.alloc.free(old);
-            self.restart_pending_addr = null;
-        }
-
         const owned = self.alloc.dupe(u8, server_addr) catch |e| {
             self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        self.restart_pending_addr = owned;
+        const old = self.restart_pending_addr;
         self.restart_pending_is_connect_hotswap = true;
         self.connect_keeps_child_alive = true;
+        self.restart_pending_addr = owned;
+        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});
 
@@ -2599,8 +4095,12 @@ pub const Core = struct {
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
     /// Receives the stream by value to avoid racing with stop().
     fn writerThreadFn(self: *Core, file: Stream) void {
-        var drain: std.ArrayListUnmanaged(u8) = .empty;
-        defer drain.deinit(self.alloc);
+        // See rpc_session.runLoop's identical call for rationale: match the
+        // UI thread's QoS so this thread isn't starved relative to it.
+        if (comptime @import("builtin").os.tag == .macos) {
+            _ = std.c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0);
+        }
+        defer self.writer_exited.store(true, .release);
 
         while (true) {
             self.write_queue_mu.lockUncancelable(clock.io());
@@ -2610,18 +4110,32 @@ pub const Core = struct {
                 self.write_queue_cond.waitUncancelable(clock.io(), &self.write_queue_mu);
             }
 
-            if (self.write_queue.items.len == 0 and self.write_queue_closed) {
+            // Shutdown is cancellation, not a delivery barrier. Once closed,
+            // discard queued RPC bytes instead of starting another potentially
+            // blocking write while teardown is trying to join this thread.
+            if (self.write_queue_closed) {
+                self.write_queue.clearRetainingCapacity();
+                self.write_queue_normal_bytes = 0;
+                self.write_queue_ui_state_bytes = 0;
                 self.write_queue_mu.unlock(clock.io());
-                self.log.write("writer thread: clean shutdown (queue drained)\n", .{});
+                self.log.write("writer thread: shutdown (queued writes dropped)\n", .{});
                 break;
             }
 
-            // O(1) swap: take full queue, leave empty drain buffer for producers
-            std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_queue, &drain);
+            // All producers append to one FIFO. Swapping the whole buffer is
+            // the only drain boundary, so normal and UI-state RPCs retain the
+            // exact order in which they acquired write_queue_mu.
+            std.mem.swap(
+                std.ArrayListUnmanaged(u8),
+                &self.write_queue,
+                &self.write_spare_queue,
+            );
+            self.write_queue_normal_bytes = 0;
+            self.write_queue_ui_state_bytes = 0;
             self.write_queue_mu.unlock(clock.io());
 
             // Write to pipe WITHOUT holding any mutex
-            file.writeAll(drain.items) catch |e| {
+            file.writeAllCancelable(self.write_spare_queue.items, &self.writer_cancel_requested) catch |e| {
                 self.log.write("writer thread writeAll err: {any}\n", .{e});
                 // Mark writer as failed + closed, notify any future waiters
                 self.write_queue_mu.lockUncancelable(clock.io());
@@ -2632,16 +4146,22 @@ pub const Core = struct {
                 break;
             };
 
-            drain.clearRetainingCapacity();
+            self.write_spare_queue.clearRetainingCapacity();
         }
     }
 
     /// Start the dedicated writer thread for non-blocking stdin writes.
     /// Safe to call from rpc_session.zig after stdin_file is set.
-    pub fn startWriterThread(self: *Core) void {
-        const file = self.stdin_file orelse {
+    pub fn startWriterThread(self: *Core) bool {
+        // Publish the by-value Stream and writer handle atomically with
+        // teardown's stdin_close_mu -> write_queue_mu transition. Without the
+        // outer lock, stop could close/recycle the descriptor after this copy
+        // but before writer_thread becomes visible for joining.
+        self.stdin_close_mu.lockUncancelable(clock.io());
+        var file = self.stdin_file orelse {
+            self.stdin_close_mu.unlock(clock.io());
             self.log.write("startWriterThread: stdin_file is null\n", .{});
-            return;
+            return false;
         };
 
         self.write_queue_mu.lockUncancelable(clock.io());
@@ -2649,25 +4169,106 @@ pub const Core = struct {
         // Guard: don't start if shutdown is in progress or already running.
         // write_queue_closed is set by stop() under the same mutex, so this
         // check fully closes the race window between stop_flag and lock acquisition.
-        if (self.write_queue_closed or self.writer_thread != null) {
+        if (self.writer_thread != null) {
             self.write_queue_mu.unlock(clock.io());
-            return;
+            self.stdin_close_mu.unlock(clock.io());
+            return true;
+        }
+        if (self.write_queue_closed) {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            return false;
         }
 
         // Reset state flags and drain stale data (safe for reconnect / re-use)
         self.writer_failed = false;
         self.write_queue.clearRetainingCapacity();
+        self.write_spare_queue.clearRetainingCapacity();
+        self.write_queue_normal_bytes = 0;
+        self.write_queue_ui_state_bytes = 0;
+        self.write_queue.ensureTotalCapacityPrecise(self.alloc, UI_STATE_WRITE_RESERVE_SIZE) catch |e| {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to reserve active writer UI-state capacity: {any}\n", .{e});
+            return false;
+        };
+        self.write_spare_queue.ensureTotalCapacityPrecise(self.alloc, UI_STATE_WRITE_RESERVE_SIZE) catch |e| {
+            self.write_queue_mu.unlock(clock.io());
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to reserve spare writer UI-state capacity: {any}\n", .{e});
+            return false;
+        };
+
+        if (self.transport_kind == .pipes) {
+            file = file.preparePipeWriter() catch |e| {
+                self.write_queue_mu.unlock(clock.io());
+                self.stdin_close_mu.unlock(clock.io());
+                self.log.write("FATAL: failed to make writer pipe cancelable: {any}\n", .{e});
+                return false;
+            };
+            // Keep the Core-owned copy's metadata consistent with the writer
+            // copy. The kernel flag is shared by both descriptor aliases.
+            self.stdin_file = file;
+        }
+        self.writer_cancel_requested.store(false, .release);
+        self.writer_exited.store(false, .release);
 
         self.writer_thread = std.Thread.spawn(.{}, writerThreadFn, .{ self, file }) catch |e| {
+            self.writer_exited.store(true, .release);
             self.write_queue_mu.unlock(clock.io());
-            self.log.write("FATAL: failed to spawn writer thread: {any}, using sync writes\n", .{e});
-            return; // writer_thread remains null → sendRaw uses sync fallback
+            self.stdin_close_mu.unlock(clock.io());
+            self.log.write("FATAL: failed to spawn writer thread: {any}\n", .{e});
+            return false;
         };
 
         self.write_queue_mu.unlock(clock.io());
+        self.stdin_close_mu.unlock(clock.io());
+        return true;
+    }
+
+    /// Release a writer blocked in transport I/O before joining it. The queue
+    /// must already be closed and signaled. POSIX child pipes are non-blocking
+    /// (preparePipeWriter); sockets use shutdown; Windows named pipes use
+    /// CancelIoEx; synchronous Windows child pipes are canceled by thread.
+    pub fn cancelWriterIo(self: *Core, writer: ?std.Thread, stdin: ?Stream, transport_kind: TransportKind) void {
+        self.writer_cancel_requested.store(true, .release);
+        if (stdin) |stream| {
+            if (transport_kind == .socket) stream.shutdownIfSocket(true) catch |e| self.log.write(
+                "writer cancel: socket shutdown failed: {any} (writer stays blocked)\n",
+                .{e},
+            );
+            switch (stream) {
+                .win_pipe => stream.close(),
+                .file => {},
+            }
+        }
+        if (writer) |thread| {
+            if (comptime @import("builtin").os.tag == .windows) {
+                const synchronous_file = if (stdin) |stream| switch (stream) {
+                    .file => true,
+                    .win_pipe => false,
+                } else false;
+                if (synchronous_file) {
+                    while (!self.writer_exited.load(.acquire)) {
+                        var io_status: std.os.windows.IO_STATUS_BLOCK = undefined;
+                        _ = std.os.windows.ntdll.NtCancelSynchronousIoFile(thread.getHandle(), null, &io_status);
+                        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+                    }
+                }
+            }
+            thread.join();
+        }
     }
 
     pub fn sendRaw(self: *Core, bytes: []const u8) !void {
+        return self.sendRawClassified(bytes, .normal);
+    }
+
+    fn sendUiStateRaw(self: *Core, bytes: []const u8) !void {
+        return self.sendRawClassified(bytes, .ui_state);
+    }
+
+    fn sendRawClassified(self: *Core, bytes: []const u8, class: WriteClass) !void {
         // Don't attempt writes during shutdown (avoids sync fallback re-block)
         if (self.stop_flag.load(.seq_cst)) return error.BrokenPipe;
 
@@ -2693,17 +4294,9 @@ pub const Core = struct {
                 return error.BrokenPipe;
             }
 
-            // Queue cap check (subtraction form to avoid usize overflow)
-            if (bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue.items.len) {
-                self.log.write("sendRaw: write queue full ({d} bytes), dropping\n",
-                    .{self.write_queue.items.len});
+            self.enqueueRawLocked(bytes, class) catch |e| {
                 self.write_queue_mu.unlock(clock.io());
-                return error.OutOfMemory;
-            }
-
-            self.write_queue.appendSlice(self.alloc, bytes) catch {
-                self.write_queue_mu.unlock(clock.io());
-                return error.OutOfMemory;
+                return e;
             };
             self.write_queue_cond.signal(clock.io());
             self.write_queue_mu.unlock(clock.io());
@@ -2712,11 +4305,59 @@ pub const Core = struct {
 
         self.write_queue_mu.unlock(clock.io());
 
-        // Fallback: no writer thread → synchronous write (startup / spawn failure)
-        if (self.stdin_file) |f| {
-            try f.writeAll(bytes);
-        } else {
-            return error.BrokenPipe;
+        // RPC writes must never fall back to a blocking caller-thread write:
+        // teardown could otherwise neither cancel it safely nor prevent raw
+        // descriptor reuse. Session setup fails if the writer cannot start.
+        return error.BrokenPipe;
+    }
+
+    /// Append one complete RPC while write_queue_mu is held.
+    fn enqueueRawLocked(self: *Core, bytes: []const u8, class: WriteClass) !void {
+        switch (class) {
+            .normal => {
+                if (bytes.len > MAX_WRITE_QUEUE_SIZE or
+                    bytes.len > MAX_WRITE_QUEUE_SIZE - self.write_queue_normal_bytes)
+                {
+                    self.log.write("sendRaw: normal write queue full ({d} bytes), dropping\n", .{
+                        self.write_queue_normal_bytes,
+                    });
+                    return error.OutOfMemory;
+                }
+
+                const new_normal_bytes = self.write_queue_normal_bytes + bytes.len;
+                const required_capacity = new_normal_bytes + UI_STATE_WRITE_RESERVE_SIZE;
+                if (self.write_queue.capacity < required_capacity) {
+                    var target_capacity = @max(self.write_queue.capacity, UI_STATE_WRITE_RESERVE_SIZE);
+                    while (target_capacity < required_capacity) {
+                        target_capacity = @min(MAX_TOTAL_WRITE_QUEUE_SIZE, target_capacity * 2);
+                    }
+                    self.write_queue.ensureTotalCapacityPrecise(self.alloc, target_capacity) catch {
+                        return error.OutOfMemory;
+                    };
+                }
+
+                self.write_queue.appendSliceAssumeCapacity(bytes);
+                self.write_queue_normal_bytes = new_normal_bytes;
+            },
+            .ui_state => {
+                if (bytes.len > UI_STATE_WRITE_RESERVE_SIZE or
+                    bytes.len > UI_STATE_WRITE_RESERVE_SIZE - self.write_queue_ui_state_bytes)
+                {
+                    self.log.write("sendRaw: UI-state write reserve full ({d} bytes), dropping\n", .{
+                        self.write_queue_ui_state_bytes,
+                    });
+                    return error.OutOfMemory;
+                }
+
+                // Every active buffer starts with the full reserve, and normal
+                // growth always preserves the unused part. This append cannot
+                // allocate or be displaced by normal traffic.
+                std.debug.assert(
+                    self.write_queue.items.len + bytes.len <= self.write_queue.capacity,
+                );
+                self.write_queue.appendSliceAssumeCapacity(bytes);
+                self.write_queue_ui_state_bytes += bytes.len;
+            },
         }
     }
 
@@ -2725,10 +4366,19 @@ pub const Core = struct {
     }
 
     pub fn sendRequestHeader(self: *Core, buf: *rpc.Buf, id: i64, method: []const u8) !void {
-        try rpc.packArray(buf, self.alloc, 4);
-        try rpc.packInt(buf, self.alloc, 0);
-        try rpc.packInt(buf, self.alloc, id);
-        try rpc.packStr(buf, self.alloc, method);
+        try packRequestHeader(buf, self.alloc, id, method);
+    }
+
+    fn packRequestHeader(
+        buf: *rpc.Buf,
+        alloc: std.mem.Allocator,
+        id: i64,
+        method: []const u8,
+    ) !void {
+        try rpc.packArray(buf, alloc, 4);
+        try rpc.packInt(buf, alloc, 0);
+        try rpc.packInt(buf, alloc, id);
+        try rpc.packStr(buf, alloc, method);
     }
 
     pub fn sendNotificationHeader(self: *Core, buf: *rpc.Buf, method: []const u8) !void {
@@ -2739,7 +4389,7 @@ pub const Core = struct {
 
     pub fn requestGetApiInfo(self: *Core) !void {
         const id = self.nextMsgId();
-        self.get_api_info_msgid = id;  // Save msgid for response matching
+        self.get_api_info_msgid = id; // Save msgid for response matching
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
@@ -2773,15 +4423,10 @@ pub const Core = struct {
         self.log.write("rpc send: nvim_set_client_info (id={d})\n", .{id});
     }
 
-    pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendNotificationHeader(&buf, "nvim_ui_attach");
-
-        try rpc.packArray(&buf, self.alloc, 3);
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
+    fn packUiAttachParams(self: *Core, buf: *rpc.Buf, rows: u32, cols: u32) !void {
+        try rpc.packArray(buf, self.alloc, 3);
+        try rpc.packInt(buf, self.alloc, @as(i64, @intCast(cols)));
+        try rpc.packInt(buf, self.alloc, @as(i64, @intCast(rows)));
 
         // Option count: ext_multigrid, rgb (always) + optional ext_*
         var opt_count: u32 = 2;
@@ -2790,40 +4435,74 @@ pub const Core = struct {
         if (self.ext_popupmenu_enabled) opt_count += 1;
         if (self.ext_messages_enabled) opt_count += 1;
         if (self.ext_tabline_enabled) opt_count += 1;
-        try rpc.packMap(&buf, self.alloc, opt_count);
-        try rpc.packStr(&buf, self.alloc, "ext_multigrid");
-        try rpc.packBool(&buf, self.alloc, true);
-        try rpc.packStr(&buf, self.alloc, "rgb");
-        try rpc.packBool(&buf, self.alloc, true);
+        try rpc.packMap(buf, self.alloc, opt_count);
+        try rpc.packStr(buf, self.alloc, "ext_multigrid");
+        try rpc.packBool(buf, self.alloc, true);
+        try rpc.packStr(buf, self.alloc, "rgb");
+        try rpc.packBool(buf, self.alloc, true);
 
         if (self.ext_windows_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_windows");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_windows");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_cmdline_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_cmdline");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_cmdline");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_popupmenu_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_popupmenu");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_popupmenu");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_messages_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_messages");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_messages");
+            try rpc.packBool(buf, self.alloc, true);
         }
 
         if (self.ext_tabline_enabled) {
-            try rpc.packStr(&buf, self.alloc, "ext_tabline");
-            try rpc.packBool(&buf, self.alloc, true);
+            try rpc.packStr(buf, self.alloc, "ext_tabline");
+            try rpc.packBool(buf, self.alloc, true);
         }
+    }
+
+    pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendNotificationHeader(&buf, "nvim_ui_attach");
+        try self.packUiAttachParams(&buf, rows, cols);
 
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_attach (notification, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
+    }
+
+    /// Tracked variants are used only by redraw recovery. Neovim flushes any
+    /// pending UI bytes before serializing an RPC response on the same channel,
+    /// which makes the detach response a strict old-epoch boundary and the
+    /// attach response a completion marker for the fresh full-state replay.
+    pub fn requestUiDetachTracked(self: *Core) !i64 {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_detach");
+        try rpc.packArray(&buf, self.alloc, 0);
+        try self.sendRaw(buf.items);
+        return id;
+    }
+
+    pub fn requestUiAttachTracked(self: *Core, rows: u32, cols: u32) !i64 {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_attach");
+        try self.packUiAttachParams(&buf, rows, cols);
+        try self.sendRaw(buf.items);
+        return id;
     }
 
     /// Notify Neovim of window focus change via nvim_ui_set_focus.
@@ -2831,58 +4510,95 @@ pub const Core = struct {
     /// If called before nvim_ui_attach, the focus state is deferred and
     /// sent automatically once the UI session is established.
     pub fn requestUiSetFocus(self: *Core, gained: bool) void {
+        // Serialize the attached check, pending publication, and delivery with
+        // attach completion. This prevents a stale false observation from
+        // publishing pending focus after the attach thread already drained it.
+        self.pending_resize_mu.lockUncancelable(clock.io());
+        defer self.pending_resize_mu.unlock(clock.io());
+
+        self.pending_focus.store(if (gained) 1 else 2, .seq_cst);
+        self.pending_focus_sequence = self.nextPendingUiStateSequenceLocked();
         if (!self.ui_attached.load(.seq_cst)) {
-            // UI not attached yet — store for later delivery.
-            self.pending_focus.store(if (gained) 1 else 2, .seq_cst);
             self.log.write("requestUiSetFocus: deferred (gained={any})\n", .{gained});
             return;
         }
-        self.requestUiSetFocusInternal(gained) catch |e| {
-            self.log.write("requestUiSetFocus error: {any}\n", .{e});
-        };
+        self.flushPendingUiStateLocked();
     }
 
     fn requestUiSetFocusInternal(self: *Core, gained: bool) !void {
         const id = self.nextMsgId();
+        var storage: [UI_STATE_RPC_STACK_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const fixed_alloc = fixed.allocator();
         var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
+        defer buf.deinit(fixed_alloc);
 
-        try self.sendRequestHeader(&buf, id, "nvim_ui_set_focus");
+        try packRequestHeader(&buf, fixed_alloc, id, "nvim_ui_set_focus");
 
-        try rpc.packArray(&buf, self.alloc, 1);
-        try rpc.packBool(&buf, self.alloc, gained);
+        try rpc.packArray(&buf, fixed_alloc, 1);
+        try rpc.packBool(&buf, fixed_alloc, gained);
 
-        try self.sendRaw(buf.items);
+        try self.sendUiStateRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_set_focus (id={d}, gained={any})\n", .{ id, gained });
     }
 
-    /// Send any focus state that was deferred before nvim_ui_attach.
-    pub fn flushPendingFocus(self: *Core) void {
-        const pending = self.pending_focus.swap(0, .seq_cst);
-        if (pending == 1) {
-            self.requestUiSetFocusInternal(true) catch |e| {
-                self.log.write("flushPendingFocus error: {any}\n", .{e});
+    fn nextPendingUiStateSequenceLocked(self: *Core) u64 {
+        self.pending_ui_state_sequence +%= 1;
+        if (self.pending_ui_state_sequence == 0) self.pending_ui_state_sequence = 1;
+        return self.pending_ui_state_sequence;
+    }
+
+    /// Drain deferred focus/resize in their original publication order. The
+    /// caller holds pending_resize_mu, so a newer UI event cannot replace a
+    /// record between selection and its FIFO enqueue.
+    pub fn flushPendingUiStateLocked(self: *Core) void {
+        while (true) {
+            const focus = self.pending_focus.load(.seq_cst);
+            const have_resize = self.pending_resize_valid;
+            if (focus == 0 and !have_resize) return;
+
+            const send_resize = have_resize and
+                (focus == 0 or self.pending_resize_sequence < self.pending_focus_sequence);
+            if (send_resize) {
+                const rows = self.pending_resize_rows;
+                const cols = self.pending_resize_cols;
+                self.requestTryResize(rows, cols) catch |e| {
+                    self.log.write(
+                        "pending resize send failed: {any} rows={d} cols={d}\n",
+                        .{ e, rows, cols },
+                    );
+                    return;
+                };
+                self.pending_resize_valid = false;
+                self.pending_resize_sequence = 0;
+                continue;
+            }
+
+            self.requestUiSetFocusInternal(focus == 1) catch |e| {
+                self.log.write("pending focus send failed: {any}\n", .{e});
+                return;
             };
-        } else if (pending == 2) {
-            self.requestUiSetFocusInternal(false) catch |e| {
-                self.log.write("flushPendingFocus error: {any}\n", .{e});
-            };
+            self.pending_focus.store(0, .seq_cst);
+            self.pending_focus_sequence = 0;
         }
     }
 
     pub fn requestTryResize(self: *Core, rows: u32, cols: u32) !void {
         const id = self.nextMsgId();
+        var storage: [UI_STATE_RPC_STACK_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const fixed_alloc = fixed.allocator();
         var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
+        defer buf.deinit(fixed_alloc);
 
-        try self.sendRequestHeader(&buf, id, "nvim_ui_try_resize");
+        try packRequestHeader(&buf, fixed_alloc, id, "nvim_ui_try_resize");
 
-        try rpc.packArray(&buf, self.alloc, 2);
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(cols)));
-        try rpc.packInt(&buf, self.alloc, @as(i64, @intCast(rows)));
+        try rpc.packArray(&buf, fixed_alloc, 2);
+        try rpc.packInt(&buf, fixed_alloc, @as(i64, @intCast(cols)));
+        try rpc.packInt(&buf, fixed_alloc, @as(i64, @intCast(rows)));
 
-        try self.sendRaw(buf.items);
+        try self.sendUiStateRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_try_resize (id={d}, rows={d}, cols={d})\n", .{ id, rows, cols });
     }
@@ -3589,7 +5305,6 @@ pub const Core = struct {
 
     const FlushCtx = flush.FlushCtx;
 
-
     // --- Forwarding stubs for rpc_session.zig ---
 
     pub fn containsPasswordPrompt(data: []const u8) bool {
@@ -3640,7 +5355,6 @@ pub const Core = struct {
         rpc_session.handleRpcNotification(self, arena, top);
     }
 
-
     /// Compare current external_grids with known_external_grids and notify frontend.
     /// Returns true if new external grids were added (need forced render).
 
@@ -3663,7 +5377,7 @@ pub const Core = struct {
     }
 
     pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_level: u32) void {
-        flush.sendCmdlineBlockShow(self, current_line_visible, visible_level);
+        _ = flush.sendCmdlineBlockShow(self, current_line_visible, visible_level);
     }
 
     pub fn sendCmdlineHide(self: *Core) void {
@@ -3679,7 +5393,7 @@ pub const Core = struct {
     }
 
     pub fn sendPopupmenuShow(self: *Core) void {
-        flush.sendPopupmenuShow(self);
+        _ = flush.sendPopupmenuShow(self);
     }
 
     pub fn sendPopupmenuHide(self: *Core) void {
@@ -3703,8 +5417,8 @@ pub const Core = struct {
         flush.buildMsgLineCache(self);
     }
 
-    pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) void {
-        flush.renderMsgGridFromCache(self, scroll_offset);
+    pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
+        return flush.renderMsgGridFromCache(self, scroll_offset);
     }
 
     pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
@@ -3756,13 +5470,12 @@ pub const Core = struct {
     }
 
     pub fn sendMsgHistoryShow(self: *Core) void {
-        flush.sendMsgHistoryShow(self);
+        _ = flush.sendMsgHistoryShow(self);
     }
 
     pub fn hideMsgHistory(self: *Core) void {
         flush.hideMsgHistory(self);
     }
-
 
     /// Set a Neovim global variable via nvim_set_var
     fn requestSetVar(self: *Core, name: []const u8, value: []const u8) !void {
@@ -3795,9 +5508,1607 @@ pub const Core = struct {
         return flush.countDisplayWidth(s);
     }
 
-
-
     fn runLoop(self: *Core) void {
+        self.rpc_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+        defer self.rpc_thread_id.store(0, .release);
         rpc_session.runLoop(self);
     }
 };
+
+fn checkScrollLedgerResizeAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    try core.ensureScrollCache(2);
+    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22 });
+
+    core.ensureScrollCache(64) catch |err| {
+        try std.testing.expectEqualSlices(
+            usize,
+            &.{ 11, 22 },
+            core.main_vertex_row_counts.items[0..2],
+        );
+        if (core.main_vertex_row_counts.items.len > 2) {
+            for (core.main_vertex_row_counts.items[2..]) |count| {
+                try std.testing.expectEqual(@as(usize, 0), count);
+            }
+        }
+        return err;
+    };
+}
+
+test "scroll ledger resize remains initialized on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkScrollLedgerResizeAllocationFailure,
+        .{},
+    );
+}
+
+test "scroll ledger structural changes keep vertex aggregate synchronized" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.ensureScrollCache(3);
+    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22, 33 });
+    core.main_surface_vertex_count = 66;
+    core.flush_vertex_count_aggregate = 166;
+
+    try core.ensureScrollCache(2);
+    try std.testing.expectEqual(@as(usize, 33), core.main_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 133), core.flush_vertex_count_aggregate);
+
+    core.invalidateScrollCache();
+    try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
+}
+
+const AtlasFailureTestState = struct {
+    core: *Core,
+    raster_calls: u32 = 0,
+    upload_calls: u32 = 0,
+    create_calls: u32 = 0,
+    abort_upload: bool = false,
+    abort_create: bool = false,
+    abort_raster: bool = false,
+    raster_miss: bool = false,
+
+    fn rasterize(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = scalar;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.raster_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        if (self.abort_raster) self.core.flush_aborted = true;
+        return if (self.raster_miss) 0 else 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.upload_calls += 1;
+        if (self.abort_upload) self.core.flush_aborted = true;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = atlas_w;
+        _ = atlas_h;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.create_calls += 1;
+        if (self.abort_create) self.core.flush_aborted = true;
+    }
+};
+
+const AsciiPreloadTestState = struct {
+    core: *Core,
+    table_calls: u32 = 0,
+    raster_calls: u32 = 0,
+    scalar_calls: u32 = 0,
+    upload_calls: u32 = 0,
+    create_calls: u32 = 0,
+    abort_table_after: u32 = 0,
+    abort_raster_after: u32 = 0,
+    by_id_miss: bool = false,
+
+    fn getTable(
+        ctx: ?*anyopaque,
+        style_flags: u32,
+        out_glyph_ids: [*]u32,
+        out_x_advances: [*]i32,
+        out_lig_triggers: [*]u8,
+    ) callconv(.c) c_int {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.table_calls += 1;
+        @memset(out_glyph_ids[0..128], 0);
+        @memset(out_x_advances[0..128], 64);
+        @memset(out_lig_triggers[0..128], 0);
+        const style_index: u32 =
+            @as(u32, if (style_flags & c_api.STYLE_BOLD != 0) 1 else 0) +
+            @as(u32, if (style_flags & c_api.STYLE_ITALIC != 0) 2 else 0);
+        out_glyph_ids['A'] = 100 + style_index;
+        if (self.abort_table_after != 0 and self.table_calls == self.abort_table_after) {
+            self.core.flush_aborted = true;
+        }
+        return 1;
+    }
+
+    fn rasterizeById(
+        ctx: ?*anyopaque,
+        glyph_id: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = glyph_id;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.raster_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        if (self.abort_raster_after != 0 and self.raster_calls == self.abort_raster_after) {
+            self.core.flush_aborted = true;
+        }
+        return if (self.by_id_miss) 0 else 1;
+    }
+
+    fn rasterizeScalar(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = scalar;
+        _ = style_flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.scalar_calls += 1;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        return 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.upload_calls += 1;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = atlas_w;
+        _ = atlas_h;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.create_calls += 1;
+    }
+};
+
+test "glyph cache two-choice probe preserves a primary collision" {
+    var keys = [_]u64{GLYPH_CACHE_INVALID_KEY} ** 8;
+    const hash: u64 = 3;
+    const key_a: u64 = 0x100;
+    const probe_a = glyphCacheProbe(&keys, key_a, hash);
+    keys[probe_a.insert] = key_a;
+
+    var key_b: u64 = key_a + 1;
+    var probe_b = glyphCacheProbe(&keys, key_b, hash);
+    while (probe_b.insert == probe_a.insert) : (key_b += 1) {
+        probe_b = glyphCacheProbe(&keys, key_b, hash);
+    }
+    keys[probe_b.insert] = key_b;
+
+    try std.testing.expectEqual(probe_a.insert, glyphCacheProbe(&keys, key_a, hash).hit.?);
+    try std.testing.expectEqual(probe_b.insert, glyphCacheProbe(&keys, key_b, hash).hit.?);
+}
+
+test "aborted atlas upload rolls back shelf allocation" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .abort_upload = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    const after_first = core.atlas_packer.?;
+    try std.testing.expectEqual(@as(u32, 1), after_first.next_x);
+    try std.testing.expectEqual(@as(u32, 1), after_first.next_y);
+    try std.testing.expectEqual(@as(u32, 0), after_first.row_h);
+
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    const after_second = core.atlas_packer.?;
+    try std.testing.expectEqual(after_first.next_x, after_second.next_x);
+    try std.testing.expectEqual(after_first.next_y, after_second.next_y);
+    try std.testing.expectEqual(after_first.row_h, after_second.row_h);
+    try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
+}
+
+test "atlas create abort stops raster and retries creation" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .abort_create = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) == null);
+    try std.testing.expectEqual(@as(u32, 1), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+    try std.testing.expect(!core.atlas_initialized);
+    try std.testing.expect(core.atlas_packer == null);
+
+    state.abort_create = false;
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    try std.testing.expectEqual(@as(u32, 2), state.create_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
+}
+
+test "atlas reset create abort stops before upload" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    try std.testing.expect(core.ensureGlyphPhase2('A', 0) != null);
+    const uploads_before = state.upload_calls;
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_full_resets_this_flush = 0;
+    state.abort_create = true;
+
+    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expectEqual(uploads_before, state.upload_calls);
+    try std.testing.expect(!core.atlas_initialized);
+    try std.testing.expect(core.atlas_packer == null);
+}
+
+test "rasterizer miss returns a cacheable blank while explicit abort stays null" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .raster_miss = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_rasterize_glyph_by_id = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+
+    const id_blank = core.ensureGlyphByID(123, c_api.STYLE_BOLD).?;
+    try std.testing.expectEqual(@as(f32, 0), id_blank.bbox_size_px[0]);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+
+    const scalar_blank = core.ensureGlyphPhase2('A', 0).?;
+    try std.testing.expectEqual(@as(f32, 0), scalar_blank.bbox_size_px[0]);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    const first_retry_at = core.transient_glyph_retry_at.?;
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(first_retry_at, core.transient_glyph_retry_at.?);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+
+    core.resetAtlasMaintenanceBackoff();
+    state.abort_raster = true;
+    core.flush_aborted = false;
+    try std.testing.expect(core.ensureGlyphPhase2('B', 0) == null);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+}
+
+test "ASCII table and pre-raster callbacks stop immediately on abort" {
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        var state = AsciiPreloadTestState{ .core = &core, .abort_table_after = 2 };
+        core.ctx = &state;
+        core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+        core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+        core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+        core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+        try std.testing.expect(!core.loadAsciiTables());
+        try std.testing.expectEqual(@as(u32, 2), state.table_calls);
+        try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+        try std.testing.expect(!core.ascii_tables_valid);
+    }
+
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        var state = AsciiPreloadTestState{ .core = &core, .abort_raster_after = 2 };
+        core.ctx = &state;
+        core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+        core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+        core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+        core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+        try std.testing.expect(!core.loadAsciiTables());
+        try std.testing.expectEqual(@as(u32, 4), state.table_calls);
+        try std.testing.expectEqual(@as(u32, 2), state.raster_calls);
+        try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
+        try std.testing.expect(!core.ascii_tables_valid);
+    }
+}
+
+test "ASCII pre-raster mirrors by-ID entries into canonical scalar slots" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AsciiPreloadTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+    core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+    core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+    core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+    try std.testing.expect(core.loadAsciiTables());
+    try std.testing.expect(core.ascii_tables_valid);
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+        try std.testing.expect(core.glyph_cache_ascii.?[scalar_index].bbox_size_px[0] > 0);
+        core.glyph_valid_ascii.?[scalar_index] = false;
+    }
+
+    // A second preload hits the by-ID cache, repairs the scalar aliases, and
+    // performs no duplicate rasterization or upload.
+    try std.testing.expect(core.preRasterizeAscii());
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.upload_calls);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+    }
+}
+
+test "ASCII pre-raster resolves a blank by-ID entry through scalar fallback" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AsciiPreloadTestState{ .core = &core, .by_id_miss = true };
+    core.ctx = &state;
+    core.cb.on_get_ascii_table = AsciiPreloadTestState.getTable;
+    core.cb.on_rasterize_glyph_by_id = AsciiPreloadTestState.rasterizeById;
+    core.cb.on_rasterize_glyph = AsciiPreloadTestState.rasterizeScalar;
+    core.cb.on_atlas_upload = AsciiPreloadTestState.upload;
+    core.cb.on_atlas_create = AsciiPreloadTestState.create;
+
+    try std.testing.expect(core.loadAsciiTables());
+    try std.testing.expectEqual(@as(u32, 4), state.raster_calls);
+    try std.testing.expectEqual(@as(u32, 4), state.scalar_calls);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    for (0..4) |style_index| {
+        const scalar_index = @as(usize, 'A') * 4 + style_index;
+        try std.testing.expect(core.glyph_valid_ascii.?[scalar_index]);
+        try std.testing.expect(core.glyph_cache_ascii.?[scalar_index].bbox_size_px[0] > 0);
+    }
+}
+
+test "unrepresentable glyph bitmap dimensions return blank without upload" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    const packer_before = core.atlas_packer.?;
+    const reset_seq_before = core.atlas_reset_seq;
+
+    var hostile = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = std.math.maxInt(u32),
+        .height = 1,
+        .pitch = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 192,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    const too_wide = core.packAndUploadBitmap(&hostile).?;
+    try std.testing.expectEqual(@as(f32, 0), too_wide.bbox_size_px[0]);
+    try std.testing.expectEqual(@as(f32, 3), too_wide.advance_px);
+
+    hostile.width = 1;
+    hostile.height = std.math.maxInt(u32);
+    const too_tall = core.packAndUploadBitmap(&hostile).?;
+    try std.testing.expectEqual(@as(f32, 0), too_tall.bbox_size_px[1]);
+    try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
+    try std.testing.expectEqual(reset_seq_before, core.atlas_reset_seq);
+    try std.testing.expectEqualDeep(packer_before, core.atlas_packer.?);
+}
+
+test "atlas grows and maximum-size full retry converges" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.atlas_w = 8;
+    core.atlas_h = 8;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(8, 8);
+    core.atlas_initialized = true;
+    const grow_bitmap = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = 10,
+        .height = 10,
+        .pitch = 10,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 64,
+        .ascent_px = 8,
+        .descent_px = 2,
+        .bytes_per_pixel = 1,
+    };
+    const grown = core.packAndUploadBitmap(&grow_bitmap).?;
+    try std.testing.expect(core.atlas_w >= 16 and core.atlas_h >= 16);
+    try std.testing.expect(core.atlas_reset_during_flush);
+    try std.testing.expect(grown.bbox_size_px[0] > 0);
+
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_reset_during_flush = false;
+    const reset_seq = core.atlas_reset_seq;
+    const oversized = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = config.atlas_size_max,
+        .height = 1,
+        .pitch = config.atlas_size_max,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 128,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    const missed = core.packAndUploadBitmap(&oversized).?;
+    try std.testing.expectEqual(@as(f32, 0), missed.bbox_size_px[0]);
+    try std.testing.expectEqual(reset_seq, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+
+    // A packer-full miss at max gets exactly one same-size reset so the
+    // working set can change. A second full condition in the same flush is
+    // blank-negative-cached without another reset.
+    const small = c_api.GlyphBitmap{
+        .pixels = null,
+        .width = 1,
+        .height = 1,
+        .pitch = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+        .advance_26_6 = 64,
+        .ascent_px = 1,
+        .descent_px = 0,
+        .bytes_per_pixel = 1,
+    };
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_reset_during_flush = false;
+    const before_full = core.atlas_reset_seq;
+    const first = core.packAndUploadBitmap(&small).?;
+    try std.testing.expect(first.bbox_size_px[0] > 0);
+    try std.testing.expectEqual(before_full +% 1, core.atlas_reset_seq);
+    try std.testing.expectEqual(@as(u8, 1), core.atlas_full_resets_this_flush);
+
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    core.atlas_reset_during_flush = false;
+    const before_second = core.atlas_reset_seq;
+    const second = core.packAndUploadBitmap(&small).?;
+    try std.testing.expectEqual(@as(f32, 0), second.bbox_size_px[0]);
+    try std.testing.expectEqual(before_second, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_reset_during_flush);
+    try std.testing.expect(core.atlas_has_capacity_negative);
+
+    // A working-set change schedules one delayed reprobe rather than
+    // recreating a maximum atlas synchronously.
+    const before_revision_changes = core.atlas_reset_seq;
+    try core.grid.resizeGrid(1, 2, 2);
+    core.grid.putCell(0, 0, 'x', 0);
+    core.grid.scrollGrid(1, 0, 2, 0, 2, 1, 0);
+    try core.hl.define(7, null, null, null, false, 0, .{ .bold = true }, false);
+    const schedule_now: i128 = 10 * std.time.ns_per_s;
+    const retry_at = schedule_now + 250 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(schedule_now));
+    try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(retry_at, flush.nextMsgTimeoutNs(&core).?);
+
+    // Until the scheduled deadline, repeated new-glyph edits remain negative
+    // cached. They neither recreate the maximum texture nor postpone the
+    // absolute deadline, even though each is a new flush with a fresh local
+    // same-size-reset budget.
+    const ordinary_flush_times = [_]i128{
+        schedule_now + 1,
+        schedule_now + 100 * std.time.ns_per_ms,
+    };
+    for (ordinary_flush_times) |ordinary_now| {
+        core.grid.glyph_working_set_rev +%= 1;
+        try std.testing.expect(!core.prepareAtlasCapacityRetryAt(ordinary_now));
+        core.atlas_full_resets_this_flush = 0;
+        core.atlas_packer.?.next_y = config.atlas_size_max;
+        core.atlas_reset_during_flush = false;
+        const blocked = core.packAndUploadBitmap(&small).?;
+        try std.testing.expectEqual(@as(f32, 0), blocked.bbox_size_px[0]);
+        try std.testing.expectEqual(before_revision_changes, core.atlas_reset_seq);
+        try std.testing.expectEqual(@as(u8, 0), core.atlas_full_resets_this_flush);
+        try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+        try std.testing.expect(!core.atlas_negative_recovery_armed);
+        try std.testing.expect(!core.atlas_reset_during_flush);
+    }
+
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(retry_at));
+    try std.testing.expectEqual(before_revision_changes, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+
+    // A genuinely uncached glyph reaches the packer. On the next flush it may
+    // reactively perform exactly one same-size reset and recover capacity.
+    core.atlas_full_resets_this_flush = 0;
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    const recovered = core.packAndUploadBitmap(&small).?;
+    try std.testing.expect(recovered.bbox_size_px[0] > 0);
+    try std.testing.expectEqual(before_revision_changes +% 1, core.atlas_reset_seq);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    core.finishAtlasCapacityRetry();
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+}
+
+test "capacity-negative retry is selective and backs off after repeated failure" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+
+    const negative_index: usize = 'x';
+    const positive_index: usize = 'y';
+    core.glyph_cache_ascii.?[negative_index] = std.mem.zeroes(c_api.GlyphEntry);
+    core.glyph_valid_ascii.?[negative_index] = true;
+    var positive = std.mem.zeroes(c_api.GlyphEntry);
+    positive.bbox_size_px = .{ 1, 1 };
+    core.glyph_cache_ascii.?[positive_index] = positive;
+    core.glyph_valid_ascii.?[positive_index] = true;
+
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_grid_rev = core.grid.glyph_working_set_rev;
+    core.atlas_negative_retry_style_rev = core.hl.glyph_style_rev;
+    core.grid.glyph_working_set_rev +%= 1;
+    const first_now: i128 = 1 * std.time.ns_per_s;
+    const first_retry_at = first_now + 250 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_now));
+    try std.testing.expectEqual(first_retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(first_retry_at, flush.nextMsgTimeoutNs(&core).?);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(first_retry_at));
+    try std.testing.expect(!core.glyph_valid_ascii.?[negative_index]);
+    try std.testing.expect(core.glyph_valid_ascii.?[positive_index]);
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+
+    // Simulate the delayed reprobe finding the working set still impossible.
+    // The unchanged set gets no deadline and therefore cannot churn while idle.
+    core.recordAtlasCapacityNegative();
+    try std.testing.expectEqual(@as(i128, 500 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(first_retry_at + std.time.ns_per_s));
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+
+    const second_now = first_retry_at + 2 * std.time.ns_per_s;
+    core.grid.glyph_working_set_rev +%= 1;
+    const second_retry_at = second_now + 500 * std.time.ns_per_ms;
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(second_now));
+    try std.testing.expectEqual(second_retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expect(!core.prepareAtlasCapacityRetryAt(second_retry_at - 1));
+    try std.testing.expect(core.prepareAtlasCapacityRetryAt(second_retry_at));
+
+    // No renewed miss means the old negative left the visible working set.
+    // A successful flush retires the episode and restores the minimum delay.
+    core.finishAtlasCapacityRetry();
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expectEqual(@as(i128, 250 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_delay_ns = 4 * std.time.ns_per_s;
+    core.atlas_negative_recovery_armed = true;
+    core.resetAtlasCapacityRetryBackoff();
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expectEqual(@as(i128, 250 * std.time.ns_per_ms), core.atlas_negative_retry_delay_ns);
+}
+
+test "restart replaces connect cleanup policy before notifying observers" {
+    const State = struct {
+        core: *Core,
+        restart_calls: u32 = 0,
+        saw_pending_restart: bool = false,
+        saw_connect_hotswap: bool = true,
+        saw_keep_child_alive: bool = true,
+
+        fn onRestart(
+            ctx: ?*anyopaque,
+            listen_addr: [*]const u8,
+            listen_addr_len: usize,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.restart_calls += 1;
+            self.saw_pending_restart = self.core.restart_pending_addr != null and
+                std.mem.eql(u8, self.core.restart_pending_addr.?, listen_addr[0..listen_addr_len]);
+            self.saw_connect_hotswap = self.core.restart_pending_is_connect_hotswap;
+            self.saw_keep_child_alive = self.core.connect_keeps_child_alive;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_restart = State.onRestart;
+
+    try core.handleConnectEvent("old-server");
+    try std.testing.expect(core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(core.connect_keeps_child_alive);
+
+    try core.handleRestartEvent("new-server");
+    try std.testing.expectEqual(@as(u32, 1), state.restart_calls);
+    try std.testing.expect(state.saw_pending_restart);
+    try std.testing.expect(!state.saw_connect_hotswap);
+    try std.testing.expect(!state.saw_keep_child_alive);
+}
+
+fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+
+    try core.handleConnectEvent("old-connect");
+    const old = core.restart_pending_addr.?;
+    core.handleRestartEvent("new-restart") catch |err| {
+        try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);
+        try std.testing.expectEqualSlices(u8, "old-connect", core.restart_pending_addr.?);
+        try std.testing.expect(core.restart_pending_is_connect_hotswap);
+        try std.testing.expect(core.connect_keeps_child_alive);
+        return err;
+    };
+
+    try std.testing.expectEqualSlices(u8, "new-restart", core.restart_pending_addr.?);
+    try std.testing.expect(!core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(!core.connect_keeps_child_alive);
+}
+
+test "restart replacement OOM preserves pending connect address and policy" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRestartReplacementAllocationFailure,
+        .{},
+    );
+}
+
+fn checkConnectReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
+    var core = Core.initForTest(alloc);
+    defer core.deinitForTest();
+    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
+
+    try core.handleRestartEvent("old-restart");
+    const old = core.restart_pending_addr.?;
+    core.handleConnectEvent("new-connect") catch |err| {
+        try std.testing.expectEqual(old.ptr, core.restart_pending_addr.?.ptr);
+        try std.testing.expectEqualSlices(u8, "old-restart", core.restart_pending_addr.?);
+        try std.testing.expect(!core.restart_pending_is_connect_hotswap);
+        try std.testing.expect(!core.connect_keeps_child_alive);
+        return err;
+    };
+
+    try std.testing.expectEqualSlices(u8, "new-connect", core.restart_pending_addr.?);
+    try std.testing.expect(core.restart_pending_is_connect_hotswap);
+    try std.testing.expect(core.connect_keeps_child_alive);
+}
+
+test "connect replacement OOM preserves pending restart address and policy" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkConnectReplacementAllocationFailure,
+        .{},
+    );
+}
+
+test "transient glyph retries are bounded and restart after working-set change" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var now: i128 = 3 * std.time.ns_per_s;
+    core.recordTransientGlyphNegativeAt(now);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(now + 250 * std.time.ns_per_ms, core.transient_glyph_retry_at.?);
+    try std.testing.expectEqual(core.transient_glyph_retry_at.?, flush.nextMsgTimeoutNs(&core).?);
+
+    // Repeated misses before the timer fires must not postpone the deadline.
+    const first_retry_at = core.transient_glyph_retry_at.?;
+    core.recordTransientGlyphNegativeAt(now + 100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(first_retry_at, core.transient_glyph_retry_at.?);
+
+    const expected_delays = [_]i128{
+        250 * std.time.ns_per_ms,
+        500 * std.time.ns_per_ms,
+        1 * std.time.ns_per_s,
+        2 * std.time.ns_per_s,
+        4 * std.time.ns_per_s,
+    };
+    for (expected_delays, 0..) |delay_ns, attempt_index| {
+        const retry_at = core.transient_glyph_retry_at.?;
+        try std.testing.expectEqual(now + delay_ns, retry_at);
+        try std.testing.expect(!core.prepareAtlasMaintenanceAt(retry_at - 1));
+        try std.testing.expect(core.prepareAtlasMaintenanceAt(retry_at));
+        try std.testing.expect(core.transient_glyph_recovery_armed);
+
+        now = retry_at;
+        core.recordTransientGlyphNegativeAt(now);
+        try std.testing.expect(core.transient_glyph_has_negative);
+        try std.testing.expect(!core.transient_glyph_recovery_armed);
+        if (attempt_index + 1 < expected_delays.len) {
+            try std.testing.expectEqual(@as(u8, @intCast(attempt_index + 2)), core.transient_glyph_retry_attempts);
+            try std.testing.expect(core.transient_glyph_retry_at != null);
+        } else {
+            try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS, core.transient_glyph_retry_attempts);
+            try std.testing.expect(core.transient_glyph_retry_at == null);
+        }
+    }
+
+    // An unchanged unsupported glyph converges with no timer.
+    try std.testing.expect(!core.prepareAtlasMaintenanceAt(now + 10 * std.time.ns_per_s));
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+
+    // The blank remains cached, so prepare (not another raster callback) must
+    // notice a new working set and restart the bounded budget -- but at twice
+    // the previous episode's starting delay, not at the minimum. The working
+    // set changes on every edit (putCell bumps glyph_working_set_rev), so a
+    // restart at the minimum would re-run beginNegativeGlyphReprobe's
+    // full-screen invalidation indefinitely for one unrasterizable codepoint.
+    const changed_now = now + 20 * std.time.ns_per_s;
+    core.grid.glyph_working_set_rev +%= 1;
+    try std.testing.expect(!core.prepareAtlasMaintenanceAt(changed_now));
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    const restarted_at = changed_now + 2 * TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+    try std.testing.expectEqual(restarted_at, core.transient_glyph_retry_at.?);
+    try std.testing.expect(core.prepareAtlasMaintenanceAt(restarted_at));
+
+    // No renewed raster miss means the retry succeeded; successful commit
+    // clears the transient episode without touching capacity state.
+    core.finishAtlasMaintenance();
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(!core.transient_glyph_recovery_armed);
+    try std.testing.expectEqual(@as(u8, 0), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_INITIAL_NS, core.transient_glyph_retry_delay_ns);
+    // The cross-episode escalation must also be retired by a genuine success,
+    // otherwise it stays elevated for the process lifetime and every later
+    // first-miss reprobe is needlessly slow.
+    try std.testing.expectEqual(TRANSIENT_GLYPH_RETRY_INITIAL_NS, core.transient_glyph_episode_delay_ns);
+}
+
+test "maintenance abort rearms capacity and transient retries without consuming attempts" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const now: i128 = 5 * std.time.ns_per_s;
+    core.recordTransientGlyphNegativeAt(now);
+    core.atlas_has_capacity_negative = true;
+    core.atlas_negative_retry_at = now + TRANSIENT_GLYPH_RETRY_INITIAL_NS;
+    try std.testing.expect(core.prepareAtlasMaintenanceAt(now + TRANSIENT_GLYPH_RETRY_INITIAL_NS));
+    try std.testing.expect(core.atlas_negative_recovery_armed);
+    try std.testing.expect(core.transient_glyph_recovery_armed);
+
+    const retry_at = now + std.time.ns_per_s;
+    core.rearmAtlasMaintenanceAfterAbort(retry_at);
+    try std.testing.expect(core.atlas_has_capacity_negative);
+    try std.testing.expect(core.transient_glyph_has_negative);
+    try std.testing.expect(!core.atlas_negative_recovery_armed);
+    try std.testing.expect(!core.transient_glyph_recovery_armed);
+    try std.testing.expectEqual(@as(u8, 1), core.transient_glyph_retry_attempts);
+    try std.testing.expectEqual(retry_at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(retry_at, core.transient_glyph_retry_at.?);
+
+    core.resetAtlasMaintenanceBackoff();
+    try std.testing.expect(!core.atlas_has_capacity_negative);
+    try std.testing.expect(!core.transient_glyph_has_negative);
+    try std.testing.expect(core.atlas_negative_retry_at == null);
+    try std.testing.expect(core.transient_glyph_retry_at == null);
+    try std.testing.expectEqual(@as(u8, 0), core.transient_glyph_retry_attempts);
+}
+
+test "maintenance timeout selects earliest independent glyph deadline" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.atlas_negative_retry_at = 900;
+    core.transient_glyph_retry_at = 700;
+    try std.testing.expectEqual(@as(i128, 700), flush.nextMsgTimeoutNs(&core).?);
+    core.transient_glyph_retry_at = 1_100;
+    try std.testing.expectEqual(@as(i128, 900), flush.nextMsgTimeoutNs(&core).?);
+}
+
+test "Core stop owns teardown exactly once" {
+    var core = Core.initForTest(std.testing.allocator);
+    core.stop();
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+    try std.testing.expectEqual(@as(u8, 2), core.stop_state.load(.acquire));
+}
+
+test "RPC-thread stop requests shutdown without joining itself" {
+    const Worker = struct {
+        fn run(core: *Core, returned: *std.atomic.Value(bool)) void {
+            core.rpc_thread_id.store(@intCast(std.Thread.getCurrentId()), .release);
+            core.stop();
+            core.rpc_thread_id.store(0, .release);
+            returned.store(true, .release);
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    var returned = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &core, &returned });
+    core.thread = thread;
+
+    while (!returned.load(.acquire)) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u8, 0), core.stop_state.load(.acquire));
+
+    // The lifecycle thread takes ownership and joins the already-returned RPC
+    // thread before releasing Core resources.
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+}
+
+test "asynchronous hard failure wakes a socket RPC reader" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var sockets: [2]std.posix.socket_t = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.socketpair(
+        std.posix.AF.UNIX,
+        std.posix.SOCK.STREAM,
+        0,
+        &sockets,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+
+    const local_file = std.Io.File{ .handle = sockets[0], .flags = .{ .nonblocking = false } };
+    const peer_file = std.Io.File{ .handle = sockets[1], .flags = .{ .nonblocking = false } };
+    defer peer_file.close(clock.io());
+
+    const Reader = struct {
+        fn run(
+            stream: Stream,
+            entered: *std.atomic.Value(bool),
+            returned: *std.atomic.Value(bool),
+        ) void {
+            var byte: [1]u8 = undefined;
+            entered.store(true, .release);
+            _ = stream.read(&byte) catch {};
+            returned.store(true, .release);
+        }
+    };
+
+    // wakeRpcReaderForHardFailure reports a failed shutdown through the log
+    // rather than a return value, and initForTest leaves the log detached.
+    // Surface it: a wake that silently no-ops is exactly the failure this
+    // test exists to catch, and without this the reason never reaches anyone.
+    const Diag = struct {
+        fn write(_: ?*anyopaque, msg: [*]const u8, len: usize) callconv(.c) void {
+            std.debug.print("[wake-test] {s}", .{msg[0..len]});
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.log.cb = Diag.write;
+    core.stdin_file = Stream.fromFile(local_file);
+    core.transport_kind = .socket;
+    var entered = std.atomic.Value(bool).init(false);
+    var returned = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(
+        .{},
+        Reader.run,
+        .{ core.stdin_file.?, &entered, &returned },
+    );
+
+    // The interesting case is a reader already parked in the read syscall, so
+    // wait for it to get there. Without this the wake can land before the
+    // reader ever blocks, and the test silently stops covering the wake.
+    while (!entered.load(.acquire)) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+
+    core.failHardRender(error.VertexBudgetExceeded);
+    core.wakeRpcReaderForHardFailure();
+
+    // Bounded: a wake that does not release the reader must fail the test
+    // rather than hang it. Shutting the peer end down is the fallback that
+    // guarantees EOF, so the thread is always joinable. Use the raw syscall
+    // rather than closing peer_file, which the defer above already owns.
+    const deadline_ns: i128 = clock.nowNs() + 5 * std.time.ns_per_s;
+    while (!returned.load(.acquire) and clock.nowNs() < deadline_ns) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    const woke = returned.load(.acquire);
+    if (!woke) _ = std.posix.system.shutdown(sockets[1], std.posix.SHUT.RDWR);
+    reader.join();
+
+    core.stdin_file = null;
+    local_file.close(clock.io());
+
+    if (!woke) return error.HardFailureWakeDidNotReleaseReader;
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+}
+
+test "on_log stop stays non-blocking while teardown mutex is held" {
+    const Callback = struct {
+        fn log(ctx: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {
+            const core: *Core = @ptrCast(@alignCast(ctx.?));
+            core.stop();
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.log.cb = Callback.log;
+    core.log.ctx = &core;
+
+    // Models cleanup/teardown joining a callback worker while owning the
+    // transport mutex. The callback must only request cancellation.
+    core.child_handle_mu.lockUncancelable(clock.io());
+    core.stdin_close_mu.lockUncancelable(clock.io());
+    core.write_queue_mu.lockUncancelable(clock.io());
+    core.log.write("callback stop\n", .{});
+    core.write_queue_mu.unlock(clock.io());
+    core.stdin_close_mu.unlock(clock.io());
+    core.child_handle_mu.unlock(clock.io());
+
+    try std.testing.expect(core.stop_flag.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), core.stop_state.load(.acquire));
+    core.log.cb = null;
+    core.stop();
+    try std.testing.expect(core.waitUntilStopped());
+}
+
+test "session reset republishes the latest desired resize" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    _ = core.resize(47, 113);
+    // Model a successful enqueue to the old session: pending delivery was
+    // cleared, but the queue can still be discarded by reconnect cleanup.
+    core.pending_resize_valid = false;
+    core.ui_attached.store(true, .release);
+    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, 32);
+    try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
+    try core.hl.setGroup("SessionOnly", 9);
+
+    core.resetSessionState();
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+    try std.testing.expect(core.pending_resize_valid);
+    try std.testing.expectEqual(@as(u32, 47), core.pending_resize_rows);
+    try std.testing.expectEqual(@as(u32, 113), core.pending_resize_cols);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
+    try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
+}
+
+test "redraw allocation failure poisons epoch and suppresses batch presentation" {
+    const TestCtx = struct {
+        row_callbacks: u32 = 0,
+
+        fn onVerticesRow(
+            opaque_ctx: ?*anyopaque,
+            _: i64,
+            _: u32,
+            _: u32,
+            _: ?[*]const c_api.Vertex,
+            _: usize,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {
+            const ctx: *@This() = @ptrCast(@alignCast(opaque_ctx.?));
+            ctx.row_callbacks += 1;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var test_ctx: TestCtx = .{};
+    var core = Core.init(failing.allocator(), .{ .on_vertices_row = TestCtx.onVerticesRow }, &test_ctx);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+
+    var cell_a_fields = [_]mp.Value{.{ .str = "A" }};
+    var cells_a = [_]mp.Value{.{ .arr = &cell_a_fields }};
+    var line_a_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 0 }, .{ .arr = &cells_a }, .{ .bool = false },
+    };
+    var line_a_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_a_tuple } };
+
+    var group_tuple = [_]mp.Value{ .{ .str = "RecoveryTest" }, .{ .int = 7 } };
+    var group_event = [_]mp.Value{ .{ .str = "hl_group_set" }, .{ .arr = &group_tuple } };
+
+    var cell_b_fields = [_]mp.Value{.{ .str = "B" }};
+    var cells_b = [_]mp.Value{.{ .arr = &cell_b_fields }};
+    var line_b_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 1 }, .{ .arr = &cells_b }, .{ .bool = false },
+    };
+    var line_b_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_b_tuple } };
+    var flush_event = [_]mp.Value{.{ .str = "flush" }};
+    var params = [_]mp.Value{
+        .{ .arr = &line_a_event },
+        .{ .arr = &group_event },
+        .{ .arr = &line_b_event },
+        .{ .arr = &flush_event },
+    };
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    // The next allocation is hl_group_set's duplicated group-name key.
+    failing.fail_index = failing.alloc_index;
+    rpc_session.handleRpcNotification(&core, failing.allocator(), &top);
+
+    try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCell(0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0), test_ctx.row_callbacks);
+    try std.testing.expect(!core.hl.groups.contains("RecoveryTest"));
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+}
+
+test "redraw detach response resets poisoned protocol state before reattach" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.setWinPos(2, 200, 0, 0);
+    try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
+    try core.hl.setGroup("PoisonedEpoch", 9);
+
+    core.redraw_recovery_state = .await_detach;
+    core.redraw_recovery_msgid = 77;
+    var response = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 77 },
+        .nil,
+        .nil,
+    };
+    rpc_session.handleRpcResponse(&core, &response);
+
+    // The test core has no writer thread, so queueing the fresh attach fails
+    // after reset. That still proves the detach-response boundary clears the
+    // complete old protocol epoch before any reattach can be attempted.
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), core.grid.sub_grids.count());
+    try std.testing.expectEqual(@as(usize, 0), core.grid.win_pos.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
+    try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
+}
+
+test "redraw recovery rejects old epoch and admits fresh attach replay" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 2);
+
+    var cell_fields = [_]mp.Value{.{ .str = "A" }};
+    var cells = [_]mp.Value{.{ .arr = &cell_fields }};
+    var line_tuple = [_]mp.Value{
+        .{ .int = 1 }, .{ .int = 0 }, .{ .int = 0 }, .{ .arr = &cells }, .{ .bool = false },
+    };
+    var line_event = [_]mp.Value{ .{ .str = "grid_line" }, .{ .arr = &line_tuple } };
+    var params = [_]mp.Value{.{ .arr = &line_event }};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    core.redraw_recovery_state = .await_detach;
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCell(0, 0).cp);
+
+    // Neovim serializes the fresh replay before the ui_attach response, so it
+    // must be accepted while that response is still pending.
+    core.redraw_recovery_state = .await_attach;
+    core.redraw_recovery_attempts = 1;
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u8, 1), core.redraw_recovery_attempts);
+}
+
+test "redraw recovery retains resize that cannot queue after fresh attach" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.redraw_recovery_state = .await_attach;
+    core.redraw_recovery_msgid = 91;
+    core.redraw_recovery_attach_rows = 24;
+    core.redraw_recovery_attach_cols = 80;
+    core.pending_resize_valid = true;
+    core.pending_resize_rows = 30;
+    core.pending_resize_cols = 100;
+    var response = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 91 },
+        .nil,
+        .nil,
+    };
+    rpc_session.handleRpcResponse(&core, &response);
+
+    try std.testing.expectEqual(RedrawRecoveryState.healthy, core.redraw_recovery_state);
+    try std.testing.expect(core.ui_attached.load(.acquire));
+    try std.testing.expect(core.pending_resize_valid);
+    try std.testing.expectEqual(@as(u32, 24), core.ui_attach_rows);
+    try std.testing.expectEqual(@as(u32, 80), core.ui_attach_cols);
+}
+
+test "focus send failure preserves the latest state for attach retry" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    core.ui_attached.store(true, .release);
+    core.requestUiSetFocus(true);
+
+    // A test core has no live writer, so the send fails. The focus state must
+    // remain pending for a future attachment.
+    try std.testing.expectEqual(@as(u8, 1), core.pending_focus.load(.acquire));
+}
+
+test "hard redraw resource limit fails the session without epoch retry" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var resize_tuple = [_]mp.Value{
+        .{ .int = 1 },
+        .{ .int = 80 },
+        .{ .int = @as(i64, grid_mod.MAX_GRID_ROWS) + 1 },
+    };
+    var resize_event = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_tuple } };
+    var params = [_]mp.Value{.{ .arr = &resize_event }};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u8, 0), core.redraw_recovery_attempts);
+    try std.testing.expectEqual(RedrawRecoveryState.healthy, core.redraw_recovery_state);
+}
+
+test "redraw post-processing failure poisons the attachment" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.pending_grid_resizes.append(core.alloc, .{
+        .grid_id = 9,
+        .width = 40,
+        .height = 12,
+    });
+
+    var params = [_]mp.Value{};
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "redraw" }, .{ .arr = &params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+
+    // The test core has no writer, so try_resize_grid fails. It must enter the
+    // same poisoned-session boundary instead of being logged and ignored.
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(!core.ui_attached.load(.acquire));
+}
+
+test "UI-state reserve preserves order across a full normal queue" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    defer core.stop();
+
+    var n0: rpc.Buf = .empty;
+    defer n0.deinit(core.alloc);
+    try core.sendRequestHeader(&n0, 10, "nvim_input");
+    try rpc.packArray(&n0, core.alloc, 1);
+    const n0_prefix_len = n0.items.len + 5;
+    const filler = try core.alloc.alloc(u8, Core.MAX_WRITE_QUEUE_SIZE - n0_prefix_len);
+    defer core.alloc.free(filler);
+    @memset(filler, 'x');
+    try rpc.packStr(&n0, core.alloc, filler);
+    try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE, n0.items.len);
+
+    var r1: rpc.Buf = .empty;
+    defer r1.deinit(core.alloc);
+    try core.sendRequestHeader(&r1, 11, "nvim_ui_set_focus");
+    try rpc.packArray(&r1, core.alloc, 1);
+    try rpc.packBool(&r1, core.alloc, false);
+
+    var n1: rpc.Buf = .empty;
+    defer n1.deinit(core.alloc);
+    try core.sendRequestHeader(&n1, 12, "nvim_input");
+    try rpc.packArray(&n1, core.alloc, 1);
+    try rpc.packStr(&n1, core.alloc, "y");
+
+    // Reproduce the reported failure boundary. N0 consumes the complete
+    // normal allowance, but R1 still appends to the same FIFO from reserved
+    // capacity. The writer then swaps N0+R1 before later N1 is produced.
+    {
+        core.write_queue_mu.lockUncancelable(clock.io());
+        defer core.write_queue_mu.unlock(clock.io());
+        try core.enqueueRawLocked(n0.items, .normal);
+        try core.enqueueRawLocked(r1.items, .ui_state);
+        try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE, core.write_queue_normal_bytes);
+        try std.testing.expectEqual(r1.items.len, core.write_queue_ui_state_bytes);
+        try std.testing.expectEqual(Core.MAX_WRITE_QUEUE_SIZE + r1.items.len, core.write_queue.items.len);
+        core.write_queue_cond.signal(clock.io());
+    }
+
+    var swap_waits: usize = 0;
+    while (swap_waits < 1000) : (swap_waits += 1) {
+        core.write_queue_mu.lockUncancelable(clock.io());
+        const swapped = core.write_queue_normal_bytes == 0 and
+            core.write_queue_ui_state_bytes == 0;
+        core.write_queue_mu.unlock(clock.io());
+        if (swapped) break;
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(swap_waits < 1000);
+    try core.sendRaw(n1.items);
+
+    const total_len = n0.items.len + r1.items.len + n1.items.len;
+    const actual = try std.testing.allocator.alloc(u8, total_len);
+    defer std.testing.allocator.free(actual);
+    const read_stream = Stream.fromFile(read_file);
+    var offset: usize = 0;
+    while (offset < actual.len) {
+        const n = try read_stream.read(actual[offset..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        offset += n;
+    }
+    var reader = mp.SliceReader{ .data = actual };
+    const decoded_n0 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_n0);
+    const decoded_r1 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_r1);
+    const decoded_n1 = try mp.decode(std.testing.allocator, &reader);
+    defer mp.freeValue(std.testing.allocator, decoded_n1);
+    try std.testing.expectEqual(actual.len, reader.i);
+    try std.testing.expectEqualStrings("nvim_input", decoded_n0.arr[2].str);
+    try std.testing.expectEqualStrings("nvim_ui_set_focus", decoded_r1.arr[2].str);
+    try std.testing.expect(!decoded_r1.arr[3].arr[0].bool);
+    try std.testing.expectEqualStrings("nvim_input", decoded_n1.arr[2].str);
+    try std.testing.expectEqualStrings("y", decoded_n1.arr[3].arr[0].str);
+    try std.testing.expect(core.write_queue.capacity <= Core.MAX_TOTAL_WRITE_QUEUE_SIZE);
+    try std.testing.expect(core.write_spare_queue.capacity <= Core.MAX_TOTAL_WRITE_QUEUE_SIZE);
+    try std.testing.expect(
+        core.write_queue.capacity + core.write_spare_queue.capacity <=
+            2 * Core.MAX_TOTAL_WRITE_QUEUE_SIZE,
+    );
+}
+
+test "pending focus and resize preserve publication order" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    defer core.stop();
+
+    var expected: rpc.Buf = .empty;
+    defer expected.deinit(core.alloc);
+    try core.sendRequestHeader(&expected, 1, "nvim_ui_set_focus");
+    try rpc.packArray(&expected, core.alloc, 1);
+    try rpc.packBool(&expected, core.alloc, false);
+    try core.sendRequestHeader(&expected, 2, "nvim_ui_try_resize");
+    try rpc.packArray(&expected, core.alloc, 2);
+    try rpc.packInt(&expected, core.alloc, 100);
+    try rpc.packInt(&expected, core.alloc, 30);
+    try core.sendRequestHeader(&expected, 3, "nvim_ui_try_resize");
+    try rpc.packArray(&expected, core.alloc, 2);
+    try rpc.packInt(&expected, core.alloc, 120);
+    try rpc.packInt(&expected, core.alloc, 40);
+    try core.sendRequestHeader(&expected, 4, "nvim_ui_set_focus");
+    try rpc.packArray(&expected, core.alloc, 1);
+    try rpc.packBool(&expected, core.alloc, true);
+
+    core.requestUiSetFocus(false);
+    _ = core.resize(30, 100);
+    core.pending_resize_mu.lockUncancelable(clock.io());
+    core.ui_attached.store(true, .release);
+    core.flushPendingUiStateLocked();
+    core.pending_resize_mu.unlock(clock.io());
+
+    core.ui_attached.store(false, .release);
+    _ = core.resize(40, 120);
+    core.requestUiSetFocus(true);
+    core.pending_resize_mu.lockUncancelable(clock.io());
+    core.ui_attached.store(true, .release);
+    core.flushPendingUiStateLocked();
+    core.pending_resize_mu.unlock(clock.io());
+
+    const actual = try std.testing.allocator.alloc(u8, expected.items.len);
+    defer std.testing.allocator.free(actual);
+    const read_stream = Stream.fromFile(read_file);
+    var used: usize = 0;
+    while (used < actual.len) {
+        const n = try read_stream.read(actual[used..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        used += n;
+    }
+    try std.testing.expectEqualSlices(u8, expected.items, actual);
+}
+
+test "writer stop cancels a full unread child pipe" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(std.testing.allocator);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+
+    const payload = try std.testing.allocator.alloc(u8, 512 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    try core.sendRaw(payload);
+
+    // Let the writer fill the kernel pipe and enter its WouldBlock retry.
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    core.stop();
+    try std.testing.expectEqual(@as(u8, 2), core.stop_state.load(.acquire));
+}
+
+test "complete visible-grid snapshot reports truncation from one lock state" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 40, 120);
+    var grid_id: i64 = 2;
+    while (grid_id < 22) : (grid_id += 1) {
+        try core.grid.resizeGrid(grid_id, 4, 8);
+        try core.grid.setWinPos(grid_id, 1000 + grid_id, @intCast(grid_id), 0);
+    }
+    try core.grid.resizeGrid(30, 3, 7);
+    try core.grid.putSyntheticExternal(30, .{
+        .win = 3000,
+        .start_row = 0,
+        .start_col = 0,
+    });
+
+    var out: [16]c_api.GridInfo = undefined;
+    const snapshot = core.tryGetVisibleGridsComplete(&out).?;
+    try std.testing.expectEqual(@as(usize, out.len), snapshot.written);
+    try std.testing.expectEqual(@as(usize, 22), snapshot.total);
+    try std.testing.expectEqual(@as(i64, 1), out[0].grid_id);
+
+    var empty: [0]c_api.GridInfo = .{};
+    const count_only = core.tryGetVisibleGridsComplete(&empty).?;
+    try std.testing.expectEqual(@as(usize, 0), count_only.written);
+    try std.testing.expectEqual(snapshot.total, count_only.total);
+
+    core.grid_mu.lockUncancelable(clock.io());
+    defer core.grid_mu.unlock(clock.io());
+    try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
+}
+
+test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 2, 2);
+    try core.grid.win_pos.put(core.grid.alloc, 2, .{
+        .row = std.math.maxInt(u32),
+        .col = std.math.maxInt(u32),
+    });
+    try core.grid.viewport_margins.put(core.grid.alloc, 2, .{
+        .top = std.math.maxInt(u32),
+        .bottom = std.math.maxInt(u32),
+        .left = std.math.maxInt(u32),
+        .right = std.math.maxInt(u32),
+    });
+
+    var out: [2]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_row);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_col);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_top);
+    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_right);
+
+    core.grid.cursor_grid = 1;
+    core.grid.cursor_row = std.math.maxInt(u32);
+    core.grid.cursor_col = std.math.maxInt(u32);
+    const cursor = core.getCursorPosition();
+    try std.testing.expectEqual(std.math.maxInt(i32), cursor.row);
+    try std.testing.expectEqual(std.math.maxInt(i32), cursor.col);
+}
+
+test "cmdline rendering consumes normalized hostile position and indent" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 8);
+    core.ext_cmdline_enabled = true;
+    const content = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "abc" }};
+    try core.grid.setCmdlineShow(
+        &content,
+        std.math.maxInt(u32),
+        ':',
+        "",
+        std.math.maxInt(u32),
+        1,
+        0,
+    );
+
+    core.notifyCmdlineChanges();
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(core.grid.sub_grids.contains(grid_mod.CMDLINE_GRID_ID));
+    try std.testing.expectEqual(@as(u32, 3), core.grid.getCmdlineState(1).?.pos);
+    try std.testing.expectEqual(@as(u32, 8), core.grid.getCmdlineState(1).?.indent);
+}
+
+// ---------------------------------------------------------------------------
+// Atlas reclamation eligibility
+// ---------------------------------------------------------------------------
+
+const AtlasGcTestCallbacks = struct {
+    fn rasterize(_: ?*anyopaque, _: u32, _: u32, _: *c_api.GlyphBitmap) callconv(.c) c_int {
+        return 0;
+    }
+    fn upload(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: *const c_api.GlyphBitmap) callconv(.c) void {}
+    fn create(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {}
+};
+
+/// A core whose main rows are all mirrored and empty, over a packer holding
+/// closed shelves from a previous epoch. Nothing references those shelves, so a
+/// collection that is allowed to run reclaims them.
+fn initCoreForAtlasGcTest(core: *Core, rows: u32) !void {
+    core.cb.on_rasterize_glyph = AtlasGcTestCallbacks.rasterize;
+    core.cb.on_atlas_upload = AtlasGcTestCallbacks.upload;
+    core.cb.on_atlas_create = AtlasGcTestCallbacks.create;
+
+    try core.grid.resize(rows, 4);
+    try core.ensureScrollCache(rows);
+    var r: u32 = 0;
+    while (r < rows) : (r += 1) core.scroll_cache_valid.set(r);
+
+    var packer = shelf_packer.ShelfPacker.init(16, 4096);
+    _ = packer.alloc(12, 1).?;
+    _ = packer.alloc(12, 1).?;
+    _ = packer.alloc(12, 1).?;
+    packer.beginEpoch();
+    core.atlas_packer = packer;
+}
+
+fn recycledShelfCount(core: *Core) u32 {
+    const packer = &(core.atlas_packer.?);
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while (i < packer.shelf_count) : (i += 1) {
+        if (packer.shelves[i].recycled) n += 1;
+    }
+    return n;
+}
+
+test "atlas reclamation runs when the frontend owns no surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(recycledShelfCount(&core) > 0);
+}
+
+test "atlas reclamation stands down for a frontend-owned surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    // The ordinary shape of a float: cell storage, placement, and a frontend
+    // surface the core was told about.
+    try core.grid.resizeGrid(7, 2, 2);
+    try core.grid.external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0 });
+    try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+
+    try std.testing.expect(!core.collectAtlasGarbage());
+    try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}
+
+test "atlas reclamation stands down for a surface that outlived its grid buffer" {
+    // grid_destroy can drop the GridBuf while the frontend surface is still on
+    // screen. Deriving eligibility from sub_grids missed exactly that window
+    // and reclaimed shelves the surface was still drawing from.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+
+    try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    try std.testing.expect(!core.grid.sub_grids.contains(7));
+
+    try std.testing.expect(!core.collectAtlasGarbage());
+    try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}

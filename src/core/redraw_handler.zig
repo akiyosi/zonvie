@@ -74,17 +74,20 @@ pub const RedrawEvent = enum {
 /// Parse Neovim ext type handle (tab, buffer, window handles).
 /// Neovim sends handles as ext types with data containing big-endian integer.
 fn parseExtHandle(ext: mp.Ext) i64 {
+    // Neovim encodes window/tab/buffer handles as MessagePack EXT with the
+    // payload itself a nested MessagePack integer (e.g. handle 128 is the
+    // 2-byte payload \xcc\x80: uint8 tag + value 128) — NOT a raw
+    // big-endian integer. Ported from mpack_stream.zig's parseExtHandle,
+    // the reference-correct implementation for the streaming decoder.
+    // This path is normally unreachable in practice: mp.decode's own `ext`
+    // branch already pre-unwraps well-formed integer payloads into `.int`
+    // before this function ever sees a `.ext` Value, so this only runs on
+    // malformed/edge-case payloads mp.decode itself failed to unwrap.
     if (ext.data.len == 0) return 0;
-    // Neovim typically sends 8-byte handles
-    if (ext.data.len >= 8) {
-        return @bitCast(std.mem.readInt(u64, ext.data[0..8], .big));
-    } else if (ext.data.len >= 4) {
-        return @as(i64, @bitCast(@as(u64, std.mem.readInt(u32, ext.data[0..4], .big))));
-    } else if (ext.data.len >= 2) {
-        return @as(i64, std.mem.readInt(u16, ext.data[0..2], .big));
-    } else {
-        return @as(i64, ext.data[0]);
-    }
+    var sr = mp.SliceReader{ .data = ext.data };
+    const ib0 = sr.readByte() catch return 0;
+    const v = mp.decodeInt(&sr, ib0) catch return 0;
+    return v;
 }
 
 fn firstCodepoint(utf8: []const u8) u32 {
@@ -107,25 +110,46 @@ fn firstCodepoint(utf8: []const u8) u32 {
 
 /// Extract all codepoints from a UTF-8 cell string into a stack buffer.
 /// Returns the number of codepoints written (including the first).
-/// If the string has only one codepoint, returns 1 (no overflow needed).
-fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) u32 {
+/// If the string exceeds the lossless inline cell representation, fail before
+/// mutating the grid instead of silently publishing a truncated cluster.
+fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
     if (utf8.len == 0) {
         buf[0] = 0;
         return 1;
     }
 
-    var it = std.unicode.Utf8Iterator{ .bytes = utf8, .i = 0 };
+    // Cell text arrives as unvalidated wire bytes, so the sequence length is
+    // probed before the cursor advances: Utf8Iterator.nextCodepointSlice traps
+    // on an invalid start byte and slices out of bounds on a truncated tail.
+    var i: usize = 0;
     var count: u32 = 0;
 
-    while (count < buf.len) {
-        const slice = it.nextCodepointSlice() orelse break;
-        const cp = std.unicode.utf8Decode(slice) catch {
+    while (count < buf.len and i < utf8.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(utf8[i]) catch {
             buf[count] = 0xFFFD;
             count += 1;
+            i += 1;
+            continue;
+        };
+        if (i + cp_len > utf8.len) {
+            buf[count] = 0xFFFD;
+            count += 1;
+            i = utf8.len;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(utf8[i .. i + cp_len]) catch {
+            buf[count] = 0xFFFD;
+            count += 1;
+            i += cp_len;
             continue;
         };
         buf[count] = @as(u32, cp);
         count += 1;
+        i += cp_len;
+    }
+
+    if (count == buf.len and i < utf8.len) {
+        return error.CellClusterTooLong;
     }
 
     if (count == 0) {
@@ -133,6 +157,24 @@ fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) u32 {
         return 1;
     }
     return count;
+}
+
+const ExtractedCellCodepoints = struct {
+    count: u32,
+    replaced_oversized: bool,
+};
+
+/// Preserve redraw-stream alignment when a malformed cell exceeds the inline
+/// cluster representation. The low-level extractor remains lossless-or-error;
+/// the wire handler substitutes one visible replacement glyph instead of
+/// truncating the cluster or aborting the rest of the redraw batch (including
+/// its flush event).
+fn extractCellCodepoints(utf8: []const u8, buf: *[16]u32) ExtractedCellCodepoints {
+    const count = extractAllCodepoints(utf8, buf) catch {
+        buf[0] = 0xFFFD;
+        return .{ .count = 1, .replaced_oversized = true };
+    };
+    return .{ .count = count, .replaced_oversized = false };
 }
 
 fn mapGetInt(m: []mp.Pair, key: []const u8) ?i64 {
@@ -182,11 +224,67 @@ fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
     return null;
 }
 
+/// Convert a signed 64-bit msgpack integer to u32, rejecting values that
+/// would require an unsafe `@intCast` (negative, or larger than
+/// `maxInt(u32)`). `@intCast` in Zig is a safety-checked assertion, not a
+/// clamp: an out-of-range value panics in Debug/ReleaseSafe and is UB in
+/// ReleaseFast. Callers treat `null` as "skip this event/tuple", matching
+/// the existing sign-checked call sites in this file (e.g. `grid_resize`,
+/// `grid_cursor_goto`).
+fn checkedU32(v: i64) ?u32 {
+    if (v < 0 or v > std.math.maxInt(u32)) return null;
+    return @as(u32, @intCast(v));
+}
+
+/// Neovim allocates grid handles from a positive signed-int domain. Metal's
+/// vertex input and scroll-offset ABI consume the low signed 32 bits, so reject
+/// values outside that producer domain before they can enter shared grid state.
+fn checkedGridId(v: i64) ?i64 {
+    if (v <= 0 or v > std.math.maxInt(i32)) return null;
+    return v;
+}
+
+/// Convert a signed 64-bit msgpack integer to i32, rejecting values outside
+/// the i32 range. Exposed as `pub` because `rpc_session.zig`'s
+/// `handleWinMoveCursor` — a directly reachable RPC *request* handler, not
+/// just a redraw event — needs the identical guard.
+pub fn checkedI32(v: i64) ?i32 {
+    if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return null;
+    return @as(i32, @intCast(v));
+}
+
+/// Truncate one finite Msgpack float to i64 without letting @intFromFloat
+/// assert on NaN, infinity, or a value outside the integer domain.
+fn checkedFloatToI64(v: f64) ?i64 {
+    if (!std.math.isFinite(v)) return null;
+    const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
+    const max_i64_exclusive_f: f64 = 0x1p63;
+    if (v < min_i64_f or v >= max_i64_exclusive_f) return null;
+    return @intFromFloat(v);
+}
+
+/// Grid positions cross i32 frontend ABI fields. Reject, rather than wrap or
+/// clamp, an event which cannot be represented consistently by every consumer.
+fn checkedGridCoord(v: i64) ?u32 {
+    if (v < 0 or v > std.math.maxInt(i32)) return null;
+    return @intCast(v);
+}
+
+test "checked float and grid coordinates reject hostile numeric bounds" {
+    try std.testing.expectEqual(@as(?i64, -3), checkedFloatToI64(-3.75));
+    try std.testing.expectEqual(@as(?i64, null), checkedFloatToI64(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(?i64, null), checkedFloatToI64(std.math.inf(f64)));
+    try std.testing.expectEqual(@as(?i64, null), checkedFloatToI64(0x1p63));
+    try std.testing.expectEqual(@as(?u32, null), checkedGridCoord(std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(?i64, 1), checkedGridId(1));
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i32)), checkedGridId(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(?i64, null), checkedGridId(0));
+    try std.testing.expectEqual(@as(?i64, null), checkedGridId(@as(i64, std.math.maxInt(i32)) + 1));
+}
+
 fn toRgbOpt(v: ?i64) ?u32 {
     if (v == null) return null;
-    const x = v.?;
-    if (x < 0) return null;
-    return @as(u32, @intCast(x));
+    return checkedU32(v.?);
 }
 
 fn tupleIter(a: []mp.Value) []mp.Value {
@@ -530,7 +628,6 @@ fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Streaming helpers — used by handleRedrawStream / streamGridLine for the
 // zero-copy redraw path. These are defined here rather than in
@@ -580,6 +677,31 @@ fn readArrayLenOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?u32 {
             break :blk null;
         },
     };
+}
+
+/// Bound one grid_line cell tuple to the destination row. This is applied
+/// even when `repeat` was omitted or malformed (defaulting to one), so a
+/// hostile starting column can neither wrap u32 nor turn no-op writes beyond
+/// the grid into unbounded work.
+fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
+    if (col >= cols) return 0;
+    return @min(repeat, cols - col);
+}
+
+test "grid_line repeat clamp handles untrusted u32 bounds" {
+    try std.testing.expectEqual(@as(u32, 2), clampGridLineRepeat(2, 4, std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u32, 0), clampGridLineRepeat(4, 4, 1));
+    try std.testing.expectEqual(@as(u32, 0), clampGridLineRepeat(std.math.maxInt(u32), 4, std.math.maxInt(u32)));
+}
+
+test "cell cluster extraction rejects rather than truncates codepoint 17" {
+    var buf: [16]u32 = undefined;
+    try std.testing.expectEqual(@as(u32, 16), try extractAllCodepoints("abcdefghijklmnop", &buf));
+    try std.testing.expectError(error.CellClusterTooLong, extractAllCodepoints("abcdefghijklmnopq", &buf));
+    const wire_result = extractCellCodepoints("abcdefghijklmnopq", &buf);
+    try std.testing.expect(wire_result.replaced_oversized);
+    try std.testing.expectEqual(@as(u32, 1), wire_result.count);
+    try std.testing.expectEqual(@as(u32, 0xFFFD), buf[0]);
 }
 
 /// Read one value as a `Str` or `Bin`, returning a zero-copy slice into
@@ -633,6 +755,7 @@ fn streamGridLine(
     in: *mps.InnerDecoder,
     n_tuples: u32,
     log: *Logger,
+    redraw_epoch: u64,
 ) !void {
     if (log.cb != null) log.write("ui_ev grid_line tuples={d}\n", .{n_tuples});
 
@@ -649,7 +772,10 @@ fn streamGridLine(
         // Field 0: grid_id.
         const grid_id_opt = try readIntOrSkipped(in);
         t_consumed = 1;
-        const grid_id = grid_id_opt orelse {
+        const grid_id = checkedGridId(grid_id_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        }) orelse {
             try in.skipAny(t_n - t_consumed);
             continue :tuples;
         };
@@ -661,11 +787,25 @@ fn streamGridLine(
             try in.skipAny(t_n - t_consumed);
             continue :tuples;
         };
+        // Validate row fits u32 here (before the still-unread `cells` field
+        // is touched) so an out-of-range value can bail via the same
+        // "skip remaining top-level fields" idiom used above — at this
+        // point `cells` has not been read at all yet, so skipping it whole
+        // (along with any trailing fields) is safe and keeps the stream
+        // decoder in sync.
+        const row = checkedU32(row_i) orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
 
         // Field 2: col_start.
         const col_opt = try readIntOrSkipped(in);
         t_consumed = 3;
         const col_i = col_opt orelse {
+            try in.skipAny(t_n - t_consumed);
+            continue :tuples;
+        };
+        var col = checkedU32(col_i) orelse {
             try in.skipAny(t_n - t_consumed);
             continue :tuples;
         };
@@ -692,10 +832,16 @@ fn streamGridLine(
             grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
         }
 
-        grid.noteGridLine(grid_id);
+        grid.noteGridLine(grid_id, redraw_epoch);
 
-        const row = @as(u32, @intCast(row_i));
-        var col = @as(u32, @intCast(col_i));
+        // Resolve once per tuple. Besides avoiding a sub-grid hash probe per
+        // cell, this is the trust boundary for hostile col/repeat values.
+        const grid_cols: u32 = if (grid_id == 1)
+            grid.cols
+        else if (grid.sub_grids.get(grid_id)) |sg|
+            sg.cols
+        else
+            0;
 
         // hl_state persists across cells within this grid_line event.
         var hl_state: i64 = 0;
@@ -719,7 +865,13 @@ fn streamGridLine(
             };
 
             var cp_buf: [16]u32 = undefined;
-            const cp_count = extractAllCodepoints(text, &cp_buf);
+            const extracted = extractCellCodepoints(text, &cp_buf);
+            const cp_count = extracted.count;
+            if (extracted.replaced_oversized) {
+                log.write("[redraw] oversized grid_line cluster grid={d} row={d} col={d} bytes={d}; using U+FFFD\n", .{
+                    grid_id, row, col, text.len,
+                });
+            }
             const cp = cp_buf[0];
             const has_overflow = cp_count > 1;
 
@@ -736,8 +888,10 @@ fn streamGridLine(
                 if (try readIntOrSkipped(in)) |r64| {
                     if (r64 <= 0) {
                         skip_cell = true;
+                    } else if (checkedU32(r64)) |r32| {
+                        repeat = r32;
                     } else {
-                        repeat = @as(u32, @intCast(r64));
+                        skip_cell = true;
                     }
                 }
                 c_consumed = 3;
@@ -747,6 +901,8 @@ fn streamGridLine(
             if (c_n > c_consumed) try in.skipAny(c_n - c_consumed);
 
             if (skip_cell) continue :cells;
+            repeat = clampGridLineRepeat(col, grid_cols, repeat);
+            if (repeat == 0) continue :cells;
 
             // Write `repeat` copies of the cell starting at `col`.
             var i: u32 = 0;
@@ -754,7 +910,10 @@ fn streamGridLine(
                 var hl_to_use: u32 = 0;
                 if (hl_state != -1 or col == 0) {
                     if (hl_state >= 0) {
-                        hl_to_use = @as(u32, @intCast(hl_state));
+                        // Match the Value-tree path: hostile hl_ids outside
+                        // the u32-keyed highlight table use the default style
+                        // instead of trapping the redraw thread.
+                        hl_to_use = std.math.cast(u32, hl_state) orelse 0;
                     } else {
                         // hl_state == -1 at col 0 → treat as 0.
                         hl_to_use = 0;
@@ -764,22 +923,14 @@ fn streamGridLine(
                     hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
                 }
 
-                grid.putCellGrid(grid_id, row, col, cp, hl_to_use);
-
-                // Overflow-map management. Force dirty on change, because
-                // `putCellGrid` skips the dirty mark when (cp, hl) are
-                // unchanged even though the overflow tail differs
-                // (e.g. ⚠ → ⚠️).
-                if (has_overflow) {
-                    const old = grid.getOverflow(grid_id, row, col);
-                    const changed = if (old) |o| !std.mem.eql(u32, o, cp_buf[1..cp_count]) else true;
-                    grid.putOverflow(grid_id, row, col, cp_buf[1..cp_count]);
-                    if (changed) grid.markDirtyCellGrid(grid_id, row, col);
-                } else {
-                    const had = grid.getOverflow(grid_id, row, col) != null;
-                    grid.removeOverflow(grid_id, row, col);
-                    if (had) grid.markDirtyCellGrid(grid_id, row, col);
-                }
+                try grid.putCellGridCluster(
+                    grid_id,
+                    row,
+                    col,
+                    cp,
+                    hl_to_use,
+                    if (has_overflow) cp_buf[1..cp_count] else &.{},
+                );
 
                 col += 1;
             }
@@ -824,6 +975,7 @@ pub fn handleRedrawStream(
     n_events: u32,
     log: *Logger,
     flush_ctx: anytype,
+    pre_flush_fn: *const fn (ctx: @TypeOf(flush_ctx)) anyerror!void,
     flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
     opt_ctx: anytype,
     guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
@@ -834,6 +986,11 @@ pub fn handleRedrawStream(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
+    const redraw_epoch = grid.beginRedrawBatch();
+    std.debug.assert(grid.redraw_epoch_override == null);
+    grid.redraw_epoch_override = redraw_epoch;
+    defer grid.redraw_epoch_override = null;
+
     var ei: u32 = 0;
     while (ei < n_events) : (ei += 1) {
         const ev_n = try in.expectArray();
@@ -857,7 +1014,7 @@ pub fn handleRedrawStream(
         };
 
         if (tag == .grid_line) {
-            try streamGridLine(grid, in, n_tuples, log);
+            try streamGridLine(grid, in, n_tuples, log, redraw_epoch);
             continue;
         }
 
@@ -873,24 +1030,10 @@ pub fn handleRedrawStream(
         const synth_params = try arena.alloc(mp.Value, 1);
         synth_params[0] = .{ .arr = synth_ev };
 
-        // Dispatch errors from `handleRedraw` (e.g. a frontend vertex-
-        // submission callback failure). Match the Value-tree path's
-        // failure boundary exactly: in that path `handleRedraw` is
-        // called once over the whole params array, and a failing event's
-        // `try fn_ptr(...)` unwinds the inner for-loop so all remaining
-        // events in the same batch are skipped. The caller of the old
-        // `handleRedraw` catches the error once and then continues with
-        // post-redraw processing for the current frame.
-        //
-        // We mirror that here: on dispatch error, advance `in` past the
-        // still-unread events of this frame (the caller expects `in` to
-        // sit at the end of the events array on success), log the error,
-        // and return normally so a hypothetical wired caller runs its
-        // post-redraw block and moves on to the next RPC frame — NOT
-        // break out of the run loop. Propagating the error would conflate
-        // dispatch-side failures with decode-side failures (`streamGridLine`
-        // / `decodeFromStream`), which the run loop is supposed to treat
-        // as fatal.
+        // Keep the stream aligned on dispatch failure, then propagate the
+        // error. A future production caller must poison/recover the UI epoch;
+        // presenting or post-processing this partially-applied batch would
+        // permanently diverge from Neovim's protocol state.
         handleRedraw(
             grid,
             hl,
@@ -898,6 +1041,7 @@ pub fn handleRedrawStream(
             synth_params,
             log,
             flush_ctx,
+            pre_flush_fn,
             flush_fn,
             opt_ctx,
             guifont_fn,
@@ -911,7 +1055,7 @@ pub fn handleRedrawStream(
             log.write("redraw dispatch err: {any}\n", .{re});
             const remaining = n_events - ei - 1;
             in.skipAny(remaining) catch {};
-            return;
+            return re;
         };
     }
 }
@@ -926,6 +1070,7 @@ pub fn handleRedraw(
     params: []mp.Value,
     log: *Logger,
     flush_ctx: anytype,
+    pre_flush_fn: *const fn (ctx: @TypeOf(flush_ctx)) anyerror!void,
     flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
     opt_ctx: anytype,
     guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
@@ -936,6 +1081,7 @@ pub fn handleRedraw(
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
 ) !void {
+    const redraw_epoch = grid.redraw_epoch_override orelse grid.beginRedrawBatch();
 
     // Per-handleRedraw aggregate. Each "redraw" notification batches many
     // events (grid_line, grid_scroll, hl_attr_define, ...). The [perf_input]
@@ -975,14 +1121,18 @@ pub fn handleRedraw(
                 "[perf] grid_line_stats tuples={d} cells={d}\n",
                 .{ grid_line_tuple_total, grid_line_cells_total },
             );
-            // One [perf] redraw_event line per nonzero tag. Skips silent tags
-            // so a typical "grid_line + flush" batch produces only 2 lines.
-            inline for (@typeInfo(RedrawEvent).@"enum".fields, 0..) |f, i| {
-                if (per_event_cnt[i] != 0) {
-                    log.write(
-                        "[perf] redraw_event name={s} count={d} ns={d}\n",
-                        .{ f.name, per_event_cnt[i], per_event_ns[i] },
-                    );
+            // One [perf] redraw_event line per nonzero tag. Verbose tier:
+            // several lines per batch add up during scroll bursts (measured
+            // ~2.7k lines in a 30s tig session) and the batch-level
+            // redraw_batch/grid_line_stats aggregates above stay available.
+            if (log.verbose) {
+                inline for (@typeInfo(RedrawEvent).@"enum".fields, 0..) |f, i| {
+                    if (per_event_cnt[i] != 0) {
+                        log.write(
+                            "[perf] redraw_event name={s} count={d} ns={d}\n",
+                            .{ f.name, per_event_cnt[i], per_event_ns[i] },
+                        );
+                    }
                 }
             }
         }
@@ -1000,8 +1150,9 @@ pub fn handleRedraw(
             tuple_count +%= @intCast(tuples.len);
         }
 
-        // Only run log processing if logging is enabled (avoid overhead when disabled)
-        if (log.cb != null) {
+        // Raw tuple dumps recursively traverse every value. Keep that work out
+        // of normal/perf/scroll logging; it is an explicit verbose diagnostic.
+        if (log.cb != null and log.verbose and !log.perf_only and !log.scroll_only) {
             log.write("ui_ev {s} tuples={d}\n", .{ name, tuples.len });
             if (tuples.len != 0) {
                 var ti: usize = 0;
@@ -1023,1524 +1174,1562 @@ pub fn handleRedraw(
             per_event_ns[idx] +|= @as(u64, @intCast(@max(@as(i128, 0), dt_ns)));
             per_event_cnt[idx] +|= 1;
         };
-        switch (ev_tag) { .grid_resize => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 3) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+        switch (ev_tag) {
+            .grid_resize => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 3) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
-                const grid_id = t[0].int;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
 
-                // Validate non-negative before cast
-                if (t[1].int < 0 or t[2].int < 0) continue;
-                const width = @as(u32, @intCast(t[1].int));
-                const height = @as(u32, @intCast(t[2].int));
-                try grid.resizeGrid(grid_id, height, width);
+                    const width = checkedU32(t[1].int) orelse continue;
+                    const height = checkedU32(t[2].int) orelse continue;
+                    grid.resizeGrid(grid_id, height, width) catch |err| {
+                        log.write("grid_resize rejected grid={d} cols={d} rows={d}: {any}\n", .{ grid_id, width, height, err });
+                        return err;
+                    };
 
-                // Update external grid target size so NDC viewport matches the actual grid.
-                // Only for grids that are actual external windows (ext_windows splits
-                // or UI-extension grids like popupmenu/messages). Float windows
-                // (e.g. Telescope) must NOT get entries here — they render on the
-                // global grid and their NDC uses sg.rows/sg.cols directly.
-                if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
-                    grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width }) catch {};
+                    // Update external grid target size so NDC viewport matches the actual grid.
+                    // Only for grids that are actual external windows (ext_windows splits
+                    // or UI-extension grids like popupmenu/messages). Float windows
+                    // (e.g. Telescope) must NOT get entries here — they render on the
+                    // global grid and their NDC uses sg.rows/sg.cols directly.
+                    if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
+                        try grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width });
+                    }
+
+                    // Record the global grid size so core can detect a
+                    // Neovim-initiated resize (`:set columns=` / `:set lines=`)
+                    // after the batch completes.
+                    if (grid_id == 1) {
+                        grid.pending_main_grid_size = .{ .rows = height, .cols = width };
+                    }
+
+                    if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });
                 }
-
-                // Record the global grid size so core can detect a
-                // Neovim-initiated resize (`:set columns=` / `:set lines=`)
-                // after the batch completes.
-                if (grid_id == 1) {
-                    grid.pending_main_grid_size = .{ .rows = height, .cols = width };
-                }
-
-                if (log.cb != null) log.write("grid_resize grid={d} cols={d} rows={d}\n", .{ grid_id, width, height });
-            }
-
-        }, .grid_clear => {
-            if (tuples.len == 0) {
-                grid.clearGrid(1);
-            } else {
+            },
+            .grid_clear => {
+                // Spec always sends [grid]; an empty tuple array is malformed
+                // input. Skip instead of silently defaulting to grid 1 — the
+                // loop below is already a no-op when `tuples` is empty.
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
 
                     // grid_clear: [grid]
                     if (t.len < 1 or t[0] != .int) continue;
-                    const grid_id = t[0].int;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
                     grid.clearGrid(grid_id);
                 }
-            }
+            },
+            .grid_cursor_goto => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 3) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
-        }, .grid_cursor_goto => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 3) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    const row = checkedU32(t[1].int) orelse continue;
+                    const col = checkedU32(t[2].int) orelse continue;
+                    grid.setCursor(grid_id, row, col);
+                }
+            },
+            .grid_destroy => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1 or t[0] != .int) continue;
 
-                const grid_id = t[0].int;
-                // Validate non-negative before cast
-                if (t[1].int < 0 or t[2].int < 0) continue;
-                const row = @as(u32, @intCast(t[1].int));
-                const col = @as(u32, @intCast(t[2].int));
-                grid.setCursor(grid_id, row, col);
-            }
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    if (grid_id == 1) {
+                        log.write("grid_destroy: rejected attempt to destroy main grid (grid_id=1)\n", .{});
+                        continue;
+                    }
+                    try grid.destroyGrid(grid_id);
+                }
+            },
+            .win_split => {
+                // win_split (ext_windows): [win1, grid1, win2, grid2, flags]
+                // win1/grid1 = source window, win2/grid2 = new window
+                // flags: 0=below, 1=above, 2=right, 3=left
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 5) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int) continue;
 
-        }, .grid_destroy => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 1 or t[0] != .int) continue;
+                    const win1 = t[0].int;
+                    const grid1 = checkedGridId(t[1].int) orelse continue;
+                    const win2 = t[2].int;
+                    const grid2 = checkedGridId(t[3].int) orelse continue;
+                    const flags = t[4].int;
+                    log.write("[win_split] win1={d} grid1={d} win2={d} grid2={d} flags={d}\n", .{ win1, grid1, win2, grid2, flags });
 
-                const grid_id = t[0].int;
-                grid.destroyGrid(grid_id);
-            }
-
-        }, .win_split => {
-            // win_split (ext_windows): [win1, grid1, win2, grid2, flags]
-            // win1/grid1 = source window, win2/grid2 = new window
-            // flags: 0=below, 1=above, 2=right, 3=left
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 5) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int) continue;
-
-                const win1 = t[0].int;
-                const grid1 = t[1].int;
-                const win2 = t[2].int;
-                const grid2 = t[3].int;
-                const flags = t[4].int;
-                log.write("[win_split] win1={d} grid1={d} win2={d} grid2={d} flags={d}\n", .{ win1, grid1, win2, grid2, flags });
-
-                // Only register the NEW window (grid2/win2) as external.
-                // The source window (grid1/win1) stays where it is (global grid or already external).
-                _ = grid.setWinExternalPos(grid2, win2) catch |e| {
-                    log.write("[win_split] setWinExternalPos grid2={d} failed: {any}\n", .{ grid2, e });
-                };
-
-                // Persistently track only the NEW window as an ext_windows grid.
-                // This survives win_hide (tab switch) so win_pos can re-register it.
-                // Do NOT track grid1 (source) - it may be the main editor grid (grid 2)
-                // which should remain composited in the main window.
-                grid.ext_windows_grids.put(grid.alloc, grid2, win2) catch {};
-            }
-
-        }, .win_resize => {
-            // win_resize (ext_windows): [win, grid, width, height]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 4) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
-
-                const win_id = t[0].int;
-                const grid_id = t[1].int;
-                const width = @as(u32, @intCast(t[2].int));
-                const height = @as(u32, @intCast(t[3].int));
-                log.write("[win_resize] win={d} grid={d} width={d} height={d}\n", .{ win_id, grid_id, width, height });
-
-                // Re-register grid as external if it was removed (e.g. tab switch).
-                // When switching back to a tab, Neovim sends win_resize (not win_split)
-                // for windows that already exist in its model.
-                if (!grid.external_grids.contains(grid_id)) {
-                    _ = grid.setWinExternalPos(grid_id, win_id) catch |e| {
-                        log.write("[win_resize] setWinExternalPos grid={d} failed: {any}\n", .{ grid_id, e });
+                    // Only register the NEW window (grid2/win2) as external.
+                    // The source window (grid1/win1) stays where it is (global grid or already external).
+                    _ = grid.setWinExternalPos(grid2, win2) catch |err| switch (err) {
+                        error.TooManyWindowPlacements => {
+                            log.write("[win_split] rejected grid2={d}: TooManyWindowPlacements\n", .{grid2});
+                            return error.TooManyWindowPlacements;
+                        },
+                        else => return err,
                     };
+
+                    // Persistently track only the NEW window as an ext_windows grid.
+                    // This survives win_hide (tab switch) so win_pos can re-register it.
+                    // Do NOT track grid1 (source) - it may be the main editor grid (grid 2)
+                    // which should remain composited in the main window.
+                    try grid.ext_windows_grids.put(grid.alloc, grid2, win2);
                 }
+            },
+            .win_resize => {
+                // win_resize (ext_windows): [win, grid, width, height]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 4) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
 
-                // Queue a grid resize request for core to send after redraw
-                grid.pending_grid_resizes.append(grid.alloc, .{
-                    .grid_id = grid_id,
-                    .width = width,
-                    .height = height,
-                }) catch |e| {
-                    log.write("[win_resize] pending_grid_resizes.append failed: {any}\n", .{e});
-                };
-            }
+                    const win_id = t[0].int;
+                    const grid_id = checkedGridId(t[1].int) orelse continue;
+                    const width = checkedU32(t[2].int) orelse continue;
+                    const height = checkedU32(t[3].int) orelse continue;
+                    log.write("[win_resize] win={d} grid={d} width={d} height={d}\n", .{ win_id, grid_id, width, height });
 
-        }, .win_move => {
-            // win_move (ext_windows): [win, grid, flags]
-            // flags: 0=below, 1=above, 2=right, 3=left
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 3) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
-
-                const win_id = t[0].int;
-                const grid_id = t[1].int;
-                const flags = @as(i32, @intCast(t[2].int));
-                log.write("[win_move] win={d} grid={d} flags={d}\n", .{ win_id, grid_id, flags });
-
-                grid.pending_win_ops.append(grid.alloc, .{
-                    .op = .move,
-                    .win = win_id,
-                    .grid_id = grid_id,
-                    .flags_or_direction = flags,
-                }) catch |e| {
-                    log.write("[win_move] pending_win_ops.append failed: {any}\n", .{e});
-                };
-            }
-
-        }, .win_exchange => {
-            // win_exchange (ext_windows): [win, grid, count]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 3) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
-
-                const win_id = t[0].int;
-                const grid_id = t[1].int;
-                const count = @as(i32, @intCast(t[2].int));
-                log.write("[win_exchange] win={d} grid={d} count={d}\n", .{ win_id, grid_id, count });
-
-                grid.pending_win_ops.append(grid.alloc, .{
-                    .op = .exchange,
-                    .win = win_id,
-                    .grid_id = grid_id,
-                    .count = count,
-                }) catch |e| {
-                    log.write("[win_exchange] pending_win_ops.append failed: {any}\n", .{e});
-                };
-            }
-
-        }, .win_rotate => {
-            // win_rotate (ext_windows): [win, grid, direction, count]
-            // direction: 0=downward, 1=upward
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 4) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
-
-                const win_id = t[0].int;
-                const grid_id = t[1].int;
-                const direction = @as(i32, @intCast(t[2].int));
-                const count = @as(i32, @intCast(t[3].int));
-                log.write("[win_rotate] win={d} grid={d} direction={d} count={d}\n", .{ win_id, grid_id, direction, count });
-
-                grid.pending_win_ops.append(grid.alloc, .{
-                    .op = .rotate,
-                    .win = win_id,
-                    .grid_id = grid_id,
-                    .flags_or_direction = direction,
-                    .count = count,
-                }) catch |e| {
-                    log.write("[win_rotate] pending_win_ops.append failed: {any}\n", .{e});
-                };
-            }
-
-        }, .win_resize_equal => {
-            // win_resize_equal (ext_windows): no parameters
-            log.write("[win_resize_equal]\n", .{});
-
-            grid.pending_win_ops.append(grid.alloc, .{
-                .op = .resize_equal,
-            }) catch |e| {
-                log.write("[win_resize_equal] pending_win_ops.append failed: {any}\n", .{e});
-            };
-
-        }, .win_pos => {
-            // win_pos: [grid, win, startrow, startcol, width, height]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 6) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
-
-                const grid_id = t[0].int;
-                const win_id = t[1].int;
-                const startrow = @as(u32, @intCast(t[2].int));
-                const startcol = @as(u32, @intCast(t[3].int));
-                log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
-
-                // If this grid is tracked as an ext_windows grid (created by win_split),
-                // re-register it as external instead of compositing. This happens when
-                // switching back to a tab - Neovim sends win_pos for all windows but
-                // may not send win_resize/win_split for all of them.
-                if (grid.ext_windows_grids.contains(grid_id)) {
+                    // Re-register grid as external if it was removed (e.g. tab switch).
+                    // When switching back to a tab, Neovim sends win_resize (not win_split)
+                    // for windows that already exist in its model.
                     if (!grid.external_grids.contains(grid_id)) {
-                        // Tab switch: store position in win_pos map first so
-                        // setWinExternalPos can extract it (it reads from win_pos).
-                        try grid.win_pos.put(grid.alloc, grid_id, .{ .row = startrow, .col = startcol });
-                        _ = grid.setWinExternalPos(grid_id, win_id) catch |e| {
-                            log.write("[win_pos] re-register ext_windows grid={d} failed: {any}\n", .{ grid_id, e });
+                        _ = grid.setWinExternalPos(grid_id, win_id) catch |err| switch (err) {
+                            error.TooManyWindowPlacements => {
+                                log.write("[win_resize] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                                return error.TooManyWindowPlacements;
+                            },
+                            else => return err,
                         };
-                        log.write("[win_pos] re-registered ext_windows grid={d} as external at ({d},{d})\n", .{ grid_id, startrow, startcol });
-                    } else {
-                        // Already external (e.g. win_pos after win_split in same
-                        // redraw batch): update position directly.
-                        grid.updateExternalGridPos(grid_id, startrow, startcol);
-                        log.write("[win_pos] updated ext_windows grid={d} position to ({d},{d})\n", .{ grid_id, startrow, startcol });
                     }
-                } else {
-                    try grid.setWinPos(grid_id, win_id, startrow, startcol);
+
+                    // Queue a grid resize request for core to send after redraw
+                    try grid.pending_grid_resizes.append(grid.alloc, .{
+                        .grid_id = grid_id,
+                        .width = width,
+                        .height = height,
+                    });
                 }
-            }
+            },
+            .win_move => {
+                // win_move (ext_windows): [win, grid, flags]
+                // flags: 0=below, 1=above, 2=right, 3=left
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 3) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
-        }, .win_hide, .win_close => {
-            // win_hide/win_close: [grid]
-            const is_close = ev_tag == .win_close;
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 1 or t[0] != .int) continue;
-                const grid_id = t[0].int;
-                // Track if a composited (non-external, non-float) editor window
-                // is being closed. The promotion logic uses this to detect when
-                // Neovim re-composites grid 2 as a fallback in the same batch.
-                if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
-                    grid.composited_win_closed = true;
+                    const win_id = t[0].int;
+                    const grid_id = checkedGridId(t[1].int) orelse continue;
+                    const flags = checkedI32(t[2].int) orelse continue;
+                    log.write("[win_move] win={d} grid={d} flags={d}\n", .{ win_id, grid_id, flags });
+
+                    try grid.pending_win_ops.append(grid.alloc, .{
+                        .op = .move,
+                        .win = win_id,
+                        .grid_id = grid_id,
+                        .flags_or_direction = flags,
+                    });
                 }
-                grid.hideWin(grid_id);
-                // On permanent close, remove from ext_windows tracking.
-                // On hide (tab switch), keep tracking so win_pos can restore.
-                if (is_close) {
-                    _ = grid.ext_windows_grids.remove(grid_id);
-                    _ = grid.external_grid_target_sizes.remove(grid_id);
+            },
+            .win_exchange => {
+                // win_exchange (ext_windows): [win, grid, count]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 3) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+
+                    const win_id = t[0].int;
+                    const grid_id = checkedGridId(t[1].int) orelse continue;
+                    const count = checkedI32(t[2].int) orelse continue;
+                    log.write("[win_exchange] win={d} grid={d} count={d}\n", .{ win_id, grid_id, count });
+
+                    try grid.pending_win_ops.append(grid.alloc, .{
+                        .op = .exchange,
+                        .win = win_id,
+                        .grid_id = grid_id,
+                        .count = count,
+                    });
                 }
-            }
+            },
+            .win_rotate => {
+                // win_rotate (ext_windows): [win, grid, direction, count]
+                // direction: 0=downward, 1=upward
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 4) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
 
-        }, .win_viewport => {
-            // win_viewport: [grid, win, topline, botline, curline, curcol, line_count, scroll_delta]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 8) continue;
-                if (t[0] != .int) continue;
+                    const win_id = t[0].int;
+                    const grid_id = checkedGridId(t[1].int) orelse continue;
+                    const direction = checkedI32(t[2].int) orelse continue;
+                    const count = checkedI32(t[3].int) orelse continue;
+                    log.write("[win_rotate] win={d} grid={d} direction={d} count={d}\n", .{ win_id, grid_id, direction, count });
 
-                const grid_id = t[0].int;
-                // t[1] is win (window handle), not used here
-                const topline = if (t[2] == .int) t[2].int else 0;
-                const botline = if (t[3] == .int) t[3].int else 0;
-                const curline = if (t[4] == .int) t[4].int else 0;
-                const curcol = if (t[5] == .int) t[5].int else 0;
-                const line_count = if (t[6] == .int) t[6].int else 0;
-                const scroll_delta = if (t[7] == .int) t[7].int else 0;
-
-                log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
-                try grid.setViewport(grid_id, topline, botline, curline, curcol, line_count, scroll_delta);
-            }
-
-        }, .win_viewport_margins => {
-            // win_viewport_margins: [grid, win, top, bottom, left, right]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 6) continue;
-                if (t[0] != .int) continue;
-
-                const grid_id = t[0].int;
-                // t[1] is win (window handle), not used here
-                const top = if (t[2] == .int) @as(u32, @intCast(t[2].int)) else 0;
-                const bottom = if (t[3] == .int) @as(u32, @intCast(t[3].int)) else 0;
-                const left = if (t[4] == .int) @as(u32, @intCast(t[4].int)) else 0;
-                const right = if (t[5] == .int) @as(u32, @intCast(t[5].int)) else 0;
-
-                log.write("[win_viewport_margins] grid_id={d} top={d} bottom={d} left={d} right={d}\n", .{ grid_id, top, bottom, left, right });
-                try grid.setViewportMargins(grid_id, top, bottom, left, right);
-            }
-
-        }, .win_float_pos => {
-
-
-            // Observed (older nvim): [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled, zindex]
-            // Docs (newer nvim):     [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled,
-            //                         zindex, compindex, screen_row, screen_col]
-            for (tuples) |tv| {
-
-                // log.write("win_float_pos:", .{});
-                // dumpValue(tv, 2);
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                // Need at least: grid..zindex (len >= 8)
-                if (t.len < 8) continue;
-
-                // grid_id, win, and zindex are required for both forms.
-                if (t[0] != .int or t[1] != .int or t[7] != .int) continue;
-
-                const grid_id = t[0].int;
-                const win_id = t[1].int;
-                const zindex = t[7].int;
-
-                // Optional fields (newer form)
-                var compindex: i64 = 0;
-                var screen_row_i: i64 = -1;
-                var screen_col_i: i64 = -1;
-
-                if (t.len >= 11) {
-                    if (t[8] != .int or t[9] != .int or t[10] != .int) continue;
-                    compindex = t[8].int;
-                    screen_row_i = t[9].int;
-                    screen_col_i = t[10].int;
+                    try grid.pending_win_ops.append(grid.alloc, .{
+                        .op = .rotate,
+                        .win = win_id,
+                        .grid_id = grid_id,
+                        .flags_or_direction = direction,
+                        .count = count,
+                    });
                 }
+            },
+            .win_resize_equal => {
+                // win_resize_equal (ext_windows): no parameters
+                log.write("[win_resize_equal]\n", .{});
 
-                var row_i64: i64 = 0;
-                var col_i64: i64 = 0;
-
-                // Extract anchor_grid (always at t[3] when present)
-                const anchor_grid: i64 = if (t[3] == .int) t[3].int else 1;
-
-                if (screen_row_i >= 0 and screen_col_i >= 0) {
-                    // Let nvim take care of positioning.
-                    row_i64 = screen_row_i;
-                    col_i64 = screen_col_i;
-                } else {
-                    // Manual anchor mode: [anchor, anchor_grid, anchor_row, anchor_col]
-                    // anchor_row/col may be int or float depending on nvim version.
-                    if (t[2] != .str or t[3] != .int) continue;
-
-                    // Need indices [4], [5] to exist
+                try grid.pending_win_ops.append(grid.alloc, .{
+                    .op = .resize_equal,
+                });
+            },
+            .win_pos => {
+                // win_pos: [grid, win, startrow, startcol, width, height]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
                     if (t.len < 6) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
 
-                    const anchor = t[2].str;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    const win_id = t[1].int;
+                    const startrow = checkedGridCoord(t[2].int) orelse continue;
+                    const startcol = checkedGridCoord(t[3].int) orelse continue;
+                    log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
 
-                    var anchor_row_i: i64 = 0;
-                    var anchor_col_i: i64 = 0;
-
-                    if (t[4] == .int) {
-                        anchor_row_i = t[4].int;
-                    } else if (t[4] == .float) {
-                        anchor_row_i = @as(i64, @intFromFloat(t[4].float));
+                    // If this grid is tracked as an ext_windows grid (created by win_split),
+                    // re-register it as external instead of compositing. This happens when
+                    // switching back to a tab - Neovim sends win_pos for all windows but
+                    // may not send win_resize/win_split for all of them.
+                    if (grid.ext_windows_grids.contains(grid_id)) {
+                        if (!grid.external_grids.contains(grid_id)) {
+                            _ = grid.setWinExternalPosAt(grid_id, win_id, startrow, startcol) catch |err| switch (err) {
+                                error.TooManyWindowPlacements => {
+                                    log.write("[win_pos] rejected ext_windows grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                                    return error.TooManyWindowPlacements;
+                                },
+                                else => return err,
+                            };
+                            log.write("[win_pos] re-registered ext_windows grid={d} as external at ({d},{d})\n", .{ grid_id, startrow, startcol });
+                        } else {
+                            // Already external (e.g. win_pos after win_split in same
+                            // redraw batch): update position directly.
+                            grid.updateExternalGridPos(grid_id, startrow, startcol);
+                            log.write("[win_pos] updated ext_windows grid={d} position to ({d},{d})\n", .{ grid_id, startrow, startcol });
+                        }
                     } else {
-                        continue;
+                        grid.setWinPos(grid_id, win_id, startrow, startcol) catch |err| switch (err) {
+                            error.TooManyWindowPlacements => {
+                                log.write("[win_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                                return error.TooManyWindowPlacements;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+            },
+            .win_hide, .win_close => {
+                // win_hide/win_close: [grid]
+                const is_close = ev_tag == .win_close;
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1 or t[0] != .int) continue;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    // Track if a composited (non-external, non-float) editor window
+                    // is being closed. The promotion logic uses this to detect when
+                    // Neovim re-composites grid 2 as a fallback in the same batch.
+                    if (is_close and grid.win_pos.contains(grid_id) and !grid.win_layer.contains(grid_id) and grid_id != 1) {
+                        grid.composited_win_closed = true;
+                    }
+                    try grid.hideWin(grid_id);
+                    // On permanent close, remove from ext_windows tracking.
+                    // On hide (tab switch), keep tracking so win_pos can restore.
+                    if (is_close) {
+                        _ = grid.ext_windows_grids.remove(grid_id);
+                        _ = grid.external_grid_target_sizes.remove(grid_id);
+                    }
+                }
+            },
+            .win_viewport => {
+                // win_viewport: [grid, win, topline, botline, curline, curcol, line_count, scroll_delta]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 8) continue;
+                    if (t[0] != .int) continue;
+
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    // t[1] is win (window handle), not used here
+                    const topline = if (t[2] == .int) t[2].int else 0;
+                    const botline = if (t[3] == .int) t[3].int else 0;
+                    const curline = if (t[4] == .int) t[4].int else 0;
+                    const curcol = if (t[5] == .int) t[5].int else 0;
+                    const line_count = if (t[6] == .int) t[6].int else 0;
+                    const scroll_delta = if (t[7] == .int) t[7].int else 0;
+
+                    log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
+                    try grid.setViewport(grid_id, topline, botline, curline, curcol, line_count, scroll_delta);
+                }
+            },
+            .win_viewport_margins => {
+                // win_viewport_margins: [grid, win, top, bottom, left, right]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 6) continue;
+                    if (t[0] != .int) continue;
+
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    // t[1] is win (window handle), not used here
+                    const top = if (t[2] == .int) (checkedU32(t[2].int) orelse 0) else 0;
+                    const bottom = if (t[3] == .int) (checkedU32(t[3].int) orelse 0) else 0;
+                    const left = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
+                    const right = if (t[5] == .int) (checkedU32(t[5].int) orelse 0) else 0;
+
+                    log.write("[win_viewport_margins] grid_id={d} top={d} bottom={d} left={d} right={d}\n", .{ grid_id, top, bottom, left, right });
+                    try grid.setViewportMargins(grid_id, top, bottom, left, right);
+                }
+            },
+            .win_float_pos => {
+
+                // Observed (older nvim): [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled, zindex]
+                // Docs (newer nvim):     [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled,
+                //                         zindex, compindex, screen_row, screen_col]
+                for (tuples) |tv| {
+
+                    // log.write("win_float_pos:", .{});
+                    // dumpValue(tv, 2);
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+
+                    // Need at least: grid..zindex (len >= 8)
+                    if (t.len < 8) continue;
+
+                    // grid_id, win, and zindex are required for both forms.
+                    if (t[0] != .int or t[1] != .int or t[7] != .int) continue;
+
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    const win_id = t[1].int;
+                    const zindex = t[7].int;
+
+                    // Optional fields (newer form)
+                    var compindex: i64 = 0;
+                    var screen_row_i: i64 = -1;
+                    var screen_col_i: i64 = -1;
+
+                    if (t.len >= 11) {
+                        if (t[8] != .int or t[9] != .int or t[10] != .int) continue;
+                        compindex = t[8].int;
+                        screen_row_i = t[9].int;
+                        screen_col_i = t[10].int;
                     }
 
-                    if (t[5] == .int) {
-                        anchor_col_i = t[5].int;
-                    } else if (t[5] == .float) {
-                        anchor_col_i = @as(i64, @intFromFloat(t[5].float));
+                    var row_i64: i64 = 0;
+                    var col_i64: i64 = 0;
+
+                    // Extract anchor_grid (always at t[3] when present)
+                    const anchor_grid = checkedGridId(if (t[3] == .int) t[3].int else 1) orelse continue;
+
+                    if (screen_row_i >= 0 and screen_col_i >= 0) {
+                        // Let nvim take care of positioning.
+                        row_i64 = screen_row_i;
+                        col_i64 = screen_col_i;
                     } else {
-                        continue;
-                    }
+                        // Manual anchor mode: [anchor, anchor_grid, anchor_row, anchor_col]
+                        // anchor_row/col may be int or float depending on nvim version.
+                        if (t[2] != .str or t[3] != .int) continue;
 
-                    var base_row: i64 = 0;
-                    var base_col: i64 = 0;
+                        // Need indices [4], [5] to exist
+                        if (t.len < 6) continue;
 
-                    if (anchor_grid != 1) {
-                        if (grid.win_pos.get(anchor_grid)) |p| {
-                            base_row = @as(i64, p.row);
-                            base_col = @as(i64, p.col);
-                        } else if (grid.external_grids.get(anchor_grid)) |ext| {
-                            // anchor_grid is an external window - use its stored position
-                            if (ext.start_row >= 0 and ext.start_col >= 0) {
-                                base_row = @as(i64, ext.start_row);
-                                base_col = @as(i64, ext.start_col);
+                        const anchor = t[2].str;
+
+                        var anchor_row_i: i64 = 0;
+                        var anchor_col_i: i64 = 0;
+
+                        if (t[4] == .int) {
+                            anchor_row_i = t[4].int;
+                        } else if (t[4] == .float) {
+                            anchor_row_i = checkedFloatToI64(t[4].float) orelse continue;
+                        } else {
+                            continue;
+                        }
+
+                        if (t[5] == .int) {
+                            anchor_col_i = t[5].int;
+                        } else if (t[5] == .float) {
+                            anchor_col_i = checkedFloatToI64(t[5].float) orelse continue;
+                        } else {
+                            continue;
+                        }
+
+                        var base_row: i64 = 0;
+                        var base_col: i64 = 0;
+
+                        if (anchor_grid != 1) {
+                            if (grid.win_pos.get(anchor_grid)) |p| {
+                                base_row = @as(i64, p.row);
+                                base_col = @as(i64, p.col);
+                            } else if (grid.external_grids.get(anchor_grid)) |ext| {
+                                // anchor_grid is an external window - use its stored position
+                                if (ext.start_row >= 0 and ext.start_col >= 0) {
+                                    base_row = @as(i64, ext.start_row);
+                                    base_col = @as(i64, ext.start_col);
+                                }
+                            }
+                        }
+
+                        // Adjust by anchor using goneovim-like metrics conversion.
+                        // We compute float window size in "global grid cell units" using per-grid pixel metrics.
+                        const main_m = grid.getGridMetricsPx(1);
+                        const anchor_m = grid.getGridMetricsPx(anchor_grid);
+                        const float_m = grid.getGridMetricsPx(grid_id);
+
+                        // Convert anchor point from anchor_grid units -> global grid units.
+                        // base_row/base_col are already in global grid units (win_pos is relative to grid=1).
+                        const anchor_row_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_row_i)) * @as(f64, @floatFromInt(anchor_m.cell_h_px)) /
+                            @as(f64, @floatFromInt(main_m.cell_h_px))) orelse continue;
+                        const anchor_col_main = checkedFloatToI64(@as(f64, @floatFromInt(anchor_col_i)) * @as(f64, @floatFromInt(anchor_m.cell_w_px)) /
+                            @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
+
+                        row_i64 = std.math.add(i64, base_row, anchor_row_main) catch continue;
+                        col_i64 = std.math.add(i64, base_col, anchor_col_main) catch continue;
+
+                        // Compute float window size in global grid units (approx; future-proof for per-grid fonts).
+                        if (grid.sub_grids.get(grid_id)) |sg| {
+                            const float_rows: i64 = @as(i64, sg.rows);
+                            const float_cols: i64 = @as(i64, sg.cols);
+
+                            const wincols_main = checkedFloatToI64(@as(f64, @floatFromInt(float_cols)) * @as(f64, @floatFromInt(float_m.cell_w_px)) /
+                                @as(f64, @floatFromInt(main_m.cell_w_px))) orelse continue;
+
+                            const winrows_main = checkedFloatToI64(@ceil(@as(f64, @floatFromInt(float_rows)) * @as(f64, @floatFromInt(float_m.cell_h_px)) /
+                                @as(f64, @floatFromInt(main_m.cell_h_px)))) orelse continue;
+
+                            // Anchor string: "NW", "NE", "SW", "SE"
+                            if (std.mem.indexOfScalar(u8, anchor, 'S') != null) {
+                                row_i64 = std.math.sub(i64, row_i64, winrows_main) catch std.math.minInt(i64);
+                            }
+                            if (std.mem.indexOfScalar(u8, anchor, 'E') != null) {
+                                col_i64 = std.math.sub(i64, col_i64, wincols_main) catch std.math.minInt(i64);
                             }
                         }
                     }
 
-                    row_i64 = base_row + anchor_row_i;
-                    col_i64 = base_col + anchor_col_i;
+                    if (row_i64 < 0) row_i64 = 0;
+                    if (col_i64 < 0) col_i64 = 0;
 
-                    // Adjust by anchor using goneovim-like metrics conversion.
-                    // We compute float window size in "global grid cell units" using per-grid pixel metrics.
-                    const main_m = grid.getGridMetricsPx(1);
-                    const anchor_m = grid.getGridMetricsPx(anchor_grid);
-                    const float_m = grid.getGridMetricsPx(grid_id);
+                    const row = checkedGridCoord(row_i64) orelse continue;
+                    const col = checkedGridCoord(col_i64) orelse continue;
 
-                    // Convert anchor point from anchor_grid units -> global grid units.
-                    // base_row/base_col are already in global grid units (win_pos is relative to grid=1).
-                    const anchor_row_main: i64 = @as(i64, @intFromFloat(
-                        @as(f64, @floatFromInt(anchor_row_i)) * @as(f64, @floatFromInt(anchor_m.cell_h_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_h_px))
-                    ));
-                    const anchor_col_main: i64 = @as(i64, @intFromFloat(
-                        @as(f64, @floatFromInt(anchor_col_i)) * @as(f64, @floatFromInt(anchor_m.cell_w_px)) /
-                            @as(f64, @floatFromInt(main_m.cell_w_px))
-                    ));
+                    grid.setWinFloatPos(
+                        grid_id,
+                        win_id,
+                        row,
+                        col,
+                        zindex,
+                        compindex,
+                        anchor_grid,
+                    ) catch |err| switch (err) {
+                        error.TooManyWindowPlacements => {
+                            log.write("[win_float_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                            return error.TooManyWindowPlacements;
+                        },
+                        else => return err,
+                    };
+                }
+            },
+            .win_external_pos => {
+                // win_external_pos: [grid, win]
+                // Marks a grid as "external" - to be displayed in a separate top-level window.
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
 
-                    row_i64 = base_row + anchor_row_main;
-                    col_i64 = base_col + anchor_col_main;
+                    // Need at least: grid, win
+                    if (t.len < 2) continue;
+                    if (t[0] != .int or t[1] != .int) continue;
 
-                    // Compute float window size in global grid units (approx; future-proof for per-grid fonts).
-                    if (grid.sub_grids.get(grid_id)) |sg| {
-                        const float_rows: i64 = @as(i64, sg.rows);
-                        const float_cols: i64 = @as(i64, sg.cols);
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    const win = t[1].int;
 
-                        const wincols_main: i64 = @as(i64, @intFromFloat(
-                            @as(f64, @floatFromInt(float_cols)) * @as(f64, @floatFromInt(float_m.cell_w_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_w_px))
-                        ));
+                    // Mark this grid as external
+                    const is_new = grid.setWinExternalPos(grid_id, win) catch |err| switch (err) {
+                        error.TooManyWindowPlacements => {
+                            log.write("[win_external_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                            return error.TooManyWindowPlacements;
+                        },
+                        else => return err,
+                    };
+                    _ = is_new; // Callback notification is handled by nvim_core after redraw processing
+                }
+            },
+            .msg_set_pos => {
+                // msg_set_pos: [grid, row, scrolled, sep_char, zindex, compindex]
+                // The message grid is positioned on the default grid (grid=1) at the given row,
+                // covering the full width. Treat it like an overlay layer (zindex is typically 200).
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
 
-                        const winrows_main: i64 = @as(i64, @intFromFloat(@ceil(
-                            @as(f64, @floatFromInt(float_rows)) * @as(f64, @floatFromInt(float_m.cell_h_px)) /
-                                @as(f64, @floatFromInt(main_m.cell_h_px))
-                        )));
+                    // log.write("msg_set_pos:\n", .{});
 
-                        // Anchor string: "NW", "NE", "SW", "SE"
-                        if (std.mem.indexOfScalar(u8, anchor, 'S') != null) row_i64 -= winrows_main;
-                        if (std.mem.indexOfScalar(u8, anchor, 'E') != null) col_i64 -= wincols_main;
+                    // Accept old/new msg_set_pos:
+                    // old: [grid, row, scrolled, sep_char]
+                    // new: [grid, row, scrolled, sep_char, zindex, compindex]
+                    if (t.len < 4) continue;
+                    if (t[0] != .int or t[1] != .int) continue;
+
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+                    const row_i = t[1].int;
+
+                    var zindex: i64 = 200;
+                    var compindex: i64 = 0;
+                    if (t.len >= 6) {
+                        if (t[4] != .int or t[5] != .int) continue;
+                        zindex = t[4].int;
+                        compindex = t[5].int;
                     }
+
+                    const row = checkedGridCoord(row_i) orelse continue;
+                    const col: u32 = 0;
+                    // msg_set_pos has no win handle; pass 0 (no window mapping stored)
+                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1) catch |err| switch (err) {
+                        error.TooManyWindowPlacements => {
+                            log.write("msg_set_pos rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+                            return error.TooManyWindowPlacements;
+                        },
+                        else => return err,
+                    };
                 }
+            },
+            .grid_scroll => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 7) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int or t[5] != .int or t[6] != .int) continue;
 
-                if (row_i64 < 0) row_i64 = 0;
-                if (col_i64 < 0) col_i64 = 0;
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
 
-                try grid.setWinFloatPos(
-                    grid_id,
-                    win_id,
-                    @as(u32, @intCast(row_i64)),
-                    @as(u32, @intCast(col_i64)),
-                    zindex,
-                    compindex,
-                    anchor_grid,
-                );
-            }
+                    const top = checkedU32(t[1].int) orelse continue;
+                    const bot = checkedU32(t[2].int) orelse continue;
+                    const left = checkedU32(t[3].int) orelse continue;
+                    const right = checkedU32(t[4].int) orelse continue;
+                    const rows = checkedI32(t[5].int) orelse continue;
+                    const cols = checkedI32(t[6].int) orelse continue;
 
-        }, .win_external_pos => {
-            // win_external_pos: [grid, win]
-            // Marks a grid as "external" - to be displayed in a separate top-level window.
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
+                    // No-op scroll: avoid touching dirty state for nothing.
+                    // Neovim's spec reserves `cols` for future use (always 0
+                    // today), so `rows == 0` alone is the authoritative signal
+                    // that nothing visually changes — treat it as a no-op
+                    // regardless of `cols`.
+                    if (rows == 0) continue;
 
-                // Need at least: grid, win
-                if (t.len < 2) continue;
-                if (t[0] != .int or t[1] != .int) continue;
-
-                const grid_id = t[0].int;
-                const win = t[1].int;
-
-                // Mark this grid as external
-                const is_new = try grid.setWinExternalPos(grid_id, win);
-                _ = is_new; // Callback notification is handled by nvim_core after redraw processing
-            }
-
-        }, .msg_set_pos => {
-            // msg_set_pos: [grid, row, scrolled, sep_char, zindex, compindex]
-            // The message grid is positioned on the default grid (grid=1) at the given row,
-            // covering the full width. Treat it like an overlay layer (zindex is typically 200).
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                // log.write("msg_set_pos:\n", .{});
-
-
-                // Accept old/new msg_set_pos:
-                // old: [grid, row, scrolled, sep_char]
-                // new: [grid, row, scrolled, sep_char, zindex, compindex]
-                if (t.len < 4) continue;
-                if (t[0] != .int or t[1] != .int) continue;
-
-
-                const grid_id = t[0].int;
-                const row_i = t[1].int;
-
-                var zindex: i64 = 200;
-                var compindex: i64 = 0;
-                if (t.len >= 6) {
-                    if (t[4] != .int or t[5] != .int) continue;
-                    zindex = t[4].int;
-                    compindex = t[5].int;
-                }
-
-                const row = @as(u32, @intCast(row_i));
-                const col: u32 = 0;
-                // msg_set_pos has no win handle; pass 0 (no window mapping stored)
-                try grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1);
-
-            }
-
-        }, .grid_scroll => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 7) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int or t[5] != .int or t[6] != .int) continue;
-
-                const grid_id = t[0].int;
-
-                // Validate non-negative for u32 casts
-                if (t[1].int < 0 or t[2].int < 0 or t[3].int < 0 or t[4].int < 0) continue;
-                const top = @as(u32, @intCast(t[1].int));
-                const bot = @as(u32, @intCast(t[2].int));
-                const left = @as(u32, @intCast(t[3].int));
-                const right = @as(u32, @intCast(t[4].int));
-                const rows = @as(i32, @intCast(t[5].int));
-                const cols = @as(i32, @intCast(t[6].int));
-
-                // No-op scroll: avoid touching dirty state for nothing.
-                if (rows == 0 and cols == 0) continue;
-
-                if (log.cb != null) {
-                    var target_rows: u32 = grid.rows;
-                    var target_cols: u32 = grid.cols;
-                    if (grid_id != 1) {
-                        if (grid.sub_grids.getPtr(grid_id)) |sg| {
-                            target_rows = sg.rows;
-                            target_cols = sg.cols;
+                    if (log.cb != null) {
+                        var target_rows: u32 = grid.rows;
+                        var target_cols: u32 = grid.cols;
+                        if (grid_id != 1) {
+                            if (grid.sub_grids.getPtr(grid_id)) |sg| {
+                                target_rows = sg.rows;
+                                target_cols = sg.cols;
+                            }
+                        }
+                        log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
+                            grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
+                        });
+                        if (grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
+                            const now_ns = clock.nowNs();
+                            const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
+                            log.write("[perf_input] seq={d} stage=grid_scroll delta_us={d} grid={d}\n", .{
+                                grid.input_trace_seq, delta_us, grid_id,
+                            });
+                            grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
                         }
                     }
-                    log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
-                        grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
-                    });
-                    if (grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
+
+                    // Apply scroll to the target grid under ext_multigrid.
+                    grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
+                }
+            },
+            .hl_attr_define => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+                    if (t[0] != .int) continue;
+
+                    const id_u32: u32 = checkedU32(t[0].int) orelse continue;
+
+                    if (t[1] == .map) {
+                        const m = t[1].map;
+
+                        const fg = toRgbOpt(mapGetInt(m, "foreground"));
+                        const bg = toRgbOpt(mapGetInt(m, "background"));
+                        const sp = toRgbOpt(mapGetInt(m, "special"));
+
+                        const reverse = mapGetBool(m, "reverse") orelse false;
+
+                        var blend_u8: u8 = 0;
+                        if (mapGetInt(m, "blend")) |b64| {
+                            var b = b64;
+                            if (b < 0) b = 0;
+                            if (b > 100) b = 100;
+                            blend_u8 = @as(u8, @intCast(b));
+                        }
+
+                        const styles: Styles = .{
+                            .italic = mapGetBool(m, "italic") orelse false,
+                            .bold = mapGetBool(m, "bold") orelse false,
+                            .strikethrough = mapGetBool(m, "strikethrough") orelse false,
+                            .underline = mapGetBool(m, "underline") orelse false,
+                            .undercurl = mapGetBool(m, "undercurl") orelse false,
+                            .underdouble = mapGetBool(m, "underdouble") orelse false,
+                            .underdotted = mapGetBool(m, "underdotted") orelse false,
+                            .underdashed = mapGetBool(m, "underdashed") orelse false,
+                            .overline = mapGetBool(m, "overline") orelse false,
+                        };
+
+                        const has_url = (mapGetStr(m, "url") != null);
+
+                        try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
+                    } else {
+                        try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
+                    }
+                }
+            },
+            .hl_group_set => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+                    if (t[0] != .str or t[1] != .int) continue;
+
+                    const group_name = t[0].str;
+                    const hl_id_u32: u32 = checkedU32(t[1].int) orelse continue;
+                    try hl.setGroup(group_name, hl_id_u32);
+                }
+            },
+            .default_colors_set => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+
+                    const fg = if (t[0] == .int) toRgbOpt(t[0].int) else null;
+                    const bg = if (t[1] == .int) toRgbOpt(t[1].int) else null;
+                    const sp = if (t.len >= 3 and t[2] == .int) toRgbOpt(t[2].int) else null;
+                    hl.setDefaults(fg, bg, sp);
+
+                    if (default_colors_fn) |dcf| {
+                        try dcf(opt_ctx, fg orelse 0xFFFFFFFF, bg orelse 0xFFFFFFFF);
+                    }
+                }
+            },
+            .option_set => {
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+                    if (t[0] != .str) continue;
+
+                    const opt_name = t[0].str;
+                    // Per-option timing. option_set fires rarely (startup + :set)
+                    // so per-call logging is acceptable. The aggregate redraw_event
+                    // line shows option_set as a 57ms outlier; this breakdown
+                    // points at the specific option doing the heavy lifting
+                    // (typically guifont triggers atlas reset + font rebuild).
+                    const log_on_opt = log.cb != null;
+                    const t_opt_start: i128 = if (log_on_opt) clock.nowNs() else 0;
+                    defer if (log_on_opt) {
+                        const dt_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_opt_start), 1000));
+                        log.write("[perf] option_set name={s} us={d}\n", .{ opt_name, dt_us });
+                    };
+
+                    // switch (t[1]) {
+                    //     .str => {
+                    //         const v = t[1].str;
+                    //         const n = @min(v.len, 120);
+                    //         log.write("option_set {s} = '{s}' (len={d})\n", .{ opt_name, v[0..n], v.len });
+                    //     },
+                    //     .int => log.write("option_set {s} = {d}\n", .{ opt_name, t[1].int }),
+                    //     .bool => log.write("option_set {s} = {any}\n", .{ opt_name, t[1].bool }),
+                    //     .nil => log.write("option_set {s} = nil\n", .{ opt_name }),
+                    //     else => log.write("option_set {s} = <{s}>\n", .{ opt_name, @tagName(t[1]) }),
+                    // }
+
+                    if (std.mem.eql(u8, opt_name, "guifont")) {
+                        if (t[1] != .str) {
+                            if (log.cb != null) log.write("guifont option_set had non-string value tag={s}\n", .{@tagName(t[1])});
+                            continue;
+                        }
+
+                        const raw = t[1].str;
+
+                        if (std.mem.eql(u8, raw, "*")) {
+                            if (log.cb != null) log.write("guifont: request picker '*'\n", .{});
+                            try guifont_fn(opt_ctx, raw);
+                            continue;
+                        }
+
+                        if (raw.len == 0) {
+                            if (log.cb != null) log.write("guifont: empty -> notify frontend\n", .{});
+                            // Notify frontend with empty name and size 0 - it will use config/OS default for both.
+                            const msg = try std.fmt.allocPrint(arena, "\t0", .{});
+                            try guifont_fn(opt_ctx, msg);
+                            continue;
+                        }
+
+                        const list = try parseGuiFontList(arena, raw);
+                        if (log.cb != null) log.write("guifont: {d} candidate(s)\n", .{list.items.len});
+
+                        // Build a single newline-separated string of all resolved
+                        // candidates and notify the frontend once.  The frontend
+                        // tries each entry in order and uses the first loadable font.
+                        var combined: std.ArrayListUnmanaged(u8) = .empty;
+                        for (list.items, 0..) |cand, idx| {
+                            const resolved = try parseGuiFontCandidate(arena, cand);
+                            const msg = try formatResolvedGuiFont(arena, resolved);
+                            if (log.cb != null) log.write("guifont resolved: '{s}'\n", .{msg});
+                            if (idx > 0) try combined.append(arena, '\n');
+                            try combined.appendSlice(arena, msg);
+                        }
+                        try guifont_fn(opt_ctx, combined.items);
+                    }
+
+                    if (std.mem.eql(u8, opt_name, "linespace")) {
+                        // Neovim sends integer pixels.
+                        // Default is 0 (no extra leading).
+                        var px_i32: i32 = 0;
+
+                        switch (t[1]) {
+                            .int => {
+                                const v = t[1].int;
+                                px_i32 = if (v < 0) 0 else @as(i32, @intCast(@min(v, std.math.maxInt(i32))));
+                            },
+                            .nil => {
+                                px_i32 = 0;
+                            },
+                            else => {
+                                if (log.cb != null) log.write("linespace option_set had non-int value tag={s}\n", .{@tagName(t[1])});
+                                continue;
+                            },
+                        }
+
+                        try linespace_fn(linespace_ctx, px_i32);
+                    }
+                }
+            },
+            .mode_info_set => {
+                // ["mode_info_set", cursor_style_enabled, mode_info]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+
+                    const enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
+                    grid.cursor_style_enabled = enabled;
+
+                    if (t[1] != .arr) continue;
+                    const arr = t[1].arr;
+
+                    grid.mode_infos.clearRetainingCapacity();
+                    try grid.mode_infos.ensureTotalCapacity(grid.alloc, arr.len);
+
+                    for (arr, 0..) |mv, mode_idx| {
+                        var mi: ModeInfo = .{};
+                        if (mv == .map) {
+                            const m = mv.map;
+
+                            if (mapGetStr(m, "cursor_shape")) |s| {
+                                if (std.mem.eql(u8, s, "block")) mi.shape = .block else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
+                                // Debug: log parsed shape
+                                if (log.cb != null) {
+                                    log.write("  parse mode[{d}]: cursor_shape='{s}' -> {s}\n", .{
+                                        mode_idx, s, @tagName(mi.shape),
+                                    });
+                                }
+                            }
+                            if (mapGetInt(m, "cell_percentage")) |p64| {
+                                var p = p64;
+                                if (p <= 0) p = 100;
+                                if (p > 100) p = 100;
+                                mi.cell_percentage = @as(u8, @intCast(p));
+                            }
+                            if (mapGetInt(m, "attr_id")) |a64| {
+                                mi.attr_id = checkedU32(a64) orelse 0;
+                            }
+                            // Parse blink parameters
+                            if (mapGetInt(m, "blinkwait")) |bw| {
+                                mi.blink_wait_ms = checkedU32(bw) orelse 0;
+                            }
+                            if (mapGetInt(m, "blinkon")) |bon| {
+                                mi.blink_on_ms = checkedU32(bon) orelse 0;
+                            }
+                            if (mapGetInt(m, "blinkoff")) |boff| {
+                                mi.blink_off_ms = checkedU32(boff) orelse 0;
+                            }
+                        } else {
+                            // Debug: mv is not a map
+                            if (log.cb != null) {
+                                log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
+                            }
+                        }
+                        grid.mode_infos.appendAssumeCapacity(mi);
+                    }
+
+                    // Debug log: mode_info_set processed
+                    if (log.cb != null) {
+                        log.write("mode_info_set: enabled={} mode_count={d}\n", .{
+                            grid.cursor_style_enabled,
+                            grid.mode_infos.items.len,
+                        });
+                        for (grid.mode_infos.items, 0..) |mi2, i| {
+                            log.write("  mode[{d}]: shape={s} cell_pct={d} attr_id={d}\n", .{
+                                i,
+                                @tagName(mi2.shape),
+                                mi2.cell_percentage,
+                                mi2.attr_id,
+                            });
+                        }
+                    }
+                }
+                // The table just changed under the current mode (`:set guicursor`).
+                // Neovim sends no mode_change for it, so re-resolve the live style
+                // here or the cursor keeps its old shape until the mode changes.
+                applyModeInfo(grid, grid.current_mode_idx);
+                grid.cursor_rev +%= 1;
+            },
+            .mode_change => {
+                // ["mode_change", mode, mode_idx]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+                    if (t[1] != .int) continue;
+
+                    const idx64 = t[1].int;
+                    if (idx64 < 0) continue;
+                    const idx = std.math.cast(usize, idx64) orelse continue;
+
+                    grid.current_mode_idx = idx;
+
+                    applyModeInfo(grid, idx);
+
+                    // Debug log: mode_change processed
+                    if (log.cb != null) {
+                        log.write("mode_change: idx={d} cursor_style_enabled={} shape={s} cell_pct={d} blink=({d},{d},{d})\n", .{
+                            idx,
+                            grid.cursor_style_enabled,
+                            @tagName(grid.cursor_shape),
+                            grid.cursor_cell_percentage,
+                            grid.cursor_blink_wait_ms,
+                            grid.cursor_blink_on_ms,
+                            grid.cursor_blink_off_ms,
+                        });
+                    }
+
+                    // Store mode name for external queries (e.g., terminal mode detection)
+                    if (t[0] == .str) {
+                        const mode_str = t[0].str;
+                        // Copy mode name to fixed buffer (null-terminated)
+                        const copy_len = @min(mode_str.len, grid.current_mode_name.len - 1);
+                        @memcpy(grid.current_mode_name[0..copy_len], mode_str[0..copy_len]);
+                        grid.current_mode_name[copy_len] = 0; // null terminate
+                    }
+
+                    // Clear showmode when exiting insert/replace mode
+                    // Neovim doesn't always send empty msg_showmode on mode exit
+                    if (t[0] == .str) {
+                        const mode_str = t[0].str;
+                        // Check if mode is NOT insert-related (i, R, Rv, etc.)
+                        const is_insert_mode = mode_str.len > 0 and
+                            (mode_str[0] == 'i' or mode_str[0] == 'R');
+                        if (!is_insert_mode and grid.message_state.showmode_content.items.len > 0) {
+                            // Clear showmode content
+                            for (grid.message_state.showmode_content.items) |chunk| {
+                                if (chunk.text.len > 0) grid.alloc.free(chunk.text);
+                            }
+                            grid.message_state.showmode_content.clearRetainingCapacity();
+                            grid.message_state.showmode_dirty = true;
+                            if (log.cb != null) log.write("mode_change: cleared showmode (mode={s})\n", .{mode_str});
+                        }
+                    }
+                }
+                // Request IME off on any mode change (config check done by nvim_core)
+                grid.ime_off_requested = true;
+                grid.cursor_rev +%= 1;
+            },
+            .busy_start => {
+                grid.cursor_visible = false;
+                grid.cursor_rev +%= 1;
+            },
+            .busy_stop => {
+                grid.cursor_visible = true;
+                grid.cursor_rev +%= 1;
+            },
+            .grid_line => {
+                if (log_on_batch) grid_line_tuple_total +%= @intCast(tuples.len);
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 5) continue;
+                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+                    if (t[3] != .arr) continue;
+
+                    const grid_id = checkedGridId(t[0].int) orelse continue;
+
+                    if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
                         const now_ns = clock.nowNs();
                         const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
-                        log.write("[perf_input] seq={d} stage=grid_scroll delta_us={d} grid={d}\n", .{
-                            grid.input_trace_seq, delta_us, grid_id,
+                        log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
+                            grid.input_trace_seq, delta_us, grid_id, t[1].int,
                         });
                         grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
                     }
-                }
 
-                // Apply scroll to the target grid under ext_multigrid.
-                grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
-            }
+                    const row = checkedU32(t[1].int) orelse continue;
+                    var col = checkedU32(t[2].int) orelse continue;
 
-        }, .hl_attr_define => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-                if (t[0] != .int) continue;
+                    // Update order (existing behavior)
+                    grid.noteGridLine(grid_id, redraw_epoch);
 
-                const id_u32: u32 = @as(u32, @intCast(t[0].int));
+                    const cells = t[3].arr;
 
-                if (t[1] == .map) {
-                    const m = t[1].map;
+                    // Resolved once per grid_line tuple (grid_id is constant within
+                    // it); used by the repeat clamp below. A per-cell sub_grids
+                    // lookup here would be a hash probe on the grid_line hot path.
+                    const grid_cols: u32 = if (grid_id == 1)
+                        grid.cols
+                    else if (grid.sub_grids.get(grid_id)) |sg|
+                        sg.cols
+                    else
+                        0;
 
-                    const fg = toRgbOpt(mapGetInt(m, "foreground"));
-                    const bg = toRgbOpt(mapGetInt(m, "background"));
-                    const sp = toRgbOpt(mapGetInt(m, "special"));
+                    // "hl" is a state that persists across cell tuples within THIS grid_line event.
+                    // - If hl is omitted, keep previous hl value.
+                    // - If hl == -1, inherit from left cell at write time (except col==0).
+                    //
+                    // NOTE:
+                    // Neovim help says the first cell in the event always includes hl_id, but we still
+                    // implement the state machine safely.
+                    var hl_state: i64 = 0;
 
-                    const reverse = mapGetBool(m, "reverse") orelse false;
+                    for (cells) |cellv| {
+                        if (cellv != .arr) continue;
+                        const c = cellv.arr;
+                        if (c.len < 1 or c[0] != .str) continue;
 
-                    var blend_u8: u8 = 0;
-                    if (mapGetInt(m, "blend")) |b64| {
-                        var b = b64;
-                        if (b < 0) b = 0;
-                        if (b > 100) b = 100;
-                        blend_u8 = @as(u8, @intCast(b));
-                    }
+                        // Extract all codepoints from the cell string.
+                        // If >1 codepoint (e.g., U+26A0 + U+FE0F), extras go to overflow map.
+                        var cp_buf: [16]u32 = undefined;
+                        const extracted = extractCellCodepoints(c[0].str, &cp_buf);
+                        const cp_count = extracted.count;
+                        if (extracted.replaced_oversized) {
+                            log.write("[redraw] oversized grid_line cluster grid={d} row={d} col={d} bytes={d}; using U+FFFD\n", .{
+                                grid_id, row, col, c[0].str.len,
+                            });
+                        }
+                        const cp = cp_buf[0];
+                        const has_overflow = cp_count > 1;
 
-                    const styles: Styles = .{
-                        .italic = mapGetBool(m, "italic") orelse false,
-                        .bold = mapGetBool(m, "bold") orelse false,
-                        .strikethrough = mapGetBool(m, "strikethrough") orelse false,
-                        .underline = mapGetBool(m, "underline") orelse false,
-                        .undercurl = mapGetBool(m, "undercurl") orelse false,
-                        .underdouble = mapGetBool(m, "underdouble") orelse false,
-                        .underdotted = mapGetBool(m, "underdotted") orelse false,
-                        .underdashed = mapGetBool(m, "underdashed") orelse false,
-                        .overline = mapGetBool(m, "overline") orelse false,
-                    };
+                        // Update hl_state only when provided.
+                        if (c.len >= 2 and c[1] == .int) {
+                            hl_state = c[1].int; // may be -1
+                        }
 
-                    const has_url = (mapGetStr(m, "url") != null);
-
-                    try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
-                } else {
-                    try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
-                }
-            }
-
-        }, .hl_group_set => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-                if (t[0] != .str or t[1] != .int) continue;
-
-                const group_name = t[0].str;
-                const hl_id_u32: u32 = @as(u32, @intCast(t[1].int));
-                try hl.setGroup(group_name, hl_id_u32);
-            }
-
-        }, .default_colors_set => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-
-                const fg = if (t[0] == .int) toRgbOpt(t[0].int) else null;
-                const bg = if (t[1] == .int) toRgbOpt(t[1].int) else null;
-                const sp = if (t.len >= 3 and t[2] == .int) toRgbOpt(t[2].int) else null;
-                hl.setDefaults(fg, bg, sp);
-
-                if (default_colors_fn) |dcf| {
-                    try dcf(opt_ctx, fg orelse 0xFFFFFFFF, bg orelse 0xFFFFFFFF);
-                }
-            }
-
-        }, .option_set => {
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-                if (t[0] != .str) continue;
-
-                const opt_name = t[0].str;
-                // Per-option timing. option_set fires rarely (startup + :set)
-                // so per-call logging is acceptable. The aggregate redraw_event
-                // line shows option_set as a 57ms outlier; this breakdown
-                // points at the specific option doing the heavy lifting
-                // (typically guifont triggers atlas reset + font rebuild).
-                const log_on_opt = log.cb != null;
-                const t_opt_start: i128 = if (log_on_opt) clock.nowNs() else 0;
-                defer if (log_on_opt) {
-                    const dt_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_opt_start), 1000));
-                    log.write("[perf] option_set name={s} us={d}\n", .{ opt_name, dt_us });
-                };
-
-                // switch (t[1]) {
-                //     .str => {
-                //         const v = t[1].str;
-                //         const n = @min(v.len, 120);
-                //         log.write("option_set {s} = '{s}' (len={d})\n", .{ opt_name, v[0..n], v.len });
-                //     },
-                //     .int => log.write("option_set {s} = {d}\n", .{ opt_name, t[1].int }),
-                //     .bool => log.write("option_set {s} = {any}\n", .{ opt_name, t[1].bool }),
-                //     .nil => log.write("option_set {s} = nil\n", .{ opt_name }),
-                //     else => log.write("option_set {s} = <{s}>\n", .{ opt_name, @tagName(t[1]) }),
-                // }
-
-                if (std.mem.eql(u8, opt_name, "guifont")) {
-                    if (t[1] != .str) {
-                        if (log.cb != null) log.write("guifont option_set had non-string value tag={s}\n", .{@tagName(t[1])});
-                        continue;
-                    }
-
-                    const raw = t[1].str;
-
-                    if (std.mem.eql(u8, raw, "*")) {
-                        if (log.cb != null) log.write("guifont: request picker '*'\n", .{});
-                        try guifont_fn(opt_ctx, raw);
-                        continue;
-                    }
-
-                    if (raw.len == 0) {
-                        if (log.cb != null) log.write("guifont: empty -> notify frontend\n", .{});
-                        // Notify frontend with empty name and size 0 - it will use config/OS default for both.
-                        const msg = try std.fmt.allocPrint(arena, "\t0", .{});
-                        try guifont_fn(opt_ctx, msg);
-                        continue;
-                    }
-
-                    const list = try parseGuiFontList(arena, raw);
-                    if (log.cb != null) log.write("guifont: {d} candidate(s)\n", .{list.items.len});
-
-                    // Build a single newline-separated string of all resolved
-                    // candidates and notify the frontend once.  The frontend
-                    // tries each entry in order and uses the first loadable font.
-                    var combined: std.ArrayListUnmanaged(u8) = .empty;
-                    for (list.items, 0..) |cand, idx| {
-                        const resolved = try parseGuiFontCandidate(arena, cand);
-                        const msg = try formatResolvedGuiFont(arena, resolved);
-                        if (log.cb != null) log.write("guifont resolved: '{s}'\n", .{msg});
-                        if (idx > 0) try combined.append(arena, '\n');
-                        try combined.appendSlice(arena, msg);
-                    }
-                    try guifont_fn(opt_ctx, combined.items);
-                }
-
-                if (std.mem.eql(u8, opt_name, "linespace")) {
-                    // Neovim sends integer pixels.
-                    // Default is 0 (no extra leading).
-                    var px_i32: i32 = 0;
-
-                    switch (t[1]) {
-                        .int => {
-                            const v = t[1].int;
-                            px_i32 = if (v < 0) 0 else @as(i32, @intCast(@min(v, std.math.maxInt(i32))));
-                        },
-                        .nil => {
-                            px_i32 = 0;
-                        },
-                        else => {
-                            if (log.cb != null) log.write("linespace option_set had non-int value tag={s}\n", .{@tagName(t[1])});
-                            continue;
-                        },
-                    }
-
-                    try linespace_fn(linespace_ctx, px_i32);
-                }
-
-            }
-
-        }, .mode_info_set => {
-            // ["mode_info_set", cursor_style_enabled, mode_info]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-        
-                const enabled = (t[0] == .int and t[0].int != 0) or (t[0] == .bool and t[0].bool);
-                grid.cursor_style_enabled = enabled;
-        
-                if (t[1] != .arr) continue;
-                const arr = t[1].arr;
-        
-                grid.mode_infos.clearRetainingCapacity();
-                try grid.mode_infos.ensureTotalCapacity(grid.alloc, arr.len);
-        
-                for (arr, 0..) |mv, mode_idx| {
-                    var mi: ModeInfo = .{};
-                    if (mv == .map) {
-                        const m = mv.map;
-
-                        if (mapGetStr(m, "cursor_shape")) |s| {
-                            if (std.mem.eql(u8, s, "block")) mi.shape = .block
-                            else if (std.mem.eql(u8, s, "vertical")) mi.shape = .vertical
-                            else if (std.mem.eql(u8, s, "horizontal")) mi.shape = .horizontal;
-                            // Debug: log parsed shape
-                            if (log.cb != null) {
-                                log.write("  parse mode[{d}]: cursor_shape='{s}' -> {s}\n", .{
-                                    mode_idx, s, @tagName(mi.shape),
-                                });
+                        // repeat:
+                        // - If not present: 1
+                        // - If present and == 0: write NOTHING (this is important; do not treat as 1)
+                        // - If present and > 0: repeat times
+                        var repeat: u32 = 1;
+                        if (c.len >= 3 and c[2] == .int) {
+                            const r64 = c[2].int;
+                            if (r64 <= 0) {
+                                // repeat==0 => no-op; repeat<0 => treat as no-op as well
+                                continue;
                             }
+                            repeat = checkedU32(r64) orelse continue;
                         }
-                        if (mapGetInt(m, "cell_percentage")) |p64| {
-                            var p = p64;
-                            if (p <= 0) p = 100;
-                            if (p > 100) p = 100;
-                            mi.cell_percentage = @as(u8, @intCast(p));
-                        }
-                        if (mapGetInt(m, "attr_id")) |a64| {
-                            mi.attr_id = @as(u32, @intCast(@max(a64, 0)));
-                        }
-                        // Parse blink parameters
-                        if (mapGetInt(m, "blinkwait")) |bw| {
-                            mi.blink_wait_ms = @as(u32, @intCast(@max(bw, 0)));
-                        }
-                        if (mapGetInt(m, "blinkon")) |bon| {
-                            mi.blink_on_ms = @as(u32, @intCast(@max(bon, 0)));
-                        }
-                        if (mapGetInt(m, "blinkoff")) |boff| {
-                            mi.blink_off_ms = @as(u32, @intCast(@max(boff, 0)));
-                        }
-                    } else {
-                        // Debug: mv is not a map
-                        if (log.cb != null) {
-                            log.write("  parse mode[{d}]: NOT a map!\n", .{mode_idx});
-                        }
-                    }
-                    grid.mode_infos.appendAssumeCapacity(mi);
-                }
 
-                // Debug log: mode_info_set processed
-                if (log.cb != null) {
-                    log.write("mode_info_set: enabled={} mode_count={d}\n", .{
-                        grid.cursor_style_enabled,
-                        grid.mode_infos.items.len,
-                    });
-                    for (grid.mode_infos.items, 0..) |mi2, i| {
-                        log.write("  mode[{d}]: shape={s} cell_pct={d} attr_id={d}\n", .{
-                            i,
-                            @tagName(mi2.shape),
-                            mi2.cell_percentage,
-                            mi2.attr_id,
-                        });
-                    }
-                }
-            }
-            // The table just changed under the current mode (`:set guicursor`).
-            // Neovim sends no mode_change for it, so re-resolve the live style
-            // here or the cursor keeps its old shape until the mode changes.
-            applyModeInfo(grid, grid.current_mode_idx);
-            grid.cursor_rev +%= 1;
+                        // Always clamp, including an omitted or malformed
+                        // repeat which defaults to one. Keeping this outside
+                        // the optional repeat branch also rejects col >= cols
+                        // before col += 1 can overflow.
+                        repeat = clampGridLineRepeat(col, grid_cols, repeat);
+                        if (repeat == 0) continue;
 
+                        if (log_on_batch) grid_line_cells_total +%= repeat;
+                        var i: u32 = 0;
+                        while (i < repeat) : (i += 1) {
+                            var hl_to_use: u32 = 0;
 
-        }, .mode_change => {
-            // ["mode_change", mode, mode_idx]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-                if (t[1] != .int) continue;
-
-                const idx64 = t[1].int;
-                if (idx64 < 0) continue;
-                const idx: usize = @intCast(idx64);
-
-                grid.current_mode_idx = idx;
-
-                applyModeInfo(grid, idx);
-
-                // Debug log: mode_change processed
-                if (log.cb != null) {
-                    log.write("mode_change: idx={d} cursor_style_enabled={} shape={s} cell_pct={d} blink=({d},{d},{d})\n", .{
-                        idx,
-                        grid.cursor_style_enabled,
-                        @tagName(grid.cursor_shape),
-                        grid.cursor_cell_percentage,
-                        grid.cursor_blink_wait_ms,
-                        grid.cursor_blink_on_ms,
-                        grid.cursor_blink_off_ms,
-                    });
-                }
-
-                // Store mode name for external queries (e.g., terminal mode detection)
-                if (t[0] == .str) {
-                    const mode_str = t[0].str;
-                    // Copy mode name to fixed buffer (null-terminated)
-                    const copy_len = @min(mode_str.len, grid.current_mode_name.len - 1);
-                    @memcpy(grid.current_mode_name[0..copy_len], mode_str[0..copy_len]);
-                    grid.current_mode_name[copy_len] = 0; // null terminate
-                }
-
-                // Clear showmode when exiting insert/replace mode
-                // Neovim doesn't always send empty msg_showmode on mode exit
-                if (t[0] == .str) {
-                    const mode_str = t[0].str;
-                    // Check if mode is NOT insert-related (i, R, Rv, etc.)
-                    const is_insert_mode = mode_str.len > 0 and
-                        (mode_str[0] == 'i' or mode_str[0] == 'R');
-                    if (!is_insert_mode and grid.message_state.showmode_content.items.len > 0) {
-                        // Clear showmode content
-                        for (grid.message_state.showmode_content.items) |chunk| {
-                            if (chunk.text.len > 0) grid.alloc.free(chunk.text);
-                        }
-                        grid.message_state.showmode_content.clearRetainingCapacity();
-                        grid.message_state.showmode_dirty = true;
-                        if (log.cb != null) log.write("mode_change: cleared showmode (mode={s})\n", .{mode_str});
-                    }
-                }
-            }
-            // Request IME off on any mode change (config check done by nvim_core)
-            grid.ime_off_requested = true;
-            grid.cursor_rev +%= 1;
-
-
-        }, .busy_start => {
-            grid.cursor_visible = false;
-            grid.cursor_rev +%= 1;
-        }, .busy_stop => {
-            grid.cursor_visible = true;
-            grid.cursor_rev +%= 1;
-
-        }, .grid_line => {
-            if (log_on_batch) grid_line_tuple_total +%= @intCast(tuples.len);
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 5) continue;
-                if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
-                if (t[3] != .arr) continue;
-
-                const grid_id = t[0].int;
-
-                if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
-                    const now_ns = clock.nowNs();
-                    const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
-                    log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
-                        grid.input_trace_seq, delta_us, grid_id, t[1].int,
-                    });
-                    grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
-                }
-
-                // Update order (existing behavior)
-                grid.noteGridLine(grid_id);
-
-                const row = @as(u32, @intCast(t[1].int));
-                var col = @as(u32, @intCast(t[2].int));
-
-                const cells = t[3].arr;
-
-                // "hl" is a state that persists across cell tuples within THIS grid_line event.
-                // - If hl is omitted, keep previous hl value.
-                // - If hl == -1, inherit from left cell at write time (except col==0).
-                //
-                // NOTE:
-                // Neovim help says the first cell in the event always includes hl_id, but we still
-                // implement the state machine safely.
-                var hl_state: i64 = 0;
-
-                for (cells) |cellv| {
-                    if (cellv != .arr) continue;
-                    const c = cellv.arr;
-                    if (c.len < 1 or c[0] != .str) continue;
-
-                    // Extract all codepoints from the cell string.
-                    // If >1 codepoint (e.g., U+26A0 + U+FE0F), extras go to overflow map.
-                    var cp_buf: [16]u32 = undefined;
-                    const cp_count = extractAllCodepoints(c[0].str, &cp_buf);
-                    const cp = cp_buf[0];
-                    const has_overflow = cp_count > 1;
-
-                    // Update hl_state only when provided.
-                    if (c.len >= 2 and c[1] == .int) {
-                        hl_state = c[1].int; // may be -1
-                    }
-
-                    // repeat:
-                    // - If not present: 1
-                    // - If present and == 0: write NOTHING (this is important; do not treat as 1)
-                    // - If present and > 0: repeat times
-                    var repeat: u32 = 1;
-                    if (c.len >= 3 and c[2] == .int) {
-                        const r64 = c[2].int;
-                        if (r64 <= 0) {
-                            // repeat==0 => no-op; repeat<0 => treat as no-op as well
-                            continue;
-                        }
-                        repeat = @as(u32, @intCast(r64));
-                    }
-
-                    if (log_on_batch) grid_line_cells_total +%= repeat;
-                    var i: u32 = 0;
-                    while (i < repeat) : (i += 1) {
-                        var hl_to_use: u32 = 0;
-
-                        // goneovim-compatible behavior:
-                        // if hl != -1 OR col == 0 -> use hl
-                        // else -> inherit from left cell
-                        if (hl_state != -1 or col == 0) {
-                            if (hl_state >= 0) {
-                                hl_to_use = @as(u32, @intCast(hl_state));
+                            // goneovim-compatible behavior:
+                            // if hl != -1 OR col == 0 -> use hl
+                            // else -> inherit from left cell
+                            if (hl_state != -1 or col == 0) {
+                                if (hl_state >= 0) {
+                                    // A malformed/malicious redraw event can carry an
+                                    // hl_id beyond u32; a raw @intCast would panic the
+                                    // render thread. Out-of-range ids fall back to 0
+                                    // (default hl) — the hl table is u32-keyed anyway.
+                                    hl_to_use = std.math.cast(u32, hl_state) orelse 0;
+                                } else {
+                                    // hl_state can be -1 here only when col==0; treat as 0.
+                                    hl_to_use = 0;
+                                }
                             } else {
-                                // hl_state can be -1 here only when col==0; treat as 0.
-                                hl_to_use = 0;
+                                // hl_state == -1 and col > 0 -> inherit from left cell
+                                hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
                             }
-                        } else {
-                            // hl_state == -1 and col > 0 -> inherit from left cell
-                            hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
+
+                            try grid.putCellGridCluster(
+                                grid_id,
+                                row,
+                                col,
+                                cp,
+                                hl_to_use,
+                                if (has_overflow) cp_buf[1..cp_count] else &.{},
+                            );
+
+                            col += 1;
                         }
-
-                        grid.putCellGrid(grid_id, row, col, cp, hl_to_use);
-
-                        // Manage overflow map for multi-codepoint cells.
-                        // Force-mark dirty when overflow state changes, because
-                        // putCellGrid skips dirty marking when cp+hl are unchanged
-                        // (e.g., ⚠ → ⚠️ where base cp is the same).
-                        if (has_overflow) {
-                            const old = grid.getOverflow(grid_id, row, col);
-                            const changed = if (old) |o| !std.mem.eql(u32, o, cp_buf[1..cp_count]) else true;
-                            grid.putOverflow(grid_id, row, col, cp_buf[1..cp_count]);
-                            if (changed) grid.markDirtyCellGrid(grid_id, row, col);
-                        } else {
-                            const had = grid.getOverflow(grid_id, row, col) != null;
-                            grid.removeOverflow(grid_id, row, col);
-                            if (had) grid.markDirtyCellGrid(grid_id, row, col);
-                        }
-
-                        col += 1;
                     }
                 }
-            }
 
-        // =====================================================================
-        // ext_cmdline events
-        // =====================================================================
-        }, .cmdline_show => {
-            // cmdline_show: [[content, pos, firstc, prompt, indent, level, hl_id], ...]
-            // content is array of [attr, text, hl_id] tuples
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 5) continue;
+                // =====================================================================
+                // ext_cmdline events
+                // =====================================================================
+            },
+            .cmdline_show => {
+                // cmdline_show: [[content, pos, firstc, prompt, indent, level, hl_id], ...]
+                // content is array of [attr, text, hl_id] tuples
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 5) continue;
 
-                // Parse content (array of [attrs, text] or [attrs, text, hl_id])
-                var chunks : std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-                if (t[0] == .arr) {
+                    // Parse content (array of [attrs, text] or [attrs, text, hl_id])
+                    var chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
+                    if (t[0] == .arr) {
+                        for (t[0].arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            if (chunk.len < 2) continue;
+
+                            // chunk[0] is attrs (map or int for hl_id)
+                            // chunk[1] is text
+                            const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
+                            try chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
+                        }
+                    }
+
+                    const pos: u32 = if (t[1] == .int) (checkedU32(t[1].int) orelse 0) else 0;
+                    const firstc: u8 = if (t[2] == .str and t[2].str.len > 0) t[2].str[0] else 0;
+                    const prompt: []const u8 = if (t[3] == .str) t[3].str else "";
+                    const indent: u32 = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
+                    const level: u32 = if (t.len > 5 and t[5] == .int and t[5].int >= 1) (checkedU32(t[5].int) orelse 1) else 1;
+                    const prompt_hl_id: u32 = if (t.len > 6 and t[6] == .int) (checkedU32(t[6].int) orelse 0) else 0;
+
+                    try grid.setCmdlineShow(chunks.items, pos, firstc, prompt, indent, level, prompt_hl_id);
+                    if (log.cb != null) log.write("cmdline_show pos={d} firstc={c} level={d}\n", .{ pos, firstc, level });
+                }
+            },
+            .cmdline_hide => {
+                // cmdline_hide: [[level], ...] or [level, abort]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+
+                    const level: u32 = if (t.len >= 1 and t[0] == .int and t[0].int >= 1) (checkedU32(t[0].int) orelse 1) else 1;
+
+                    grid.setCmdlineHide(level);
+                    if (log.cb != null) log.write("cmdline_hide level={d}\n", .{level});
+                }
+            },
+            .cmdline_pos => {
+                // cmdline_pos: [[pos, level], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
+                    if (t[0] != .int or t[1] != .int) continue;
+
+                    const pos: u32 = checkedU32(t[0].int) orelse 0;
+                    const level: u32 = if (t[1].int >= 1) (checkedU32(t[1].int) orelse 1) else 1;
+
+                    grid.setCmdlinePos(pos, level);
+                    if (log.cb != null) log.write("cmdline_pos pos={d} level={d}\n", .{ pos, level });
+                }
+            },
+            .cmdline_special_char => {
+                // cmdline_special_char: [[c, shift, level], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 3) continue;
+
+                    const c: []const u8 = if (t[0] == .str) t[0].str else "";
+                    const shift: bool = if (t[1] == .bool) t[1].bool else false;
+                    const level: u32 = if (t[2] == .int and t[2].int >= 1) (checkedU32(t[2].int) orelse 1) else 1;
+
+                    grid.setCmdlineSpecialChar(c, shift, level);
+                    if (log.cb != null) {
+                        log.write("cmdline_special_char c=\"{s}\" len={d} shift={} level={d}\n", .{ c, c.len, shift, level });
+                        // Log bytes for debugging
+                        if (c.len > 0) {
+                            log.write("cmdline_special_char bytes: ", .{});
+                            for (c) |b| {
+                                log.write("0x{x:0>2} ", .{b});
+                            }
+                            log.write("\n", .{});
+                        }
+                    }
+                }
+            },
+            .cmdline_block_show => {
+                // cmdline_block_show: [[lines], ...]
+                // lines is array of arrays of [attrs, text] tuples (same format as cmdline content)
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1) continue;
+                    if (t[0] != .arr) continue;
+
+                    var lines: std.ArrayListUnmanaged([]const CmdlineChunk) = .empty;
+                    for (t[0].arr) |line_v| {
+                        if (line_v != .arr) continue;
+                        var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
+                        for (line_v.arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            if (chunk.len < 2) continue;
+
+                            const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
+                            try line_chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
+                        }
+                        try lines.append(arena, line_chunks.items);
+                    }
+
+                    try grid.setCmdlineBlockShow(lines.items);
+                    if (log.cb != null) log.write("cmdline_block_show lines={d}\n", .{lines.items.len});
+                }
+            },
+            .cmdline_block_append => {
+                // cmdline_block_append: [[line], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1) continue;
+                    if (t[0] != .arr) continue;
+
+                    var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
                     for (t[0].arr) |chunk_v| {
                         if (chunk_v != .arr) continue;
                         const chunk = chunk_v.arr;
                         if (chunk.len < 2) continue;
 
-                        // chunk[0] is attrs (map or int for hl_id)
-                        // chunk[1] is text
-                        const hl_id: u32 = blk: {
-                            if (chunk[0] == .int and chunk[0].int >= 0) {
-                                break :blk @as(u32, @intCast(chunk[0].int));
-                            }
-                            break :blk 0;
-                        };
-                        const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                        try chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
-                    }
-                }
-
-                const pos: u32 = if (t[1] == .int and t[1].int >= 0) @as(u32, @intCast(t[1].int)) else 0;
-                const firstc: u8 = if (t[2] == .str and t[2].str.len > 0) t[2].str[0] else 0;
-                const prompt: []const u8 = if (t[3] == .str) t[3].str else "";
-                const indent: u32 = if (t[4] == .int and t[4].int >= 0) @as(u32, @intCast(t[4].int)) else 0;
-                const level: u32 = if (t.len > 5 and t[5] == .int and t[5].int >= 1) @as(u32, @intCast(t[5].int)) else 1;
-                const prompt_hl_id: u32 = if (t.len > 6 and t[6] == .int and t[6].int >= 0) @as(u32, @intCast(t[6].int)) else 0;
-
-                try grid.setCmdlineShow(chunks.items, pos, firstc, prompt, indent, level, prompt_hl_id);
-                if (log.cb != null) log.write("cmdline_show pos={d} firstc={c} level={d}\n", .{ pos, firstc, level });
-            }
-
-        }, .cmdline_hide => {
-            // cmdline_hide: [[level], ...] or [level, abort]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                const level: u32 = if (t.len >= 1 and t[0] == .int and t[0].int >= 1) @as(u32, @intCast(t[0].int)) else 1;
-
-                grid.setCmdlineHide(level);
-                if (log.cb != null) log.write("cmdline_hide level={d}\n", .{level});
-            }
-
-        }, .cmdline_pos => {
-            // cmdline_pos: [[pos, level], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
-                if (t[0] != .int or t[1] != .int) continue;
-
-                const pos: u32 = if (t[0].int >= 0) @as(u32, @intCast(t[0].int)) else 0;
-                const level: u32 = if (t[1].int >= 1) @as(u32, @intCast(t[1].int)) else 1;
-
-                grid.setCmdlinePos(pos, level);
-                if (log.cb != null) log.write("cmdline_pos pos={d} level={d}\n", .{ pos, level });
-            }
-
-        }, .cmdline_special_char => {
-            // cmdline_special_char: [[c, shift, level], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 3) continue;
-
-                const c: []const u8 = if (t[0] == .str) t[0].str else "";
-                const shift: bool = if (t[1] == .bool) t[1].bool else false;
-                const level: u32 = if (t[2] == .int and t[2].int >= 1) @as(u32, @intCast(t[2].int)) else 1;
-
-                grid.setCmdlineSpecialChar(c, shift, level);
-                if (log.cb != null) {
-                    log.write("cmdline_special_char c=\"{s}\" len={d} shift={} level={d}\n", .{ c, c.len, shift, level });
-                    // Log bytes for debugging
-                    if (c.len > 0) {
-                        log.write("cmdline_special_char bytes: ", .{});
-                        for (c) |b| {
-                            log.write("0x{x:0>2} ", .{b});
-                        }
-                        log.write("\n", .{});
-                    }
-                }
-            }
-
-        }, .cmdline_block_show => {
-            // cmdline_block_show: [[lines], ...]
-            // lines is array of arrays of [attrs, text] tuples (same format as cmdline content)
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 1) continue;
-                if (t[0] != .arr) continue;
-
-                var lines : std.ArrayListUnmanaged([]const CmdlineChunk) = .empty;
-                for (t[0].arr) |line_v| {
-                    if (line_v != .arr) continue;
-                    var line_chunks : std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-                    for (line_v.arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        if (chunk.len < 2) continue;
-
-                        const hl_id: u32 = if (chunk[0] == .int and chunk[0].int >= 0) @as(u32, @intCast(chunk[0].int)) else 0;
+                        const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
                         const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
                         try line_chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
                     }
-                    try lines.append(arena, line_chunks.items);
+
+                    try grid.appendCmdlineBlock(line_chunks.items);
+                    if (log.cb != null) log.write("cmdline_block_append\n", .{});
                 }
+            },
+            .cmdline_block_hide => {
+                // cmdline_block_hide: []
+                grid.hideCmdlineBlock();
+                if (log.cb != null) log.write("cmdline_block_hide\n", .{});
 
-                try grid.setCmdlineBlockShow(lines.items);
-                if (log.cb != null) log.write("cmdline_block_show lines={d}\n", .{lines.items.len});
-            }
+                // =====================================================================
+                // ext_popupmenu events
+                // =====================================================================
+            },
+            .popupmenu_show => {
+                // popupmenu_show: [[items, selected, row, col, grid], ...]
+                // items: [[word, kind, menu, info], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 5) continue;
 
-        }, .cmdline_block_append => {
-            // cmdline_block_append: [[line], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 1) continue;
-                if (t[0] != .arr) continue;
+                    // Parse items array
+                    var items: std.ArrayListUnmanaged(PopupmenuItem) = .empty;
+                    if (t[0] == .arr) {
+                        for (t[0].arr) |item_v| {
+                            if (item_v != .arr) continue;
+                            const item = item_v.arr;
+                            // Each item is [word, kind, menu, info]
+                            const word: []const u8 = if (item.len > 0 and item[0] == .str) item[0].str else "";
+                            const kind: []const u8 = if (item.len > 1 and item[1] == .str) item[1].str else "";
+                            const menu: []const u8 = if (item.len > 2 and item[2] == .str) item[2].str else "";
+                            const info: []const u8 = if (item.len > 3 and item[3] == .str) item[3].str else "";
 
-                var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-                for (t[0].arr) |chunk_v| {
-                    if (chunk_v != .arr) continue;
-                    const chunk = chunk_v.arr;
-                    if (chunk.len < 2) continue;
-
-                    const hl_id: u32 = if (chunk[0] == .int and chunk[0].int >= 0) @as(u32, @intCast(chunk[0].int)) else 0;
-                    const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                    try line_chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
-                }
-
-                try grid.appendCmdlineBlock(line_chunks.items);
-                if (log.cb != null) log.write("cmdline_block_append\n", .{});
-            }
-
-        }, .cmdline_block_hide => {
-            // cmdline_block_hide: []
-            grid.hideCmdlineBlock();
-            if (log.cb != null) log.write("cmdline_block_hide\n", .{});
-
-        // =====================================================================
-        // ext_popupmenu events
-        // =====================================================================
-        }, .popupmenu_show => {
-            // popupmenu_show: [[items, selected, row, col, grid], ...]
-            // items: [[word, kind, menu, info], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 5) continue;
-
-                // Parse items array
-                var items: std.ArrayListUnmanaged(PopupmenuItem) = .empty;
-                if (t[0] == .arr) {
-                    for (t[0].arr) |item_v| {
-                        if (item_v != .arr) continue;
-                        const item = item_v.arr;
-                        // Each item is [word, kind, menu, info]
-                        const word: []const u8 = if (item.len > 0 and item[0] == .str) item[0].str else "";
-                        const kind: []const u8 = if (item.len > 1 and item[1] == .str) item[1].str else "";
-                        const menu: []const u8 = if (item.len > 2 and item[2] == .str) item[2].str else "";
-                        const info: []const u8 = if (item.len > 3 and item[3] == .str) item[3].str else "";
-
-                        try items.append(arena, PopupmenuItem{
-                            .word = word,
-                            .kind = kind,
-                            .menu = menu,
-                            .info = info,
-                        });
+                            try items.append(arena, PopupmenuItem{
+                                .word = word,
+                                .kind = kind,
+                                .menu = menu,
+                                .info = info,
+                            });
+                        }
                     }
+
+                    const selected: i32 = if (t[1] == .int) (checkedI32(t[1].int) orelse -1) else -1;
+                    const row: i32 = if (t[2] == .int) (checkedI32(t[2].int) orelse 0) else 0;
+                    const col: i32 = if (t[3] == .int) (checkedI32(t[3].int) orelse 0) else 0;
+                    const raw_grid_id: i64 = if (t[4] == .int) t[4].int else 1;
+                    // -1 is the documented ext_cmdline anchor sentinel. All
+                    // real Neovim grid handles must fit the Metal i32 domain.
+                    const grid_id = if (raw_grid_id == -1)
+                        raw_grid_id
+                    else
+                        checkedGridId(raw_grid_id) orelse continue;
+
+                    try grid.setPopupmenuShow(items.items, selected, row, col, grid_id);
+                    if (log.cb != null) log.write("popupmenu_show items={d} selected={d} row={d} col={d} grid={d}\n", .{ items.items.len, selected, row, col, grid_id });
                 }
+            },
+            .popupmenu_hide => {
+                // popupmenu_hide: []
+                grid.setPopupmenuHide();
+                if (log.cb != null) log.write("popupmenu_hide\n", .{});
+            },
+            .popupmenu_select => {
+                // popupmenu_select: [[selected], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1) continue;
 
-                const selected: i32 = if (t[1] == .int) @as(i32, @intCast(t[1].int)) else -1;
-                const row: i32 = if (t[2] == .int) @as(i32, @intCast(t[2].int)) else 0;
-                const col: i32 = if (t[3] == .int) @as(i32, @intCast(t[3].int)) else 0;
-                const grid_id: i64 = if (t[4] == .int) t[4].int else 1;
+                    const selected: i32 = if (t[0] == .int) (checkedI32(t[0].int) orelse -1) else -1;
+                    grid.setPopupmenuSelect(selected);
+                    if (log.cb != null) log.write("popupmenu_select selected={d}\n", .{selected});
+                }
+            },
+            .tabline_update => {
+                // tabline_update: [[curtab, tabs, curbuf, buffers], ...]
+                // tabs: [{tab: Integer, name: String}, ...]
+                // buffers: [{buffer: Integer, name: String}, ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 4) continue;
 
-                try grid.setPopupmenuShow(items.items, selected, row, col, grid_id);
-                if (log.cb != null) log.write("popupmenu_show items={d} selected={d} row={d} col={d} grid={d}\n", .{ items.items.len, selected, row, col, grid_id });
-            }
+                    // curtab can be int or ext type
+                    const curtab: i64 = if (t[0] == .int) t[0].int else if (t[0] == .ext) parseExtHandle(t[0].ext) else 0;
 
-        }, .popupmenu_hide => {
-            // popupmenu_hide: []
-            grid.setPopupmenuHide();
-            if (log.cb != null) log.write("popupmenu_hide\n", .{});
-
-        }, .popupmenu_select => {
-            // popupmenu_select: [[selected], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 1) continue;
-
-                const selected: i32 = if (t[0] == .int) @as(i32, @intCast(t[0].int)) else -1;
-                grid.setPopupmenuSelect(selected);
-                if (log.cb != null) log.write("popupmenu_select selected={d}\n", .{selected});
-            }
-
-        }, .tabline_update => {
-            // tabline_update: [[curtab, tabs, curbuf, buffers], ...]
-            // tabs: [{tab: Integer, name: String}, ...]
-            // buffers: [{buffer: Integer, name: String}, ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 4) continue;
-
-                // curtab can be int or ext type
-                const curtab: i64 = if (t[0] == .int) t[0].int else if (t[0] == .ext) parseExtHandle(t[0].ext) else 0;
-
-                // Parse tabs array
-                var tabs: std.ArrayListUnmanaged(TabEntry) = .empty;
-                if (t[1] == .arr) {
-                    for (t[1].arr) |tab_v| {
-                        if (tab_v != .map) continue;
-                        const tab_map = tab_v.map;
-                        var tab_handle: i64 = 0;
-                        var tab_name: []const u8 = "";
-                        for (tab_map) |pair| {
-                            if (pair.key == .str) {
-                                if (std.mem.eql(u8, pair.key.str, "tab")) {
-                                    tab_handle = if (pair.val == .int) pair.val.int else if (pair.val == .ext) parseExtHandle(pair.val.ext) else 0;
-                                } else if (std.mem.eql(u8, pair.key.str, "name")) {
-                                    tab_name = if (pair.val == .str) pair.val.str else "";
+                    // Parse tabs array
+                    var tabs: std.ArrayListUnmanaged(TabEntry) = .empty;
+                    if (t[1] == .arr) {
+                        for (t[1].arr) |tab_v| {
+                            if (tab_v != .map) continue;
+                            const tab_map = tab_v.map;
+                            var tab_handle: i64 = 0;
+                            var tab_name: []const u8 = "";
+                            for (tab_map) |pair| {
+                                if (pair.key == .str) {
+                                    if (std.mem.eql(u8, pair.key.str, "tab")) {
+                                        tab_handle = if (pair.val == .int) pair.val.int else if (pair.val == .ext) parseExtHandle(pair.val.ext) else 0;
+                                    } else if (std.mem.eql(u8, pair.key.str, "name")) {
+                                        tab_name = if (pair.val == .str) pair.val.str else "";
+                                    }
                                 }
                             }
+                            try tabs.append(arena, TabEntry{
+                                .tab_handle = tab_handle,
+                                .name = tab_name,
+                            });
                         }
-                        try tabs.append(arena, TabEntry{
-                            .tab_handle = tab_handle,
-                            .name = tab_name,
-                        });
                     }
-                }
 
-                // curbuf can be int or ext type
-                const curbuf: i64 = if (t[2] == .int) t[2].int else if (t[2] == .ext) parseExtHandle(t[2].ext) else 0;
+                    // curbuf can be int or ext type
+                    const curbuf: i64 = if (t[2] == .int) t[2].int else if (t[2] == .ext) parseExtHandle(t[2].ext) else 0;
 
-                // Parse buffers array
-                var buffers: std.ArrayListUnmanaged(BufferEntry) = .empty;
-                if (t[3] == .arr) {
-                    for (t[3].arr) |buf_v| {
-                        if (buf_v != .map) continue;
-                        const buf_map = buf_v.map;
-                        var buffer_handle: i64 = 0;
-                        var buf_name: []const u8 = "";
-                        for (buf_map) |pair| {
-                            if (pair.key == .str) {
-                                if (std.mem.eql(u8, pair.key.str, "buffer")) {
-                                    buffer_handle = if (pair.val == .int) pair.val.int else if (pair.val == .ext) parseExtHandle(pair.val.ext) else 0;
-                                } else if (std.mem.eql(u8, pair.key.str, "name")) {
-                                    buf_name = if (pair.val == .str) pair.val.str else "";
+                    // Parse buffers array
+                    var buffers: std.ArrayListUnmanaged(BufferEntry) = .empty;
+                    if (t[3] == .arr) {
+                        for (t[3].arr) |buf_v| {
+                            if (buf_v != .map) continue;
+                            const buf_map = buf_v.map;
+                            var buffer_handle: i64 = 0;
+                            var buf_name: []const u8 = "";
+                            for (buf_map) |pair| {
+                                if (pair.key == .str) {
+                                    if (std.mem.eql(u8, pair.key.str, "buffer")) {
+                                        buffer_handle = if (pair.val == .int) pair.val.int else if (pair.val == .ext) parseExtHandle(pair.val.ext) else 0;
+                                    } else if (std.mem.eql(u8, pair.key.str, "name")) {
+                                        buf_name = if (pair.val == .str) pair.val.str else "";
+                                    }
                                 }
                             }
+                            try buffers.append(arena, BufferEntry{
+                                .buffer_handle = buffer_handle,
+                                .name = buf_name,
+                            });
                         }
-                        try buffers.append(arena, BufferEntry{
-                            .buffer_handle = buffer_handle,
-                            .name = buf_name,
-                        });
                     }
+
+                    try grid.setTablineUpdate(curtab, tabs.items, curbuf, buffers.items);
+                    if (log.cb != null) log.write("tabline_update curtab={d} tabs={d} curbuf={d} buffers={d}\n", .{ curtab, tabs.items.len, curbuf, buffers.items.len });
                 }
+            },
+            .msg_show => {
+                // msg_show: [[kind, content, replace_last, history, append, msg_id], ...]
+                // content: [[attr_id, text_chunk, hl_id], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2) continue;
 
-                try grid.setTablineUpdate(curtab, tabs.items, curbuf, buffers.items);
-                if (log.cb != null) log.write("tabline_update curtab={d} tabs={d} curbuf={d} buffers={d}\n", .{ curtab, tabs.items.len, curbuf, buffers.items.len });
-            }
+                    const kind: []const u8 = if (t[0] == .str) t[0].str else "";
 
-        }, .msg_show => {
-            // msg_show: [[kind, content, replace_last, history, append, msg_id], ...]
-            // content: [[attr_id, text_chunk, hl_id], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (t.len < 2) continue;
+                    // Parse content array
+                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
+                    if (t[1] == .arr) {
+                        for (t[1].arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            // Each chunk is [attr_id, text_chunk] or [attr_id, text_chunk, hl_id]
+                            // attr_id is typically the highlight id
+                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
 
-                const kind: []const u8 = if (t[0] == .str) t[0].str else "";
-
-                // Parse content array
-                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                if (t[1] == .arr) {
-                    for (t[1].arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        // Each chunk is [attr_id, text_chunk] or [attr_id, text_chunk, hl_id]
-                        // attr_id is typically the highlight id
-                        const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) @as(u32, @intCast(chunk[0].int)) else 0;
-                        const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-
-                        try chunks.append(arena, MsgChunk{
-                            .hl_id = hl_id,
-                            .text = text,
-                        });
-                    }
-                }
-
-                const replace_last: bool = if (t.len > 2 and t[2] == .bool) t[2].bool else false;
-                const history: bool = if (t.len > 3 and t[3] == .bool) t[3].bool else false;
-                const append_flag: bool = if (t.len > 4 and t[4] == .bool) t[4].bool else false;
-                const msg_id: i64 = if (t.len > 5 and t[5] == .int) t[5].int else 0;
-
-                try grid.setMsgShow(kind, chunks.items, replace_last, history, append_flag, msg_id);
-                if (log.cb != null) log.write("msg_show kind={s} chunks={d} replace_last={} history={} append={} msg_id={d}\n", .{ kind, chunks.items.len, replace_last, history, append_flag, msg_id });
-            }
-
-        }, .msg_clear => {
-            // msg_clear: []
-            grid.setMsgClear();
-            if (log.cb != null) log.write("msg_clear\n", .{});
-
-        }, .msg_showmode => {
-            // msg_showmode: [[content], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                if (t.len > 0 and t[0] == .arr) {
-                    for (t[0].arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) @as(u32, @intCast(chunk[0].int)) else 0;
-                        const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                        try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                    }
-                }
-                try grid.setMsgShowmode(chunks.items);
-                if (log.cb != null) log.write("msg_showmode chunks={d}\n", .{chunks.items.len});
-            }
-
-        }, .msg_showcmd => {
-            // msg_showcmd: [[content], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                if (t.len > 0 and t[0] == .arr) {
-                    for (t[0].arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) @as(u32, @intCast(chunk[0].int)) else 0;
-                        const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                        try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                    }
-                }
-                try grid.setMsgShowcmd(chunks.items);
-                if (log.cb != null) log.write("msg_showcmd chunks={d}\n", .{chunks.items.len});
-            }
-
-        }, .msg_ruler => {
-            // msg_ruler: [[content], ...]
-            for (tuples) |tv| {
-                if (tv != .arr) continue;
-                const t = tv.arr;
-
-                var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                if (t.len > 0 and t[0] == .arr) {
-                    for (t[0].arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) @as(u32, @intCast(chunk[0].int)) else 0;
-                        const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                        try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                    }
-                }
-                try grid.setMsgRuler(chunks.items);
-                if (log.cb != null) log.write("msg_ruler chunks={d}\n", .{chunks.items.len});
-            }
-
-        }, .msg_history_show => {
-            // msg_history_show: [[entries, prev_cmd], ...]
-            // entries: [[kind, content, append], ...]
-            // content: [[hl_id, text], ...]
-            if (log.cb != null) log.write("msg_history_show: tuples.len={d}\n", .{tuples.len});
-            for (tuples, 0..) |tv, ti| {
-                if (log.cb != null) log.write("  tuple[{d}] type={s}\n", .{ ti, @tagName(tv) });
-                if (tv != .arr) continue;
-                const t = tv.arr;
-                if (log.cb != null) log.write("  tuple[{d}].len={d}\n", .{ ti, t.len });
-                if (t.len < 1) continue;
-
-                if (log.cb != null) log.write("  t[0] type={s}\n", .{@tagName(t[0])});
-
-                // Parse entries array
-                var entries: std.ArrayListUnmanaged(grid_mod.MsgHistoryEntry) = .empty;
-                if (t[0] == .arr) {
-                    if (log.cb != null) log.write("  t[0].arr.len={d}\n", .{t[0].arr.len});
-                    for (t[0].arr, 0..) |entry_v, ei| {
-                        if (log.cb != null) log.write("    entry[{d}] type={s}\n", .{ ei, @tagName(entry_v) });
-                        if (entry_v != .arr) continue;
-                        const entry = entry_v.arr;
-                        if (log.cb != null) log.write("    entry[{d}].len={d}\n", .{ ei, entry.len });
-                        // entry: [kind, content] or [kind, content, append]
-                        if (entry.len < 2) {
-                            if (log.cb != null) log.write("    entry[{d}] skipped (len < 2)\n", .{ei});
-                            continue;
+                            try chunks.append(arena, MsgChunk{
+                                .hl_id = hl_id,
+                                .text = text,
+                            });
                         }
+                    }
 
-                        const kind: []const u8 = if (entry[0] == .str) entry[0].str else "";
+                    const replace_last: bool = if (t.len > 2 and t[2] == .bool) t[2].bool else false;
+                    const history: bool = if (t.len > 3 and t[3] == .bool) t[3].bool else false;
+                    const append_flag: bool = if (t.len > 4 and t[4] == .bool) t[4].bool else false;
+                    const msg_id: i64 = if (t.len > 5 and t[5] == .int) t[5].int else 0;
 
-                        // Parse content array [[hl_id, text], ...]
-                        var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                        if (entry[1] == .arr) {
-                            for (entry[1].arr) |chunk_v| {
-                                if (chunk_v != .arr) continue;
-                                const chunk = chunk_v.arr;
-                                if (chunk.len < 2) continue;
+                    try grid.setMsgShow(kind, chunks.items, replace_last, history, append_flag, msg_id);
+                    if (log.cb != null) log.write("msg_show kind={s} chunks={d} replace_last={} history={} append={} msg_id={d}\n", .{ kind, chunks.items.len, replace_last, history, append_flag, msg_id });
+                }
+            },
+            .msg_clear => {
+                // msg_clear: []
+                grid.setMsgClear();
+                if (log.cb != null) log.write("msg_clear\n", .{});
+            },
+            .msg_showmode => {
+                // msg_showmode: [[content], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
 
-                                const hl_id: u32 = if (chunk[0] == .int and chunk[0].int >= 0)
-                                    @as(u32, @intCast(chunk[0].int))
-                                else
-                                    0;
-                                const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                                try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
+                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
+                    if (t.len > 0 and t[0] == .arr) {
+                        for (t[0].arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
+                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
+                        }
+                    }
+                    try grid.setMsgShowmode(chunks.items);
+                    if (log.cb != null) log.write("msg_showmode chunks={d}\n", .{chunks.items.len});
+                }
+            },
+            .msg_showcmd => {
+                // msg_showcmd: [[content], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+
+                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
+                    if (t.len > 0 and t[0] == .arr) {
+                        for (t[0].arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
+                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
+                        }
+                    }
+                    try grid.setMsgShowcmd(chunks.items);
+                    if (log.cb != null) log.write("msg_showcmd chunks={d}\n", .{chunks.items.len});
+                }
+            },
+            .msg_ruler => {
+                // msg_ruler: [[content], ...]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+
+                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
+                    if (t.len > 0 and t[0] == .arr) {
+                        for (t[0].arr) |chunk_v| {
+                            if (chunk_v != .arr) continue;
+                            const chunk = chunk_v.arr;
+                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
+                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
+                        }
+                    }
+                    try grid.setMsgRuler(chunks.items);
+                    if (log.cb != null) log.write("msg_ruler chunks={d}\n", .{chunks.items.len});
+                }
+            },
+            .msg_history_show => {
+                // msg_history_show: [[entries, prev_cmd], ...]
+                // entries: [[kind, content, append], ...]
+                // content: [[hl_id, text], ...]
+                if (log.cb != null) log.write("msg_history_show: tuples.len={d}\n", .{tuples.len});
+                for (tuples, 0..) |tv, ti| {
+                    if (log.cb != null) log.write("  tuple[{d}] type={s}\n", .{ ti, @tagName(tv) });
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (log.cb != null) log.write("  tuple[{d}].len={d}\n", .{ ti, t.len });
+                    if (t.len < 1) continue;
+
+                    if (log.cb != null) log.write("  t[0] type={s}\n", .{@tagName(t[0])});
+
+                    // Parse entries array
+                    var entries: std.ArrayListUnmanaged(grid_mod.MsgHistoryEntry) = .empty;
+                    if (t[0] == .arr) {
+                        if (log.cb != null) log.write("  t[0].arr.len={d}\n", .{t[0].arr.len});
+                        for (t[0].arr, 0..) |entry_v, ei| {
+                            if (log.cb != null) log.write("    entry[{d}] type={s}\n", .{ ei, @tagName(entry_v) });
+                            if (entry_v != .arr) continue;
+                            const entry = entry_v.arr;
+                            if (log.cb != null) log.write("    entry[{d}].len={d}\n", .{ ei, entry.len });
+                            // entry: [kind, content] or [kind, content, append]
+                            if (entry.len < 2) {
+                                if (log.cb != null) log.write("    entry[{d}] skipped (len < 2)\n", .{ei});
+                                continue;
                             }
+
+                            const kind: []const u8 = if (entry[0] == .str) entry[0].str else "";
+
+                            // Parse content array [[hl_id, text], ...]
+                            var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
+                            if (entry[1] == .arr) {
+                                for (entry[1].arr) |chunk_v| {
+                                    if (chunk_v != .arr) continue;
+                                    const chunk = chunk_v.arr;
+                                    if (chunk.len < 2) continue;
+
+                                    const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+                                    const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
+                                    try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
+                                }
+                            }
+
+                            // append is optional (3rd element)
+                            const append_flag: bool = if (entry.len > 2 and entry[2] == .bool) entry[2].bool else false;
+
+                            try entries.append(arena, grid_mod.MsgHistoryEntry{
+                                .kind = kind,
+                                .content = chunks,
+                                .append = append_flag,
+                            });
                         }
+                    }
 
-                        // append is optional (3rd element)
-                        const append_flag: bool = if (entry.len > 2 and entry[2] == .bool) entry[2].bool else false;
+                    const prev_cmd: bool = if (t.len > 1 and t[1] == .bool) t[1].bool else false;
 
-                        try entries.append(arena, grid_mod.MsgHistoryEntry{
-                            .kind = kind,
-                            .content = chunks,
-                            .append = append_flag,
-                        });
+                    try grid.setMsgHistoryShow(entries.items, prev_cmd);
+                    if (log.cb != null) log.write("msg_history_show entries={d} prev_cmd={}\n", .{ entries.items.len, prev_cmd });
+                }
+            },
+            .msg_history_clear => {
+                // msg_history_clear: []
+                grid.setMsgHistoryClear();
+                if (log.cb != null) log.write("msg_history_clear\n", .{});
+            },
+            .set_title => {
+                // set_title: [title]
+                if (set_title_fn) |fn_ptr| {
+                    for (tuples) |tv| {
+                        if (tv != .arr) continue;
+                        const t = tv.arr;
+                        if (t.len < 1 or t[0] != .str) continue;
+
+                        const title = t[0].str;
+                        if (log.cb != null) log.write("set_title: {s}\n", .{title});
+                        try fn_ptr(opt_ctx, title);
                     }
                 }
+            },
+            .restart => {
+                // restart: [listen_addr]
+                // Nvim invoked :restart and started a new server. The current
+                // channel is about to close; the UI should attach to the new
+                // server at listen_addr after the close is observed.
+                if (restart_fn) |fn_ptr| {
+                    for (tuples) |tv| {
+                        if (tv != .arr) continue;
+                        const t = tv.arr;
+                        if (t.len < 1 or t[0] != .str) continue;
 
-                const prev_cmd: bool = if (t.len > 1 and t[1] == .bool) t[1].bool else false;
-
-                try grid.setMsgHistoryShow(entries.items, prev_cmd);
-                if (log.cb != null) log.write("msg_history_show entries={d} prev_cmd={}\n", .{ entries.items.len, prev_cmd });
-            }
-
-        }, .msg_history_clear => {
-            // msg_history_clear: []
-            grid.setMsgHistoryClear();
-            if (log.cb != null) log.write("msg_history_clear\n", .{});
-
-        }, .set_title => {
-            // set_title: [title]
-            if (set_title_fn) |fn_ptr| {
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 1 or t[0] != .str) continue;
-
-                    const title = t[0].str;
-                    if (log.cb != null) log.write("set_title: {s}\n", .{title});
-                    try fn_ptr(opt_ctx, title);
+                        const listen_addr = t[0].str;
+                        if (log.cb != null) log.write("restart: listen_addr={s}\n", .{listen_addr});
+                        try fn_ptr(opt_ctx, listen_addr);
+                    }
                 }
-            }
+            },
+            .connect => {
+                // connect: [server_addr]
+                // Nvim invoked :connect and detached the current UI. Unlike
+                // restart, the old server keeps running headless; the UI
+                // should immediately attach to the new server at server_addr.
+                // The core's reconnect machinery is identical for both events
+                // (only the old-server fate differs, and the UI sees the same
+                // channel-close handshake), but the dispatcher routes through
+                // a distinct callback so the frontend can tell them apart for
+                // logging / UI-hint purposes.
+                if (connect_fn) |fn_ptr| {
+                    for (tuples) |tv| {
+                        if (tv != .arr) continue;
+                        const t = tv.arr;
+                        if (t.len < 1 or t[0] != .str) continue;
 
-        }, .restart => {
-            // restart: [listen_addr]
-            // Nvim invoked :restart and started a new server. The current
-            // channel is about to close; the UI should attach to the new
-            // server at listen_addr after the close is observed.
-            if (restart_fn) |fn_ptr| {
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 1 or t[0] != .str) continue;
-
-                    const listen_addr = t[0].str;
-                    if (log.cb != null) log.write("restart: listen_addr={s}\n", .{listen_addr});
-                    try fn_ptr(opt_ctx, listen_addr);
+                        const server_addr = t[0].str;
+                        if (log.cb != null) log.write("connect: server_addr={s}\n", .{server_addr});
+                        try fn_ptr(opt_ctx, server_addr);
+                    }
                 }
-            }
-
-        }, .connect => {
-            // connect: [server_addr]
-            // Nvim invoked :connect and detached the current UI. Unlike
-            // restart, the old server keeps running headless; the UI
-            // should immediately attach to the new server at server_addr.
-            // The core's reconnect machinery is identical for both events
-            // (only the old-server fate differs, and the UI sees the same
-            // channel-close handshake), but the dispatcher routes through
-            // a distinct callback so the frontend can tell them apart for
-            // logging / UI-hint purposes.
-            if (connect_fn) |fn_ptr| {
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 1 or t[0] != .str) continue;
-
-                    const server_addr = t[0].str;
-                    if (log.cb != null) log.write("connect: server_addr={s}\n", .{server_addr});
-                    try fn_ptr(opt_ctx, server_addr);
+            },
+            .flush => {
+                if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
+                if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
+                    const now_ns = clock.nowNs();
+                    const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
+                    log.write("[perf_input] seq={d} stage=flush_start delta_us={d} rows={d} cols={d}\n", .{
+                        grid.input_trace_seq, delta_us, grid.rows, grid.cols,
+                    });
+                    grid.input_trace_flush_logged_seq = grid.input_trace_seq;
                 }
-            }
-
-        }, .flush => {
-            if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
-            if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
-                const now_ns = clock.nowNs();
-                const delta_us: i64 = @intCast(@divTrunc(@max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)), 1000));
-                log.write("[perf_input] seq={d} stage=flush_start delta_us={d} rows={d} cols={d}\n", .{
-                    grid.input_trace_seq, delta_us, grid.rows, grid.cols,
-                });
-                grid.input_trace_flush_logged_seq = grid.input_trace_seq;
-            }
-            try flush_fn(flush_ctx, grid.rows, grid.cols);
-            // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
-            // inside onFlush on successful completion. On abort, all state is
-            // preserved for the next flush attempt.
-        } }
+                // Render-affecting state derived from the completed redraw batch
+                // must be applied before the frontend transaction is committed.
+                try pre_flush_fn(flush_ctx);
+                try flush_fn(flush_ctx, grid.rows, grid.cols);
+                // Dirty state (dirty_all, dirty_rows, scroll provenance) is cleared
+                // inside onFlush on successful completion. On abort, all state is
+                // preserved for the next flush attempt.
+            },
+        }
     }
 }
-

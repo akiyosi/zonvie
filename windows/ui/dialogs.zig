@@ -833,22 +833,38 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
         return;
     }
 
-    const copy_len: usize = @min(@as(usize, @intCast(utf8_len - 1)), app.clipboard_buf.len);
-    if (copy_len > 0) {
+    // utf8_len counts the terminating NUL that WideCharToMultiByte writes, so
+    // the payload is one byte shorter and the buffer must hold both.
+    const needed: usize = @intCast(utf8_len - 1);
+    if (app.clipboard_buf.len < needed + 1) {
+        const grown = app.alloc.alloc(u8, needed + 1) catch {
+            if (applog.isEnabled()) applog.appLog(
+                "[win] clipboard_get_ui: alloc {d} failed\n",
+                .{needed + 1},
+            );
+            app.clipboard_len = 0;
+            _ = c.SetEvent(app.clipboard_event);
+            return;
+        };
+        if (app.clipboard_buf.len != 0) app.alloc.free(app.clipboard_buf);
+        app.clipboard_buf = grown;
+    }
+
+    if (needed > 0) {
         _ = c.WideCharToMultiByte(
             c.CP_UTF8,
             0,
             wide_ptr,
             -1,
-            @ptrCast(&app.clipboard_buf),
+            @ptrCast(app.clipboard_buf.ptr),
             @intCast(app.clipboard_buf.len),
             null,
             null,
         );
     }
 
-    app.clipboard_len = copy_len;
-    if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: len={d}\n", .{copy_len});
+    app.clipboard_len = needed;
+    if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: len={d}\n", .{needed});
 
     // Signal completion
     _ = c.SetEvent(app.clipboard_event);

@@ -19,6 +19,7 @@ const Logger = zc.log_mod.Logger;
 const testing = std.testing;
 
 const Stub = struct {
+    fn onPreFlush(_: *Stub) anyerror!void {}
     fn onFlush(_: *Stub, _: u32, _: u32) anyerror!void {}
     fn onGuifont(_: *Stub, _: []const u8) anyerror!void {}
     fn onLinespace(_: *Stub, _: i32) anyerror!void {}
@@ -59,6 +60,7 @@ const World = struct {
             params,
             &self.log,
             &self.stub,
+            Stub.onPreFlush,
             Stub.onFlush,
             &self.stub,
             Stub.onGuifont,

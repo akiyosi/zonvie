@@ -145,6 +145,15 @@ test "gui:visual_emoji_cursor_width" {
     }
 }
 
+test "gui:visual_emoji_cluster_cache" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/emoji_cluster_cache.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_float_border_continuity" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
