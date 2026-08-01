@@ -184,7 +184,11 @@ pub const Stream = union(enum) {
     /// Errors are swallowed — at teardown we only care that the
     /// blocked thread is woken; a SocketNotConnected or
     /// ConnectionResetByPeer is acceptable noise.
-    pub fn shutdownIfSocket(self: Stream, is_socket: bool) void {
+    /// Errors are returned rather than swallowed: a failed shutdown means a
+    /// concurrently blocked reader or writer is never released, which
+    /// presents as a hang with no other symptom. Callers own a logger; make
+    /// them say so.
+    pub fn shutdownIfSocket(self: Stream, is_socket: bool) !void {
         if (!is_socket) return;
         // Windows `.file` is only used for spawn-mode pipe transport in
         // this codebase — connect-mode socket equivalent is `.win_pipe`

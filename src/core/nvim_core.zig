@@ -1137,7 +1137,10 @@ pub const Core = struct {
         defer self.stdin_close_mu.unlock(clock.io());
         if (self.transport_kind != .socket) return;
         if (self.stdin_file) |stream| {
-            stream.shutdownIfSocket(true);
+            stream.shutdownIfSocket(true) catch |e| self.log.write(
+                "hard-failure wake: socket shutdown failed: {any} (RPC reader stays blocked)\n",
+                .{e},
+            );
             switch (stream) {
                 .win_pipe => stream.close(),
                 .file => {},
@@ -1633,7 +1636,10 @@ pub const Core = struct {
         if (self.stdin_close_mu.tryLock()) {
             if (self.stdin_file) |f| {
                 if (self.transport_kind == .socket) {
-                    f.shutdownIfSocket(true);
+                    f.shutdownIfSocket(true) catch |e| self.log.write(
+                        "stop: socket shutdown failed: {any} (reader stays blocked)\n",
+                        .{e},
+                    );
                     switch (f) {
                         .win_pipe => f.close(), // CancelIoEx; no HANDLE close.
                         .file => {},
@@ -4227,7 +4233,10 @@ pub const Core = struct {
     pub fn cancelWriterIo(self: *Core, writer: ?std.Thread, stdin: ?Stream, transport_kind: TransportKind) void {
         self.writer_cancel_requested.store(true, .release);
         if (stdin) |stream| {
-            if (transport_kind == .socket) stream.shutdownIfSocket(true);
+            if (transport_kind == .socket) stream.shutdownIfSocket(true) catch |e| self.log.write(
+                "writer cancel: socket shutdown failed: {any} (writer stays blocked)\n",
+                .{e},
+            );
             switch (stream) {
                 .win_pipe => stream.close(),
                 .file => {},
@@ -6434,28 +6443,69 @@ test "asynchronous hard failure wakes a socket RPC reader" {
     defer peer_file.close(clock.io());
 
     const Reader = struct {
-        fn run(stream: Stream, returned: *std.atomic.Value(bool)) void {
+        fn run(
+            stream: Stream,
+            entered: *std.atomic.Value(bool),
+            returned: *std.atomic.Value(bool),
+        ) void {
             var byte: [1]u8 = undefined;
+            entered.store(true, .release);
             _ = stream.read(&byte) catch {};
             returned.store(true, .release);
         }
     };
 
+    // wakeRpcReaderForHardFailure reports a failed shutdown through the log
+    // rather than a return value, and initForTest leaves the log detached.
+    // Surface it: a wake that silently no-ops is exactly the failure this
+    // test exists to catch, and without this the reason never reaches anyone.
+    const Diag = struct {
+        fn write(_: ?*anyopaque, msg: [*]const u8, len: usize) callconv(.c) void {
+            std.debug.print("[wake-test] {s}", .{msg[0..len]});
+        }
+    };
+
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
+    core.log.cb = Diag.write;
     core.stdin_file = Stream.fromFile(local_file);
     core.transport_kind = .socket;
+    var entered = std.atomic.Value(bool).init(false);
     var returned = std.atomic.Value(bool).init(false);
-    const reader = try std.Thread.spawn(.{}, Reader.run, .{ core.stdin_file.?, &returned });
+    const reader = try std.Thread.spawn(
+        .{},
+        Reader.run,
+        .{ core.stdin_file.?, &entered, &returned },
+    );
+
+    // The interesting case is a reader already parked in the read syscall, so
+    // wait for it to get there. Without this the wake can land before the
+    // reader ever blocks, and the test silently stops covering the wake.
+    while (!entered.load(.acquire)) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    std.Io.sleep(clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
 
     core.failHardRender(error.VertexBudgetExceeded);
     core.wakeRpcReaderForHardFailure();
+
+    // Bounded: a wake that does not release the reader must fail the test
+    // rather than hang it. Shutting the peer end down is the fallback that
+    // guarantees EOF, so the thread is always joinable. Use the raw syscall
+    // rather than closing peer_file, which the defer above already owns.
+    const deadline_ns: i128 = clock.nowNs() + 5 * std.time.ns_per_s;
+    while (!returned.load(.acquire) and clock.nowNs() < deadline_ns) {
+        std.Io.sleep(clock.io(), .{ .nanoseconds = std.time.ns_per_ms }, .awake) catch {};
+    }
+    const woke = returned.load(.acquire);
+    if (!woke) _ = std.posix.system.shutdown(sockets[1], std.posix.SHUT.RDWR);
     reader.join();
-    try std.testing.expect(returned.load(.acquire));
-    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
 
     core.stdin_file = null;
     local_file.close(clock.io());
+
+    if (!woke) return error.HardFailureWakeDidNotReleaseReader;
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
 }
 
 test "on_log stop stays non-blocking while teardown mutex is held" {
