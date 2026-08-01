@@ -4350,7 +4350,13 @@ pub const FlushCtx = struct {
                         // On retry: force all rows (stale UVs in non-dirty rows too)
                         const effective_rebuild_all = rebuild_all or atlas_retried;
                         if (atlas_retried) {
-                            // Reset all per-pass mutable state for clean retry
+                            // Reset all per-pass mutable state for clean retry.
+                            // used_scroll_fast_path gates the row loop below; the
+                            // retry regenerates every row, so a stale true from the
+                            // pre-reset pass would filter every row against an empty
+                            // regen set and compose nothing. Matches the external-grid
+                            // retry, which clears use_ext_scroll_fast_path the same way.
+                            used_scroll_fast_path = false;
                             had_glyph_miss = false;
                             perf_hl_cache_hits = 0;
                             perf_hl_cache_misses = 0;
@@ -12485,6 +12491,208 @@ test "second row-mode atlas reset cancels instead of committing empty rows" {
     try std.testing.expectEqual(@as(u32, 1), state.row_calls);
     try std.testing.expectEqual(@as(u32, 2), state.create_calls);
     try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
+}
+
+test "atlas reset on a scroll fast path flush still resends every row" {
+    const ROWS: u32 = 8;
+    const COLS: u32 = 2;
+
+    const State = struct {
+        reset_seen: bool = false,
+        rows_after_reset: [ROWS]bool = @splat(false),
+        committed_flushes: u32 = 0,
+        cancelled_flushes: u32 = 0,
+        scroll_calls: u32 = 0,
+        core: *Core,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            if (self.reset_seen and row_start < ROWS) {
+                self.rows_after_reset[row_start] = true;
+            }
+        }
+
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.core.flush_aborted or self.core.flush_atlas_corrupted) {
+                self.cancelled_flushes += 1;
+            } else {
+                self.committed_flushes += 1;
+            }
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = atlas_w;
+            _ = atlas_h;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.reset_seen = true;
+        }
+
+        fn onMainRowScroll(
+            ctx: ?*anyopaque,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scroll_calls += 1;
+        }
+    };
+
+    // The fast path has two publication branches: frontends that implement
+    // on_main_row_scroll let the frontend shift its own row slots (macOS),
+    // the rest replay the shifted cache row by row (Windows). Both set
+    // used_scroll_fast_path at the same site, so both must survive the retry.
+    for ([_]bool{ false, true }) |use_scroll_cb| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try core.grid.resizeGrid(1, ROWS, COLS);
+        try core.grid.resizeGrid(2, ROWS, COLS);
+        try core.grid.setWinPos(2, 100, 0, 0);
+        core.grid.cursor_visible = false;
+        core.drawable_w_px = COLS;
+        core.drawable_h_px = ROWS;
+        core.cell_w_px = 1;
+        core.cell_h_px = 1;
+        core.atlas_w = config.atlas_size_default;
+        core.atlas_h = config.atlas_size_default;
+        core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+        core.atlas_initialized = true;
+
+        for (0..ROWS) |r| {
+            for (0..COLS) |c| {
+                core.grid.putCellGrid(2, @intCast(r), @intCast(c), 'A', 0);
+            }
+        }
+
+        var state = State{ .core = &core };
+        core.ctx = &state;
+        core.cb.on_flush_end = State.onEnd;
+        core.cb.on_vertices_row = State.onRow;
+        core.cb.on_rasterize_glyph = State.rasterize;
+        core.cb.on_atlas_upload = State.upload;
+        core.cb.on_atlas_create = State.create;
+        if (use_scroll_cb) core.cb.on_main_row_scroll = State.onMainRowScroll;
+
+        // Warm the scroll cache and the row ledger, then settle dirty_all so
+        // the next flush is eligible for the scroll fast path.
+        var flush_ctx = FlushCtx{ .core = &core };
+        try flush_ctx.onFlush(ROWS, COLS);
+        try flush_ctx.onFlush(ROWS, COLS);
+        try std.testing.expect(!core.grid.dirty_all);
+
+        // Arm: the next uncached glyph finds a full packer and resets the
+        // atlas mid-composition, which restarts the row loop.
+        core.atlas_packer.?.next_x = core.atlas_w;
+        core.atlas_packer.?.next_y = core.atlas_h;
+        core.atlas_packer.?.row_h = 0;
+
+        state.committed_flushes = 0;
+        state.cancelled_flushes = 0;
+        state.scroll_calls = 0;
+
+        core.grid.scrollGrid(2, 0, ROWS, 0, COLS, 1, 0);
+        core.grid.putCellGrid(2, ROWS - 1, 0, 'Z', 0);
+        core.grid.putCellGrid(2, ROWS - 1, 1, 'Z', 0);
+        try flush_ctx.onFlush(ROWS, COLS);
+
+        // The fast path must actually have been taken, on the branch this
+        // iteration is exercising — otherwise the retry is never reached and
+        // the assertion below would pass vacuously.
+        try std.testing.expectEqual(
+            @as(u32, if (use_scroll_cb) 1 else 0),
+            state.scroll_calls,
+        );
+
+        // The reset must have fired, and the frame must not have been
+        // cancelled — this is the single-reset path that commits.
+        try std.testing.expect(state.reset_seen);
+        try std.testing.expect(!core.flush_atlas_corrupted);
+        try std.testing.expect(!core.flush_aborted);
+        try std.testing.expectEqual(@as(u32, 1), state.committed_flushes);
+        try std.testing.expectEqual(@as(u32, 0), state.cancelled_flushes);
+
+        // Every row sent before the reset carries stale UVs, so the retry owes
+        // the frontend a fresh copy of all of them. A stale fast-path flag
+        // would filter the retry against an empty regen set and send nothing.
+        for (state.rows_after_reset, 0..) |sent, r| {
+            if (!sent) {
+                std.debug.print(
+                    "row {d} was never resent after the atlas reset (scroll_cb={any})\n",
+                    .{ r, use_scroll_cb },
+                );
+                return error.RowNotResentAfterAtlasReset;
+            }
+        }
+    }
 }
 
 test "atlas create abort does not leak reset edge into next flush" {
