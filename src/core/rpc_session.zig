@@ -848,18 +848,46 @@ pub fn handleClipboardGet(self: *Core, msgid: i64, params: mp.Value) void {
 
     self.log.write("clipboard get: register={s}\n", .{register});
 
-    // Call frontend callback
+    // Call frontend callback.
+    //
+    // The callback reports the total size available, not the amount it wrote,
+    // so a register larger than the staging buffer is detected rather than
+    // silently cut in half (and, for UTF-8, cut mid-sequence). The common
+    // paste fits the stack buffer and costs no allocation; only an oversized
+    // one takes the heap path.
     if (self.cb.on_clipboard_get) |cb| {
-        var buf: [64 * 1024]u8 = undefined;
+        var stack_buf: [64 * 1024]u8 = undefined;
         var out_len: usize = 0;
 
-        const result = cb(self.ctx, register.ptr, &buf, &out_len, buf.len);
-        if (result != 0) {
-            // Success - send clipboard content
-            sendClipboardGetResponse(self, msgid, buf[0..out_len]) catch |e| {
-                self.log.write("sendClipboardGetResponse failed: {any}\n", .{e});
-            };
-            return;
+        if (cb(self.ctx, register.ptr, &stack_buf, &out_len, stack_buf.len) != 0) {
+            if (out_len <= stack_buf.len) {
+                sendClipboardGetResponse(self, msgid, stack_buf[0..out_len]) catch |e| {
+                    self.log.write("sendClipboardGetResponse failed: {any}\n", .{e});
+                };
+                return;
+            }
+
+            // The clipboard can change between the sizing call and the fetch,
+            // so allow a few rounds before giving up rather than looping on a
+            // target that keeps moving.
+            var rounds: u8 = 0;
+            while (rounds < 3) : (rounds += 1) {
+                const heap = self.alloc.alloc(u8, out_len) catch break;
+                defer self.alloc.free(heap);
+
+                out_len = 0;
+                if (cb(self.ctx, register.ptr, heap.ptr, &out_len, heap.len) == 0) break;
+                if (out_len <= heap.len) {
+                    sendClipboardGetResponse(self, msgid, heap[0..out_len]) catch |e| {
+                        self.log.write("sendClipboardGetResponse failed: {any}\n", .{e});
+                    };
+                    return;
+                }
+            }
+            self.log.write(
+                "clipboard get: could not obtain {d} bytes, returning empty\n",
+                .{out_len},
+            );
         }
     }
 
@@ -883,23 +911,50 @@ pub fn handleClipboardSet(self: *Core, msgid: i64, params: mp.Value) void {
 
     self.log.write("clipboard set: register={s}\n", .{register});
 
-    // Convert lines array to newline-separated string
-    var content_buf: [64 * 1024]u8 = undefined;
+    // Convert lines array to newline-separated string.
+    //
+    // Sized exactly and heap-allocated rather than staged through a fixed
+    // buffer: a register that did not fit used to have the offending lines
+    // dropped while later lines were still appended, so the content lost its
+    // middle with the line structure intact — and the response still said the
+    // copy succeeded. A whole-register yank is not a per-frame path, so the
+    // allocation is cheap relative to reporting a truncated clipboard as good.
+    // The size is already bounded upstream by the RPC frame and blob caps.
+    var content: []u8 = &.{};
     var content_len: usize = 0;
+    var owned = false;
+    defer if (owned) self.alloc.free(content);
 
     if (params.arr[1] == .arr) {
         const lines = params.arr[1].arr;
+
+        // Both loops must agree on which elements contribute, so they share
+        // their predicates verbatim.
+        var needed: usize = 0;
+        for (lines, 0..) |line, i| {
+            if (line == .str) {
+                needed += line.str.len;
+                if (i < lines.len - 1) needed += 1;
+            }
+        }
+
+        // The callback takes a pointer even for an empty register; keep it
+        // valid without special-casing the caller.
+        content = self.alloc.alloc(u8, @max(needed, 1)) catch {
+            sendRpcErrorResponse(self, msgid, "Clipboard allocation failed") catch {};
+            return;
+        };
+        owned = true;
+
         for (lines, 0..) |line, i| {
             if (line == .str) {
                 const line_str = line.str;
-                if (content_len + line_str.len + 1 < content_buf.len) {
-                    @memcpy(content_buf[content_len..][0..line_str.len], line_str);
-                    content_len += line_str.len;
-                    // Add newline between lines (not after last)
-                    if (i < lines.len - 1) {
-                        content_buf[content_len] = '\n';
-                        content_len += 1;
-                    }
+                @memcpy(content[content_len..][0..line_str.len], line_str);
+                content_len += line_str.len;
+                // Add newline between lines (not after last)
+                if (i < lines.len - 1) {
+                    content[content_len] = '\n';
+                    content_len += 1;
                 }
             }
         }
@@ -907,7 +962,8 @@ pub fn handleClipboardSet(self: *Core, msgid: i64, params: mp.Value) void {
 
     // Call frontend callback
     if (self.cb.on_clipboard_set) |cb| {
-        const result = cb(self.ctx, register.ptr, &content_buf, content_len);
+        const data: [*]const u8 = if (owned) content.ptr else "";
+        const result = cb(self.ctx, register.ptr, data, content_len);
         sendRpcBoolResponse(self, msgid, result != 0) catch |e| {
             self.log.write("sendRpcBoolResponse failed: {any}\n", .{e});
         };
@@ -3071,4 +3127,363 @@ test "child reaper does not wait for inherited stderr EOF" {
 
     reaper_thread.join();
     reaper_joined = true;
+}
+
+/// Drives the real handleClipboardSet over a real writer thread and pipe, so
+/// both the bytes handed to the frontend and the RPC response Neovim receives
+/// are observed rather than inferred.
+const ClipboardSetProbe = struct {
+    captured: std.ArrayListUnmanaged(u8) = .empty,
+    calls: usize = 0,
+
+    fn onSet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        self.captured.appendSlice(std.testing.allocator, data[0..len]) catch @panic("oom");
+        return 1;
+    }
+
+    fn run(self: *@This(), lines: []const []const u8) !bool {
+        const alloc = std.testing.allocator;
+        clock.init();
+
+        var fds: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+
+        var core = Core.initForTest(alloc);
+        core.ctx = self;
+        core.stdin_file = rpc_transport.Stream.fromFile(
+            .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        );
+        core.transport_kind = .pipes;
+        core.cb.on_clipboard_set = onSet;
+        try std.testing.expect(core.startWriterThread());
+
+        const vals = try alloc.alloc(mp.Value, lines.len);
+        defer alloc.free(vals);
+        for (lines, 0..) |l, i| vals[i] = .{ .str = l };
+        var top = [2]mp.Value{ .{ .str = "+" }, .{ .arr = vals } };
+
+        handleClipboardSet(&core, 7, .{ .arr = &top });
+
+        // Response frame is [1, msgid, err, result].
+        var rbuf: [256]u8 = undefined;
+        const n = try rpc_transport.Stream.fromFile(read_file).read(&rbuf);
+        var reader = mp.SliceReader{ .data = rbuf[0..n] };
+        const decoded = try mp.decode(alloc, &reader);
+        defer mp.freeValue(alloc, decoded);
+
+        try std.testing.expectEqual(@as(usize, 1), self.calls);
+        try std.testing.expect(decoded == .arr);
+
+        core.stop();
+        read_file.close(clock.io());
+        // deinitForTest is intentionally omitted: iterating a never-populated
+        // std HashMap asserts on Zig 0.16, which is why the sibling
+        // writer-thread tests omit it too.
+
+        return decoded.arr[3] == .bool and decoded.arr[3].bool;
+    }
+
+    /// What the register should contain: every line, '\n' between them.
+    fn expected(alloc: std.mem.Allocator, lines: []const []const u8) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(alloc);
+        for (lines, 0..) |l, i| {
+            try out.appendSlice(alloc, l);
+            if (i < lines.len - 1) try out.append(alloc, '\n');
+        }
+        return out.toOwnedSlice(alloc);
+    }
+};
+
+test "clipboard set delivers every line when the register exceeds the staging buffer" {
+    const alloc = std.testing.allocator;
+
+    // 62 x 1000B fills most of the old 64 KiB staging buffer; the 4096B line
+    // then cannot fit, and five short lines follow it. Without a heap buffer
+    // the oversized line is dropped and the tails are still appended, so the
+    // register loses its middle with no visible seam.
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    for (0..62) |_| {
+        const l = try alloc.alloc(u8, 1000);
+        @memset(l, 'a');
+        try lines.append(alloc, l);
+    }
+    const big = try alloc.alloc(u8, 4096);
+    @memset(big, 'b');
+    try lines.append(alloc, big);
+    for (0..5) |i| {
+        const l = try alloc.alloc(u8, 5);
+        @memset(l, @intCast('0' + i));
+        try lines.append(alloc, l);
+    }
+
+    var probe = ClipboardSetProbe{};
+    defer probe.captured.deinit(alloc);
+    const ok = try probe.run(lines.items);
+
+    const want = try ClipboardSetProbe.expected(alloc, lines.items);
+    defer alloc.free(want);
+
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(want.len, probe.captured.items.len);
+    try std.testing.expectEqualSlices(u8, want, probe.captured.items);
+}
+
+test "clipboard set delivers a single line larger than the staging buffer" {
+    const alloc = std.testing.allocator;
+
+    // A minified file or a base64 blob is one very long line. Without a heap
+    // buffer nothing fits, the frontend is handed zero bytes, and the RPC
+    // response still reports success — the register silently becomes empty.
+    const line = try alloc.alloc(u8, 100_000);
+    defer alloc.free(line);
+    @memset(line, 'z');
+    const lines = [_][]const u8{line};
+
+    var probe = ClipboardSetProbe{};
+    defer probe.captured.deinit(alloc);
+    const ok = try probe.run(&lines);
+
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(@as(usize, 100_000), probe.captured.items.len);
+    try std.testing.expectEqualSlices(u8, line, probe.captured.items);
+}
+
+/// Frontend stand-in that honours the on_clipboard_get contract: it reports
+/// the total size and writes only what fits, so the core's retry loop is what
+/// is actually under test.
+const ClipboardGetProbe = struct {
+    content: []const u8 = "",
+    calls: usize = 0,
+    saw_short_buffer: bool = false,
+
+    fn onGet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        out_buf: [*]u8,
+        out_len: *usize,
+        max_len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.content.len > max_len) self.saw_short_buffer = true;
+        const n = @min(self.content.len, max_len);
+        if (n > 0) @memcpy(out_buf[0..n], self.content[0..n]);
+        out_len.* = self.content.len;
+        return 1;
+    }
+
+    /// Returns the register content Neovim would receive, rejoined with '\n'.
+    fn run(self: *@This(), alloc: std.mem.Allocator) ![]u8 {
+        return fetchClipboard(alloc, self, onGet);
+    }
+};
+
+test "clipboard get retries until the whole register fits" {
+    const alloc = std.testing.allocator;
+
+    // Larger than the core's stack staging buffer, so the first call reports a
+    // short write and the core must allocate and fetch again.
+    const content = try alloc.alloc(u8, 200_000);
+    defer alloc.free(content);
+    for (content, 0..) |*b, i| b.* = if (i % 97 == 0) '\n' else 'x';
+
+    var probe = ClipboardGetProbe{ .content = content };
+    const got = try probe.run(alloc);
+    defer alloc.free(got);
+
+    try std.testing.expect(probe.saw_short_buffer);
+    try std.testing.expect(probe.calls >= 2);
+    try std.testing.expectEqual(content.len, got.len);
+    try std.testing.expectEqualSlices(u8, content, got);
+}
+
+test "clipboard get takes no heap path when the register already fits" {
+    const alloc = std.testing.allocator;
+
+    const content = "small clipboard\nsecond line";
+    var probe = ClipboardGetProbe{ .content = content };
+    const got = try probe.run(alloc);
+    defer alloc.free(got);
+
+    try std.testing.expect(!probe.saw_short_buffer);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqualSlices(u8, content, got);
+}
+
+/// Runs handleClipboardGet against the given frontend callback and returns the
+/// register content Neovim would receive, rejoined with '\n'. Caller frees.
+fn fetchClipboard(
+    alloc: std.mem.Allocator,
+    ctx: *anyopaque,
+    get_cb: @TypeOf(ClipboardGetProbe.onGet),
+) ![]u8 {
+    clock.init();
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+
+    var core = Core.initForTest(alloc);
+    core.ctx = ctx;
+    core.stdin_file = rpc_transport.Stream.fromFile(
+        .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+    );
+    core.transport_kind = .pipes;
+    core.cb.on_clipboard_get = get_cb;
+    try std.testing.expect(core.startWriterThread());
+
+    var top = [1]mp.Value{.{ .str = "+" }};
+    handleClipboardGet(&core, 11, .{ .arr = &top });
+
+    // The response can exceed one pipe read, so accumulate until a whole frame
+    // decodes. A partial frame leaves the decoder's sub-allocations orphaned,
+    // so each attempt gets an arena that is simply reset — the same reason the
+    // production read loop uses one.
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(alloc);
+    const stream = rpc_transport.Stream.fromFile(read_file);
+    var chunk: [16 * 1024]u8 = undefined;
+    var joined: []u8 = &.{};
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var guard: usize = 0;
+    while (guard < 4096) : (guard += 1) {
+        const n = try stream.read(&chunk);
+        if (n == 0) break;
+        try raw.appendSlice(alloc, chunk[0..n]);
+
+        _ = arena_state.reset(.retain_capacity);
+        var reader = mp.SliceReader{ .data = raw.items };
+        const decoded = mp.decode(arena_state.allocator(), &reader) catch |e| switch (e) {
+            error.EndOfStream => continue,
+            else => return e,
+        };
+
+        // [1, msgid, err, [[lines...], regtype]]
+        try std.testing.expect(decoded == .arr);
+        try std.testing.expect(decoded.arr[2] == .nil);
+        const lines = decoded.arr[3].arr[0].arr;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(alloc);
+        for (lines, 0..) |l, i| {
+            try out.appendSlice(alloc, l.str);
+            if (i < lines.len - 1) try out.append(alloc, '\n');
+        }
+        joined = try out.toOwnedSlice(alloc);
+        break;
+    }
+
+    core.stop();
+    read_file.close(clock.io());
+    return joined;
+}
+
+/// Stands in for the system pasteboard: whatever the copy path writes is what
+/// the paste path later reports, honouring the full-size contract.
+const ClipboardBoard = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onSet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.bytes.clearRetainingCapacity();
+        self.bytes.appendSlice(std.testing.allocator, data[0..len]) catch @panic("oom");
+        return 1;
+    }
+
+    fn onGet(
+        ctx: ?*anyopaque,
+        register: [*]const u8,
+        out_buf: [*]u8,
+        out_len: *usize,
+        max_len: usize,
+    ) callconv(.c) c_int {
+        _ = register;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const n = @min(self.bytes.items.len, max_len);
+        if (n > 0) @memcpy(out_buf[0..n], self.bytes.items[0..n]);
+        out_len.* = self.bytes.items.len;
+        return 1;
+    }
+};
+
+test "yank and put round-trip a register larger than the staging buffers" {
+    const alloc = std.testing.allocator;
+
+    // Both directions used a 64 KiB staging buffer, so a register above that
+    // lost content on the way out and again on the way back. This is the whole
+    // user-visible operation: "+y a big selection, then "+p it.
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    for (0..300) |i| {
+        const l = try alloc.alloc(u8, 400);
+        @memset(l, @intCast('a' + (i % 26)));
+        try lines.append(alloc, l);
+    }
+
+    var board = ClipboardBoard{};
+    defer board.bytes.deinit(alloc);
+
+    // Copy.
+    {
+        clock.init();
+
+        var fds: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+
+        var core = Core.initForTest(alloc);
+        core.ctx = &board;
+        core.stdin_file = rpc_transport.Stream.fromFile(
+            .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        );
+        core.transport_kind = .pipes;
+        core.cb.on_clipboard_set = ClipboardBoard.onSet;
+        try std.testing.expect(core.startWriterThread());
+
+        const vals = try alloc.alloc(mp.Value, lines.items.len);
+        defer alloc.free(vals);
+        for (lines.items, 0..) |l, i| vals[i] = .{ .str = l };
+        var top = [2]mp.Value{ .{ .str = "+" }, .{ .arr = vals } };
+        handleClipboardSet(&core, 7, .{ .arr = &top });
+
+        core.stop();
+        read_file.close(clock.io());
+    }
+
+    // Paste.
+    const pasted = try fetchClipboard(alloc, &board, ClipboardBoard.onGet);
+    defer alloc.free(pasted);
+
+    const want = try ClipboardSetProbe.expected(alloc, lines.items);
+    defer alloc.free(want);
+
+    try std.testing.expect(want.len > 64 * 1024);
+    try std.testing.expectEqual(want.len, board.bytes.items.len);
+    try std.testing.expectEqual(want.len, pasted.len);
+    try std.testing.expectEqualSlices(u8, want, pasted);
 }

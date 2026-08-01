@@ -8154,16 +8154,20 @@ final class ZonvieCore {
             return 1  // Success with empty content
         }
 
-        // Convert to UTF-8 bytes
-        let utf8Data = text.utf8
-        let copyLen = min(utf8Data.count, maxLen)
+        // Report the full size and write only what fits: the core uses the
+        // difference to detect truncation and retry with a large enough
+        // buffer, so a clipboard bigger than its staging buffer arrives whole.
+        // Clamping outLen here would hide the shortfall and, for multi-byte
+        // UTF-8, hand back a sequence cut in the middle.
+        let utf8Count = text.utf8.count
+        let copyLen = min(utf8Count, maxLen)
 
         if copyLen > 0 {
-            var bytes = Array(utf8Data)
+            var bytes = Array(text.utf8)
             memcpy(outBuf, &bytes, copyLen)
         }
 
-        outLen.pointee = copyLen
+        outLen.pointee = utf8Count
         return 1
     }
 

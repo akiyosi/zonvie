@@ -3297,12 +3297,14 @@ pub fn onClipboardGet(
         return 1;
     }
 
-    // Copy result
+    // Copy what fits, but report the full size: the core retries with a bigger
+    // buffer when out_len exceeds max_len, so clamping here would silently
+    // truncate the paste instead.
     const copy_len = @min(app.clipboard_len, max_len);
     if (copy_len > 0) {
         @memcpy(out_buf[0..copy_len], app.clipboard_buf[0..copy_len]);
     }
-    out_len.* = copy_len;
+    out_len.* = app.clipboard_len;
 
     if (applog.isEnabled()) applog.appLog("[win] clipboard_get: len={d}\n", .{copy_len});
     return app.clipboard_result;

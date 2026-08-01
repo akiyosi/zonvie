@@ -639,10 +639,18 @@ typedef void (*zonvie_on_agent_status_fn)(void* ctx, int64_t tab_handle, uint8_t
 
 /* Called to get clipboard content.
    register_name: "+" or "*" (system clipboard register)
-   out_buf: output buffer for clipboard content (UTF-8)
-   out_len: output length written
-   max_len: maximum buffer size
-   Returns: 1 on success, 0 on failure */
+   out_buf: output buffer for clipboard content (UTF-8); may be NULL when
+            max_len is 0, in which case nothing is written and only the size
+            is reported.
+   out_len: on success, the TOTAL number of bytes available — not the number
+            written. The implementation writes min(*out_len, max_len) bytes.
+   max_len: capacity of out_buf in bytes
+   Returns: 1 on success, 0 on failure
+
+   Reporting the full size rather than the clamped one lets the caller detect
+   truncation (*out_len > max_len) and retry with a large enough buffer, so a
+   register bigger than any fixed staging buffer is delivered whole instead of
+   being silently cut. Implementations must not clamp *out_len to max_len. */
 typedef int (*zonvie_on_clipboard_get_fn)(
     void* ctx,
     const char* register_name,

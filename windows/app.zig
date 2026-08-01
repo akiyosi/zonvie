@@ -3987,7 +3987,10 @@ pub const App = struct {
 
     // Clipboard request state (for cross-thread clipboard operations)
     clipboard_event: c.HANDLE = null, // Manual-reset event for sync
-    clipboard_buf: [64 * 1024]u8 = undefined,
+    // Grown to fit whatever the system clipboard holds. A fixed buffer here
+    // truncated large pastes silently, and the core cannot recover what the
+    // UI thread never fetched.
+    clipboard_buf: []u8 = &.{},
     clipboard_len: usize = 0,
     clipboard_result: c_int = 0,
     clipboard_set_data: ?[*]const u8 = null,
@@ -4443,6 +4446,10 @@ pub const App = struct {
         if (self.clipboard_event != null) {
             _ = c.CloseHandle(self.clipboard_event);
             self.clipboard_event = null;
+        }
+        if (self.clipboard_buf.len != 0) {
+            self.alloc.free(self.clipboard_buf);
+            self.clipboard_buf = &.{};
         }
 
         // SSH cleanup
