@@ -1,0 +1,10 @@
+# Fixture for the mini_message_bulk scenario: send every msg_show to the mini
+# view, which is what made a 2000-line `:history` dump land in a single
+# NSTextField and block the main thread for nine seconds.
+#
+# One route only, on purpose: it also exercises that declaring a route does
+# not disable the events it does not mention.
+[[messages.routes]]
+event = "msg_show"
+view = "mini"
+timeout = 0

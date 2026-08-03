@@ -75,6 +75,17 @@ test "gui:mini_message_position" {
     }
 }
 
+test "gui:mini_message_bulk" {
+    // macOS only: exercises the macOS frontend's mini line bound
+    // (clampMiniContent / miniWindowSize).
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/mini_message_bulk.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_message_position" {
     // macOS only: exercises the macOS frontend's ext-float anchoring
     // (getExtFloatTargetFrame); the Windows frontend has its own message UI.
