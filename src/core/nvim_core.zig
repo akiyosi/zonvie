@@ -4927,8 +4927,10 @@ pub const Core = struct {
 
     /// Buffer size `buildSplitLua` is written against. Exposed so a test can
     /// check the template still fits with headroom rather than discovering
-    /// error.NoSpaceLeft in production, where it is only logged.
-    pub const split_lua_buf_len = 8192;
+    /// error.NoSpaceLeft in production, where it is only logged. 16 KiB:
+    /// the template grew past half of 8 KiB when the enter/leave timer
+    /// autocmds were added, and the headroom test demands ≥2x slack.
+    pub const split_lua_buf_len = 16384;
 
     /// Window height for the split: at least one line, at most 20, plus the
     /// label line and its separator when a label is present.
@@ -4981,6 +4983,14 @@ pub const Core = struct {
             \\    state.win = nil
             \\  end
             \\  state.close = close
+            \\  state.timeout = timeout
+            \\  local function arm_timer()
+            \\    stop_timer()
+            \\    if state.timeout > 0 then
+            \\      state.timer = uv.new_timer()
+            \\      state.timer:start(state.timeout, 0, vim.schedule_wrap(function() state.close() end))
+            \\    end
+            \\  end
             \\  if not state.buf then
             \\    local ok, buf = pcall(vim.api.nvim_create_buf, false, true)
             \\    if not ok then return end
@@ -5033,17 +5043,31 @@ pub const Core = struct {
             \\        if others <= 1 then state.close() end
             \\      end,
             \\    }})
+            \\    -- The cursor entering the split pauses the auto-hide
+            \\    -- countdown (the user is reading it); leaving re-arms the
+            \\    -- full timeout. This BufLeave only re-arms a timer — it
+            \\    -- never closes the window.
+            \\    vim.api.nvim_create_autocmd('BufEnter', {{
+            \\      group = grp, buffer = state.buf,
+            \\      callback = function() stop_timer() end,
+            \\    }})
+            \\    vim.api.nvim_create_autocmd('BufLeave', {{
+            \\      group = grp, buffer = state.buf,
+            \\      callback = function() arm_timer() end,
+            \\    }})
             \\  else
             \\    pcall(vim.api.nvim_win_set_height, state.win, height)
             \\  end
             \\  if state.win and vim.api.nvim_win_is_valid(state.win) then
             \\    pcall(vim.api.nvim_win_set_cursor, state.win, {{ 1, 0 }})
             \\  end
-            \\  -- Restart the auto-hide timer on every show.
-            \\  stop_timer()
-            \\  if timeout > 0 then
-            \\    state.timer = uv.new_timer()
-            \\    state.timer:start(timeout, 0, vim.schedule_wrap(function() state.close() end))
+            \\  -- Restart the auto-hide timer on every show, unless the
+            \\  -- cursor currently sits inside the split — the user is
+            \\  -- reading it, so the countdown stays paused until they leave.
+            \\  if state.win and vim.api.nvim_get_current_win() == state.win then
+            \\    stop_timer()
+            \\  else
+            \\    arm_timer()
             \\  end
             \\end
             \\vim.schedule(show)

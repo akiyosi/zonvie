@@ -9182,12 +9182,28 @@ fn runMsgGridScrollFlush(self: *Core, offset: u32) bool {
     return committed;
 }
 
+/// Cancel a channel's pending auto-hide without hiding anything. Used when
+/// the user starts interacting with a view — a message being read must not
+/// vanish mid-read. The next show cycle re-arms the timeout as usual.
+pub fn pauseChannelAutoHide(self: *Core, ch: MsgChannel) void {
+    if (channelAutoHideSlot(self, ch).* != null) {
+        self.log.write("[msg] channel={s}: auto-hide paused (user interaction)\n", .{@tagName(ch)});
+        channelAutoHideSlot(self, ch).* = null;
+    }
+}
+
 pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
     // Check if message grid is active
     if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) {
         self.log.write("[msg] handleMsgGridScroll: grid not active\n", .{});
         return;
     }
+
+    // Scrolling the float is the ext_float equivalent of moving the cursor
+    // into a split: the user is reading. Stop the auto-hide countdown even
+    // when the scroll hits a boundary and the offset does not change —
+    // the interaction is the signal, not the movement.
+    pauseChannelAutoHide(self, .show);
 
     const scroll_amount: u32 = 3; // Lines per scroll event
     var new_offset = self.msg_scroll_offset;
@@ -13375,6 +13391,30 @@ test "auto-hide expiry clears the visible flag through the hide funnel" {
     // The next empty cycle has nothing to hide — no spurious action.
     try core.msg_views.beginCycle(core.alloc, 0);
     try std.testing.expectEqual(msg_view.Action.none, core.msg_views.action(.ext_float));
+}
+
+test "scrolling the message float pauses its auto-hide" {
+    // The ext_float grid is synthetic — the Neovim cursor cannot enter it —
+    // so scrolling is its "cursor moved in" equivalent: the user is reading,
+    // and the countdown must stop. Pause is not hide: the float stays.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    // Catch-all default routes echo to ext_float with the 4s view default.
+    try appendTestMessage(&core, 1, "echo", "readable");
+    _ = sendMsgShow(&core);
+    // Direct sendMsgShow bypasses notifyMessageChanges, which is what clears
+    // msg_dirty in production. Clear it here, or the flush bracket inside the
+    // scroll would legitimately re-show and re-arm the timeout.
+    core.grid.message_state.msg_dirty = false;
+    try std.testing.expect(core.msg_show_auto_hide_at != null);
+
+    handleMsgGridScroll(&core, "down");
+
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+    try std.testing.expect(core.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID));
 }
 
 test "message timeout conversion rejects invalid values and saturates" {

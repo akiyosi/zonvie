@@ -57,13 +57,22 @@ test "enter is emitted verbatim so a routed message cannot steal the cursor" {
 // -- lifetime -----------------------------------------------------------------
 
 test "the split is never closed by leaving it" {
-    // noice attaches BufLeave to popups but not to splits
+    // noice attaches a closing BufLeave to popups but not to splits
     // (config/views.lua:99-106 vs :73-86): a split meant to be entered has to
-    // survive being left. A BufLeave autocmd here closed it on any window
-    // switch.
+    // survive being left. A BufLeave autocmd here once closed it on any
+    // window switch. BufLeave now exists again — but only to re-arm the
+    // auto-hide timer — so assert structurally: exactly one occurrence, and
+    // its callback re-arms without any close.
     var buf: [buf_len]u8 = undefined;
     const lua = try build(&buf, 5, true, 0, null);
-    try std.testing.expect(!contains(lua, "BufLeave"));
+
+    const at = std.mem.indexOf(u8, lua, "'BufLeave'") orelse return error.BufLeaveMissing;
+    // Only one BufLeave registration exists.
+    try std.testing.expect(std.mem.indexOf(u8, lua[at + 1 ..], "'BufLeave'") == null);
+    // Its callback re-arms the timer and never closes the window.
+    const block = lua[at..@min(at + 160, lua.len)];
+    try std.testing.expect(contains(block, "arm_timer()"));
+    try std.testing.expect(!contains(block, "close("));
 }
 
 test "closing is bound to q and Esc" {
@@ -135,11 +144,14 @@ test "the buffer survives being hidden so it can be reused" {
 // -- auto-hide ----------------------------------------------------------------
 
 test "the timeout reaches the generated program" {
-    // The split path used to ignore the routed timeout entirely.
+    // The split path used to ignore the routed timeout entirely. The value is
+    // stored on state so the enter/leave autocmds re-arm the CURRENT show's
+    // timeout, not the one captured when the window was first created.
     var buf: [buf_len]u8 = undefined;
     const lua = try build(&buf, 5, false, 2500, null);
     try std.testing.expect(contains(lua, "local timeout = 2500"));
-    try std.testing.expect(contains(lua, "state.timer:start(timeout"));
+    try std.testing.expect(contains(lua, "state.timeout = timeout"));
+    try std.testing.expect(contains(lua, "state.timer:start(state.timeout"));
 }
 
 test "a zero timeout leaves the split until dismissed" {
@@ -147,7 +159,23 @@ test "a zero timeout leaves the split until dismissed" {
     const lua = try build(&buf, 5, false, 0, null);
     try std.testing.expect(contains(lua, "local timeout = 0"));
     // The timer is still guarded, so 0 simply never arms it.
-    try std.testing.expect(contains(lua, "if timeout > 0 then"));
+    try std.testing.expect(contains(lua, "if state.timeout > 0 then"));
+}
+
+test "entering the split pauses the auto-hide; leaving re-arms it" {
+    // A split the cursor sits in must not vanish mid-read: BufEnter stops the
+    // countdown, BufLeave re-arms the full timeout, and a show that finds the
+    // cursor already inside keeps the timer stopped instead of arming it.
+    var buf: [buf_len]u8 = undefined;
+    const lua = try build(&buf, 5, true, 3000, null);
+
+    const enter_at = std.mem.indexOf(u8, lua, "'BufEnter'") orelse return error.BufEnterMissing;
+    const enter_block = lua[enter_at..@min(enter_at + 160, lua.len)];
+    try std.testing.expect(contains(enter_block, "stop_timer()"));
+    try std.testing.expect(!contains(enter_block, "arm_timer()"));
+
+    // The show-time arming is conditional on the cursor's window.
+    try std.testing.expect(contains(lua, "vim.api.nvim_get_current_win() == state.win"));
 }
 
 test "the timer is stopped on every path that closes the split" {
