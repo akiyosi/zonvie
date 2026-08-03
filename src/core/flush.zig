@@ -10,6 +10,7 @@ const Highlights = highlight.Highlights;
 const ResolvedAttrWithStyles = highlight.ResolvedAttrWithStyles;
 const redraw = @import("redraw_handler.zig");
 const config = @import("config.zig");
+const msg_view = @import("msg_view.zig");
 const rpc = @import("rpc_encode.zig");
 const Logger = @import("log.zig").Logger;
 const nvim_core = @import("nvim_core.zig");
@@ -8718,10 +8719,23 @@ pub fn notifyMessageChanges(self: *Core) void {
 pub fn sendMsgShow(self: *Core) bool {
     const messages = self.grid.message_state.messages.items;
 
+    // Route once. Every later consumer reads this assignment instead of
+    // routing again, which is what keeps them from disagreeing: the line-cache
+    // pass used to re-route with a line count of 1 and could therefore drop a
+    // message the main pass had assigned to ext_float. Cleared before the empty
+    // check too, so an empty cycle cannot leave a stale assignment behind.
+    const views = &self.msg_views;
+    views.beginCycle(self.alloc, messages.len) catch {
+        self.log.write("[msg] sendMsgShow: view assignment alloc failed; retrying\n", .{});
+        self.flush_aborted = true;
+        return false;
+    };
+
     if (messages.len == 0) {
         // Full state reset (scroll, cache, grid -102) then explicit on_msg_clear
         hideMsgShow(self);
         self.msg_show_auto_hide_at = null;
+        views.markHidden(.ext_float);
         self.log.write("[msg] sendMsgShow: hide (empty)\n", .{});
         if (self.cb.on_msg_clear) |cb| {
             cb(self.ctx);
@@ -8740,15 +8754,20 @@ pub fn sendMsgShow(self: *Core) bool {
         }
     }
 
-    // Route each message individually and track which views are needed
-    var has_ext_float = false;
-    var has_split = false;
-    var split_auto_dismiss = false;
-    var max_ext_float_timeout: f32 = 0;
+    for (messages, 0..) |msg, i| {
+        // `return_prompt` is answered, never displayed (noice ui/msg.lua:86,
+        // 149-151). Handling it here instead of per-route is what keeps the
+        // CR from being sent twice: once from the route and once from the
+        // split's own prompt clearing. It stays assigned to `none` so it is
+        // dropped rather than rendered by whatever the catch-all route says.
+        if (config.isReturnPrompt(msg.kind)) {
+            self.log.write("[msg] return_prompt: answering with <CR>\n", .{});
+            self.requestInput("<CR>") catch {};
+            continue;
+        }
 
-    for (messages) |msg| {
-        const chunks = msg.content.items;
         const route_result = self.msg_config.routeMessage(.msg_show, msg.kind, total_line_count);
+        views.assign(i, route_result.view, route_result.timeout);
 
         self.log.write("[msg] sendMsgShow: kind={s} lines={d} routed to view={s} timeout={d:.1}\n", .{
             msg.kind,
@@ -8756,138 +8775,135 @@ pub fn sendMsgShow(self: *Core) bool {
             @tagName(route_result.view),
             route_result.timeout,
         });
-
-        switch (route_result.view) {
-            .none => {
-                // Don't show this message
-            },
-            .mini => {
-                // Send to frontend callback for mini view display
-                self.log.write("[msg] sendMsgShow: view=mini, sending to callback\n", .{});
-                sendMsgShowCallback(self, msg, chunks, route_result.view, route_result.timeout);
-            },
-            .confirm => {
-                // return_prompt routes here via config.zig hardcoding.
-                // confirm/confirm_sub are in confirm_msg (Step 5), not here.
-                // Send via callback regardless (safety for return_prompt + fallback).
-                self.log.write("[msg] sendMsgShow: view=confirm, sending to callback\n", .{});
-                sendMsgShowCallback(self, msg, chunks, route_result.view, 0);
-            },
-            .notification => {
-                // Send to frontend callback for OS notification display (no timeout)
-                self.log.write("[msg] sendMsgShow: view=notification, sending to callback\n", .{});
-                sendMsgShowCallback(self, msg, chunks, route_result.view, 0);
-            },
-            .ext_float => {
-                has_ext_float = true;
-                if (route_result.timeout > max_ext_float_timeout)
-                    max_ext_float_timeout = route_result.timeout;
-            },
-            .split => {
-                has_split = true;
-                if (route_result.auto_dismiss) split_auto_dismiss = true;
-            },
-        }
     }
 
-    // Handle ext_float view (renders all ext_float-routed messages together)
-    if (has_ext_float) {
-        self.log.write("[msg] sendMsgShow: view=ext_float, rendering message grid\n", .{});
-        if (!buildMsgLineCache(self)) {
-            self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
-            self.flush_aborted = true;
-            return false;
-        }
-        self.msg_scroll_offset = 0;
-        if (!renderMsgGridFromCache(self, 0)) {
-            self.flush_aborted = true;
-            return false;
-        }
-
-        // Set auto-hide timeout (timeout=0 means no auto-hide, e.g. errors)
-        if (messageTimeoutNs(max_ext_float_timeout)) |timeout_ns| {
-            self.msg_show_auto_hide_at = clock.nowNs() + timeout_ns;
-        } else {
-            self.msg_show_auto_hide_at = null;
-        }
+    // noice `View:display()` (view/init.lua:156-180): a view holding messages
+    // is shown, an empty one that the core still owns is hidden.
+    for (msg_view.ViewSet.dispatch_order) |view| {
+        if (!dispatchView(self, view, messages)) return false;
     }
 
-    // Handle split view (renders all split-routed messages together)
-    if (has_split) {
-        self.log.write("[msg] sendMsgShow: view=split (auto_dismiss={}), creating split window\n", .{split_auto_dismiss});
-
-        // auto_dismiss: send <CR> to clear any pending prompt (e.g. return_prompt)
-        if (split_auto_dismiss) {
-            self.requestInput("<CR>") catch {};
-        }
-
-        // Clear any pending prompt windows on frontend
-        if (self.cb.on_msg_clear) |cb| {
-            cb(self.ctx);
-        }
-
-        // Build content string from split-routed messages only
-        var content_buf: [8192]u8 = undefined;
-        var content_len: usize = 0;
-        var split_line_count: u32 = 0;
-        for (messages) |m| {
-            // Only include messages that route to split
-            const route_result = self.msg_config.routeMessage(.msg_show, m.kind, total_line_count);
-            if (route_result.view != .split) continue;
-
-            for (m.content.items) |chunk| {
-                const copy_len = @min(chunk.text.len, content_buf.len - content_len);
-                @memcpy(content_buf[content_len..][0..copy_len], chunk.text[0..copy_len]);
-                content_len += copy_len;
-                if (content_len >= content_buf.len) break;
-                // Count lines
-                for (chunk.text[0..copy_len]) |ch| {
-                    if (ch == '\n') split_line_count += 1;
-                }
-            }
-            // Add newline between messages
-            if (content_len < content_buf.len - 1) {
-                content_buf[content_len] = '\n';
-                content_len += 1;
-                split_line_count += 1;
-            }
-        }
-        self.createMessageSplit(content_buf[0..content_len], split_line_count, true, true, null) catch |e| {
-            self.log.write("[msg] createMessageSplit failed: {any}\n", .{e});
-        };
-    }
-
-    // If no ext_float messages, remove the message grid
-    if (!has_ext_float) {
-        hideMsgShow(self);
-        self.msg_show_auto_hide_at = null;
-    }
-
-    // Drop transient messages from the array so they don't pile up across
-    // subsequent sendMsgShow calls. ext_float-routed messages stay because
-    // renderMsgGridFromCache re-renders from the array on each sendMsgShow;
-    // mini/notification/split routes are fire-and-forget (the frontend or
-    // Neovim takes ownership of display once the callback fires).
-    //
-    // Without this, a later accumulating msg_show (e.g. kind=list_cmd from
-    // `:history`) would skip the addMsgShow clear-on-non-accumulating path
-    // and combine its content with stale mini-routed messages in the same
-    // split window.
-    dropTransientMessages(self, total_line_count);
+    // Drop the messages whose display has been handed off, so they do not pile
+    // up across cycles. ext_float-routed messages stay because the grid is
+    // re-rendered from the array every cycle; everything else has an owner
+    // elsewhere (frontend timer, OS, Neovim) or was never shown.
+    dropTransientMessages(self);
     return true;
 }
 
-/// Stable, single-pass removal of fire-and-forget message routes.
-fn dropTransientMessages(self: *Core, total_line_count: u32) void {
+/// Show, hide, or leave a view alone for this cycle.
+fn dispatchView(self: *Core, view: config.MsgViewType, messages: []const grid_mod.Message) bool {
+    switch (self.msg_views.action(view)) {
+        .none => {},
+        .hide => {
+            hideView(self, view);
+            self.msg_views.markHidden(view);
+        },
+        .show => {
+            if (!showView(self, view, messages)) return false;
+            self.msg_views.markShown(view);
+        },
+    }
+    return true;
+}
+
+/// Backend dispatch. Returns false only when the flush must be retried.
+fn showView(self: *Core, view: config.MsgViewType, messages: []const grid_mod.Message) bool {
+    const state = self.msg_views.state(view);
+    self.log.write("[msg] view={s}: show ({d} message(s), timeout={d:.1})\n", .{
+        @tagName(view), state.count, state.timeout,
+    });
+
+    switch (view) {
+        .none => {},
+        // Frontend-rendered views: one callback per assigned message.
+        .mini, .confirm, .notification => {
+            for (messages, 0..) |msg, i| {
+                if (self.msg_views.assignedTo(i) != view) continue;
+                sendMsgShowCallback(self, msg, msg.content.items, view, state.timeout);
+            }
+        },
+        // Core-rendered view: the external message grid.
+        .ext_float => {
+            if (!buildMsgLineCache(self)) {
+                self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
+                self.flush_aborted = true;
+                return false;
+            }
+            self.msg_scroll_offset = 0;
+            if (!renderMsgGridFromCache(self, 0)) {
+                self.flush_aborted = true;
+                return false;
+            }
+            // timeout=0 means no auto-hide, e.g. errors.
+            self.msg_show_auto_hide_at = if (messageTimeoutNs(state.timeout)) |ns|
+                clock.nowNs() + ns
+            else
+                null;
+        },
+        // Neovim-rendered view: content is sent back over RPC as Lua.
+        .split => {
+            // Clear any pending prompt windows on frontend
+            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+
+            // The buffer is a persistent Core field reused across calls, so a
+            // large `:history` dump costs at most one growth rather than the
+            // silent truncation a fixed stack buffer used to impose. noice
+            // never truncates message content either (view/init.lua:212-223);
+            // the window is bounded, not the content.
+            const buf = &self.msg_split_buf;
+            buf.clearRetainingCapacity();
+            var line_count: u32 = 0;
+            for (messages, 0..) |m, i| {
+                if (self.msg_views.assignedTo(i) != .split) continue;
+                for (m.content.items) |chunk| {
+                    buf.appendSlice(self.alloc, chunk.text) catch break;
+                    for (chunk.text) |ch| {
+                        if (ch == '\n') line_count += 1;
+                    }
+                }
+                // Add newline between messages
+                buf.append(self.alloc, '\n') catch break;
+                line_count += 1;
+            }
+            // enter=false: routed messages must not steal the cursor. noice's
+            // `split` view is `enter = false` (config/views.lua:75); only the
+            // dedicated `:messages` view opts into entering (:91-94).
+            self.createMessageSplit(
+                buf.items,
+                line_count,
+                false,
+                messageTimeoutMs(state.timeout),
+                null,
+            ) catch |e| {
+                self.log.write("[msg] createMessageSplit failed: {any}\n", .{e});
+            };
+        },
+    }
+    return true;
+}
+
+/// Only views the core still owns are hidden here; the rest were handed off on
+/// show (see msg_view.retentionOf).
+fn hideView(self: *Core, view: config.MsgViewType) void {
+    self.log.write("[msg] view={s}: hide\n", .{@tagName(view)});
+    switch (view) {
+        .ext_float => {
+            hideMsgShow(self);
+            self.msg_show_auto_hide_at = null;
+        },
+        else => {},
+    }
+}
+
+/// Stable, single-pass removal of messages whose display was handed off.
+fn dropTransientMessages(self: *Core) void {
     const messages = &self.grid.message_state.messages;
     var write_idx: usize = 0;
     for (0..messages.items.len) |read_idx| {
         const m = &messages.items[read_idx];
-        const r = self.msg_config.routeMessage(.msg_show, m.kind, total_line_count);
-        const is_transient = switch (r.view) {
-            .mini, .notification, .split => true,
-            else => false,
-        };
+        const view = self.msg_views.assignedTo(read_idx);
+        const is_transient = msg_view.retentionOf(view) == .transient;
         if (is_transient) {
             m.deinit(self.alloc);
         } else {
@@ -8918,10 +8934,12 @@ pub fn buildMsgLineCache(self: *Core) bool {
 
     var max_width: u32 = 10;
 
-    for (messages) |m| {
-        // Only include messages that route to ext_float
-        const route_result = self.msg_config.routeMessage(.msg_show, m.kind, 1);
-        if (route_result.view != .ext_float) continue;
+    for (messages, 0..) |m, i| {
+        // Only include messages this cycle assigned to ext_float. Re-routing
+        // here would disagree with the assignment: this pass used a line count
+        // of 1 while sendMsgShow uses the total, so any height-filtered route
+        // could send a message to the grid and then omit it from the cache.
+        if (self.msg_views.assignedTo(i) != .ext_float) continue;
         // Process all chunks, splitting on newlines
         var current_line: MsgCachedLine = .{};
 
@@ -9643,29 +9661,27 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
         .split => {
             // Split view: create Neovim split window
             self.msg_history_auto_hide_at = null;
-            self.log.write("[msg_history] view=split (auto_dismiss={}), creating split window\n", .{route_result.auto_dismiss});
+            self.log.write("[msg_history] view=split, showing split window\n", .{});
 
-            // Build content string from all entries
-            var content_buf: [8192]u8 = undefined;
-            var content_len: usize = 0;
+            // Build content from all entries into the persistent buffer, so a
+            // long history is shown whole rather than clipped to 8 KiB.
+            const buf = &self.msg_split_buf;
+            buf.clearRetainingCapacity();
             for (entries) |entry| {
                 for (entry.content.items) |chunk| {
-                    const copy_len = @min(chunk.text.len, content_buf.len - content_len);
-                    @memcpy(content_buf[content_len..][0..copy_len], chunk.text[0..copy_len]);
-                    content_len += copy_len;
-                    if (content_len >= content_buf.len) break;
+                    buf.appendSlice(self.alloc, chunk.text) catch break;
                 }
                 // Add newline between entries
-                if (content_len < content_buf.len - 1) {
-                    content_buf[content_len] = '\n';
-                    content_len += 1;
-                }
+                buf.append(self.alloc, '\n') catch break;
             }
+            // enter=true here: `:messages` / `:history` is content the user
+            // asked to read, so it takes focus. noice makes the same
+            // distinction (config/views.lua:91-94 vs :73-86).
             self.createMessageSplit(
-                content_buf[0..content_len],
+                buf.items,
                 @intCast(entries.len),
                 true,
-                route_result.auto_dismiss,
+                messageTimeoutMs(route_result.timeout),
                 null,
             ) catch |e| {
                 self.log.write("[msg_history] createMessageSplit failed: {any}\n", .{e});
@@ -10513,7 +10529,7 @@ test "message history allocation failure preserves dirty state for retry" {
     defer core.deinitForTest();
     core.ext_messages_enabled = true;
     var routes = [_]config.MsgRoute{
-        .{ .event = .msg_history_show, .view = .ext_float, .timeout = 0 },
+        .{ .filter = .{ .event = .msg_history_show }, .view = .ext_float, .opts = .{ .timeout = 0 } },
     };
     core.msg_config.messages.routes = &routes;
 
@@ -13225,10 +13241,91 @@ test "transient message compaction is stable" {
         });
     }
 
-    dropTransientMessages(&core, 1);
+    // Compaction now reads the cycle's view assignment rather than re-routing.
+    const items = core.grid.message_state.messages.items;
+    try core.msg_views.beginCycle(core.alloc, items.len);
+    for (items, 0..) |m, i| {
+        const r = core.msg_config.routeMessage(.msg_show, m.kind, 1);
+        core.msg_views.assign(i, r.view, r.timeout);
+    }
+
+    dropTransientMessages(&core);
     try std.testing.expectEqual(@as(usize, 2), core.grid.message_state.messages.items.len);
     try std.testing.expectEqual(@as(i64, 2), core.grid.message_state.messages.items[0].id);
     try std.testing.expectEqual(@as(i64, 4), core.grid.message_state.messages.items[1].id);
+}
+
+/// Append a msg_show message with one chunk. Caller keeps ownership through
+/// the core's message_state, which frees both on teardown.
+fn appendTestMessage(core: *Core, id: i64, kind: []const u8, text: []const u8) !void {
+    const owned_kind = try core.alloc.dupe(u8, kind);
+    errdefer core.alloc.free(owned_kind);
+    const owned_text = try core.alloc.dupe(u8, text);
+    errdefer core.alloc.free(owned_text);
+    var msg: grid_mod.Message = .{ .id = id, .kind = owned_kind };
+    try msg.content.append(core.alloc, .{ .hl_id = 0, .text = owned_text });
+    try core.grid.message_state.messages.append(core.alloc, msg);
+    core.grid.message_state.msg_dirty = true;
+}
+
+test "a height-filtered ext_float route reaches the line cache" {
+    // Regression: buildMsgLineCache re-routed with a line count of 1 while
+    // sendMsgShow routes with the total, so a route filtered on height sent
+    // the message to the grid and then omitted it from the cache — the view
+    // appeared empty. Both now read the one assignment made per cycle.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_show, .min_height = 3 }, .view = .ext_float },
+        .{ .filter = .{ .event = .msg_show }, .view = .mini },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    // Three lines, so the total line count clears min_height while the
+    // per-message count of 1 would not.
+    try appendTestMessage(&core, 1, "echo", "alpha\nbeta\ngamma");
+
+    _ = sendMsgShow(&core);
+
+    try std.testing.expectEqual(config.MsgViewType.ext_float, core.msg_views.assignedTo(0));
+    try std.testing.expect(core.msg_line_cache.items.len > 0);
+    try std.testing.expect(core.msg_total_lines > 0);
+}
+
+test "return_prompt is never rendered and never retained" {
+    // Regression: once the return_prompt hardcode was removed, the consumers
+    // that re-routed sent it to the catch-all view, so its text was rendered
+    // into the message grid and it was kept as a non-transient message.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "return_prompt", "Press ENTER");
+
+    _ = sendMsgShow(&core);
+
+    try std.testing.expectEqual(config.MsgViewType.none, core.msg_views.assignedTo(0));
+    try std.testing.expectEqual(@as(usize, 0), core.grid.message_state.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), core.msg_line_cache.items.len);
+}
+
+test "an emptied core-owned view is hidden exactly once" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "visible");
+    _ = sendMsgShow(&core);
+    try std.testing.expectEqual(config.MsgViewType.ext_float, core.msg_views.assignedTo(0));
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+
+    // Next cycle with nothing routed there: the view hides and stays hidden.
+    core.grid.message_state.clearMessages(core.alloc);
+    _ = sendMsgShow(&core);
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expectEqual(msg_view.Action.none, core.msg_views.action(.ext_float));
 }
 
 test "message timeout conversion rejects invalid values and saturates" {

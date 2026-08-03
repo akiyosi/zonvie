@@ -3,44 +3,28 @@ const builtin = @import("builtin");
 const toml = @import("toml");
 const redraw_handler = @import("redraw_handler.zig");
 const clock = @import("clock.zig");
+const msg_route = @import("msg_route.zig");
 
-/// Message event types for routing
-pub const MsgEvent = enum {
-    msg_show,
-    msg_showmode,
-    msg_showcmd,
-    msg_ruler,
-    msg_history_show,
+/// Message routing lives in msg_route.zig. Re-exported here because the
+/// config surface and every existing call site refers to `config.MsgEvent`
+/// and friends.
+pub const MsgEvent = msg_route.MsgEvent;
+pub const MsgViewType = msg_route.MsgViewType;
+pub const MsgLevel = msg_route.MsgLevel;
+pub const MsgFilter = msg_route.MsgFilter;
+pub const MsgRoute = msg_route.MsgRoute;
+pub const RouteOpts = msg_route.RouteOpts;
+pub const RouteResult = msg_route.RouteResult;
+pub const ViewSettings = msg_route.ViewSettings;
+pub const isReturnPrompt = msg_route.isReturnPrompt;
+pub const levelForKind = msg_route.levelForKind;
 
-    pub fn fromString(s: []const u8) ?MsgEvent {
-        if (std.mem.eql(u8, s, "msg_show")) return .msg_show;
-        if (std.mem.eql(u8, s, "msg_showmode")) return .msg_showmode;
-        if (std.mem.eql(u8, s, "msg_showcmd")) return .msg_showcmd;
-        if (std.mem.eql(u8, s, "msg_ruler")) return .msg_ruler;
-        if (std.mem.eql(u8, s, "msg_history_show")) return .msg_history_show;
-        return null;
-    }
-};
-
-/// View types for message display
-pub const MsgViewType = enum(u8) {
-    mini = 0,
-    ext_float = 1,
-    confirm = 2,
-    split = 3,
-    none = 4,
-    notification = 5,
-
-    pub fn fromString(s: []const u8) ?MsgViewType {
-        if (std.mem.eql(u8, s, "mini")) return .mini;
-        if (std.mem.eql(u8, s, "ext-float")) return .ext_float;
-        if (std.mem.eql(u8, s, "confirm")) return .confirm;
-        if (std.mem.eql(u8, s, "split")) return .split;
-        if (std.mem.eql(u8, s, "none")) return .none;
-        if (std.mem.eql(u8, s, "notification")) return .notification;
-        return null;
-    }
-};
+fn levelFromString(s: []const u8) ?MsgLevel {
+    if (std.mem.eql(u8, s, "info")) return .info;
+    if (std.mem.eql(u8, s, "warn")) return .warn;
+    if (std.mem.eql(u8, s, "error")) return .err;
+    return null;
+}
 
 /// Position anchor for message views
 pub const MsgPosition = enum {
@@ -54,81 +38,6 @@ pub const MsgPosition = enum {
         if (std.mem.eql(u8, s, "grid")) return .grid;
         return null;
     }
-};
-
-/// A single routing rule
-pub const MsgRoute = struct {
-    event: MsgEvent,
-    kinds: ?[]const []const u8 = null, // null = match all kinds
-    view: MsgViewType,
-    timeout: ?f32 = null, // null = use default
-    min_height: ?u32 = null, // null = no minimum line filter
-    max_height: ?u32 = null, // null = no maximum line filter
-    /// If true, automatically dismiss return_prompt by sending <CR>.
-    /// null = use view default (split/none -> true, others -> false)
-    auto_dismiss: ?bool = null,
-
-    /// Get auto_dismiss value, using view default if not specified
-    pub fn getAutoDismiss(self: MsgRoute) bool {
-        if (self.auto_dismiss) |ad| return ad;
-        // View defaults: split, none, notification don't show prompts, so auto-dismiss
-        return switch (self.view) {
-            .split, .none, .notification => true,
-            .mini, .ext_float, .confirm => false,
-        };
-    }
-
-    /// Check if this route matches the given event, kind, and line count
-    pub fn matches(self: MsgRoute, event: MsgEvent, kind: []const u8, line_count: u32) bool {
-        if (self.event != event) return false;
-
-        // Check min_height filter
-        if (self.min_height) |min| {
-            if (line_count < min) return false;
-        }
-
-        // Check max_height filter
-        if (self.max_height) |max| {
-            if (line_count > max) return false;
-        }
-
-        // If no kind filter, match all
-        if (self.kinds == null) return true;
-
-        // Check if kind is in the list
-        for (self.kinds.?) |k| {
-            if (std.mem.eql(u8, k, kind)) return true;
-        }
-        return false;
-    }
-};
-
-/// Result of routing a message
-pub const RouteResult = struct {
-    view: MsgViewType,
-    timeout: f32, // -1 = no auto-hide, 0 = use default
-    /// If true, auto-dismiss return_prompt by sending <CR> before displaying
-    auto_dismiss: bool,
-};
-
-/// Default routes when none configured
-pub const default_routes = [_]MsgRoute{
-    // Confirm dialogs (note: confirm/confirm_sub/return_prompt are hardcoded to .confirm view)
-    .{ .event = .msg_show, .kinds = &.{ "confirm", "confirm_sub", "return_prompt" }, .view = .confirm },
-    // Error messages
-    .{ .event = .msg_show, .kinds = &.{ "emsg", "echoerr", "lua_error", "rpc_error" }, .view = .ext_float, .timeout = 0 },
-    // Warning messages
-    .{ .event = .msg_show, .kinds = &.{"wmsg"}, .view = .ext_float },
-    // Search count
-    .{ .event = .msg_show, .kinds = &.{"search_count"}, .view = .mini, .timeout = 2.0 },
-    // Normal echo (fallback for msg_show)
-    .{ .event = .msg_show, .view = .ext_float },
-    // Mode display
-    .{ .event = .msg_showmode, .view = .mini },
-    .{ .event = .msg_showcmd, .view = .mini },
-    .{ .event = .msg_ruler, .view = .mini },
-    // History
-    .{ .event = .msg_history_show, .view = .split },
 };
 
 // Atlas size limits (shared between TOML parser and C API setter)
@@ -257,7 +166,13 @@ pub const Config = struct {
     pub const MessagesConfig = struct {
         external: bool = false,
         msg_pos: MsgPosConfig = .{},
-        routes: []const MsgRoute = &default_routes,
+        /// User-declared routes only. They are consulted BEFORE the built-in
+        /// defaults (msg_route.defaultRoutes) and never replace them, so an
+        /// empty list means "defaults only", not "nothing is displayed".
+        routes: []const MsgRoute = &.{},
+        /// Named view settings the default routes read, so the common
+        /// retargeting cases need no routes at all.
+        views: ViewSettings = .{},
     };
 
     pub const TablineConfig = struct {
@@ -379,7 +294,7 @@ pub const Config = struct {
     }
 
     /// Parse TOML content using toml library
-    fn parseToml(self: *Self, content: []const u8) !void {
+    pub fn parseToml(self: *Self, content: []const u8) !void {
         const alloc = self.alloc orelse return;
 
         var parser = toml.Parser(TomlConfig).init(alloc);
@@ -471,49 +386,81 @@ pub const Config = struct {
                 }
             }
 
-            // Parse routes
+            // Parse named view settings. These retarget the built-in default
+            // routes, which is what most users want instead of writing routes.
+            if (m.view) |v| {
+                if (MsgViewType.fromString(v)) |vt| self.messages.views.view = vt;
+            }
+            if (m.view_error) |v| {
+                if (MsgViewType.fromString(v)) |vt| self.messages.views.view_error = vt;
+            }
+            if (m.view_warn) |v| {
+                if (MsgViewType.fromString(v)) |vt| self.messages.views.view_warn = vt;
+            }
+            if (m.view_history) |v| {
+                if (MsgViewType.fromString(v)) |vt| self.messages.views.view_history = vt;
+            }
+            if (m.view_search) |v| {
+                if (MsgViewType.fromString(v)) |vt| self.messages.views.view_search = vt;
+            }
+
+            // Parse routes. Every field is optional: an absent field matches
+            // anything, so a route with only `kind` applies across events.
+            // These are prepended to the defaults, never a replacement.
             if (m.routes) |routes| {
                 var route_list: std.ArrayList(MsgRoute) = .empty;
                 for (routes) |r| {
+                    // An unparseable event would silently widen the filter to
+                    // "all events", so drop the whole route instead.
+                    var event: ?MsgEvent = null;
                     if (r.event) |event_str| {
-                        if (MsgEvent.fromString(event_str)) |event| {
-                            const view = if (r.view) |v| MsgViewType.fromString(v) orelse .ext_float else .ext_float;
+                        event = MsgEvent.fromString(event_str) orelse continue;
+                    }
+                    var level: ?MsgLevel = null;
+                    if (r.level) |level_str| {
+                        level = levelFromString(level_str) orelse continue;
+                    }
+                    const view = if (r.view) |v| MsgViewType.fromString(v) orelse .ext_float else .ext_float;
 
-                            // Parse kinds array
-                            var kinds: ?[]const []const u8 = null;
-                            if (r.kind) |kind_arr| {
-                                var kinds_list: std.ArrayList([]const u8) = .empty;
-                                for (kind_arr) |k| {
-                                    const duped = alloc.dupe(u8, k) catch continue;
-                                    kinds_list.append(alloc, duped) catch {
-                                        alloc.free(duped);
-                                        continue;
-                                    };
-                                }
-                                if (kinds_list.toOwnedSlice(alloc)) |slice| {
-                                    kinds = slice;
-                                } else |_| {
-                                    for (kinds_list.items) |k_str| alloc.free(k_str);
-                                    kinds_list.deinit(alloc);
-                                }
-                            }
-
-                            route_list.append(alloc, .{
-                                .event = event,
-                                .kinds = kinds,
-                                .view = view,
-                                .timeout = r.timeout,
-                                .min_height = r.min_height,
-                                .max_height = r.max_height,
-                            }) catch {
-                                if (kinds) |ks| {
-                                    for (ks) |k_str| alloc.free(k_str);
-                                    alloc.free(ks);
-                                }
+                    // Parse kinds array
+                    var kinds: ?[]const []const u8 = null;
+                    if (r.kind) |kind_arr| {
+                        var kinds_list: std.ArrayList([]const u8) = .empty;
+                        for (kind_arr) |k| {
+                            const duped = alloc.dupe(u8, k) catch continue;
+                            kinds_list.append(alloc, duped) catch {
+                                alloc.free(duped);
                                 continue;
                             };
                         }
+                        if (kinds_list.toOwnedSlice(alloc)) |slice| {
+                            kinds = slice;
+                        } else |_| {
+                            for (kinds_list.items) |k_str| alloc.free(k_str);
+                            kinds_list.deinit(alloc);
+                        }
                     }
+
+                    route_list.append(alloc, .{
+                        .filter = .{
+                            .event = event,
+                            .kinds = kinds,
+                            .min_height = r.min_height,
+                            .max_height = r.max_height,
+                            .level = level,
+                        },
+                        .view = view,
+                        .opts = .{
+                            .skip = r.skip orelse false,
+                            .timeout = r.timeout,
+                        },
+                    }) catch {
+                        if (kinds) |ks| {
+                            for (ks) |k_str| alloc.free(k_str);
+                            alloc.free(ks);
+                        }
+                        continue;
+                    };
                 }
                 if (route_list.items.len > 0) {
                     if (route_list.toOwnedSlice(alloc)) |slice| {
@@ -521,7 +468,7 @@ pub const Config = struct {
                         self.routes_allocated = true;
                     } else |_| {
                         for (route_list.items) |route| {
-                            if (route.kinds) |ks| {
+                            if (route.filter.kinds) |ks| {
                                 for (ks) |k_str| alloc.free(k_str);
                                 alloc.free(ks);
                             }
@@ -643,35 +590,14 @@ pub const Config = struct {
         }
     }
 
-    /// Route a message to the appropriate view
+    /// Route a message to the appropriate view.
     /// line_count: number of lines in the message (used for min_height/max_height filters)
     pub fn routeMessage(self: *const Self, event: MsgEvent, kind: []const u8, line_count: u32) RouteResult {
-        const default_timeout: f32 = 4.0; // 4 seconds default
-
-        // Confirm dialogs are ALWAYS routed to confirm view (hardcoded, not configurable)
-        // This prevents users from accidentally routing confirm/confirm_sub/return_prompt
-        // to split or other views where interactive input is not possible.
-        if (event == .msg_show) {
-            if (std.mem.eql(u8, kind, "confirm") or
-                std.mem.eql(u8, kind, "confirm_sub") or
-                std.mem.eql(u8, kind, "return_prompt"))
-            {
-                return .{ .view = .confirm, .timeout = 0, .auto_dismiss = false }; // timeout=0 means no auto-hide
-            }
-        }
-
-        for (self.messages.routes) |route| {
-            if (route.matches(event, kind, line_count)) {
-                return .{
-                    .view = route.view,
-                    .timeout = route.timeout orelse default_timeout,
-                    .auto_dismiss = route.getAutoDismiss(),
-                };
-            }
-        }
-
-        // No match - default to none (hide, auto-dismiss)
-        return .{ .view = .none, .timeout = 0, .auto_dismiss = true };
+        const router: msg_route.Router = .{
+            .user_routes = self.messages.routes,
+            .views = self.messages.views,
+        };
+        return router.route(event, kind, line_count);
     }
 
     /// Free allocated memory
@@ -731,7 +657,7 @@ pub const Config = struct {
         // Free allocated routes
         if (self.routes_allocated) {
             for (self.messages.routes) |route| {
-                if (route.kinds) |kinds| {
+                if (route.filter.kinds) |kinds| {
                     for (kinds) |k| {
                         alloc.free(k);
                     }
@@ -886,15 +812,23 @@ const TomlMessages = struct {
     external: ?bool = null,
     msg_pos: ?TomlMsgPos = null,
     routes: ?[]const TomlRoute = null,
+    // Named view settings; see msg_route.ViewSettings.
+    view: ?[]const u8 = null,
+    view_error: ?[]const u8 = null,
+    view_warn: ?[]const u8 = null,
+    view_history: ?[]const u8 = null,
+    view_search: ?[]const u8 = null,
 };
 
 const TomlRoute = struct {
     event: ?[]const u8 = null,
     kind: ?[]const []const u8 = null,
+    level: ?[]const u8 = null,
     view: ?[]const u8 = null,
     timeout: ?f32 = null,
     min_height: ?u32 = null,
     max_height: ?u32 = null,
+    skip: ?bool = null,
 };
 
 const TomlTabline = struct {
@@ -949,3 +883,97 @@ const TomlServer = struct {
     close_to_tray: ?bool = null,
     open_mode: ?[]const u8 = null,
 };
+
+// -- message routing config tests --------------------------------------------
+
+fn parseForTest(alloc: std.mem.Allocator, toml_src: []const u8) !Config {
+    var cfg = Config{ .alloc = alloc };
+    errdefer cfg.deinit();
+    try cfg.parseToml(toml_src);
+    return cfg;
+}
+
+test "declaring one route keeps the defaults for other events" {
+    // The reported bug: a lone msg_show rule used to replace the whole table,
+    // silently dropping :history and the mode/cmd/ruler indicators.
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[[messages.routes]]
+        \\event = "msg_show"
+        \\view = "split"
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_show, "", 1).view);
+    try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_history_show, "", 1).view);
+    try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_showmode, "", 1).view);
+    try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_showcmd, "", 1).view);
+    try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_ruler, "", 1).view);
+}
+
+test "named view settings need no routes at all" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[messages]
+        \\view = "split"
+        \\view_error = "notification"
+        \\view_history = "ext-float"
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_show, "echo", 1).view);
+    try std.testing.expectEqual(MsgViewType.notification, cfg.routeMessage(.msg_show, "emsg", 1).view);
+    try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_history_show, "", 1).view);
+    // Untouched settings keep their defaults.
+    try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_show, "search_count", 1).view);
+}
+
+test "skip hides a route explicitly" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[[messages.routes]]
+        \\event = "msg_ruler"
+        \\skip = true
+    );
+    defer cfg.deinit();
+
+    try std.testing.expect(cfg.routeMessage(.msg_ruler, "", 1).skip);
+    try std.testing.expect(!cfg.routeMessage(.msg_showcmd, "", 1).skip);
+}
+
+test "a route needs no event and can filter on level or height alone" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[[messages.routes]]
+        \\level = "error"
+        \\view = "notification"
+        \\
+        \\[[messages.routes]]
+        \\min_height = 20
+        \\view = "split"
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(MsgViewType.notification, cfg.routeMessage(.msg_show, "emsg", 1).view);
+    try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_show, "echo", 2034).view);
+    try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_show, "echo", 3).view);
+}
+
+test "an unparseable event drops the route instead of widening it" {
+    // Dropping is the safe failure: an ignored `event` key would turn the rule
+    // into a catch-all that swallows every message.
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[[messages.routes]]
+        \\event = "msg_typo"
+        \\view = "none"
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_show, "echo", 1).view);
+    try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_showmode, "", 1).view);
+}
+
+test "no messages config at all yields the defaults" {
+    var cfg = try parseForTest(std.testing.allocator, "[font]\nsize = 12.0\n");
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_show, "echo", 1).view);
+    try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_history_show, "", 1).view);
+    try std.testing.expectEqual(MsgViewType.confirm, cfg.routeMessage(.msg_show, "confirm", 1).view);
+}
