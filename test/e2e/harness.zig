@@ -36,11 +36,29 @@ pub const WaitError = error{ Timeout, NvimExited };
 
 pub const AgentEvent = struct { tab: i64, state: u8, title: []u8 };
 
+/// One recorded on_msg_show callback. `view` is the routed view type; the
+/// core has already decided it, so scenarios assert on routing outcomes
+/// without reimplementing the route table.
+pub const MsgShowEvent = struct {
+    view: u8,
+    kind: []u8,
+    content: []u8,
+    timeout_ms: u32,
+};
+
 pub const Options = struct {
     rows: u32 = 24,
     cols: u32 = 80,
     /// Pass --clean so user config cannot break determinism.
     clean: bool = true,
+    /// Attach with ext_messages and record the message callbacks. Off by
+    /// default so existing scenarios keep seeing messages in the grid.
+    ext_messages: bool = false,
+    /// User-declared message routes, prepended to the built-in defaults
+    /// exactly as a config file's would be. Borrowed for the harness lifetime.
+    msg_routes: ?[]const zc.config.MsgRoute = null,
+    /// Named view settings that the default routes read.
+    msg_views: ?zc.config.ViewSettings = null,
     /// Attach with the ext_windows UI option. WARNING: stock nvim rejects
     /// this option (attach fails, nvim exits); it targets a patched nvim.
     /// Plain external floats (nvim_open_win external=true) already work via
@@ -95,6 +113,14 @@ pub const Harness = struct {
     agent_events_mu: std.Io.Mutex = .init,
     agent_events: std.ArrayListUnmanaged(AgentEvent) = .empty,
 
+    // ext_messages recording. Appended in arrival order. Only channels with a
+    // consumer are recorded: msg_shows (per-message routing outcomes) and
+    // msg_showmodes (the mode indicator, used to prove that events a user
+    // route never mentioned still reach their default view).
+    msg_mu: std.Io.Mutex = .init,
+    msg_shows: std.ArrayListUnmanaged(MsgShowEvent) = .empty,
+    msg_showmodes: std.ArrayListUnmanaged(MsgShowEvent) = .empty,
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -131,12 +157,17 @@ pub const Harness = struct {
             .on_external_window = onExternalWindow,
             .on_external_window_close = onExternalWindowClose,
             .on_agent_status = onAgentStatus,
+            .on_msg_show = if (opts.ext_messages) onMsgShow else null,
+            .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
         };
         h.core = try alloc.create(Core);
         errdefer alloc.destroy(h.core);
         h.core.* = Core.init(alloc, cbs, h);
         // Must be set before start(): requestUiAttach reads it.
         h.core.ext_windows_enabled = opts.ext_windows;
+        h.core.ext_messages_enabled = opts.ext_messages;
+        if (opts.msg_routes) |routes| h.core.msg_config.messages.routes = routes;
+        if (opts.msg_views) |views| h.core.msg_config.messages.views = views;
 
         try h.core.start(h.nvim_cmd, opts.rows, opts.cols);
         errdefer h.core.stop();
@@ -167,6 +198,16 @@ pub const Harness = struct {
         h.alloc.free(h.nvim_cmd);
         for (h.agent_events.items) |e| h.alloc.free(e.title);
         h.agent_events.deinit(h.alloc);
+        for (h.msg_shows.items) |e| {
+            h.alloc.free(e.kind);
+            h.alloc.free(e.content);
+        }
+        h.msg_shows.deinit(h.alloc);
+        for (h.msg_showmodes.items) |e| {
+            h.alloc.free(e.kind);
+            h.alloc.free(e.content);
+        }
+        h.msg_showmodes.deinit(h.alloc);
         h.alloc.destroy(h);
     }
 
@@ -228,6 +269,203 @@ pub const Harness = struct {
         h.agent_events.append(h.alloc, .{ .tab = tab_handle, .state = state, .title = copy }) catch h.alloc.free(copy);
     }
 
+    /// Flatten msg chunks into one string. Returns null on OOM so the
+    /// callback can drop the event rather than fail on the RPC thread.
+    fn joinChunks(h: *Harness, chunks: [*]const zc.MsgChunk, count: usize) ?[]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        for (chunks[0..count]) |c| {
+            if (c.text_len == 0) continue;
+            buf.appendSlice(h.alloc, c.text[0..c.text_len]) catch {
+                buf.deinit(h.alloc);
+                return null;
+            };
+        }
+        return buf.toOwnedSlice(h.alloc) catch {
+            buf.deinit(h.alloc);
+            return null;
+        };
+    }
+
+    fn onMsgShow(
+        ctx: ?*anyopaque,
+        view: zc.zonvie_msg_view_type,
+        kind: [*]const u8,
+        kind_len: usize,
+        chunks: [*]const zc.MsgChunk,
+        chunk_count: usize,
+        replace_last: c_int,
+        history: c_int,
+        append: c_int,
+        msg_id: i64,
+        timeout_ms: u32,
+    ) callconv(.c) void {
+        _ = replace_last;
+        _ = history;
+        _ = append;
+        _ = msg_id;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        const content = h.joinChunks(chunks, chunk_count) orelse return;
+        const kind_copy = h.alloc.dupe(u8, kind[0..kind_len]) catch {
+            h.alloc.free(content);
+            return;
+        };
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        h.msg_shows.append(h.alloc, .{
+            .view = @intCast(@intFromEnum(view)),
+            .kind = kind_copy,
+            .content = content,
+            .timeout_ms = timeout_ms,
+        }) catch {
+            h.alloc.free(content);
+            h.alloc.free(kind_copy);
+        };
+    }
+
+    /// The core skips this callback entirely when the event routed to `none`
+    /// or was skipped (flush.zig sendMsgShowmode), so a recorded event is
+    /// itself proof the default route survived.
+    fn onMsgShowmode(
+        ctx: ?*anyopaque,
+        view: zc.zonvie_msg_view_type,
+        chunks: [*]const zc.MsgChunk,
+        chunk_count: usize,
+    ) callconv(.c) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        const content = h.joinChunks(chunks, chunk_count) orelse return;
+        const kind_copy = h.alloc.dupe(u8, "") catch {
+            h.alloc.free(content);
+            return;
+        };
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        h.msg_showmodes.append(h.alloc, .{
+            .view = @intCast(@intFromEnum(view)),
+            .kind = kind_copy,
+            .content = content,
+            .timeout_ms = 0,
+        }) catch {
+            h.alloc.free(content);
+            h.alloc.free(kind_copy);
+        };
+    }
+
+    // ── ext_messages readback ──────────────────────────────────────────
+
+    /// True if any recorded on_msg_show matches `pred`.
+    pub fn hasMsgShow(h: *Harness, comptime pred: fn (MsgShowEvent) bool) bool {
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        for (h.msg_shows.items) |e| {
+            if (pred(e)) return true;
+        }
+        return false;
+    }
+
+    /// Wait until some recorded on_msg_show matches `pred`. Events that
+    /// arrived before the wait started still count.
+    pub fn waitMsgShow(h: *Harness, comptime pred: fn (MsgShowEvent) bool, timeout_ms: u64) WaitError!void {
+        const Wrap = struct {
+            fn check(_: void, hh: *Harness) bool {
+                return hh.hasMsgShow(pred);
+            }
+        };
+        h.waitUntil({}, Wrap.check, timeout_ms) catch |e| {
+            h.dumpMsgShows();
+            return e;
+        };
+    }
+
+    pub fn msgShowCount(h: *Harness) usize {
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        return h.msg_shows.items.len;
+    }
+
+    /// True if any recorded on_msg_showmode matches `pred`.
+    pub fn hasMsgShowmode(h: *Harness, comptime pred: fn (MsgShowEvent) bool) bool {
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        for (h.msg_showmodes.items) |e| {
+            if (pred(e)) return true;
+        }
+        return false;
+    }
+
+    /// Wait until some recorded on_msg_showmode matches `pred`.
+    pub fn waitMsgShowmode(h: *Harness, comptime pred: fn (MsgShowEvent) bool, timeout_ms: u64) WaitError!void {
+        const Wrap = struct {
+            fn check(_: void, hh: *Harness) bool {
+                return hh.hasMsgShowmode(pred);
+            }
+        };
+        try h.waitUntil({}, Wrap.check, timeout_ms);
+    }
+
+    pub fn dumpMsgShows(h: *Harness) void {
+        h.msg_mu.lockUncancelable(zc.clock.io());
+        defer h.msg_mu.unlock(zc.clock.io());
+        std.debug.print("[e2e] recorded msg_show events ({d}):\n", .{h.msg_shows.items.len});
+        for (h.msg_shows.items) |e| {
+            std.debug.print(
+                "  view={d} kind=\"{s}\" timeout_ms={d} content=\"{s}\"\n",
+                .{ e.view, e.kind, e.timeout_ms, e.content },
+            );
+        }
+    }
+
+    /// Bytes of content the core assembled for the most recent split show.
+    /// Reading this separates "was the content clipped" from "where is the
+    /// split scrolled to", which visible rows alone cannot distinguish.
+    pub fn splitContentLen(h: *Harness) usize {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.msg_split_buf.items.len;
+    }
+
+    /// Number of messages the core is still holding. Lets a scenario assert
+    /// that handed-off or undisplayed messages do not accumulate.
+    pub fn pendingMessageCount(h: *Harness) usize {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.grid.message_state.messages.items.len;
+    }
+
+    // ── Neovim window observation ──────────────────────────────────────
+
+    /// Number of positioned, non-external Neovim windows, derived from
+    /// win_pos. Floats ARE included (win_float_pos also populates win_pos),
+    /// so scenarios that open floats must account for them. The split view
+    /// creates a real window, so this is how a scenario sees whether it
+    /// appeared or went away.
+    pub fn windowCount(h: *Harness) usize {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        var n: usize = 0;
+        var it = h.core.grid.win_pos.keyIterator();
+        while (it.next()) |k| {
+            if (h.core.grid.external_grids.contains(k.*)) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Wait until `windowCount()` equals `expected`.
+    pub fn waitWindowCount(h: *Harness, expected: usize, timeout_ms: u64) !void {
+        const Ctx = struct { expected: usize };
+        h.waitUntil(Ctx{ .expected = expected }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                return hh.windowCount() == c.expected;
+            }
+        }.check, timeout_ms) catch |e| {
+            std.debug.print(
+                "[e2e] waitWindowCount failed: expected={d} actual={d}\n",
+                .{ expected, h.windowCount() },
+            );
+            return e;
+        };
+    }
+
     // ── Input ──────────────────────────────────────────────────────────
 
     /// Send keys in nvim_input notation ("ihello<Esc>", "<C-w>v", ...).
@@ -260,6 +498,19 @@ pub const Harness = struct {
             // with a sleep; the loop re-checks pred/exited/timeout each iteration.
             std.Io.sleep(zc.clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
         }
+    }
+
+    /// Wait until nvim exits. Used by scenarios whose subject IS the exit,
+    /// e.g. that a leftover scratch window does not keep the editor alive.
+    pub fn waitExit(h: *Harness, timeout_ms: u64) !void {
+        h.waitUntil({}, struct {
+            fn check(_: void, _: *Harness) bool {
+                return false; // only NvimExited ends this wait
+            }
+        }.check, timeout_ms) catch |e| switch (e) {
+            WaitError.NvimExited => return,
+            else => return e,
+        };
     }
 
     // ── Readback (locks grid_mu internally) ────────────────────────────
@@ -461,6 +712,25 @@ pub const Harness = struct {
             }
         };
         try h.waitUntil({}, Wrap.check, timeout_ms);
+    }
+
+    /// Wait until the cursor sits on grid `grid_id`. Because handleRedraw
+    /// holds grid_mu for a whole batch, observing the cursor on the target
+    /// grid proves every event in that batch (and all earlier batches) has
+    /// been applied — an ordering signal for window-switch round trips.
+    pub fn waitCursorGrid(h: *Harness, grid_id: i64, timeout_ms: u64) !void {
+        const Ctx = struct { grid_id: i64 };
+        h.waitUntil(Ctx{ .grid_id = grid_id }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                return hh.cursor().grid_id == c.grid_id;
+            }
+        }.check, timeout_ms) catch |e| {
+            std.debug.print(
+                "[e2e] waitCursorGrid failed: expected grid={d} actual grid={d}\n",
+                .{ grid_id, h.cursor().grid_id },
+            );
+            return e;
+        };
     }
 
     /// Wait until the cursor sits at (row, col) in its current grid.

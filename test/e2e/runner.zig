@@ -228,3 +228,41 @@ test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);
 }
+
+// ext_messages. These attach with ext_messages on and observe the message
+// callbacks plus the real Neovim windows the split view creates.
+
+test "e2e:msg_route_defaults" {
+    try requireNvim();
+    try @import("scenarios/msg_route_defaults.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_lifecycle" {
+    try requireNvim();
+    try @import("scenarios/msg_split_lifecycle.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_timeout" {
+    try requireNvim();
+    try @import("scenarios/msg_split_timeout.zig").run(testing.allocator);
+}
+
+test "e2e:msg_history_split" {
+    try requireNvim();
+    try @import("scenarios/msg_history_split.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_quit" {
+    try requireNvim();
+    try @import("scenarios/msg_split_quit.zig").run(testing.allocator);
+}
+
+test "e2e:msg_return_prompt" {
+    try requireNvim();
+    try @import("scenarios/msg_return_prompt.zig").run(testing.allocator);
+}
+
+test "e2e:msg_no_accumulation" {
+    try requireNvim();
+    try @import("scenarios/msg_no_accumulation.zig").run(testing.allocator);
+}
