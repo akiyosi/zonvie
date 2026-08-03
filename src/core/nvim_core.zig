@@ -908,10 +908,12 @@ pub const Core = struct {
     // is never truncated to fit a fixed stack buffer.
     msg_split_buf: std.ArrayListUnmanaged(u8) = .empty,
 
-    // Per-view lifecycle for msg_show. Routing runs once per cycle and the
-    // result lives here; every consumer reads the assignment instead of
-    // re-routing. See msg_view.zig.
+    // Per-view lifecycle, one ViewSet per message channel (msg_show and
+    // msg_history_show — each has its own grid and auto-hide slot). Routing
+    // runs once per cycle and the result lives here; every consumer reads the
+    // assignment instead of re-routing. See msg_view.zig.
     msg_views: msg_view.ViewSet = .{},
+    history_views: msg_view.ViewSet = .{},
 
     // Auto-hide deadlines for ext_float grids (nanos timestamp)
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
@@ -1230,6 +1232,7 @@ pub const Core = struct {
         self.shaping_src_cols.deinit(self.alloc);
         self.flush_float_overlay_buf.deinit(self.alloc);
         self.msg_views.deinit(self.alloc);
+        self.history_views.deinit(self.alloc);
         self.msg_line_cache.deinit(self.alloc);
         self.msg_line_cache_build.deinit(self.alloc);
         self.msg_split_buf.deinit(self.alloc);
@@ -1881,7 +1884,13 @@ pub const Core = struct {
         self.msg_line_cache_build = .empty;
         self.msg_split_buf.deinit(self.alloc);
         self.msg_split_buf = .empty;
+        // Full reset, not just deinit: ViewSet.deinit frees the assignment
+        // but keeps per-view state, and a stale `visible` flag would make the
+        // next session's first empty cycle issue a spurious hide.
         self.msg_views.deinit(self.alloc);
+        self.msg_views = .{};
+        self.history_views.deinit(self.alloc);
+        self.history_views = .{};
         self.msg_config.deinit();
         self.msg_config = .{};
 

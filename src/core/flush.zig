@@ -8492,11 +8492,10 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
     // msg_show (grid -102) auto-hide
     if (self.msg_show_auto_hide_at) |hide_at| {
         if (now >= hide_at) {
-            self.msg_show_auto_hide_at = null;
             hid_message = true;
             self.log.write("[msg] auto-hide: msg_show timeout expired\n", .{});
             self.grid.message_state.clearMessages(self.grid.alloc);
-            hideMsgShow(self);
+            hideChannelView(self, .show, .ext_float);
             // Remove from known_external_grids and notify close only if it was tracked.
             // This prevents spurious close notifications for grids that were never
             // registered or already closed.
@@ -8518,10 +8517,9 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
     // msg_history (grid -103) auto-hide
     if (self.msg_history_auto_hide_at) |hide_at| {
         if (now >= hide_at) {
-            self.msg_history_auto_hide_at = null;
             hid_message = true;
             self.log.write("[msg] auto-hide: msg_history timeout expired\n", .{});
-            hideMsgHistory(self);
+            hideChannelView(self, .history, .ext_float);
             self.grid.msg_history_state.clear(self.grid.alloc);
             // Same guard: only notify if it was actually tracked
             if (self.known_external_grids.remove(grid_mod.MSG_HISTORY_GRID_ID)) {
@@ -8620,9 +8618,8 @@ pub fn notifyMessageChanges(self: *Core) void {
         // If msg_clear was received in this batch, notify frontend to clear old state
         // BEFORE processing new messages. This handles msg_clear -> msg_show same-batch.
         if (cleared_in_batch and !sent_msg_clear) {
-            hideMsgShow(self);
+            hideChannelView(self, .show, .ext_float);
             self.msg_show_pending_since = null;
-            self.msg_show_auto_hide_at = null;
             if (self.cb.on_msg_clear) |cb| {
                 cb(self.ctx);
             }
@@ -8633,9 +8630,8 @@ pub fn notifyMessageChanges(self: *Core) void {
         if (messages.len == 0) {
             if (!cleared_in_batch) {
                 // Pure empty (not from same-batch clear which was already handled above)
-                hideMsgShow(self);
+                hideChannelView(self, .show, .ext_float);
                 self.msg_show_pending_since = null;
-                self.msg_show_auto_hide_at = null;
                 if (!sent_msg_clear) {
                     if (self.cb.on_msg_clear) |cb| {
                         cb(self.ctx);
@@ -8733,9 +8729,7 @@ pub fn sendMsgShow(self: *Core) bool {
 
     if (messages.len == 0) {
         // Full state reset (scroll, cache, grid -102) then explicit on_msg_clear
-        hideMsgShow(self);
-        self.msg_show_auto_hide_at = null;
-        views.markHidden(.ext_float);
+        hideChannelView(self, .show, .ext_float);
         self.log.write("[msg] sendMsgShow: hide (empty)\n", .{});
         if (self.cb.on_msg_clear) |cb| {
             cb(self.ctx);
@@ -8779,9 +8773,7 @@ pub fn sendMsgShow(self: *Core) bool {
 
     // noice `View:display()` (view/init.lua:156-180): a view holding messages
     // is shown, an empty one that the core still owns is hidden.
-    for (msg_view.ViewSet.dispatch_order) |view| {
-        if (!dispatchView(self, view, messages)) return false;
-    }
+    if (!dispatchChannel(self, .show, .{ .show = messages })) return false;
 
     // Drop the messages whose display has been handed off, so they do not pile
     // up across cycles. ext_float-routed messages stay because the grid is
@@ -8791,52 +8783,99 @@ pub fn sendMsgShow(self: *Core) bool {
     return true;
 }
 
-/// Show, hide, or leave a view alone for this cycle.
-fn dispatchView(self: *Core, view: config.MsgViewType, messages: []const grid_mod.Message) bool {
-    switch (self.msg_views.action(view)) {
-        .none => {},
-        .hide => {
-            hideView(self, view);
-            self.msg_views.markHidden(view);
-        },
-        .show => {
-            if (!showView(self, view, messages)) return false;
-            self.msg_views.markShown(view);
-        },
+/// A message channel: an event source with its own ViewSet, external grid,
+/// and auto-hide slot. The two channels share every backend below — the only
+/// per-channel differences are which grid ext_float renders into and whether
+/// the split takes focus.
+pub const MsgChannel = enum {
+    /// msg_show — grid -102, msg_show_auto_hide_at.
+    show,
+    /// msg_history_show — grid -103, msg_history_auto_hide_at.
+    history,
+};
+
+/// Content a channel dispatches this cycle, parallel to its ViewSet
+/// assignment (`messages` per-index; `history` is routed as one unit at
+/// index 0).
+const ChannelContent = union(MsgChannel) {
+    show: []const grid_mod.Message,
+    history: []const grid_mod.MsgHistoryEntry,
+};
+
+fn channelViews(self: *Core, ch: MsgChannel) *msg_view.ViewSet {
+    return switch (ch) {
+        .show => &self.msg_views,
+        .history => &self.history_views,
+    };
+}
+
+fn channelAutoHideSlot(self: *Core, ch: MsgChannel) *?i128 {
+    return switch (ch) {
+        .show => &self.msg_show_auto_hide_at,
+        .history => &self.msg_history_auto_hide_at,
+    };
+}
+
+/// Run one display cycle for a channel: show every view holding content,
+/// hide every empty view the core still owns. Returns false when the flush
+/// must be retried.
+fn dispatchChannel(self: *Core, ch: MsgChannel, content: ChannelContent) bool {
+    const views = channelViews(self, ch);
+    for (msg_view.ViewSet.dispatch_order) |view| {
+        switch (views.action(view)) {
+            .none => {},
+            .hide => hideChannelView(self, ch, view),
+            .show => {
+                if (!showChannelView(self, ch, view, content)) return false;
+                views.markShown(view);
+            },
+        }
     }
     return true;
 }
 
-/// Backend dispatch. Returns false only when the flush must be retried.
-fn showView(self: *Core, view: config.MsgViewType, messages: []const grid_mod.Message) bool {
-    const state = self.msg_views.state(view);
-    self.log.write("[msg] view={s}: show ({d} message(s), timeout={d:.1})\n", .{
-        @tagName(view), state.count, state.timeout,
+/// Backend dispatch, shared by both channels. Returns false only when the
+/// flush must be retried.
+fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, content: ChannelContent) bool {
+    const views = channelViews(self, ch);
+    const state = views.state(view);
+    self.log.write("[msg] channel={s} view={s}: show ({d} item(s), timeout={d:.1})\n", .{
+        @tagName(ch), @tagName(view), state.count, state.timeout,
     });
 
     switch (view) {
         .none => {},
-        // Frontend-rendered views: one callback per assigned message.
-        .mini, .confirm, .notification => {
-            for (messages, 0..) |msg, i| {
-                if (self.msg_views.assignedTo(i) != view) continue;
+        // Frontend-rendered views.
+        .mini, .confirm, .notification => switch (content) {
+            // One callback per assigned message.
+            .show => |messages| for (messages, 0..) |msg, i| {
+                if (views.assignedTo(i) != view) continue;
                 sendMsgShowCallback(self, msg, msg.content.items, view, state.timeout);
-            }
+            },
+            // History is routed as one unit; the callback combines entries.
+            .history => |entries| sendMsgHistoryCallbackAll(self, entries, view),
         },
-        // Core-rendered view: the external message grid.
+        // Core-rendered view: the channel's external grid.
         .ext_float => {
-            if (!buildMsgLineCache(self)) {
-                self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
-                self.flush_aborted = true;
-                return false;
-            }
-            self.msg_scroll_offset = 0;
-            if (!renderMsgGridFromCache(self, 0)) {
-                self.flush_aborted = true;
-                return false;
+            switch (content) {
+                .show => {
+                    if (!buildMsgLineCache(self)) {
+                        self.log.write("[msg] buildMsgLineCache failed; preserving previous cache for retry\n", .{});
+                        self.flush_aborted = true;
+                        return false;
+                    }
+                    self.msg_scroll_offset = 0;
+                    if (!renderMsgGridFromCache(self, 0)) {
+                        self.flush_aborted = true;
+                        return false;
+                    }
+                },
+                .history => |entries| {
+                    if (!renderMsgHistoryGrid(self, entries)) return false;
+                },
             }
             // timeout=0 means no auto-hide, e.g. errors.
-            self.msg_show_auto_hide_at = if (messageTimeoutNs(state.timeout)) |ns|
+            channelAutoHideSlot(self, ch).* = if (messageTimeoutNs(state.timeout)) |ns|
                 clock.nowNs() + ns
             else
                 null;
@@ -8854,46 +8893,62 @@ fn showView(self: *Core, view: config.MsgViewType, messages: []const grid_mod.Me
             const buf = &self.msg_split_buf;
             buf.clearRetainingCapacity();
             var line_count: u32 = 0;
-            for (messages, 0..) |m, i| {
-                if (self.msg_views.assignedTo(i) != .split) continue;
-                for (m.content.items) |chunk| {
-                    buf.appendSlice(self.alloc, chunk.text) catch break;
-                    for (chunk.text) |ch| {
-                        if (ch == '\n') line_count += 1;
+            switch (content) {
+                .show => |messages| for (messages, 0..) |m, i| {
+                    if (views.assignedTo(i) != .split) continue;
+                    for (m.content.items) |chunk| {
+                        buf.appendSlice(self.alloc, chunk.text) catch break;
+                        for (chunk.text) |ch_byte| {
+                            if (ch_byte == '\n') line_count += 1;
+                        }
                     }
-                }
-                // Add newline between messages
-                buf.append(self.alloc, '\n') catch break;
-                line_count += 1;
+                    // Add newline between messages
+                    buf.append(self.alloc, '\n') catch break;
+                    line_count += 1;
+                },
+                .history => |entries| for (entries) |entry| {
+                    for (entry.content.items) |chunk| {
+                        buf.appendSlice(self.alloc, chunk.text) catch break;
+                    }
+                    // Add newline between entries
+                    buf.append(self.alloc, '\n') catch break;
+                    line_count += 1;
+                },
             }
-            // enter=false: routed messages must not steal the cursor. noice's
-            // `split` view is `enter = false` (config/views.lua:75); only the
-            // dedicated `:messages` view opts into entering (:91-94).
+            // enter differs per channel: routed messages must not steal the
+            // cursor (noice's `split` view is `enter = false`,
+            // config/views.lua:75), while `:messages` is content the user
+            // asked to read, so it takes focus (:91-94).
             self.createMessageSplit(
                 buf.items,
                 line_count,
-                false,
+                ch == .history,
                 messageTimeoutMs(state.timeout),
                 null,
             ) catch |e| {
                 self.log.write("[msg] createMessageSplit failed: {any}\n", .{e});
+                if (ch == .history) return false;
             };
         },
     }
     return true;
 }
 
-/// Only views the core still owns are hidden here; the rest were handed off on
-/// show (see msg_view.retentionOf).
-fn hideView(self: *Core, view: config.MsgViewType) void {
-    self.log.write("[msg] view={s}: hide\n", .{@tagName(view)});
-    switch (view) {
-        .ext_float => {
-            hideMsgShow(self);
-            self.msg_show_auto_hide_at = null;
-        },
-        else => {},
+/// THE hide funnel for a channel's view: every path that stops displaying a
+/// core-owned view — cycle dispatch, auto-hide timeout, msg_clear — goes
+/// through here so grid, auto-hide slot, and the ViewSet's `visible` flag
+/// can never disagree. Transient views were handed off on show (see
+/// msg_view.retentionOf) and only have their flag cleared.
+pub fn hideChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType) void {
+    self.log.write("[msg] channel={s} view={s}: hide\n", .{ @tagName(ch), @tagName(view) });
+    if (view == .ext_float) {
+        switch (ch) {
+            .show => hideMsgShow(self),
+            .history => hideMsgHistory(self),
+        }
+        channelAutoHideSlot(self, ch).* = null;
     }
+    channelViews(self, ch).markHidden(view);
 }
 
 /// Stable, single-pass removal of messages whose display was handed off.
@@ -9476,13 +9531,10 @@ pub fn sendMsgClear(self: *Core) void {
     // Close any existing message split window
     closeMessageSplit(self);
 
-    // Hide msg_show external grid
-    hideMsgShow(self);
-    self.msg_show_auto_hide_at = null;
-
-    // Hide msg_history external grid
-    hideMsgHistory(self);
-    self.msg_history_auto_hide_at = null;
+    // Hide both channels' external grids through the funnel so the
+    // ViewSets' visible flags stay accurate.
+    hideChannelView(self, .show, .ext_float);
+    hideChannelView(self, .history, .ext_float);
 
     // Call frontend callback
     if (self.cb.on_msg_clear) |cb| {
@@ -9612,88 +9664,38 @@ pub fn sendMsgRuler(self: *Core) void {
     cb(self.ctx, c_view, &c_chunks, chunk_count);
 }
 
-/// Show msg_history as external grid (like popupmenu pattern).
+/// Show msg_history through the channel dispatch: route the entry set once
+/// as a single unit, then let the shared backends display it. Previously this
+/// function was its own five-arm switch with its own auto-hide handling — the
+/// second consumer the view abstraction existed for.
 pub fn sendMsgHistoryShow(self: *Core) bool {
-    const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
     const entries = self.grid.msg_history_state.entries.items;
+    const views = &self.history_views;
 
-    if (entries.len == 0) {
-        // No entries - hide the history window if visible
-        _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
-            if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-            return false;
-        };
-        self.msg_history_auto_hide_at = null;
-        self.log.write("[msg_history] hide (empty)\n", .{});
-        return true;
+    // History is routed as one unit, so the cycle has a single slot. Cleared
+    // before the empty check too, so an empty cycle hides a still-visible
+    // core-owned view through the same dispatch as everything else.
+    views.beginCycle(self.alloc, 1) catch {
+        self.log.write("[msg_history] view assignment alloc failed; retrying\n", .{});
+        self.flush_aborted = true;
+        return false;
+    };
+
+    if (entries.len > 0) {
+        const route_result = self.msg_config.routeMessage(.msg_history_show, "", @intCast(entries.len));
+        self.log.write("[msg_history] entries={d} routed to view={s}\n", .{ entries.len, @tagName(route_result.view) });
+        views.assign(0, route_result.view, route_result.timeout);
+    } else {
+        self.log.write("[msg_history] empty\n", .{});
     }
 
-    // Route message using config (use entry count as line count)
-    const route_result = self.msg_config.routeMessage(.msg_history_show, "", @intCast(entries.len));
-    self.log.write("[msg_history] entries={d} routed to view={s}\n", .{ entries.len, @tagName(route_result.view) });
+    return dispatchChannel(self, .history, .{ .history = entries });
+}
 
-    // Handle based on routing result
-    switch (route_result.view) {
-        .none => {
-            // Don't show anything
-            _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
-                if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-                return false;
-            };
-            self.msg_history_auto_hide_at = null;
-            self.log.write("[msg_history] view=none, hiding\n", .{});
-            return true;
-        },
-        .mini => {
-            // Mini view: send all entries combined to frontend callback
-            self.msg_history_auto_hide_at = null;
-            self.log.write("[msg_history] view=mini, sending {d} entries to callback\n", .{entries.len});
-            sendMsgHistoryCallbackAll(self, entries, route_result.view);
-            return true;
-        },
-        .notification => {
-            // Notification view: send all entries combined to frontend callback for OS notification
-            self.msg_history_auto_hide_at = null;
-            self.log.write("[msg_history] view=notification, sending {d} entries to callback\n", .{entries.len});
-            sendMsgHistoryCallbackAll(self, entries, route_result.view);
-            return true;
-        },
-        .split => {
-            // Split view: create Neovim split window
-            self.msg_history_auto_hide_at = null;
-            self.log.write("[msg_history] view=split, showing split window\n", .{});
-
-            // Build content from all entries into the persistent buffer, so a
-            // long history is shown whole rather than clipped to 8 KiB.
-            const buf = &self.msg_split_buf;
-            buf.clearRetainingCapacity();
-            for (entries) |entry| {
-                for (entry.content.items) |chunk| {
-                    buf.appendSlice(self.alloc, chunk.text) catch break;
-                }
-                // Add newline between entries
-                buf.append(self.alloc, '\n') catch break;
-            }
-            // enter=true here: `:messages` / `:history` is content the user
-            // asked to read, so it takes focus. noice makes the same
-            // distinction (config/views.lua:91-94 vs :73-86).
-            self.createMessageSplit(
-                buf.items,
-                @intCast(entries.len),
-                true,
-                messageTimeoutMs(route_result.timeout),
-                null,
-            ) catch |e| {
-                self.log.write("[msg_history] createMessageSplit failed: {any}\n", .{e});
-                return false;
-            };
-            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
-            return true;
-        },
-        else => {
-            // Continue to external grid rendering below (ext_float, confirm)
-        },
-    }
+/// Render history entries into the msg_history external grid (-103).
+/// Returns false when the flush must be retried.
+fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) bool {
+    const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
 
     // Build content lines from entries
     var lines: [256][256]u8 = undefined;
@@ -9770,13 +9772,8 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
         return false;
     };
 
-    // Set auto-hide timeout (timeout=0 means no auto-hide)
-    if (messageTimeoutNs(route_result.timeout)) |timeout_ns| {
-        self.msg_history_auto_hide_at = clock.nowNs() + timeout_ns;
-        self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
-    } else {
-        self.msg_history_auto_hide_at = null;
-    }
+    // Auto-hide is owned by showChannelView; retry backoff is reset by the
+    // caller on success. Nothing channel-lifecycle-related belongs here.
     return true;
 }
 
@@ -13325,6 +13322,58 @@ test "an emptied core-owned view is hidden exactly once" {
     core.grid.message_state.clearMessages(core.alloc);
     _ = sendMsgShow(&core);
     try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expectEqual(msg_view.Action.none, core.msg_views.action(.ext_float));
+}
+
+test "history dispatches through its own view set and hides on empty" {
+    // msg_history_show used to be a five-arm switch outside the view
+    // abstraction; this pins that it now runs the same show/hide lifecycle,
+    // including hiding a still-visible grid when the history is cleared.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_history_show }, .view = .ext_float, .opts = .{ .timeout = 0 } },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var entry: grid_mod.MsgHistoryEntry = .{};
+    defer entry.content.deinit(std.testing.allocator);
+    try entry.content.append(std.testing.allocator, .{ .hl_id = 0, .text = "history" });
+    try core.grid.setMsgHistoryShow(&.{entry}, false);
+
+    try std.testing.expect(sendMsgHistoryShow(&core));
+    try std.testing.expect(core.history_views.state(.ext_float).visible);
+    try std.testing.expect(core.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID));
+
+    // Clearing the history hides the grid through the same dispatch.
+    core.grid.msg_history_state.clear(core.grid.alloc);
+    try std.testing.expect(sendMsgHistoryShow(&core));
+    try std.testing.expect(!core.history_views.state(.ext_float).visible);
+    try std.testing.expect(!core.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID));
+}
+
+test "auto-hide expiry clears the visible flag through the hide funnel" {
+    // Out-of-band hides (auto-hide timeout, msg_clear) used to bypass the
+    // ViewSet, leaving `visible` stale so the next empty cycle issued a
+    // spurious hide. Every hide path now goes through hideChannelView.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "visible");
+    _ = sendMsgShow(&core);
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+
+    // Force the deadline into the past and fire the timeout path.
+    core.msg_show_auto_hide_at = clock.nowNs() - 1;
+    checkMsgAutoHideTimeout(&core);
+
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+    // The next empty cycle has nothing to hide — no spurious action.
+    try core.msg_views.beginCycle(core.alloc, 0);
     try std.testing.expectEqual(msg_view.Action.none, core.msg_views.action(.ext_float));
 }
 
