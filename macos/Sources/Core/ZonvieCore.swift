@@ -7150,13 +7150,36 @@ final class ZonvieCore {
         label.cell?.isScrollable = false
     }
 
+    /// Maximum number of lines a mini window renders. Matches noice.nvim's
+    /// `views.mini.size.max_height` (`config/views.lua:178-182`).
+    private static let miniMaxLines = 10
+
+    /// Bound mini content to `miniMaxLines`.
+    ///
+    /// noice bounds the mini *window* and lets the buffer underneath scroll;
+    /// Zonvie's mini is a single NSTextField, so the bound has to be applied to
+    /// the string. The excess is summarised rather than silently dropped —
+    /// oversized messages belong in `ext-float` or `split`, which do scroll.
+    ///
+    /// Without this, a `:history` dump (~2000 lines) makes AppKit lay out a
+    /// borderless window tens of thousands of points tall on the main thread.
+    private func clampMiniContent(_ content: String) -> String {
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > Self.miniMaxLines else { return content }
+        let kept = Self.miniMaxLines - 1
+        return lines.prefix(kept).joined(separator: "\n")
+            + "\n…(\(lines.count - kept) more lines)"
+    }
+
     /// Update a mini window with new content
     /// - Parameters:
     ///   - miniId: The mini window identifier
-    ///   - content: The content to display
+    ///   - rawContent: The content to display, before the mini line bound
     ///   - timeout: Optional timeout in seconds (nil = use default, 0 = no auto-hide)
-    private func updateMini(_ miniId: MiniWindowId, content: String, timeout: Double? = nil) {
+    private func updateMini(_ miniId: MiniWindowId, content rawContent: String, timeout: Double? = nil) {
         guard let mainWindow = terminalView?.window else { return }
+
+        let content = clampMiniContent(rawContent)
 
         // Cancel any existing hide timer for this mini window
         miniWindows[miniId]?.hideWorkItem?.cancel()
