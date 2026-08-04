@@ -11,14 +11,8 @@ const zc = @import("zonvie_core");
 const Core = zc.nvim_core.Core;
 const buf_len = Core.split_lua_buf_len;
 
-fn build(
-    buf: []u8,
-    line_count: u32,
-    enter: bool,
-    timeout_ms: u32,
-    label: ?[]const u8,
-) ![]const u8 {
-    return Core.buildSplitLua(buf, line_count, enter, timeout_ms, label);
+fn build(buf: []u8, line_count: u32, enter: bool, timeout_ms: u32) ![]const u8 {
+    return Core.buildSplitLua(buf, line_count, enter, timeout_ms);
 }
 
 fn contains(haystack: []const u8, needle: []const u8) bool {
@@ -32,13 +26,13 @@ test "the template fits its buffer with headroom" {
     // the split would silently stop appearing. Require real slack, not a
     // by-one-byte fit.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 20, true, 4000, "Messages");
+    const lua = try build(&buf, 20, true, 4000);
     try std.testing.expect(lua.len < buf_len / 2);
 }
 
 test "a tiny buffer reports overflow rather than truncating" {
     var small: [64]u8 = undefined;
-    try std.testing.expectError(error.NoSpaceLeft, build(&small, 1, false, 0, null));
+    try std.testing.expectError(error.NoSpaceLeft, build(&small, 1, false, 0));
 }
 
 // -- focus --------------------------------------------------------------------
@@ -46,11 +40,11 @@ test "a tiny buffer reports overflow rather than truncating" {
 test "enter is emitted verbatim so a routed message cannot steal the cursor" {
     var buf: [buf_len]u8 = undefined;
 
-    const not_entered = try build(&buf, 5, false, 0, null);
+    const not_entered = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(not_entered, "local enter = false"));
 
     var buf2: [buf_len]u8 = undefined;
-    const entered = try build(&buf2, 5, true, 0, null);
+    const entered = try build(&buf2, 5, true, 0);
     try std.testing.expect(contains(entered, "local enter = true"));
 }
 
@@ -64,7 +58,7 @@ test "the split is never closed by leaving it" {
     // auto-hide timer — so assert structurally: exactly one occurrence, and
     // its callback re-arms without any close.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, true, 0, null);
+    const lua = try build(&buf, 5, true, 0);
 
     const at = std.mem.indexOf(u8, lua, "'BufLeave'") orelse return error.BufLeaveMissing;
     // Only one BufLeave registration exists.
@@ -77,7 +71,7 @@ test "the split is never closed by leaving it" {
 
 test "closing is bound to q and Esc" {
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, true, 0, null);
+    const lua = try build(&buf, 5, true, 0);
     try std.testing.expect(contains(lua, "'q'"));
     try std.testing.expect(contains(lua, "'<Esc>'"));
 }
@@ -86,7 +80,7 @@ test "the split does not keep Neovim alive" {
     // Without this, `:q` closed the editor window and left the scratch split
     // as the only window, so nvim never exited.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(lua, "QuitPre"));
     try std.testing.expect(contains(lua, "nvim_tabpage_list_wins"));
 }
@@ -99,7 +93,7 @@ test "a queued auto-hide cannot close a later split" {
     // is what makes a queued close a no-op once anything re-armed or
     // stopped the timer.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 3000, null);
+    const lua = try build(&buf, 5, false, 3000);
 
     // Every stop bumps the generation, so BufEnter also cancels queued closes.
     const stop_at = std.mem.indexOf(u8, lua, "local function stop_timer()") orelse
@@ -119,7 +113,7 @@ test "closing the split stops its timer instead of leaking the handle" {
     // relative to `state.win = nil` is deliberately NOT asserted: stop_timer
     // never reads state.win, and a reversed variant measured identically.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 3000, null);
+    const lua = try build(&buf, 5, false, 3000);
 
     const at = std.mem.indexOf(u8, lua, "'WinClosed'") orelse return error.WinClosedMissing;
     const block = lua[at..@min(at + 700, lua.len)];
@@ -136,7 +130,7 @@ test "a window that no longer shows our buffer is forgotten, not reused" {
     // window, and the keymaps and pause autocmds are only registered on the
     // mount path, so `q` and `<Esc>` would no longer close the split.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
 
     const check = "if state.win and vim.api.nvim_win_get_buf(state.win) ~= state.buf then";
     const at = std.mem.indexOf(u8, lua, check) orelse return error.StaleWindowCheckMissing;
@@ -157,7 +151,7 @@ test "QuitPre ignores quits that cannot end the session" {
     // floats are excluded from the count, so dismissing an LSP hover with
     // `:q` looked like "one real window left" and took the split with it.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
 
     const at = std.mem.indexOf(u8, lua, "'QuitPre'") orelse return error.QuitPreMissing;
     const block = lua[at..];
@@ -188,7 +182,7 @@ test "the split never survives as the last window of its own tabpage" {
     // whenever the split is alone destroyed a whole tabpage on a `:q` that
     // left windows behind in its own tab.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
 
     const at = std.mem.indexOf(u8, lua, "'QuitPre'") orelse return error.QuitPreMissing;
     const block = lua[at..];
@@ -212,7 +206,7 @@ test "the split never survives as the last window of its own tabpage" {
 
 test "autocmds are grouped so re-showing does not stack duplicates" {
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(lua, "nvim_create_augroup('ZonvieMsgSplit'"));
     try std.testing.expect(contains(lua, "clear = true"));
 }
@@ -230,7 +224,7 @@ test "content is always re-rendered, not skipped when already mounted" {
     // The e2e scenario msg_split_lifecycle covers the behavior end to end;
     // this keeps the generated program from regressing shape-wise.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
 
     const render_at = std.mem.indexOf(u8, lua, "nvim_buf_set_lines") orelse
         return error.RenderCallMissing;
@@ -246,7 +240,7 @@ test "content is always re-rendered, not skipped when already mounted" {
 
 test "stale handles are repaired rather than trusted" {
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(lua, "if state.buf and not vim.api.nvim_buf_is_valid(state.buf) then state.buf = nil end"));
     try std.testing.expect(contains(lua, "if state.win and not vim.api.nvim_win_is_valid(state.win) then state.win = nil end"));
 }
@@ -255,7 +249,7 @@ test "the buffer survives being hidden so it can be reused" {
     // bufhidden=wipe would destroy the buffer on close, defeating the
     // update-in-place path on the next message.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(lua, "bufhidden = 'hide'"));
     try std.testing.expect(!contains(lua, "bufhidden = 'wipe'"));
 }
@@ -267,7 +261,7 @@ test "the timeout reaches the generated program" {
     // stored on state so the enter/leave autocmds re-arm the CURRENT show's
     // timeout, not the one captured when the window was first created.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 2500, null);
+    const lua = try build(&buf, 5, false, 2500);
     try std.testing.expect(contains(lua, "local timeout = 2500"));
     try std.testing.expect(contains(lua, "state.timeout = timeout"));
     try std.testing.expect(contains(lua, "state.timer:start(state.timeout"));
@@ -275,7 +269,7 @@ test "the timeout reaches the generated program" {
 
 test "a zero timeout leaves the split until dismissed" {
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, null);
+    const lua = try build(&buf, 5, false, 0);
     try std.testing.expect(contains(lua, "local timeout = 0"));
     // The timer is still guarded, so 0 simply never arms it.
     try std.testing.expect(contains(lua, "if state.timeout > 0 then"));
@@ -286,7 +280,7 @@ test "entering the split pauses the auto-hide; leaving re-arms it" {
     // countdown, BufLeave re-arms the full timeout, and a show that finds the
     // cursor already inside keeps the timer stopped instead of arming it.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, true, 3000, null);
+    const lua = try build(&buf, 5, true, 3000);
 
     const enter_at = std.mem.indexOf(u8, lua, "'BufEnter'") orelse return error.BufEnterMissing;
     const enter_block = lua[enter_at..@min(enter_at + 160, lua.len)];
@@ -302,7 +296,7 @@ test "the timer is stopped on every path that closes the split" {
     // begins by stopping the timer — assert the definition itself, not just
     // that the tokens appear somewhere.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 1000, null);
+    const lua = try build(&buf, 5, false, 1000);
     try std.testing.expect(contains(lua, "local function close()\n    stop_timer()"));
     try std.testing.expect(contains(lua, "is_closing()"));
 }
@@ -313,7 +307,7 @@ test "the split does not answer prompts on its own" {
     // return_prompt is answered once at the event layer. This program used to
     // feed a second <CR> of its own, racing the first.
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, true, 0, null);
+    const lua = try build(&buf, 5, true, 0);
     try std.testing.expect(!contains(lua, "feedkeys"));
     try std.testing.expect(!contains(lua, "replace_termcodes"));
 }
@@ -321,67 +315,38 @@ test "the split does not answer prompts on its own" {
 // -- height -------------------------------------------------------------------
 
 test "height is clamped to a readable window" {
-    try std.testing.expectEqual(@as(u32, 1), Core.splitHeight(0, null));
-    try std.testing.expectEqual(@as(u32, 1), Core.splitHeight(1, null));
-    try std.testing.expectEqual(@as(u32, 12), Core.splitHeight(12, null));
-    try std.testing.expectEqual(@as(u32, 20), Core.splitHeight(20, null));
-    try std.testing.expectEqual(@as(u32, 20), Core.splitHeight(2034, null));
-}
-
-test "a label adds its own line and separator to the height" {
-    try std.testing.expectEqual(@as(u32, 7), Core.splitHeight(5, "Messages"));
-    // Still clamped.
-    try std.testing.expectEqual(@as(u32, 20), Core.splitHeight(19, "Messages"));
+    try std.testing.expectEqual(@as(u32, 1), Core.splitHeight(0));
+    try std.testing.expectEqual(@as(u32, 1), Core.splitHeight(1));
+    try std.testing.expectEqual(@as(u32, 12), Core.splitHeight(12));
+    try std.testing.expectEqual(@as(u32, 20), Core.splitHeight(20));
+    try std.testing.expectEqual(@as(u32, 20), Core.splitHeight(2034));
 }
 
 test "the height reaches the generated program" {
     var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 7, false, 0, null);
+    const lua = try build(&buf, 7, false, 0);
     try std.testing.expect(contains(lua, "local height = 7"));
 }
 
-// -- label --------------------------------------------------------------------
-
-test "a label is rendered only when present" {
+test "nothing user-controlled is interpolated into the program" {
+    // The message text travels as a msgpack argument, never as source, so the
+    // generated Lua needs no escaping. That only holds while every `{}` in
+    // the template takes an integer or a boolean literal — a formatted
+    // string would reintroduce a Lua-literal injection surface.
     var buf: [buf_len]u8 = undefined;
-    const without = try build(&buf, 5, false, 0, null);
-    try std.testing.expect(contains(without, "local has_label = false"));
+    const lua = try build(&buf, 7, true, 4000);
+    try std.testing.expect(contains(lua, "local height = 7"));
+    try std.testing.expect(contains(lua, "local enter = true"));
+    try std.testing.expect(contains(lua, "local timeout = 4000"));
+    // `local content = ...` is the vararg the RPC argument binds to.
+    try std.testing.expect(contains(lua, "local content = ...\n"));
 
-    var buf2: [buf_len]u8 = undefined;
-    const with = try build(&buf2, 5, false, 0, "Messages");
-    try std.testing.expect(contains(with, "local has_label = true"));
-    try std.testing.expect(contains(with, "local label = \"Messages\""));
-}
-
-test "a hostile label cannot break out of the Lua string" {
-    // The label is interpolated into a double-quoted Lua literal. Unescaped,
-    // a `"` in a route label ends the string early and the rest of the label
-    // executes as Lua; a raw newline splits the statement. Every dangerous
-    // byte must arrive escaped.
-    var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, "a\"b\\c\nd\re");
-    // Expected literal on the Lua side: "a\"b\\c\nd\re" — each escape is a
-    // two-byte backslash sequence, never the raw byte.
-    try std.testing.expect(contains(lua, "local label = \"a\\\"b\\\\c\\nd\\re\""));
-}
-
-test "an oversized label is truncated, never allowed to suppress the split" {
-    // The label is decoration; the messages are not. Failing the whole call
-    // over a long label would make the split silently stop appearing, since
-    // callers only log the error — the exact failure the buffer-headroom
-    // comment warns about, just at 256 bytes instead of 16 KiB.
-    var buf: [buf_len]u8 = undefined;
-    const lua = try build(&buf, 5, false, 0, "x" ** 300);
-    try std.testing.expect(contains(lua, "local has_label = true"));
-    try std.testing.expect(contains(lua, "local label = \"" ++ "x" ** 256 ++ "\""));
-}
-
-test "truncation never splits an escape sequence" {
-    // A quote escaped to two bytes must land whole or not at all: half of
-    // `\"` is a stray backslash that eats the closing quote and breaks the
-    // program. 255 plain bytes leave room for one byte, not two.
-    var buf: [buf_len]u8 = undefined;
-    const label = "x" ** 255 ++ "\"y";
-    const lua = try build(&buf, 5, false, 0, label);
-    try std.testing.expect(contains(lua, "local label = \"" ++ "x" ** 255 ++ "\""));
+    // The emitted program contains no `"` byte at all (the template quotes
+    // exclusively with '), so this trips on the historically likely
+    // reintroduction: reviving the deleted label code, which was
+    // double-quoted (`local label = "{s}"`). It does NOT catch a fresh
+    // single-quoted `'{s}'` or a long-bracket `[[{s}]]` — those are stopped
+    // only by buildSplitLua's closed integer/bool signature, where feeding a
+    // string requires a parameter change that breaks this file's build.
+    try std.testing.expect(!contains(lua, "\""));
 }

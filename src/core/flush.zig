@@ -7367,8 +7367,11 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         };
         const cmdline_grid_id = grid_mod.CMDLINE_GRID_ID;
 
-        // Record command content for split view label
-        // (record every update, the final content before hide is the executed command)
+        // Record command content into last_cmd_buf — currently written and
+        // never read; the split-view label it was collected for was never
+        // wired up (see the field declaration in nvim_core.zig).
+        // (record every update, the final content before hide is the
+        // executed command)
         self.last_cmd_firstc = state.firstc;
         self.last_cmd_len = 0;
         for (state.content.items) |chunk| {
@@ -8751,16 +8754,12 @@ pub fn notifyMessageChanges(self: *Core) void {
     }
 }
 
-const PromptPass = struct {
-    /// Prompts removed from the array, whether answered or given up on.
-    consumed: usize,
-    /// The caller must abort the flush and try again.
-    retry: bool,
-};
-
 /// Answer pending press-enter prompts with `<CR>` and remove them — BEFORE
 /// any dispatch step that can fail, so a retried flush cannot answer one
 /// twice. (noice answers at the event layer too: ui/init.lua:122-126.)
+///
+/// Returns how many prompts left the array, or null when one is still
+/// unanswered for a reason a retry can resolve — the caller must then abort.
 ///
 /// A prompt leaves the array only once its `<CR>` is resolved, and the two
 /// send-failure classes resolve differently:
@@ -8775,7 +8774,7 @@ const PromptPass = struct {
 /// with `ext_messages` attached produced no return_prompt at all, so this
 /// path is currently unreachable. Kept because the guarantee should not
 /// depend on that observation holding.
-fn answerReturnPrompts(self: *Core) PromptPass {
+fn answerReturnPrompts(self: *Core) ?usize {
     const messages = &self.grid.message_state.messages;
     var consumed: usize = 0;
     var write_idx: usize = 0;
@@ -8804,7 +8803,7 @@ fn answerReturnPrompts(self: *Core) PromptPass {
         write_idx += 1;
     }
     messages.items.len = write_idx;
-    return .{ .consumed = consumed, .retry = retry };
+    return if (retry) null else consumed;
 }
 
 /// Send msg_show as external grid (like popupmenu pattern).
@@ -8814,12 +8813,12 @@ pub fn sendMsgShow(self: *Core) bool {
     // flush, so a retry cannot answer them twice. A side effect worth naming:
     // prompt text no longer inflates total_line_count, so height-filtered
     // routes see only real content.
-    const prompt_pass = answerReturnPrompts(self);
-    if (prompt_pass.retry) {
+    const consumed_prompts = answerReturnPrompts(self) orelse {
+        // null means a prompt is still unanswered for a reason a retry can
+        // resolve.
         self.flush_aborted = true;
         return false;
-    }
-    const consumed_prompts = prompt_pass.consumed;
+    };
 
     const messages = self.grid.message_state.messages.items;
 
@@ -9060,7 +9059,6 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 line_count,
                 ch == .history,
                 messageTimeoutMs(state.timeout),
-                null,
             ) catch |e| {
                 // Both channels fail the dispatch. Swallowing this for .show
                 // returned success, so markShown ran and dropTransientMessages
@@ -13491,8 +13489,66 @@ test "a dead transport drops the prompt instead of freezing the pipeline" {
     try std.testing.expect(sendMsgShow(&core));
     try std.testing.expect(!core.flush_aborted);
     try std.testing.expectEqual(@as(usize, 0), core.grid.message_state.messages.items.len);
-    // Dropped, not rendered: prompt text never reaches a view.
-    try std.testing.expectEqual(@as(usize, 0), core.msg_line_cache.items.len);
+}
+
+test "a prompt-only batch hides the view without clearing the frontend" {
+    // The two arms of the empty-batch branch differ in exactly one
+    // observable: both hide a visible core-owned view, but only the
+    // pure-empty arm fires on_msg_clear — a prompt-only batch displayed
+    // nothing and cleared nothing, so the frontend must not be told
+    // otherwise. Asserting both arms through an on_msg_clear probe is what
+    // discriminates the two mutations that used to escape: deleting the
+    // prompt-only arm (a prompt-only batch would then fire a clear) and
+    // widening its gate to >= 0 (a pure-empty batch would then stop firing
+    // one).
+    //
+    // The staging is a unit-level approximation: in production a visible
+    // ext_float cannot coexist with a prompt-only array (only msg_clear
+    // empties it, and notifyMessageChanges' cleared_in_batch branch hides
+    // and clears BEFORE sendMsgShow runs). The clear-count observable still
+    // maps to real symptoms — the escaped mutations fire a duplicate or
+    // spurious on_msg_clear on reachable batches. And the prompt is consumed
+    // via the drop path only (test cores have no transport); that stands in
+    // faithfully for the answered path, whose body is identical
+    // (consume + deinit + continue), but the answered increment itself is
+    // provable only with a transport seam this harness lacks.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    var clear_calls: usize = 0;
+    const Probe = struct {
+        var calls: *usize = undefined;
+        fn onClear(_: ?*anyopaque) callconv(.c) void {
+            calls.* += 1;
+        }
+    };
+    Probe.calls = &clear_calls;
+    core.cb.on_msg_clear = Probe.onClear;
+
+    // A visible ext_float view to give both arms something to hide.
+    try appendTestMessage(&core, 1, "echo", "visible");
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+
+    // Prompt-only batch: the dead transport drops the prompt (test cores
+    // have no writer thread), leaving zero messages with consumed > 0.
+    core.grid.message_state.clearMessages(core.alloc);
+    try appendTestMessage(&core, 2, "return_prompt", "Press ENTER");
+    clear_calls = 0;
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expectEqual(@as(usize, 0), clear_calls);
+
+    // A pure-empty batch takes the other arm: same hide, plus the clear.
+    try appendTestMessage(&core, 3, "echo", "visible again");
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+    core.grid.message_state.clearMessages(core.alloc);
+    clear_calls = 0;
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(!core.msg_views.state(.ext_float).visible);
+    try std.testing.expectEqual(@as(usize, 1), clear_calls);
 }
 
 test "an out-of-memory answer keeps the prompt for retry" {

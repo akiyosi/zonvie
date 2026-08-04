@@ -936,7 +936,8 @@ pub const Core = struct {
     msg_line_cache_build: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_cache_valid: bool = false,
 
-    // Track last executed command for split view label
+    // Track last executed command. Recorded but not yet consumed: the
+    // split-view label it was collected for was never wired up.
     last_cmd_buf: [256]u8 = .{0} ** 256,
     last_cmd_len: usize = 0,
     last_cmd_firstc: u8 = 0, // ':' or '!' etc.
@@ -1528,8 +1529,8 @@ pub const Core = struct {
         self.msg_line_cache_build.clearRetainingCapacity();
         self.resetAtlasMaintenanceBackoff();
 
-        // Last command tracking for the split-view label was a snapshot
-        // of the old session's :commands.
+        // Last command tracking was a snapshot of the old session's
+        // :commands.
         self.last_cmd_len = 0;
         self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
@@ -4889,7 +4890,6 @@ pub const Core = struct {
     /// Based on noice.nvim/nui.nvim patterns for state management.
     /// enter=true: focus moves to split (for regular messages)
     /// enter=false: focus stays in current window (for confirm dialogs)
-    /// label: optional label line showing command and duration (prepended to content)
     /// Show (or update) the message split. Modelled on noice.nvim's
     /// `NuiView:show()` (`view/nui.lua:274-289`): mounting and rendering are
     /// independent, so a second message updates the existing split instead of
@@ -4913,16 +4913,15 @@ pub const Core = struct {
         line_count: u32,
         enter: bool,
         timeout_ms: u32,
-        label: ?[]const u8,
     ) !void {
         // Overflow here surfaces as error.NoSpaceLeft, which callers only log,
         // so the split would silently stop appearing. Keep generous headroom.
         var lua_buf: [split_lua_buf_len]u8 = undefined;
-        const lua_code = try buildSplitLua(&lua_buf, line_count, enter, timeout_ms, label);
+        const lua_code = try buildSplitLua(&lua_buf, line_count, enter, timeout_ms);
 
         // Send nvim_exec_lua with content as argument
         try self.requestExecLuaWithArg(lua_code, content);
-        self.log.write("rpc send: createMessageSplit (lines={d}, height={d}, enter={any}, timeout_ms={d}, label={?s})\n", .{ line_count, splitHeight(line_count, label), enter, timeout_ms, label });
+        self.log.write("rpc send: createMessageSplit (lines={d}, height={d}, enter={any}, timeout_ms={d})\n", .{ line_count, splitHeight(line_count), enter, timeout_ms });
     }
 
     /// Buffer size `buildSplitLua` is written against. Exposed so a test can
@@ -4932,44 +4931,9 @@ pub const Core = struct {
     /// autocmds were added, and the headroom test demands ≥2x slack.
     pub const split_lua_buf_len = 16384;
 
-    /// Escape `src` for inclusion inside a Lua double-quoted string literal:
-    /// backslash, double quote, newline, and carriage return. Everything else
-    /// passes through byte-for-byte — every other value, including NUL and
-    /// arbitrary UTF-8, is legal inside such a literal.
-    ///
-    /// A label too long for `dst` is truncated at the last escape boundary
-    /// rather than reported as an error: the label is decoration, and failing
-    /// the whole call would make the split silently stop appearing (callers
-    /// only log the error) over a cosmetic overflow. Truncation never splits
-    /// an escape sequence, so the result always parses.
-    fn escapeLuaString(dst: []u8, src: []const u8) []const u8 {
-        var len: usize = 0;
-        for (src) |byte| {
-            const escaped: ?[]const u8 = switch (byte) {
-                '\\' => "\\\\",
-                '"' => "\\\"",
-                '\n' => "\\n",
-                '\r' => "\\r",
-                else => null,
-            };
-            if (escaped) |e| {
-                if (len + e.len > dst.len) break;
-                @memcpy(dst[len..][0..e.len], e);
-                len += e.len;
-            } else {
-                if (len + 1 > dst.len) break;
-                dst[len] = byte;
-                len += 1;
-            }
-        }
-        return dst[0..len];
-    }
-
-    /// Window height for the split: at least one line, at most 20, plus the
-    /// label line and its separator when a label is present.
-    pub fn splitHeight(line_count: u32, label: ?[]const u8) u32 {
-        const extra_lines: u32 = if (label != null) 2 else 0;
-        return @max(1, @min(line_count + extra_lines, 20));
+    /// Window height for the split: at least one line, at most 20.
+    pub fn splitHeight(line_count: u32) u32 {
+        return @max(1, @min(line_count, 20));
     }
 
     /// Render the split-view Lua into `buf`. Pure: no Core, no I/O, so the
@@ -4991,28 +4955,22 @@ pub const Core = struct {
     ///   * `:close` and `:tabclose` do not fire QuitPre at all, so they can
     ///     still leave the split as the last window. Not a lock: `:q` there
     ///     takes the `cur == state.win` branch and Neovim exits normally.
+    /// Nothing user-controlled is interpolated into the program below: only
+    /// integers and two literal booleans. The message text travels as a
+    /// msgpack argument, never as source. Keep it that way — a formatted
+    /// string here would need Lua-literal escaping to stay injection-safe.
     pub fn buildSplitLua(
         buf: []u8,
         line_count: u32,
         enter: bool,
         timeout_ms: u32,
-        label: ?[]const u8,
     ) ![]const u8 {
-        const height = splitHeight(line_count, label);
+        const height = splitHeight(line_count);
         const enter_str = if (enter) "true" else "false";
-        // `label` is formatted into a Lua double-quoted literal below; escape
-        // it so a quote, backslash, or newline cannot break out of the string
-        // and execute injected Lua inside Neovim. `content` is immune by
-        // design — it travels as a msgpack argument, never as source text.
-        var label_buf: [256]u8 = undefined;
-        const label_str = if (label) |l| escapeLuaString(&label_buf, l) else "";
-        const has_label_str = if (label != null) "true" else "false";
         return std.fmt.bufPrint(buf,
             \\local content = ...
             \\local height = {d}
             \\local enter = {s}
-            \\local label = "{s}"
-            \\local has_label = {s}
             \\local timeout = {d}
             \\local uv = vim.uv or vim.loop
             \\local function show()
@@ -5072,10 +5030,6 @@ pub const Core = struct {
             \\    state.win = nil
             \\  end
             \\  local lines = vim.split((content:gsub('\r', '')), '\n')
-            \\  if has_label and label ~= "" then
-            \\    table.insert(lines, 1, string.rep("-", 40))
-            \\    table.insert(lines, 1, label)
-            \\  end
             \\  -- Always re-render: content is independent of mount state.
             \\  vim.bo[state.buf].modifiable = true
             \\  pcall(vim.api.nvim_buf_set_lines, state.buf, 0, -1, false, lines)
@@ -5187,7 +5141,7 @@ pub const Core = struct {
             \\  end
             \\end
             \\vim.schedule(show)
-        , .{ height, enter_str, label_str, has_label_str, timeout_ms });
+        , .{ height, enter_str, timeout_ms });
     }
 
     /// Execute Lua code in Neovim via nvim_exec_lua with a string argument.
