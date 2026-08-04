@@ -82,6 +82,23 @@ pub fn isReturnPrompt(kind: []const u8) bool {
     return std.mem.eql(u8, kind, "return_prompt");
 }
 
+/// Kinds where Neovim is blocked waiting for the user's answer. Routing one
+/// of these to a non-interactive view — or skipping it, or letting it
+/// auto-hide — turns a prompt into an unanswerable hang, so `Router.route`
+/// pins them to the confirm view with no timeout and consults no route at
+/// all. There is no escape hatch, not even a route targeting `.confirm`
+/// itself: a timeout hangs the editor the same way.
+///
+/// In practice only `number_prompt` gets here: `confirm` and `confirm_sub`
+/// are diverted into the singleton confirm message by `Grid.setMsgShow`
+/// before routing. They are listed anyway so the guarantee does not depend
+/// on that upstream detail staying true.
+pub fn isInteractivePrompt(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "confirm") or
+        std.mem.eql(u8, kind, "confirm_sub") or
+        std.mem.eql(u8, kind, "number_prompt");
+}
+
 /// A route predicate. All present fields must match (logical AND); absent
 /// fields match anything.
 pub const MsgFilter = struct {
@@ -161,19 +178,15 @@ pub fn viewDefaultTimeout(view: MsgViewType) f32 {
 }
 
 /// Number of built-in default routes.
-pub const default_route_count = 9;
+pub const default_route_count = 8;
 
 /// Build the default route tail. Depends on `views`, so it is a function
 /// rather than a constant; the result lives on the caller's stack.
+///
+/// Interactive prompts have no entry here: `Router.route` pins them before
+/// any route is consulted, so a default for them would be unreachable.
 pub fn defaultRoutes(views: ViewSettings) [default_route_count]MsgRoute {
     return .{
-        // Interactive prompts. Kept ahead of everything else because routing
-        // them anywhere but `confirm` loses the ability to answer them.
-        .{
-            .filter = .{ .event = .msg_show, .kinds = &.{ "confirm", "confirm_sub", "number_prompt" } },
-            .view = .confirm,
-            .opts = .{ .timeout = 0 },
-        },
         .{ .filter = .{ .event = .msg_history_show }, .view = views.view_history, .opts = .{ .timeout = 0 } },
         .{
             .filter = .{ .event = .msg_show, .kinds = &.{"search_count"} },
@@ -200,6 +213,14 @@ pub const Router = struct {
     views: ViewSettings = .{},
 
     pub fn route(self: Router, event: MsgEvent, kind: []const u8, line_count: u32) RouteResult {
+        // Interactive prompts are pinned before any route is consulted. A
+        // broad user route (a catch-all `view = "split"`, a blanket
+        // `skip = true`, or a confirm route carrying a timeout) would
+        // otherwise leave Neovim blocked on a question the user cannot see,
+        // cannot answer, or that vanishes while it still blocks.
+        if (event == .msg_show and isInteractivePrompt(kind)) {
+            return .{ .view = .confirm, .timeout = 0, .skip = false };
+        }
         for (self.user_routes) |r| {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
         }

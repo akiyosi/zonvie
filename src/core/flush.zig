@@ -3609,13 +3609,20 @@ pub const FlushCtx = struct {
             const history_hide_due = if (ctx.core.msg_history_auto_hide_at) |hide_at| now >= hide_at else false;
             const atlas_retry_due = if (ctx.core.atlas_negative_retry_at) |retry_at| now >= retry_at else false;
             const transient_retry_due = if (ctx.core.transient_glyph_retry_at) |retry_at| now >= retry_at else false;
-            if (throttle_due or show_hide_due or history_hide_due or atlas_retry_due or transient_retry_due) {
+            // Included since a history dispatch failure now always arms this,
+            // making an elapsed deadline common: left out, it alone keeps
+            // nextMsgTimeoutNs at zero and the frontend spins a 0ms timer.
+            const history_retry_due = if (ctx.core.msg_history_retry_at) |retry_at| now >= retry_at else false;
+            if (throttle_due or show_hide_due or history_hide_due or atlas_retry_due or
+                transient_retry_due or history_retry_due)
+            {
                 const retry_at = scheduleMsgRetryDeadline(ctx.core, now);
                 if (throttle_due) ctx.core.msg_show_retry_at = retry_at;
                 if (show_hide_due) ctx.core.msg_show_auto_hide_at = retry_at;
                 if (history_hide_due) ctx.core.msg_history_auto_hide_at = retry_at;
                 if (atlas_retry_due) ctx.core.atlas_negative_retry_at = retry_at;
                 if (transient_retry_due) ctx.core.transient_glyph_retry_at = retry_at;
+                if (history_retry_due) ctx.core.msg_history_retry_at = retry_at;
             }
             return;
         }
@@ -8472,6 +8479,14 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
         if (sendMsgShow(self)) {
             self.grid.message_state.pending_count = 0;
             self.grid.message_state.msg_dirty = false;
+            // This batch has been displayed, so its "a msg_clear arrived"
+            // marker is spent. Its only other consumer sits inside
+            // notifyMessageChanges' `if (msg_dirty)` block, which the line
+            // above just made unreachable — leaving the flag set to fire a
+            // spurious on_msg_clear on some later, unrelated batch. That
+            // path has no confirm_msg.active guard, so the stale clear can
+            // tear down a prompt window Neovim is still waiting on.
+            self.grid.message_state.msg_cleared_in_batch = false;
             self.msg_show_pending_since = null;
             self.msg_show_retry_at = null;
             self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
@@ -8666,13 +8681,36 @@ pub fn notifyMessageChanges(self: *Core) void {
                     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
                 }
             } else {
-                // Other messages (including list_cmd): display immediately
-                if (sendMsgShow(self)) {
+                // Other messages (including list_cmd): display immediately,
+                // unless a previous failure asked us to wait. A deadline is
+                // only meaningful if something honours it: this branch used
+                // to write the backoff and re-attempt on the very next flush
+                // regardless, so a permanently-failing dispatch retried at
+                // the flush rate while the delay it inflated was read by
+                // nobody.
+                const now = clock.nowNs();
+                const retry_due = if (self.msg_show_retry_at) |at| now >= at else true;
+                if (!retry_due) {
+                    msg_retry_needed = true;
+                } else if (sendMsgShow(self)) {
                     self.msg_show_pending_since = null;
                     self.msg_show_retry_at = null;
                     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
                 } else {
+                    // Keeping msg_dirty set is not enough on its own: without
+                    // a deadline, nextMsgTimeoutNs returns null and the
+                    // frontend arms no timer, so the retry this failure asks
+                    // for only happens if some unrelated event triggers
+                    // another flush — and a prompt-blocked Neovim emits no
+                    // further redraw at all. Both fields are needed: every
+                    // reader of msg_show_retry_at is gated on
+                    // msg_show_pending_since, so the deadline alone arms
+                    // nothing.
                     msg_retry_needed = true;
+                    if (self.msg_show_pending_since == null) {
+                        self.msg_show_pending_since = now;
+                    }
+                    self.msg_show_retry_at = scheduleMsgRetryDeadline(self, now);
                 }
             }
         }
@@ -8703,16 +8741,86 @@ pub fn notifyMessageChanges(self: *Core) void {
                 self.grid.clearMsgHistoryDirty();
                 self.msg_history_retry_at = null;
                 self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
-            } else if (!self.flush_aborted) {
+            } else {
+                // Scheduled even when the failure aborted the flush: that is
+                // exactly the case with no other retry driver, and skipping
+                // it left history_dirty set with nothing to act on it.
                 self.msg_history_retry_at = scheduleMsgHistoryRetryDeadline(self, now);
             }
         }
     }
 }
 
+const PromptPass = struct {
+    /// Prompts removed from the array, whether answered or given up on.
+    consumed: usize,
+    /// The caller must abort the flush and try again.
+    retry: bool,
+};
+
+/// Answer pending press-enter prompts with `<CR>` and remove them — BEFORE
+/// any dispatch step that can fail, so a retried flush cannot answer one
+/// twice. (noice answers at the event layer too: ui/init.lua:122-126.)
+///
+/// A prompt leaves the array only once its `<CR>` is resolved, and the two
+/// send-failure classes resolve differently:
+///   * `OutOfMemory` — the allocator, or a full write queue. Transient: keep
+///     the prompt, stop answering the rest of the batch, and let the caller
+///     retry. Rendering stalls until it clears, which is bounded.
+///   * anything else — `BrokenPipe`, i.e. the writer is gone. Permanent: no
+///     retry can ever deliver the `<CR>`, and aborting every flush over it
+///     would freeze the render pipeline on its last frame forever.
+///
+/// Defensive in practice: probing nine command surfaces under Neovim 0.12
+/// with `ext_messages` attached produced no return_prompt at all, so this
+/// path is currently unreachable. Kept because the guarantee should not
+/// depend on that observation holding.
+fn answerReturnPrompts(self: *Core) PromptPass {
+    const messages = &self.grid.message_state.messages;
+    var consumed: usize = 0;
+    var write_idx: usize = 0;
+    var retry = false;
+    for (0..messages.items.len) |read_idx| {
+        const m = &messages.items[read_idx];
+        if (!retry and config.isReturnPrompt(m.kind)) {
+            if (self.requestInput("<CR>")) |_| {
+                self.log.write("[msg] return_prompt: answered with <CR>\n", .{});
+                consumed += 1;
+                m.deinit(self.alloc);
+                continue;
+            } else |err| {
+                if (err == error.OutOfMemory) {
+                    self.log.write("[msg] return_prompt: send queue full or out of memory; keeping for retry\n", .{});
+                    retry = true;
+                } else {
+                    self.log.write("[msg] return_prompt: transport is gone ({s}); dropping unanswered\n", .{@errorName(err)});
+                    consumed += 1;
+                    m.deinit(self.alloc);
+                    continue;
+                }
+            }
+        }
+        if (write_idx != read_idx) messages.items[write_idx] = messages.items[read_idx];
+        write_idx += 1;
+    }
+    messages.items.len = write_idx;
+    return .{ .consumed = consumed, .retry = retry };
+}
+
 /// Send msg_show as external grid (like popupmenu pattern).
 /// Confirm dialogs are sent via callback (special case for cmdline mode).
 pub fn sendMsgShow(self: *Core) bool {
+    // Prompts first: answered and gone before anything below can abort the
+    // flush, so a retry cannot answer them twice. A side effect worth naming:
+    // prompt text no longer inflates total_line_count, so height-filtered
+    // routes see only real content.
+    const prompt_pass = answerReturnPrompts(self);
+    if (prompt_pass.retry) {
+        self.flush_aborted = true;
+        return false;
+    }
+    const consumed_prompts = prompt_pass.consumed;
+
     const messages = self.grid.message_state.messages.items;
 
     // Route once. Every later consumer reads this assignment instead of
@@ -8728,6 +8836,13 @@ pub fn sendMsgShow(self: *Core) bool {
     };
 
     if (messages.len == 0) {
+        if (consumed_prompts > 0) {
+            // The batch held only prompts: nothing to display and nothing
+            // newly cleared, so no on_msg_clear — but the empty dispatch
+            // still hides a visible core-owned view. This preserves the
+            // pre-removal behavior for prompt-only batches.
+            return dispatchChannel(self, .show, .{ .show = messages });
+        }
         // Full state reset (scroll, cache, grid -102) then explicit on_msg_clear
         hideChannelView(self, .show, .ext_float);
         self.log.write("[msg] sendMsgShow: hide (empty)\n", .{});
@@ -8749,17 +8864,8 @@ pub fn sendMsgShow(self: *Core) bool {
     }
 
     for (messages, 0..) |msg, i| {
-        // `return_prompt` is answered, never displayed (noice ui/msg.lua:86,
-        // 149-151). Handling it here instead of per-route is what keeps the
-        // CR from being sent twice: once from the route and once from the
-        // split's own prompt clearing. It stays assigned to `none` so it is
-        // dropped rather than rendered by whatever the catch-all route says.
-        if (config.isReturnPrompt(msg.kind)) {
-            self.log.write("[msg] return_prompt: answering with <CR>\n", .{});
-            self.requestInput("<CR>") catch {};
-            continue;
-        }
-
+        // return_prompt never reaches this loop — answerReturnPrompts removed
+        // it above — so every remaining message routes normally.
         const route_result = self.msg_config.routeMessage(.msg_show, msg.kind, total_line_count);
         views.assign(i, route_result.view, route_result.timeout);
 
@@ -8882,39 +8988,69 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
         },
         // Neovim-rendered view: content is sent back over RPC as Lua.
         .split => {
-            // Clear any pending prompt windows on frontend
-            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
-
             // The buffer is a persistent Core field reused across calls, so a
             // large `:history` dump costs at most one growth rather than the
             // silent truncation a fixed stack buffer used to impose. noice
             // never truncates message content either (view/init.lua:212-223);
             // the window is bounded, not the content.
+            //
+            // Nothing here touches the frontend until the content is safely
+            // handed to Neovim: both the assembly and the RPC send run before
+            // on_msg_clear, so any failure aborts the flush for retry exactly
+            // like the ext_float arm above — messages kept, frontend untouched
+            // — instead of showing content with a hole in it (the old
+            // `catch break`) or clearing the UI with nothing to replace it.
             const buf = &self.msg_split_buf;
             buf.clearRetainingCapacity();
             var line_count: u32 = 0;
-            switch (content) {
-                .show => |messages| for (messages, 0..) |m, i| {
+            const ok = switch (content) {
+                .show => blk: for (content.show, 0..) |m, i| {
                     if (views.assignedTo(i) != .split) continue;
                     for (m.content.items) |chunk| {
-                        buf.appendSlice(self.alloc, chunk.text) catch break;
+                        buf.appendSlice(self.alloc, chunk.text) catch break :blk false;
                         for (chunk.text) |ch_byte| {
                             if (ch_byte == '\n') line_count += 1;
                         }
                     }
-                    // Add newline between messages
-                    buf.append(self.alloc, '\n') catch break;
+                    buf.append(self.alloc, '\n') catch break :blk false;
                     line_count += 1;
-                },
-                .history => |entries| for (entries) |entry| {
+                } else true,
+                .history => blk: for (content.history) |entry| {
                     for (entry.content.items) |chunk| {
-                        buf.appendSlice(self.alloc, chunk.text) catch break;
+                        buf.appendSlice(self.alloc, chunk.text) catch break :blk false;
                     }
-                    // Add newline between entries
-                    buf.append(self.alloc, '\n') catch break;
+                    buf.append(self.alloc, '\n') catch break :blk false;
                     line_count += 1;
-                },
+                } else true,
+            };
+            if (!ok) {
+                self.log.write("[msg] split content assembly ran out of memory; retrying\n", .{});
+                self.flush_aborted = true;
+                return false;
             }
+
+            // A payload the write queue can never accept is not a transient
+            // failure: retrying re-assembles megabytes on every flush forever
+            // and the send fails identically each time. Give up loudly and
+            // let the messages be dropped, as they were before the dispatch
+            // learned to retry. 1000 messages of up to 64 KiB each make this
+            // reachable, not theoretical.
+            // What the queue rejects is the ENCODED request, not this buffer:
+            // the Lua program and the msgpack framing ride along, so comparing
+            // the raw content against the cap leaves a window just under it
+            // that still fails every time.
+            const split_payload_budget = Core.MAX_WRITE_QUEUE_SIZE - Core.split_lua_buf_len;
+            if (buf.items.len > split_payload_budget) {
+                self.log.write("[msg] split content is {d} bytes, past the {d} the RPC write queue can carry; dropping\n", .{ buf.items.len, split_payload_budget });
+                // The content is unrecoverable, but the frontend must not be
+                // left drawing a window whose content this batch replaced:
+                // every other exit from this arm either clears or aborts, and
+                // silently keeping stale text on screen is worse than an
+                // empty message area.
+                if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+                return true;
+            }
+
             // enter differs per channel: routed messages must not steal the
             // cursor (noice's `split` view is `enter = false`,
             // config/views.lua:75), while `:messages` is content the user
@@ -8926,9 +9062,18 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 messageTimeoutMs(state.timeout),
                 null,
             ) catch |e| {
+                // Both channels fail the dispatch. Swallowing this for .show
+                // returned success, so markShown ran and dropTransientMessages
+                // then freed messages that were never handed to Neovim — the
+                // same data loss the assembly transaction above prevents.
                 self.log.write("[msg] createMessageSplit failed: {any}\n", .{e});
-                if (ch == .history) return false;
+                return false;
             };
+
+            // Only now that the content is on its way to Neovim: clearing the
+            // frontend's pending prompt windows any earlier would empty the
+            // message UI with nothing to replace it if the steps above failed.
+            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
         },
     }
     return true;
@@ -9253,7 +9398,14 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
 /// Process pending scroll update (called from flush or timer).
 pub fn processPendingMsgScroll(self: *Core) void {
     if (!self.msg_scroll_pending) return;
-    if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) return;
+    if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) {
+        // There is nothing left to scroll: the view was hidden while the
+        // retry was outstanding. Returning without clearing left the flag
+        // set forever, and the frontends read it as "retry needed" and
+        // re-armed a 50ms timer on every tick, each one taking grid_mu.
+        self.msg_scroll_pending = false;
+        return;
+    }
 
     self.log.write("[msg] processPendingMsgScroll: offset {d}\n", .{self.msg_scroll_offset});
     if (runMsgGridScrollFlush(self, self.msg_scroll_offset)) {
@@ -9800,6 +9952,14 @@ pub fn hideMsgHistory(self: *Core) void {
         if (Core.isHardRenderFailure(err)) self.failHardRender(err);
         return;
     };
+    // Drop any pending retry, mirroring hideMsgShow. nextMsgTimeoutNs reads
+    // msg_history_retry_at unconditionally, but only the history_dirty block
+    // clears it — so an auto-hide that lands between a failed dispatch and
+    // its retry clears the dirty flag and strands the deadline in the past,
+    // and the frontend then re-arms a 0ms timer forever, each tick driving a
+    // full flush under grid_mu.
+    self.msg_history_retry_at = null;
+    self.msg_history_retry_delay_ns = 16 * std.time.ns_per_ms;
     self.log.write("[msg_history] hide\n", .{});
 }
 
@@ -10557,13 +10717,21 @@ test "message history allocation failure preserves dirty state for retry" {
     try std.testing.expect(core.grid.msg_history_state.dirty);
     try std.testing.expect(core.flush_aborted);
 
+    // An aborted dispatch must arm a retry deadline: it is the only driver
+    // left, since the abort discards the frame. Scrubbing this by hand — as
+    // this test used to — hides whether the deadline was armed at all.
+    try std.testing.expect(core.msg_history_retry_at != null);
+
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
     core.flush_aborted = false;
-    core.msg_history_retry_at = null;
+    // Reach the deadline rather than deleting it, so the retry exercises the
+    // real due-check.
+    core.msg_history_retry_at = clock.nowNs() - 1;
     notifyMessageChanges(&core);
     try std.testing.expect(!core.grid.msg_history_state.dirty);
     try std.testing.expect(core.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID));
+    try std.testing.expect(core.msg_history_retry_at == null);
 }
 
 test "vertex budget does not preflight-reject a normal blank grid" {
@@ -13307,20 +13475,45 @@ test "a height-filtered ext_float route reaches the line cache" {
     try std.testing.expect(core.msg_total_lines > 0);
 }
 
-test "return_prompt is never rendered and never retained" {
-    // Regression: once the return_prompt hardcode was removed, the consumers
-    // that re-routed sent it to the catch-all view, so its text was rendered
-    // into the message grid and it was kept as a non-transient message.
+test "a dead transport drops the prompt instead of freezing the pipeline" {
+    // Test cores have no writer thread, so requestInput always fails with
+    // BrokenPipe — a PERMANENT failure. Retrying cannot deliver the `<CR>`
+    // to a transport that is gone, and aborting the flush over it would
+    // abort every later flush too, freezing the whole render pipeline on its
+    // last frame (onFlush returns before all vertex work when flush_aborted
+    // is set). So the prompt is dropped and the cycle completes normally.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     core.ext_messages_enabled = true;
 
     try appendTestMessage(&core, 1, "return_prompt", "Press ENTER");
 
-    _ = sendMsgShow(&core);
-
-    try std.testing.expectEqual(config.MsgViewType.none, core.msg_views.assignedTo(0));
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(!core.flush_aborted);
     try std.testing.expectEqual(@as(usize, 0), core.grid.message_state.messages.items.len);
+    // Dropped, not rendered: prompt text never reaches a view.
+    try std.testing.expectEqual(@as(usize, 0), core.msg_line_cache.items.len);
+}
+
+test "an out-of-memory answer keeps the prompt for retry" {
+    // The other half of the split: OutOfMemory is transient, so the prompt
+    // must survive to be answered by a later attempt rather than being
+    // silently dropped while Neovim still blocks on hit-enter. It must also
+    // not be rendered on the way through.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "content");
+    try appendTestMessage(&core, 2, "return_prompt", "Press ENTER");
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expect(!sendMsgShow(&core));
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.message_state.messages.items.len);
+    try std.testing.expect(config.isReturnPrompt(core.grid.message_state.messages.items[1].kind));
     try std.testing.expectEqual(@as(usize, 0), core.msg_line_cache.items.len);
 }
 
@@ -13415,6 +13608,379 @@ test "scrolling the message float pauses its auto-hide" {
     try std.testing.expect(core.msg_show_auto_hide_at == null);
     try std.testing.expect(core.msg_views.state(.ext_float).visible);
     try std.testing.expect(core.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID));
+}
+
+test "hiding the history grid drops its retry deadline" {
+    // nextMsgTimeoutNs reads msg_history_retry_at unconditionally, but only
+    // the history_dirty block clears it. An auto-hide landing between a
+    // failed dispatch and its retry clears the dirty flag, so without this
+    // the deadline stays stranded in the past and the frontend re-arms a 0ms
+    // timer forever, each tick driving a full flush under grid_mu.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    core.msg_history_retry_at = clock.nowNs() - std.time.ns_per_s;
+    core.msg_history_retry_delay_ns = 512 * std.time.ns_per_ms;
+    try std.testing.expect(nextMsgTimeoutNs(&core) != null);
+
+    hideMsgHistory(&core);
+
+    try std.testing.expect(core.msg_history_retry_at == null);
+    try std.testing.expectEqual(@as(i128, 16 * std.time.ns_per_ms), core.msg_history_retry_delay_ns);
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+}
+
+test "a failed message dispatch arms a retry the frontend can see" {
+    // The whole abort-and-retry design rests on the frontend arming a timer
+    // from nextMsgTimeoutNs. Setting msg_show_retry_at alone did not do that:
+    // every reader of it is gated on msg_show_pending_since, so the deadline
+    // was written and never read, and a prompt-blocked Neovim emits no
+    // further redraw to drive a retry any other way.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "content");
+    core.grid.message_state.msg_dirty = true;
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+
+    // Fail the dispatch: beginCycle's allocation is the first thing to go.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    notifyMessageChanges(&core);
+
+    try std.testing.expect(core.grid.message_state.msg_dirty);
+    try std.testing.expect(nextMsgTimeoutNs(&core) != null);
+}
+
+// The message subsystem's deadline bookkeeping produced three separate
+// defects of one shape: a field armed on one path and cleared only on
+// another, so a state nobody enumerated left the frontend re-arming a timer
+// forever. These pin the paths that produced them. They were first written
+// against a scratch copy with the fixes reverted, where each one fails.
+
+test "an auto-hide that clears history dirty also drops its retry deadline" {
+    // The real route into the stranded state: a history dispatch failed
+    // (deadline armed, dirty kept), then the auto-hide fired first and
+    // cleared dirty — making the only other clear site unreachable. This
+    // goes through checkMsgAutoHideTimeout rather than calling the hide
+    // directly, so it covers the ordering inside hideChannelView too.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    core.msg_history_retry_at = clock.nowNs() - std.time.ns_per_s;
+    core.msg_history_retry_delay_ns = 512 * std.time.ns_per_ms;
+    core.grid.msg_history_state.dirty = true;
+    core.msg_history_auto_hide_at = clock.nowNs() - std.time.ns_per_ms;
+
+    checkMsgAutoHideTimeout(&core);
+
+    try std.testing.expect(!core.grid.msg_history_state.dirty);
+    try std.testing.expect(core.msg_history_retry_at == null);
+    try std.testing.expectEqual(@as(i128, 16 * std.time.ns_per_ms), core.msg_history_retry_delay_ns);
+    try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+}
+
+test "no tick path can re-produce an elapsed history deadline" {
+    // The consequence the previous test guards against is a frontend timer
+    // armed at zero forever, so assert the property the frontend actually
+    // reads, repeatedly, across every entry point a tick drives.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    core.msg_history_retry_at = clock.nowNs() - std.time.ns_per_s;
+    core.grid.msg_history_state.dirty = true;
+    core.msg_history_auto_hide_at = clock.nowNs() - std.time.ns_per_ms;
+    checkMsgAutoHideTimeout(&core);
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        notifyMessageChanges(&core);
+        checkMsgShowThrottleTimeout(&core);
+        checkMsgAutoHideTimeout(&core);
+        try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+    }
+}
+
+test "a session reset drops the history retry deadline" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    core.msg_history_retry_at = clock.nowNs() - std.time.ns_per_s;
+    core.grid.msg_history_state.dirty = true;
+
+    core.resetRedrawProtocolState();
+
+    try std.testing.expect(!core.grid.msg_history_state.dirty);
+    try std.testing.expect(core.msg_history_retry_at == null);
+}
+
+/// Drives a flush that the frontend rejects at the bracket, which is the only
+/// way to reach onFlush's abort-path deadline coalescer.
+const AbortProbe = struct {
+    var target: ?*Core = null;
+    fn onBegin(_: ?*anyopaque) callconv(.c) void {
+        if (target) |c| c.flush_aborted = true;
+    }
+};
+
+test "an aborted flush pushes a due history deadline into the future" {
+    // Without history in the coalescer, an abort left msg_history_retry_at
+    // elapsed and nextMsgTimeoutNs reported zero, so the frontend re-armed a
+    // 0ms timer and drove a full flush per tick under grid_mu.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    AbortProbe.target = &core;
+    defer AbortProbe.target = null;
+    core.cb.on_flush_begin = AbortProbe.onBegin;
+
+    core.msg_history_retry_at = clock.nowNs() - std.time.ns_per_s;
+    core.grid.msg_history_state.dirty = true;
+
+    var ctx = FlushCtx{ .core = &core };
+    try ctx.onFlush(1, 1);
+
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.msg_history_retry_at.? > clock.nowNs());
+    try std.testing.expect(nextMsgTimeoutNs(&core).? > clock.nowNs());
+}
+
+test "the abort coalescer moves only the deadlines that were due" {
+    // It folds several unrelated deadlines onto one value; adding history to
+    // that set must not disturb the others, and must not touch a deadline
+    // that has not elapsed.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    AbortProbe.target = &core;
+    defer AbortProbe.target = null;
+    core.cb.on_flush_begin = AbortProbe.onBegin;
+
+    const now = clock.nowNs();
+    const future = now + 10 * std.time.ns_per_s;
+    core.msg_history_retry_at = now - 1;
+    core.atlas_negative_retry_at = now - 1;
+    core.msg_history_auto_hide_at = now - 1;
+    core.msg_show_auto_hide_at = future;
+    core.transient_glyph_retry_at = future;
+
+    var ctx = FlushCtx{ .core = &core };
+    try ctx.onFlush(1, 1);
+
+    const at = core.msg_history_retry_at.?;
+    try std.testing.expectEqual(at, core.atlas_negative_retry_at.?);
+    try std.testing.expectEqual(at, core.msg_history_auto_hide_at.?);
+    try std.testing.expect(at > clock.nowNs());
+    try std.testing.expectEqual(future, core.msg_show_auto_hide_at.?);
+    try std.testing.expectEqual(future, core.transient_glyph_retry_at.?);
+}
+
+test "a message arriving during a retry backoff is delayed, not lost" {
+    // The gate that suppresses re-attempts must not swallow work: the
+    // message has to survive the wait and be displayed once the deadline
+    // passes, with the retry state cleared behind it.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    // .split with no writer thread: the dispatch always fails, which is how
+    // the backoff gets armed without an allocator fault.
+    var split_routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .split },
+    };
+    core.msg_config.messages.routes = &split_routes;
+    try appendTestMessage(&core, 1, "echo", "first");
+    notifyMessageChanges(&core);
+    try std.testing.expect(core.msg_show_retry_at != null);
+
+    try appendTestMessage(&core, 2, "echo", "second");
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.message_state.messages.items.len);
+    try std.testing.expect(core.grid.message_state.msg_dirty);
+    try std.testing.expect(nextMsgTimeoutNs(&core) != null);
+
+    // Deadline reached, and a view that can actually succeed.
+    var shown: usize = 0;
+    const ShowProbe = struct {
+        var count: *usize = undefined;
+        fn onShow(
+            _: ?*anyopaque,
+            _: c_api.zonvie_msg_view_type,
+            _: [*]const u8,
+            _: usize,
+            _: [*]const c_api.MsgChunk,
+            _: usize,
+            _: c_int,
+            _: c_int,
+            _: c_int,
+            _: i64,
+            _: u32,
+        ) callconv(.c) void {
+            count.* += 1;
+        }
+    };
+    ShowProbe.count = &shown;
+    core.cb.on_msg_show = ShowProbe.onShow;
+    var mini_routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .mini },
+    };
+    core.msg_config.messages.routes = &mini_routes;
+    core.msg_show_retry_at = clock.nowNs() - 1;
+
+    notifyMessageChanges(&core);
+    try std.testing.expect(shown > 0);
+    try std.testing.expect(!core.grid.message_state.msg_dirty);
+    try std.testing.expect(core.msg_show_retry_at == null);
+    try std.testing.expectEqual(@as(i128, 16 * std.time.ns_per_ms), core.msg_show_retry_delay_ns);
+}
+
+test "the split payload budget drops only what the write queue cannot carry" {
+    // The give-up branch is the one place in the split arm that neither sends
+    // nor aborts: it frees the messages and returns success. An error in
+    // either direction is silent — too low and legitimate `:messages` output
+    // vanishes, too high and the payload fails on every retry forever. Both
+    // sides of the boundary are pinned here.
+    //
+    // Test cores have no writer thread, so a payload that clears the budget
+    // reaches `createMessageSplit` and fails there with BrokenPipe. That is
+    // the discriminator: over budget returns true (dropped without sending),
+    // under budget returns false (a send was attempted).
+    const budget = Core.MAX_WRITE_QUEUE_SIZE - Core.split_lua_buf_len;
+
+    var clear_calls: usize = 0;
+    const Probe = struct {
+        var calls: *usize = undefined;
+        fn onClear(_: ?*anyopaque) callconv(.c) void {
+            calls.* += 1;
+        }
+    };
+    Probe.calls = &clear_calls;
+
+    // Over budget: dropped, no send, and the frontend is left alone.
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        core.cb.on_msg_clear = Probe.onClear;
+
+        const filler = try std.testing.allocator.alloc(u8, budget + 1);
+        defer std.testing.allocator.free(filler);
+        @memset(filler, 'x');
+        try appendTestMessage(&core, 1, "echo", filler);
+        const messages = core.grid.message_state.messages.items;
+        try core.msg_views.beginCycle(core.alloc, messages.len);
+        core.msg_views.assign(0, .split, 0);
+
+        try std.testing.expect(showChannelView(&core, .show, .split, .{ .show = messages }));
+        try std.testing.expect(!core.flush_aborted);
+        // The content is gone, so the frontend must not keep drawing what
+        // this batch was meant to replace.
+        try std.testing.expectEqual(@as(usize, 1), clear_calls);
+    }
+
+    // One byte under: the send is attempted. It fails only because the test
+    // core has no transport, which is what makes the attempt observable.
+    clear_calls = 0;
+    {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        core.cb.on_msg_clear = Probe.onClear;
+
+        // The assembled buffer gains one newline per message.
+        const filler = try std.testing.allocator.alloc(u8, budget - 1);
+        defer std.testing.allocator.free(filler);
+        @memset(filler, 'x');
+        try appendTestMessage(&core, 1, "echo", filler);
+        const messages = core.grid.message_state.messages.items;
+        try core.msg_views.beginCycle(core.alloc, messages.len);
+        core.msg_views.assign(0, .split, 0);
+
+        try std.testing.expect(!showChannelView(&core, .show, .split, .{ .show = messages }));
+        try std.testing.expectEqual(@as(usize, 0), clear_calls);
+    }
+}
+
+test "a pending retry deadline suppresses the next immediate attempt" {
+    // The deadline is only worth arming if something honours it: without the
+    // gate a permanently-failing dispatch re-attempts on every flush while
+    // doubling a delay nobody reads. The backoff itself is the observable —
+    // an attempt that fails doubles it, a suppressed attempt leaves it alone.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "content");
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    notifyMessageChanges(&core);
+    try std.testing.expect(core.grid.message_state.msg_dirty);
+    const armed = core.msg_show_retry_at orelse return error.RetryDeadlineNotArmed;
+    const delay_after_failure = core.msg_show_retry_delay_ns;
+    try std.testing.expect(delay_after_failure > 16 * std.time.ns_per_ms);
+
+    // Healthy allocator, deadline still in the future: no attempt is made,
+    // so the backoff does not move and the deadline is not consumed.
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    core.flush_aborted = false;
+    notifyMessageChanges(&core);
+    try std.testing.expect(core.grid.message_state.msg_dirty);
+    try std.testing.expectEqual(delay_after_failure, core.msg_show_retry_delay_ns);
+    try std.testing.expectEqual(@as(?i128, armed), core.msg_show_retry_at);
+
+    // Once due, the attempt runs and succeeds, clearing the retry state.
+    core.msg_show_retry_at = clock.nowNs() - 1;
+    notifyMessageChanges(&core);
+    try std.testing.expect(!core.grid.message_state.msg_dirty);
+    try std.testing.expect(core.msg_show_retry_at == null);
+    try std.testing.expectEqual(@as(i128, 16 * std.time.ns_per_ms), core.msg_show_retry_delay_ns);
+}
+
+test "an OOM during split assembly retries instead of showing partial content" {
+    // The split arm used to `catch break` per message and show whatever had
+    // landed — content with its middle missing, unrecoverably, because the
+    // originals are dropped after dispatch. It now behaves like the
+    // ext_float arm: abort the flush, keep the messages, retry. Assembly
+    // also runs before on_msg_clear, so a failed attempt leaves the
+    // frontend's message UI untouched rather than cleared with nothing to
+    // replace it.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+
+    var clear_calls: usize = 0;
+    const Probe = struct {
+        var calls: *usize = undefined;
+        fn onClear(_: ?*anyopaque) callconv(.c) void {
+            calls.* += 1;
+        }
+    };
+    Probe.calls = &clear_calls;
+    core.cb.on_msg_clear = Probe.onClear;
+
+    try appendTestMessage(&core, 1, "echo", "one");
+    try appendTestMessage(&core, 2, "echo", "x" ** 4096);
+    const messages = core.grid.message_state.messages.items;
+
+    try core.msg_views.beginCycle(core.alloc, messages.len);
+    core.msg_views.assign(0, .split, 0);
+    core.msg_views.assign(1, .split, 0);
+
+    try core.msg_split_buf.ensureTotalCapacity(core.alloc, 64);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try std.testing.expect(!showChannelView(&core, .show, .split, .{ .show = messages }));
+    try std.testing.expect(core.flush_aborted);
+    // on_msg_clear must not have fired: the frontend's message UI stays as it
+    // was rather than being emptied with nothing to replace it.
+    try std.testing.expectEqual(@as(usize, 0), clear_calls);
 }
 
 test "message timeout conversion rejects invalid values and saturates" {

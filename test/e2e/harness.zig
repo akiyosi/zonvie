@@ -120,6 +120,10 @@ pub const Harness = struct {
     msg_mu: std.Io.Mutex = .init,
     msg_shows: std.ArrayListUnmanaged(MsgShowEvent) = .empty,
     msg_showmodes: std.ArrayListUnmanaged(MsgShowEvent) = .empty,
+    /// on_msg_clear arrivals. This is the only signal a frontend gets that a
+    /// message window it owns (mini, confirm prompt) must come down, so a
+    /// scenario can only prove "the old window went away" by counting it.
+    msg_clears: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
@@ -159,6 +163,7 @@ pub const Harness = struct {
             .on_agent_status = onAgentStatus,
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
+            .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
         };
         h.core = try alloc.create(Core);
         errdefer alloc.destroy(h.core);
@@ -350,7 +355,20 @@ pub const Harness = struct {
         };
     }
 
+    fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        _ = h.msg_clears.fetchAdd(1, .seq_cst);
+    }
+
     // ── ext_messages readback ──────────────────────────────────────────
+
+    /// How many on_msg_clear callbacks have arrived so far. Compared across a
+    /// transition rather than read as an absolute: a rising count is the only
+    /// observable proof that the frontend was told to take its message window
+    /// down.
+    pub fn msgClearCount(h: *Harness) u64 {
+        return h.msg_clears.load(.seq_cst);
+    }
 
     /// True if any recorded on_msg_show matches `pred`.
     pub fn hasMsgShow(h: *Harness, comptime pred: fn (MsgShowEvent) bool) bool {
@@ -423,12 +441,84 @@ pub const Harness = struct {
         return h.core.msg_split_buf.items.len;
     }
 
+    /// Copy of the content the core assembled for the most recent split show.
+    /// Caller owns the slice. Lets a scenario check completeness, order and
+    /// duplication of the assembled text, which visible rows cannot.
+    pub fn splitContentAlloc(h: *Harness, alloc: std.mem.Allocator) ![]u8 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return alloc.dupe(u8, h.core.msg_split_buf.items);
+    }
+
     /// Number of messages the core is still holding. Lets a scenario assert
     /// that handed-off or undisplayed messages do not accumulate.
     pub fn pendingMessageCount(h: *Harness) usize {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.message_state.messages.items.len;
+    }
+
+    /// Put the message pipeline into the state a FAILED dispatch leaves
+    /// behind: a retry deadline `delay_ms` in the future, with the pending
+    /// marker set so `nextMsgTimeoutNs` actually reports it. The failures that
+    /// arm this for real (allocator exhaustion, a full RPC write queue) cannot
+    /// be provoked from a scenario, and the branch under test reads exactly
+    /// these two fields, so injecting them tests the real thing.
+    pub fn armMsgShowBackoff(h: *Harness, delay_ms: i64) void {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const now = zc.clock.nowNs();
+        h.core.msg_show_pending_since = now;
+        h.core.msg_show_retry_at = now + @as(i128, delay_ms) * std.time.ns_per_ms;
+    }
+
+    /// True while a msg_show retry deadline is still armed. After a message has
+    /// been displayed this must be null again; a deadline that survives a
+    /// successful dispatch would delay every later message.
+    pub fn msgShowRetryArmed(h: *Harness) bool {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.msg_show_retry_at != null;
+    }
+
+    /// True when the msg_show (ext_float) auto-hide deadline is armed. A
+    /// route with `timeout = 0` — errors, for instance — must leave it null.
+    pub fn msgAutoHideArmed(h: *Harness) bool {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.msg_show_auto_hide_at != null;
+    }
+
+    /// Drive one frontend timer tick, exactly as
+    /// `zonvie_core_tick_msg_throttle` does for the real frontends
+    /// (c_api.zig:1224). ext_float auto-hide is expired from here, so without
+    /// this a message never disappears while Neovim is idle.
+    pub fn tickMsgThrottle(h: *Harness) void {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        h.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        defer {
+            h.core.redraw_thread_id.store(0, .seq_cst);
+            h.core.grid_mu.unlock(zc.clock.io());
+        }
+        var fctx = zc.flush_mod.FlushCtx{ .core = h.core };
+        zc.flush_mod.FlushCtx.onFlush(&fctx, h.core.grid.rows, h.core.grid.cols) catch {};
+    }
+
+    /// Wait until `pred(h)` holds, ticking the msg timer between polls so
+    /// auto-hide deadlines actually expire while Neovim is idle.
+    pub fn waitTicking(
+        h: *Harness,
+        comptime pred: fn (*Harness) bool,
+        timeout_ms: u64,
+    ) WaitError!void {
+        const t0 = zc.clock.nowNs();
+        while (true) {
+            h.tickMsgThrottle();
+            if (pred(h)) return;
+            if (h.exited.load(.seq_cst)) return WaitError.NvimExited;
+            if (@as(u64, @intCast(zc.clock.nowNs() - t0)) / std.time.ns_per_ms >= timeout_ms) return WaitError.Timeout;
+            std.Io.sleep(zc.clock.io(), .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+        }
     }
 
     // ── Neovim window observation ──────────────────────────────────────

@@ -468,7 +468,7 @@ pub const RedrawRecoveryState = enum {
 };
 
 pub const Core = struct {
-    const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
+    pub const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
     const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
     const MAX_TOTAL_WRITE_QUEUE_SIZE: usize = MAX_WRITE_QUEUE_SIZE + UI_STATE_WRITE_RESERVE_SIZE;
     const UI_STATE_RPC_STACK_SIZE: usize = 256;
@@ -4932,6 +4932,39 @@ pub const Core = struct {
     /// autocmds were added, and the headroom test demands ≥2x slack.
     pub const split_lua_buf_len = 16384;
 
+    /// Escape `src` for inclusion inside a Lua double-quoted string literal:
+    /// backslash, double quote, newline, and carriage return. Everything else
+    /// passes through byte-for-byte — every other value, including NUL and
+    /// arbitrary UTF-8, is legal inside such a literal.
+    ///
+    /// A label too long for `dst` is truncated at the last escape boundary
+    /// rather than reported as an error: the label is decoration, and failing
+    /// the whole call would make the split silently stop appearing (callers
+    /// only log the error) over a cosmetic overflow. Truncation never splits
+    /// an escape sequence, so the result always parses.
+    fn escapeLuaString(dst: []u8, src: []const u8) []const u8 {
+        var len: usize = 0;
+        for (src) |byte| {
+            const escaped: ?[]const u8 = switch (byte) {
+                '\\' => "\\\\",
+                '"' => "\\\"",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                else => null,
+            };
+            if (escaped) |e| {
+                if (len + e.len > dst.len) break;
+                @memcpy(dst[len..][0..e.len], e);
+                len += e.len;
+            } else {
+                if (len + 1 > dst.len) break;
+                dst[len] = byte;
+                len += 1;
+            }
+        }
+        return dst[0..len];
+    }
+
     /// Window height for the split: at least one line, at most 20, plus the
     /// label line and its separator when a label is present.
     pub fn splitHeight(line_count: u32, label: ?[]const u8) u32 {
@@ -4943,6 +4976,21 @@ pub const Core = struct {
     /// generated program can be asserted on directly. Everything the split
     /// does — whether it takes focus, whether it auto-hides, how it closes —
     /// is decided by this text, and previously nothing checked it.
+    ///
+    /// Keep explanation in Zig comments like this one rather than inside the
+    /// `\\` literal: comments in there are RPC payload, re-sent and re-lexed
+    /// on every split, and they spend the buffer budget below.
+    ///
+    /// Two QuitPre limits are accepted rather than worked around, both from
+    /// its own semantics (measured against nvim 0.12.2):
+    ///   * QuitPre fires before the can-quit check, so a `:q` that then
+    ///     aborts (E37, no write since last change) has still closed the
+    ///     split. Declining would mean predicting the abort, and guessing
+    ///     from 'modified' gets `:q!` wrong in the direction that strands
+    ///     the split as the session's last window.
+    ///   * `:close` and `:tabclose` do not fire QuitPre at all, so they can
+    ///     still leave the split as the last window. Not a lock: `:q` there
+    ///     takes the `cur == state.win` branch and Neovim exits normally.
     pub fn buildSplitLua(
         buf: []u8,
         line_count: u32,
@@ -4952,7 +5000,12 @@ pub const Core = struct {
     ) ![]const u8 {
         const height = splitHeight(line_count, label);
         const enter_str = if (enter) "true" else "false";
-        const label_str = label orelse "";
+        // `label` is formatted into a Lua double-quoted literal below; escape
+        // it so a quote, backslash, or newline cannot break out of the string
+        // and execute injected Lua inside Neovim. `content` is immune by
+        // design — it travels as a msgpack argument, never as source text.
+        var label_buf: [256]u8 = undefined;
+        const label_str = if (label) |l| escapeLuaString(&label_buf, l) else "";
         const has_label_str = if (label != null) "true" else "false";
         return std.fmt.bufPrint(buf,
             \\local content = ...
@@ -4969,6 +5022,10 @@ pub const Core = struct {
             \\  if state.buf and not vim.api.nvim_buf_is_valid(state.buf) then state.buf = nil end
             \\  if state.win and not vim.api.nvim_win_is_valid(state.win) then state.win = nil end
             \\  local function stop_timer()
+            \\    -- Bumping the generation invalidates any close that
+            \\    -- schedule_wrap has already queued: stopping the handle
+            \\    -- cannot retract an entry that is waiting to drain.
+            \\    state.gen = (state.gen or 0) + 1
             \\    if state.timer then
             \\      state.timer:stop()
             \\      if not state.timer:is_closing() then state.timer:close() end
@@ -4987,8 +5044,11 @@ pub const Core = struct {
             \\  local function arm_timer()
             \\    stop_timer()
             \\    if state.timeout > 0 then
+            \\      local gen = state.gen
             \\      state.timer = uv.new_timer()
-            \\      state.timer:start(state.timeout, 0, vim.schedule_wrap(function() state.close() end))
+            \\      state.timer:start(state.timeout, 0, vim.schedule_wrap(function()
+            \\        if state.gen == gen then state.close() end
+            \\      end))
             \\    end
             \\  end
             \\  if not state.buf then
@@ -5000,6 +5060,16 @@ pub const Core = struct {
             \\      vim.bo[buf].bufhidden = 'hide'
             \\      vim.bo[buf].buflisted = false
             \\    end)
+            \\  end
+            \\  -- A window that no longer shows our buffer is not ours to
+            \\  -- reuse: the buffer was wiped (`:bd!`), or the user opened a
+            \\  -- file in the split. Forget it and mount a fresh split rather
+            \\  -- than seating our buffer back into it — re-seating would
+            \\  -- hijack the user's window, and the keymaps and pause
+            \\  -- autocmds only get registered on the mount path, so the
+            \\  -- result would be a split that `q` and `<Esc>` cannot close.
+            \\  if state.win and vim.api.nvim_win_get_buf(state.win) ~= state.buf then
+            \\    state.win = nil
             \\  end
             \\  local lines = vim.split((content:gsub('\r', '')), '\n')
             \\  if has_label and label ~= "" then
@@ -5025,7 +5095,13 @@ pub const Core = struct {
             \\    local grp = vim.api.nvim_create_augroup('ZonvieMsgSplit', {{ clear = true }})
             \\    vim.api.nvim_create_autocmd('WinClosed', {{
             \\      group = grp, pattern = tostring(win), once = true,
-            \\      callback = function() state.win = nil end,
+            \\      -- Closing the split while the cursor is inside fires
+            \\      -- BufLeave first, which re-arms a fresh timer. Nothing
+            \\      -- would ever close that handle: measured with uv.walk, one
+            \\      -- libuv timer leaked per split close. (The generation token
+            \\      -- already stops the orphan from closing a later split, so
+            \\      -- this is a handle-leak fix, not a correctness one.)
+            \\      callback = function() stop_timer() state.win = nil end,
             \\    }})
             \\    -- Zonvie addition (noice has no equivalent): the split must
             \\    -- not be what keeps Neovim alive. On the last real window,
@@ -5034,12 +5110,52 @@ pub const Core = struct {
             \\      group = grp,
             \\      callback = function()
             \\        if not (state.win and vim.api.nvim_win_is_valid(state.win)) then return end
+            \\        local cur = vim.api.nvim_get_current_win()
+            \\        -- Quitting the split itself: Neovim is already closing
+            \\        -- that window, so let it, and let WinClosed sync the
+            \\        -- state. Defensive — on 0.12.2 closing it here is
+            \\        -- tolerated (the quit simply aborts), but nothing in the
+            \\        -- API promises that.
+            \\        if cur == state.win then return end
+            \\        -- Quitting a float never ends the session, and floats are
+            \\        -- not counted below, so acting on one would close the
+            \\        -- split spuriously — dismissing an LSP hover with `:q`
+            \\        -- took the split with it. Checked before every close
+            \\        -- decision, including the alone-in-its-tabpage one.
+            \\        if vim.api.nvim_win_get_config(cur).relative ~= '' then return end
+            \\        -- Count the real windows sharing the SPLIT's tabpage,
+            \\        -- which is not necessarily the quitting one.
+            \\        local split_tab = vim.api.nvim_win_get_tabpage(state.win)
             \\        local others = 0
-            \\        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+            \\        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(split_tab)) do
             \\          if w ~= state.win and vim.api.nvim_win_get_config(w).relative == '' then
             \\            others = others + 1
             \\          end
             \\        end
+            \\        -- The split is alone in its tabpage, so it can never be
+            \\        -- what the user wants to keep — but only act when THIS
+            \\        -- quit would actually leave it as the session's last
+            \\        -- window: the quitting window must be the last real one
+            \\        -- in its own tabpage, and that tabpage the last besides
+            \\        -- the split's. Closing unconditionally instead destroyed
+            \\        -- a whole tabpage on a `:q` that left windows behind;
+            \\        -- guarding on the tabpage match instead let `:q` in the
+            \\        -- last other tab leave the split as the only window.
+            \\        if others == 0 then
+            \\          local cur_tab = vim.api.nvim_get_current_tabpage()
+            \\          local cur_others = 0
+            \\          for _, w in ipairs(vim.api.nvim_tabpage_list_wins(cur_tab)) do
+            \\            if w ~= cur and vim.api.nvim_win_get_config(w).relative == '' then
+            \\              cur_others = cur_others + 1
+            \\            end
+            \\          end
+            \\          if cur_others == 0 and #vim.api.nvim_list_tabpages() <= 2 then state.close() end
+            \\          return
+            \\        end
+            \\        -- Beyond that the split only matters to a quit in its own
+            \\        -- tabpage: the count above is per-tabpage, so acting on a
+            \\        -- `:q` elsewhere would close a split it never needed to.
+            \\        if split_tab ~= vim.api.nvim_get_current_tabpage() then return end
             \\        if others <= 1 then state.close() end
             \\      end,
             \\    }})

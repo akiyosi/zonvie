@@ -116,8 +116,13 @@ pub const ViewSet = struct {
         self.states[@intFromEnum(view)].visible = false;
     }
 
-    /// Views in dispatch order. `ext_float` runs first so a failed render
-    /// aborts the flush before any transient view has been handed off.
+    /// Views in dispatch order. The two views that can fail — `ext_float`
+    /// (render) and `split` (assembly, RPC send) — MUST come before the
+    /// callback-driven ones. A failure aborts the flush for retry, and the
+    /// retry re-dispatches the whole cycle; a frontend that had already been
+    /// handed a message via `on_msg_show` would then receive it twice.
+    /// Frontends do not dedupe (the Windows one discards `msg_id` entirely),
+    /// so reordering this list silently duplicates message text.
     pub const dispatch_order = [_]MsgViewType{
         .ext_float,
         .split,

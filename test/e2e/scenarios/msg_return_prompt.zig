@@ -9,6 +9,18 @@
 //     also never got dropped
 //
 // Both show up as "return_prompt reached a view", so that is what is asserted.
+//
+// HONEST LIMITATION: this scenario currently cannot fail. Probing nine
+// command surfaces under Neovim 0.12 with `ext_messages` attached (long
+// :echo, :!cmd, :echoerr, :source of a missing file, :version, :messages
+// after 80 :echomsg, each both typed and via nvim_command) produced zero
+// return_prompt events in the core log — the event appears not to be emitted
+// to an ext_messages UI at all, though that was inferred from the absence,
+// not from Neovim's source. A mutation making the core send two <CR>s left
+// the whole suite green. It is kept as a tripwire for the day the event
+// reappears; the assertions below are correct, they simply have nothing to
+// observe today. The real coverage for the answer logic is the unit tests in
+// src/core/flush.zig.
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;

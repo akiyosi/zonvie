@@ -284,7 +284,7 @@ mode/command indicators on their defaults. The first match wins.
 | Key | Description |
 |-----|-------------|
 | `event` | Event type: "msg_show", "msg_showmode", "msg_showcmd", "msg_ruler", "msg_history_show" (optional, omit to match all) |
-| `kind` | Array of message kinds to match (optional, omit to match all). Kinds: "emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "search_count", "confirm", "confirm_sub", etc. |
+| `kind` | Array of message kinds to match (optional, omit to match all). Kinds: "emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "search_count", "shell_out", etc. Interactive prompt kinds are not matchable — see below. |
 | `level` | Match by severity instead of kind: "info", "warn" or "error" (optional) |
 | `view` | View type (see above) |
 | `timeout` | Auto-hide timeout in seconds (optional, 0 = no auto-hide) |
@@ -294,6 +294,17 @@ mode/command indicators on their defaults. The first match wins.
 
 `return_prompt` is never routed: Zonvie answers the press-enter prompt for
 you, because the message it is confirming has already been displayed.
+
+Interactive prompts ("confirm", "confirm_sub", "number_prompt") are not
+configurable: they always reach the confirm view, with no timeout. Neovim
+blocks until one is answered, so a route that sent a prompt to another view,
+skipped it, or let it auto-hide would hang the editor on a question the user
+cannot see or answer. Such routes are overridden, including a route that
+targets "confirm" itself but attaches a timeout.
+
+("confirm" and "confirm_sub" never enter routing at all — they are handled
+as a single live dialog rather than as messages — so the override exists for
+"number_prompt" and to keep the guarantee independent of that.)
 
 #### [tabline]
 | Key | Description |

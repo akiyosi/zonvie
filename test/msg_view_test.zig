@@ -167,8 +167,26 @@ test "unassigned messages are transient so they cannot accumulate" {
 
 // -- dispatch order -----------------------------------------------------------
 
-test "ext_float is dispatched first so a failed render aborts before handoff" {
-    try std.testing.expectEqual(msg_view.MsgViewType.ext_float, ViewSet.dispatch_order[0]);
+test "both fallible views are dispatched before any handoff" {
+    // The two views that can fail — ext_float (render) and split (assembly,
+    // RPC send) — must both precede the callback-driven ones. A failure
+    // aborts the flush and the retry re-dispatches the whole cycle, so a
+    // frontend already handed a message via on_msg_show would receive it
+    // twice; frontends do not dedupe (the Windows one discards msg_id).
+    // Pinning only dispatch_order[0] left the split half unguarded, which is
+    // the reordering the invariant exists to forbid.
+    var pos: [msg_view.view_count]?usize = @splat(null);
+    for (ViewSet.dispatch_order, 0..) |v, i| pos[@intFromEnum(v)] = i;
+
+    const fallible = [_]msg_view.MsgViewType{ .ext_float, .split };
+    const handoff = [_]msg_view.MsgViewType{ .mini, .confirm, .notification };
+    for (fallible) |f| {
+        const f_at = pos[@intFromEnum(f)] orelse return error.FallibleViewNotDispatched;
+        for (handoff) |h| {
+            const h_at = pos[@intFromEnum(h)] orelse return error.HandoffViewNotDispatched;
+            try std.testing.expect(f_at < h_at);
+        }
+    }
 }
 
 test "dispatch order covers every displayable view exactly once" {

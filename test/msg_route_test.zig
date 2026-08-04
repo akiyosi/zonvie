@@ -144,13 +144,68 @@ test "an empty filter matches everything" {
 
 // -- prompts ------------------------------------------------------------------
 
-test "confirm kinds reach the confirm view by default" {
+test "confirm kinds reach the confirm view with no configuration" {
     const r: Router = .{};
     for ([_][]const u8{ "confirm", "confirm_sub", "number_prompt" }) |kind| {
         const res = r.route(.msg_show, kind, 1);
         try std.testing.expectEqual(msg_route.MsgViewType.confirm, res.view);
         try std.testing.expectEqual(@as(f32, 0), res.timeout);
     }
+}
+
+test "interactive prompts cannot be routed away by broad user routes" {
+    // Regression: the old pre-route hardcode was replaced by an overridable
+    // default route, so a catch-all user route captured confirm dialogs and
+    // sent them to a view where they cannot be answered — Neovim then
+    // blocked on a question the user never saw. Prompts are pinned ahead of
+    // every route again, user or default.
+    const catch_all = [_]MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .split },
+    };
+    const r1: Router = .{ .user_routes = &catch_all };
+    for ([_][]const u8{ "confirm", "confirm_sub", "number_prompt" }) |kind| {
+        const res = r1.route(.msg_show, kind, 1);
+        try std.testing.expectEqual(msg_route.MsgViewType.confirm, res.view);
+        try std.testing.expect(!res.skip);
+        // The captured route's timeout must not ride along: a prompt Neovim
+        // is blocked on can never be allowed to auto-hide.
+        try std.testing.expectEqual(@as(f32, 0), res.timeout);
+    }
+    // Non-prompt kinds still follow the user's route.
+    try std.testing.expectEqual(msg_route.MsgViewType.split, r1.route(.msg_show, "echo", 1).view);
+}
+
+test "interactive prompts cannot be skipped" {
+    const skip_all = [_]MsgRoute{
+        .{ .filter = .{}, .opts = .{ .skip = true } },
+    };
+    const r: Router = .{ .user_routes = &skip_all };
+    const res = r.route(.msg_show, "confirm", 1);
+    try std.testing.expectEqual(msg_route.MsgViewType.confirm, res.view);
+    try std.testing.expect(!res.skip);
+    // The skip still applies to everything that is not a prompt.
+    try std.testing.expect(r.route(.msg_show, "echo", 1).skip);
+}
+
+test "not even a confirm-targeting route can time out a blocking prompt" {
+    // The escape hatch this replaces let a route that resolved to `.confirm`
+    // keep its own timeout — so the one view that CAN answer a prompt was
+    // allowed to auto-hide while Neovim still blocked on it, which is the
+    // very hang the net exists to prevent. There is no exception now.
+    const user = [_]MsgRoute{
+        .{ .filter = .{ .event = .msg_show, .kinds = &.{"confirm"} }, .view = .confirm, .opts = .{ .timeout = 5.0 } },
+    };
+    const r: Router = .{ .user_routes = &user };
+    const res = r.route(.msg_show, "confirm", 1);
+    try std.testing.expectEqual(msg_route.MsgViewType.confirm, res.view);
+    try std.testing.expectEqual(@as(f32, 0), res.timeout);
+
+    // Non-prompt kinds are untouched by the net and keep the route's timeout.
+    const echo_route = [_]MsgRoute{
+        .{ .filter = .{ .event = .msg_show, .kinds = &.{"echo"} }, .view = .confirm, .opts = .{ .timeout = 5.0 } },
+    };
+    const r2: Router = .{ .user_routes = &echo_route };
+    try std.testing.expectEqual(@as(f32, 5.0), r2.route(.msg_show, "echo", 1).timeout);
 }
 
 test "return_prompt is identified for event-layer dismissal" {

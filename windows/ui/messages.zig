@@ -366,8 +366,14 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
 
     // Determine message type
     const kind_str = msg.kind[0..msg.kind_len];
+    // number_prompt asks the user to pick a numbered choice, so it belongs
+    // with the other blocking dialogs: centered over the app, height-clamped,
+    // no auto-hide. The core pins every interactive prompt to the confirm
+    // view now, so a user can no longer route it elsewhere to escape the
+    // top-right toast placement it used to fall into.
     const is_confirm = std.mem.eql(u8, kind_str, "confirm") or
-        std.mem.eql(u8, kind_str, "confirm_sub");
+        std.mem.eql(u8, kind_str, "confirm_sub") or
+        std.mem.eql(u8, kind_str, "number_prompt");
     const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
 
     // External window with auto-hide
