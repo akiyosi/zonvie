@@ -1927,6 +1927,110 @@ func makeRowScissorRect(
     return MTLScissorRect(x: 0, y: y, width: width, height: height)
 }
 
+// MARK: - Fixed-Float Mask Geometry
+
+/// Build the fragment-shader fixed-float mask (bands plus z-carrying interval
+/// segments) from fixed-float rects. Pure geometry, shared between the
+/// renderer and the standalone test harness. Where rects overlap within a
+/// band, intervals are split at the rects' x edges and each segment carries
+/// the MAX zindex of the rects covering it, so the shader's per-fragment
+/// z comparison needs a single lookup. Outputs and scratch buffers retain
+/// capacity; the steady path allocates nothing.
+func buildSurfaceFixedFloatMask(
+    rects: [MetalTerminalRenderer.FixedFloatRect],
+    bands: inout [MetalTerminalRenderer.FixedFloatBand],
+    intervals: inout [MetalTerminalRenderer.FixedFloatInterval],
+    yEdgesScratch: inout [Float],
+    xEdgesScratch: inout [Float],
+    coveringScratch: inout [MetalTerminalRenderer.FixedFloatRect]
+) {
+    bands.removeAll(keepingCapacity: true)
+    intervals.removeAll(keepingCapacity: true)
+    yEdgesScratch.removeAll(keepingCapacity: true)
+
+    guard !rects.isEmpty else { return }
+
+    for rect in rects where rect.x0 < rect.x1 && rect.top < rect.bottom {
+        yEdgesScratch.append(rect.top)
+        yEdgesScratch.append(rect.bottom)
+    }
+    guard yEdgesScratch.count >= 2 else { return }
+
+    yEdgesScratch.sort(by: <)
+    dedupSortedSurfaceEdges(&yEdgesScratch)
+
+    for edgeIndex in 0..<(yEdgesScratch.count - 1) {
+        let top = yEdgesScratch[edgeIndex]
+        let bottom = yEdgesScratch[edgeIndex + 1]
+        let sampleY = (top + bottom) * 0.5
+
+        coveringScratch.removeAll(keepingCapacity: true)
+        xEdgesScratch.removeAll(keepingCapacity: true)
+        for rect in rects
+            where rect.x0 < rect.x1 && sampleY > rect.top && sampleY < rect.bottom
+        {
+            coveringScratch.append(rect)
+            xEdgesScratch.append(rect.x0)
+            xEdgesScratch.append(rect.x1)
+        }
+        guard !coveringScratch.isEmpty else { continue }
+        xEdgesScratch.sort(by: <)
+        dedupSortedSurfaceEdges(&xEdgesScratch)
+
+        // Assign each x segment the max z of the rects covering it; merge
+        // contiguous segments with equal z so the common non-overlapping
+        // case emits exactly one interval per rect, as before.
+        let start = intervals.count
+        var pending: MetalTerminalRenderer.FixedFloatInterval?
+        for xIndex in 0..<(xEdgesScratch.count - 1) {
+            let x0 = xEdgesScratch[xIndex]
+            let x1 = xEdgesScratch[xIndex + 1]
+            let sampleX = (x0 + x1) * 0.5
+            var maxZ: Int32?
+            for rect in coveringScratch where sampleX > rect.x0 && sampleX < rect.x1 {
+                maxZ = max(maxZ ?? rect.zindex, rect.zindex)
+            }
+            guard let z = maxZ else {
+                if let flushed = pending {
+                    intervals.append(flushed)
+                    pending = nil
+                }
+                continue
+            }
+            let zf = Float(z)
+            if var merged = pending, merged.x1 == x0, merged.z == zf {
+                merged.x1 = x1
+                pending = merged
+            } else {
+                if let flushed = pending { intervals.append(flushed) }
+                pending = MetalTerminalRenderer.FixedFloatInterval(x0: x0, x1: x1, z: zf)
+            }
+        }
+        if let flushed = pending { intervals.append(flushed) }
+        guard intervals.count > start else { continue }
+        bands.append(MetalTerminalRenderer.FixedFloatBand(
+            top: top,
+            bottom: bottom,
+            intervalStart: UInt32(start),
+            intervalCount: UInt32(intervals.count - start)
+        ))
+    }
+}
+
+/// In-place dedup of a sorted edge list (exact float equality is intended:
+/// edges come from identical cell-grid products, not accumulated math).
+private func dedupSortedSurfaceEdges(_ values: inout [Float]) {
+    guard values.count > 1 else { return }
+    var uniqueCount = 1
+    for i in 1..<values.count where values[i] != values[uniqueCount - 1] {
+        values[uniqueCount] = values[i]
+        uniqueCount += 1
+    }
+    if uniqueCount < values.count {
+        values.removeLast(values.count - uniqueCount)
+    }
+}
+
 // MARK: - Surface Encoder Binding Helpers
 
 /// Bind scroll offset data to a render encoder.

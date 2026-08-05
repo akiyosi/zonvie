@@ -17,6 +17,14 @@ final class MetalTerminalRenderer {
         var move_all: Int32 = 0
     }
 
+    struct FixedFloatRect: Equatable {
+        var x0: Float
+        var x1: Float
+        var top: Float
+        var bottom: Float
+        var zindex: Int32
+    }
+
     struct FixedFloatBand {
         var top: Float
         var bottom: Float
@@ -27,6 +35,7 @@ final class MetalTerminalRenderer {
     struct FixedFloatInterval {
         var x0: Float
         var x1: Float
+        var z: Float = 0
     }
 }
 
@@ -401,11 +410,132 @@ private enum SurfaceRowProvisionTests {
         require(fresh !== slot1, "narrow row wrote into an in-flight ring slot 1")
     }
 
+    // Test-local mirror of Shaders.metal insideFixedFloatAbove (linear scan is
+    // fine here): true when (x, y) lies inside a mask segment whose z is
+    // strictly greater than scrollZ.
+    private static func maskCoversAbove(
+        bands: [MetalTerminalRenderer.FixedFloatBand],
+        intervals: [MetalTerminalRenderer.FixedFloatInterval],
+        x: Float,
+        y: Float,
+        scrollZ: Float
+    ) -> Bool {
+        for band in bands where y >= band.top && y <= band.bottom {
+            let start = Int(band.intervalStart)
+            let end = start + Int(band.intervalCount)
+            for interval in intervals[start..<end] where x >= interval.x0 && x <= interval.x1 {
+                return interval.z > scrollZ
+            }
+            return false
+        }
+        return false
+    }
+
+    private static func buildMask(
+        _ rects: [MetalTerminalRenderer.FixedFloatRect]
+    ) -> (bands: [MetalTerminalRenderer.FixedFloatBand], intervals: [MetalTerminalRenderer.FixedFloatInterval]) {
+        var bands: [MetalTerminalRenderer.FixedFloatBand] = []
+        var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+        var yEdges: [Float] = []
+        var xEdges: [Float] = []
+        var covering: [MetalTerminalRenderer.FixedFloatRect] = []
+        buildSurfaceFixedFloatMask(
+            rects: rects,
+            bands: &bands,
+            intervals: &intervals,
+            yEdgesScratch: &yEdges,
+            xEdgesScratch: &xEdges,
+            coveringScratch: &covering
+        )
+        return (bands, intervals)
+    }
+
+    private static func verifyFixedFloatMaskZOrder() {
+        // Lazy layout: full-screen backdrop (z49) under an inner float (z50).
+        let backdrop = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
+        let lazy = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
+        let (bands, intervals) = buildMask([backdrop, lazy])
+
+        require(bands.count == 3, "lazy mask should split into 3 bands, got \(bands.count)")
+        require(Int(bands[0].intervalCount) == 1, "top band should be backdrop-only")
+        require(Int(bands[1].intervalCount) == 3, "middle band should split at the inner float's x edges, got \(bands[1].intervalCount)")
+        require(Int(bands[2].intervalCount) == 1, "bottom band should be backdrop-only")
+        let mid = Int(bands[1].intervalStart)
+        require(intervals[mid].z == 49 && intervals[mid + 1].z == 50 && intervals[mid + 2].z == 49,
+                "middle band z values must be [49, 50, 49]")
+        require(intervals[mid].x1 == 100 && intervals[mid + 1].x0 == 100
+                    && intervals[mid + 1].x1 == 800 && intervals[mid + 2].x0 == 800,
+                "middle band segments must split exactly at the inner float's x edges")
+
+        // Semantics: window content (z0) is masked everywhere; the scrolled
+        // inner float (z50) survives over its own rect and its backdrop.
+        require(maskCoversAbove(bands: bands, intervals: intervals, x: 400, y: 300, scrollZ: 0),
+                "window content must be masked under the inner float")
+        require(maskCoversAbove(bands: bands, intervals: intervals, x: 50, y: 300, scrollZ: 0),
+                "window content must be masked under the backdrop")
+        require(!maskCoversAbove(bands: bands, intervals: intervals, x: 400, y: 300, scrollZ: 50),
+                "the scrolled float must not be masked inside its own rect")
+        require(!maskCoversAbove(bands: bands, intervals: intervals, x: 400, y: 50, scrollZ: 50),
+                "the scrolled float must not be masked over the backdrop alone")
+
+        // A higher-z fixed float stacked over the scrolled one must win.
+        let popup = MetalTerminalRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
+        let stacked = buildMask([backdrop, lazy, popup])
+        require(maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 400, y: 300, scrollZ: 50),
+                "a z50 scrolled float must be masked under a z60 fixed float")
+        require(!maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 400, y: 300, scrollZ: 60),
+                "z60 content must not be masked under its own rect")
+        require(!maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 200, y: 300, scrollZ: 50),
+                "the z60 popup must not mask the scrolled float outside its own rect")
+
+        // Contiguous equal-z rects merge into one interval; differing z stays split.
+        let leftSame = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let rightSame = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
+        let mergedMask = buildMask([leftSame, rightSame])
+        require(mergedMask.bands.count == 1 && mergedMask.intervals.count == 1,
+                "touching equal-z rects must merge into one interval")
+        require(mergedMask.intervals[0].x0 == 0 && mergedMask.intervals[0].x1 == 200,
+                "merged interval must span both rects")
+        let rightHigher = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
+        let splitMask = buildMask([leftSame, rightHigher])
+        require(splitMask.intervals.count == 2, "touching rects with differing z must stay split")
+        require(splitMask.intervals[0].z == 50 && splitMask.intervals[1].z == 60,
+                "split segments must keep their own z")
+
+        // Vertically disjoint rects: no band is emitted for the gap between them.
+        let upper = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let lower = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
+        let disjoint = buildMask([upper, lower])
+        require(disjoint.bands.count == 2, "vertically disjoint rects must produce exactly 2 bands")
+        require(!maskCoversAbove(bands: disjoint.bands, intervals: disjoint.intervals, x: 50, y: 200, scrollZ: 0),
+                "the vertical gap between rects must not be masked")
+
+        // Degenerate rects are ignored; an empty input clears the outputs.
+        let degenerate = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let degenerateMask = buildMask([degenerate])
+        require(degenerateMask.bands.isEmpty && degenerateMask.intervals.isEmpty,
+                "a zero-width rect must produce an empty mask")
+        let emptyMask = buildMask([])
+        require(emptyMask.bands.isEmpty && emptyMask.intervals.isEmpty,
+                "an empty rect list must produce an empty mask")
+
+        // Strict-inequality boundary: content at the same z as the mask
+        // segment is never discarded (equal-z stacking is settled by
+        // composition order, not the mask).
+        let single = buildMask([lazy])
+        require(maskCoversAbove(bands: single.bands, intervals: single.intervals, x: 400, y: 300, scrollZ: 49),
+                "z49 content must be masked under a z50 float")
+        require(!maskCoversAbove(bands: single.bands, intervals: single.intervals, x: 400, y: 300, scrollZ: 50),
+                "equal-z content must not be masked")
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
             exit(1)
         }
+
+        verifyFixedFloatMaskZOrder()
 
         // Both production owners call the same durable state transition from
         // commit and from every GPU completion path.

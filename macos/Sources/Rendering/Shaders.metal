@@ -33,6 +33,8 @@ struct VSOut {
     float content_top_y;    // Content area top bound in NDC (for clipping)
     float content_bottom_y; // Content area bottom bound in NDC (for clipping)
     float was_content;      // 1.0 if this vertex was in content area (scrollable), 0.0 if margin
+    float scroll_z;         // zindex of the scrolled grid this vertex belongs to (0 for windows);
+                            // only meaningful when was_content > 0.5
     uint deco_flags;        // decoration flags
     float deco_phase;       // phase for undercurl
 };
@@ -48,6 +50,10 @@ struct ScrollOffset {
     int pin_edges;          // 1 = stretch the edge row's background across the gap the offset
                             // opens. 0 when a retained row already covers that gap with its own
                             // background, which the stretch would otherwise paint over.
+    int zindex;             // The scrolled grid's zindex (0 for windows, > 0 for floats).
+                            // Carried to the fragment stage so the fixed-float guard only
+                            // discards scrolled content under a STRICTLY higher-z fixed float
+                            // — a float scrolling above its own backdrop must keep drawing.
 };
 
 // Drawable size for NDC conversion in fragment shader
@@ -74,6 +80,7 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
     o.content_top_y = 2.0;     // Above screen
     o.content_bottom_y = -2.0; // Below screen
     o.was_content = 0.0;
+    o.scroll_z = 0.0;
 
     // scrollOffsets is sorted by grid_id on the CPU. Binary search keeps this
     // per-vertex lookup bounded when many windows/floats scroll together.
@@ -146,9 +153,11 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
                 pos.y += offset;
             }
             // 2.0 marks bodily-moved float content (move_all); 1.0 marks
-            // window-scrolled content. The fixed-float bleed guard targets
-            // only window content so it never discards a moving float.
+            // window-scrolled content. The fixed-float bleed guard compares
+            // scroll_z against each mask rect's z, so content is only
+            // discarded under a strictly higher fixed float.
             o.was_content = move_all ? 2.0 : 1.0;
+            o.scroll_z = (float)scroll.zindex;
         }
     }
 
@@ -162,7 +171,9 @@ vertex VSOut vs_main(VertexIn in [[stage_in]],
 
 // Exact union of fixed-float rectangles in drawable pixel coordinates. Bands
 // are disjoint and sorted top-to-bottom. Each band points at a disjoint,
-// left-to-right interval slice.
+// left-to-right interval slice. Where fixed floats overlap, the interval is
+// split at their x edges and each segment carries the MAX zindex of the
+// rects covering it, so the per-fragment z test below stays a single lookup.
 struct FixedFloatBand {
     float top;
     float bottom;
@@ -173,13 +184,18 @@ struct FixedFloatBand {
 struct FixedFloatInterval {
     float x0;
     float x1;
+    float z;   // max zindex of the fixed floats covering this segment
 };
 
 // Two-level binary search: O(log bands + log intervals), replacing the old
 // O(floats) test executed for every fragment (and for both blur passes).
-static inline bool insideFixedFloat(float pixel_x, float pixel_y,
-                                    constant FixedFloatBand* bands, uint band_count,
-                                    constant FixedFloatInterval* intervals) {
+// Returns true when the pixel lies inside a fixed float whose zindex is
+// STRICTLY greater than scroll_z (the scrolled grid's own zindex): scrolled
+// content only yields to fixed floats stacked above it, never to those it is
+// drawn over (e.g. a float scrolling above its own backdrop).
+static inline bool insideFixedFloatAbove(float pixel_x, float pixel_y, float scroll_z,
+                                         constant FixedFloatBand* bands, uint band_count,
+                                         constant FixedFloatInterval* intervals) {
     uint lo = 0u;
     uint hi = band_count;
     while (lo < hi) {
@@ -200,7 +216,7 @@ static inline bool insideFixedFloat(float pixel_x, float pixel_y,
                 } else if (pixel_x > interval.x1) {
                     xlo = xmid + 1u;
                 } else {
-                    return true;
+                    return interval.z > scroll_z;
                 }
             }
             return false;
@@ -234,10 +250,12 @@ fragment float4 ps_main(VSOut in [[stage_in]],
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
         }
-        // Only window content (was_content ~1.0) is guarded against bleeding over
-        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
-            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
+        // Scrolled content must not bleed over a fixed float stacked above
+        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
+        // windows) against the mask segment's z, so a float scrolling above
+        // a lower fixed float (e.g. its own backdrop) keeps drawing.
+        if (fixedFloatBandCount > 0u) {
+            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -369,10 +387,12 @@ fragment float4 ps_background(VSOut in [[stage_in]],
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
         }
-        // Only window content (was_content ~1.0) is guarded against bleeding over
-        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
-            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
+        // Scrolled content must not bleed over a fixed float stacked above
+        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
+        // windows) against the mask segment's z, so a float scrolling above
+        // a lower fixed float (e.g. its own backdrop) keeps drawing.
+        if (fixedFloatBandCount > 0u) {
+            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -428,10 +448,12 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
         }
-        // Only window content (was_content ~1.0) is guarded against bleeding over
-        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
-            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
+        // Scrolled content must not bleed over a fixed float stacked above
+        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
+        // windows) against the mask segment's z, so a float scrolling above
+        // a lower fixed float (e.g. its own backdrop) keeps drawing.
+        if (fixedFloatBandCount > 0u) {
+            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }
@@ -544,10 +566,12 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
             discard_fragment();
         }
-        // Only window content (was_content ~1.0) is guarded against bleeding over
-        // a fixed float; bodily-moved float content (was_content ~2.0) must draw.
-        if (in.was_content < 1.5 && fixedFloatBandCount > 0u) {
-            if (insideFixedFloat(in.position.x, in.position.y, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
+        // Scrolled content must not bleed over a fixed float stacked above
+        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
+        // windows) against the mask segment's z, so a float scrolling above
+        // a lower fixed float (e.g. its own backdrop) keeps drawing.
+        if (fixedFloatBandCount > 0u) {
+            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
                 discard_fragment();
             }
         }

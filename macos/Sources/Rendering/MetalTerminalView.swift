@@ -2130,7 +2130,11 @@ final class MetalTerminalView: MTKView {
                 gridTopYNDC: gridTopYNDC,
                 gridRows: info.rows,
                 marginTop: info.marginTop,
-                marginBottom: info.marginBottom
+                marginBottom: info.marginBottom,
+                // The z-aware guard only discards this grid's scrolled content
+                // under STRICTLY higher fixed floats, so a directly-scrolled
+                // float keeps drawing above its own backdrop.
+                zindex: Int32(clamping: info.zindex)
             ))
         }
         for key in scrollOffsetStaleKeysScratch {
@@ -2163,15 +2167,16 @@ final class MetalTerminalView: MTKView {
         if scrollOffsetsComplete && !scrollOffsetInfoScratch.isEmpty {
             let cellW = Float(renderer.cellWidthPx)
             for g in grids where g.zindex > 0 && g.gridId != 1 && !g.followsScroll {
-                // A fixed float that is itself being scrolled (its own content,
-                // because it is logically scrollable) must not mask its own
-                // scrolled content — skip it so the guard never self-discards.
-                if scrollOffsetInfoScratch.contains(where: { $0.gridId == g.gridId }) { continue }
+                // A directly-scrolled float stays in the mask: the z-aware
+                // guard compares its own zindex against the mask segment's, so
+                // it cannot self-discard, while lower-z content scrolled in
+                // the same frame is still masked under it.
                 fixedFloatRectsScratch.append(MetalTerminalRenderer.FixedFloatRect(
                     x0: Float(g.startCol) * cellW,
                     x1: Float(g.startCol + g.cols) * cellW,
                     top: Float(g.startRow) * cellHeightPx,
-                    bottom: Float(g.startRow + g.rows) * cellHeightPx
+                    bottom: Float(g.startRow + g.rows) * cellHeightPx,
+                    zindex: Int32(clamping: g.zindex)
                 ))
                 // One entry beyond the representable maximum is enough to
                 // select the cell-aligned fallback; do not grow this hot-path
@@ -3150,7 +3155,8 @@ final class MetalTerminalView: MTKView {
                 gridRows: floatGrid.rows,
                 marginTop: 0,
                 marginBottom: 0,
-                clipToContent: false
+                clipToContent: false,
+                zindex: Int32(clamping: floatGrid.zindex)
             ))
         }
         return true
