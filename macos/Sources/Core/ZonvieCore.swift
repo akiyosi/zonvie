@@ -6849,8 +6849,14 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[msg_show] calling showOSNotification")
                 self.showOSNotification(title: "Neovim", body: contentStr)
             } else if isConfirmView {
-                // Confirm messages go to separate bottom-center window
-                let isConfirm = kindStr == "confirm" || kindStr == "confirm_sub"
+                // Confirm messages go to separate bottom-center window.
+                // number_prompt asks the user to pick a numbered choice and
+                // blocks Neovim exactly like the others, so it takes the same
+                // geometry; excluding it gave a blocking prompt the narrower
+                // non-confirm layout. The core pins every interactive prompt
+                // to this view, so there is no configuration that avoids it.
+                let isConfirm = kindStr == "confirm" || kindStr == "confirm_sub" ||
+                    kindStr == "number_prompt"
                 let isReturnPrompt = kindStr == "return_prompt"
                 self.showPromptWindow(content: contentStr, hlId: primaryHlId, isConfirm: isConfirm, isReturnPrompt: isReturnPrompt)
             } else if isMini {
@@ -7150,13 +7156,41 @@ final class ZonvieCore {
         label.cell?.isScrollable = false
     }
 
+    /// Maximum number of lines a mini window renders. Matches noice.nvim's
+    /// `views.mini.size.max_height` (`config/views.lua:178-182`).
+    private static let miniMaxLines = 10
+
+    /// Bound mini content to `miniMaxLines`.
+    ///
+    /// noice bounds the mini *window* and lets the buffer underneath scroll;
+    /// Zonvie's mini is a single NSTextField, so the bound has to be applied to
+    /// the string. The excess is summarised rather than silently dropped —
+    /// oversized messages belong in `ext-float` or `split`, which do scroll.
+    ///
+    /// Without this, a `:history` dump (~2000 lines) makes AppKit lay out a
+    /// borderless window tens of thousands of points tall on the main thread.
+    private func clampMiniContent(_ content: String) -> String {
+        // A trailing newline yields a phantom empty element. It has to be
+        // dropped from what is RETURNED, not just from the count:
+        // miniWindowSize splits the same way, so keeping it both clamps one
+        // line early and sizes the window a blank line taller than its text.
+        var lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.count > 1, lines.last?.isEmpty == true { lines.removeLast() }
+        guard lines.count > Self.miniMaxLines else { return lines.joined(separator: "\n") }
+        let kept = Self.miniMaxLines - 1
+        return lines.prefix(kept).joined(separator: "\n")
+            + "\n…(\(lines.count - kept) more lines)"
+    }
+
     /// Update a mini window with new content
     /// - Parameters:
     ///   - miniId: The mini window identifier
-    ///   - content: The content to display
+    ///   - rawContent: The content to display, before the mini line bound
     ///   - timeout: Optional timeout in seconds (nil = use default, 0 = no auto-hide)
-    private func updateMini(_ miniId: MiniWindowId, content: String, timeout: Double? = nil) {
+    private func updateMini(_ miniId: MiniWindowId, content rawContent: String, timeout: Double? = nil) {
         guard let mainWindow = terminalView?.window else { return }
+
+        let content = clampMiniContent(rawContent)
 
         // Cancel any existing hide timer for this mini window
         miniWindows[miniId]?.hideWorkItem?.cancel()

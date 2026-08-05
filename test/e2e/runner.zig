@@ -228,3 +228,96 @@ test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);
 }
+
+// ext_messages. These attach with ext_messages on and observe the message
+// callbacks plus the real Neovim windows the split view creates.
+
+test "e2e:msg_route_defaults" {
+    try requireNvim();
+    try @import("scenarios/msg_route_defaults.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_lifecycle" {
+    try requireNvim();
+    try @import("scenarios/msg_split_lifecycle.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_timeout" {
+    try requireNvim();
+    try @import("scenarios/msg_split_timeout.zig").run(testing.allocator);
+}
+
+test "e2e:msg_history_split" {
+    try requireNvim();
+    try @import("scenarios/msg_history_split.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_quit" {
+    try requireNvim();
+    try @import("scenarios/msg_split_quit.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_quit_other_tab" {
+    try requireNvim();
+    try @import("scenarios/msg_split_quit_other_tab.zig").run(testing.allocator);
+}
+
+test "e2e:msg_return_prompt" {
+    try requireNvim();
+    try @import("scenarios/msg_return_prompt.zig").run(testing.allocator);
+}
+
+test "e2e:msg_no_accumulation" {
+    try requireNvim();
+    try @import("scenarios/msg_no_accumulation.zig").run(testing.allocator);
+}
+
+test "e2e:msg_default_views" {
+    try requireNvim();
+    try @import("scenarios/msg_default_views.zig").run(testing.allocator);
+}
+
+test "e2e:msg_ext_float_timeout" {
+    try requireNvim();
+    try @import("scenarios/msg_ext_float_timeout.zig").run(testing.allocator);
+}
+
+test "e2e:msg_repeat_updates" {
+    try requireNvim();
+    try @import("scenarios/msg_repeat_updates.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_close_key" {
+    try requireNvim();
+    try @import("scenarios/msg_split_close_key.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_enter" {
+    try requireNvim();
+    try @import("scenarios/msg_split_enter.zig").run(testing.allocator);
+}
+
+test "e2e:msg_history_content" {
+    try requireNvim();
+    try @import("scenarios/msg_history_content.zig").run(testing.allocator);
+}
+
+test "e2e:msg_history_repeat" {
+    try requireNvim();
+    try @import("scenarios/msg_history_repeat.zig").run(testing.allocator);
+}
+
+test "e2e:msg_mini_then_split" {
+    try requireNvim();
+    try @import("scenarios/msg_mini_then_split.zig").run(testing.allocator);
+}
+
+test "e2e:msg_backoff_delivery" {
+    try requireNvim();
+    try @import("scenarios/msg_backoff_delivery.zig").run(testing.allocator);
+}
+
+test "e2e:msg_split_payload_ceiling" {
+    try requireNvim();
+    try @import("scenarios/msg_split_payload_ceiling.zig").run(testing.allocator);
+}

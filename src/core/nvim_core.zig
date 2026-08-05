@@ -11,6 +11,7 @@ pub const redraw = @import("redraw_handler.zig");
 const log_mod = @import("log.zig");
 const Logger = log_mod.Logger;
 const config = @import("config.zig");
+const msg_view = @import("msg_view.zig");
 const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
 const rpc_transport = @import("rpc_transport.zig");
@@ -467,7 +468,7 @@ pub const RedrawRecoveryState = enum {
 };
 
 pub const Core = struct {
-    const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
+    pub const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
     const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
     const MAX_TOTAL_WRITE_QUEUE_SIZE: usize = MAX_WRITE_QUEUE_SIZE + UI_STATE_WRITE_RESERVE_SIZE;
     const UI_STATE_RPC_STACK_SIZE: usize = 256;
@@ -902,6 +903,18 @@ pub const Core = struct {
     msg_history_retry_at: ?i128 = null,
     msg_history_retry_delay_ns: i128 = 16 * std.time.ns_per_ms,
 
+    // Scratch buffer for split-view content. Persistent so repeated `:messages`
+    // / `:history` dumps reuse capacity instead of reallocating, and so content
+    // is never truncated to fit a fixed stack buffer.
+    msg_split_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    // Per-view lifecycle, one ViewSet per message channel (msg_show and
+    // msg_history_show — each has its own grid and auto-hide slot). Routing
+    // runs once per cycle and the result lives here; every consumer reads the
+    // assignment instead of re-routing. See msg_view.zig.
+    msg_views: msg_view.ViewSet = .{},
+    history_views: msg_view.ViewSet = .{},
+
     // Auto-hide deadlines for ext_float grids (nanos timestamp)
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
     msg_history_auto_hide_at: ?i128 = null, // grid -103 auto-hide deadline
@@ -923,7 +936,8 @@ pub const Core = struct {
     msg_line_cache_build: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_cache_valid: bool = false,
 
-    // Track last executed command for split view label
+    // Track last executed command. Recorded but not yet consumed: the
+    // split-view label it was collected for was never wired up.
     last_cmd_buf: [256]u8 = .{0} ** 256,
     last_cmd_len: usize = 0,
     last_cmd_firstc: u8 = 0, // ':' or '!' etc.
@@ -1218,6 +1232,11 @@ pub const Core = struct {
         self.shaping_col_widths.deinit(self.alloc);
         self.shaping_src_cols.deinit(self.alloc);
         self.flush_float_overlay_buf.deinit(self.alloc);
+        self.msg_views.deinit(self.alloc);
+        self.history_views.deinit(self.alloc);
+        self.msg_line_cache.deinit(self.alloc);
+        self.msg_line_cache_build.deinit(self.alloc);
+        self.msg_split_buf.deinit(self.alloc);
         self.freeGlowGroupNames();
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
@@ -1510,8 +1529,8 @@ pub const Core = struct {
         self.msg_line_cache_build.clearRetainingCapacity();
         self.resetAtlasMaintenanceBackoff();
 
-        // Last command tracking for the split-view label was a snapshot
-        // of the old session's :commands.
+        // Last command tracking was a snapshot of the old session's
+        // :commands.
         self.last_cmd_len = 0;
         self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
@@ -1864,6 +1883,15 @@ pub const Core = struct {
         self.msg_line_cache = .empty;
         self.msg_line_cache_build.deinit(self.alloc);
         self.msg_line_cache_build = .empty;
+        self.msg_split_buf.deinit(self.alloc);
+        self.msg_split_buf = .empty;
+        // Full reset, not just deinit: ViewSet.deinit frees the assignment
+        // but keeps per-view state, and a stale `visible` flag would make the
+        // next session's first empty cycle issue a spurious hide.
+        self.msg_views.deinit(self.alloc);
+        self.msg_views = .{};
+        self.history_views.deinit(self.alloc);
+        self.history_views = .{};
         self.msg_config.deinit();
         self.msg_config = .{};
 
@@ -4862,113 +4890,266 @@ pub const Core = struct {
     /// Based on noice.nvim/nui.nvim patterns for state management.
     /// enter=true: focus moves to split (for regular messages)
     /// enter=false: focus stays in current window (for confirm dialogs)
-    /// label: optional label line showing command and duration (prepended to content)
-    pub fn createMessageSplit(self: *Core, content: []const u8, line_count: u32, enter: bool, clear_prompt: bool, label: ?[]const u8) !void {
-        // Calculate height (max 20 lines, min 5)
-        // Add 2 for label line + separator if label is present
-        const extra_lines: u32 = if (label != null) 2 else 0;
-        const height = @min(line_count + extra_lines, 20);
-
-        // Lua code based on noice.nvim/nui.nvim patterns:
-        // - If clear_prompt is true, send <CR> to clear return_prompt first (like noice.nvim)
-        // - State tracked in _G._zonvie_msg_split
-        // - Autocmd for cleanup on BufWipeout
-        // - Skip if already mounted (prevents duplicate splits)
-        var lua_buf: [4096]u8 = undefined;
-        const enter_str = if (enter) "true" else "false";
-        const clear_prompt_str = if (clear_prompt) "true" else "false";
-        const label_str = label orelse "";
-        const has_label_str = if (label != null) "true" else "false";
-        const lua_code = try std.fmt.bufPrint(&lua_buf,
-            \\local content = ...
-            \\local height = {d}
-            \\local enter = {s}
-            \\local clear_prompt = {s}
-            \\local label = "{s}"
-            \\local has_label = {s}
-            \\-- Function to create the split window
-            \\local function create_split()
-            \\  local state = _G._zonvie_msg_split or {{}}
-            \\  _G._zonvie_msg_split = state
-            \\  -- Check if already mounted
-            \\  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
-            \\    if state.win and vim.api.nvim_win_is_valid(state.win) then
-            \\      return
-            \\    end
-            \\  end
-            \\  -- Create buffer
-            \\  local ok, buf = pcall(vim.api.nvim_create_buf, false, true)
-            \\  if not ok then return end
-            \\  state.buf = buf
-            \\  -- Prepare lines with optional label
-            \\  local lines = vim.split(content:gsub('\r', ''), '\n')
-            \\  if has_label and label ~= "" then
-            \\    local sep = string.rep("─", 40)
-            \\    table.insert(lines, 1, sep)
-            \\    table.insert(lines, 1, label)
-            \\  end
-            \\  -- Set buffer content
-            \\  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
-            \\  -- Create split window
-            \\  local win_ok, win = pcall(vim.api.nvim_open_win, buf, enter, {{
-            \\    split = 'below',
-            \\    height = height,
-            \\  }})
-            \\  if not win_ok then return end
-            \\  state.win = win
-            \\  -- Buffer options
-            \\  pcall(function()
-            \\    vim.bo[buf].modifiable = false
-            \\    vim.bo[buf].buftype = 'nofile'
-            \\    vim.bo[buf].bufhidden = 'wipe'
-            \\    vim.bo[buf].buflisted = false
-            \\  end)
-            \\  -- Apply highlight to label line (if present)
-            \\  if has_label and label ~= "" then
-            \\    pcall(vim.api.nvim_buf_add_highlight, buf, -1, "Title", 0, 0, -1)
-            \\    pcall(vim.api.nvim_buf_add_highlight, buf, -1, "Comment", 1, 0, -1)
-            \\  end
-            \\  -- Keymaps for closing (only when entered)
-            \\  if enter then
-            \\    vim.keymap.set('n', 'q', ':close<CR>', {{buffer = buf, silent = true}})
-            \\    vim.keymap.set('n', '<Esc>', ':close<CR>', {{buffer = buf, silent = true}})
-            \\  end
-            \\  -- Autocmd for cleanup
-            \\  vim.api.nvim_create_autocmd('BufWipeout', {{
-            \\    buffer = buf,
-            \\    once = true,
-            \\    callback = function()
-            \\      _G._zonvie_msg_split = nil
-            \\    end,
-            \\  }})
-            \\  -- Close on BufLeave (only when entered)
-            \\  if enter then
-            \\    vim.api.nvim_create_autocmd('BufLeave', {{
-            \\      buffer = buf,
-            \\      once = true,
-            \\      callback = function()
-            \\        if vim.api.nvim_win_is_valid(win) then
-            \\          vim.api.nvim_win_close(win, true)
-            \\        end
-            \\      end,
-            \\    }})
-            \\  end
-            \\end
-            \\-- Clear return_prompt first if needed, then create split
-            \\-- Use nested vim.schedule when clear_prompt to ensure <CR> is fully processed
-            \\if clear_prompt then
-            \\  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<cr>", true, false, true), "n", false)
-            \\  vim.schedule(function()
-            \\    vim.schedule(create_split)
-            \\  end)
-            \\else
-            \\  vim.schedule(create_split)
-            \\end
-        , .{ height, enter_str, clear_prompt_str, label_str, has_label_str });
+    /// Show (or update) the message split. Modelled on noice.nvim's
+    /// `NuiView:show()` (`view/nui.lua:274-289`): mounting and rendering are
+    /// independent, so a second message updates the existing split instead of
+    /// being dropped, and stale handles are repaired rather than trusted
+    /// (`view/nui.lua:249-272`).
+    ///
+    /// There is deliberately no `BufLeave` auto-close. noice attaches that to
+    /// popups but not to splits (`config/views.lua:99-106` vs `:73-86`): a
+    /// split you are meant to enter must survive being left.
+    ///
+    /// `return_prompt` is answered by the caller at the event layer, so this
+    /// no longer feeds a second `<CR>` of its own.
+    ///
+    /// `timeout_ms` of 0 means the split stays until dismissed. Otherwise the
+    /// timer is restarted on every show and stopped on close, mirroring
+    /// noice's `NuiView:autohide()` (`view/nui.lua:24-35`, called at the end of
+    /// `show()`); noice applies it to splits as well as popups.
+    pub fn createMessageSplit(
+        self: *Core,
+        content: []const u8,
+        line_count: u32,
+        enter: bool,
+        timeout_ms: u32,
+    ) !void {
+        // Overflow here surfaces as error.NoSpaceLeft, which callers only log,
+        // so the split would silently stop appearing. Keep generous headroom.
+        var lua_buf: [split_lua_buf_len]u8 = undefined;
+        const lua_code = try buildSplitLua(&lua_buf, line_count, enter, timeout_ms);
 
         // Send nvim_exec_lua with content as argument
         try self.requestExecLuaWithArg(lua_code, content);
-        self.log.write("rpc send: createMessageSplit (lines={d}, height={d}, enter={any}, label={?s})\n", .{ line_count, height, enter, label });
+        self.log.write("rpc send: createMessageSplit (lines={d}, height={d}, enter={any}, timeout_ms={d})\n", .{ line_count, splitHeight(line_count), enter, timeout_ms });
+    }
+
+    /// Buffer size `buildSplitLua` is written against. Exposed so a test can
+    /// check the template still fits with headroom rather than discovering
+    /// error.NoSpaceLeft in production, where it is only logged. 16 KiB:
+    /// the template grew past half of 8 KiB when the enter/leave timer
+    /// autocmds were added, and the headroom test demands ≥2x slack.
+    pub const split_lua_buf_len = 16384;
+
+    /// Window height for the split: at least one line, at most 20.
+    pub fn splitHeight(line_count: u32) u32 {
+        return @max(1, @min(line_count, 20));
+    }
+
+    /// Render the split-view Lua into `buf`. Pure: no Core, no I/O, so the
+    /// generated program can be asserted on directly. Everything the split
+    /// does — whether it takes focus, whether it auto-hides, how it closes —
+    /// is decided by this text, and previously nothing checked it.
+    ///
+    /// Keep explanation in Zig comments like this one rather than inside the
+    /// `\\` literal: comments in there are RPC payload, re-sent and re-lexed
+    /// on every split, and they spend the buffer budget below.
+    ///
+    /// Two QuitPre limits are accepted rather than worked around, both from
+    /// its own semantics (measured against nvim 0.12.2):
+    ///   * QuitPre fires before the can-quit check, so a `:q` that then
+    ///     aborts (E37, no write since last change) has still closed the
+    ///     split. Declining would mean predicting the abort, and guessing
+    ///     from 'modified' gets `:q!` wrong in the direction that strands
+    ///     the split as the session's last window.
+    ///   * `:close` and `:tabclose` do not fire QuitPre at all, so they can
+    ///     still leave the split as the last window. Not a lock: `:q` there
+    ///     takes the `cur == state.win` branch and Neovim exits normally.
+    /// Nothing user-controlled is interpolated into the program below: only
+    /// integers and two literal booleans. The message text travels as a
+    /// msgpack argument, never as source. Keep it that way — a formatted
+    /// string here would need Lua-literal escaping to stay injection-safe.
+    pub fn buildSplitLua(
+        buf: []u8,
+        line_count: u32,
+        enter: bool,
+        timeout_ms: u32,
+    ) ![]const u8 {
+        const height = splitHeight(line_count);
+        const enter_str = if (enter) "true" else "false";
+        return std.fmt.bufPrint(buf,
+            \\local content = ...
+            \\local height = {d}
+            \\local enter = {s}
+            \\local timeout = {d}
+            \\local uv = vim.uv or vim.loop
+            \\local function show()
+            \\  local state = _G._zonvie_msg_split or {{}}
+            \\  _G._zonvie_msg_split = state
+            \\  -- Repair stale handles instead of trusting them.
+            \\  if state.buf and not vim.api.nvim_buf_is_valid(state.buf) then state.buf = nil end
+            \\  if state.win and not vim.api.nvim_win_is_valid(state.win) then state.win = nil end
+            \\  local function stop_timer()
+            \\    -- Bumping the generation invalidates any close that
+            \\    -- schedule_wrap has already queued: stopping the handle
+            \\    -- cannot retract an entry that is waiting to drain.
+            \\    state.gen = (state.gen or 0) + 1
+            \\    if state.timer then
+            \\      state.timer:stop()
+            \\      if not state.timer:is_closing() then state.timer:close() end
+            \\      state.timer = nil
+            \\    end
+            \\  end
+            \\  local function close()
+            \\    stop_timer()
+            \\    if state.win and vim.api.nvim_win_is_valid(state.win) then
+            \\      pcall(vim.api.nvim_win_close, state.win, true)
+            \\    end
+            \\    state.win = nil
+            \\  end
+            \\  state.close = close
+            \\  state.timeout = timeout
+            \\  local function arm_timer()
+            \\    stop_timer()
+            \\    if state.timeout > 0 then
+            \\      local gen = state.gen
+            \\      state.timer = uv.new_timer()
+            \\      state.timer:start(state.timeout, 0, vim.schedule_wrap(function()
+            \\        if state.gen == gen then state.close() end
+            \\      end))
+            \\    end
+            \\  end
+            \\  if not state.buf then
+            \\    local ok, buf = pcall(vim.api.nvim_create_buf, false, true)
+            \\    if not ok then return end
+            \\    state.buf = buf
+            \\    pcall(function()
+            \\      vim.bo[buf].buftype = 'nofile'
+            \\      vim.bo[buf].bufhidden = 'hide'
+            \\      vim.bo[buf].buflisted = false
+            \\    end)
+            \\  end
+            \\  -- A window that no longer shows our buffer is not ours to
+            \\  -- reuse: the buffer was wiped (`:bd!`), or the user opened a
+            \\  -- file in the split. Forget it and mount a fresh split rather
+            \\  -- than seating our buffer back into it — re-seating would
+            \\  -- hijack the user's window, and the keymaps and pause
+            \\  -- autocmds only get registered on the mount path, so the
+            \\  -- result would be a split that `q` and `<Esc>` cannot close.
+            \\  if state.win and vim.api.nvim_win_get_buf(state.win) ~= state.buf then
+            \\    state.win = nil
+            \\  end
+            \\  local lines = vim.split((content:gsub('\r', '')), '\n')
+            \\  -- Always re-render: content is independent of mount state.
+            \\  vim.bo[state.buf].modifiable = true
+            \\  pcall(vim.api.nvim_buf_set_lines, state.buf, 0, -1, false, lines)
+            \\  vim.bo[state.buf].modifiable = false
+            \\  if not state.win then
+            \\    local ok, win = pcall(vim.api.nvim_open_win, state.buf, enter, {{
+            \\      split = 'below',
+            \\      height = height,
+            \\    }})
+            \\    if not ok then return end
+            \\    state.win = win
+            \\    pcall(function() vim.wo[win].wrap = true end)
+            \\    for _, key in ipairs({{ 'q', '<Esc>' }}) do
+            \\      vim.keymap.set('n', key, function() state.close() end,
+            \\        {{ buffer = state.buf, silent = true, nowait = true }})
+            \\    end
+            \\    local grp = vim.api.nvim_create_augroup('ZonvieMsgSplit', {{ clear = true }})
+            \\    vim.api.nvim_create_autocmd('WinClosed', {{
+            \\      group = grp, pattern = tostring(win), once = true,
+            \\      -- Closing the split while the cursor is inside fires
+            \\      -- BufLeave first, which re-arms a fresh timer. Nothing
+            \\      -- would ever close that handle: measured with uv.walk, one
+            \\      -- libuv timer leaked per split close. (The generation token
+            \\      -- already stops the orphan from closing a later split, so
+            \\      -- this is a handle-leak fix, not a correctness one.)
+            \\      callback = function() stop_timer() state.win = nil end,
+            \\    }})
+            \\    -- Zonvie addition (noice has no equivalent): the split must
+            \\    -- not be what keeps Neovim alive. On the last real window,
+            \\    -- close it first so `:q` still quits.
+            \\    vim.api.nvim_create_autocmd('QuitPre', {{
+            \\      group = grp,
+            \\      callback = function()
+            \\        if not (state.win and vim.api.nvim_win_is_valid(state.win)) then return end
+            \\        local cur = vim.api.nvim_get_current_win()
+            \\        -- Quitting the split itself: Neovim is already closing
+            \\        -- that window, so let it, and let WinClosed sync the
+            \\        -- state. Defensive — on 0.12.2 closing it here is
+            \\        -- tolerated (the quit simply aborts), but nothing in the
+            \\        -- API promises that.
+            \\        if cur == state.win then return end
+            \\        -- Quitting a float never ends the session, and floats are
+            \\        -- not counted below, so acting on one would close the
+            \\        -- split spuriously — dismissing an LSP hover with `:q`
+            \\        -- took the split with it. Checked before every close
+            \\        -- decision, including the alone-in-its-tabpage one.
+            \\        if vim.api.nvim_win_get_config(cur).relative ~= '' then return end
+            \\        -- Count the real windows sharing the SPLIT's tabpage,
+            \\        -- which is not necessarily the quitting one.
+            \\        local split_tab = vim.api.nvim_win_get_tabpage(state.win)
+            \\        local others = 0
+            \\        for _, w in ipairs(vim.api.nvim_tabpage_list_wins(split_tab)) do
+            \\          if w ~= state.win and vim.api.nvim_win_get_config(w).relative == '' then
+            \\            others = others + 1
+            \\          end
+            \\        end
+            \\        -- The split is alone in its tabpage, so it can never be
+            \\        -- what the user wants to keep — but only act when THIS
+            \\        -- quit would actually leave it as the session's last
+            \\        -- window: the quitting window must be the last real one
+            \\        -- in its own tabpage, and that tabpage the last besides
+            \\        -- the split's. Closing unconditionally instead destroyed
+            \\        -- a whole tabpage on a `:q` that left windows behind;
+            \\        -- guarding on the tabpage match instead let `:q` in the
+            \\        -- last other tab leave the split as the only window.
+            \\        if others == 0 then
+            \\          local cur_tab = vim.api.nvim_get_current_tabpage()
+            \\          local cur_others = 0
+            \\          for _, w in ipairs(vim.api.nvim_tabpage_list_wins(cur_tab)) do
+            \\            if w ~= cur and vim.api.nvim_win_get_config(w).relative == '' then
+            \\              cur_others = cur_others + 1
+            \\            end
+            \\          end
+            \\          if cur_others == 0 and #vim.api.nvim_list_tabpages() <= 2 then state.close() end
+            \\          return
+            \\        end
+            \\        -- Beyond that the split only matters to a quit in its own
+            \\        -- tabpage: the count above is per-tabpage, so acting on a
+            \\        -- `:q` elsewhere would close a split it never needed to.
+            \\        if split_tab ~= vim.api.nvim_get_current_tabpage() then return end
+            \\        if others <= 1 then state.close() end
+            \\      end,
+            \\    }})
+            \\    -- The cursor entering the split pauses the auto-hide
+            \\    -- countdown (the user is reading it); leaving re-arms the
+            \\    -- full timeout. This BufLeave only re-arms a timer — it
+            \\    -- never closes the window.
+            \\    vim.api.nvim_create_autocmd('BufEnter', {{
+            \\      group = grp, buffer = state.buf,
+            \\      callback = function() stop_timer() end,
+            \\    }})
+            \\    vim.api.nvim_create_autocmd('BufLeave', {{
+            \\      group = grp, buffer = state.buf,
+            \\      callback = function() arm_timer() end,
+            \\    }})
+            \\  else
+            \\    pcall(vim.api.nvim_win_set_height, state.win, height)
+            \\  end
+            \\  if state.win and vim.api.nvim_win_is_valid(state.win) then
+            \\    pcall(vim.api.nvim_win_set_cursor, state.win, {{ 1, 0 }})
+            \\    -- enter applies on EVERY show, not just the mount:
+            \\    -- nvim_open_win only takes focus when it creates the
+            \\    -- window, so a re-show into a live split must move the
+            \\    -- cursor itself. Runs before the arming decision below so
+            \\    -- the pause logic sees the final cursor location.
+            \\    if enter and vim.api.nvim_get_current_win() ~= state.win then
+            \\      pcall(vim.api.nvim_set_current_win, state.win)
+            \\    end
+            \\  end
+            \\  -- Restart the auto-hide timer on every show, unless the
+            \\  -- cursor currently sits inside the split — the user is
+            \\  -- reading it, so the countdown stays paused until they leave.
+            \\  if state.win and vim.api.nvim_get_current_win() == state.win then
+            \\    stop_timer()
+            \\  else
+            \\    arm_timer()
+            \\  end
+            \\end
+            \\vim.schedule(show)
+        , .{ height, enter_str, timeout_ms });
     }
 
     /// Execute Lua code in Neovim via nvim_exec_lua with a string argument.

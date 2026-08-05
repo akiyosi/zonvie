@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const gui_io = @import("../../gui_io.zig");
 const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 
@@ -42,5 +43,37 @@ pub fn open(alloc: std.mem.Allocator) !*Gui {
     driver.platform.pinWindow(g.app_pid, 80, 80);
     try g.exec("execute('set guicursor+=a:blinkon0')");
     try g.exec("execute('set guifont=" ++ guifont ++ "')");
+    try waitStableGrid(g);
     return g;
+}
+
+/// Wait until the editor grid stops resizing.
+///
+/// Setting `guifont` above makes the app recompute cell metrics and push a
+/// new grid size to nvim asynchronously. A scenario that lays windows out
+/// before that lands captures a different geometry from run to run —
+/// `:vsplit` halves the CURRENT width, so the divider ends up in a different
+/// column depending on whether the resize won the race. captureStable cannot
+/// save it: by then the split has already happened and the image is stable,
+/// just stable at the wrong geometry.
+fn waitStableGrid(g: *Gui) !void {
+    const settle_polls = 3;
+    var timer = gui_io.Timer.start();
+    var last: i64 = -1;
+    var same: u32 = 0;
+    while (true) {
+        if (timer.read() / std.time.ns_per_ms >= 15_000) return error.Timeout;
+        const cols = g.evalInt("&columns") catch {
+            gui_io.sleepNs(150 * std.time.ns_per_ms);
+            continue;
+        };
+        if (cols == last) {
+            same += 1;
+            if (same >= settle_polls) return;
+        } else {
+            same = 0;
+        }
+        last = cols;
+        gui_io.sleepNs(150 * std.time.ns_per_ms);
+    }
 }

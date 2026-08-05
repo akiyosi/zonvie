@@ -143,44 +143,25 @@ external = true
 external = true
 msg_pos = { ext-float = "window", mini = "grid" }  # display, window, or grid
 
-# Message routing rules (processed in order, first match wins)
+# Where each class of message goes. These retarget the built-in routes, so
+# most setups need nothing else.
+view = "ext-float"          # ordinary messages
+view_error = "ext-float"    # emsg, echoerr, lua_error, rpc_error
+view_warn = "ext-float"     # wmsg
+view_history = "split"      # :messages / :history
+view_search = "mini"        # search_count
+
+# Optional rules for anything the settings above cannot express. They are
+# prepended to the built-in routes, never a replacement: events you do not
+# mention keep their defaults.
 [[messages.routes]]
 event = "msg_show"
-kind = ["emsg", "echoerr", "lua_error", "rpc_error"]
-view = "ext-float"
-timeout = 0  # 0 = no auto-hide
-
-[[messages.routes]]
-event = "msg_show"
-kind = ["wmsg"]
-view = "ext-float"
-timeout = 4.0
-
-[[messages.routes]]
-event = "msg_show"
-kind = ["search_count"]
-view = "mini"
-timeout = 2.0
-
-[[messages.routes]]
-event = "msg_show"
-view = "ext-float"  # fallback for other msg_show
-
-[[messages.routes]]
-event = "msg_showmode"
-view = "mini"
-
-[[messages.routes]]
-event = "msg_showcmd"
-view = "mini"
+min_height = 20             # long output is easier to read in a split
+view = "split"
 
 [[messages.routes]]
 event = "msg_ruler"
-view = "mini"
-
-[[messages.routes]]
-event = "msg_history_show"
-view = "split"
+skip = true                 # hide it outright
 
 [tabline]
 external = true
@@ -283,20 +264,48 @@ paths = [
 |-----|-------------|
 | `external` | Use external messages UI (true/false) |
 | `msg_pos` | Position anchor for message views: `{ ext-float = "...", mini = "..." }`. Values: "display", "window", "grid" |
+| `view` | View for ordinary messages (default "ext-float") |
+| `view_error` | View for errors: emsg, echoerr, lua_error, rpc_error (default "ext-float") |
+| `view_warn` | View for warnings: wmsg (default "ext-float") |
+| `view_history` | View for `:messages` / `:history` (default "split") |
+| `view_search` | View for search_count (default "mini") |
+
+View types are "mini", "ext-float", "confirm", "split", "none" and
+"notification". Each view has its own auto-hide default: "mini" and
+"ext-float" hide after 4 seconds, while "split", "confirm" and
+"notification" stay until dismissed. A route's `timeout` overrides that.
 
 ##### [[messages.routes]]
 
-Message routing rules are processed in order; first match wins.
+Routes you declare are consulted **before** the built-in ones and never
+replace them, so declaring a rule for `msg_show` leaves `:messages` and the
+mode/command indicators on their defaults. The first match wins.
 
 | Key | Description |
 |-----|-------------|
-| `event` | Event type: "msg_show", "msg_showmode", "msg_showcmd", "msg_ruler", "msg_history_show" |
-| `kind` | Array of message kinds to match (optional, omit to match all). Kinds: "emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "search_count", "confirm", "confirm_sub", "return_prompt", etc. |
-| `view` | View type: "mini", "ext-float", "confirm", "split", "none", "notification" |
+| `event` | Event type: "msg_show", "msg_showmode", "msg_showcmd", "msg_ruler", "msg_history_show" (optional, omit to match all) |
+| `kind` | Array of message kinds to match (optional, omit to match all). Kinds: "emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "search_count", "shell_out", etc. Interactive prompt kinds are not matchable — see below. |
+| `level` | Match by severity instead of kind: "info", "warn" or "error" (optional) |
+| `view` | View type (see above) |
 | `timeout` | Auto-hide timeout in seconds (optional, 0 = no auto-hide) |
 | `min_height` | Minimum line count to match (optional) |
 | `max_height` | Maximum line count to match (optional) |
-| `auto_dismiss` | Auto-dismiss return_prompt by sending \<CR\> (optional, default depends on view) |
+| `skip` | Do not display this message at all (optional) |
+| `enter` | Whether showing the message moves the cursor into the view (optional). Only meaningful for "split" — the ext-float view is a synthetic grid the Neovim cursor cannot enter. Unset means the channel default: `:messages` takes the cursor, routed messages do not. Entering applies on every show, not just the first: re-running `:messages` while its split is open moves the cursor back into it, and a routed message with `enter = true` takes focus each time it fires — including while you are typing, so prefer it only for messages you explicitly ask for. If a show lands mid-insert, insert mode continues inside the split, and keystrokes may leak into its scratch buffer until you leave (an upstream Neovim quirk; the next message repaints it). Press `<Esc>` and `q` to get out. |
+
+`return_prompt` is never routed: Zonvie answers the press-enter prompt for
+you, because the message it is confirming has already been displayed.
+
+Interactive prompts ("confirm", "confirm_sub", "number_prompt") are not
+configurable: they always reach the confirm view, with no timeout. Neovim
+blocks until one is answered, so a route that sent a prompt to another view,
+skipped it, or let it auto-hide would hang the editor on a question the user
+cannot see or answer. Such routes are overridden, including a route that
+targets "confirm" itself but attaches a timeout.
+
+("confirm" and "confirm_sub" never enter routing at all — they are handled
+as a single live dialog rather than as messages — so the override exists for
+"number_prompt" and to keep the guarantee independent of that.)
 
 #### [tabline]
 | Key | Description |
