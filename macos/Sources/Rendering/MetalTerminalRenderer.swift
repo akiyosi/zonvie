@@ -741,7 +741,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var fixedFloatRectInputData: [FixedFloatRect] = []
     private var fixedFloatMaskOverflowed = false
     private var fixedFloatYEdgesScratch: [Float] = []
-    private var fixedFloatIntervalsScratch: [FixedFloatInterval] = []
+    private var fixedFloatXEdgesScratch: [Float] = []
+    private var fixedFloatCoveringScratch: [FixedFloatRect] = []
     // setFragmentBytes is limited to 4096 bytes. Sixteen arbitrary rectangles
     // produce at most 31 bands and 496 intervals, fitting both buffers. When
     // this limit is exceeded the caller disables smooth scrolling for the
@@ -816,14 +817,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // stretch paints the edge row's background over the retained row's own,
         // so the band shows one row's glyphs on its neighbour's background.
         var pin_edges: Int32 = 1
+        // The scrolled grid's zindex (0 for windows, > 0 for floats). The
+        // fragment guard only discards scrolled content under a STRICTLY
+        // higher-z fixed float — see Shaders.metal insideFixedFloatAbove.
+        var zindex: Int32 = 0
     }
 
-    // FixedFloatRect struct matching Shaders.metal (drawable pixel edges).
+    // Fixed-float rect in drawable pixel edges, carrying the float's zindex
+    // for the z-aware mask (see Shaders.metal insideFixedFloatAbove).
     struct FixedFloatRect: Equatable {
         var x0: Float
         var x1: Float
         var top: Float
         var bottom: Float
+        var zindex: Int32
     }
 
     // Matches Shaders.metal. Bands are sorted from top to bottom; intervals
@@ -838,6 +845,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     struct FixedFloatInterval {
         var x0: Float
         var x1: Float
+        // Max zindex of the fixed floats covering this segment; overlapping
+        // rects are split at their x edges so one value is always exact.
+        var z: Float = 0
     }
 
     /// Set the fixed (non-following) float rects used by the fragment shader to
@@ -868,64 +878,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         fixedFloatMaskOverflowed = false
         fixedFloatRectInputData.removeAll(keepingCapacity: true)
         fixedFloatRectInputData.append(contentsOf: rects)
-        fixedFloatBandData.removeAll(keepingCapacity: true)
-        fixedFloatIntervalData.removeAll(keepingCapacity: true)
-        fixedFloatYEdgesScratch.removeAll(keepingCapacity: true)
 
-        guard !rects.isEmpty else { return true }
-
-        for rect in rects where rect.x0 < rect.x1 && rect.top < rect.bottom {
-            fixedFloatYEdgesScratch.append(rect.top)
-            fixedFloatYEdgesScratch.append(rect.bottom)
-        }
-        guard fixedFloatYEdgesScratch.count >= 2 else { return true }
-
-        fixedFloatYEdgesScratch.sort(by: <)
-        var uniqueCount = 1
-        for i in 1..<fixedFloatYEdgesScratch.count {
-            if fixedFloatYEdgesScratch[i] != fixedFloatYEdgesScratch[uniqueCount - 1] {
-                fixedFloatYEdgesScratch[uniqueCount] = fixedFloatYEdgesScratch[i]
-                uniqueCount += 1
-            }
-        }
-        if uniqueCount < fixedFloatYEdgesScratch.count {
-            fixedFloatYEdgesScratch.removeLast(fixedFloatYEdgesScratch.count - uniqueCount)
-        }
-
-        for edgeIndex in 0..<(fixedFloatYEdgesScratch.count - 1) {
-            let top = fixedFloatYEdgesScratch[edgeIndex]
-            let bottom = fixedFloatYEdgesScratch[edgeIndex + 1]
-            let sampleY = (top + bottom) * 0.5
-
-            fixedFloatIntervalsScratch.removeAll(keepingCapacity: true)
-            for rect in rects
-                where rect.x0 < rect.x1 && sampleY > rect.top && sampleY < rect.bottom
-            {
-                fixedFloatIntervalsScratch.append(FixedFloatInterval(x0: rect.x0, x1: rect.x1))
-            }
-            guard !fixedFloatIntervalsScratch.isEmpty else { continue }
-            fixedFloatIntervalsScratch.sort { lhs, rhs in
-                lhs.x0 == rhs.x0 ? lhs.x1 < rhs.x1 : lhs.x0 < rhs.x0
-            }
-
-            let start = fixedFloatIntervalData.count
-            var merged = fixedFloatIntervalsScratch[0]
-            for interval in fixedFloatIntervalsScratch.dropFirst() {
-                if interval.x0 <= merged.x1 {
-                    merged.x1 = max(merged.x1, interval.x1)
-                } else {
-                    fixedFloatIntervalData.append(merged)
-                    merged = interval
-                }
-            }
-            fixedFloatIntervalData.append(merged)
-            fixedFloatBandData.append(FixedFloatBand(
-                top: top,
-                bottom: bottom,
-                intervalStart: UInt32(start),
-                intervalCount: UInt32(fixedFloatIntervalData.count - start)
-            ))
-        }
+        buildSurfaceFixedFloatMask(
+            rects: rects,
+            bands: &fixedFloatBandData,
+            intervals: &fixedFloatIntervalData,
+            yEdgesScratch: &fixedFloatYEdgesScratch,
+            xEdgesScratch: &fixedFloatXEdgesScratch,
+            coveringScratch: &fixedFloatCoveringScratch
+        )
         return true
     }
 
@@ -2134,6 +2095,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // (frame + content) by the underlying window's sub-cell scroll offset,
         // rather than scroll their content within a fixed frame.
         var clipToContent: Bool = true
+        // The scrolled grid's zindex (0 for windows, > 0 for floats). The
+        // fixed-float guard only discards this grid's scrolled content under
+        // fixed floats with a STRICTLY higher zindex, so a float scrolling
+        // above its own backdrop keeps drawing.
+        var zindex: Int32 = 0
     }
 
     /// - Parameters:
@@ -2182,7 +2148,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 offset_y: ndc,
                 content_top_y: contentTopY,
                 content_bottom_y: contentBottomY,
-                move_all: info.clipToContent ? 0 : 1
+                move_all: info.clipToContent ? 0 : 1,
+                zindex: info.zindex
             ))
         }
         // Shaders.metal uses binary search for the per-vertex grid lookup.
@@ -2256,7 +2223,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             offset_y: ndc,
             content_top_y: contentTopY,
             content_bottom_y: contentBottomY,
-            move_all: info.clipToContent ? 0 : 1
+            move_all: info.clipToContent ? 0 : 1,
+            zindex: info.zindex
         )
     }
 
