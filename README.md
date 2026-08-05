@@ -291,6 +291,7 @@ mode/command indicators on their defaults. The first match wins.
 | `min_height` | Minimum line count to match (optional) |
 | `max_height` | Maximum line count to match (optional) |
 | `skip` | Do not display this message at all (optional) |
+| `enter` | Whether showing the message moves the cursor into the view (optional). Only meaningful for "split" — the ext-float view is a synthetic grid the Neovim cursor cannot enter. Unset means the channel default: `:messages` takes the cursor, routed messages do not. Entering applies on every show, not just the first: re-running `:messages` while its split is open moves the cursor back into it, and a routed message with `enter = true` takes focus each time it fires — including while you are typing, so prefer it only for messages you explicitly ask for. If a show lands mid-insert, insert mode continues inside the split, and keystrokes may leak into its scratch buffer until you leave (an upstream Neovim quirk; the next message repaints it). Press `<Esc>` and `q` to get out. |
 
 `return_prompt` is never routed: Zonvie answers the press-enter prompt for
 you, because the message it is confirming has already been displayed.

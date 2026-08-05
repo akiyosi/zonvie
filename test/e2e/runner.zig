@@ -292,6 +292,11 @@ test "e2e:msg_split_close_key" {
     try @import("scenarios/msg_split_close_key.zig").run(testing.allocator);
 }
 
+test "e2e:msg_split_enter" {
+    try requireNvim();
+    try @import("scenarios/msg_split_enter.zig").run(testing.allocator);
+}
+
 test "e2e:msg_history_content" {
     try requireNvim();
     try @import("scenarios/msg_history_content.zig").run(testing.allocator);

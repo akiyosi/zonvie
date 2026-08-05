@@ -16,9 +16,17 @@
 // Checking "exactly once" on round 3 is what catches that; a length check or a
 // "some history text is on screen" check would not.
 //
+// A final phase pins the OTHER repeat shape: `:messages` again while the
+// split is still open. The history channel's default is enter=true, and
+// enter applies on every show — so the re-show must move the cursor back
+// into the live split, not just re-render it. That is a deliberate behavior
+// change from the mount-only era and this is the only place that pins it
+// for the default (no user routes) configuration.
+//
 // Ordering discipline: every assertion follows an ordered signal. Appearance is
 // a rising window-count edge plus the cursor landing on the split's own grid
-// (`:messages` mounts with enter=true, flush.zig:9047); dismissal is a falling
+// (`:messages` enters by channel default — the split arm of showChannelView
+// resolves `state.enter orelse (ch == .history)`); dismissal is a falling
 // edge observed strictly after the cursor was there; a round's `echomsg` is
 // only considered delivered once its text is visible in the ext_float grid.
 
@@ -147,4 +155,48 @@ pub fn run(alloc: std.mem.Allocator) !void {
         };
         try h.waitCursorGrid(buffer_grid, h.opts.timeout_ms);
     }
+
+    // Final phase: `:messages` again while the split is STILL OPEN. The
+    // channel default is enter=true, and enter applies on every show, so the
+    // re-show into the live window must take the cursor back — the mount-only
+    // era left it where it was, and no other scenario pins the default here.
+    try h.command("messages");
+    try h.waitWindowCount(start_windows + 1, h.opts.timeout_ms);
+    const split_grid = try findSplitGrid(h, alloc, buffer_grid);
+    try h.waitCursorGrid(split_grid, h.opts.timeout_ms);
+
+    try h.command("wincmd p");
+    try h.waitCursorGrid(buffer_grid, h.opts.timeout_ms);
+
+    try h.command("echomsg 'reshow-marker-end'");
+    // Ordered signal: the new entry visible in the ext_float grid proves it
+    // entered history before the re-show is requested.
+    try h.waitUntil(NeedleCtx{ .needle = "reshow-marker-end" }, struct {
+        fn check(c: NeedleCtx, hh: *Harness) bool {
+            return floatHas(hh, c.needle);
+        }
+    }.check, h.opts.timeout_ms);
+
+    try h.command("messages");
+    // The window count does not change — same live split. The content
+    // updating to include the new entry proves the re-show was assembled and
+    // queued (msg_split_buf is only rebuilt by the split arm), which is
+    // enough ordering here because the cursor check below is itself a
+    // bounded wait, not a one-shot assert. The cursor landing back inside is
+    // the behavior under test.
+    try h.waitUntil(NeedleCtx{ .needle = "reshow-marker-end" }, struct {
+        fn check(c: NeedleCtx, hh: *Harness) bool {
+            const text = hh.splitContentAlloc(hh.alloc) catch return false;
+            defer hh.alloc.free(text);
+            return std.mem.indexOf(u8, text, c.needle) != null;
+        }
+    }.check, h.opts.timeout_ms);
+    h.waitCursorGrid(split_grid, h.opts.timeout_ms) catch |e| {
+        std.debug.print(
+            "[e2e] msg_history_repeat: re-show into the live split did not move the cursor " ++
+                "(default :messages must enter on every show)\n",
+            .{},
+        );
+        return e;
+    };
 }

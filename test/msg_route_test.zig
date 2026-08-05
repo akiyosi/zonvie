@@ -208,6 +208,32 @@ test "not even a confirm-targeting route can time out a blocking prompt" {
     try std.testing.expectEqual(@as(f32, 5.0), r2.route(.msg_show, "echo", 1).timeout);
 }
 
+test "a route's enter reaches the result; unset stays the channel default" {
+    // `enter` rides the route like `timeout` does. null must survive to the
+    // dispatch layer untouched — it means "channel default" (`:messages`
+    // enters, routed messages do not), and resolving it here would lose
+    // which channel is asking.
+    const user = [_]MsgRoute{
+        .{ .filter = .{ .event = .msg_show, .kinds = &.{"echo"} }, .view = .split, .opts = .{ .enter = true } },
+        .{ .filter = .{ .event = .msg_history_show }, .view = .split, .opts = .{ .enter = false } },
+    };
+    const r: Router = .{ .user_routes = &user };
+    try std.testing.expectEqual(@as(?bool, true), r.route(.msg_show, "echo", 1).enter);
+    try std.testing.expectEqual(@as(?bool, false), r.route(.msg_history_show, "", 1).enter);
+    // No route sets it: the default routes leave it null.
+    try std.testing.expectEqual(@as(?bool, null), r.route(.msg_show, "emsg", 1).enter);
+}
+
+test "pinned prompts carry no enter override" {
+    // The confirm view is a frontend dialog with no cursor; the pin must not
+    // invent an enter value a broad user route could otherwise smuggle in.
+    const user = [_]MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .split, .opts = .{ .enter = true } },
+    };
+    const r: Router = .{ .user_routes = &user };
+    try std.testing.expectEqual(@as(?bool, null), r.route(.msg_show, "number_prompt", 1).enter);
+}
+
 test "return_prompt is identified for event-layer dismissal" {
     try std.testing.expect(msg_route.isReturnPrompt("return_prompt"));
     try std.testing.expect(!msg_route.isReturnPrompt("confirm"));

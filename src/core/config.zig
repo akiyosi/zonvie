@@ -453,6 +453,7 @@ pub const Config = struct {
                         .opts = .{
                             .skip = r.skip orelse false,
                             .timeout = r.timeout,
+                            .enter = r.enter,
                         },
                     }) catch {
                         if (kinds) |ks| {
@@ -829,6 +830,7 @@ const TomlRoute = struct {
     min_height: ?u32 = null,
     max_height: ?u32 = null,
     skip: ?bool = null,
+    enter: ?bool = null,
 };
 
 const TomlTabline = struct {
@@ -924,6 +926,23 @@ test "named view settings need no routes at all" {
     try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_history_show, "", 1).view);
     // Untouched settings keep their defaults.
     try std.testing.expectEqual(MsgViewType.mini, cfg.routeMessage(.msg_show, "search_count", 1).view);
+}
+
+test "enter parses from TOML and stays unset when omitted" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[[messages.routes]]
+        \\event = "msg_history_show"
+        \\view = "split"
+        \\enter = false
+        \\
+        \\[[messages.routes]]
+        \\event = "msg_show"
+        \\view = "split"
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(?bool, false), cfg.routeMessage(.msg_history_show, "", 1).enter);
+    try std.testing.expectEqual(@as(?bool, null), cfg.routeMessage(.msg_show, "echo", 1).enter);
 }
 
 test "skip hides a route explicitly" {

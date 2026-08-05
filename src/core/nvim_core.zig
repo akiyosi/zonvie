@@ -5130,6 +5130,14 @@ pub const Core = struct {
             \\  end
             \\  if state.win and vim.api.nvim_win_is_valid(state.win) then
             \\    pcall(vim.api.nvim_win_set_cursor, state.win, {{ 1, 0 }})
+            \\    -- enter applies on EVERY show, not just the mount:
+            \\    -- nvim_open_win only takes focus when it creates the
+            \\    -- window, so a re-show into a live split must move the
+            \\    -- cursor itself. Runs before the arming decision below so
+            \\    -- the pause logic sees the final cursor location.
+            \\    if enter and vim.api.nvim_get_current_win() ~= state.win then
+            \\      pcall(vim.api.nvim_set_current_win, state.win)
+            \\    end
             \\  end
             \\  -- Restart the auto-hide timer on every show, unless the
             \\  -- cursor currently sits inside the split — the user is

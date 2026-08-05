@@ -136,6 +136,12 @@ pub const RouteOpts = struct {
     skip: bool = false,
     /// Seconds before auto-hide. null = view default, 0 = never auto-hide.
     timeout: ?f32 = null,
+    /// Whether showing the message moves the cursor into the view. Only the
+    /// split view can take the cursor — ext_float is a synthetic grid the
+    /// Neovim cursor cannot enter — so this is ignored elsewhere.
+    /// null = the channel default: `:messages` enters, routed messages do not
+    /// (noice `config/views.lua:75` vs `:91-94`).
+    enter: ?bool = null,
 };
 
 pub const MsgRoute = struct {
@@ -161,6 +167,8 @@ pub const RouteResult = struct {
     timeout: f32,
     /// True when a route matched with `skip`. Callers must not display.
     skip: bool,
+    /// Cursor-entry override for the split view. null = channel default.
+    enter: ?bool = null,
 };
 
 /// Timeout for the transient views when a route does not override it.
@@ -219,7 +227,7 @@ pub const Router = struct {
         // otherwise leave Neovim blocked on a question the user cannot see,
         // cannot answer, or that vanishes while it still blocks.
         if (event == .msg_show and isInteractivePrompt(kind)) {
-            return .{ .view = .confirm, .timeout = 0, .skip = false };
+            return .{ .view = .confirm, .timeout = 0, .skip = false, .enter = null };
         }
         for (self.user_routes) |r| {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
@@ -237,6 +245,7 @@ pub const Router = struct {
             .view = view,
             .timeout = r.opts.timeout orelse viewDefaultTimeout(view),
             .skip = r.opts.skip,
+            .enter = r.opts.enter,
         };
     }
 };

@@ -54,6 +54,10 @@ pub const ViewState = struct {
     count: u32 = 0,
     /// Largest timeout among the assigned messages, in seconds. 0 = no auto-hide.
     timeout: f32 = 0,
+    /// Cursor-entry override across the assigned messages: any route saying
+    /// true wins over false, false over null (the channel default). One view
+    /// instance shows the whole cycle, so per-message values must merge.
+    enter: ?bool = null,
 };
 
 pub const ViewSet = struct {
@@ -73,6 +77,7 @@ pub const ViewSet = struct {
         for (&self.states) |*s| {
             s.count = 0;
             s.timeout = 0;
+            s.enter = null;
         }
         self.assigned.clearRetainingCapacity();
         try self.assigned.ensureTotalCapacity(alloc, message_count);
@@ -81,12 +86,17 @@ pub const ViewSet = struct {
 
     /// Assign message `index` to `view`. Out-of-range indices are ignored so a
     /// caller that grew its message list mid-cycle cannot corrupt state.
-    pub fn assign(self: *ViewSet, index: usize, view: MsgViewType, timeout: f32) void {
+    pub fn assign(self: *ViewSet, index: usize, view: MsgViewType, timeout: f32, enter: ?bool) void {
         if (index >= self.assigned.items.len) return;
         self.assigned.items[index] = view;
         const s = &self.states[@intFromEnum(view)];
         s.count += 1;
         if (timeout > s.timeout) s.timeout = timeout;
+        // true > false > null: taking focus is the stronger request, and an
+        // explicit false must still beat the unset channel default.
+        if (enter) |e| {
+            if (e or s.enter == null) s.enter = e;
+        }
     }
 
     pub fn assignedTo(self: *const ViewSet, index: usize) MsgViewType {

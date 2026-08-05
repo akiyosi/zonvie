@@ -8866,7 +8866,7 @@ pub fn sendMsgShow(self: *Core) bool {
         // return_prompt never reaches this loop — answerReturnPrompts removed
         // it above — so every remaining message routes normally.
         const route_result = self.msg_config.routeMessage(.msg_show, msg.kind, total_line_count);
-        views.assign(i, route_result.view, route_result.timeout);
+        views.assign(i, route_result.view, route_result.timeout, route_result.enter);
 
         self.log.write("[msg] sendMsgShow: kind={s} lines={d} routed to view={s} timeout={d:.1}\n", .{
             msg.kind,
@@ -9050,14 +9050,15 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 return true;
             }
 
-            // enter differs per channel: routed messages must not steal the
+            // enter defaults per channel: routed messages must not steal the
             // cursor (noice's `split` view is `enter = false`,
             // config/views.lua:75), while `:messages` is content the user
-            // asked to read, so it takes focus (:91-94).
+            // asked to read, so it takes focus (:91-94). A route's `enter`
+            // overrides the default in either direction.
             self.createMessageSplit(
                 buf.items,
                 line_count,
-                ch == .history,
+                state.enter orelse (ch == .history),
                 messageTimeoutMs(state.timeout),
             ) catch |e| {
                 // Both channels fail the dispatch. Swallowing this for .show
@@ -9850,7 +9851,7 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
     if (entries.len > 0) {
         const route_result = self.msg_config.routeMessage(.msg_history_show, "", @intCast(entries.len));
         self.log.write("[msg_history] entries={d} routed to view={s}\n", .{ entries.len, @tagName(route_result.view) });
-        views.assign(0, route_result.view, route_result.timeout);
+        views.assign(0, route_result.view, route_result.timeout, route_result.enter);
     } else {
         self.log.write("[msg_history] empty\n", .{});
     }
@@ -13425,7 +13426,7 @@ test "transient message compaction is stable" {
     try core.msg_views.beginCycle(core.alloc, items.len);
     for (items, 0..) |m, i| {
         const r = core.msg_config.routeMessage(.msg_show, m.kind, 1);
-        core.msg_views.assign(i, r.view, r.timeout);
+        core.msg_views.assign(i, r.view, r.timeout, r.enter);
     }
 
     dropTransientMessages(&core);
@@ -13507,11 +13508,10 @@ test "a prompt-only batch hides the view without clearing the frontend" {
     // empties it, and notifyMessageChanges' cleared_in_batch branch hides
     // and clears BEFORE sendMsgShow runs). The clear-count observable still
     // maps to real symptoms — the escaped mutations fire a duplicate or
-    // spurious on_msg_clear on reachable batches. And the prompt is consumed
-    // via the drop path only (test cores have no transport); that stands in
-    // faithfully for the answered path, whose body is identical
-    // (consume + deinit + continue), but the answered increment itself is
-    // provable only with a transport seam this harness lacks.
+    // spurious on_msg_clear on reachable batches. Here the prompt is
+    // consumed via the drop path (this core has no transport); the answered
+    // path is pinned separately by "an answered prompt counts as consumed",
+    // which arms the in-process transport seam.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     core.ext_messages_enabled = true;
@@ -13549,6 +13549,108 @@ test "a prompt-only batch hides the view without clearing the frontend" {
     try std.testing.expect(sendMsgShow(&core));
     try std.testing.expect(!core.msg_views.state(.ext_float).visible);
     try std.testing.expectEqual(@as(usize, 1), clear_calls);
+}
+
+/// Arm the in-process transport seam: with any thread handle in
+/// `writer_thread`, `sendRawClassified` takes the enqueue path and the full
+/// encoded request lands in `core.write_queue` without a live transport. The
+/// thread is joined before the handle is stored — nothing ever joins or
+/// detaches it again, it only satisfies the null check.
+///
+/// A test that arms this must NOT call `stop()` or session teardown: those
+/// paths join `writer_thread`, and joining an already-joined handle is UB.
+/// `deinitForTest` is safe — it never touches the field.
+fn armTestTransport(core: *Core) !void {
+    const Dummy = struct {
+        fn run() void {}
+    };
+    var t = try std.Thread.spawn(.{}, Dummy.run, .{});
+    t.join();
+    core.writer_thread = t;
+}
+
+test "the resolved enter value reaches the generated program" {
+    // `state.enter orelse (ch == .history)` is decided in the split arm and
+    // its only downstream trace is the `local enter = ...` literal in the
+    // enqueued Lua. The transport seam makes that observable at unit level,
+    // so the dispatch-site mutations (ignore the option, flip a default) are
+    // killed here and not only by e2e cursor movement.
+    //
+    // The substring match assumes the template binds `local enter` exactly
+    // once and that no message content in this test contains that literal
+    // (content rides in the same encoded request). Both are under this
+    // test's control; keep them true if either changes.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try armTestTransport(&core);
+    defer core.writer_thread = null;
+
+    // Show channel, enter unset: the channel default is false.
+    try appendTestMessage(&core, 1, "echo", "content");
+    const messages = core.grid.message_state.messages.items;
+    try core.msg_views.beginCycle(core.alloc, messages.len);
+    core.msg_views.assign(0, .split, 0, null);
+    var mark: usize = core.write_queue.items.len;
+    try std.testing.expect(showChannelView(&core, .show, .split, .{ .show = messages }));
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "local enter = false") != null);
+
+    // Show channel, route says true: the override wins.
+    try core.msg_views.beginCycle(core.alloc, messages.len);
+    core.msg_views.assign(0, .split, 0, true);
+    mark = core.write_queue.items.len;
+    try std.testing.expect(showChannelView(&core, .show, .split, .{ .show = messages }));
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "local enter = true") != null);
+
+    // History channel, enter unset: the channel default is true.
+    var entry: grid_mod.MsgHistoryEntry = .{};
+    defer entry.content.deinit(std.testing.allocator);
+    try entry.content.append(std.testing.allocator, .{ .hl_id = 0, .text = "h" });
+    try core.history_views.beginCycle(core.alloc, 1);
+    core.history_views.assign(0, .split, 0, null);
+    mark = core.write_queue.items.len;
+    try std.testing.expect(showChannelView(&core, .history, .split, .{ .history = &.{entry} }));
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "local enter = true") != null);
+
+    // History channel, route says false: the override wins here too.
+    try core.history_views.beginCycle(core.alloc, 1);
+    core.history_views.assign(0, .split, 0, false);
+    mark = core.write_queue.items.len;
+    try std.testing.expect(showChannelView(&core, .history, .split, .{ .history = &.{entry} }));
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "local enter = false") != null);
+}
+
+test "an answered prompt counts as consumed" {
+    // The transport seam lets requestInput SUCCEED, so this drives the
+    // answered arm of answerReturnPrompts — previously reachable only via
+    // the drop arm, which left the answered `consumed += 1` unverifiable:
+    // removing it survived the whole suite. Observables: the `<CR>` really
+    // was enqueued, the prompt left the array, and the prompt-only dispatch
+    // took the no-clear arm (consumed > 0), which is exactly what a missing
+    // increment would flip.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    try armTestTransport(&core);
+    defer core.writer_thread = null;
+
+    var clear_calls: usize = 0;
+    const Probe = struct {
+        var calls: *usize = undefined;
+        fn onClear(_: ?*anyopaque) callconv(.c) void {
+            calls.* += 1;
+        }
+    };
+    Probe.calls = &clear_calls;
+    core.cb.on_msg_clear = Probe.onClear;
+
+    try appendTestMessage(&core, 1, "return_prompt", "Press ENTER");
+    const mark = core.write_queue.items.len;
+
+    try std.testing.expect(sendMsgShow(&core));
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "nvim_input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core.write_queue.items[mark..], "<CR>") != null);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.message_state.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), clear_calls);
 }
 
 test "an out-of-memory answer keeps the prompt for retry" {
@@ -13929,7 +14031,7 @@ test "the split payload budget drops only what the write queue cannot carry" {
         try appendTestMessage(&core, 1, "echo", filler);
         const messages = core.grid.message_state.messages.items;
         try core.msg_views.beginCycle(core.alloc, messages.len);
-        core.msg_views.assign(0, .split, 0);
+        core.msg_views.assign(0, .split, 0, null);
 
         try std.testing.expect(showChannelView(&core, .show, .split, .{ .show = messages }));
         try std.testing.expect(!core.flush_aborted);
@@ -13953,7 +14055,7 @@ test "the split payload budget drops only what the write queue cannot carry" {
         try appendTestMessage(&core, 1, "echo", filler);
         const messages = core.grid.message_state.messages.items;
         try core.msg_views.beginCycle(core.alloc, messages.len);
-        core.msg_views.assign(0, .split, 0);
+        core.msg_views.assign(0, .split, 0, null);
 
         try std.testing.expect(!showChannelView(&core, .show, .split, .{ .show = messages }));
         try std.testing.expectEqual(@as(usize, 0), clear_calls);
@@ -14025,8 +14127,8 @@ test "an OOM during split assembly retries instead of showing partial content" {
     const messages = core.grid.message_state.messages.items;
 
     try core.msg_views.beginCycle(core.alloc, messages.len);
-    core.msg_views.assign(0, .split, 0);
-    core.msg_views.assign(1, .split, 0);
+    core.msg_views.assign(0, .split, 0, null);
+    core.msg_views.assign(1, .split, 0, null);
 
     try core.msg_split_buf.ensureTotalCapacity(core.alloc, 64);
     failing.fail_index = failing.alloc_index;

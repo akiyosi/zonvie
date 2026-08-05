@@ -27,9 +27,9 @@ test "assignment is readable by later consumers without re-routing" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 4);
-    set.assign(0, .ext_float, 4.0);
-    set.assign(1, .split, 0);
-    set.assign(2, .ext_float, 0);
+    set.assign(0, .ext_float, 4.0, null);
+    set.assign(1, .split, 0, null);
+    set.assign(2, .ext_float, 0, null);
     // index 3 stays `none`
 
     try std.testing.expectEqual(msg_view.MsgViewType.ext_float, set.assignedTo(0));
@@ -46,7 +46,7 @@ test "an out-of-range index is ignored rather than corrupting state" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 1);
-    set.assign(7, .split, 0);
+    set.assign(7, .split, 0, null);
     try std.testing.expectEqual(@as(u32, 0), set.state(.split).count);
     try std.testing.expectEqual(msg_view.MsgViewType.none, set.assignedTo(7));
 }
@@ -56,7 +56,7 @@ test "a new cycle clears the previous assignment" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 2);
-    set.assign(0, .split, 2.0);
+    set.assign(0, .split, 2.0, null);
     try std.testing.expectEqual(@as(u32, 1), set.state(.split).count);
 
     try set.beginCycle(alloc, 2);
@@ -70,7 +70,7 @@ test "an empty cycle leaves no stale assignment" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 2);
-    set.assign(0, .ext_float, 0);
+    set.assign(0, .ext_float, 0, null);
     try set.beginCycle(alloc, 0);
 
     try std.testing.expectEqual(msg_view.MsgViewType.none, set.assignedTo(0));
@@ -82,10 +82,37 @@ test "the view timeout is the largest among its messages" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 3);
-    set.assign(0, .mini, 2.0);
-    set.assign(1, .mini, 6.0);
-    set.assign(2, .mini, 4.0);
+    set.assign(0, .mini, 2.0, null);
+    set.assign(1, .mini, 6.0, null);
+    set.assign(2, .mini, 4.0, null);
     try std.testing.expectEqual(@as(f32, 6.0), set.state(.mini).timeout);
+}
+
+test "enter merges across a view's messages: true wins, false beats unset" {
+    // One split instance shows the whole cycle, so per-message enter values
+    // must merge: any route asking for focus gets it; an explicit false still
+    // overrides the unset channel default; unset stays null so the caller
+    // can apply that default.
+    var set: ViewSet = .{};
+    defer set.deinit(alloc);
+
+    try set.beginCycle(alloc, 3);
+    set.assign(0, .split, 0, null);
+    try std.testing.expectEqual(@as(?bool, null), set.state(.split).enter);
+    set.assign(1, .split, 0, false);
+    try std.testing.expectEqual(@as(?bool, false), set.state(.split).enter);
+    set.assign(2, .split, 0, true);
+    try std.testing.expectEqual(@as(?bool, true), set.state(.split).enter);
+
+    // true is sticky: a later false cannot demote it.
+    try set.beginCycle(alloc, 2);
+    set.assign(0, .split, 0, true);
+    set.assign(1, .split, 0, false);
+    try std.testing.expectEqual(@as(?bool, true), set.state(.split).enter);
+
+    // A new cycle resets to the channel default.
+    try set.beginCycle(alloc, 0);
+    try std.testing.expectEqual(@as(?bool, null), set.state(.split).enter);
 }
 
 // -- display() ----------------------------------------------------------------
@@ -95,7 +122,7 @@ test "a view holding messages is shown" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 1);
-    set.assign(0, .ext_float, 0);
+    set.assign(0, .ext_float, 0, null);
     try std.testing.expectEqual(msg_view.Action.show, set.action(.ext_float));
 }
 
@@ -104,7 +131,7 @@ test "an empty core-owned view that is visible is hidden" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 1);
-    set.assign(0, .ext_float, 0);
+    set.assign(0, .ext_float, 0, null);
     set.markShown(.ext_float);
 
     try set.beginCycle(alloc, 0);
@@ -132,7 +159,7 @@ test "handed-off views are never hidden by the core" {
 
     for ([_]msg_view.MsgViewType{ .split, .mini, .notification, .confirm }) |v| {
         try set.beginCycle(alloc, 1);
-        set.assign(0, v, 0);
+        set.assign(0, v, 0, null);
         try std.testing.expectEqual(msg_view.Action.show, set.action(v));
         set.markShown(v);
 
@@ -146,7 +173,7 @@ test "the none view is never dispatched" {
     defer set.deinit(alloc);
 
     try set.beginCycle(alloc, 1);
-    set.assign(0, .none, 0);
+    set.assign(0, .none, 0, null);
     try std.testing.expectEqual(msg_view.Action.none, set.action(.none));
 }
 

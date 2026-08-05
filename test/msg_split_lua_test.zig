@@ -312,6 +312,25 @@ test "the split does not answer prompts on its own" {
     try std.testing.expect(!contains(lua, "replace_termcodes"));
 }
 
+test "enter moves the cursor on every show, not only the mount" {
+    // nvim_open_win takes focus only when it creates the window, so a
+    // re-show into a live split must move the cursor itself — without this,
+    // a route's `enter = true` worked once and then silently stopped. The
+    // move must precede the arming decision so the pause logic sees the
+    // final cursor location.
+    var buf: [buf_len]u8 = undefined;
+    const lua = try build(&buf, 5, true, 3000);
+
+    const focus_needle = "if enter and vim.api.nvim_get_current_win() ~= state.win then";
+    const focus_at = std.mem.indexOf(u8, lua, focus_needle) orelse
+        return error.ReShowFocusMissing;
+    try std.testing.expect(contains(lua[focus_at..], "nvim_set_current_win"));
+
+    const arm_at = std.mem.indexOf(u8, lua, "if state.win and vim.api.nvim_get_current_win() == state.win then") orelse
+        return error.ArmDecisionMissing;
+    try std.testing.expect(focus_at < arm_at);
+}
+
 // -- height -------------------------------------------------------------------
 
 test "height is clamped to a readable window" {
