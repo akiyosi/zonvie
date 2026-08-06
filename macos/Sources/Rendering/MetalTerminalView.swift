@@ -2884,9 +2884,11 @@ final class MetalTerminalView: MTKView {
             : 1.0
         lastSmoothScrollTickTime = now
 
-        // A seed exists only for a scroll whose outgoing row was retained, so
-        // an uncaptured scroll (page motion, a non-fast-path redraw) simply
-        // leaves the offset to decay.
+        // A seed exists only for a single-row step whose outgoing row was
+        // retained — the shape a held key produces. Page motion and
+        // non-fast-path redraws seed nothing and simply land where they land;
+        // rows may still be retained for them, but with no offset to show
+        // them in, updateScrollOffsets prunes them unused.
         seedScratch.removeAll(keepingCapacity: true)
         for seed in renderer.takeSmoothScrollSeeds() {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
@@ -3280,7 +3282,14 @@ final class MetalTerminalView: MTKView {
         // it cannot show, and the picture would jump by exactly that much when
         // the rows land — so the ceiling has to be at least 'mousescroll' ver
         // rows, with the overscroll allowance as the floor.
-        let cells = max(Self.scrollMaxOverscrollCells, CGFloat(core?.getMouseScrollVer() ?? 0))
+        //
+        // Bounded by what the retention can cover: displacing further than
+        // that leaves part of the band with no retained row, and the edge
+        // stretch then paints over the rows that ARE retained. A 'mousescroll'
+        // past the depth loses the excess to a jump either way; taking it here
+        // at least keeps the band consistent.
+        let ver = min(core?.getMouseScrollVer() ?? 0, ScrollRetention.maxDepthRows)
+        let cells = max(Self.scrollMaxOverscrollCells, CGFloat(ver))
         let maxOffsetPx = safeCellHeightPx * cells
         guard maxOffsetPx > 0 else { return 0 }
         return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))

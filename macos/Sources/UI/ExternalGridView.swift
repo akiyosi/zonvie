@@ -1293,8 +1293,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             committedGridCols = gridCols
             // Publish this bracket's retention together with the vertices it
             // belongs to: a retained row shown against pre-scroll content
-            // would draw the same line twice.
+            // would draw the same line twice. Same for the cursor rect the
+            // shader uniforms carry — it describes this bracket's cursor
+            // vertices, which only reach the screen now.
             retention.commit()
+            mainTerminalView?.renderer.publishCursorShaderState()
             commitRevision &+= 1
             serviceSurfaceRowStorageRetirement(
                 bufferSets: bufferSets,
@@ -1424,7 +1427,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// renderer's shared one, which follows the main view's draw cadence.
     /// Returns 0 when nothing is displaced, which is also what the cursor
     /// shader needs then.
-    private func cursorScrollOffsetPxForShader() -> Float {
+    private func cursorScrollOffsetPxForShader() -> Float? {
+        // The cursor rect is shared with the main surface and every other
+        // external window. Only displace it when it is this grid's cursor;
+        // otherwise say nothing and let the owner's value stand.
+        guard let renderer = mainTerminalView?.renderer,
+              renderer.shaderCursorBelongs(toGrid: gridId) else { return nil }
         lock.lock()
         let offset = scrollOffsetActive ? scrollOffsetData : nil
         lock.unlock()
@@ -1456,10 +1464,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// Capture the rows the pending scroll takes off this window's edge.
     ///
     /// Runs at bracket open, which is the last moment the committed set still
-    /// holds the on-screen content: this surface has no row-scroll fast path
-    /// (the core does not emit on_grid_row_scroll for it in the multi-scroll
-    /// and anchored-float cases, and never for a coalesced multi-row step), so
-    /// its rows are simply regenerated over the course of the flush.
+    /// holds the on-screen content — by the end of the flush its rows have
+    /// been regenerated or their slots rotated.
+    ///
+    /// This is the ONLY capture for this surface. `applyRowScroll` covers just
+    /// the core's row-scroll fast path, which it skips for a coalesced
+    /// multi-row step and in the multi-scroll and anchored-float cases,
+    /// whereas grid_scroll is reported for every scroll; and ZonvieCore opens
+    /// the bracket immediately before calling `applyRowScroll`, so capturing
+    /// there as well would stage the same rows twice.
     private func captureRetainedRowsForPendingScroll() {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         pendingGridScrollLock.lock()
@@ -1476,13 +1489,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // edge stretch have the band rather than retain the wrong rows.
         guard let bounds else { return }
         let rows = Int(committedGridRows > 0 ? committedGridRows : gridRows)
-        let staged = captureRetainedRows(
+        captureRetainedRows(
             ws: bufferSets[flushSourceSetIndex],
             rowStart: bounds.top,
             rowEnd: min(bounds.bottomEx, rows),
             rowsDelta: rowsDelta
         )
-        ZonvieCore.appLog("[retain_debug] ext capture gridId=\(gridId) rowsDelta=\(rowsDelta) span=\(bounds.top)..<\(min(bounds.bottomEx, rows)) staged=\(staged)")
     }
 
     /// Copy the rows about to leave this window's scroll region into the
@@ -1492,20 +1504,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// The whole row is copied: an external window owns its surface outright,
     /// so unlike the main composite there is no other grid's content mixed
     /// into it. Called from inside the flush bracket, before the slot remap.
-    @discardableResult
-    private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int) -> Int {
-        guard MetalTerminalRenderer.smoothScrollEnabled else { return 0 }
-        guard ws.rowState.usingRowBuffers else { return 0 }
+    private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int) {
+        guard MetalTerminalRenderer.smoothScrollEnabled else { return }
+        guard ws.rowState.usingRowBuffers else { return }
         guard let plan = ScrollRetention.plan(
             rowStart: rowStart,
             rowEnd: rowEnd,
             rowsDelta: rowsDelta,
             depth: retention.depthRows
-        ) else { return 0 }
+        ) else { return }
 
         let capturedCellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
-        guard capturedCellHeightPx > 0 else { return 0 }
-        var staged = 0
+        guard capturedCellHeightPx > 0 else { return }
         var stepOpened = false
         for i in 0..<plan.count {
             let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
@@ -1539,9 +1549,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 targetRow: outgoingRow - rowsDelta,
                 cellHeightPx: capturedCellHeightPx
             ))
-            staged += 1
         }
-        return staged
     }
 
     func applyRowScroll(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
@@ -1567,10 +1575,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // does not converge under sustained scroll.
 
         let ws = bufferSets[writeSetIndex]
-        // Must run before the remap below: it rotates the outgoing rows' slots
-        // into the vacated band, and Neovim writes the incoming rows into
-        // those same slots during this flush.
-        captureRetainedRows(ws: ws, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta)
+        // No retention capture here. This runs only when the core takes the
+        // row-scroll fast path, but the grid_scroll callback has already
+        // handed the same distance to captureRetainedRowsForPendingScroll,
+        // which ran at bracket open — and ZonvieCore opens the bracket
+        // immediately before calling this. Capturing again would stage the
+        // same rows twice and shift the first copy a second time.
         flushHasStructuralRowChange = true
         remapSurfaceRowSlots(
             bufferSet: ws,
@@ -3296,12 +3306,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // cadence, and this window routinely draws a frame ahead of
                 // it — which put the cursor shader a frame of finger travel
                 // away from the cursor.
+                // Fold in the displacement THIS frame draws with before
+                // reading the uniforms: the shared value follows the main
+                // view's draw cadence, and this window routinely draws a frame
+                // ahead of it.
+                renderer.evaluateCursorShaderChange(scrollOffsetPx: cursorScrollOffsetPxForShader())
                 let uniforms = renderer.makeCustomShaderUniforms(
                     screenResolution: screenRes,
                     windowOffset: windowOffset,
                     windowSize: view.drawableSize,
-                    timing: shaderTiming,
-                    cursorScrollOffsetPx: cursorScrollOffsetPxForShader()
+                    timing: shaderTiming
                 )
                 // Decorated surfaces use the OPAQUE variant (preserve_alpha
                 // OFF): their backTex has alpha-0 padding / empty-input regions
@@ -3592,7 +3606,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // No offset. A retained row is only meaningful while the grid is
             // displaced: with no offset it would be drawn one row outside real
             // content.
-            retention.clearAll()
+            retention.clearPublished()
 
             lock.lock()
             defer { lock.unlock() }

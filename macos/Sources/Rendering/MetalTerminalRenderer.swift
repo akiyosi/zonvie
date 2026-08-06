@@ -985,20 +985,35 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var customShaderPong: [MTLTexture?] = [nil, nil]
     private var customShaderPongSize: CGSize = .zero
     // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
+    //
+    // Held in SCREEN space — the smooth-scroll displacement already folded in
+    // — because that is what a cursor shader draws against and what "the
+    // cursor moved" has to mean. The rect the core measures is in vertex
+    // space, which shifts by a whole row on every scroll step while the
+    // displacement cancels it and the cursor stays put on the glass. Rotating
+    // on that would restart the trail every step, so it never plays out.
     private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorChangeTime: Float = 0
-    /// The grid the cursor rect above was measured on, and that grid's current
-    /// smooth-scroll displacement in drawable pixels (positive = content drawn
-    /// lower). The rect is measured from raw vertex positions on the core
-    /// thread, but the vertex shader displaces the cursor quad by the scroll
-    /// offset at draw time — without adding it back the shader lights up the
-    /// row the cursor will occupy once the ease settles, not the one it is
-    /// drawn on. Both written under `lock`.
+    /// The rect as the core measured it, and the grid it belongs to. Turned
+    /// into the screen-space state above by `evaluateCursorShaderChange`, once
+    /// the frame's displacement for that grid is known. Written under `lock`.
+    private var shaderCursorRawRect: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorRawColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorGridId: Int64 = 0
-    private var shaderCursorScrollOffsetPx: Float = 0
+    /// Sub-pixel movement is not a cursor move; it is the ease sliding the
+    /// cursor along. Rotating on it would restart the trail every frame.
+    private static let shaderCursorMoveEpsilonPx: Float = 0.5
+    /// Cursor state measured during a flush, held until that flush commits.
+    ///
+    /// The rect describes the cursor vertices of the flush that measured it,
+    /// and those only reach the screen at commit. Publishing at submit put the
+    /// NEXT flush's cursor position into the uniforms while the screen still
+    /// showed the previous one — a row apart mid-scroll, which is a cursor
+    /// shader firing off the cursor for that frame.
+    private var stagedShaderCursor: (rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64)?
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -1406,6 +1421,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
             lock.unlock()
         }
+        // Same reason: a cursor measured by a bracket that never committed
+        // describes vertices that never reached the screen.
+        lock.lock()
+        stagedShaderCursor = nil
+        lock.unlock()
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         let perfEnabled = ZonvieCore.appLogEnabled
@@ -1725,6 +1745,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
         }
+        publishCursorShaderStateLocked()
         commitRevision &+= 1
         let rev = commitRevision
         serviceSurfaceRowStorageRetirement(
@@ -2106,14 +2127,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Taken in pixels straight from the input side rather than recovered
         // from the NDC below: the NDC is built against a cell-snapped height
         // that need not match the back buffer the cursor rect was measured in.
-        shaderCursorScrollOffsetPx = 0
+        // Any entry for the cursor's grid displaces it: cursor vertices always
+        // carry DECO_SCROLLABLE (flush.zig), and a bodily-moved float
+        // (move_all) translates every vertex it owns.
+        var cursorScrollOffsetPx: Float = 0
         for info in offsets {
             let ndc = -info.offsetYPx * scale
-            // Any entry for the cursor's grid displaces it: cursor vertices
-            // always carry DECO_SCROLLABLE (flush.zig), and a bodily-moved
-            // float (move_all) translates every vertex it owns.
             if info.gridId == shaderCursorGridId {
-                shaderCursorScrollOffsetPx = info.offsetYPx
+                cursorScrollOffsetPx = info.offsetYPx
             }
 
             // Calculate content bounds in NDC
@@ -2165,6 +2186,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
         // This eliminates the GPU/CPU race on shared MTLBuffers.
         hasActiveScrollOffset = count > 0
+        // This surface owns the cursor's grid whenever it appears in its own
+        // offsets, and a grid with no entry is simply not displaced.
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: cursorScrollOffsetPx)
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
@@ -2191,7 +2215,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         gridScrollCaptureBounds.removeAll(keepingCapacity: true)
         // Retained rows were built for the layout that is being abandoned
         // (resize, font change, grid teardown all clear the offsets).
-        retention.clearAll()
+        retention.clearPublished()
     }
 
     /// Compute ScrollOffset from ScrollOffsetInfo (shared logic for main window and external grids).
@@ -4310,20 +4334,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Each caller passes the result inline via `setFragmentBytes`, so
     /// multiple MTKViews animating at 60fps never race on a shared
     /// buffer.
-    /// - Parameter cursorScrollOffsetPx: the smooth-scroll displacement the
-    ///   CALLER is drawing the cursor's grid with, in its own drawable pixels.
-    ///   Supplied per call rather than read from shared state because each
-    ///   surface computes its offset on its own draw cadence: an external
-    ///   window routinely draws a frame the main view has not caught up to, so
-    ///   a shared value lands the shader a frame of finger travel away from
-    ///   the cursor. nil means "use the main surface's", for callers that
-    ///   share its scroll state.
     func makeCustomShaderUniforms(
         screenResolution: CGSize,
         windowOffset: CGPoint,
         windowSize: CGSize,
-        timing: ShaderViewTimingState? = nil,
-        cursorScrollOffsetPx: Float? = nil
+        timing: ShaderViewTimingState? = nil
     ) -> zonvie_shader_uniforms {
         let state = timing ?? mainShaderTiming
         let now = CACurrentMediaTime()
@@ -4365,23 +4380,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // setCursorShaderState() (core/RPC thread) writes these same fields
         // as one unit; reading them individually here could otherwise mix
         // a new rect with a stale color/timestamp for one frame.
-        let (cursorCurRaw, cursorPrevRaw, cursorCurColor, cursorPrevColor, cursorChangeTime, sharedScrollPx): (
+        // Already in screen space: evaluateCursorShaderChange folded each
+        // endpoint's displacement in when it accepted that endpoint.
+        let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime): (
             (Float, Float, Float, Float), (Float, Float, Float, Float),
-            (Float, Float, Float, Float), (Float, Float, Float, Float), Float, Float
+            (Float, Float, Float, Float), (Float, Float, Float, Float), Float
         ) = {
             lock.lock()
             defer { lock.unlock() }
-            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime, shaderCursorScrollOffsetPx)
+            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime)
         }()
-        let cursorScrollPx = cursorScrollOffsetPx ?? sharedScrollPx
-        // Follow the cursor quad, which the vertex shader displaces by the
-        // grid's smooth-scroll offset. Both endpoints move together: they are
-        // anchored to content that is displaced as a whole, so shifting only
-        // the current one would stretch the trail across the ease.
-        // y is the rect's BOTTOM edge in pixels from the top, and a positive
-        // offset draws content lower, so it adds.
-        let cursorCur = (cursorCurRaw.0, cursorCurRaw.1 + cursorScrollPx, cursorCurRaw.2, cursorCurRaw.3)
-        let cursorPrev = (cursorPrevRaw.0, cursorPrevRaw.1 + cursorScrollPx, cursorPrevRaw.2, cursorPrevRaw.3)
         uniforms.iCurrentCursor = cursorCur
         uniforms.iPreviousCursor = cursorPrev
         uniforms.iCurrentCursorColor = cursorCurColor
@@ -4425,31 +4433,97 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// window's drawable). color is straight RGBA in [0, 1]. No-op
     /// when incoming state matches the current state, so shaders keep
     /// seeing the last real change's iTimeCursorChange.
-    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64 = 0) {
+    /// Whether the cursor rect the shader uniforms carry was measured on this
+    /// grid. The rect is shared between the main surface and every external
+    /// window — whoever submitted a cursor last owns it — so a surface must
+    /// not apply its own scroll displacement to a rect belonging to another
+    /// grid.
+    func shaderCursorBelongs(toGrid gridId: Int64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return shaderCursorGridId == gridId
+    }
+
+    /// Stage the cursor state a flush just measured. Published by
+    /// `publishCursorShaderState()` when that flush commits — see
+    /// `stagedShaderCursor` for why it cannot go straight out.
+    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64) {
         // Called from the vertex-submit path (core/RPC thread), while
-        // makeCustomShaderUniforms() reads these same fields from the main
+        // makeCustomShaderUniforms() reads the published fields from the main
         // thread during draw(in:). Guard with the existing `lock` (already
         // used for other cross-thread snapshots in this class) so a torn
         // rect/color combination is never observed mid-frame.
         lock.lock()
+        stagedShaderCursor = (rect: rect, color: color, gridId: gridId)
+        lock.unlock()
+    }
+
+    /// Hand the staged cursor state to the shader uniforms, together with the
+    /// vertices it describes. Called from every surface's commit; a flush that
+    /// aborts instead drops it in `beginFlush`.
+    func publishCursorShaderState() {
+        lock.lock()
         defer { lock.unlock() }
+        publishCursorShaderStateLocked()
+    }
 
-        // Recorded even when the rect is unchanged: the cursor can sit still
-        // while the grid under it scrolls, which is exactly when the offset
-        // has to follow it.
-        shaderCursorGridId = gridId
+    /// Caller must hold `lock` (commitFlush publishes inside its own scope).
+    private func publishCursorShaderStateLocked() {
+        guard let staged = stagedShaderCursor else { return }
+        stagedShaderCursor = nil
+        shaderCursorRawRect = staged.rect
+        shaderCursorRawColor = staged.color
+        shaderCursorGridId = staged.gridId
+    }
 
+    /// Fold this frame's displacement of the cursor's grid into the shader's
+    /// cursor endpoints, rotating them only when the cursor actually moved ON
+    /// SCREEN.
+    ///
+    /// Called from each surface's pre-draw, where the displacement it is about
+    /// to render with is known. The measured rect alone cannot answer "did the
+    /// cursor move": a scroll step shifts it a whole row while the
+    /// compensating offset holds the cursor still on the glass, and rotating
+    /// there restarts the trail every step so it never plays out — the effect
+    /// reads as weak and intermittent. Once the finger consumes the offset the
+    /// cursor really does slide, and that motion rotates it as it should.
+    ///
+    /// - Parameter scrollOffsetPx: displacement of the cursor's grid for this
+    ///   frame, or nil when the caller does not own that grid's cursor.
+    func evaluateCursorShaderChange(scrollOffsetPx: Float?) {
+        guard let scrollOffsetPx else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: scrollOffsetPx)
+    }
+
+    /// Caller must hold `lock` (updateScrollOffsets evaluates inside its own
+    /// scope).
+    private func evaluateCursorShaderChangeLocked(scrollOffsetPx: Float) {
+        let rect = (
+            shaderCursorRawRect.0,
+            shaderCursorRawRect.1 + scrollOffsetPx,
+            shaderCursorRawRect.2,
+            shaderCursorRawRect.3
+        )
+        let color = shaderCursorRawColor
+        let eps = Self.shaderCursorMoveEpsilonPx
         let sameRect =
-            rect.0 == shaderCursorCurrent.0 &&
-            rect.1 == shaderCursorCurrent.1 &&
-            rect.2 == shaderCursorCurrent.2 &&
-            rect.3 == shaderCursorCurrent.3
+            abs(rect.0 - shaderCursorCurrent.0) < eps &&
+            abs(rect.1 - shaderCursorCurrent.1) < eps &&
+            abs(rect.2 - shaderCursorCurrent.2) < eps &&
+            abs(rect.3 - shaderCursorCurrent.3) < eps
         let sameColor =
             color.0 == shaderCursorCurrentColor.0 &&
             color.1 == shaderCursorCurrentColor.1 &&
             color.2 == shaderCursorCurrentColor.2 &&
             color.3 == shaderCursorCurrentColor.3
-        if sameRect && sameColor { return }
+        if sameRect && sameColor {
+            // Keep the endpoint exact even when the move was below the
+            // threshold, so a slow ease does not accumulate drift.
+            shaderCursorCurrent = rect
+            return
+        }
 
         shaderCursorPrevious = shaderCursorCurrent
         shaderCursorPreviousColor = shaderCursorCurrentColor
@@ -5190,7 +5264,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cellHeightPx: capturedCellHeightPx
             ))
         }
-        if let stepGridId {
+        // Seed the keyboard ease only for the single-row steps a held key
+        // produces. A larger jump — page motion, a shift from a resize — keeps
+        // the pre-existing behaviour of landing where it lands: seeding it
+        // would displace the picture by the whole jump and ease back only the
+        // few rows the clamp allows, animating a motion that never was
+        // animated. The multi-row RETENTION above still runs, because a
+        // trackpad step is routinely several rows; a gesture's seed is dropped
+        // by tickSmoothScroll anyway (the gesture reconciles its own offset),
+        // so this gate costs it nothing.
+        if let stepGridId, abs(rowsDelta) == 1 {
             lock.lock()
             stagedSmoothScrollSeeds.append((gridId: stepGridId, rowsDelta: rowsDelta))
             lock.unlock()
@@ -5215,7 +5298,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// is recomposed away within the flush, and the vacated band falls back
     /// to the edge-row background stretch, which paints the neighbouring
     /// row's highlight across the band. Full-width grids never get capture
-    /// bounds (see updateScrollOffsets), so the two paths cannot double-stage.
+    /// bounds (see MetalTerminalView.armScrollRetention), so the two paths
+    /// cannot double-stage.
     ///
     /// Called from the on_grid_scroll callback, inside the flush bracket and
     /// before row recomposition, so the flush's source set still holds the
@@ -5251,53 +5335,43 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
 
-        var staged = 0
-        var totalKept = 0
         for i in 0..<plan.count {
             let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-            if let kept = captureOneRetainedRow(cs: cs, gridId: gridId, row: row, rowsDelta: rowsDelta) {
-                staged += 1
-                totalKept += kept
-            }
-        }
-        if staged > 0 {
-            ZonvieCore.appLog("[retain_debug] capture gridId=\(gridId) rowsDelta=\(rowsDelta) rows=\(plan.first)..<\(plan.first + plan.count) staged=\(staged) verts=\(totalKept)")
+            captureOneRetainedRow(cs: cs, gridId: gridId, row: row, rowsDelta: rowsDelta)
         }
     }
 
     /// Copy one outgoing row's own scrollable vertices into the retention ring
-    /// and append it to the open step. Returns the vertex count kept, or nil
-    /// when there was nothing to retain (a blank row, or a row holding no
-    /// vertices of this grid) — the band then falls back to the edge stretch,
-    /// same as the fast-path capture's vc == 0 case.
+    /// and append it to the open step. A row with nothing to retain (blank, or
+    /// holding no vertices of this grid) is skipped — the band then falls back
+    /// to the edge stretch, same as the fast-path capture's vc == 0 case.
     private func captureOneRetainedRow(
         cs: SurfaceBufferSet,
         gridId: Int64,
         row: Int,
         rowsDelta: Int
-    ) -> Int? {
-        guard row >= 0, row < cs.rowLogicalToSlot.count else { return nil }
+    ) {
+        guard row >= 0, row < cs.rowLogicalToSlot.count else { return }
         let slot = cs.rowLogicalToSlot[row]
-        guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return nil }
+        guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return }
         let vc = cs.rowState.counts[slot]
-        guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return nil }
+        guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
         let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : row
 
-        // ZONVIE_DECO_SCROLLABLE (zonvie_core.h): content cells only. Counted
-        // before a ring slot is taken, because taking one has side effects
-        // (it advances the ring and arms staging).
-        let scrollable: UInt32 = 1 << 7
+        // Content cells only. Counted before a ring slot is taken, because
+        // taking one advances the ring.
+        let scrollable = ZONVIE_DECO_SCROLLABLE
         let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
         var kept = 0
         for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
             kept += 1
         }
-        guard kept > 0 else { return nil }
+        guard kept > 0 else { return }
 
         // Read before locking: the accessor takes `lock` itself, which is not
         // recursive.
         let capturedCellHeightPx = cellHeightPx
-        guard let dstBuf = retention.takeBuffer(needed: kept * MemoryLayout<Vertex>.stride) else { return nil }
+        guard let dstBuf = retention.takeBuffer(needed: kept * MemoryLayout<Vertex>.stride) else { return }
         let dstPtr = dstBuf.contents().bindMemory(to: Vertex.self, capacity: kept)
         var w = 0
         for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
@@ -5313,7 +5387,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             targetRow: row - rowsDelta,
             cellHeightPx: capturedCellHeightPx
         ))
-        return kept
     }
 
 

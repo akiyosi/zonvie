@@ -157,13 +157,19 @@ final class ScrollRetention {
     /// A wheel event worth more rows than this leaves part of its band to the
     /// edge stretch.
     static let maxDepthRows = 4
-    /// Round-robin over far more buffers than can be live at once, so a
-    /// capture never overwrites vertices a frame is still reading: an
-    /// in-flight frame's snapshot, the published set and the set being staged
-    /// are each at most `maxDepthRows` rows, and several flushes can land
-    /// within one frame. Allocated on first use, grown only when a wider row
-    /// appears.
-    static let ringSize = 4 * maxDepthRows
+    /// Round-robin over more buffers than can be live at once, so a capture
+    /// never overwrites vertices a frame is still reading. Retained buffers
+    /// are bound straight to the encoder and are not tracked by any in-flight
+    /// counter, so ring size is the only thing keeping them alive.
+    ///
+    /// Live at once, each at most `maxDepthRows` rows: one snapshot per
+    /// in-flight frame, the published set, and the set being staged. External
+    /// surfaces allow TWO frames in flight (the main renderer allows one), so
+    /// the worst case is four sets — and several flushes can land within one
+    /// frame, so carry the same again as headroom. Allocated on first use,
+    /// grown only when a wider row appears.
+    static let maxInFlightFrames = 2
+    static let ringSize = 2 * (maxInFlightFrames + 2) * maxDepthRows
 
     struct Plan {
         let first: Int
@@ -253,12 +259,18 @@ final class ScrollRetention {
         return published.reduce(0) { $0 + ($1.gridId == gridId ? 1 : 0) }
     }
 
-    /// Everything retained describes a layout being abandoned (resize, font
-    /// change, grid teardown).
-    func clearAll() {
+    /// Drop everything on screen: a retained row is only meaningful while its
+    /// grid is displaced, and with no offset it would draw a row outside real
+    /// content.
+    ///
+    /// Deliberately leaves the STAGED set alone. This is called from the draw
+    /// side while the core thread may be mid-bracket, and discarding its
+    /// staged rows would make `commit()` report that nothing was staged —
+    /// dropping the step, and with it the caller's own per-step state (the
+    /// main surface's ease seed), so the picture snaps instead of easing.
+    /// An open bracket's rows are the bracket's to publish or abandon.
+    func clearPublished() {
         lock.lock()
-        stagedValid = false
-        staged.removeAll(keepingCapacity: true)
         published.removeAll(keepingCapacity: true)
         lock.unlock()
     }
