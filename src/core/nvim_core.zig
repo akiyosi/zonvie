@@ -1076,6 +1076,15 @@ pub const Core = struct {
     // cross-thread reads from the frontend UI thread.
     option_as_meta: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
+    // Rows one wheel event scrolls: the 'ver' component of Neovim's
+    // 'mousescroll'. Seeded with Neovim's own default so the value is usable
+    // before the reporter's first notification lands. Updated via RPC
+    // notification "zonvie_mousescroll" (see setupMouseScrollReporter); read
+    // from the frontend UI thread on every precise scroll event, hence atomic.
+    // A page-relative setting ('ver:0' means one page) reports 0, which the
+    // frontend treats as "not a fixed row count" and falls back to 1.
+    mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
+
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
     // on :restart/:connect), so these are atomic.

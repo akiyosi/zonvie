@@ -1480,6 +1480,16 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
     return box.core.option_as_meta.load(.acquire);
 }
 
+/// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
+/// Reported by the auto-injected reporter (macOS only) and refreshed when the
+/// option changes. Returns 0 when the setting is page-relative ('ver:0'),
+/// which has no fixed row count. Lock-free atomic read.
+pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.mousescroll_ver.load(.acquire);
+}
+
 /// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).
 pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callconv(.c) void {
     if (p == null) return;

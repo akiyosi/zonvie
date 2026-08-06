@@ -1381,6 +1381,46 @@ pub fn setupAgentStatus(self: *Core) void {
     self.log.write("agent status reporter installed\n", .{});
 }
 
+/// Report the 'ver' component of 'mousescroll' — how many rows one wheel
+/// event scrolls — and keep reporting it when the option changes.
+///
+/// The trackpad's sub-cell scrolling has to know this: it asks Neovim for
+/// rows before the finger has travelled them and cancels each arrival against
+/// the pixel offset it holds, so an event worth N rows must be accounted as N
+/// rows of travel. Assuming one row made a fast gesture jump, because the
+/// lookahead paid for one row while the content moved N.
+///
+/// 'ver:0' (scroll by a page) has no fixed row count and reports 0; the
+/// frontend falls back to one row. augroup clear=true keeps re-injection
+/// idempotent. Fire-and-forget.
+///
+/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
+/// the Windows frontend scrolls by whole rows, so injecting the reporter
+/// there would cost an exec_lua and an autocmd for a value nothing reads.
+pub fn setupMouseScrollReporter(self: *Core) void {
+    if (comptime builtin.os.tag != .macos) return;
+    const lua_code =
+        \\local function report()
+        \\  local ms = vim.o.mousescroll or ''
+        \\  local n = tonumber(ms:match('ver:(%d+)'))
+        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3)
+        \\end
+        \\report()
+        \\local grp = vim.api.nvim_create_augroup('zonvie_mousescroll', { clear = true })
+        \\vim.api.nvim_create_autocmd('OptionSet', {
+        \\  group = grp,
+        \\  pattern = 'mousescroll',
+        \\  callback = function() report() end,
+        \\})
+    ;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupMouseScrollReporter: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+    self.log.write("mousescroll reporter installed\n", .{});
+}
+
 fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     const self = ctx.core;
 
@@ -1725,6 +1765,16 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             const val_str = params[0].str;
             const val: u8 = if (std.mem.eql(u8, val_str, "both")) 0 else if (std.mem.eql(u8, val_str, "none")) 1 else if (std.mem.eql(u8, val_str, "only_left")) 2 else if (std.mem.eql(u8, val_str, "only_right")) 3 else return; // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_mousescroll")) {
+        // Rows one wheel event scrolls; see setupMouseScrollReporter. Clamped
+        // to what the frontend's lookahead can carry — a pathological
+        // 'mousescroll' must not make it hold an unbounded pixel offset.
+        if (params.len > 0 and params[0] == .int) {
+            const v = params[0].int;
+            const clamped: u32 = if (v <= 0) 0 else if (v > 32) 32 else @intCast(v);
+            self.mousescroll_ver.store(clamped, .release);
+            self.log.write("mousescroll ver={d}\n", .{clamped});
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
@@ -2381,6 +2431,10 @@ pub fn runLoop(self: *Core) void {
 
         // Install the AI-agent tab-status reporter (zero user-side config).
         setupAgentStatus(self);
+
+        // Report 'mousescroll' so the trackpad path knows how many rows one
+        // wheel event is worth. No-op off macOS (see the function).
+        setupMouseScrollReporter(self);
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});

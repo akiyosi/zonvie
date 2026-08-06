@@ -1219,6 +1219,15 @@ ZONVIE_API const char* zonvie_core_get_current_mode(zonvie_core *core);
 ZONVIE_API uint8_t zonvie_core_get_option_as_meta(zonvie_core *core);
 ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value);
 
+/* Rows one mouse-wheel event scrolls: the 'ver' component of Neovim's
+   'mousescroll'. Reported by an auto-injected reporter and refreshed when the
+   option changes, so sub-cell scrolling can account an event as the N rows it
+   is actually worth. Returns 0 for the page-relative setting ('ver:0'), which
+   has no fixed row count, and 0 if core is null.
+   The reporter is installed on macOS only; elsewhere this returns Neovim's
+   default (3) and should not be relied on. */
+ZONVIE_API uint32_t zonvie_core_get_mousescroll_ver(zonvie_core *core);
+
 /* Check if cursor is visible.
    Returns false during busy_start, true after busy_stop. */
 ZONVIE_API bool zonvie_core_is_cursor_visible(zonvie_core *core);
