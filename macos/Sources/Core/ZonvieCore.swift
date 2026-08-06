@@ -111,6 +111,14 @@ final class ZonvieCore {
     /// still owns while this runs.
     private var pendingCapacityScratch: [ExternalGridView] = []
 
+    /// The window owning a grid, if that grid is rendered as its own surface.
+    /// Callers must not hold a surface lock (see the note below).
+    func externalGridView(for gridId: Int64) -> ExternalGridView? {
+        externalGridViewsLock.lock()
+        defer { externalGridViewsLock.unlock() }
+        return externalGridViews[gridId]
+    }
+
     /// True while any surface still owes a row-capacity provisioning pass.
     /// Snapshots under the map lock and releases it before asking any view, so
     /// externalGridViewsLock is never held across a surface lock.
@@ -3209,6 +3217,14 @@ final class ZonvieCore {
     func getOptionAsMeta() -> UInt8 {
         guard let core else { return ZonvieConfig.shared.ime.optionAsMeta.rawValue }
         return zonvie_core_get_option_as_meta(core)
+    }
+
+    /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
+    /// 0 means the page-relative setting, which has no fixed row count.
+    /// Lock-free atomic read; safe to call from any thread.
+    func getMouseScrollVer() -> Int {
+        guard let core else { return 0 }
+        return Int(zonvie_core_get_mousescroll_ver(core))
     }
 
     /// Check if cursor is visible (false during busy, true otherwise)

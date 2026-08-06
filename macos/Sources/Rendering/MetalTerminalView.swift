@@ -2246,6 +2246,46 @@ final class MetalTerminalView: MTKView {
     ///   - scale: Backing scale factor
     ///   - hasPrecise: Whether this is precise (trackpad) scrolling
     /// - Returns: Current scroll offset in pixels (for sub-cell visual offset)
+    /// Tell the renderer which main-surface rows this grid's smooth scroll may
+    /// retain an outgoing row from. Only non-full-width grids get a span: a
+    /// vertical split or a float always fails the core's row-scroll fast path
+    /// (partial_width), so the grid_scroll capture is the only thing that can
+    /// keep their outgoing row alive, while full-width grids belong to the
+    /// fast path and must not be captured twice.
+    private func armScrollRetention(gridId: Int64) {
+        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        // The band a wheel event opens is as wide as the rows it moves, so the
+        // retention has to keep that many to cover it.
+        renderer.setRetentionDepthRows(core.getMouseScrollVer())
+        let grids = core.getVisibleGridsCached()
+        guard let info = grids.first(where: { $0.gridId == gridId }) else { return }
+
+        // An external window renders its own surface, so its rows are its own
+        // and the full-width test below does not apply. The core reports it at
+        // (0,0), which is already this window's row space.
+        if let external = core.externalGridView(for: gridId) {
+            external.setScrollCaptureBounds(
+                top: Int(info.marginTop),
+                bottomEx: Int(info.rows - info.marginBottom)
+            )
+            return
+        }
+
+        guard let main = grids.first(where: { $0.gridId == 1 }),
+              !(info.startCol == 0 && info.cols == main.cols)
+        else {
+            renderer.setGridScrollCaptureBounds(gridId: gridId, bounds: nil)
+            return
+        }
+        renderer.setGridScrollCaptureBounds(
+            gridId: gridId,
+            bounds: (
+                top: Int(info.startRow + info.marginTop),
+                bottomEx: Int(info.startRow + info.rows - info.marginBottom)
+            )
+        )
+    }
+
     func handleScrollInput(
         gridId: Int64,
         row: Int32,
@@ -2273,6 +2313,18 @@ final class MetalTerminalView: MTKView {
             if mode == "terminal" && !cursorVisible {
                 effectiveHasPrecise = false
             }
+        }
+
+        // How many rows one wheel event is worth ('mousescroll' ver). The
+        // sub-cell model asks Neovim for rows before the finger has travelled
+        // them and cancels each arrival against the pixel offset it holds, so
+        // an event has to be accounted as the N rows it really moves. Assuming
+        // one made a fast gesture jump the other N-1 per event.
+        // A page-relative setting ('ver:0') has no row count to account with,
+        // so pixel scrolling is not attempted at all.
+        let rowsPerWheelEvent = core.getMouseScrollVer()
+        if rowsPerWheelEvent < 1 {
+            effectiveHasPrecise = false
         }
 
         // Instant edge detection from the (non-blocking) viewport cache:
@@ -2304,6 +2356,14 @@ final class MetalTerminalView: MTKView {
         }
 
         if effectiveHasPrecise {
+            // Arm the outgoing-row retention before any scroll request goes
+            // out: Neovim's grid_scroll can come back within a millisecond,
+            // ahead of the next frame, so the geometry cannot be picked up
+            // from the pre-draw pass. Takes the renderer lock, so it must
+            // stay outside scrollOffsetLock (the order the rest of this file
+            // keeps).
+            armScrollRetention(gridId: gridId)
+
             // Trackpad: implement sub-cell smooth scrolling for external grids
             let deltaYPx = deltaY * scale
 
@@ -2312,8 +2372,15 @@ final class MetalTerminalView: MTKView {
             let alreadyPending = pendingSentScroll[gridId] ?? 0
             pendingSentScrollLock.unlock()
 
-            let maxTotalPending = 8
+            // Counted in ROWS, not events: one event answers for
+            // rowsPerWheelEvent of them, and what the lookahead has to know is
+            // the distance already asked for. The backpressure cap is scaled
+            // to match so it still admits the same eight events it always did
+            // — as a row count it would otherwise throttle a fast gesture the
+            // moment 'mousescroll' was above one.
+            let maxTotalPending = 8 * rowsPerWheelEvent
             let canSendMore = alreadyPending < maxTotalPending
+            let stepPx = rowHeightPx * CGFloat(rowsPerWheelEvent)
 
             // Hold scrollOffsetLock for entire read-modify-write (TOCTOU fix).
             // processPendingScrollClears also acquires this lock, but it runs on the
@@ -2409,7 +2476,7 @@ final class MetalTerminalView: MTKView {
                         modifier: modifier
                     )
                     scrollCount += 1
-                    lookaheadPx -= sendDirection * rowHeightPx
+                    lookaheadPx -= sendDirection * stepPx
                 }
             }
 
@@ -2445,7 +2512,7 @@ final class MetalTerminalView: MTKView {
             // Track how many scroll commands we sent (outside scrollOffsetLock)
             if scrollCount > 0 {
                 pendingSentScrollLock.lock()
-                pendingSentScroll[gridId, default: 0] += scrollCount
+                pendingSentScroll[gridId, default: 0] += scrollCount * rowsPerWheelEvent
                 pendingSentScrollLock.unlock()
             }
 
@@ -2463,9 +2530,19 @@ final class MetalTerminalView: MTKView {
             // Mouse wheel / fast scroll: send directly with acceleration
             let direction = deltaY > 0 ? "up" : "down"
 
-            // Calculate scroll count based on speed (acceleration)
+            // The acceleration is measured in ROWS of finger travel, but one
+            // wheel event moves 'mousescroll' ver of them — sending one event
+            // per row runs the content ahead of the finger by exactly that
+            // factor, which is what made a fast flick overshoot. A discrete
+            // wheel notch still sends one event: its travel is under a row, so
+            // the division never reduces it below the floor of one.
+            // A page-relative setting ('ver:0') has no row count to divide by;
+            // one event is all that can be reasoned about.
             let deltaYPx = abs(deltaY) * scale
-            let scrollCount = max(1, Int(deltaYPx / rowHeightPx))
+            let rowsTravelled = Int(deltaYPx / rowHeightPx)
+            let scrollCount = rowsPerWheelEvent > 0
+                ? max(1, rowsTravelled / rowsPerWheelEvent)
+                : 1
 
             for _ in 0..<scrollCount {
                 core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
@@ -2513,6 +2590,40 @@ final class MetalTerminalView: MTKView {
     /// Staged until the flush carrying those rows commits.
     func clearScrollOffsetForGrid(_ gridId: Int64, rowsDelta: Int) {
         guard rowsDelta != 0 else { return }
+        // The reconciliation staged below hands the gesture a row of
+        // compensation to ease out; retain the outgoing row now, while the
+        // flush's source set still holds it, so the vacated band shows the
+        // row that left instead of the edge-row background stretch (the
+        // neighbouring row's highlight) on grids the row-scroll fast path
+        // cannot cover.
+        if MetalTerminalRenderer.smoothScrollEnabled {
+            scrollOffsetLock.lock()
+            let offset = scrollOffsetPx[gridId] ?? 0
+            let lookahead = gestureLookaheadGrids.contains(gridId)
+            scrollOffsetLock.unlock()
+            pendingSentScrollLock.lock()
+            let sent = pendingSentScroll[gridId] ?? 0
+            pendingSentScrollLock.unlock()
+            // Mirrors processPendingScrollClears' gestureOwns: only a scroll
+            // whose compensation will displace the grid needs its row kept —
+            // an unowned (keyboard/nvim) scroll here clears the offset, and
+            // updateScrollOffsets would prune the retained row unused.
+            if sent > 0 || lookahead || abs(offset) >= Self.scrollOffsetEpsilon {
+                if let external = core?.externalGridView(for: gridId) {
+                    // An external window's rows live in its own surface, not
+                    // the main composite, so the capture belongs to it. It
+                    // cannot happen here: its flush bracket opens lazily on
+                    // first content, which is after this callback, and opening
+                    // discards anything staged before it. Hand over the
+                    // distance instead and let it capture when the bracket
+                    // opens — the committed set still holds the on-screen rows
+                    // at that point.
+                    external.noteGridScroll(rowsDelta: rowsDelta)
+                } else {
+                    renderer.captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta)
+                }
+            }
+        }
         pendingScrollClearLock.lock()
         stagedScrollClear.append((gridId: gridId, rowsDelta: rowsDelta))
         pendingScrollClearLock.unlock()
@@ -2795,7 +2906,7 @@ final class MetalTerminalView: MTKView {
             || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
 
         scrollOffsetLock.lock()
-        let maxOffsetPx = rowHeightPx * CGFloat(MetalTerminalRenderer.maxRetainedScrollRows)
+        let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
             // A gesture-owned grid is already square: its rows were cancelled
             // against the distance the notification reported, which exists for
@@ -3164,7 +3275,13 @@ final class MetalTerminalView: MTKView {
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
         let safeCellHeightPx = max(0, cellHeightPx)
-        let maxOffsetPx = safeCellHeightPx * Self.scrollMaxOverscrollCells
+        // One wheel event hands the gesture a whole event's worth of
+        // compensation to consume. Clamping below that would discard the part
+        // it cannot show, and the picture would jump by exactly that much when
+        // the rows land — so the ceiling has to be at least 'mousescroll' ver
+        // rows, with the overscroll allowance as the floor.
+        let cells = max(Self.scrollMaxOverscrollCells, CGFloat(core?.getMouseScrollVer() ?? 0))
+        let maxOffsetPx = safeCellHeightPx * cells
         guard maxOffsetPx > 0 else { return 0 }
         return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
     }
