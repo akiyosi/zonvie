@@ -2347,11 +2347,28 @@ final class MetalTerminalView: MTKView {
             let fastScrollThreshold = rowHeightPx / scale  // ~20 points at 2x scale
             if abs(deltaY) > fastScrollThreshold {
                 effectiveHasPrecise = false
-                // Clear any accumulated offset when switching to fast mode
+                // Clear any accumulated offset when switching to fast mode,
+                // and hand ownership of this grid back with it. The discrete
+                // path below books nothing, so every scroll it sends comes
+                // back with sentCount == 0 — but while the fingers are still
+                // down, gestureScrollGridId and gestureLookaheadGrids keep
+                // answering "the gesture owns this grid", and
+                // processPendingScrollClears then credits the arrival's whole
+                // distance to the offset. Nothing consumes that, so the
+                // picture carries up to a clamp's worth of displacement for
+                // the body of every fast flick (26% of reconciliations in a
+                // real trackpad log arrived this way). Discrete scrolling asks
+                // for whole rows and wants no sub-cell compensation, so those
+                // arrivals belong in the Neovim-initiated branch, which clears
+                // the offset. A later slow event re-establishes ownership.
                 scrollOffsetLock.lock()
                 scrollOffsetPx.removeValue(forKey: gridId)
                 scrollStaleSince.removeValue(forKey: gridId)
                 scrollEdgeBlocked.removeValue(forKey: gridId)
+                gestureLookaheadGrids.remove(gridId)
+                if gestureScrollGridId == gridId {
+                    gestureScrollGridId = nil
+                }
                 scrollOffsetLock.unlock()
                 pendingSentScrollLock.lock()
                 pendingSentScroll.removeValue(forKey: gridId)
