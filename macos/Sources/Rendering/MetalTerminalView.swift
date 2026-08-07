@@ -790,6 +790,10 @@ final class MetalTerminalView: MTKView {
             }
             // Update shader with current scroll offsets (safe to call here on main thread).
             self?.updateScrollShaderOffset()
+            // …and fold the cursor's displacement into the shader endpoints
+            // even when the call above took its idle early-out, which it does
+            // whenever nothing is scrolling. The cursor still moves then.
+            self?.renderer.refreshCursorShaderState()
             // Update cursor blink state for rendering
             if let core = self?.core {
                 let state = core.cursorBlinkState

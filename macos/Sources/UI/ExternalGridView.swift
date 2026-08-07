@@ -1298,6 +1298,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // vertices, which only reach the screen now.
             retention.commit()
             mainTerminalView?.renderer.publishCursorShaderState()
+            // The distance this bracket captured against is only spent now
+            // that its vertices are the committed ones; a cancelled bracket
+            // leaves it for the next (see captureRetainedRowsForPendingScroll).
+            pendingGridScrollLock.lock()
+            pendingGridScrollRows = 0
+            pendingGridScrollLock.unlock()
             commitRevision &+= 1
             serviceSurfaceRowStorageRetirement(
                 bufferSets: bufferSets,
@@ -1475,9 +1481,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// there as well would stage the same rows twice.
     private func captureRetainedRowsForPendingScroll() {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
+        // Read but do NOT consume: this bracket may be cancelled, and the core
+        // never resends a grid_scroll (it consumes the notification as it
+        // dispatches). Clearing here would lose the distance, leaving the
+        // published rows a step behind the content they are drawn against —
+        // stale lines over live text, with the edge stretch suppressed because
+        // rows are still published. commitFlush clears it once the vertices
+        // this capture belongs to are actually on screen. Same reasoning as
+        // cancelFlush's rowStaging merge-back.
         pendingGridScrollLock.lock()
         let rowsDelta = pendingGridScrollRows
-        pendingGridScrollRows = 0
         let bounds = scrollCaptureBounds
         pendingGridScrollLock.unlock()
         guard rowsDelta != 0 else { return }
@@ -2274,6 +2287,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let lastKnownCursorRowSnapshot: Int
             let cursorBlinkStateSnapshot: Bool
             let committedFontIsCurrent: Bool
+            // Latched with the committed set, not read later: commitFlush
+            // publishes the retention inside this same lock, so taking it
+            // afterwards can pair set N's vertices with set N+1's retained
+            // rows — the retained line drawn against pre-scroll content, which
+            // is the duplicate the publish-on-commit rule exists to prevent.
+            // (MetalTerminalRenderer already snapshots it under its lock.)
+            let retainedSnapshot: [RetainedScrollRow]
             tripleBufferLock.lock()
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
                 let terminal = rowCapacityHardFailure
@@ -2291,6 +2311,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 return
             }
             csi = committedSetIndex
+            retainedSnapshot = retention.snapshotPublished()
             // Set when the staged replay below raises rowCapacityRequiredRows, so
             // provisioning can be driven after tripleBufferLock is released.
             var recordedRowCapacityShortfall = false
@@ -2719,12 +2740,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // back to the edge it left through; the shader then applies this
             // grid's scroll offset like any other row, and the existing
             // content clip discards the part outside the window.
-            let retainedSnapshot = smoothScrolling ? retention.snapshotPublished() : []
+            let retainedRows = smoothScrolling ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
-            let smoothRowRange = 0..<(safeRowCount + retainedSnapshot.count)
+            let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow >= retainedRowBase else { return resolvedRowState(logicalRow) }
-                let r = retainedSnapshot[logicalRow - retainedRowBase]
+                let i = logicalRow - retainedRowBase
+                guard i < retainedRows.count else { return nil }
+                let r = retainedRows[i]
                 guard r.cellHeightPx == Float(cellHi) else { return nil }
                 // Same relation resolvedRowState uses: the vertices live at
                 // sourceRow and have to appear at targetRow.

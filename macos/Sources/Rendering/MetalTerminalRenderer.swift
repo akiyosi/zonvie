@@ -1003,6 +1003,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var shaderCursorRawRect: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorRawColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorGridId: Int64 = 0
+    /// Displacement of the cursor's grid as of the last offset rebuild. Cached
+    /// because `updateScrollOffsets` is skipped entirely on idle frames, while
+    /// the cursor still moves — the evaluation has to run every frame or the
+    /// shader keeps whatever endpoints the last scrolled frame left it.
+    private var shaderCursorScrollOffsetPx: Float = 0
     /// Sub-pixel movement is not a cursor move; it is the ease sliding the
     /// cursor along. Rotating on it would restart the trail every frame.
     private static let shaderCursorMoveEpsilonPx: Float = 0.5
@@ -2188,7 +2193,25 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         hasActiveScrollOffset = count > 0
         // This surface owns the cursor's grid whenever it appears in its own
         // offsets, and a grid with no entry is simply not displaced.
+        shaderCursorScrollOffsetPx = cursorScrollOffsetPx
         evaluateCursorShaderChangeLocked(scrollOffsetPx: cursorScrollOffsetPx)
+    }
+
+    /// Fold the cursor's current displacement into the shader endpoints for a
+    /// frame that did not rebuild the scroll offsets.
+    ///
+    /// `updateScrollOffsets` is the only place that knows a grid's
+    /// displacement, and the view skips it entirely once nothing is scrolling
+    /// — but the cursor still moves. Without this the shader endpoints stay at
+    /// whatever the last scrolled frame left, which from a cold start is a
+    /// zero rect at the drawable origin: a cursor shader draws nothing at all
+    /// until the first scroll (verified with the harness in tmp/cursorprobe).
+    /// The cached offset is correct on those frames because the last rebuild
+    /// before going idle ran with an empty offset set.
+    func refreshCursorShaderState() {
+        lock.lock()
+        defer { lock.unlock() }
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: shaderCursorScrollOffsetPx)
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
