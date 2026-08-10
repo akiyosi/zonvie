@@ -169,7 +169,12 @@ final class ScrollRetention {
     /// frame, so carry the same again as headroom. Allocated on first use,
     /// grown only when a wider row appears.
     static let maxInFlightFrames = 2
-    static let ringSize = 2 * (maxInFlightFrames + 2) * maxDepthRows
+    /// Windows that can hold a band at the same time. 'scrollbind' moves two
+    /// (:vert diffsplit), and each keeps its own rows, so the ring drains that
+    /// many times faster. Slots are only allocated as they are reached, so the
+    /// headroom costs nothing until the grids are actually there.
+    static let maxRetainedGrids = 4
+    static let ringSize = 2 * (maxInFlightFrames + 2) * maxDepthRows * maxRetainedGrids
 
     struct Plan {
         let first: Int
@@ -342,13 +347,18 @@ final class ScrollRetention {
             staged.removeAll(keepingCapacity: true)
             staged.append(contentsOf: published)
         }
-        for i in staged.indices {
+        // Grid-scoped: a step describes one grid's movement, and 'scrollbind'
+        // (:vert diffsplit) scrolls two windows from one gesture, each needing
+        // its own band filled. Shifting or pruning another grid's rows here
+        // would move them by a distance their content never travelled, and
+        // dropping them would leave that window's band to the edge stretch.
+        for i in staged.indices where staged[i].gridId == gridId {
             staged[i].targetRow -= rowsDelta
         }
         staged.removeAll {
-            $0.gridId != gridId
-                || abs($0.targetRow - pivotTargetRow) >= depth
-                || ($0.targetRow - pivotTargetRow) * rowsDelta > 0
+            $0.gridId == gridId
+                && (abs($0.targetRow - pivotTargetRow) >= depth
+                    || ($0.targetRow - pivotTargetRow) * rowsDelta > 0)
         }
         lock.unlock()
     }
@@ -386,8 +396,13 @@ final class ScrollRetention {
     func stage(_ row: RetainedScrollRow) {
         lock.lock()
         staged.append(row)
-        if staged.count > depth {
-            staged.removeFirst(staged.count - depth)
+        // Counted per grid: the depth is how far one band reaches, and two
+        // windows scrolling together each get their own.
+        var held = 0
+        for candidate in staged where candidate.gridId == row.gridId { held += 1 }
+        while held > depth, let oldest = staged.firstIndex(where: { $0.gridId == row.gridId }) {
+            staged.remove(at: oldest)
+            held -= 1
         }
         lock.unlock()
     }

@@ -3677,23 +3677,32 @@ pub const Grid = struct {
         left: u32,
         right: u32,
     ) !void {
-        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) return;
-        var rows = self.rows;
-        var cols = self.cols;
-        if (grid_id != 1) {
-            if (self.sub_grids.get(grid_id)) |sg| {
-                rows = sg.rows;
-                cols = sg.cols;
-            } else {
-                rows = 0;
-                cols = 0;
-            }
+        // Kept even for a grid that does not exist yet. Neovim announces a new
+        // window's margins BEFORE the grid_resize that creates it — measured,
+        // 2.6 ms before — and only resends them when they change, so dropping
+        // them here left that window's winbar row inside the scrollable area
+        // for the rest of the session. Bounded by the same budget as the
+        // sub-grid metadata it accompanies.
+        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) {
+            const inserts_new = !self.viewport_margins.contains(grid_id);
+            if (!subgridInsertFits(self.viewport_margins.count(), inserts_new)) return;
+            try self.viewport_margins.put(self.alloc, grid_id, .{
+                .top = top,
+                .bottom = bottom,
+                .left = left,
+                .right = right,
+            });
+            return;
         }
+        // Stored as reported; getViewportMargins clamps against the grid's
+        // current size. Clamping here instead would bake in whatever size the
+        // grid happened to have when the margins arrived, and Neovim does not
+        // resend them when the window is merely resized.
         const new_margins = ViewportMargins{
-            .top = @min(top, rows),
-            .bottom = @min(bottom, rows),
-            .left = @min(left, cols),
-            .right = @min(right, cols),
+            .top = top,
+            .bottom = bottom,
+            .left = left,
+            .right = right,
         };
         const old_margins = self.viewport_margins.get(grid_id) orelse ViewportMargins{};
         if (std.meta.eql(old_margins, new_margins)) return;
@@ -3724,7 +3733,23 @@ pub const Grid = struct {
 
     /// Get viewport margins for a grid. Returns default (all zeros) if not set.
     pub fn getViewportMargins(self: *const Grid, grid_id: i64) ViewportMargins {
-        return self.viewport_margins.get(grid_id) orelse .{};
+        const stored = self.viewport_margins.get(grid_id) orelse return .{};
+        // Clamped on the way out, not on the way in: margins can be kept for a
+        // grid whose size has not arrived yet, and clamping them against a size
+        // of zero would erase them permanently.
+        var rows = self.rows;
+        var cols = self.cols;
+        if (grid_id != 1) {
+            const sg = self.sub_grids.get(grid_id) orelse return .{};
+            rows = sg.rows;
+            cols = sg.cols;
+        }
+        return .{
+            .top = @min(stored.top, rows),
+            .bottom = @min(stored.bottom, rows),
+            .left = @min(stored.left, cols),
+            .right = @min(stored.right, cols),
+        };
     }
 
     /// Get viewport for a grid. Returns null if not set.
@@ -4972,9 +4997,15 @@ test "viewport metadata ignores unknown grids" {
     try grid.setViewport(99, 7, 1, 2, 3, 4, 5, 6);
     try grid.setViewportMargins(99, 1, 1, 1, 1);
     try std.testing.expectEqual(@as(usize, 0), grid.viewport.count());
-    try std.testing.expectEqual(@as(usize, 0), grid.viewport_margins.count());
+    // Margins are the exception: Neovim announces a window's margins before the
+    // grid_resize that creates it, and never resends them, so they are kept
+    // against the grid's arrival. They read as nothing until it does.
+    try std.testing.expectEqual(@as(usize, 1), grid.viewport_margins.count());
+    try std.testing.expectEqual(@as(u32, 0), grid.getViewportMargins(99).top);
 
     try grid.resizeGrid(99, 1, 1);
+    // Now that the grid exists, what was announced earlier takes effect.
+    try std.testing.expectEqual(@as(u32, 1), grid.getViewportMargins(99).top);
     try grid.setViewport(99, 7, 1, 2, 3, 4, 5, 6);
     try grid.setViewportMargins(99, 1, 1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), grid.viewport.count());

@@ -174,11 +174,10 @@ private enum ScrollRetentionTests {
         )
     }
 
-    /// One grid at a time. beginStep drops every staged row belonging to
-    /// another grid, so two windows scrolling in one flush end with the later
-    /// one's band filled and the earlier one's empty. Anything built on the
-    /// retention is bounded by this.
-    private static func verifySingleGridAtATime(device: MTLDevice) {
+    /// 'scrollbind' (:vert diffsplit) moves two windows from one gesture, and
+    /// both need their band filled. A step describes one grid, so opening a
+    /// second one must leave the first grid's rows where they are.
+    private static func verifyGridsAreIndependent(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
         retention.setDepthRows(3)
         retention.beginFlush()
@@ -187,8 +186,38 @@ private enum ScrollRetentionTests {
         retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
         retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
         _ = retention.commit()
-        requireEqual(retention.publishedCount(gridId: 3), 1, "the later grid is retained")
-        requireEqual(retention.publishedCount(gridId: 2), 0, "the earlier grid's rows are dropped")
+        requireEqual(retention.publishedCount(gridId: 2), 1, "the first grid keeps its rows")
+        requireEqual(retention.publishedCount(gridId: 3), 1, "the second grid gets its own")
+
+        // And the depth is per grid, not shared between them.
+        retention.beginFlush()
+        retention.beginStep(gridId: 2, rowsDelta: 1, pivotTargetRow: 0)
+        for row in 0..<5 { retention.stage(makeRow(retention, gridId: 2, targetRow: row)) }
+        retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
+        for row in 0..<5 { retention.stage(makeRow(retention, gridId: 3, targetRow: row)) }
+        _ = retention.commit()
+        requireEqual(retention.publishedCount(gridId: 2), 3, "first grid holds a full depth")
+        requireEqual(retention.publishedCount(gridId: 3), 3, "second grid holds a full depth")
+    }
+
+    /// A step must not drag another grid's rows along with it: they describe
+    /// content that did not move, and shifting them draws them off real text.
+    private static func verifyStepLeavesOtherGridsInPlace(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(3)
+        retention.beginFlush()
+        retention.beginStep(gridId: 2, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 2, targetRow: 5))
+        // A step for another grid, three rows in the opposite direction.
+        retention.beginStep(gridId: 3, rowsDelta: -3, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
+        _ = retention.commit()
+        let rows = retention.snapshotPublished()
+        guard let kept = rows.first(where: { $0.gridId == 2 }) else {
+            require(false, "the untouched grid's row survived")
+            return
+        }
+        requireEqual(kept.targetRow, 5, "the untouched grid's row stayed where it was")
     }
 
     /// A retained row is only meaningful while its grid is displaced.
@@ -230,7 +259,8 @@ private enum ScrollRetentionTests {
         }
         verifyStagingLifecycle(device: device)
         verifyAbortDiscardsStaged(device: device)
-        verifySingleGridAtATime(device: device)
+        verifyGridsAreIndependent(device: device)
+        verifyStepLeavesOtherGridsInPlace(device: device)
         verifyPrune(device: device)
         verifyDepthClamp(device: device)
         print("ScrollRetentionTests: OK")

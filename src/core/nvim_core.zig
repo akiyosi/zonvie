@@ -7187,8 +7187,11 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_row);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_col);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_top);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_right);
+    // Margins are clamped to the grid on the way out — stricter than the
+    // saturating conversion the placement fields fall back to, and the reason
+    // they can be stored before the grid that bounds them exists.
+    try std.testing.expectEqual(@as(i32, 2), out[1].margin_top);
+    try std.testing.expectEqual(@as(i32, 2), out[1].margin_right);
 
     core.grid.cursor_grid = 1;
     core.grid.cursor_row = std.math.maxInt(u32);
