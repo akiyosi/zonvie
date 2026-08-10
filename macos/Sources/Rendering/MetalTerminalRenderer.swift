@@ -775,7 +775,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// frame is drawn, which left every gesture's first row uncaptured.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
     /// Grids this bracket has already retained rows for, so the row-scroll fast
-    /// path does not stage the same movement a second time. Reset in beginFlush.
+    /// path does not stage the same movement a second time. Reset in
+    /// beginFlush. Written and read only inside the flush bracket, which is
+    /// wholly on the core thread, so it carries no lock of its own.
     private var bracketStagedGrids: Set<Int64> = []
 
     /// grid_scroll steps captured by a bracket that has not committed yet.
@@ -5261,14 +5263,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// time as the scrolled vertices.
     private func captureRetainedScrollRow(rowStart: Int, rowEnd: Int, rowsDelta: Int) {
         guard Self.smoothScrollEnabled else { return }
-        // The grid_scroll notification is dispatched earlier in this bracket
-        // and has already retained this movement's rows, from the source set
-        // before any of this flush's writes. Staging them again here would ask
-        // ScrollRetention for a second step and shift the seeded rows twice.
-        lock.lock()
-        let alreadyStaged = !bracketStagedGrids.isEmpty
-        lock.unlock()
-        if alreadyStaged { return }
         let ws = bufferSets[writeSetIndex]
         guard ws.rowState.usingRowBuffers else { return }
         let depth = retention.depthRows
@@ -5315,6 +5309,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if mixed { continue }
             if let stepGridId, gid != stepGridId { continue }
             if stepGridId == nil {
+                // The grid_scroll notification is dispatched earlier in this
+                // bracket and may already have retained this grid's movement,
+                // read from the source set before any of this flush's writes.
+                // Staging it again would open a second step and shift the
+                // seeded rows twice. Per grid, not per bracket: two windows can
+                // scroll in one flush, and a blanket check would leave the
+                // second one's band empty.
+                if bracketStagedGrids.contains(gid) { return }
                 retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
                 stepGridId = gid
             }
