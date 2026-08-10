@@ -1081,8 +1081,8 @@ pub const Core = struct {
     // before the reporter's first notification lands. Updated via RPC
     // notification "zonvie_mousescroll" (see setupMouseScrollReporter); read
     // from the frontend UI thread on every precise scroll event, hence atomic.
-    // A page-relative setting ('ver:0' means one page) reports 0, which the
-    // frontend treats as "not a fixed row count" and falls back to 1.
+    // 'ver:0' disables mouse scrolling in Neovim and reports 0, which the
+    // frontend treats as "no row count to reason with".
     mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
 
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME

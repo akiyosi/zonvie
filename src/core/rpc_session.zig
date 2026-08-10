@@ -1390,9 +1390,12 @@ pub fn setupAgentStatus(self: *Core) void {
 /// rows of travel. Assuming one row made a fast gesture jump, because the
 /// lookahead paid for one row while the content moved N.
 ///
-/// 'ver:0' (scroll by a page) has no fixed row count and reports 0; the
-/// frontend falls back to one row. augroup clear=true keeps re-injection
-/// idempotent. Fire-and-forget.
+/// 'ver:0' disables mouse scrolling entirely (it is not a page-relative
+/// setting) and reports 0; the frontend then has no row count to reason with
+/// and leaves the precise path alone. A setting with no 'ver' component at all
+/// reports 3, matching the default Neovim uses for an omitted direction — the
+/// Lua fallback is for a missing component, never for an explicit 0.
+/// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 ///
 /// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
 /// the Windows frontend scrolls by whole rows, so injecting the reporter

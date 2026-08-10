@@ -3231,7 +3231,7 @@ final class ZonvieCore {
     }
 
     /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
-    /// 0 means the page-relative setting, which has no fixed row count.
+    /// 0 means 'ver:0', which disables mouse scrolling in Neovim entirely.
     /// Lock-free atomic read; safe to call from any thread.
     func getMouseScrollVer() -> Int {
         guard let core else { return 0 }

@@ -1492,8 +1492,8 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
 
 /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
 /// Reported by the auto-injected reporter (macOS only) and refreshed when the
-/// option changes. Returns 0 when the setting is page-relative ('ver:0'),
-/// which has no fixed row count. Lock-free atomic read.
+/// option changes. Returns 0 for 'ver:0', which disables mouse scrolling in
+/// Neovim rather than making it page-relative. Lock-free atomic read.
 pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {
     if (p == null) return 0;
     const box = asBox(p.?);

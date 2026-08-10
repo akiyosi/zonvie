@@ -2329,8 +2329,8 @@ final class MetalTerminalView: MTKView {
         // them and cancels each arrival against the pixel offset it holds, so
         // an event has to be accounted as the N rows it really moves. Assuming
         // one made a fast gesture jump the other N-1 per event.
-        // A page-relative setting ('ver:0') has no row count to account with,
-        // so pixel scrolling is not attempted at all.
+        // 'ver:0' disables mouse scrolling in Neovim, so there is nothing to
+        // account with and pixel scrolling is not attempted at all.
         let rowsPerWheelEvent = core.getMouseScrollVer()
         if rowsPerWheelEvent < 1 {
             effectiveHasPrecise = false
@@ -2562,8 +2562,8 @@ final class MetalTerminalView: MTKView {
             // factor, which is what made a fast flick overshoot. A discrete
             // wheel notch still sends one event: its travel is under a row, so
             // the division never reduces it below the floor of one.
-            // A page-relative setting ('ver:0') has no row count to divide by;
-            // one event is all that can be reasoned about.
+            // 'ver:0' disables mouse scrolling in Neovim, so there is no row
+            // count to divide by; the events it sends are ignored anyway.
             let deltaYPx = abs(deltaY) * scale
             let rowsTravelled = Int(deltaYPx / rowHeightPx)
             let scrollCount = rowsPerWheelEvent > 0
@@ -2814,6 +2814,10 @@ final class MetalTerminalView: MTKView {
         guard !pending.isEmpty || !external.isEmpty else { return }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        // One wheel event's worth of rows, the unit the lookahead books in and
+        // therefore the most it may ever be running ahead by. Read once: it is
+        // a lock-free atomic, but this loop runs per arrival.
+        let rowsPerWheelEventForClamp = core?.getMouseScrollVer() ?? 1
 
         scrollOffsetLock.lock()
         for gridId in external {
@@ -2875,12 +2879,50 @@ final class MetalTerminalView: MTKView {
                 pendingSentScroll[gridId] = sentCount - toConsume
                 pendingSentScrollLock.unlock()
 
-                // Cancel exactly the distance the content travelled, so the
-                // picture stays where the finger left it. What is left is the
-                // compensation the finger then consumes pixel by pixel — the
-                // row appears as it is crossed, with no frame in which the
+                // Cancel the distance the compensation was taken out for, so
+                // the picture stays where the finger left it. What is left is
+                // the compensation the finger then consumes pixel by pixel —
+                // the row appears as it is crossed, with no frame in which the
                 // content has moved and the offset has not.
-                let newOffset = currentOffset + CGFloat(rowsDelta) * rowHeightPx
+                //
+                // Booked rows, not reported rows: 'mousescroll' counts buffer
+                // lines while grid_scroll counts screen rows, so on a 'wrap'ped
+                // buffer one wheel event books ver rows and Neovim answers with
+                // every row those lines occupy — four times as many for a line
+                // spanning four rows. Crediting the report would drive the
+                // offset past zero and out the other side. Where nothing was
+                // booked there is no better number than the report itself, and
+                // the healthy case has the two equal, so this only bites where
+                // the units genuinely disagree.
+                let creditedRows = sentCount > 0
+                    ? (rowsDelta < 0 ? -toConsume : toConsume)
+                    : rowsDelta
+                var newOffset = currentOffset + CGFloat(creditedRows) * rowHeightPx
+                // A credit hands back compensation that is being held, so it
+                // must not leave MORE held than before — and never more than
+                // the single step the lookahead is allowed to run ahead by.
+                //
+                // The clamp above only bounds an arrival that still has a
+                // booking to measure against. The first arrival of a wrapped
+                // scroll consumes the whole booking, so a second one for the
+                // same gesture finds none left and would be credited in full:
+                // measured, one wheel event moves 12 screen rows against a
+                // booking of 3, which drove the offset deeper into the far side
+                // and stalled further sends until the finger recovered it.
+                // Giving back what is held may overshoot zero by one step —
+                // that is the allowance the lookahead runs on. A credit that
+                // instead pushes AWAY from zero is not giving anything back, so
+                // it may not deepen an offset that already holds something; from
+                // rest it is a genuine Neovim-initiated scroll and gets the same
+                // one-step compensation the model uses everywhere else.
+                let stepPx = rowHeightPx * CGFloat(max(1, rowsPerWheelEventForClamp))
+                let deepens = currentOffset == 0 || (newOffset < 0) == (currentOffset < 0)
+                let cap = deepens
+                    ? (currentOffset == 0 ? stepPx : abs(currentOffset))
+                    : stepPx
+                if abs(newOffset) > cap {
+                    newOffset = newOffset < 0 ? -cap : cap
+                }
                 if abs(newOffset) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     gestureLookaheadGrids.remove(gridId)

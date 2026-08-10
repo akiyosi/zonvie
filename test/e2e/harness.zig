@@ -125,6 +125,21 @@ pub const Harness = struct {
     /// scenario can only prove "the old window went away" by counting it.
     msg_clears: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    // grid_scroll recording. A frontend holding a sub-cell scroll offset has to
+    // give the reported distance back, so what matters is not just that the
+    // notification arrives but that it arrives exactly once — see
+    // `abort_flush_on_grid_scroll`.
+    grid_scrolls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    grid_scroll_rows: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// Arm to abort the flush from inside the next on_grid_scroll, the way a
+    /// frontend does when it cannot finish the bracket. The core dispatches
+    /// grid_scroll before that point, so this reproduces an abort that lands
+    /// after the notification was already consumed.
+    abort_flush_on_grid_scroll: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Flushes that ended with the abort flag set. Without this a scenario
+    /// cannot tell an abort that took effect from a write that did nothing.
+    flush_aborts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -161,6 +176,7 @@ pub const Harness = struct {
             .on_external_window = onExternalWindow,
             .on_external_window_close = onExternalWindowClose,
             .on_agent_status = onAgentStatus,
+            .on_grid_scroll = onGridScroll,
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
@@ -220,6 +236,7 @@ pub const Harness = struct {
 
     fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        if (h.core.flush_aborted) _ = h.flush_aborts.fetchAdd(1, .seq_cst);
         _ = h.flush_seq.fetchAdd(1, .seq_cst);
         h.sync_mu.lockUncancelable(zc.clock.io());
         h.sync_cond.signal(zc.clock.io());
@@ -233,6 +250,17 @@ pub const Harness = struct {
         h.sync_mu.lockUncancelable(zc.clock.io());
         h.sync_cond.signal(zc.clock.io());
         h.sync_mu.unlock(zc.clock.io());
+    }
+
+    fn onGridScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
+        _ = grid_id;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        _ = h.grid_scrolls.fetchAdd(1, .seq_cst);
+        _ = h.grid_scroll_rows.fetchAdd(rows_delta, .seq_cst);
+        if (h.abort_flush_on_grid_scroll.swap(false, .seq_cst)) {
+            // Same effect as zonvie_core_abort_flush from the frontend.
+            h.core.flush_aborted = true;
+        }
     }
 
     fn onLog(_: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
@@ -569,6 +597,17 @@ pub const Harness = struct {
         try h.core.requestCommand(cmd);
     }
 
+    /// Send one mouse wheel event, the way the frontends do.
+    pub fn wheel(h: *Harness, grid_id: i64, direction: []const u8) void {
+        h.core.sendMouseScroll(grid_id, 0, 0, direction, "");
+    }
+
+    /// The 'ver' component of 'mousescroll' as the core currently understands
+    /// it — what the reporter injected at startup last published.
+    pub fn mousescrollVer(h: *Harness) u32 {
+        return h.core.mousescroll_ver.load(.acquire);
+    }
+
     // ── Synchronization ────────────────────────────────────────────────
 
     /// Wait until `pred(ctx, h)` is true. Wakes on every flush-end (condvar)
@@ -894,6 +933,18 @@ pub const Harness = struct {
             return vp.scroll_delta;
         }
         return 0;
+    }
+
+    /// Read topline and scroll_delta together. scroll_delta belongs to the last
+    /// win_viewport, so reading it in a second lock acquisition can pair it with
+    /// a different event than the topline it is being compared against.
+    pub fn getViewportTopAndDelta(h: *Harness, grid_id: i64) struct { top: u32, delta: i64 } {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        if (h.core.grid.viewport.get(grid_id)) |vp| {
+            return .{ .top = @intCast(vp.topline), .delta = vp.scroll_delta };
+        }
+        return .{ .top = 0, .delta = 0 };
     }
 
     /// Take the screen rows moved that no grid_scroll accounted for.

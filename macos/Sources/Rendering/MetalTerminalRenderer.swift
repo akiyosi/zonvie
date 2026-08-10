@@ -775,6 +775,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// frame is drawn, which left every gesture's first row uncaptured.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
 
+    /// grid_scroll steps captured by a bracket that has not committed yet.
+    /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
+    /// instead. Guarded by `lock`.
+    private var pendingRetentionReplay: [(gridId: Int64, rowsDelta: Int)] = []
+    /// A run of aborting brackets must not accumulate steps without bound.
+    /// Bounded by the retention depth, not a multiple of it: one beginFlush
+    /// replays every pending step, each taking up to `depthRows` ring buffers,
+    /// and the ring holds `ringSize` of them with no in-flight counter to stop
+    /// a wrap from re-handing a buffer a frame is still reading.
+    /// `maxDepthRows` steps x `maxDepthRows` rows stays well inside `ringSize`.
+    private static let maxPendingRetentionReplay = ScrollRetention.maxDepthRows
+
+    /// Per-grid distance the source set is behind the steps staged so far in
+    /// this bracket. Reset every beginFlush. Guarded by `lock`.
+    private var bracketSourceShift: [Int64: Int] = [:]
+
     // ScrollOffset struct matching Shaders.metal
     struct ScrollOffset {
         var grid_id: Int32
@@ -1454,7 +1470,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushDirtyRows.removeAll()
         flushDirtyRectPx = nil
         flushSourceSetIndex = committedSetIndex
+        bracketSourceShift.removeAll(keepingCapacity: true)
+        let retentionReplay = Self.smoothScrollEnabled ? pendingRetentionReplay : []
         lock.unlock()
+
+        // Re-stage the steps of any bracket that aborted after the core had
+        // already handed over its grid_scroll. The source set is the same one
+        // those captures read, because an aborted bracket does not commit.
+        for step in retentionReplay {
+            captureRetainedRowForGridScroll(
+                gridId: step.gridId,
+                rowsDelta: step.rowsDelta,
+                replaying: true
+            )
+        }
 
         // Prepare atlas back texture.
         // Phase 1: handle non-GPU cases (rebuild, CPU sync, no-op).
@@ -1750,6 +1779,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
         }
+        // These steps reached the screen, so there is nothing left to replay.
+        pendingRetentionReplay.removeAll(keepingCapacity: true)
         publishCursorShaderStateLocked()
         commitRevision &+= 1
         let rev = commitRevision
@@ -2236,6 +2267,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // The spans describe a layout this reset is abandoning (resize, font
         // change, grid teardown all land here).
         gridScrollCaptureBounds.removeAll(keepingCapacity: true)
+        // A parked step describes the same abandoned layout, and would be
+        // replayed against post-reset bounds and a post-reset source set.
+        pendingRetentionReplay.removeAll(keepingCapacity: true)
+        bracketSourceShift.removeAll(keepingCapacity: true)
         // Retained rows were built for the layout that is being abandoned
         // (resize, font change, grid teardown all clear the offsets).
         retention.clearPublished()
@@ -5333,12 +5368,43 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// pay the row twice), and a keyboard scroll on such a grid never
     /// displaces it, so its retained row is pruned unused.
     func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int) {
+        captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta, replaying: false)
+    }
+
+    private func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int, replaying: Bool) {
         guard Self.smoothScrollEnabled, rowsDelta != 0, isInFlush else { return }
 
         lock.lock()
         let bounds = gridScrollCaptureBounds[gridId]
+        let capturable = (bounds?.bottomEx ?? 0) > (bounds?.top ?? 0)
+        // The core hands a grid_scroll over exactly once: it is consumed at
+        // dispatch, and a bracket that aborts afterwards is never re-offered it
+        // (see e2e grid_scroll_abort_delivery). Since beginFlush discards
+        // retention staged by a bracket that did not commit, the step would be
+        // lost outright — so remember it here and stage it again next bracket.
+        // The rows come from the committed set, which an aborted bracket left
+        // untouched, so the replay reads exactly what this capture read.
+        //
+        // Only steps that could actually be staged are remembered: a grid with
+        // no armed bounds (grid 1 and every other full-width grid — those are
+        // never armed) would otherwise spend slots in the window and evict a
+        // split's real step.
+        if !replaying, capturable {
+            pendingRetentionReplay.append((gridId: gridId, rowsDelta: rowsDelta))
+            if pendingRetentionReplay.count > Self.maxPendingRetentionReplay {
+                pendingRetentionReplay.removeFirst(
+                    pendingRetentionReplay.count - Self.maxPendingRetentionReplay
+                )
+            }
+        }
+        // How far the source set is behind what this step describes. A replayed
+        // step did not move the committed content, so a capture that follows it
+        // in the same bracket must read that much further into the set or it
+        // retains the same line twice.
+        let sourceShift = bracketSourceShift[gridId] ?? 0
+        bracketSourceShift[gridId] = sourceShift + rowsDelta
         lock.unlock()
-        guard let bounds, bounds.bottomEx > bounds.top else { return }
+        guard let bounds, capturable else { return }
 
         let cs = bufferSets[flushSourceSetIndex]
         guard cs.rowState.usingRowBuffers else { return }
@@ -5360,7 +5426,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         for i in 0..<plan.count {
             let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-            captureOneRetainedRow(cs: cs, gridId: gridId, row: row, rowsDelta: rowsDelta)
+            captureOneRetainedRow(
+                cs: cs,
+                gridId: gridId,
+                readRow: row + sourceShift,
+                targetRow: row - rowsDelta
+            )
         }
     }
 
@@ -5368,12 +5439,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// and append it to the open step. A row with nothing to retain (blank, or
     /// holding no vertices of this grid) is skipped — the band then falls back
     /// to the edge stretch, same as the fast-path capture's vc == 0 case.
+    /// `readRow` is where the row currently sits in the source set; `targetRow`
+    /// is where it must be drawn. They differ by more than the step's own
+    /// rowsDelta once a replayed step has moved content the source set has not
+    /// caught up with.
     private func captureOneRetainedRow(
         cs: SurfaceBufferSet,
         gridId: Int64,
-        row: Int,
-        rowsDelta: Int
+        readRow: Int,
+        targetRow: Int
     ) {
+        let row = readRow
         guard row >= 0, row < cs.rowLogicalToSlot.count else { return }
         let slot = cs.rowLogicalToSlot[row]
         guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return }
@@ -5407,7 +5483,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             count: kept,
             gridId: gridId,
             sourceRow: sourceRow,
-            targetRow: row - rowsDelta,
+            targetRow: targetRow,
             cellHeightPx: capturedCellHeightPx
         ))
     }

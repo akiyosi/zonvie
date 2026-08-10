@@ -34,6 +34,21 @@ test "e2e:scroll" {
     try @import("scenarios/scroll.zig").run(testing.allocator);
 }
 
+test "e2e:mousescroll_ver" {
+    try requireNvim();
+    try @import("scenarios/mousescroll_ver.zig").run(testing.allocator);
+}
+
+test "e2e:grid_scroll_abort_delivery" {
+    try requireNvim();
+    try @import("scenarios/grid_scroll_abort_delivery.zig").run(testing.allocator);
+}
+
+test "e2e:mousescroll_wrap_rows" {
+    try requireNvim();
+    try @import("scenarios/mousescroll_wrap_rows.zig").run(testing.allocator);
+}
+
 test "e2e:smoothscroll_viewport_delta" {
     try requireNvim();
     try @import("scenarios/smoothscroll_viewport_delta.zig").run(testing.allocator);
