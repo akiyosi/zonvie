@@ -774,6 +774,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// time: Neovim's response can land within a millisecond, before any
     /// frame is drawn, which left every gesture's first row uncaptured.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
+    /// Grids this bracket has already retained rows for, so the row-scroll fast
+    /// path does not stage the same movement a second time. Reset in beginFlush.
+    private var bracketStagedGrids: Set<Int64> = []
 
     /// grid_scroll steps captured by a bracket that has not committed yet.
     /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
@@ -1471,6 +1474,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushDirtyRectPx = nil
         flushSourceSetIndex = committedSetIndex
         bracketSourceShift.removeAll(keepingCapacity: true)
+        bracketStagedGrids.removeAll(keepingCapacity: true)
         let retentionReplay = Self.smoothScrollEnabled ? pendingRetentionReplay : []
         lock.unlock()
 
@@ -5257,6 +5261,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// time as the scrolled vertices.
     private func captureRetainedScrollRow(rowStart: Int, rowEnd: Int, rowsDelta: Int) {
         guard Self.smoothScrollEnabled else { return }
+        // The grid_scroll notification is dispatched earlier in this bracket
+        // and has already retained this movement's rows, from the source set
+        // before any of this flush's writes. Staging them again here would ask
+        // ScrollRetention for a second step and shift the seeded rows twice.
+        lock.lock()
+        let alreadyStaged = !bracketStagedGrids.isEmpty
+        lock.unlock()
+        if alreadyStaged { return }
         let ws = bufferSets[writeSetIndex]
         guard ws.rowState.usingRowBuffers else { return }
         let depth = retention.depthRows
@@ -5311,6 +5323,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
             memcpy(dstBuf.contents(), srcBuf.contents(), needed)
 
+            bracketStagedGrids.insert(gid)
             retention.stage(RetainedScrollRow(
                 buffer: dstBuf,
                 count: vc,
@@ -5404,10 +5417,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let sourceShift = bracketSourceShift[gridId] ?? 0
         bracketSourceShift[gridId] = sourceShift + rowsDelta
         lock.unlock()
-        guard let bounds, capturable else { return }
+        guard let bounds, capturable else {
+            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no armed bounds")
+            return
+        }
 
         let cs = bufferSets[flushSourceSetIndex]
-        guard cs.rowState.usingRowBuffers else { return }
+        guard cs.rowState.usingRowBuffers else {
+            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no row buffers")
+            return
+        }
 
         // A step is routinely more than one row: the lookahead asks for a
         // whole wheel event's worth ('mousescroll' ver) and the core coalesces
@@ -5420,7 +5439,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             rowEnd: bounds.bottomEx,
             rowsDelta: rowsDelta,
             depth: depth
-        ) else { return }
+        ) else {
+            ZonvieCore.appLog(
+                "[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no plan (top=\(bounds.top) bottomEx=\(bounds.bottomEx) depth=\(depth))"
+            )
+            return
+        }
 
         retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
 
@@ -5478,6 +5502,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             w += 1
         }
 
+        bracketStagedGrids.insert(gridId)
         retention.stage(RetainedScrollRow(
             buffer: dstBuf,
             count: kept,

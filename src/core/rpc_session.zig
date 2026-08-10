@@ -1424,6 +1424,81 @@ pub fn setupMouseScrollReporter(self: *Core) void {
     self.log.write("mousescroll reporter installed\n", .{});
 }
 
+/// Borrow 'smoothscroll' for the duration of a trackpad gesture, and hand it
+/// back when the gesture ends.
+///
+/// Without it a 'wrap'ped window can only move a whole buffer line at a time,
+/// which is however many screen rows that line occupies — measured, one wheel
+/// event books 3 rows and moves 12. No amount of frontend accounting smooths
+/// that: the picture either jumps at every wrapped line or the offset runs away
+/// from the finger. With 'smoothscroll' the quantum becomes one screen row and
+/// a wheel event moves exactly the 'mousescroll' count, so booking and movement
+/// agree and the sub-cell model holds.
+///
+/// The previous value is stashed in a window variable and restored from it, so
+/// a restore that arrives twice is harmless and one that never arrives leaves a
+/// visible trace to recover from. Windows without 'wrap' are skipped: the
+/// option would do nothing there, and this keeps the OptionSet autocmd (which
+/// user config can observe) quiet in the common case.
+///
+/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
+///
+/// Returns false when the request could not be issued — the grid lock was busy,
+/// or no window is known yet. Called from the input path, so it never blocks on
+/// the lock; the caller is expected to try again, which matters most for the
+/// restore.
+pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
+    if (comptime builtin.os.tag != .macos) return true;
+
+    const win = blk: {
+        if (!self.grid_mu.tryLock()) {
+            self.log.write("[ss_borrow] grid={d} enable={any} lock busy\n", .{ grid_id, enable });
+            return false;
+        }
+        defer self.grid_mu.unlock(clock.io());
+        const vp = self.grid.getViewport(grid_id) orelse break :blk 0;
+        break :blk vp.win;
+    };
+    if (win == 0) {
+        self.log.write("[ss_borrow] grid={d} enable={any} no window\n", .{ grid_id, enable });
+        return false;
+    }
+
+    const enable_lua =
+        \\local w = {d}
+        \\if vim.api.nvim_win_is_valid(w)
+        \\  and vim.api.nvim_get_option_value('wrap', {{ win = w }})
+        \\  and not pcall(vim.api.nvim_win_get_var, w, 'zonvie_ss_prev') then
+        \\  vim.api.nvim_win_set_var(w, 'zonvie_ss_prev',
+        \\    vim.api.nvim_get_option_value('smoothscroll', {{ win = w }}))
+        \\  vim.api.nvim_set_option_value('smoothscroll', true, {{ win = w }})
+        \\end
+    ;
+    const restore_lua =
+        \\local w = {d}
+        \\if vim.api.nvim_win_is_valid(w) then
+        \\  local ok, prev = pcall(vim.api.nvim_win_get_var, w, 'zonvie_ss_prev')
+        \\  if ok then
+        \\    pcall(vim.api.nvim_set_option_value, 'smoothscroll', prev, {{ win = w }})
+        \\    pcall(vim.api.nvim_win_del_var, w, 'zonvie_ss_prev')
+        \\  end
+        \\end
+    ;
+
+    var buf: [640]u8 = undefined;
+    const lua_code = (if (enable)
+        std.fmt.bufPrint(&buf, enable_lua, .{win})
+    else
+        std.fmt.bufPrint(&buf, restore_lua, .{win})) catch return false;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("[ss_borrow] grid={d} win={d} enable={any} exec_lua failed: {any}\n", .{ grid_id, win, enable, e });
+        return false;
+    };
+    self.log.write("[ss_borrow] grid={d} win={d} enable={any} issued\n", .{ grid_id, win, enable });
+    return true;
+}
+
 fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
     const self = ctx.core;
 

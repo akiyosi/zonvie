@@ -90,10 +90,26 @@ pub fn run(alloc: std.mem.Allocator) !void {
     _ = h.grid_scroll_rows.swap(0, .seq_cst);
     h.wheel(g, "down");
     h.wheel(g, "down");
-    try waitTopline(h, g, PARK_TOP + 2 * VER);
+    // Waited on the reports, not on topline: the viewport is updated during
+    // redraw while the notification is dispatched in the flush that follows, so
+    // topline reaching its target does not mean the counters have caught up.
+    const want_burst = 2 * @as(i64, VER) * ROWS_PER_LINE;
+    const Ctx = struct { want: i64 };
+    h.waitUntil(Ctx{ .want = want_burst }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return hh.grid_scroll_rows.load(.seq_cst) >= c.want;
+        }
+    }.check, h.opts.timeout_ms) catch {};
     if (h.getViewportTop(g) != PARK_TOP + 2 * VER) return error.SecondWheelDidNotLand;
     const burst_notifications = h.grid_scrolls.load(.seq_cst);
     const burst_rows = h.grid_scroll_rows.load(.seq_cst);
+    if (burst_rows != want_burst) {
+        std.debug.print(
+            "[e2e] mousescroll_wrap_rows: two wheel events moved {d} screen rows, expected {d}\n",
+            .{ burst_rows, want_burst },
+        );
+        return error.BurstRowsMismatch;
+    }
 
     std.debug.print(
         "[e2e] mousescroll_wrap_rows: one wheel event books {d} rows and moves {d} screen rows " ++

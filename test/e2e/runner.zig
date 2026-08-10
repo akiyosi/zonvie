@@ -44,6 +44,11 @@ test "e2e:grid_scroll_abort_delivery" {
     try @import("scenarios/grid_scroll_abort_delivery.zig").run(testing.allocator);
 }
 
+test "e2e:gesture_smoothscroll_borrow" {
+    try requireNvim();
+    try @import("scenarios/gesture_smoothscroll_borrow.zig").run(testing.allocator);
+}
+
 test "e2e:mousescroll_wrap_rows" {
     try requireNvim();
     try @import("scenarios/mousescroll_wrap_rows.zig").run(testing.allocator);

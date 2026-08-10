@@ -740,7 +740,17 @@ typedef struct zonvie_callbacks {
        produce a single notification, and rows_delta is their sum — it is not
        always +/-1, and the count of notifications does not describe how far
        the content travelled. Reconcile against this value, not against the
-       number of calls. */
+       number of calls.
+
+       Not every notification corresponds to a Neovim grid_scroll event. Where
+       the view moved but Neovim repainted instead of shifting rows — which is
+       what 'smoothscroll' does on a wrapped line — the movement win_viewport
+       reported and no grid_scroll described is delivered here too, so this is
+       the single report of "the content of this grid moved N screen rows"
+       however Neovim chose to express it. A frontend holding a sub-cell scroll
+       offset must give back that distance and retain the rows that left in
+       both cases; one that only shifts whole rows can ignore the distinction,
+       since the repainted rows arrive as ordinary row updates. */
     void (*on_grid_scroll)(void* ctx, int64_t grid_id, int32_t rows_delta);
 
     /* IME off notification callback.
@@ -1151,17 +1161,28 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
     zonvie_viewport_info *out_viewport
 );
 
-/* Take the screen rows a grid's view moved that no grid_scroll described,
-   clearing the running total. Under 'smoothscroll' Neovim repaints rather than
-   emitting grid_scroll, so this is the only report that content moved; when
-   grid_scroll does describe the movement the two cancel and this yields 0.
-   Sign matches grid_scroll's rows (positive = content moved up).
-   Returns 1 on success, or -1 if the grid lock could not be acquired — the
-   value is left intact for a later call, never dropped. */
-ZONVIE_API int32_t zonvie_core_try_take_uncovered_scroll_rows(
+/* Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
+   hand it back when it ends (enable=0).
+
+   A 'wrap'ped window can otherwise only move a whole buffer line at a time,
+   however many screen rows that line occupies — one wheel event books
+   'mousescroll' rows and moves every row those lines span. With 'smoothscroll'
+   the quantum is one screen row and a wheel event moves exactly the
+   'mousescroll' count, so a sub-cell scroll model's booking and the movement it
+   gets back agree.
+
+   The previous value is stashed in a window variable and restored from it, so a
+   restore arriving twice is harmless. Windows without 'wrap' are skipped: the
+   option does nothing there.
+
+   No-op off macOS (sub-cell trackpad scrolling is a macOS frontend feature).
+   Returns 1 when the request was issued, 0 when it could not be (grid lock
+   busy, or no window known for the grid yet) — the caller must try again, which
+   matters most for the restore. */
+ZONVIE_API int32_t zonvie_core_set_gesture_smooth_scroll(
     zonvie_core *core,
     int64_t grid_id,
-    int64_t *out_rows
+    bool enable
 );
 
 /* Get list of visible grids for hit-testing.

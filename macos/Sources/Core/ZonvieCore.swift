@@ -2827,15 +2827,12 @@ final class ZonvieCore {
     /// Same as above, but reports lock contention: lockBusy is set to true
     /// when the returned value came from the stale cache because grid_mu was
     /// held. Callers with no later healing read (e.g. the once-per-flush
-    /// Take the screen rows this grid's view moved that no grid_scroll
-    /// described, clearing the running total. Non-zero only where Neovim
-    /// repaints instead of scrolling ('smoothscroll'). Returns 0 when the grid
-    /// lock is busy; the total is kept in the core for the next attempt.
-    func takeUncoveredScrollRows(gridId: Int64) -> Int {
-        guard let core else { return 0 }
-        var rows: Int64 = 0
-        guard zonvie_core_try_take_uncovered_scroll_rows(core, gridId, &rows) == 1 else { return 0 }
-        return Int(rows)
+    /// Borrow 'smoothscroll' for this grid's window for the duration of a
+    /// trackpad gesture, or hand it back. Returns false when the request could
+    /// not be issued and must be retried.
+    func setGestureSmoothScroll(gridId: Int64, enable: Bool) -> Bool {
+        guard let core else { return true }
+        return zonvie_core_set_gesture_smooth_scroll(core, gridId, enable) == 1
     }
 
     /// scrollbar update) use this to schedule a retry.

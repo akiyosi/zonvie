@@ -51,7 +51,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const Flushed = struct { from: u64 };
     try h.waitUntil(Flushed{ .from = before_flushes }, struct {
         fn check(c: Flushed, hh: *Harness) bool {
-            return hh.flush_seq.load(.seq_cst) > c.from + 1;
+            // One flush after the command is enough: the wheel events went out
+            // on the same channel ahead of it, so they have been processed.
+            return hh.flush_seq.load(.seq_cst) > c.from;
         }
     }.check, h.opts.timeout_ms);
     if (h.getViewportTop(g) != parked) {

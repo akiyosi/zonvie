@@ -1163,6 +1163,9 @@ pub const ViewportMargins = struct {
 
 /// Viewport info from win_viewport event.
 pub const Viewport = struct {
+    /// Neovim window handle this grid belongs to, from win_viewport. 0 until a
+    /// win_viewport has been seen. Needed to address window-local options.
+    win: i64 = 0,
     topline: i64 = 0,
     botline: i64 = 0,
     curline: i64 = 0,
@@ -1175,6 +1178,11 @@ pub const Viewport = struct {
     /// emitting grid_scroll — this is the only signal that content moved.
     /// Normal scrolling makes the two agree and this stays at 0.
     uncovered_scroll_rows: i64 = 0,
+    /// A grid_scroll described this batch's movement. Set independently of the
+    /// accumulator above because Neovim's ordering of grid_scroll against
+    /// win_viewport within a batch is not fixed, and doing this with arithmetic
+    /// made the result depend on which arrived first.
+    scroll_covered: bool = false,
 };
 
 /// Describes a pending grid_scroll operation preserved until flush.
@@ -3593,6 +3601,7 @@ pub const Grid = struct {
     pub fn setViewport(
         self: *Grid,
         grid_id: i64,
+        win: i64,
         topline: i64,
         botline: i64,
         curline: i64,
@@ -3604,23 +3613,48 @@ pub const Grid = struct {
         // unknown IDs instead of creating an independently unbounded map that
         // bypasses the subgrid count and metadata budgets.
         if (grid_id != 1 and !self.sub_grids.contains(grid_id)) return;
-        const carried: i64 = if (self.viewport.get(grid_id)) |vp| vp.uncovered_scroll_rows else 0;
+        // A movement larger than the window is a jump (gg, G, a tag jump), not
+        // a scroll: Neovim documents scroll_delta as approximate past a screen,
+        // nothing scrolled off the edge to retain, and a sub-cell offset cannot
+        // smooth it anyway. Such a jump also invalidates any remainder still
+        // waiting, so the running total restarts from it rather than carrying
+        // a stale one that would later be reported as movement.
+        const window_rows: i64 = if (grid_id == 1)
+            @intCast(self.rows)
+        else if (self.sub_grids.get(grid_id)) |sg| @intCast(sg.rows) else 0;
+        const is_jump = window_rows > 0 and (scroll_delta > window_rows or scroll_delta < -window_rows);
+        const previous = self.viewport.get(grid_id);
+        const carried: i64 = if (is_jump)
+            0
+        else if (previous) |vp| vp.uncovered_scroll_rows else 0;
+        const carried_covered = !is_jump and if (previous) |vp| vp.scroll_covered else false;
         try self.viewport.put(self.alloc, grid_id, .{
+            .win = win,
             .topline = topline,
             .botline = botline,
             .curline = curline,
             .curcol = curcol,
             .line_count = line_count,
             .scroll_delta = scroll_delta,
-            .uncovered_scroll_rows = carried +| scroll_delta,
+            .uncovered_scroll_rows = if (is_jump) 0 else carried +| scroll_delta,
+            .scroll_covered = carried_covered,
         });
     }
 
-    /// Account a grid_scroll's row count against the movement win_viewport
-    /// reported, so only movement grid_scroll did not describe is left over.
+    /// A grid_scroll describes this batch's movement, so it is the authority
+    /// for it and nothing is left over.
+    ///
+    /// Deliberately not `-= rows`: win_viewport's scroll_delta is documented as
+    /// approximate once the movement passes a screen, and measured at 21 for a
+    /// 24-row scroll of a 24-row window. Subtracting one from the other then
+    /// leaves a phantom remainder that would be reported as movement of its
+    /// own. Only a batch where grid_scroll said nothing at all — Neovim
+    /// repainting a 'smoothscroll' window instead of shifting rows — leaves the
+    /// viewport report as the sole description.
     pub fn creditScrollCoverage(self: *Grid, grid_id: i64, rows: i64) void {
+        _ = rows;
         if (self.viewport.getPtr(grid_id)) |vp| {
-            vp.uncovered_scroll_rows -|= rows;
+            vp.scroll_covered = true;
         }
     }
 
@@ -4935,13 +4969,13 @@ test "viewport metadata ignores unknown grids" {
     defer grid.deinit();
 
     try grid.resizeGrid(1, 2, 2);
-    try grid.setViewport(99, 1, 2, 3, 4, 5, 6);
+    try grid.setViewport(99, 7, 1, 2, 3, 4, 5, 6);
     try grid.setViewportMargins(99, 1, 1, 1, 1);
     try std.testing.expectEqual(@as(usize, 0), grid.viewport.count());
     try std.testing.expectEqual(@as(usize, 0), grid.viewport_margins.count());
 
     try grid.resizeGrid(99, 1, 1);
-    try grid.setViewport(99, 1, 2, 3, 4, 5, 6);
+    try grid.setViewport(99, 7, 1, 2, 3, 4, 5, 6);
     try grid.setViewportMargins(99, 1, 1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), grid.viewport.count());
     try std.testing.expectEqual(@as(usize, 1), grid.viewport_margins.count());

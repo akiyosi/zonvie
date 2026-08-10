@@ -947,6 +947,14 @@ pub const Harness = struct {
         return .{ .top = 0, .delta = 0 };
     }
 
+    /// The Neovim window handle win_viewport reported for a grid, 0 if none yet.
+    pub fn viewportWin(h: *Harness, grid_id: i64) i64 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        if (h.core.grid.viewport.get(grid_id)) |vp| return vp.win;
+        return 0;
+    }
+
     /// Take the screen rows moved that no grid_scroll accounted for.
     pub fn takeUncoveredScrollRows(h: *Harness, grid_id: i64) i64 {
         h.core.grid_mu.lockUncancelable(zc.clock.io());

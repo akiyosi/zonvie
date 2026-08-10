@@ -76,8 +76,12 @@ final class MetalTerminalView: MTKView {
     // carry several rows and take the count to zero mid-gesture.
     private var pendingSentScroll: [Int64: Int] = [:]
     private let pendingSentScrollLock = NSLock()
-    // Reused by drainUncoveredScrollRows so polling allocates nothing per frame.
-    private var uncoveredDrainScratch: [Int64] = []
+
+    // The grid whose window has our 'smoothscroll' borrowed, and whether the
+    // enable request still has to be retried. Main thread only (scroll input
+    // and the pre-draw tick).
+    private var smoothScrollBorrowedGrid: Int64?
+    private var smoothScrollBorrowPending = false
 
     // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
     // thread), carrying the signed distance the content moved in rows.
@@ -781,8 +785,10 @@ final class MetalTerminalView: MTKView {
             // preventing double-shift glitches in split windows.
             // 'smoothscroll' reports its movement only through win_viewport, so
             // collect what grid_scroll did not describe before processing.
-            self?.drainUncoveredScrollRows()
             self?.processPendingScrollClears()
+            // Hand 'smoothscroll' back once the gesture is over. Frame-driven
+            // so a missed .ended phase cannot leave the user's option flipped.
+            self?.tickGestureSmoothScroll()
             // Advance the sub-row ease (seed + decay) for keyboard scrolling.
             self?.tickSmoothScroll()
             // Detect buffer-edge blocked scrolls and run the rubber-band
@@ -2280,12 +2286,12 @@ final class MetalTerminalView: MTKView {
             return
         }
 
-        guard let main = grids.first(where: { $0.gridId == 1 }),
-              !(info.startCol == 0 && info.cols == main.cols)
-        else {
-            renderer.setGridScrollCaptureBounds(gridId: gridId, bounds: nil)
-            return
-        }
+        // Armed for full-width windows too, which used to be left to the
+        // row-scroll fast path alone. That path only sees rows that actually
+        // shifted, so when Neovim repaints a 'smoothscroll' window instead of
+        // scrolling it, nothing was staged and the band opened with no rows to
+        // fill it. The fast path now stands down for a grid this one already
+        // retained, so the two cannot stage the same movement twice.
         renderer.setGridScrollCaptureBounds(
             gridId: gridId,
             bounds: (
@@ -2392,6 +2398,18 @@ final class MetalTerminalView: MTKView {
 
             // Trackpad: implement sub-cell smooth scrolling for external grids
             let deltaYPx = deltaY * scale
+
+            // Borrow 'smoothscroll' BEFORE any wheel event goes out. Both travel
+            // the same ordered RPC channel, so a request sent afterwards leaves
+            // the gesture's first event to be processed under the old quantum:
+            // on a 'wrap'ped line that moves four or five screen rows against a
+            // booking of three, and the difference is visible as a row-sized
+            // jolt at exactly the moment a gesture starts. Measured — every
+            // gesture's first grid_scroll arrived before the borrow landed.
+            //
+            // Taken before scrollOffsetLock: the core call acquires the grid
+            // lock, and nothing else here nests those two.
+            requestGestureSmoothScroll(gridId: gridId)
 
             // Read pending scroll count OUTSIDE scrollOffsetLock to avoid deadlock
             pendingSentScrollLock.lock()
@@ -2634,6 +2652,11 @@ final class MetalTerminalView: MTKView {
             // whose compensation will displace the grid needs its row kept —
             // an unowned (keyboard/nvim) scroll here clears the offset, and
             // updateScrollOffsets would prune the retained row unused.
+            if !(sent > 0 || lookahead || abs(offset) >= Self.scrollOffsetEpsilon) {
+                ZonvieCore.appLog(
+                    "[retain] ungated grid=\(gridId) rowsDelta=\(rowsDelta) sent=\(sent) lookahead=\(lookahead) offset=\(offset)"
+                )
+            }
             if sent > 0 || lookahead || abs(offset) >= Self.scrollOffsetEpsilon {
                 if let external = core?.externalGridView(for: gridId) {
                     // An external window's rows live in its own surface, not
@@ -2770,36 +2793,40 @@ final class MetalTerminalView: MTKView {
     /// Does NOT call updateScrollShaderOffset() to avoid deadlock when called from Zig callback.
     /// Shader update will happen in onPreDraw before rendering.
     /// Public so external grid views can call this before their draw to stay in sync.
-    /// A window with 'smoothscroll' moves by repainting, so Neovim sends no
-    /// grid_scroll and the lookahead compensation would never be cancelled —
-    /// the view would keep drifting until the stale detector dropped it. The
-    /// core reports the screen rows win_viewport saw that grid_scroll did not
-    /// describe; queue those as if a grid_scroll had arrived.
-    ///
-    /// Frame-driven, and deliberately not part of processPendingScrollClears:
-    /// that runs per row batch from inside handleRedraw, where grid_mu is
-    /// already held and the core's tryLock could never succeed anyway.
-    ///
-    /// Only grids with outstanding requests are polled, and only when no
-    /// grid_scroll is already queued for them: where grid_scroll does report
-    /// the movement it stays the sole authority, so the same rows cannot be
-    /// cancelled twice.
-    private func drainUncoveredScrollRows() {
-        guard let core else { return }
-        pendingSentScrollLock.lock()
-        uncoveredDrainScratch.removeAll(keepingCapacity: true)
-        for gridId in pendingSentScroll.keys { uncoveredDrainScratch.append(gridId) }
-        pendingSentScrollLock.unlock()
-        guard !uncoveredDrainScratch.isEmpty else { return }
+    /// Ask Neovim to turn 'smoothscroll' on for the grid the gesture is
+    /// driving. Idempotent on the Neovim side, but only sent once per gesture;
+    /// a request that could not be issued is retried by the tick below.
+    private func requestGestureSmoothScroll(gridId: Int64) {
+        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        if smoothScrollBorrowedGrid == gridId, !smoothScrollBorrowPending { return }
+        // A gesture that moved to another grid hands the old one back first.
+        if let previous = smoothScrollBorrowedGrid, previous != gridId {
+            _ = core.setGestureSmoothScroll(gridId: previous, enable: false)
+        }
+        smoothScrollBorrowedGrid = gridId
+        smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
+        ZonvieCore.appLog("[ss_borrow] request grid=\(gridId) pending=\(smoothScrollBorrowPending)")
+    }
 
-        for gridId in uncoveredDrainScratch {
-            let rows = core.takeUncoveredScrollRows(gridId: gridId)
-            guard rows != 0 else { continue }
-            pendingScrollClearLock.lock()
-            if !pendingScrollClear.contains(where: { $0.gridId == gridId }) {
-                pendingScrollClear.append((gridId: gridId, rowsDelta: rows))
-            }
-            pendingScrollClearLock.unlock()
+    /// Hand 'smoothscroll' back once the gesture and its momentum are done.
+    ///
+    /// Frame-driven rather than tied to the .ended phase: that phase can be
+    /// missed (a cancelled gesture, a window losing focus mid-scroll), and the
+    /// option is the user's, not ours to keep. Retried until the core accepts
+    /// it, since the request is dropped when the grid lock is busy.
+    private func tickGestureSmoothScroll() {
+        guard let core, let gridId = smoothScrollBorrowedGrid else { return }
+        if smoothScrollBorrowPending {
+            smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
+        }
+        let idleFor = CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime
+        guard !scrollGestureTouching,
+              !scrollMomentumRunning,
+              idleFor > Self.smoothScrollGestureGuardSeconds
+        else { return }
+        if core.setGestureSmoothScroll(gridId: gridId, enable: false) {
+            smoothScrollBorrowedGrid = nil
+            smoothScrollBorrowPending = false
         }
     }
 

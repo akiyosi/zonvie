@@ -3659,6 +3659,30 @@ pub const FlushCtx = struct {
                     if (ctx.core.flush_aborted) break;
                 }
             }
+            // Movement win_viewport reported that no grid_scroll described.
+            // Under 'smoothscroll' Neovim repaints instead of shifting rows, so
+            // this is the only report that the content moved — and a frontend
+            // holding a sub-cell offset has to give back that distance and
+            // retain the rows that left, exactly as for a real scroll. Same
+            // dispatch point and the same consume-after-delivery rule, so an
+            // abort preserves it for the retry.
+            var vp_it = ctx.core.grid.viewport.iterator();
+            while (vp_it.next()) |entry| {
+                const uncovered = entry.value_ptr.uncovered_scroll_rows;
+                // A batch grid_scroll already described is fully accounted for;
+                // the viewport's own figure for it is redundant and, past a
+                // screen, approximate.
+                if (entry.value_ptr.scroll_covered) {
+                    entry.value_ptr.scroll_covered = false;
+                    entry.value_ptr.uncovered_scroll_rows = 0;
+                    continue;
+                }
+                if (uncovered == 0) continue;
+                const clamped: i32 = @intCast(@max(-1_000_000, @min(1_000_000, uncovered)));
+                cb(ctx.core.ctx, entry.key_ptr.*, clamped);
+                entry.value_ptr.uncovered_scroll_rows = 0;
+                if (ctx.core.flush_aborted) break;
+            }
         }
         if (ctx.core.flush_aborted) return;
 

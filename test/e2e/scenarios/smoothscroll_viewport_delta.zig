@@ -41,26 +41,26 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // 'smoothscroll': no grid_scroll, so every screen row the view moves is
     // left uncovered. topline lags because one buffer line spans several rows.
     const top_before = h.getViewportTop(g);
-    var uncovered_total: i64 = 0;
+    _ = h.grid_scroll_rows.swap(0, .seq_cst);
     var step: usize = 0;
     while (step < 8) : (step += 1) try scrollOneRow(h);
 
-    // A win_viewport can still be in flight when the last keystroke's redraw
-    // lands, so drain until the rows show up rather than reading once.
-    const Acc = struct { g: i64, total: *i64 };
-    h.waitUntil(Acc{ .g = g, .total = &uncovered_total }, struct {
-        fn check(c: Acc, hh: *Harness) bool {
-            c.total.* += hh.takeUncoveredScrollRows(c.g);
-            return c.total.* >= 8;
+    // The last keystroke's win_viewport can still be in flight, so wait for the
+    // reports rather than reading once.
+    const Acc = struct {};
+    h.waitUntil(Acc{}, struct {
+        fn check(_: Acc, hh: *Harness) bool {
+            return hh.grid_scroll_rows.load(.seq_cst) >= 8;
         }
     }.check, h.opts.timeout_ms) catch {};
 
-    if (uncovered_total != 8) {
+    const reported = h.grid_scroll_rows.load(.seq_cst);
+    if (reported != 8) {
         std.debug.print(
-            "[e2e] smoothscroll_viewport_delta: expected 8 uncovered rows, got {d}\n",
-            .{uncovered_total},
+            "[e2e] smoothscroll_viewport_delta: 8 screen rows moved, {d} reported\n",
+            .{reported},
         );
-        return error.UncoveredRowsMismatch;
+        return error.ReportedRowsMismatch;
     }
     const top_advance = h.getViewportTop(g) - top_before;
     if (top_advance >= 8) {
@@ -76,9 +76,18 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try h.command("set nosmoothscroll");
     try h.command("normal! gg");
     // Settle the mode switch: the gg jump's own win_viewport is still in flight
-    // and would otherwise be read as this scroll's.
+    // and would otherwise be read as this scroll's. Wait for these to be
+    // reported too, or they land after the counter is reset and inflate the
+    // measurement that follows.
+    _ = h.grid_scroll_rows.swap(0, .seq_cst);
     step = 0;
     while (step < 4) : (step += 1) try scrollOneRow(h);
+    const Settle = struct {};
+    h.waitUntil(Settle{}, struct {
+        fn check(_: Settle, hh: *Harness) bool {
+            return hh.grid_scroll_rows.load(.seq_cst) >= 4;
+        }
+    }.check, h.opts.timeout_ms) catch {};
     // Here one <C-e> moves a whole buffer line, so scroll_delta reports the
     // number of screen rows that line occupies. Wait for topline to advance
     // first, or the value still belongs to the preceding gg.
@@ -91,26 +100,33 @@ pub fn run(alloc: std.mem.Allocator) !void {
         );
         return error.NotWrapping;
     }
-    _ = h.takeUncoveredScrollRows(g);
-
+    // Here grid_scroll describes the movement itself, and the total must come
+    // out the same way: whatever the mix of shifted and repainted rows, the
+    // frontend is told the whole distance exactly once.
+    _ = h.grid_scroll_rows.swap(0, .seq_cst);
     step = 0;
-    while (step < 8) : (step += 1) {
-        try scrollOneRow(h);
-        const uncovered = h.takeUncoveredScrollRows(g);
-        if (uncovered != 0) {
-            std.debug.print(
-                "[e2e] smoothscroll_viewport_delta: grid_scroll should cover the movement, {d} rows left over\n",
-                .{uncovered},
-            );
-            return error.UnexpectedUncoveredRows;
+    while (step < 8) : (step += 1) try scrollOneRow(h);
+    const want_rows = 8 * wrapped_rows_per_line;
+    const Ctx = struct { want: i64 };
+    h.waitUntil(Ctx{ .want = want_rows }, struct {
+        fn check(c: Ctx, hh: *Harness) bool {
+            return hh.grid_scroll_rows.load(.seq_cst) >= c.want;
         }
+    }.check, h.opts.timeout_ms) catch {};
+    const control_rows = h.grid_scroll_rows.load(.seq_cst);
+    if (control_rows != want_rows) {
+        std.debug.print(
+            "[e2e] smoothscroll_viewport_delta: {d} buffer lines span {d} screen rows, {d} reported\n",
+            .{ 8, want_rows, control_rows },
+        );
+        return error.ReportedRowsMismatch;
     }
 
     std.debug.print(
         "[e2e] smoothscroll_viewport_delta: 1 buffer line spans {d} screen rows; " ++
-            "smoothscroll left {d} rows uncovered over 8 <C-e> (topline advanced {d}), " ++
-            "nosmoothscroll left 0\n",
-        .{ wrapped_rows_per_line, uncovered_total, top_advance },
+            "8 <C-e> reported {d} rows under smoothscroll (topline advanced {d}) " ++
+            "and {d} without it\n",
+        .{ wrapped_rows_per_line, reported, top_advance, control_rows },
     );
 }
 

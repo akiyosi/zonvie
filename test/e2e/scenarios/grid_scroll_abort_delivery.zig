@@ -45,12 +45,16 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        // Any content change forces another flush without scrolling.
-        try h.command("normal! ix\u{1b}");
-        try h.command("undo");
+        // Any content change forces another flush without scrolling. Waited on
+        // one at a time: an edit and its undo can land in the same redraw batch,
+        // so asking for two flushes per pair is not guaranteed.
+        //
         // Propagated, not swallowed: if these produced no flush at all, then
         // "the scroll was not re-offered" would hold for the wrong reason.
-        try waitFlushes(h, 2);
+        try h.command("normal! ix\u{1b}");
+        try waitFlushes(h, 1);
+        try h.command("undo");
+        try waitFlushes(h, 1);
     }
 
     // Without this the assertion below is also what a flush that never aborted

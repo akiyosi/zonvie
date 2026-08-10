@@ -1382,14 +1382,18 @@ pub export fn zonvie_core_try_get_viewport(
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
 }
 
-pub export fn zonvie_core_try_take_uncovered_scroll_rows(
+/// Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
+/// hand it back afterwards. No-op off macOS. Returns 0 when the request could
+/// not be issued (grid lock busy, or no window known yet) — the caller must try
+/// again, which matters most for the restore.
+pub export fn zonvie_core_set_gesture_smooth_scroll(
     p: ?*zonvie_core,
     grid_id: i64,
-    out_rows: ?*i64,
+    enable: bool,
 ) callconv(.c) i32 {
-    if (p == null or out_rows == null) return -1;
+    if (p == null) return 0;
     const box = asBox(p.?);
-    return box.core.tryTakeUncoveredScrollRows(grid_id, out_rows.?) orelse -1;
+    return if (box.core.setGestureSmoothScroll(grid_id, enable)) 1 else 0;
 }
 
 /// Get current cursor position.
