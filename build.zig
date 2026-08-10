@@ -254,6 +254,22 @@ pub fn build(b: *std.Build) !void {
         const run_row_provision_test = b.addSystemCommand(&.{"/usr/bin/env"});
         run_row_provision_test.addFileArg(row_provision_test_exe);
         test_step.dependOn(&run_row_provision_test.step);
+
+        // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
+        // where they must be drawn, and that staged rows reach the screen only
+        // through their own bracket's commit.
+        const compile_scroll_retention_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_scroll_retention_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_scroll_retention_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
+        compile_scroll_retention_test.addFileArg(b.path("macos/Tests/ScrollRetentionTests.swift"));
+        compile_scroll_retention_test.addArg("-o");
+        const scroll_retention_test_exe = compile_scroll_retention_test.addOutputFileArg("scroll-retention-tests");
+        const run_scroll_retention_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
+        test_step.dependOn(&run_scroll_retention_test.step);
     }
 
     // Core inline tests (c_api.zig and its relative imports, including the
