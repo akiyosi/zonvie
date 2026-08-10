@@ -1127,7 +1127,11 @@ typedef struct zonvie_viewport_info {
     int64_t line_count;   /* Total lines in buffer */
     int64_t curline;      /* Current cursor line */
     int64_t curcol;       /* Current cursor column */
-    int64_t scroll_delta; /* Lines scrolled since last update */
+    int64_t scroll_delta; /* Screen rows scrolled since last update. Counts
+                             displayed rows, not buffer lines: with 'wrap' a
+                             one-line scroll reports every row the view moved,
+                             and under 'smoothscroll' it reports single rows
+                             while topline stays put. Positive = scrolled down. */
 } zonvie_viewport_info;
 
 /* Get viewport info for a specific grid (for scrollbar rendering).
@@ -1145,6 +1149,19 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
     zonvie_core *core,
     int64_t grid_id,
     zonvie_viewport_info *out_viewport
+);
+
+/* Take the screen rows a grid's view moved that no grid_scroll described,
+   clearing the running total. Under 'smoothscroll' Neovim repaints rather than
+   emitting grid_scroll, so this is the only report that content moved; when
+   grid_scroll does describe the movement the two cancel and this yields 0.
+   Sign matches grid_scroll's rows (positive = content moved up).
+   Returns 1 on success, or -1 if the grid lock could not be acquired — the
+   value is left intact for a later call, never dropped. */
+ZONVIE_API int32_t zonvie_core_try_take_uncovered_scroll_rows(
+    zonvie_core *core,
+    int64_t grid_id,
+    int64_t *out_rows
 );
 
 /* Get list of visible grids for hit-testing.

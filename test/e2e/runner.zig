@@ -34,6 +34,11 @@ test "e2e:scroll" {
     try @import("scenarios/scroll.zig").run(testing.allocator);
 }
 
+test "e2e:smoothscroll_viewport_delta" {
+    try requireNvim();
+    try @import("scenarios/smoothscroll_viewport_delta.zig").run(testing.allocator);
+}
+
 test "e2e:float_window" {
     try requireNvim();
     try @import("scenarios/float_window.zig").run(testing.allocator);

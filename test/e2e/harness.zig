@@ -886,6 +886,23 @@ pub const Harness = struct {
     }
 
 
+    /// Get the scroll_delta reported by the last win_viewport event for a grid.
+    pub fn getViewportScrollDelta(h: *Harness, grid_id: i64) i64 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        if (h.core.grid.viewport.get(grid_id)) |vp| {
+            return vp.scroll_delta;
+        }
+        return 0;
+    }
+
+    /// Take the screen rows moved that no grid_scroll accounted for.
+    pub fn takeUncoveredScrollRows(h: *Harness, grid_id: i64) i64 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        return h.core.grid.takeUncoveredScrollRows(grid_id);
+    }
+
     /// Get cell width (in terminal cells) for a character.
     /// Emoji and CJK are typically 2 cells; ASCII is 1 cell.
     /// This is a simplified approximation; actual width depends on glyph metrics.

@@ -1169,6 +1169,12 @@ pub const Viewport = struct {
     curcol: i64 = 0,
     line_count: i64 = 0,
     scroll_delta: i64 = 0,
+    /// Screen rows the view moved that no grid_scroll accounted for, summed
+    /// since the frontend last took them. win_viewport's scroll_delta counts
+    /// screen rows, so under 'smoothscroll' — where Neovim repaints instead of
+    /// emitting grid_scroll — this is the only signal that content moved.
+    /// Normal scrolling makes the two agree and this stays at 0.
+    uncovered_scroll_rows: i64 = 0,
 };
 
 /// Describes a pending grid_scroll operation preserved until flush.
@@ -3598,6 +3604,7 @@ pub const Grid = struct {
         // unknown IDs instead of creating an independently unbounded map that
         // bypasses the subgrid count and metadata budgets.
         if (grid_id != 1 and !self.sub_grids.contains(grid_id)) return;
+        const carried: i64 = if (self.viewport.get(grid_id)) |vp| vp.uncovered_scroll_rows else 0;
         try self.viewport.put(self.alloc, grid_id, .{
             .topline = topline,
             .botline = botline,
@@ -3605,7 +3612,26 @@ pub const Grid = struct {
             .curcol = curcol,
             .line_count = line_count,
             .scroll_delta = scroll_delta,
+            .uncovered_scroll_rows = carried +| scroll_delta,
         });
+    }
+
+    /// Account a grid_scroll's row count against the movement win_viewport
+    /// reported, so only movement grid_scroll did not describe is left over.
+    pub fn creditScrollCoverage(self: *Grid, grid_id: i64, rows: i64) void {
+        if (self.viewport.getPtr(grid_id)) |vp| {
+            vp.uncovered_scroll_rows -|= rows;
+        }
+    }
+
+    /// Take the leftover uncovered movement for a grid, clearing it.
+    pub fn takeUncoveredScrollRows(self: *Grid, grid_id: i64) i64 {
+        if (self.viewport.getPtr(grid_id)) |vp| {
+            const rows = vp.uncovered_scroll_rows;
+            vp.uncovered_scroll_rows = 0;
+            return rows;
+        }
+        return 0;
     }
 
     /// Set viewport margins from win_viewport_margins event.

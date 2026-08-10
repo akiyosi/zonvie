@@ -1763,6 +1763,7 @@ pub fn handleRedraw(
 
                     // Apply scroll to the target grid under ext_multigrid.
                     grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
+                    grid.creditScrollCoverage(grid_id, rows);
                 }
             },
             .hl_attr_define => {

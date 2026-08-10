@@ -76,6 +76,8 @@ final class MetalTerminalView: MTKView {
     // carry several rows and take the count to zero mid-gesture.
     private var pendingSentScroll: [Int64: Int] = [:]
     private let pendingSentScrollLock = NSLock()
+    // Reused by drainUncoveredScrollRows so polling allocates nothing per frame.
+    private var uncoveredDrainScratch: [Int64] = []
 
     // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
     // thread), carrying the signed distance the content moved in rows.
@@ -777,6 +779,9 @@ final class MetalTerminalView: MTKView {
             // Process pending scroll clears from grid_scroll events before rendering.
             // This ensures scroll offsets are cleared before vertices are drawn,
             // preventing double-shift glitches in split windows.
+            // 'smoothscroll' reports its movement only through win_viewport, so
+            // collect what grid_scroll did not describe before processing.
+            self?.drainUncoveredScrollRows()
             self?.processPendingScrollClears()
             // Advance the sub-row ease (seed + decay) for keyboard scrolling.
             self?.tickSmoothScroll()
@@ -2765,6 +2770,39 @@ final class MetalTerminalView: MTKView {
     /// Does NOT call updateScrollShaderOffset() to avoid deadlock when called from Zig callback.
     /// Shader update will happen in onPreDraw before rendering.
     /// Public so external grid views can call this before their draw to stay in sync.
+    /// A window with 'smoothscroll' moves by repainting, so Neovim sends no
+    /// grid_scroll and the lookahead compensation would never be cancelled —
+    /// the view would keep drifting until the stale detector dropped it. The
+    /// core reports the screen rows win_viewport saw that grid_scroll did not
+    /// describe; queue those as if a grid_scroll had arrived.
+    ///
+    /// Frame-driven, and deliberately not part of processPendingScrollClears:
+    /// that runs per row batch from inside handleRedraw, where grid_mu is
+    /// already held and the core's tryLock could never succeed anyway.
+    ///
+    /// Only grids with outstanding requests are polled, and only when no
+    /// grid_scroll is already queued for them: where grid_scroll does report
+    /// the movement it stays the sole authority, so the same rows cannot be
+    /// cancelled twice.
+    private func drainUncoveredScrollRows() {
+        guard let core else { return }
+        pendingSentScrollLock.lock()
+        uncoveredDrainScratch.removeAll(keepingCapacity: true)
+        for gridId in pendingSentScroll.keys { uncoveredDrainScratch.append(gridId) }
+        pendingSentScrollLock.unlock()
+        guard !uncoveredDrainScratch.isEmpty else { return }
+
+        for gridId in uncoveredDrainScratch {
+            let rows = core.takeUncoveredScrollRows(gridId: gridId)
+            guard rows != 0 else { continue }
+            pendingScrollClearLock.lock()
+            if !pendingScrollClear.contains(where: { $0.gridId == gridId }) {
+                pendingScrollClear.append((gridId: gridId, rowsDelta: rows))
+            }
+            pendingScrollClearLock.unlock()
+        }
+    }
+
     func processPendingScrollClears() {
         pendingScrollClearLock.lock()
         let pending = pendingScrollClear

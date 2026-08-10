@@ -3516,6 +3516,18 @@ pub const Core = struct {
         return self.getViewportInfoLocked(grid_id, out);
     }
 
+    /// Take the screen-row movement no grid_scroll accounted for. Non-blocking:
+    /// returns null when the grid lock is busy, leaving the value to be taken
+    /// on a later attempt rather than dropping it.
+    pub fn tryTakeUncoveredScrollRows(self: *Core, grid_id: i64, out_rows: *i64) ?i32 {
+        const acquired = self.grid_mu.tryLock();
+        self.perf_lock_viewport.record(acquired);
+        if (!acquired) return null;
+        defer self.grid_mu.unlock(clock.io());
+        out_rows.* = self.grid.takeUncoveredScrollRows(grid_id);
+        return 1;
+    }
+
     /// Internal: get viewport info assuming grid_mu is already held.
     fn getViewportInfoLocked(self: *Core, grid_id: i64, out: *c_api.ViewportInfo) i32 {
         const vp = self.grid.getViewport(grid_id) orelse {
