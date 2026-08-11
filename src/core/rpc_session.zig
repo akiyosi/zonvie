@@ -1436,10 +1436,11 @@ pub fn setupMouseScrollReporter(self: *Core) void {
 /// agree and the sub-cell model holds.
 ///
 /// The previous value is stashed in a window variable and restored from it, so
-/// a restore that arrives twice is harmless and one that never arrives leaves a
-/// visible trace to recover from. Windows without 'wrap' are skipped: the
-/// option would do nothing there, and this keeps the OptionSet autocmd (which
-/// user config can observe) quiet in the common case.
+/// a restore that arrives twice is harmless, and one that never arrives leaves
+/// the trace the next borrow over that window restores from. Windows without
+/// 'wrap' are skipped, where the option would do nothing — but 'wrap' is on by
+/// default, so this is not the common case: expect an OptionSet autocmd (which
+/// user config can observe) per gesture on a normally configured window.
 ///
 /// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
 ///

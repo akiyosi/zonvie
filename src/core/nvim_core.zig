@@ -7170,7 +7170,10 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     defer core.deinitForTest();
 
     try core.grid.resizeGrid(1, 4, 4);
-    try core.grid.resizeGrid(2, 2, 2);
+    // Deliberately non-square: with equal dimensions the margin assertions
+    // below read the same number whether the clamp pairs top/bottom with rows
+    // and left/right with cols, or swaps them.
+    try core.grid.resizeGrid(2, 2, 3);
     try core.grid.win_pos.put(core.grid.alloc, 2, .{
         .row = std.math.maxInt(u32),
         .col = std.math.maxInt(u32),
@@ -7191,7 +7194,7 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     // saturating conversion the placement fields fall back to, and the reason
     // they can be stored before the grid that bounds them exists.
     try std.testing.expectEqual(@as(i32, 2), out[1].margin_top);
-    try std.testing.expectEqual(@as(i32, 2), out[1].margin_right);
+    try std.testing.expectEqual(@as(i32, 3), out[1].margin_right);
 
     core.grid.cursor_grid = 1;
     core.grid.cursor_row = std.math.maxInt(u32);

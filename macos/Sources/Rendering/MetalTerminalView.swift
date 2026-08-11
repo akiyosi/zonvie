@@ -2033,6 +2033,11 @@ final class MetalTerminalView: MTKView {
         // Written on the main thread, read on the core thread by
         // processPendingScrollClears when it decides who owns a scroll — so
         // the writes take the same lock that read is already holding.
+        //
+        // What the lock covers is the id comparison, not the phase booleans:
+        // those are read lock-free elsewhere as hints (see the early exit in
+        // tickScrollEdgeBounce), where being a few microseconds stale is
+        // nothing against the 0.2 s window the terms themselves carry.
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
         let phase = event.phase
@@ -2248,7 +2253,16 @@ final class MetalTerminalView: MTKView {
         updateScrollShaderOffset()
     }
 
-    /// Clear all scroll offsets
+    /// Clear all scroll offsets.
+    ///
+    /// UNREACHABLE: nothing calls this, and it is the only caller of the
+    /// renderer's clearScrollOffsets — so none of that reset happens on the
+    /// main surface. Nothing depends on it: pendingRetentionReplay is cleared
+    /// by commitFlush, bracketSourceShift by beginFlush, published rows by
+    /// updateScrollOffsets' prune, and scrollOffsetData is rebuilt every frame.
+    /// The capture spans do survive a layout change, which is harmless because
+    /// Neovim does not reuse grid handles. Left in place rather than deleted,
+    /// but do not write code that relies on it running.
     private func clearAllScrollOffsets() {
         scrollOffsetLock.lock()
         scrollOffsetPx.removeAll()
@@ -2269,12 +2283,17 @@ final class MetalTerminalView: MTKView {
     ///   - scale: Backing scale factor
     ///   - hasPrecise: Whether this is precise (trackpad) scrolling
     /// - Returns: Current scroll offset in pixels (for sub-cell visual offset)
-    /// Tell the renderer which main-surface rows this grid's smooth scroll may
-    /// retain an outgoing row from. Only non-full-width grids get a span: a
-    /// vertical split or a float always fails the core's row-scroll fast path
-    /// (partial_width), so the grid_scroll capture is the only thing that can
-    /// keep their outgoing row alive, while full-width grids belong to the
-    /// fast path and must not be captured twice.
+    /// Tell the renderer which main-surface rows each visible grid's smooth
+    /// scroll may retain an outgoing row from. A vertical split or a float
+    /// always fails the core's row-scroll fast path (partial_width), so the
+    /// grid_scroll capture is the only thing that can keep their outgoing row
+    /// alive. A full-width grid normally belongs to the fast path, but that
+    /// path only sees rows that actually shifted — a 'smoothscroll' window
+    /// repaints instead — so it is armed as well, and the fast path stands
+    /// down for a grid this one already retained.
+    ///
+    /// Note the spans are never disarmed in practice (see
+    /// clearAllScrollOffsets), so one gesture arms every grid for the session.
     private func armScrollRetention(gridId: Int64) {
         guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
         // The band a wheel event opens is as wide as the rows it moves, so the

@@ -2268,17 +2268,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
+        // Reached only from an external grid view. The main surface's caller
+        // (MetalTerminalView.clearAllScrollOffsets) has none of its own, so on
+        // that surface none of this runs — see that function's note before
+        // relying on any of it.
         scrollOffsetData = []
         hasActiveScrollOffset = false
-        // The spans describe a layout this reset is abandoning (resize, font
-        // change, grid teardown all land here).
+        // The spans describe the layout this reset abandons.
         gridScrollCaptureBounds.removeAll(keepingCapacity: true)
         // A parked step describes the same abandoned layout, and would be
         // replayed against post-reset bounds and a post-reset source set.
         pendingRetentionReplay.removeAll(keepingCapacity: true)
         bracketSourceShift.removeAll(keepingCapacity: true)
-        // Retained rows were built for the layout that is being abandoned
-        // (resize, font change, grid teardown all clear the offsets).
+        // Retained rows were built for the layout being abandoned.
         retention.clearPublished()
     }
 
@@ -5381,9 +5383,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// with it captureRetainedScrollRow — never runs for it: its outgoing row
     /// is recomposed away within the flush, and the vacated band falls back
     /// to the edge-row background stretch, which paints the neighbouring
-    /// row's highlight across the band. Full-width grids never get capture
-    /// bounds (see MetalTerminalView.armScrollRetention), so the two paths
-    /// cannot double-stage.
+    /// row's highlight across the band. Full-width grids are armed too — the
+    /// fast path only sees rows that actually shifted, and a 'smoothscroll'
+    /// window repaints instead — so the two paths do overlap; what keeps them
+    /// from staging the same movement twice is `bracketStagedGrids`, which the
+    /// fast path checks before opening a step of its own.
     ///
     /// Called from the on_grid_scroll callback, inside the flush bracket and
     /// before row recomposition, so the flush's source set still holds the
@@ -5412,9 +5416,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // untouched, so the replay reads exactly what this capture read.
         //
         // Only steps that could actually be staged are remembered: a grid with
-        // no armed bounds (grid 1 and every other full-width grid — those are
-        // never armed) would otherwise spend slots in the window and evict a
-        // split's real step.
+        // no armed bounds — grid 1, and any grid scrolled before the gesture
+        // that arms it — would otherwise spend slots in the window and evict a
+        // real step.
         if !replaying, capturable {
             pendingRetentionReplay.append((gridId: gridId, rowsDelta: rowsDelta))
             if pendingRetentionReplay.count > Self.maxPendingRetentionReplay {
