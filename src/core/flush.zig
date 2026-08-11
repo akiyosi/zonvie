@@ -3659,6 +3659,11 @@ pub const FlushCtx = struct {
                     if (ctx.core.flush_aborted) break;
                 }
             }
+            // The loops above break on abort; without the same check here a
+            // bracket that has already given up would still hand over a
+            // distance and clear the accumulator that proves it is owed.
+            if (ctx.core.flush_aborted) return;
+
             // Movement win_viewport reported that no grid_scroll described.
             // Under 'smoothscroll' Neovim repaints instead of shifting rows, so
             // this is the only report that the content moved — and a frontend

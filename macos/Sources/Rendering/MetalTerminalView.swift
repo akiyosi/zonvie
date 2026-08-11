@@ -87,6 +87,9 @@ final class MetalTerminalView: MTKView {
     // and the pre-draw tick).
     private var smoothScrollBorrowedGrid: Int64?
     private var smoothScrollBorrowPending = false
+    /// Windows whose borrow was handed back but whose request the core refused.
+    /// Drained by the frame tick until it accepts.
+    private var smoothScrollHandback: Set<Int64> = []
 
     // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
     // thread), carrying the signed distance the content moved in rows.
@@ -2570,9 +2573,18 @@ final class MetalTerminalView: MTKView {
             // window stayed displaced instead of easing back. The finger's
             // travel is the only thing that consumes an offset, so it has to
             // reach every window this gesture is moving.
+            //
+            // `?? 0` rather than a guard: a bound window settling on the cell
+            // grid drops its entry, and skipping it from then on froze it there
+            // while the driver ran on. Clamped like the driver above, so a
+            // window that stops being scrolled — its own buffer edge — cannot
+            // bank travel it will never be credited for and then ignore a
+            // reversed finger until the excess is paid off.
             for bound in gestureBoundGrids where bound != gridId {
-                guard let held = scrollOffsetPx[bound] else { continue }
-                let paid = held + deltaYPx
+                let paid = clampVisualScrollOffsetPx(
+                    (scrollOffsetPx[bound] ?? 0) + deltaYPx,
+                    cellHeightPx: rowHeightPx
+                )
                 if abs(paid) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: bound)
                     gestureLookaheadGrids.remove(bound)
@@ -2851,9 +2863,14 @@ final class MetalTerminalView: MTKView {
         guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
         if smoothScrollBorrowedGrid == gridId, !smoothScrollBorrowPending { return }
         // A gesture that moved to another grid hands the old one back first.
+        // Queued rather than issued once: the core refuses while the grid lock
+        // is busy, which is most of a flush, and this was the one hand-back
+        // with nothing left holding the id afterwards. It heals on the next
+        // gesture over that window either way, but "either way" can be never.
         if let previous = smoothScrollBorrowedGrid, previous != gridId {
-            _ = core.setGestureSmoothScroll(gridId: previous, enable: false)
+            smoothScrollHandback.insert(previous)
         }
+        smoothScrollHandback.remove(gridId)
         smoothScrollBorrowedGrid = gridId
         smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
         ZonvieCore.appLog("[ss_borrow] request grid=\(gridId) pending=\(smoothScrollBorrowPending)")
@@ -2876,7 +2893,11 @@ final class MetalTerminalView: MTKView {
             gestureBoundGrids.removeAll(keepingCapacity: true)
             scrollOffsetLock.unlock()
         }
-        guard let core, let gridId = smoothScrollBorrowedGrid else { return }
+        guard let core else { return }
+        for handback in smoothScrollHandback where core.setGestureSmoothScroll(gridId: handback, enable: false) {
+            smoothScrollHandback.remove(handback)
+        }
+        guard let gridId = smoothScrollBorrowedGrid else { return }
         if smoothScrollBorrowPending {
             smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
         }
@@ -2975,7 +2996,17 @@ final class MetalTerminalView: MTKView {
                 && gridId != 1
                 && gestureScrollGridId != gridId
                 && pending.contains { $0.gridId == gestureScrollGridId }
-            if boundToThisGesture { gestureBoundGrids.insert(gridId) }
+            if boundToThisGesture, gestureBoundGrids.insert(gridId).inserted,
+               scrollOffsetPx[gridId] == nil,
+               let driving = gestureScrollGridId, let banked = scrollOffsetPx[driving] {
+                // Seeded from the driver on the way in. A bound window is only
+                // recognised when its first scroll shares a batch with the
+                // driver's, by which time the finger has banked a round trip's
+                // travel that this window was never paid — starting it from
+                // zero left the two panes of a diff a fraction of a row apart
+                // for the rest of the gesture.
+                scrollOffsetPx[gridId] = banked
+            }
             let gestureOwns = sentCount > 0
                 || gestureLookaheadGrids.contains(gridId)
                 || gestureDrivesThisGrid
@@ -3024,13 +3055,35 @@ final class MetalTerminalView: MTKView {
                 // it may not deepen an offset that already holds something; from
                 // rest it is a genuine Neovim-initiated scroll and gets the same
                 // one-step compensation the model uses everywhere else.
+                //
+                // Not for a window this gesture merely drags along. A bound
+                // window never books, so its report is the sole account of how
+                // far it moved and must be allowed to deepen: it sits near zero
+                // at every arrival (it trails the driver by one round trip),
+                // and capping at `abs(currentOffset)` there discarded the
+                // credit outright — the window then moved a full step with no
+                // compensation, about every other arrival. That is the
+                // row-at-a-time stepping this whole path exists to remove.
+                //
+                // Keyed on membership, not on `sentCount == 0`: the driving
+                // grid also reaches zero booking mid-gesture (a wrapped scroll's
+                // first arrival consumes all of it), and there the deepen rule
+                // is exactly what stops the over-report running the offset out
+                // the far side.
                 let stepPx = rowHeightPx * CGFloat(max(1, rowsPerWheelEventForClamp))
-                let deepens = currentOffset == 0 || (newOffset < 0) == (currentOffset < 0)
-                let cap = deepens
-                    ? (currentOffset == 0 ? stepPx : abs(currentOffset))
-                    : stepPx
-                if abs(newOffset) > cap {
-                    newOffset = newOffset < 0 ? -cap : cap
+                if !gestureBoundGrids.contains(gridId) {
+                    let deepens = currentOffset == 0 || (newOffset < 0) == (currentOffset < 0)
+                    let cap = deepens
+                        ? (currentOffset == 0 ? stepPx : abs(currentOffset))
+                        : stepPx
+                    if abs(newOffset) > cap {
+                        newOffset = newOffset < 0 ? -cap : cap
+                    }
+                } else if abs(newOffset) > stepPx {
+                    // Still bounded: a report larger than one wheel event's
+                    // worth is more than the finger can consume before the next
+                    // one lands.
+                    newOffset = newOffset < 0 ? -stepPx : stepPx
                 }
                 if abs(newOffset) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: gridId)

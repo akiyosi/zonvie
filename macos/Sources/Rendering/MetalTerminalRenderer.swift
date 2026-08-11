@@ -5281,6 +5281,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // recursive.
         let capturedCellHeightPx = cellHeightPx
         var stepGridId: Int64?
+        var alreadyRetained = false
         for i in 0..<plan.count {
             let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
             guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { continue }
@@ -5316,10 +5317,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // seeded rows twice. Per grid, not per bracket: two windows can
                 // scroll in one flush, and a blanket check would leave the
                 // second one's band empty.
-                if bracketStagedGrids.contains(gid) { return }
-                retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+                //
+                // Standing down means not staging — it must not mean leaving
+                // the function, because the ease seed below is this path's
+                // alone: the grid_scroll capture deliberately stages none. A
+                // `return` here cost a held key its sub-row ease on every step
+                // where the previous step's offset had not yet decayed, which
+                // reads as judder rather than a clean loss.
+                alreadyRetained = bracketStagedGrids.contains(gid)
+                if !alreadyRetained {
+                    retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+                }
                 stepGridId = gid
             }
+            if alreadyRetained { continue }
 
             let needed = vc * MemoryLayout<Vertex>.stride
             guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }

@@ -220,6 +220,43 @@ private enum ScrollRetentionTests {
         requireEqual(kept.targetRow, 5, "the untouched grid's row stayed where it was")
     }
 
+    /// The ring is the only thing keeping a retained buffer alive, so the grid
+    /// count it is sized for has to be an enforced limit and not a hope. The
+    /// least recently stepped grid loses its rows.
+    private static func verifyGridCountIsCapped(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(2)
+        retention.beginFlush()
+        let grids: [Int64] = [2, 3, 4, 5, 6]
+        for grid in grids {
+            retention.beginStep(gridId: grid, rowsDelta: 1, pivotTargetRow: 0)
+            retention.stage(makeRow(retention, gridId: grid, targetRow: 0))
+        }
+        _ = retention.commit()
+
+        var held = 0
+        for grid in grids where retention.publishedCount(gridId: grid) > 0 { held += 1 }
+        requireEqual(held, ScrollRetention.maxRetainedGrids, "at most maxRetainedGrids keep rows")
+        requireEqual(
+            retention.publishedCount(gridId: 2), 0,
+            "the least recently stepped grid is the one dropped"
+        )
+        requireEqual(retention.publishedCount(gridId: 6), 1, "the newest grid keeps its rows")
+
+        // Stepping a grid again makes it the most recent, so it survives the
+        // next eviction rather than being dropped for its original position.
+        retention.beginFlush()
+        retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
+        retention.beginStep(gridId: 7, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 7, targetRow: 0))
+        _ = retention.commit()
+        // Rows carried over from the previous commit are re-seeded alongside
+        // the new one, so what matters here is that any survive at all.
+        require(retention.publishedCount(gridId: 3) > 0, "a re-stepped grid is not evicted")
+        requireEqual(retention.publishedCount(gridId: 4), 0, "the next least recent goes instead")
+    }
+
     /// A retained row is only meaningful while its grid is displaced.
     private static func verifyPrune(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
@@ -261,6 +298,7 @@ private enum ScrollRetentionTests {
         verifyAbortDiscardsStaged(device: device)
         verifyGridsAreIndependent(device: device)
         verifyStepLeavesOtherGridsInPlace(device: device)
+        verifyGridCountIsCapped(device: device)
         verifyPrune(device: device)
         verifyDepthClamp(device: device)
         print("ScrollRetentionTests: OK")

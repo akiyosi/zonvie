@@ -171,10 +171,19 @@ final class ScrollRetention {
     static let maxInFlightFrames = 2
     /// Windows that can hold a band at the same time. 'scrollbind' moves two
     /// (:vert diffsplit), and each keeps its own rows, so the ring drains that
-    /// many times faster. Slots are only allocated as they are reached, so the
-    /// headroom costs nothing until the grids are actually there.
+    /// many times faster. Enforced in `beginStep`, not merely assumed: the ring
+    /// is the only thing keeping a retained buffer alive, so an unbounded grid
+    /// count would wrap it onto rows a frame is still reading.
     static let maxRetainedGrids = 4
-    static let ringSize = 2 * (maxInFlightFrames + 2) * maxDepthRows * maxRetainedGrids
+    /// One set per in-flight frame, plus the published set and the one being
+    /// staged, times the grids that can each hold their own. Deliberately
+    /// without the "several flushes per frame" factor the earlier sizing
+    /// carried: a published set replaced within a frame is released
+    /// immediately, so it pins nothing and buying headroom for it only doubles
+    /// a residency that is never reclaimed. `takeBuffer` walks every slot in
+    /// turn, so the whole ring becomes resident after a few seconds of
+    /// scrolling in ONE window — the count is a memory figure, not a lazy cap.
+    static let ringSize = (maxInFlightFrames + 2) * maxDepthRows * maxRetainedGrids
 
     struct Plan {
         let first: Int
@@ -193,6 +202,9 @@ final class ScrollRetention {
     private var staged: [RetainedScrollRow] = []
     private var stagedValid = false
     private var published: [RetainedScrollRow] = []
+    /// Grids that have opened a step, least recent first. Bounds how many can
+    /// hold rows at once — see `maxRetainedGrids`.
+    private var stepOrder: [Int64] = []
     private var depth = ScrollRetention.minDepthRows
 
     init(device: MTLDevice) {
@@ -346,6 +358,17 @@ final class ScrollRetention {
             stagedValid = true
             staged.removeAll(keepingCapacity: true)
             staged.append(contentsOf: published)
+        }
+        // Hold the ring's sizing assumption. Rows are capped per grid but the
+        // number of grids was not, and a `windo`/'scrollbind' group larger than
+        // `maxRetainedGrids` would wrap the ring onto buffers a frame is still
+        // reading. The grid opening a step is the one being scrolled now, so
+        // the rows shed here are the least recent.
+        stepOrder.removeAll { $0 == gridId }
+        stepOrder.append(gridId)
+        while stepOrder.count > Self.maxRetainedGrids {
+            let evicted = stepOrder.removeFirst()
+            staged.removeAll { $0.gridId == evicted }
         }
         // Grid-scoped: a step describes one grid's movement, and 'scrollbind'
         // (:vert diffsplit) scrolls two windows from one gesture, each needing
