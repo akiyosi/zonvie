@@ -77,6 +77,20 @@ final class MetalTerminalView: MTKView {
     private var pendingSentScroll: [Int64: Int] = [:]
     private let pendingSentScrollLock = NSLock()
 
+    // Windows this gesture is moving besides the one it was aimed at — the rest
+    // of a 'scrollbind' group. They receive the same compensation and the same
+    // finger travel, so they ease out together. Guarded by scrollOffsetLock.
+    private var gestureBoundGrids: Set<Int64> = []
+
+    // The grid whose window has our 'smoothscroll' borrowed, and whether the
+    // enable request still has to be retried. Main thread only (scroll input
+    // and the pre-draw tick).
+    private var smoothScrollBorrowedGrid: Int64?
+    private var smoothScrollBorrowPending = false
+    /// Windows whose borrow was handed back but whose request the core refused.
+    /// Drained by the frame tick until it accepts.
+    private var smoothScrollHandback: Set<Int64> = []
+
     // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
     // thread), carrying the signed distance the content moved in rows.
     //
@@ -124,8 +138,8 @@ final class MetalTerminalView: MTKView {
     // feel); a hand put back on the pad mid-bounce no longer freezes it.
     // Momentum does NOT gate the bounce: like the native one, it starts as
     // soon as the edge is hit and swallows the remaining momentum.
-    // Written on the main thread, read on the core thread — see
-    // noteScrollGesturePhase for the lock that covers both.
+    // Written on the main thread, read on the core thread as a hint — see
+    // noteScrollGesturePhase for what the lock does and does not cover.
     private var scrollGestureTouching = false
     // True while a momentum phase is running. Only used to keep momentum
     // events from refreshing lastPreciseScrollInputTime, which would gate the
@@ -777,7 +791,12 @@ final class MetalTerminalView: MTKView {
             // Process pending scroll clears from grid_scroll events before rendering.
             // This ensures scroll offsets are cleared before vertices are drawn,
             // preventing double-shift glitches in split windows.
+            // 'smoothscroll' reports its movement only through win_viewport, so
+            // collect what grid_scroll did not describe before processing.
             self?.processPendingScrollClears()
+            // Hand 'smoothscroll' back once the gesture is over. Frame-driven
+            // so a missed .ended phase cannot leave the user's option flipped.
+            self?.tickGestureSmoothScroll()
             // Advance the sub-row ease (seed + decay) for keyboard scrolling.
             self?.tickSmoothScroll()
             // Detect buffer-edge blocked scrolls and run the rubber-band
@@ -790,6 +809,10 @@ final class MetalTerminalView: MTKView {
             }
             // Update shader with current scroll offsets (safe to call here on main thread).
             self?.updateScrollShaderOffset()
+            // …and fold the cursor's displacement into the shader endpoints
+            // even when the call above took its idle early-out, which it does
+            // whenever nothing is scrolling. The cursor still moves then.
+            self?.renderer.refreshCursorShaderState()
             // Update cursor blink state for rendering
             if let core = self?.core {
                 let state = core.cursorBlinkState
@@ -2010,6 +2033,13 @@ final class MetalTerminalView: MTKView {
         // Written on the main thread, read on the core thread by
         // processPendingScrollClears when it decides who owns a scroll — so
         // the writes take the same lock that read is already holding.
+        //
+        // Only the id COMPARISONS are covered — `padIsDriving` reads the id for
+        // nil-ness and the phase booleans before taking the lock at all, as
+        // does tickScrollEdgeBounce for its early exit. Those reads are hints:
+        // a few microseconds of staleness is nothing against the 0.2 s window
+        // the terms carry (0.03 s for the edge-bounce exit), and a stale
+        // Optional tag can only name a grid that was valid a moment ago.
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
         let phase = event.phase
@@ -2225,7 +2255,26 @@ final class MetalTerminalView: MTKView {
         updateScrollShaderOffset()
     }
 
-    /// Clear all scroll offsets
+    /// Clear all scroll offsets.
+    ///
+    /// UNREACHABLE: nothing calls this, and it is the only caller of the
+    /// renderer's clearScrollOffsets — so none of that reset happens on any
+    /// surface (an external grid view has no MetalTerminalRenderer of its own).
+    ///
+    /// What it would reset is handled elsewhere: pendingRetentionReplay by
+    /// commitFlush, bracketSourceShift by beginFlush, published rows by
+    /// updateScrollOffsets' prune. scrollOffsetData is rebuilt whenever
+    /// anything is displaced — updateScrollShaderOffset takes an idle early-out
+    /// once nothing is, having pushed one empty state through first.
+    ///
+    /// The capture spans are the exception. They survive a layout change and
+    /// are only re-armed by a precise scroll event, so a keyboard scroll
+    /// between a window MOVING and the next gesture captures against the old
+    /// span. Handles are never reused, so a span cannot be misapplied to a
+    /// different window — but that also means the dictionary only grows.
+    ///
+    /// Left in place rather than deleted; do not write code that relies on it
+    /// running.
     private func clearAllScrollOffsets() {
         scrollOffsetLock.lock()
         scrollOffsetPx.removeAll()
@@ -2246,6 +2295,68 @@ final class MetalTerminalView: MTKView {
     ///   - scale: Backing scale factor
     ///   - hasPrecise: Whether this is precise (trackpad) scrolling
     /// - Returns: Current scroll offset in pixels (for sub-cell visual offset)
+    /// Tell the renderer which main-surface rows each visible grid's smooth
+    /// scroll may retain an outgoing row from. A vertical split or a float
+    /// always fails the core's row-scroll fast path (partial_width), so the
+    /// grid_scroll capture is the only thing that can keep their outgoing row
+    /// alive. A full-width grid normally belongs to the fast path, but that
+    /// path only sees rows that actually shifted — a 'smoothscroll' window
+    /// repaints instead — so it is armed as well, and the fast path stands
+    /// down for a grid this one already retained.
+    ///
+    /// Note the spans are never disarmed in practice (see
+    /// clearAllScrollOffsets), so one gesture arms every grid for the session.
+    private func armScrollRetention(gridId: Int64) {
+        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        // The band a wheel event opens is as wide as the rows it moves, so the
+        // retention has to keep that many to cover it.
+        renderer.setRetentionDepthRows(core.getMouseScrollVer())
+        let grids = core.getVisibleGridsCached()
+        // 'scrollbind' (:vert diffsplit) answers one gesture by scrolling every
+        // bound window, and each of them opens a band of its own. Arming only
+        // the window under the finger left the others with nothing to fill
+        // theirs. Which ones move is Neovim's decision and is not known until
+        // the scrolls arrive, so every visible grid is armed and the ones that
+        // do not move simply never capture.
+        // Grid 1 is the whole-screen composite, not a window: its span would
+        // take in the tabline and status rows, and a retained row from there
+        // is content that never scrolled.
+        for candidate in grids where candidate.gridId != gridId && candidate.gridId != 1 {
+            armScrollRetentionSpan(for: candidate, grids: grids)
+        }
+        guard let info = grids.first(where: { $0.gridId == gridId }) else { return }
+
+        armScrollRetentionSpan(for: info, grids: grids)
+    }
+
+    /// The rows one grid's smooth scroll may retain an outgoing row from.
+    private func armScrollRetentionSpan(for info: ZonvieCore.GridInfo, grids: [ZonvieCore.GridInfo]) {
+        // An external window renders its own surface, so its rows are its own
+        // and the full-width test below does not apply. The core reports it at
+        // (0,0), which is already this window's row space.
+        if let external = core?.externalGridView(for: info.gridId) {
+            external.setScrollCaptureBounds(
+                top: Int(info.marginTop),
+                bottomEx: Int(info.rows - info.marginBottom)
+            )
+            return
+        }
+
+        // Armed for full-width windows too, which used to be left to the
+        // row-scroll fast path alone. That path only sees rows that actually
+        // shifted, so when Neovim repaints a 'smoothscroll' window instead of
+        // scrolling it, nothing was staged and the band opened with no rows to
+        // fill it. The fast path now stands down for a grid this one already
+        // retained, so the two cannot stage the same movement twice.
+        renderer.setGridScrollCaptureBounds(
+            gridId: info.gridId,
+            bounds: (
+                top: Int(info.startRow + info.marginTop),
+                bottomEx: Int(info.startRow + info.rows - info.marginBottom)
+            )
+        )
+    }
+
     func handleScrollInput(
         gridId: Int64,
         row: Int32,
@@ -2275,6 +2386,18 @@ final class MetalTerminalView: MTKView {
             }
         }
 
+        // How many rows one wheel event is worth ('mousescroll' ver). The
+        // sub-cell model asks Neovim for rows before the finger has travelled
+        // them and cancels each arrival against the pixel offset it holds, so
+        // an event has to be accounted as the N rows it really moves. Assuming
+        // one made a fast gesture jump the other N-1 per event.
+        // 'ver:0' disables mouse scrolling in Neovim, so there is nothing to
+        // account with and pixel scrolling is not attempted at all.
+        let rowsPerWheelEvent = core.getMouseScrollVer()
+        if rowsPerWheelEvent < 1 {
+            effectiveHasPrecise = false
+        }
+
         // Instant edge detection from the (non-blocking) viewport cache:
         // engage the rubber band on the first overscroll pixel instead of
         // waiting for the stale-frame fallback. Checked before the fast-scroll
@@ -2291,11 +2414,35 @@ final class MetalTerminalView: MTKView {
             let fastScrollThreshold = rowHeightPx / scale  // ~20 points at 2x scale
             if abs(deltaY) > fastScrollThreshold {
                 effectiveHasPrecise = false
-                // Clear any accumulated offset when switching to fast mode
+                // Clear any accumulated offset when switching to fast mode,
+                // and hand ownership of this grid back with it. The discrete
+                // path below books nothing, so every scroll it sends comes
+                // back with sentCount == 0 — but while the fingers are still
+                // down, gestureScrollGridId and gestureLookaheadGrids keep
+                // answering "the gesture owns this grid", and
+                // processPendingScrollClears then credits the arrival's whole
+                // distance to the offset. Nothing consumes that, so the
+                // picture carries up to a clamp's worth of displacement for
+                // the body of every fast flick (26% of reconciliations in a
+                // real trackpad log arrived this way). Discrete scrolling asks
+                // for whole rows and wants no sub-cell compensation, so those
+                // arrivals belong in the Neovim-initiated branch, which clears
+                // the offset. A later slow event re-establishes ownership.
                 scrollOffsetLock.lock()
                 scrollOffsetPx.removeValue(forKey: gridId)
                 scrollStaleSince.removeValue(forKey: gridId)
                 scrollEdgeBlocked.removeValue(forKey: gridId)
+                gestureLookaheadGrids.remove(gridId)
+                if gestureScrollGridId == gridId {
+                    gestureScrollGridId = nil
+                    // The bound windows belonged to that gesture. Left behind,
+                    // they would hold a compensation nothing pays down.
+                    for bound in gestureBoundGrids {
+                        scrollOffsetPx.removeValue(forKey: bound)
+                        gestureLookaheadGrids.remove(bound)
+                    }
+                    gestureBoundGrids.removeAll(keepingCapacity: true)
+                }
                 scrollOffsetLock.unlock()
                 pendingSentScrollLock.lock()
                 pendingSentScroll.removeValue(forKey: gridId)
@@ -2304,16 +2451,43 @@ final class MetalTerminalView: MTKView {
         }
 
         if effectiveHasPrecise {
+            // Arm the outgoing-row retention before any scroll request goes
+            // out: Neovim's grid_scroll can come back within a millisecond,
+            // ahead of the next frame, so the geometry cannot be picked up
+            // from the pre-draw pass. Takes the renderer lock, so it must
+            // stay outside scrollOffsetLock (the order the rest of this file
+            // keeps).
+            armScrollRetention(gridId: gridId)
+
             // Trackpad: implement sub-cell smooth scrolling for external grids
             let deltaYPx = deltaY * scale
+
+            // Borrow 'smoothscroll' BEFORE any wheel event goes out. Both travel
+            // the same ordered RPC channel, so a request sent afterwards leaves
+            // the gesture's first event to be processed under the old quantum:
+            // on a 'wrap'ped line that moves four or five screen rows against a
+            // booking of three, and the difference is visible as a row-sized
+            // jolt at exactly the moment a gesture starts. Measured — every
+            // gesture's first grid_scroll arrived before the borrow landed.
+            //
+            // Taken before scrollOffsetLock: the core call acquires the grid
+            // lock, and nothing else here nests those two.
+            requestGestureSmoothScroll(gridId: gridId)
 
             // Read pending scroll count OUTSIDE scrollOffsetLock to avoid deadlock
             pendingSentScrollLock.lock()
             let alreadyPending = pendingSentScroll[gridId] ?? 0
             pendingSentScrollLock.unlock()
 
-            let maxTotalPending = 8
+            // Counted in ROWS, not events: one event answers for
+            // rowsPerWheelEvent of them, and what the lookahead has to know is
+            // the distance already asked for. The backpressure cap is scaled
+            // to match so it still admits the same eight events it always did
+            // — as a row count it would otherwise throttle a fast gesture the
+            // moment 'mousescroll' was above one.
+            let maxTotalPending = 8 * rowsPerWheelEvent
             let canSendMore = alreadyPending < maxTotalPending
+            let stepPx = rowHeightPx * CGFloat(rowsPerWheelEvent)
 
             // Hold scrollOffsetLock for entire read-modify-write (TOCTOU fix).
             // processPendingScrollClears also acquires this lock, but it runs on the
@@ -2409,7 +2583,7 @@ final class MetalTerminalView: MTKView {
                         modifier: modifier
                     )
                     scrollCount += 1
-                    lookaheadPx -= sendDirection * rowHeightPx
+                    lookaheadPx -= sendDirection * stepPx
                 }
             }
 
@@ -2424,6 +2598,38 @@ final class MetalTerminalView: MTKView {
             // a blocked edge. Bounce-back is gated on gesture/momentum state
             // instead, so it never fights active user input.
             scrollOffsetPx[gridId] = newOffset
+            // A bound window ('scrollbind') is given the same compensation when
+            // its scroll lands, but the finger only ever paid down the grid it
+            // was aimed at — so that compensation sat at a full step and the
+            // window stayed displaced instead of easing back. The finger's
+            // travel is the only thing that consumes an offset, so it has to
+            // reach every window this gesture is moving.
+            //
+            // Only a window that is still holding compensation. A bound window
+            // that has settled on the cell grid drops its entry and is skipped
+            // until its next arrival re-creates it — and that arrival is the
+            // proof it is still moving. Paying a window with no entry instead
+            // meant one that had stopped being scrolled at all (its own buffer
+            // edge, or the gesture pushing into the driver's) accumulated the
+            // finger's travel with nothing to credit it back, and no decay
+            // path reaches it: it stays displaced until Neovim next scrolls it.
+            //
+            // Clamped like the driver above all the same, so a window whose
+            // arrivals stop mid-gesture cannot bank travel it will never be
+            // credited for and then ignore a reversed finger.
+            for bound in gestureBoundGrids where bound != gridId {
+                guard let held = scrollOffsetPx[bound] else { continue }
+                let paid = clampVisualScrollOffsetPx(
+                    held + deltaYPx,
+                    cellHeightPx: rowHeightPx
+                )
+                if abs(paid) < Self.scrollOffsetEpsilon {
+                    scrollOffsetPx.removeValue(forKey: bound)
+                    gestureLookaheadGrids.remove(bound)
+                } else {
+                    scrollOffsetPx[bound] = paid
+                }
+            }
             // This is the grid the pad is driving; gesture ownership of an
             // incoming grid_scroll is decided against it.
             gestureScrollGridId = gridId
@@ -2445,7 +2651,7 @@ final class MetalTerminalView: MTKView {
             // Track how many scroll commands we sent (outside scrollOffsetLock)
             if scrollCount > 0 {
                 pendingSentScrollLock.lock()
-                pendingSentScroll[gridId, default: 0] += scrollCount
+                pendingSentScroll[gridId, default: 0] += scrollCount * rowsPerWheelEvent
                 pendingSentScrollLock.unlock()
             }
 
@@ -2463,9 +2669,19 @@ final class MetalTerminalView: MTKView {
             // Mouse wheel / fast scroll: send directly with acceleration
             let direction = deltaY > 0 ? "up" : "down"
 
-            // Calculate scroll count based on speed (acceleration)
+            // The acceleration is measured in ROWS of finger travel, but one
+            // wheel event moves 'mousescroll' ver of them — sending one event
+            // per row runs the content ahead of the finger by exactly that
+            // factor, which is what made a fast flick overshoot. A discrete
+            // wheel notch still sends one event: its travel is under a row, so
+            // the division never reduces it below the floor of one.
+            // 'ver:0' disables mouse scrolling in Neovim, so there is no row
+            // count to divide by; the events it sends are ignored anyway.
             let deltaYPx = abs(deltaY) * scale
-            let scrollCount = max(1, Int(deltaYPx / rowHeightPx))
+            let rowsTravelled = Int(deltaYPx / rowHeightPx)
+            let scrollCount = rowsPerWheelEvent > 0
+                ? max(1, rowsTravelled / rowsPerWheelEvent)
+                : 1
 
             for _ in 0..<scrollCount {
                 core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
@@ -2513,6 +2729,51 @@ final class MetalTerminalView: MTKView {
     /// Staged until the flush carrying those rows commits.
     func clearScrollOffsetForGrid(_ gridId: Int64, rowsDelta: Int) {
         guard rowsDelta != 0 else { return }
+        // The reconciliation staged below hands the gesture a row of
+        // compensation to ease out; retain the outgoing row now, while the
+        // flush's source set still holds it, so the vacated band shows the
+        // row that left instead of the edge-row background stretch (the
+        // neighbouring row's highlight) on grids the row-scroll fast path
+        // cannot cover.
+        if MetalTerminalRenderer.smoothScrollEnabled {
+            scrollOffsetLock.lock()
+            let offset = scrollOffsetPx[gridId] ?? 0
+            let lookahead = gestureLookaheadGrids.contains(gridId)
+            scrollOffsetLock.unlock()
+            pendingSentScrollLock.lock()
+            let sent = pendingSentScroll[gridId] ?? 0
+            pendingSentScrollLock.unlock()
+            // Mirrors processPendingScrollClears' gestureOwns: only a scroll
+            // whose compensation will displace the grid needs its row kept —
+            // an unowned (keyboard/nvim) scroll here clears the offset, and
+            // updateScrollOffsets would prune the retained row unused.
+            //
+            // padIsDriving covers the bound windows of a 'scrollbind' group on
+            // their first arrival, where none of the three terms above hold yet:
+            // the offset that displaces them is installed by the reconciliation
+            // this callback stages, so waiting for it would mean capturing a
+            // step too late and opening their band over nothing.
+            let padIsDriving = gestureScrollGridId != nil
+                && gridId != 1
+                && (scrollGestureTouching
+                    || scrollMomentumRunning
+                    || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
+            if sent > 0 || lookahead || padIsDriving || abs(offset) >= Self.scrollOffsetEpsilon {
+                if let external = core?.externalGridView(for: gridId) {
+                    // An external window's rows live in its own surface, not
+                    // the main composite, so the capture belongs to it. It
+                    // cannot happen here: its flush bracket opens lazily on
+                    // first content, which is after this callback, and opening
+                    // discards anything staged before it. Hand over the
+                    // distance instead and let it capture when the bracket
+                    // opens — the committed set still holds the on-screen rows
+                    // at that point.
+                    external.noteGridScroll(rowsDelta: rowsDelta)
+                } else {
+                    renderer.captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta)
+                }
+            }
+        }
         pendingScrollClearLock.lock()
         stagedScrollClear.append((gridId: gridId, rowsDelta: rowsDelta))
         pendingScrollClearLock.unlock()
@@ -2633,6 +2894,62 @@ final class MetalTerminalView: MTKView {
     /// Does NOT call updateScrollShaderOffset() to avoid deadlock when called from Zig callback.
     /// Shader update will happen in onPreDraw before rendering.
     /// Public so external grid views can call this before their draw to stay in sync.
+    /// Ask Neovim to turn 'smoothscroll' on for the grid the gesture is
+    /// driving. Idempotent on the Neovim side, but only sent once per gesture;
+    /// a request that could not be issued is retried by the tick below.
+    private func requestGestureSmoothScroll(gridId: Int64) {
+        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        if smoothScrollBorrowedGrid == gridId, !smoothScrollBorrowPending { return }
+        // A gesture that moved to another grid hands the old one back first.
+        // Queued rather than issued once: the core refuses while the grid lock
+        // is busy, which is most of a flush, and this was the one hand-back
+        // with nothing left holding the id afterwards. It heals on the next
+        // gesture over that window either way, but "either way" can be never.
+        if let previous = smoothScrollBorrowedGrid, previous != gridId {
+            smoothScrollHandback.insert(previous)
+        }
+        smoothScrollHandback.remove(gridId)
+        smoothScrollBorrowedGrid = gridId
+        smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
+        ZonvieCore.appLog("[ss_borrow] request grid=\(gridId) pending=\(smoothScrollBorrowPending)")
+    }
+
+    /// Hand 'smoothscroll' back once the gesture and its momentum are done.
+    ///
+    /// Frame-driven rather than tied to the .ended phase: that phase can be
+    /// missed (a cancelled gesture, a window losing focus mid-scroll), and the
+    /// option is the user's, not ours to keep. Retried until the core accepts
+    /// it, since the request is dropped when the grid lock is busy.
+    private func tickGestureSmoothScroll() {
+        // The bound windows belong to one gesture. Once it and its momentum are
+        // done their offsets are decayed by tickSmoothScroll like any other, but
+        // the membership must not carry into the next gesture, which may be
+        // driving an entirely different window.
+        if !scrollGestureTouching, !scrollMomentumRunning,
+           CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime > Self.smoothScrollGestureGuardSeconds {
+            scrollOffsetLock.lock()
+            gestureBoundGrids.removeAll(keepingCapacity: true)
+            scrollOffsetLock.unlock()
+        }
+        guard let core else { return }
+        for handback in smoothScrollHandback where core.setGestureSmoothScroll(gridId: handback, enable: false) {
+            smoothScrollHandback.remove(handback)
+        }
+        guard let gridId = smoothScrollBorrowedGrid else { return }
+        if smoothScrollBorrowPending {
+            smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
+        }
+        let idleFor = CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime
+        guard !scrollGestureTouching,
+              !scrollMomentumRunning,
+              idleFor > Self.smoothScrollGestureGuardSeconds
+        else { return }
+        if core.setGestureSmoothScroll(gridId: gridId, enable: false) {
+            smoothScrollBorrowedGrid = nil
+            smoothScrollBorrowPending = false
+        }
+    }
+
     func processPendingScrollClears() {
         pendingScrollClearLock.lock()
         let pending = pendingScrollClear
@@ -2644,6 +2961,16 @@ final class MetalTerminalView: MTKView {
         guard !pending.isEmpty || !external.isEmpty else { return }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
+        // One wheel event's worth of rows, the unit the lookahead books in and
+        // therefore the most it may ever be running ahead by. Read once: it is
+        // a lock-free atomic, but this loop runs per arrival.
+        let rowsPerWheelEventForClamp = core?.getMouseScrollVer() ?? 1
+        // Whether the pad is mid-gesture at all. The per-grid questions below
+        // add who the gesture is for.
+        let padIsDriving = gestureScrollGridId != nil
+            && (scrollGestureTouching
+                || scrollMomentumRunning
+                || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
 
         scrollOffsetLock.lock()
         for gridId in external {
@@ -2673,7 +3000,9 @@ final class MetalTerminalView: MTKView {
             // Check if this is a response to our scroll command or Neovim-initiated
             pendingSentScrollLock.lock()
             let sentCount = pendingSentScroll[gridId] ?? 0
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
+            // A bound window may be seeded below, before the credit is taken,
+            // so this is not captured until then.
+            var currentOffset = scrollOffsetPx[gridId] ?? 0
             // The in-flight count is bookkeeping for how many requests are
             // outstanding, not proof of who scrolled: one notification can
             // carry several rows and take the count to zero while the gesture
@@ -2690,13 +3019,45 @@ final class MetalTerminalView: MTKView {
             // offset instead of cleared, with the ease seed suppressed and
             // nothing left to decay it, and an unrelated split scrolled by
             // Neovim would pick up a phantom row of its own.
-            let gestureDrivesThisGrid = gestureScrollGridId == gridId
-                && (scrollGestureTouching
-                    || scrollMomentumRunning
-                    || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
+            let gestureDrivesThisGrid = gestureScrollGridId == gridId && padIsDriving
+            // 'scrollbind' (:vert diffsplit) answers one wheel event by
+            // scrolling every bound window, and only the window the event was
+            // aimed at carries a booking. The others used to reach the
+            // Neovim-initiated branch below and have their offset dropped, so
+            // they stepped a row at a time while the window under the finger
+            // moved by pixels.
+            //
+            // The tie is the BATCH, not the pad: bound windows are scrolled by
+            // the same keystroke and arrive together. Asking only whether the
+            // pad was busy let anything Neovim scrolled during a gesture claim
+            // an offset — including grid 1, whose displacement drags the
+            // tabline and status rows with it.
+            let boundToThisGesture = padIsDriving
+                && gridId != 1
+                && gestureScrollGridId != gridId
+                && pending.contains { $0.gridId == gestureScrollGridId }
+            if boundToThisGesture, gestureBoundGrids.insert(gridId).inserted,
+               scrollOffsetPx[gridId] == nil,
+               let driving = gestureScrollGridId, let banked = scrollOffsetPx[driving] {
+                // Seeded from the driver on the way in. A bound window is only
+                // recognised when its first scroll shares a batch with the
+                // driver's, by which time the finger has banked a round trip's
+                // travel that this window was never paid — starting it from
+                // zero left the two panes of a diff a fraction of a row apart
+                // for the rest of the gesture.
+                //
+                // Into `currentOffset`, not just the dictionary: the credit
+                // below is taken from this value, and writing only the map left
+                // the seed to be overwritten by the credit it was supposed to
+                // shift. Pinned by ScrollRetentionTests' "a seeded bound window
+                // lands where the driver does".
+                currentOffset = banked
+                scrollOffsetPx[gridId] = banked
+            }
             let gestureOwns = sentCount > 0
                 || gestureLookaheadGrids.contains(gridId)
                 || gestureDrivesThisGrid
+                || boundToThisGesture
             if gestureOwns {
                 // These rows are the lookahead the gesture asked for before the
                 // finger got there.
@@ -2705,13 +3066,37 @@ final class MetalTerminalView: MTKView {
                 pendingSentScroll[gridId] = sentCount - toConsume
                 pendingSentScrollLock.unlock()
 
-                // Cancel exactly the distance the content travelled, so the
-                // picture stays where the finger left it. What is left is the
-                // compensation the finger then consumes pixel by pixel — the
-                // row appears as it is crossed, with no frame in which the
+                // Cancel the distance the compensation was taken out for, so
+                // the picture stays where the finger left it. What is left is
+                // the compensation the finger then consumes pixel by pixel —
+                // the row appears as it is crossed, with no frame in which the
                 // content has moved and the offset has not.
-                let newOffset = currentOffset + CGFloat(rowsDelta) * rowHeightPx
-                if abs(newOffset) < Self.scrollOffsetEpsilon {
+                //
+                // Booked rows, not reported rows: 'mousescroll' counts buffer
+                // lines while grid_scroll counts screen rows, so on a 'wrap'ped
+                // buffer one wheel event books ver rows and Neovim answers with
+                // every row those lines occupy — four times as many for a line
+                // spanning four rows. Crediting the report would drive the
+                // offset past zero and out the other side. Where nothing was
+                // booked there is no better number than the report itself, and
+                // the healthy case has the two equal, so this only bites where
+                // the units genuinely disagree.
+                let credited = ScrollRetention.creditedOffsetPx(
+                    heldPx: currentOffset,
+                    bookedRows: sentCount,
+                    rowsDelta: rowsDelta,
+                    rowHeightPx: rowHeightPx,
+                    stepRows: rowsPerWheelEventForClamp,
+                    // Membership alone is not enough: nothing takes a grid out
+                    // of the set when it BECOMES the driver, so scrolling the
+                    // other pane of a diff within the gesture guard would have
+                    // handed the driver the bound rule and disabled the deepen
+                    // clamp its wrapped over-reports depend on.
+                    bound: gestureScrollGridId != gridId && gestureBoundGrids.contains(gridId),
+                    epsilonPx: Self.scrollOffsetEpsilon
+                )
+                let newOffset = credited ?? 0
+                if credited == nil {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     gestureLookaheadGrids.remove(gridId)
                     // Settling here erases both signals the seed guard reads,
@@ -2751,7 +3136,9 @@ final class MetalTerminalView: MTKView {
                 smoothScrollGrids.remove(gridId)
                 gestureLookaheadGrids.remove(gridId)
                 scrollOffsetPx.removeValue(forKey: gridId)
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) nvim-initiated, clearing offset=\(currentOffset)")
+                ZonvieCore.appLog(
+                    "[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) nvim-initiated, clearing offset=\(currentOffset)"
+                )
             }
         }
         scrollOffsetLock.unlock()
@@ -2773,9 +3160,11 @@ final class MetalTerminalView: MTKView {
             : 1.0
         lastSmoothScrollTickTime = now
 
-        // A seed exists only for a scroll whose outgoing row was retained, so
-        // an uncaptured scroll (page motion, a non-fast-path redraw) simply
-        // leaves the offset to decay.
+        // A seed exists only for a single-row step whose outgoing row was
+        // retained — the shape a held key produces. Page motion and
+        // non-fast-path redraws seed nothing and simply land where they land;
+        // rows may still be retained for them, but with no offset to show
+        // them in, updateScrollOffsets prunes them unused.
         seedScratch.removeAll(keepingCapacity: true)
         for seed in renderer.takeSmoothScrollSeeds() {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
@@ -2795,7 +3184,7 @@ final class MetalTerminalView: MTKView {
             || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
 
         scrollOffsetLock.lock()
-        let maxOffsetPx = rowHeightPx * CGFloat(MetalTerminalRenderer.maxRetainedScrollRows)
+        let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
             // A gesture-owned grid is already square: its rows were cancelled
             // against the distance the notification reported, which exists for
@@ -3164,7 +3553,20 @@ final class MetalTerminalView: MTKView {
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
         let safeCellHeightPx = max(0, cellHeightPx)
-        let maxOffsetPx = safeCellHeightPx * Self.scrollMaxOverscrollCells
+        // One wheel event hands the gesture a whole event's worth of
+        // compensation to consume. Clamping below that would discard the part
+        // it cannot show, and the picture would jump by exactly that much when
+        // the rows land — so the ceiling has to be at least 'mousescroll' ver
+        // rows, with the overscroll allowance as the floor.
+        //
+        // Bounded by what the retention can cover: displacing further than
+        // that leaves part of the band with no retained row, and the edge
+        // stretch then paints over the rows that ARE retained. A 'mousescroll'
+        // past the depth loses the excess to a jump either way; taking it here
+        // at least keeps the band consistent.
+        let ver = min(core?.getMouseScrollVer() ?? 0, ScrollRetention.maxDepthRows)
+        let cells = max(Self.scrollMaxOverscrollCells, CGFloat(ver))
+        let maxOffsetPx = safeCellHeightPx * cells
         guard maxOffsetPx > 0 else { return 0 }
         return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
     }

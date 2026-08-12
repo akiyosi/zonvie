@@ -1472,7 +1472,9 @@ pub fn handleRedraw(
                     if (t[0] != .int) continue;
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
-                    // t[1] is win (window handle), not used here
+                    // t[1] is the window handle. Kept so window-local options
+                    // can be addressed from a grid id.
+                    const win = if (t[1] == .int) t[1].int else 0;
                     const topline = if (t[2] == .int) t[2].int else 0;
                     const botline = if (t[3] == .int) t[3].int else 0;
                     const curline = if (t[4] == .int) t[4].int else 0;
@@ -1481,7 +1483,7 @@ pub fn handleRedraw(
                     const scroll_delta = if (t[7] == .int) t[7].int else 0;
 
                     log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
-                    try grid.setViewport(grid_id, topline, botline, curline, curcol, line_count, scroll_delta);
+                    try grid.setViewport(grid_id, win, topline, botline, curline, curcol, line_count, scroll_delta);
                 }
             },
             .win_viewport_margins => {
@@ -1763,6 +1765,7 @@ pub fn handleRedraw(
 
                     // Apply scroll to the target grid under ext_multigrid.
                     grid.scrollGrid(grid_id, top, bot, left, right, rows, cols);
+                    grid.creditScrollCoverage(grid_id, rows);
                 }
             },
             .hl_attr_define => {

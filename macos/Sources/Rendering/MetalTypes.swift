@@ -112,6 +112,413 @@ final class SurfaceRedrawScheduler {
     }
 }
 
+/// A row that scrolled off a surface's edge, kept alive across the smooth
+/// scroll so the vacated band shows the row that left.
+///
+/// A row that scrolls off is gone from the buffer sets by draw time: the slot
+/// remap rotates it into the vacated band and Neovim writes the incoming row
+/// into that same slot during the same flush. Holding the picture back by the
+/// scrolled distance therefore needs a copy taken before the slot is reused.
+struct RetainedScrollRow {
+    var buffer: MTLBuffer
+    var count: Int
+    var gridId: Int64
+    /// Row the stored vertices were *built* for. The scroll fast path leaves
+    /// vertices at their original row and compensates at draw time through
+    /// rowSlotSourceRows, so after a few steps this is nowhere near the row
+    /// the copy was taken from.
+    var sourceRow: Int
+    /// Row the copy must be displayed at, which walks off the edge of the grid
+    /// (so it goes negative, or past the last row) as scrolling continues.
+    var targetRow: Int
+    /// Cell height the vertices were built for. A font or linespace change
+    /// mid-ease invalidates their geometry.
+    var cellHeightPx: Float
+}
+
+/// Retention of rows scrolled off a surface's edge, so the band a smooth
+/// scroll opens shows the rows that left instead of the edge row's background
+/// stretched across it (`pin_edges` in Shaders.metal).
+///
+/// Shared by the main surface and every external grid window: both keep row
+/// buffers under the same slot / source-row contract, both capture inside a
+/// flush bracket before the slots rotate, and both publish on commit so a draw
+/// can never see a retained row ahead of the vertices it belongs to. Only the
+/// copying differs, so that part stays with each surface.
+///
+/// Self-synchronising. Callers may hold their own lock across a call — this
+/// class never calls back into them — but must then always take the two in
+/// that order.
+final class ScrollRetention {
+    /// The keyboard ease is clamped to two rows, so two retained rows always
+    /// cover its band. A trackpad gesture raises the depth to a wheel event's
+    /// worth of rows ('mousescroll' ver), which is how wide its band gets.
+    static let minDepthRows = 2
+    /// A wheel event worth more rows than this leaves part of its band to the
+    /// edge stretch.
+    static let maxDepthRows = 4
+    /// Round-robin over more buffers than can be live at once, so a capture
+    /// never overwrites vertices a frame is still reading. Retained buffers
+    /// are bound straight to the encoder and are not tracked by any in-flight
+    /// counter, so ring size is the only thing keeping them alive.
+    ///
+    /// Live at once, each set at most `maxRetainedGrids * maxDepthRows` rows:
+    /// one snapshot per in-flight frame, the published set, and the set being
+    /// staged. External surfaces allow TWO frames in flight (the main renderer
+    /// allows one), so the worst case is four sets. `ringSize` below carries
+    /// one more on top; a set replaced within a frame is released at once and
+    /// pins nothing, but `ringNext` advances past its slots regardless.
+    /// Pinned by ScrollRetentionTests' "ringSize must exceed the buffers that
+    /// can be live at once".
+    static let maxInFlightFrames = 2
+    /// Windows that can hold a band at the same time. 'scrollbind' moves two
+    /// (:vert diffsplit), and each keeps its own rows, so the ring drains that
+    /// many times faster. Enforced in `beginStep`, not merely assumed: the ring
+    /// is the only thing keeping a retained buffer alive, so an unbounded grid
+    /// count would wrap it onto rows a frame is still reading.
+    ///
+    /// Set to Neovim's own ceiling on a diff group (E96: at most eight buffers
+    /// may have 'diff' set), so no diff can outgrow it. What is reachable in
+    /// practice is smaller — `git mergetool --tool=vimdiff` and diffview.nvim's
+    /// diff4_mixed both top out at four windows, and `nvim -d` takes at most
+    /// four files — but the cap evicts deterministically once it is exceeded,
+    /// and the extra slots cost only residency.
+    static let maxRetainedGrids = 8
+    /// One set per in-flight frame, plus the published set and the one being
+    /// staged, times the grids that can each hold their own. Deliberately
+    /// without the "several flushes per frame" factor the earlier sizing
+    /// carried: a published set replaced within a frame is released
+    /// immediately, so it pins nothing and buying headroom for it only doubles
+    /// a residency that is never reclaimed. `takeBuffer` walks every slot in
+    /// turn, so the whole ring becomes resident after a few seconds of
+    /// scrolling in ONE window — the count is a memory figure, not a lazy cap.
+    /// One set spare on top of the live ones, because `ringNext` advances on
+    /// every take regardless of whether the set it filled was ever drawn: a
+    /// bracket landing while a frame is in flight pushes the cursor further
+    /// without releasing that frame's snapshot. Sized exactly to the live
+    /// count would wrap onto a slot still being read.
+    static let ringSize = (maxInFlightFrames + 3) * maxDepthRows * maxRetainedGrids
+
+    struct Plan {
+        let first: Int
+        let count: Int
+        /// Where the row that sits AGAINST the content edge ends up — the
+        /// anchor the prune measures distance from.
+        let pivotTargetRow: Int
+    }
+
+    private let device: MTLDevice
+    private let lock = NSLock()
+    private var ring: [MTLBuffer?] = []
+    private var ringCaps: [Int] = []
+    private var ringNext = 0
+    /// Captured during a flush, published to `published` by `commit()`.
+    private var staged: [RetainedScrollRow] = []
+    private var stagedValid = false
+    private var published: [RetainedScrollRow] = []
+    /// Grids that have opened a step, least recent first. Bounds how many can
+    /// hold rows at once — see `maxRetainedGrids`.
+    private var stepOrder: [Int64] = []
+    /// Grids the cap dropped rows for, since the caller last took them.
+    private var evictedGrids: [Int64] = []
+    private var depth = ScrollRetention.minDepthRows
+
+    init(device: MTLDevice) {
+        self.device = device
+    }
+
+    // MARK: - Depth
+
+    var depthRows: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return depth
+    }
+
+    /// Raise the retention to cover a band this many rows wide, clamped to
+    /// [`minDepthRows`, `maxDepthRows`].
+    func setDepthRows(_ rows: Int) {
+        let clamped = min(max(rows, Self.minDepthRows), Self.maxDepthRows)
+        lock.lock()
+        depth = clamped
+        lock.unlock()
+    }
+
+    // MARK: - Flush lifecycle
+
+    /// Discard anything staged by a bracket that aborted instead of
+    /// committing; publication only ever happens from a bracket's own commit.
+    func beginFlush() {
+        lock.lock()
+        stagedValid = false
+        staged.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    /// Publish this bracket's retention together with the vertices it belongs
+    /// to. A retained row shown against pre-scroll content would draw the same
+    /// line twice. Returns whether this bracket had staged anything, so the
+    /// caller can publish its own per-step state on the same condition.
+    @discardableResult
+    func commit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard stagedValid else { return false }
+        stagedValid = false
+        published.removeAll(keepingCapacity: true)
+        published.append(contentsOf: staged)
+        staged.removeAll(keepingCapacity: true)
+        return true
+    }
+
+    func snapshotPublished() -> [RetainedScrollRow] {
+        lock.lock()
+        defer { lock.unlock() }
+        return published
+    }
+
+    /// Drop published rows the caller can no longer place — typically a grid
+    /// that is no longer displaced, whose retained row would be drawn one row
+    /// off real content.
+    func prunePublished(where shouldDrop: (RetainedScrollRow) -> Bool) {
+        lock.lock()
+        published.removeAll(where: shouldDrop)
+        lock.unlock()
+    }
+
+    func publishedCount(gridId: Int64) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return published.reduce(0) { $0 + ($1.gridId == gridId ? 1 : 0) }
+    }
+
+    /// Drop everything on screen: a retained row is only meaningful while its
+    /// grid is displaced, and with no offset it would draw a row outside real
+    /// content.
+    ///
+    /// Deliberately leaves the STAGED set alone. This is called from the draw
+    /// side while the core thread may be mid-bracket, and discarding its
+    /// staged rows would make `commit()` report that nothing was staged —
+    /// dropping the step, and with it the caller's own per-step state (the
+    /// main surface's ease seed), so the picture snaps instead of easing.
+    /// An open bracket's rows are the bracket's to publish or abandon.
+    func clearPublished() {
+        lock.lock()
+        published.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    // MARK: - Planning
+
+    /// Which rows a step of `rowsDelta` takes out of [rowStart, rowEnd), cut
+    /// down to the `depth` the retention can hold.
+    ///
+    /// Rows leaving through the top are the first `moved` of the region, and
+    /// the band shows the LAST of them; leaving through the bottom they are
+    /// the last `moved`, and the band shows the FIRST. A retained row at
+    /// `targetRow = t` draws at screen row `t + o` for an offset of `o` rows,
+    /// so at the top it is inside the band while `rowStart - o <= t <
+    /// rowStart` — the row that survives longest as the finger consumes the
+    /// offset is the one with the LARGEST target, `first + count - 1`. At the
+    /// bottom the inequality flips and it is `first`.
+    ///
+    /// nil when the step replaces the whole region: every row the band could
+    /// show is gone, so there is nothing worth easing.
+    static func plan(rowStart: Int, rowEnd: Int, rowsDelta: Int, depth: Int) -> Plan? {
+        let moved = abs(rowsDelta)
+        guard moved > 0, moved < rowEnd - rowStart else { return nil }
+        let count = min(moved, depth)
+        guard count > 0 else { return nil }
+        let first = rowsDelta > 0 ? rowStart + moved - count : rowEnd - moved
+        let edgeAdjacent = rowsDelta > 0 ? first + count - 1 : first
+        return Plan(first: first, count: count, pivotTargetRow: edgeAdjacent - rowsDelta)
+    }
+
+    /// The i-th row of a plan, ordered far-edge first: `stage` drops from the
+    /// front, so the last row appended — the one against the content edge,
+    /// which the band needs longest — is the last to be shed.
+    static func planRow(_ plan: Plan, _ i: Int, rowsDelta: Int) -> Int {
+        rowsDelta > 0 ? plan.first + i : plan.first + plan.count - 1 - i
+    }
+
+    /// Whether this many retained rows cover the whole band an offset opens.
+    ///
+    /// A grid whose band is covered must not also stretch its edge row's
+    /// background across it: the stretch wins over the retained rows' own
+    /// backgrounds, so the band would render one row's glyphs on its
+    /// neighbour's background colour. Only when they cover the WHOLE band,
+    /// though — a step whose row could not be retained (a row shared with an
+    /// overlapping float, a jump past the depth) still moves the offset, and
+    /// with the stretch also gone the uncovered part would show through as a
+    /// gap, which is what the stretch is for.
+    static func coversBand(retainedRows: Int, offsetNDC: Float, cellHeightNDC: Float) -> Bool {
+        guard cellHeightNDC > 0 else { return false }
+        let bandRows = Int(ceil(abs(offsetNDC) / cellHeightNDC - 0.001))
+        return retainedRows >= bandRows
+    }
+
+    // MARK: - Credit arithmetic
+
+    /// What a grid's sub-cell scroll offset becomes when Neovim reports that
+    /// its content moved `rowsDelta` rows. `nil` means the offset settled on
+    /// the cell grid and its entry should be dropped.
+    ///
+    /// Pure so it can be tested: the view owns the bookkeeping around it, but
+    /// the rule itself is the part that has been got wrong repeatedly.
+    ///
+    /// - `heldPx` is the compensation currently being held, already including
+    ///   any seed handed over when a bound window is first recognised.
+    /// - `bookedRows` is what the gesture asked for and has not yet been
+    ///   credited. Zero for a window the gesture merely drags along
+    ///   ('scrollbind'), which is why `bound` is passed separately: the driving
+    ///   window also runs its booking down to zero mid-gesture.
+    static func creditedOffsetPx(
+        heldPx: CGFloat,
+        bookedRows: Int,
+        rowsDelta: Int,
+        rowHeightPx: CGFloat,
+        stepRows: Int,
+        bound: Bool,
+        epsilonPx: CGFloat
+    ) -> CGFloat? {
+        let consumed = min(bookedRows, abs(rowsDelta))
+        let creditedRows = bookedRows > 0 ? (rowsDelta < 0 ? -consumed : consumed) : rowsDelta
+        var offset = heldPx + CGFloat(creditedRows) * rowHeightPx
+        let stepPx = rowHeightPx * CGFloat(max(1, stepRows))
+        if !bound {
+            // Handing back what is held may overshoot zero by one step — the
+            // allowance the lookahead runs on. A credit pushing AWAY from zero
+            // is not handing anything back, so it may not deepen an offset that
+            // already holds something.
+            let deepens = heldPx == 0 || (offset < 0) == (heldPx < 0)
+            let cap = deepens ? (heldPx == 0 ? stepPx : abs(heldPx)) : stepPx
+            if abs(offset) > cap { offset = offset < 0 ? -cap : cap }
+        } else if abs(offset) > stepPx {
+            // A bound window books nothing, so its report is the only account
+            // of how far it moved and must be allowed to deepen — bounded by
+            // what the finger can consume before the next report lands.
+            offset = offset < 0 ? -stepPx : stepPx
+        }
+        return abs(offset) < epsilonPx ? nil : offset
+    }
+
+    // MARK: - Capture
+
+    /// Open a retention step: this grid's rows kept by earlier steps move
+    /// `rowsDelta` further out of view, and the ones the ease can no longer
+    /// show are dropped — rows past the clamp, and rows on the opposite edge
+    /// after a direction reversal. Other grids are left alone; they lose their
+    /// rows only to the `maxRetainedGrids` cap below. A step stages one or more
+    /// rows, which is why this is separate from `stage`: rows of the same step
+    /// must not displace each other.
+    func beginStep(gridId: Int64, rowsDelta: Int, pivotTargetRow: Int) {
+        lock.lock()
+        // Seed from what is on screen before advancing it. Seeding after the
+        // shift would reinstate the published rows at their old targetRow and
+        // draw them a step behind the content.
+        if !stagedValid {
+            stagedValid = true
+            staged.removeAll(keepingCapacity: true)
+            staged.append(contentsOf: published)
+            // Eviction takes a grid out of `staged` and out of the order, but
+            // its rows leave `published` only at a commit — so a bracket that
+            // aborts hands them back here for a grid the order no longer names,
+            // and nothing would ever evict it again. Re-admit whatever the seed
+            // brought, least-recent first (it is not being stepped now), and
+            // drop names that hold nothing so a live grid is never the victim
+            // in a ghost's place. In place on a list of at most a few entries.
+            stepOrder.removeAll { name in !staged.contains { $0.gridId == name } }
+            for row in staged where !stepOrder.contains(row.gridId) {
+                stepOrder.insert(row.gridId, at: 0)
+            }
+        }
+        // Hold the ring's sizing assumption. Rows are capped per grid but the
+        // number of grids was not, and a `windo`/'scrollbind' group larger than
+        // `maxRetainedGrids` would wrap the ring onto buffers a frame is still
+        // reading. The grid opening a step is the one being scrolled now, so
+        // the rows shed here are the least recent.
+        stepOrder.removeAll { $0 == gridId }
+        stepOrder.append(gridId)
+        while stepOrder.count > Self.maxRetainedGrids {
+            let dropped = stepOrder.removeFirst()
+            staged.removeAll { $0.gridId == dropped }
+            // Reported so the caller can forget it staged anything for this
+            // grid: the row-scroll fast path stands down for a grid the
+            // notification path already retained, and standing down for one
+            // whose rows were just thrown away leaves its band empty AND
+            // unretained.
+            if !evictedGrids.contains(dropped) { evictedGrids.append(dropped) }
+        }
+        // Grid-scoped: a step describes one grid's movement, and 'scrollbind'
+        // (:vert diffsplit) scrolls two windows from one gesture, each needing
+        // its own band filled. Shifting or pruning another grid's rows here
+        // would move them by a distance their content never travelled, and
+        // dropping them would leave that window's band to the edge stretch.
+        for i in staged.indices where staged[i].gridId == gridId {
+            staged[i].targetRow -= rowsDelta
+        }
+        staged.removeAll {
+            $0.gridId == gridId
+                && (abs($0.targetRow - pivotTargetRow) >= depth
+                    || ($0.targetRow - pivotTargetRow) * rowsDelta > 0)
+        }
+        lock.unlock()
+    }
+
+    /// Take the grids the cap has dropped rows for, clearing the record.
+    /// Appends rather than replacing, so a caller can accumulate across steps.
+    func takeEvictedGrids(into out: inout [Int64]) {
+        lock.lock()
+        defer { lock.unlock() }
+        out.append(contentsOf: evictedGrids)
+        evictedGrids.removeAll(keepingCapacity: true)
+    }
+
+    /// Grab the next ring slot with at least `needed` bytes.
+    func takeBuffer(needed: Int) -> MTLBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        if ring.count != Self.ringSize {
+            ring = Array(repeating: nil, count: Self.ringSize)
+            ringCaps = Array(repeating: 0, count: Self.ringSize)
+            ringNext = 0
+        }
+        let idx = ringNext
+        ringNext = (idx + 1) % Self.ringSize
+        if ring[idx] == nil || ringCaps[idx] < needed {
+            // Rounded up to the next power of two so scrolling into
+            // progressively wider rows converges after a few steps instead of
+            // re-allocating on every widening — this runs inside the flush
+            // bracket.
+            var alloc = 4096
+            while alloc < needed { alloc <<= 1 }
+            let buf = device.makeBuffer(length: alloc, options: .storageModeShared)
+            ring[idx] = buf
+            ringCaps[idx] = buf == nil ? 0 : alloc
+        }
+        return ring[idx]
+    }
+
+    /// Append one row staged by the open step, clamping the set to the ease's
+    /// reach. A step appends far-edge first (see `planRow`), so the
+    /// drop-from-the-front clamp sheds what earlier steps left behind, then
+    /// the rows furthest from the edge — the ones the band loses first as the
+    /// finger consumes the offset.
+    func stage(_ row: RetainedScrollRow) {
+        lock.lock()
+        staged.append(row)
+        // Counted per grid: the depth is how far one band reaches, and two
+        // windows scrolling together each get their own.
+        var held = 0
+        for candidate in staged where candidate.gridId == row.gridId { held += 1 }
+        while held > depth, let oldest = staged.firstIndex(where: { $0.gridId == row.gridId }) {
+            staged.remove(at: oldest)
+            held -= 1
+        }
+        lock.unlock()
+    }
+}
+
 struct SurfaceViewportMetrics {
     let viewportWidth: Double
     let viewportHeight: Double

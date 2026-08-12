@@ -749,29 +749,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // frame instead of silently omitting an occluder.
     static let maxFixedFloatRects = 16
 
-    // --- Sub-row smooth scrolling (keyboard-driven) ---
-    // A row that scrolls off the edge is gone from the buffer sets by draw
-    // time: remapSurfaceRowSlots rotates its slot into the vacated band and
-    // Neovim writes the incoming row into that same slot during the same
-    // flush. Easing the picture back by the scrolled distance therefore needs
-    // a copy of the outgoing row taken before the slot is reused.
-    struct RetainedScrollRow {
-        var buffer: MTLBuffer
-        var count: Int
-        var gridId: Int64
-        /// Row the stored vertices were *built* for. The scroll fast path
-        /// leaves vertices at their original row and compensates at draw time
-        /// through rowSlotSourceRows, so after a few steps this is nowhere
-        /// near the row the copy was taken from.
-        var sourceRow: Int
-        /// Row the copy must be displayed at, which walks off the edge of the
-        /// grid (so it goes negative, or past the last row) as scrolling
-        /// continues.
-        var targetRow: Int
-        /// Cell height the vertices were built for. A font or linespace change
-        /// mid-ease invalidates their geometry.
-        var cellHeightPx: Float
-    }
     /// On by default, with `ZONVIE_SMOOTH_SCROLL=0` as the way back out without
     /// a rebuild. Two earlier attempts at hiding the row quantisation measured
     /// well and looked wrong, so the escape hatch stays.
@@ -786,24 +763,49 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// vertical splits, and with a float on screen.
     static let smoothScrollEnabled: Bool =
         ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL"] != "0"
-    /// One entry per row the offset can lag behind by. The ease is clamped to
-    /// two rows, so two retained rows always cover the vacated band.
-    static let maxRetainedScrollRows = 2
-    /// Round-robin over far more buffers than the GPU can have frames in
-    /// flight, so a capture never overwrites vertices a live frame is still
-    /// reading — several flushes can land within one frame. Buffers are
-    /// allocated on first use and grown only when a wider row appears.
-    private static let retainedScrollRingSize = 12
-    private var retainedScrollRing: [MTLBuffer?] = []
-    private var retainedScrollRingCaps: [Int] = []
-    private var retainedScrollRingNext: Int = 0
-    /// Captured during flush, published to `retainedScrollRows` by commitFlush
-    /// so a draw can never see a retained row ahead of the scrolled vertices.
-    private var stagedRetainedScrollRows: [RetainedScrollRow] = []
-    private var stagedRetainedScrollValid = false
+    /// Rows kept alive across a smooth-scroll step, shared with every external
+    /// grid window through `ScrollRetention` (see MetalTypes.swift).
+    private var retention: ScrollRetention!
     private var stagedSmoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
-    private var retainedScrollRows: [RetainedScrollRow] = []
     private var smoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
+    /// Capture spans for captureRetainedRowForGridScroll, armed on the main
+    /// thread as each gesture scroll is sent and read on the core thread when
+    /// the resulting grid_scroll arrives. Armed at send time, not at draw
+    /// time: Neovim's response can land within a millisecond, before any
+    /// frame is drawn, which left every gesture's first row uncaptured.
+    private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
+    /// Grids this bracket has already retained rows for, so the row-scroll fast
+    /// path does not stage the same movement a second time. Reset in
+    /// beginFlush. Written and read only inside the flush bracket, which is
+    /// wholly on the core thread, so it carries no lock of its own.
+    private var bracketStagedGrids: Set<Int64> = []
+    /// Scratch for draining ScrollRetention's eviction record; reused so the
+    /// drain allocates nothing.
+    private var evictedGridsScratch: [Int64] = []
+
+    /// A grid whose rows the retention's cap dropped no longer counts as
+    /// staged, so the row-scroll fast path may cover it after all.
+    private func forgetEvictedStagedGrids() {
+        evictedGridsScratch.removeAll(keepingCapacity: true)
+        retention.takeEvictedGrids(into: &evictedGridsScratch)
+        for grid in evictedGridsScratch { bracketStagedGrids.remove(grid) }
+    }
+
+    /// grid_scroll steps captured by a bracket that has not committed yet.
+    /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
+    /// instead. Guarded by `lock`.
+    private var pendingRetentionReplay: [(gridId: Int64, rowsDelta: Int)] = []
+    /// A run of aborting brackets must not accumulate steps without bound.
+    /// Bounded by the retention depth, not a multiple of it: one beginFlush
+    /// replays every pending step, each taking up to `depthRows` ring buffers,
+    /// and the ring holds `ringSize` of them with no in-flight counter to stop
+    /// a wrap from re-handing a buffer a frame is still reading.
+    /// `maxDepthRows` steps x `maxDepthRows` rows stays well inside `ringSize`.
+    private static let maxPendingRetentionReplay = ScrollRetention.maxDepthRows
+
+    /// Per-grid distance the source set is behind the steps staged so far in
+    /// this bracket. Reset every beginFlush. Guarded by `lock`.
+    private var bracketSourceShift: [Int64: Int] = [:]
 
     // ScrollOffset struct matching Shaders.metal
     struct ScrollOffset {
@@ -1015,11 +1017,40 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var customShaderPong: [MTLTexture?] = [nil, nil]
     private var customShaderPongSize: CGSize = .zero
     // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
+    //
+    // Held in SCREEN space — the smooth-scroll displacement already folded in
+    // — because that is what a cursor shader draws against and what "the
+    // cursor moved" has to mean. The rect the core measures is in vertex
+    // space, which shifts by a whole row on every scroll step while the
+    // displacement cancels it and the cursor stays put on the glass. Rotating
+    // on that would restart the trail every step, so it never plays out.
     private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorChangeTime: Float = 0
+    /// The rect as the core measured it, and the grid it belongs to. Turned
+    /// into the screen-space state above by `evaluateCursorShaderChange`, once
+    /// the frame's displacement for that grid is known. Written under `lock`.
+    private var shaderCursorRawRect: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorRawColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var shaderCursorGridId: Int64 = 0
+    /// Displacement of the cursor's grid as of the last offset rebuild. Cached
+    /// because `updateScrollOffsets` is skipped entirely on idle frames, while
+    /// the cursor still moves — the evaluation has to run every frame or the
+    /// shader keeps whatever endpoints the last scrolled frame left it.
+    private var shaderCursorScrollOffsetPx: Float = 0
+    /// Sub-pixel movement is not a cursor move; it is the ease sliding the
+    /// cursor along. Rotating on it would restart the trail every frame.
+    private static let shaderCursorMoveEpsilonPx: Float = 0.5
+    /// Cursor state measured during a flush, held until that flush commits.
+    ///
+    /// The rect describes the cursor vertices of the flush that measured it,
+    /// and those only reach the screen at commit. Publishing at submit put the
+    /// NEXT flush's cursor position into the uniforms while the screen still
+    /// showed the previous one — a row apart mid-scroll, which is a cursor
+    /// shader firing off the cursor for that frame.
+    private var stagedShaderCursor: (rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64)?
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -1099,6 +1130,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return nil
         }
         self.device = dev
+        self.retention = ScrollRetention(device: dev)
         guard let q = dev.makeCommandQueue() else {
             ZonvieCore.appLog("[Renderer] init failed: Failed to create command queue")
             return nil
@@ -1421,12 +1453,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // committing; publication only ever happens from this bracket's own
         // commitFlush.
         if Self.smoothScrollEnabled {
+            retention.beginFlush()
             lock.lock()
-            stagedRetainedScrollValid = false
-            stagedRetainedScrollRows.removeAll(keepingCapacity: true)
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
             lock.unlock()
         }
+        // Same reason: a cursor measured by a bracket that never committed
+        // describes vertices that never reached the screen.
+        lock.lock()
+        stagedShaderCursor = nil
+        lock.unlock()
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         let perfEnabled = ZonvieCore.appLogEnabled
@@ -1450,7 +1486,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushDirtyRows.removeAll()
         flushDirtyRectPx = nil
         flushSourceSetIndex = committedSetIndex
+        bracketSourceShift.removeAll(keepingCapacity: true)
+        bracketStagedGrids.removeAll(keepingCapacity: true)
+        let retentionReplay = Self.smoothScrollEnabled ? pendingRetentionReplay : []
         lock.unlock()
+
+        // Re-stage the steps of any bracket that aborted after the core had
+        // already handed over its grid_scroll. The source set is the same one
+        // those captures read, because an aborted bracket does not commit.
+        for step in retentionReplay {
+            captureRetainedRowForGridScroll(
+                gridId: step.gridId,
+                rowsDelta: step.rowsDelta,
+                replaying: true
+            )
+        }
 
         // Prepare atlas back texture.
         // Phase 1: handle non-GPU cases (rebuild, CPU sync, no-op).
@@ -1742,14 +1792,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Publish this bracket's smooth-scroll retention together with the
         // vertices it belongs to: a retained row shown against pre-scroll
         // content would draw the same line twice.
-        if stagedRetainedScrollValid {
-            stagedRetainedScrollValid = false
-            retainedScrollRows.removeAll(keepingCapacity: true)
-            retainedScrollRows.append(contentsOf: stagedRetainedScrollRows)
-            stagedRetainedScrollRows.removeAll(keepingCapacity: true)
+        if retention.commit() {
             smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
         }
+        // These steps reached the screen, so there is nothing left to replay.
+        pendingRetentionReplay.removeAll(keepingCapacity: true)
+        publishCursorShaderStateLocked()
         commitRevision &+= 1
         let rev = commitRevision
         serviceSurfaceRowStorageRetirement(
@@ -2071,7 +2120,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let c0 = verts[0].color
         setCursorShaderState(
             rect: (xPx, botPx, rightPx - xPx, botPx - topPx),
-            color: (c0.x, c0.y, c0.z, c0.w)
+            color: (c0.x, c0.y, c0.z, c0.w),
+            gridId: verts[0].grid_id
         )
     }
 
@@ -2127,8 +2177,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // the same reasoning), not unconditionally on every scrolled frame.
         scrollOffsetData.removeAll(keepingCapacity: true)
         scrollOffsetData.reserveCapacity(offsets.count)
+        // Taken in pixels straight from the input side rather than recovered
+        // from the NDC below: the NDC is built against a cell-snapped height
+        // that need not match the back buffer the cursor rect was measured in.
+        // Any entry for the cursor's grid displaces it: cursor vertices always
+        // carry DECO_SCROLLABLE (flush.zig), and a bodily-moved float
+        // (move_all) translates every vertex it owns.
+        var cursorScrollOffsetPx: Float = 0
         for info in offsets {
             let ndc = -info.offsetYPx * scale
+            if info.gridId == shaderCursorGridId {
+                cursorScrollOffsetPx = info.offsetYPx
+            }
 
             // Calculate content bounds in NDC
             // Grid top is info.gridTopYNDC
@@ -2159,34 +2219,59 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // A retained row is only meaningful while its grid is displaced: with
         // no offset it would be drawn one row above real content.
-        if !retainedScrollRows.isEmpty {
-            retainedScrollRows.removeAll { retained in
-                !scrollOffsetData.contains { Int64($0.grid_id) == retained.gridId }
-            }
-            // A grid whose vacated band is covered by retained rows must not also
-            // stretch its edge row's background across that band: the stretch
-            // wins over the retained rows' own backgrounds, so the band renders
-            // one row's glyphs on its neighbour's background colour.
-            //
-            // Only when they cover the WHOLE band, though. A step whose row could
-            // not be retained (a row shared with an overlapping float, or a
-            // multi-row jump) still moves the offset, so the retained rows can
-            // fall short of it — and with the stretch also gone the uncovered
-            // part would show through as a gap, which is what the stretch is for.
-            for i in scrollOffsetData.indices {
-                let gid = Int64(scrollOffsetData[i].grid_id)
-                let retained = retainedScrollRows.reduce(0) { $0 + ($1.gridId == gid ? 1 : 0) }
-                guard retained > 0, cellHeightNDC > 0 else { continue }
-                let bandRows = Int(ceil(abs(scrollOffsetData[i].offset_y) / cellHeightNDC - 0.001))
-                if retained >= bandRows {
-                    scrollOffsetData[i].pin_edges = 0
-                }
+        let offsets = scrollOffsetData
+        retention.prunePublished { retained in
+            !offsets.contains { Int64($0.grid_id) == retained.gridId }
+        }
+        for i in scrollOffsetData.indices {
+            let gid = Int64(scrollOffsetData[i].grid_id)
+            let retained = retention.publishedCount(gridId: gid)
+            guard retained > 0, cellHeightNDC > 0 else { continue }
+            if ScrollRetention.coversBand(
+                retainedRows: retained,
+                offsetNDC: scrollOffsetData[i].offset_y,
+                cellHeightNDC: cellHeightNDC
+            ) {
+                scrollOffsetData[i].pin_edges = 0
             }
         }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
         // This eliminates the GPU/CPU race on shared MTLBuffers.
         hasActiveScrollOffset = count > 0
+        // This surface owns the cursor's grid whenever it appears in its own
+        // offsets, and a grid with no entry is simply not displaced.
+        shaderCursorScrollOffsetPx = cursorScrollOffsetPx
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: cursorScrollOffsetPx)
+    }
+
+    /// Fold the cursor's current displacement into the shader endpoints for a
+    /// frame that did not rebuild the scroll offsets.
+    ///
+    /// `updateScrollOffsets` is the only place that knows a grid's
+    /// displacement, and the view skips it entirely once nothing is scrolling
+    /// — but the cursor still moves. Without this the shader endpoints stay at
+    /// whatever the last scrolled frame left, which from a cold start is a
+    /// zero rect at the drawable origin: a cursor shader draws nothing at all
+    /// until the first scroll (verified with the harness in tmp/cursorprobe).
+    /// The cached offset is correct on those frames because the last rebuild
+    /// before going idle ran with an empty offset set.
+    func refreshCursorShaderState() {
+        lock.lock()
+        defer { lock.unlock() }
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: shaderCursorScrollOffsetPx)
+    }
+
+    /// Arm (or, with a nil span, disarm) the retention capture for a grid.
+    /// See gridScrollCaptureBounds.
+    func setGridScrollCaptureBounds(gridId: Int64, bounds: (top: Int, bottomEx: Int)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let bounds, bounds.bottomEx > bounds.top {
+            gridScrollCaptureBounds[gridId] = bounds
+        } else {
+            gridScrollCaptureBounds.removeValue(forKey: gridId)
+        }
     }
 
     /// Clear scroll offsets (reset to no offset)
@@ -2194,11 +2279,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
+        // Unreachable: its one caller, MetalTerminalView.clearAllScrollOffsets,
+        // has no callers of its own. See that function's note before relying on
+        // any of this running.
         scrollOffsetData = []
         hasActiveScrollOffset = false
-        // Retained rows were built for the layout that is being abandoned
-        // (resize, font change, grid teardown all clear the offsets).
-        retainedScrollRows.removeAll(keepingCapacity: true)
+        // The spans describe the layout this reset abandons.
+        gridScrollCaptureBounds.removeAll(keepingCapacity: true)
+        // A parked step describes the same abandoned layout, and would be
+        // replayed against post-reset bounds and a post-reset source set.
+        pendingRetentionReplay.removeAll(keepingCapacity: true)
+        bracketSourceShift.removeAll(keepingCapacity: true)
+        // Retained rows were built for the layout being abandoned.
+        retention.clearPublished()
     }
 
     /// Compute ScrollOffset from ScrollOffsetInfo (shared logic for main window and external grids).
@@ -2452,7 +2545,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
             smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
-            retainedSnapshot = retainedScrollRows
+            retainedSnapshot = retention.snapshotPublished()
             fixedFloatBandsSnapshot = fixedFloatBandData  // Value-type copies (safe across frames)
             fixedFloatIntervalsSnapshot = fixedFloatIntervalData
             // Use accumulated scroll delta (covers multiple flushes between draws)
@@ -4363,6 +4456,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // setCursorShaderState() (core/RPC thread) writes these same fields
         // as one unit; reading them individually here could otherwise mix
         // a new rect with a stale color/timestamp for one frame.
+        // Already in screen space: evaluateCursorShaderChange folded each
+        // endpoint's displacement in when it accepted that endpoint.
         let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime): (
             (Float, Float, Float, Float), (Float, Float, Float, Float),
             (Float, Float, Float, Float), (Float, Float, Float, Float), Float
@@ -4414,26 +4509,97 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// window's drawable). color is straight RGBA in [0, 1]. No-op
     /// when incoming state matches the current state, so shaders keep
     /// seeing the last real change's iTimeCursorChange.
-    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float)) {
+    /// Whether the cursor rect the shader uniforms carry was measured on this
+    /// grid. The rect is shared between the main surface and every external
+    /// window — whoever submitted a cursor last owns it — so a surface must
+    /// not apply its own scroll displacement to a rect belonging to another
+    /// grid.
+    func shaderCursorBelongs(toGrid gridId: Int64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return shaderCursorGridId == gridId
+    }
+
+    /// Stage the cursor state a flush just measured. Published by
+    /// `publishCursorShaderState()` when that flush commits — see
+    /// `stagedShaderCursor` for why it cannot go straight out.
+    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64) {
         // Called from the vertex-submit path (core/RPC thread), while
-        // makeCustomShaderUniforms() reads these same fields from the main
+        // makeCustomShaderUniforms() reads the published fields from the main
         // thread during draw(in:). Guard with the existing `lock` (already
         // used for other cross-thread snapshots in this class) so a torn
         // rect/color combination is never observed mid-frame.
         lock.lock()
-        defer { lock.unlock() }
+        stagedShaderCursor = (rect: rect, color: color, gridId: gridId)
+        lock.unlock()
+    }
 
+    /// Hand the staged cursor state to the shader uniforms, together with the
+    /// vertices it describes. Called from every surface's commit; a flush that
+    /// aborts instead drops it in `beginFlush`.
+    func publishCursorShaderState() {
+        lock.lock()
+        defer { lock.unlock() }
+        publishCursorShaderStateLocked()
+    }
+
+    /// Caller must hold `lock` (commitFlush publishes inside its own scope).
+    private func publishCursorShaderStateLocked() {
+        guard let staged = stagedShaderCursor else { return }
+        stagedShaderCursor = nil
+        shaderCursorRawRect = staged.rect
+        shaderCursorRawColor = staged.color
+        shaderCursorGridId = staged.gridId
+    }
+
+    /// Fold this frame's displacement of the cursor's grid into the shader's
+    /// cursor endpoints, rotating them only when the cursor actually moved ON
+    /// SCREEN.
+    ///
+    /// Called from each surface's pre-draw, where the displacement it is about
+    /// to render with is known. The measured rect alone cannot answer "did the
+    /// cursor move": a scroll step shifts it a whole row while the
+    /// compensating offset holds the cursor still on the glass, and rotating
+    /// there restarts the trail every step so it never plays out — the effect
+    /// reads as weak and intermittent. Once the finger consumes the offset the
+    /// cursor really does slide, and that motion rotates it as it should.
+    ///
+    /// - Parameter scrollOffsetPx: displacement of the cursor's grid for this
+    ///   frame, or nil when the caller does not own that grid's cursor.
+    func evaluateCursorShaderChange(scrollOffsetPx: Float?) {
+        guard let scrollOffsetPx else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        evaluateCursorShaderChangeLocked(scrollOffsetPx: scrollOffsetPx)
+    }
+
+    /// Caller must hold `lock` (updateScrollOffsets evaluates inside its own
+    /// scope).
+    private func evaluateCursorShaderChangeLocked(scrollOffsetPx: Float) {
+        let rect = (
+            shaderCursorRawRect.0,
+            shaderCursorRawRect.1 + scrollOffsetPx,
+            shaderCursorRawRect.2,
+            shaderCursorRawRect.3
+        )
+        let color = shaderCursorRawColor
+        let eps = Self.shaderCursorMoveEpsilonPx
         let sameRect =
-            rect.0 == shaderCursorCurrent.0 &&
-            rect.1 == shaderCursorCurrent.1 &&
-            rect.2 == shaderCursorCurrent.2 &&
-            rect.3 == shaderCursorCurrent.3
+            abs(rect.0 - shaderCursorCurrent.0) < eps &&
+            abs(rect.1 - shaderCursorCurrent.1) < eps &&
+            abs(rect.2 - shaderCursorCurrent.2) < eps &&
+            abs(rect.3 - shaderCursorCurrent.3) < eps
         let sameColor =
             color.0 == shaderCursorCurrentColor.0 &&
             color.1 == shaderCursorCurrentColor.1 &&
             color.2 == shaderCursorCurrentColor.2 &&
             color.3 == shaderCursorCurrentColor.3
-        if sameRect && sameColor { return }
+        if sameRect && sameColor {
+            // Keep the endpoint exact even when the move was below the
+            // threshold, so a slow ease does not accumulate drift.
+            shaderCursorCurrent = rect
+            return
+        }
 
         shaderCursorPrevious = shaderCursorCurrent
         shaderCursorPreviousColor = shaderCursorCurrentColor
@@ -5109,94 +5275,272 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// time as the scrolled vertices.
     private func captureRetainedScrollRow(rowStart: Int, rowEnd: Int, rowsDelta: Int) {
         guard Self.smoothScrollEnabled else { return }
-        // Only the single-row steps a held key produces are eased. Larger
-        // jumps (page motion, a shift from a resize) fall back to the
-        // pre-existing behaviour: no retention, and the offset decays out.
-        guard abs(rowsDelta) == 1 else { return }
         let ws = bufferSets[writeSetIndex]
         guard ws.rowState.usingRowBuffers else { return }
-        let outgoingRow = rowsDelta > 0 ? rowStart : rowEnd - 1
-        guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { return }
-        let slot = ws.rowLogicalToSlot[outgoingRow]
-        guard slot >= 0, slot < ws.rowState.counts.count, slot < ws.rowState.buffers.count else { return }
-        let vc = ws.rowState.counts[slot]
-        guard vc > 0, let srcBuf = ws.rowState.buffers[slot] else { return }
-        // Where these vertices actually sit. The GPU scroll-copy path never
-        // rewrites vertex positions — it remaps slots and lets draw() fix the
-        // position through rowSlotSourceRows — so under a continuous scroll
-        // this drifts one row per step away from the logical row.
-        let sourceRow = slot < ws.rowSlotSourceRows.count ? ws.rowSlotSourceRows[slot] : outgoingRow
-        // Its place once this scroll is applied: just outside the region edge
-        // it left through.
-        let targetRow = outgoingRow - rowsDelta
+        let depth = retention.depthRows
+        // A step is one row for a held key, but 'mousescroll' rows for a
+        // trackpad gesture — a full-width window takes this path for both, and
+        // retaining only the first of them left the rest of the band to the
+        // edge stretch.
+        guard let plan = ScrollRetention.plan(
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta,
+            depth: depth
+        ) else { return }
 
-        // The composite carries every grid's vertices. A row that mixes grids
-        // (a float overlapping the scrolled window) cannot be translated as a
-        // unit — the shader would move the float's cells with the buffer.
-        let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
-        let gid = src[0].grid_id
-        for i in 1..<vc where src[i].grid_id != gid { return }
-
-        let needed = vc * MemoryLayout<Vertex>.stride
         // Read before locking: the accessor takes `lock` itself, which is not
         // recursive.
         let capturedCellHeightPx = cellHeightPx
+        var stepGridId: Int64?
+        var alreadyRetained = false
+        for i in 0..<plan.count {
+            let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+            guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { continue }
+            let slot = ws.rowLogicalToSlot[outgoingRow]
+            guard slot >= 0, slot < ws.rowState.counts.count, slot < ws.rowState.buffers.count else { continue }
+            let vc = ws.rowState.counts[slot]
+            guard vc > 0, let srcBuf = ws.rowState.buffers[slot] else { continue }
+            // Where these vertices actually sit. The GPU scroll-copy path never
+            // rewrites vertex positions — it remaps slots and lets draw() fix the
+            // position through rowSlotSourceRows — so under a continuous scroll
+            // this drifts one row per step away from the logical row.
+            let sourceRow = slot < ws.rowSlotSourceRows.count ? ws.rowSlotSourceRows[slot] : outgoingRow
+
+            // The composite carries every grid's vertices. A row that mixes
+            // grids (a float overlapping the scrolled window) cannot be
+            // translated as a unit — the shader would move the float's cells
+            // with the buffer — so leave that row to the edge stretch rather
+            // than abandoning the whole step.
+            let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
+            let gid = src[0].grid_id
+            var mixed = false
+            for j in 1..<vc where src[j].grid_id != gid {
+                mixed = true
+                break
+            }
+            if mixed { continue }
+            if let stepGridId, gid != stepGridId { continue }
+            if stepGridId == nil {
+                // The grid_scroll notification is dispatched earlier in this
+                // bracket and may already have retained this grid's movement,
+                // read from the source set before any of this flush's writes.
+                // Staging it again would open a second step and shift the
+                // seeded rows twice. Per grid, not per bracket: two windows can
+                // scroll in one flush, and a blanket check would leave the
+                // second one's band empty.
+                //
+                // Standing down means not staging — it must not mean leaving
+                // the function, because the ease seed below is this path's
+                // alone: the grid_scroll capture deliberately stages none. A
+                // `return` here cost a held key its sub-row ease on every step
+                // where the previous step's offset had not yet decayed, which
+                // reads as judder rather than a clean loss.
+                forgetEvictedStagedGrids()
+                alreadyRetained = bracketStagedGrids.contains(gid)
+                if !alreadyRetained {
+                    retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+                }
+                stepGridId = gid
+            }
+            if alreadyRetained { continue }
+
+            let needed = vc * MemoryLayout<Vertex>.stride
+            guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
+            memcpy(dstBuf.contents(), srcBuf.contents(), needed)
+
+            bracketStagedGrids.insert(gid)
+            retention.stage(RetainedScrollRow(
+                buffer: dstBuf,
+                count: vc,
+                gridId: gid,
+                // Its place once this scroll is applied: just outside the
+                // region edge it left through.
+                sourceRow: sourceRow,
+                targetRow: outgoingRow - rowsDelta,
+                cellHeightPx: capturedCellHeightPx
+            ))
+        }
+        // Seed the keyboard ease only for the single-row steps a held key
+        // produces. A larger jump — page motion, a shift from a resize — keeps
+        // the pre-existing behaviour of landing where it lands: seeding it
+        // would displace the picture by the whole jump and ease back only the
+        // few rows the clamp allows, animating a motion that never was
+        // animated. The multi-row RETENTION above still runs, because a
+        // trackpad step is routinely several rows; a gesture's seed is dropped
+        // by tickSmoothScroll anyway (the gesture reconciles its own offset),
+        // so this gate costs it nothing.
+        if let stepGridId, abs(rowsDelta) == 1 {
+            lock.lock()
+            stagedSmoothScrollSeeds.append((gridId: stepGridId, rowsDelta: rowsDelta))
+            lock.unlock()
+        }
+    }
+
+    /// Raise the retention to cover a band this many rows wide. Set from the
+    /// scroll input path, where a wheel event's row count is known.
+    func setRetentionDepthRows(_ rows: Int) {
+        retention.setDepthRows(rows)
+    }
+
+    /// How many rows of displacement the retention can currently cover. The
+    /// keyboard ease clamps its offset to this: lagging further than the band
+    /// can show would snap the picture when the clamp caught up.
+    var retentionDepthRows: Int { retention.depthRows }
+
+    /// Retain the outgoing row of a grid the row-scroll fast path cannot
+    /// cover. A non-full-width window (vertical split, float) always fails
+    /// checkScrollFastPath with partial_width, so applyMainRowScrollRaw — and
+    /// with it captureRetainedScrollRow — never runs for it: its outgoing row
+    /// is recomposed away within the flush, and the vacated band falls back
+    /// to the edge-row background stretch, which paints the neighbouring
+    /// row's highlight across the band. Full-width grids are armed too — the
+    /// fast path only sees rows that actually shifted, and a 'smoothscroll'
+    /// window repaints instead — so the two paths do overlap; what keeps them
+    /// from staging the same movement twice is `bracketStagedGrids`, which the
+    /// fast path checks before opening a step of its own.
+    ///
+    /// Called from the on_grid_scroll callback, inside the flush bracket and
+    /// before row recomposition, so the flush's source set still holds the
+    /// on-screen content. Only the grid's own DECO_SCROLLABLE vertices are
+    /// copied: composite rows mix the grid with its backdrop, and its
+    /// border/margin cells must not ease. No ease seed is staged — the
+    /// trackpad gesture owns the offset it reconciles against (a seed would
+    /// pay the row twice), and a keyboard scroll on such a grid never
+    /// displaces it, so its retained row is pruned unused.
+    func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int) {
+        captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta, replaying: false)
+    }
+
+    private func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int, replaying: Bool) {
+        guard Self.smoothScrollEnabled, rowsDelta != 0, isInFlush else { return }
+
         lock.lock()
-        if retainedScrollRing.count != Self.retainedScrollRingSize {
-            retainedScrollRing = Array(repeating: nil, count: Self.retainedScrollRingSize)
-            retainedScrollRingCaps = Array(repeating: 0, count: Self.retainedScrollRingSize)
-            retainedScrollRingNext = 0
+        let bounds = gridScrollCaptureBounds[gridId]
+        let capturable = (bounds?.bottomEx ?? 0) > (bounds?.top ?? 0)
+        // The core hands a grid_scroll over exactly once: it is consumed at
+        // dispatch, and a bracket that aborts afterwards is never re-offered it
+        // (see e2e grid_scroll_abort_delivery). Since beginFlush discards
+        // retention staged by a bracket that did not commit, the step would be
+        // lost outright — so remember it here and stage it again next bracket.
+        // The rows come from the committed set, which an aborted bracket left
+        // untouched, so the replay reads exactly what this capture read.
+        //
+        // Only steps that could actually be staged are remembered: a grid with
+        // no armed bounds — any grid scrolled before the gesture that arms it —
+        // would otherwise spend slots in the window and evict a real step.
+        // (Grid 1 is skipped by the arming sweep but IS armed when it is the
+        // scroll target itself, which resolveScrollTarget returns for a point
+        // no window grid covers.)
+        if !replaying, capturable {
+            pendingRetentionReplay.append((gridId: gridId, rowsDelta: rowsDelta))
+            if pendingRetentionReplay.count > Self.maxPendingRetentionReplay {
+                pendingRetentionReplay.removeFirst(
+                    pendingRetentionReplay.count - Self.maxPendingRetentionReplay
+                )
+            }
         }
-        let idx = retainedScrollRingNext
-        retainedScrollRingNext = (idx + 1) % Self.retainedScrollRingSize
-        var dst = retainedScrollRing[idx]
-        if dst == nil || retainedScrollRingCaps[idx] < needed {
-            // Rounded up to the next power of two so scrolling into progressively
-            // wider rows converges after a few steps instead of re-allocating on
-            // every widening — this runs inside the flush bracket while holding
-            // the lock draw() contends for each frame.
-            var alloc = 4096
-            while alloc < needed { alloc <<= 1 }
-            dst = device.makeBuffer(length: alloc, options: .storageModeShared)
-            retainedScrollRing[idx] = dst
-            retainedScrollRingCaps[idx] = dst == nil ? 0 : alloc
-        }
-        if !stagedRetainedScrollValid {
-            stagedRetainedScrollValid = true
-            stagedRetainedScrollRows.removeAll(keepingCapacity: true)
-            stagedRetainedScrollRows.append(contentsOf: retainedScrollRows)
-        }
+        // How far the source set is behind what this step describes. A replayed
+        // step did not move the committed content, so a capture that follows it
+        // in the same bracket must read that much further into the set or it
+        // retains the same line twice.
+        let sourceShift = bracketSourceShift[gridId] ?? 0
+        bracketSourceShift[gridId] = sourceShift + rowsDelta
         lock.unlock()
-
-        guard let dstBuf = dst else { return }
-        memcpy(dstBuf.contents(), srcBuf.contents(), needed)
-
-        lock.lock()
-        // Rows retained by earlier steps move one further row out of view.
-        for i in stagedRetainedScrollRows.indices {
-            stagedRetainedScrollRows[i].targetRow -= rowsDelta
+        guard let bounds, capturable else {
+            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no armed bounds")
+            return
         }
-        // Keep only what the ease can still show: rows further out than the
-        // clamp, another grid's rows, or rows on the opposite edge after a
-        // direction reversal.
-        stagedRetainedScrollRows.removeAll {
-            $0.gridId != gid
-                || abs($0.targetRow - targetRow) >= Self.maxRetainedScrollRows
-                || ($0.targetRow - targetRow) * rowsDelta > 0
+
+        let cs = bufferSets[flushSourceSetIndex]
+        guard cs.rowState.usingRowBuffers else {
+            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no row buffers")
+            return
         }
-        stagedRetainedScrollRows.append(RetainedScrollRow(
+
+        // A step is routinely more than one row: the lookahead asks for a
+        // whole wheel event's worth ('mousescroll' ver) and the core coalesces
+        // them into one notification. The retention only holds `depthRows` of
+        // them — the offset is clamped to the same reach — so keep the rows
+        // adjacent to the edge the block left through and let the rest go.
+        let depth = retention.depthRows
+        guard let plan = ScrollRetention.plan(
+            rowStart: bounds.top,
+            rowEnd: bounds.bottomEx,
+            rowsDelta: rowsDelta,
+            depth: depth
+        ) else {
+            ZonvieCore.appLog(
+                "[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no plan (top=\(bounds.top) bottomEx=\(bounds.bottomEx) depth=\(depth))"
+            )
+            return
+        }
+
+        retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+
+        for i in 0..<plan.count {
+            let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+            captureOneRetainedRow(
+                cs: cs,
+                gridId: gridId,
+                readRow: row + sourceShift,
+                targetRow: row - rowsDelta
+            )
+        }
+    }
+
+    /// Copy one outgoing row's own scrollable vertices into the retention ring
+    /// and append it to the open step. A row with nothing to retain (blank, or
+    /// holding no vertices of this grid) is skipped — the band then falls back
+    /// to the edge stretch, same as the fast-path capture's vc == 0 case.
+    /// `readRow` is where the row currently sits in the source set; `targetRow`
+    /// is where it must be drawn. They differ by more than the step's own
+    /// rowsDelta once a replayed step has moved content the source set has not
+    /// caught up with.
+    private func captureOneRetainedRow(
+        cs: SurfaceBufferSet,
+        gridId: Int64,
+        readRow: Int,
+        targetRow: Int
+    ) {
+        let row = readRow
+        guard row >= 0, row < cs.rowLogicalToSlot.count else { return }
+        let slot = cs.rowLogicalToSlot[row]
+        guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return }
+        let vc = cs.rowState.counts[slot]
+        guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
+        let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : row
+
+        // Content cells only. Counted before a ring slot is taken, because
+        // taking one advances the ring.
+        let scrollable = ZONVIE_DECO_SCROLLABLE
+        let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
+        var kept = 0
+        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
+            kept += 1
+        }
+        guard kept > 0 else { return }
+
+        // Read before locking: the accessor takes `lock` itself, which is not
+        // recursive.
+        let capturedCellHeightPx = cellHeightPx
+        guard let dstBuf = retention.takeBuffer(needed: kept * MemoryLayout<Vertex>.stride) else { return }
+        let dstPtr = dstBuf.contents().bindMemory(to: Vertex.self, capacity: kept)
+        var w = 0
+        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
+            dstPtr[w] = src[i]
+            w += 1
+        }
+
+        bracketStagedGrids.insert(gridId)
+        retention.stage(RetainedScrollRow(
             buffer: dstBuf,
-            count: vc,
-            gridId: gid,
+            count: kept,
+            gridId: gridId,
             sourceRow: sourceRow,
             targetRow: targetRow,
             cellHeightPx: capturedCellHeightPx
         ))
-        if stagedRetainedScrollRows.count > Self.maxRetainedScrollRows {
-            stagedRetainedScrollRows.removeFirst(stagedRetainedScrollRows.count - Self.maxRetainedScrollRows)
-        }
-        stagedSmoothScrollSeeds.append((gridId: gid, rowsDelta: rowsDelta))
-        lock.unlock()
     }
 
 

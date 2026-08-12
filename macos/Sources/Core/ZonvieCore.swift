@@ -111,6 +111,14 @@ final class ZonvieCore {
     /// still owns while this runs.
     private var pendingCapacityScratch: [ExternalGridView] = []
 
+    /// The window owning a grid, if that grid is rendered as its own surface.
+    /// Callers must not hold a surface lock (see the note below).
+    func externalGridView(for gridId: Int64) -> ExternalGridView? {
+        externalGridViewsLock.lock()
+        defer { externalGridViewsLock.unlock() }
+        return externalGridViews[gridId]
+    }
+
     /// True while any surface still owes a row-capacity provisioning pass.
     /// Snapshots under the map lock and releases it before asking any view, so
     /// externalGridViewsLock is never held across a surface lock.
@@ -2819,6 +2827,14 @@ final class ZonvieCore {
     /// Same as above, but reports lock contention: lockBusy is set to true
     /// when the returned value came from the stale cache because grid_mu was
     /// held. Callers with no later healing read (e.g. the once-per-flush
+    /// Borrow 'smoothscroll' for this grid's window for the duration of a
+    /// trackpad gesture, or hand it back. Returns false when the request could
+    /// not be issued and must be retried.
+    func setGestureSmoothScroll(gridId: Int64, enable: Bool) -> Bool {
+        guard let core else { return true }
+        return zonvie_core_set_gesture_smooth_scroll(core, gridId, enable) == 1
+    }
+
     /// scrollbar update) use this to schedule a retry.
     func getViewportNonBlocking(gridId: Int64, lockBusy: inout Bool) -> ViewportInfo? {
         lockBusy = false
@@ -3209,6 +3225,14 @@ final class ZonvieCore {
     func getOptionAsMeta() -> UInt8 {
         guard let core else { return ZonvieConfig.shared.ime.optionAsMeta.rawValue }
         return zonvie_core_get_option_as_meta(core)
+    }
+
+    /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
+    /// 0 means 'ver:0', which disables mouse scrolling in Neovim entirely.
+    /// Lock-free atomic read; safe to call from any thread.
+    func getMouseScrollVer() -> Int {
+        guard let core else { return 0 }
+        return Int(zonvie_core_get_mousescroll_ver(core))
     }
 
     /// Check if cursor is visible (false during busy, true otherwise)

@@ -1076,6 +1076,15 @@ pub const Core = struct {
     // cross-thread reads from the frontend UI thread.
     option_as_meta: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
+    // Rows one wheel event scrolls: the 'ver' component of Neovim's
+    // 'mousescroll'. Seeded with Neovim's own default so the value is usable
+    // before the reporter's first notification lands. Updated via RPC
+    // notification "zonvie_mousescroll" (see setupMouseScrollReporter); read
+    // from the frontend UI thread on every precise scroll event, hence atomic.
+    // 'ver:0' disables mouse scrolling in Neovim and reports 0, which the
+    // frontend treats as "no row count to reason with".
+    mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
+
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
     // on :restart/:connect), so these are atomic.
@@ -5500,6 +5509,10 @@ pub const Core = struct {
         rpc_session.logEnvHints(self);
     }
 
+    pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
+        return rpc_session.setGestureSmoothScroll(self, grid_id, enable);
+    }
+
     pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         rpc_session.handleRpcResponse(self, top);
     }
@@ -7157,7 +7170,10 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     defer core.deinitForTest();
 
     try core.grid.resizeGrid(1, 4, 4);
-    try core.grid.resizeGrid(2, 2, 2);
+    // Deliberately non-square: with equal dimensions the margin assertions
+    // below read the same number whether the clamp pairs top/bottom with rows
+    // and left/right with cols, or swaps them.
+    try core.grid.resizeGrid(2, 2, 3);
     try core.grid.win_pos.put(core.grid.alloc, 2, .{
         .row = std.math.maxInt(u32),
         .col = std.math.maxInt(u32),
@@ -7174,8 +7190,11 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_row);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_col);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_top);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_right);
+    // Margins are clamped to the grid on the way out — stricter than the
+    // saturating conversion the placement fields fall back to, and the reason
+    // they can be stored before the grid that bounds them exists.
+    try std.testing.expectEqual(@as(i32, 2), out[1].margin_top);
+    try std.testing.expectEqual(@as(i32, 3), out[1].margin_right);
 
     core.grid.cursor_grid = 1;
     core.grid.cursor_row = std.math.maxInt(u32);

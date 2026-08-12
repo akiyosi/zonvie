@@ -1382,6 +1382,20 @@ pub export fn zonvie_core_try_get_viewport(
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
 }
 
+/// Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
+/// hand it back afterwards. No-op off macOS. Returns 0 when the request could
+/// not be issued (grid lock busy, or no window known yet) — the caller must try
+/// again, which matters most for the restore.
+pub export fn zonvie_core_set_gesture_smooth_scroll(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    enable: bool,
+) callconv(.c) i32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return if (box.core.setGestureSmoothScroll(grid_id, enable)) 1 else 0;
+}
+
 /// Get current cursor position.
 /// Returns the grid_id of the cursor.
 pub export fn zonvie_core_get_cursor_position(
@@ -1478,6 +1492,16 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
     if (p == null) return 0;
     const box = asBox(p.?);
     return box.core.option_as_meta.load(.acquire);
+}
+
+/// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
+/// Reported by the auto-injected reporter (macOS only) and refreshed when the
+/// option changes. Returns 0 for 'ver:0', which disables mouse scrolling in
+/// Neovim rather than making it page-relative. Lock-free atomic read.
+pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.mousescroll_ver.load(.acquire);
 }
 
 /// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).

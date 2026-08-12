@@ -740,7 +740,17 @@ typedef struct zonvie_callbacks {
        produce a single notification, and rows_delta is their sum — it is not
        always +/-1, and the count of notifications does not describe how far
        the content travelled. Reconcile against this value, not against the
-       number of calls. */
+       number of calls.
+
+       Not every notification corresponds to a Neovim grid_scroll event. Where
+       the view moved but Neovim repainted instead of shifting rows — which is
+       what 'smoothscroll' does on a wrapped line — the movement win_viewport
+       reported and no grid_scroll described is delivered here too, so this is
+       the single report of "the content of this grid moved N screen rows"
+       however Neovim chose to express it. A frontend holding a sub-cell scroll
+       offset must give back that distance and retain the rows that left in
+       both cases; one that only shifts whole rows can ignore the distinction,
+       since the repainted rows arrive as ordinary row updates. */
     void (*on_grid_scroll)(void* ctx, int64_t grid_id, int32_t rows_delta);
 
     /* IME off notification callback.
@@ -1127,7 +1137,11 @@ typedef struct zonvie_viewport_info {
     int64_t line_count;   /* Total lines in buffer */
     int64_t curline;      /* Current cursor line */
     int64_t curcol;       /* Current cursor column */
-    int64_t scroll_delta; /* Lines scrolled since last update */
+    int64_t scroll_delta; /* Screen rows scrolled since last update. Counts
+                             displayed rows, not buffer lines: with 'wrap' a
+                             one-line scroll reports every row the view moved,
+                             and under 'smoothscroll' it reports single rows
+                             while topline stays put. Positive = scrolled down. */
 } zonvie_viewport_info;
 
 /* Get viewport info for a specific grid (for scrollbar rendering).
@@ -1145,6 +1159,30 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
     zonvie_core *core,
     int64_t grid_id,
     zonvie_viewport_info *out_viewport
+);
+
+/* Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
+   hand it back when it ends (enable=0).
+
+   A 'wrap'ped window can otherwise only move a whole buffer line at a time,
+   however many screen rows that line occupies — one wheel event books
+   'mousescroll' rows and moves every row those lines span. With 'smoothscroll'
+   the quantum is one screen row and a wheel event moves exactly the
+   'mousescroll' count, so a sub-cell scroll model's booking and the movement it
+   gets back agree.
+
+   The previous value is stashed in a window variable and restored from it, so a
+   restore arriving twice is harmless. Windows without 'wrap' are skipped: the
+   option does nothing there.
+
+   No-op off macOS (sub-cell trackpad scrolling is a macOS frontend feature).
+   Returns 1 when the request was issued, 0 when it could not be (grid lock
+   busy, or no window known for the grid yet) — the caller must try again, which
+   matters most for the restore. */
+ZONVIE_API int32_t zonvie_core_set_gesture_smooth_scroll(
+    zonvie_core *core,
+    int64_t grid_id,
+    bool enable
 );
 
 /* Get list of visible grids for hit-testing.
@@ -1218,6 +1256,15 @@ ZONVIE_API const char* zonvie_core_get_current_mode(zonvie_core *core);
    Settable via config (initial) or RPC notification "zonvie_option_as_meta" (runtime). */
 ZONVIE_API uint8_t zonvie_core_get_option_as_meta(zonvie_core *core);
 ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value);
+
+/* Rows one mouse-wheel event scrolls: the 'ver' component of Neovim's
+   'mousescroll'. Reported by an auto-injected reporter and refreshed when the
+   option changes, so sub-cell scrolling can account an event as the N rows it
+   is actually worth. 'ver:0' disables mouse scrolling in Neovim altogether —
+   it is not a page-relative setting — and reports 0, as does a null core.
+   The reporter is installed on macOS only; elsewhere this returns Neovim's
+   default (3) and should not be relied on. */
+ZONVIE_API uint32_t zonvie_core_get_mousescroll_ver(zonvie_core *core);
 
 /* Check if cursor is visible.
    Returns false during busy_start, true after busy_stop. */
