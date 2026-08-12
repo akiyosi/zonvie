@@ -138,8 +138,8 @@ final class MetalTerminalView: MTKView {
     // feel); a hand put back on the pad mid-bounce no longer freezes it.
     // Momentum does NOT gate the bounce: like the native one, it starts as
     // soon as the edge is hit and swallows the remaining momentum.
-    // Written on the main thread, read on the core thread — see
-    // noteScrollGesturePhase for the lock that covers both.
+    // Written on the main thread, read on the core thread as a hint — see
+    // noteScrollGesturePhase for what the lock does and does not cover.
     private var scrollGestureTouching = false
     // True while a momentum phase is running. Only used to keep momentum
     // events from refreshing lastPreciseScrollInputTime, which would gate the
@@ -2034,10 +2034,12 @@ final class MetalTerminalView: MTKView {
         // processPendingScrollClears when it decides who owns a scroll — so
         // the writes take the same lock that read is already holding.
         //
-        // What the lock covers is the id comparison, not the phase booleans:
-        // those are read lock-free elsewhere as hints (see the early exit in
-        // tickScrollEdgeBounce), where being a few microseconds stale is
-        // nothing against the 0.2 s window the terms themselves carry.
+        // Only the id COMPARISONS are covered — `padIsDriving` reads the id for
+        // nil-ness and the phase booleans before taking the lock at all, as
+        // does tickScrollEdgeBounce for its early exit. Those reads are hints:
+        // a few microseconds of staleness is nothing against the 0.2 s window
+        // the terms carry (0.03 s for the edge-bounce exit), and a stale
+        // Optional tag can only name a grid that was valid a moment ago.
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
         let phase = event.phase
@@ -2256,13 +2258,23 @@ final class MetalTerminalView: MTKView {
     /// Clear all scroll offsets.
     ///
     /// UNREACHABLE: nothing calls this, and it is the only caller of the
-    /// renderer's clearScrollOffsets — so none of that reset happens on the
-    /// main surface. Nothing depends on it: pendingRetentionReplay is cleared
-    /// by commitFlush, bracketSourceShift by beginFlush, published rows by
-    /// updateScrollOffsets' prune, and scrollOffsetData is rebuilt every frame.
-    /// The capture spans do survive a layout change, which is harmless because
-    /// Neovim does not reuse grid handles. Left in place rather than deleted,
-    /// but do not write code that relies on it running.
+    /// renderer's clearScrollOffsets — so none of that reset happens on any
+    /// surface (an external grid view has no MetalTerminalRenderer of its own).
+    ///
+    /// What it would reset is handled elsewhere: pendingRetentionReplay by
+    /// commitFlush, bracketSourceShift by beginFlush, published rows by
+    /// updateScrollOffsets' prune. scrollOffsetData is rebuilt whenever
+    /// anything is displaced — updateScrollShaderOffset takes an idle early-out
+    /// once nothing is, having pushed one empty state through first.
+    ///
+    /// The capture spans are the exception. They survive a layout change and
+    /// are only re-armed by a precise scroll event, so a keyboard scroll
+    /// between a window MOVING and the next gesture captures against the old
+    /// span. Handles are never reused, so a span cannot be misapplied to a
+    /// different window — but that also means the dictionary only grows.
+    ///
+    /// Left in place rather than deleted; do not write code that relies on it
+    /// running.
     private func clearAllScrollOffsets() {
         scrollOffsetLock.lock()
         scrollOffsetPx.removeAll()
@@ -2593,15 +2605,22 @@ final class MetalTerminalView: MTKView {
             // travel is the only thing that consumes an offset, so it has to
             // reach every window this gesture is moving.
             //
-            // `?? 0` rather than a guard: a bound window settling on the cell
-            // grid drops its entry, and skipping it from then on froze it there
-            // while the driver ran on. Clamped like the driver above, so a
-            // window that stops being scrolled — its own buffer edge — cannot
-            // bank travel it will never be credited for and then ignore a
-            // reversed finger until the excess is paid off.
+            // Only a window that is still holding compensation. A bound window
+            // that has settled on the cell grid drops its entry and is skipped
+            // until its next arrival re-creates it — and that arrival is the
+            // proof it is still moving. Paying a window with no entry instead
+            // meant one that had stopped being scrolled at all (its own buffer
+            // edge, or the gesture pushing into the driver's) accumulated the
+            // finger's travel with nothing to credit it back, and no decay
+            // path reaches it: it stays displaced until Neovim next scrolls it.
+            //
+            // Clamped like the driver above all the same, so a window whose
+            // arrivals stop mid-gesture cannot bank travel it will never be
+            // credited for and then ignore a reversed finger.
             for bound in gestureBoundGrids where bound != gridId {
+                guard let held = scrollOffsetPx[bound] else { continue }
                 let paid = clampVisualScrollOffsetPx(
-                    (scrollOffsetPx[bound] ?? 0) + deltaYPx,
+                    held + deltaYPx,
                     cellHeightPx: rowHeightPx
                 )
                 if abs(paid) < Self.scrollOffsetEpsilon {
@@ -2981,7 +3000,9 @@ final class MetalTerminalView: MTKView {
             // Check if this is a response to our scroll command or Neovim-initiated
             pendingSentScrollLock.lock()
             let sentCount = pendingSentScroll[gridId] ?? 0
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
+            // A bound window may be seeded below, before the credit is taken,
+            // so this is not captured until then.
+            var currentOffset = scrollOffsetPx[gridId] ?? 0
             // The in-flight count is bookkeeping for how many requests are
             // outstanding, not proof of who scrolled: one notification can
             // carry several rows and take the count to zero while the gesture
@@ -3024,6 +3045,13 @@ final class MetalTerminalView: MTKView {
                 // travel that this window was never paid — starting it from
                 // zero left the two panes of a diff a fraction of a row apart
                 // for the rest of the gesture.
+                //
+                // Into `currentOffset`, not just the dictionary: the credit
+                // below is taken from this value, and writing only the map left
+                // the seed to be overwritten by the credit it was supposed to
+                // shift. Pinned by ScrollRetentionTests' "a seeded bound window
+                // lands where the driver does".
+                currentOffset = banked
                 scrollOffsetPx[gridId] = banked
             }
             let gestureOwns = sentCount > 0
@@ -3053,58 +3081,22 @@ final class MetalTerminalView: MTKView {
                 // booked there is no better number than the report itself, and
                 // the healthy case has the two equal, so this only bites where
                 // the units genuinely disagree.
-                let creditedRows = sentCount > 0
-                    ? (rowsDelta < 0 ? -toConsume : toConsume)
-                    : rowsDelta
-                var newOffset = currentOffset + CGFloat(creditedRows) * rowHeightPx
-                // A credit hands back compensation that is being held, so it
-                // must not leave MORE held than before — and never more than
-                // the single step the lookahead is allowed to run ahead by.
-                //
-                // The clamp above only bounds an arrival that still has a
-                // booking to measure against. The first arrival of a wrapped
-                // scroll consumes the whole booking, so a second one for the
-                // same gesture finds none left and would be credited in full:
-                // measured, one wheel event moves 12 screen rows against a
-                // booking of 3, which drove the offset deeper into the far side
-                // and stalled further sends until the finger recovered it.
-                // Giving back what is held may overshoot zero by one step —
-                // that is the allowance the lookahead runs on. A credit that
-                // instead pushes AWAY from zero is not giving anything back, so
-                // it may not deepen an offset that already holds something; from
-                // rest it is a genuine Neovim-initiated scroll and gets the same
-                // one-step compensation the model uses everywhere else.
-                //
-                // Not for a window this gesture merely drags along. A bound
-                // window never books, so its report is the sole account of how
-                // far it moved and must be allowed to deepen: it sits near zero
-                // at every arrival (it trails the driver by one round trip),
-                // and capping at `abs(currentOffset)` there discarded the
-                // credit outright — the window then moved a full step with no
-                // compensation, about every other arrival. That is the
-                // row-at-a-time stepping this whole path exists to remove.
-                //
-                // Keyed on membership, not on `sentCount == 0`: the driving
-                // grid also reaches zero booking mid-gesture (a wrapped scroll's
-                // first arrival consumes all of it), and there the deepen rule
-                // is exactly what stops the over-report running the offset out
-                // the far side.
-                let stepPx = rowHeightPx * CGFloat(max(1, rowsPerWheelEventForClamp))
-                if !gestureBoundGrids.contains(gridId) {
-                    let deepens = currentOffset == 0 || (newOffset < 0) == (currentOffset < 0)
-                    let cap = deepens
-                        ? (currentOffset == 0 ? stepPx : abs(currentOffset))
-                        : stepPx
-                    if abs(newOffset) > cap {
-                        newOffset = newOffset < 0 ? -cap : cap
-                    }
-                } else if abs(newOffset) > stepPx {
-                    // Still bounded: a report larger than one wheel event's
-                    // worth is more than the finger can consume before the next
-                    // one lands.
-                    newOffset = newOffset < 0 ? -stepPx : stepPx
-                }
-                if abs(newOffset) < Self.scrollOffsetEpsilon {
+                let credited = ScrollRetention.creditedOffsetPx(
+                    heldPx: currentOffset,
+                    bookedRows: sentCount,
+                    rowsDelta: rowsDelta,
+                    rowHeightPx: rowHeightPx,
+                    stepRows: rowsPerWheelEventForClamp,
+                    // Membership alone is not enough: nothing takes a grid out
+                    // of the set when it BECOMES the driver, so scrolling the
+                    // other pane of a diff within the gesture guard would have
+                    // handed the driver the bound rule and disabled the deepen
+                    // clamp its wrapped over-reports depend on.
+                    bound: gestureScrollGridId != gridId && gestureBoundGrids.contains(gridId),
+                    epsilonPx: Self.scrollOffsetEpsilon
+                )
+                let newOffset = credited ?? 0
+                if credited == nil {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     gestureLookaheadGrids.remove(gridId)
                     // Settling here erases both signals the seed guard reads,

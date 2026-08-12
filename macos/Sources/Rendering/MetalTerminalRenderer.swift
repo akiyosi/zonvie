@@ -779,6 +779,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// beginFlush. Written and read only inside the flush bracket, which is
     /// wholly on the core thread, so it carries no lock of its own.
     private var bracketStagedGrids: Set<Int64> = []
+    /// Scratch for draining ScrollRetention's eviction record; reused so the
+    /// drain allocates nothing.
+    private var evictedGridsScratch: [Int64] = []
+
+    /// A grid whose rows the retention's cap dropped no longer counts as
+    /// staged, so the row-scroll fast path may cover it after all.
+    private func forgetEvictedStagedGrids() {
+        evictedGridsScratch.removeAll(keepingCapacity: true)
+        retention.takeEvictedGrids(into: &evictedGridsScratch)
+        for grid in evictedGridsScratch { bracketStagedGrids.remove(grid) }
+    }
 
     /// grid_scroll steps captured by a bracket that has not committed yet.
     /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
@@ -2268,10 +2279,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        // Reached only from an external grid view. The main surface's caller
-        // (MetalTerminalView.clearAllScrollOffsets) has none of its own, so on
-        // that surface none of this runs — see that function's note before
-        // relying on any of it.
+        // Unreachable: its one caller, MetalTerminalView.clearAllScrollOffsets,
+        // has no callers of its own. See that function's note before relying on
+        // any of this running.
         scrollOffsetData = []
         hasActiveScrollOffset = false
         // The spans describe the layout this reset abandons.
@@ -5326,6 +5336,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // `return` here cost a held key its sub-row ease on every step
                 // where the previous step's offset had not yet decayed, which
                 // reads as judder rather than a clean loss.
+                forgetEvictedStagedGrids()
                 alreadyRetained = bracketStagedGrids.contains(gid)
                 if !alreadyRetained {
                     retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
@@ -5416,9 +5427,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // untouched, so the replay reads exactly what this capture read.
         //
         // Only steps that could actually be staged are remembered: a grid with
-        // no armed bounds — grid 1, and any grid scrolled before the gesture
-        // that arms it — would otherwise spend slots in the window and evict a
-        // real step.
+        // no armed bounds — any grid scrolled before the gesture that arms it —
+        // would otherwise spend slots in the window and evict a real step.
+        // (Grid 1 is skipped by the arming sweep but IS armed when it is the
+        // scroll target itself, which resolveScrollTarget returns for a point
+        // no window grid covers.)
         if !replaying, capturable {
             pendingRetentionReplay.append((gridId: gridId, rowsDelta: rowsDelta))
             if pendingRetentionReplay.count > Self.maxPendingRetentionReplay {

@@ -46,13 +46,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (step < 8) : (step += 1) try scrollOneRow(h);
 
     // The last keystroke's win_viewport can still be in flight, so wait for the
-    // reports rather than reading once.
-    const Acc = struct {};
-    h.waitUntil(Acc{}, struct {
-        fn check(_: Acc, hh: *Harness) bool {
-            return hh.grid_scroll_rows.load(.seq_cst) >= 8;
-        }
-    }.check, h.opts.timeout_ms) catch {};
+    // reports to stop rather than reading once.
+    waitReportsQuiet(h);
 
     const reported = h.grid_scroll_rows.load(.seq_cst);
     if (reported != 8) {
@@ -79,15 +74,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // and would otherwise be read as this scroll's. Wait for these to be
     // reported too, or they land after the counter is reset and inflate the
     // measurement that follows.
-    _ = h.grid_scroll_rows.swap(0, .seq_cst);
     step = 0;
     while (step < 4) : (step += 1) try scrollOneRow(h);
-    const Settle = struct {};
-    h.waitUntil(Settle{}, struct {
-        fn check(_: Settle, hh: *Harness) bool {
-            return hh.grid_scroll_rows.load(.seq_cst) >= 4;
-        }
-    }.check, h.opts.timeout_ms) catch {};
+    waitReportsQuiet(h);
     // Here one <C-e> moves a whole buffer line, so scroll_delta reports the
     // number of screen rows that line occupies. Wait for topline to advance
     // first, or the value still belongs to the preceding gg.
@@ -103,17 +92,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Here grid_scroll describes the movement itself, and the total must come
     // out the same way: whatever the mix of shifted and repainted rows, the
     // frontend is told the whole distance exactly once.
-    _ = h.grid_scroll_rows.swap(0, .seq_cst);
+    const control_baseline = h.grid_scroll_rows.load(.seq_cst);
     step = 0;
     while (step < 8) : (step += 1) try scrollOneRow(h);
+    waitReportsQuiet(h);
     const want_rows = 8 * wrapped_rows_per_line;
-    const Ctx = struct { want: i64 };
-    h.waitUntil(Ctx{ .want = want_rows }, struct {
-        fn check(c: Ctx, hh: *Harness) bool {
-            return hh.grid_scroll_rows.load(.seq_cst) >= c.want;
-        }
-    }.check, h.opts.timeout_ms) catch {};
-    const control_rows = h.grid_scroll_rows.load(.seq_cst);
+    const control_rows = h.grid_scroll_rows.load(.seq_cst) - control_baseline;
     if (control_rows != want_rows) {
         std.debug.print(
             "[e2e] smoothscroll_viewport_delta: {d} buffer lines span {d} screen rows, {d} reported\n",
@@ -128,6 +112,26 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "and {d} without it\n",
         .{ wrapped_rows_per_line, reported, top_advance, control_rows },
     );
+}
+
+/// Wait until the reports stop arriving. Waiting for a THRESHOLD does not work
+/// here: one <C-e> over wrapped lines reports several rows, so a "at least N
+/// rows" wait is satisfied by the first of N scrolls and the rest land later —
+/// after the next phase has taken its baseline, inflating it.
+fn waitReportsQuiet(h: *Harness) void {
+    var last: i64 = -1;
+    var stable: usize = 0;
+    while (stable < 4) {
+        const now = h.grid_scroll_rows.load(.seq_cst);
+        if (now == last) stable += 1 else stable = 0;
+        last = now;
+        const Ctx = struct { from: u64 };
+        h.waitUntil(Ctx{ .from = h.flush_seq.load(.seq_cst) }, struct {
+            fn check(c: Ctx, hh: *Harness) bool {
+                return hh.flush_seq.load(.seq_cst) > c.from;
+            }
+        }.check, 50) catch {};
+    }
 }
 
 fn waitToplineAdvance(h: *Harness, g: i64, from: u32) !void {

@@ -162,19 +162,28 @@ final class ScrollRetention {
     /// are bound straight to the encoder and are not tracked by any in-flight
     /// counter, so ring size is the only thing keeping them alive.
     ///
-    /// Live at once, each at most `maxDepthRows` rows: one snapshot per
-    /// in-flight frame, the published set, and the set being staged. External
-    /// surfaces allow TWO frames in flight (the main renderer allows one), so
-    /// the worst case is four sets — and several flushes can land within one
-    /// frame, so carry the same again as headroom. Allocated on first use,
-    /// grown only when a wider row appears.
+    /// Live at once, each set at most `maxRetainedGrids * maxDepthRows` rows:
+    /// one snapshot per in-flight frame, the published set, and the set being
+    /// staged. External surfaces allow TWO frames in flight (the main renderer
+    /// allows one), so the worst case is four sets. `ringSize` below carries
+    /// one more on top; a set replaced within a frame is released at once and
+    /// pins nothing, but `ringNext` advances past its slots regardless.
+    /// Pinned by ScrollRetentionTests' "ringSize must exceed the buffers that
+    /// can be live at once".
     static let maxInFlightFrames = 2
     /// Windows that can hold a band at the same time. 'scrollbind' moves two
     /// (:vert diffsplit), and each keeps its own rows, so the ring drains that
     /// many times faster. Enforced in `beginStep`, not merely assumed: the ring
     /// is the only thing keeping a retained buffer alive, so an unbounded grid
     /// count would wrap it onto rows a frame is still reading.
-    static let maxRetainedGrids = 4
+    ///
+    /// Set to Neovim's own ceiling on a diff group (E96: at most eight buffers
+    /// may have 'diff' set), so no diff can outgrow it. What is reachable in
+    /// practice is smaller — `git mergetool --tool=vimdiff` and diffview.nvim's
+    /// diff4_mixed both top out at four windows, and `nvim -d` takes at most
+    /// four files — but the cap evicts deterministically once it is exceeded,
+    /// and the extra slots cost only residency.
+    static let maxRetainedGrids = 8
     /// One set per in-flight frame, plus the published set and the one being
     /// staged, times the grids that can each hold their own. Deliberately
     /// without the "several flushes per frame" factor the earlier sizing
@@ -183,7 +192,12 @@ final class ScrollRetention {
     /// a residency that is never reclaimed. `takeBuffer` walks every slot in
     /// turn, so the whole ring becomes resident after a few seconds of
     /// scrolling in ONE window — the count is a memory figure, not a lazy cap.
-    static let ringSize = (maxInFlightFrames + 2) * maxDepthRows * maxRetainedGrids
+    /// One set spare on top of the live ones, because `ringNext` advances on
+    /// every take regardless of whether the set it filled was ever drawn: a
+    /// bracket landing while a frame is in flight pushes the cursor further
+    /// without releasing that frame's snapshot. Sized exactly to the live
+    /// count would wrap onto a slot still being read.
+    static let ringSize = (maxInFlightFrames + 3) * maxDepthRows * maxRetainedGrids
 
     struct Plan {
         let first: Int
@@ -205,6 +219,8 @@ final class ScrollRetention {
     /// Grids that have opened a step, least recent first. Bounds how many can
     /// hold rows at once — see `maxRetainedGrids`.
     private var stepOrder: [Int64] = []
+    /// Grids the cap dropped rows for, since the caller last took them.
+    private var evictedGrids: [Int64] = []
     private var depth = ScrollRetention.minDepthRows
 
     init(device: MTLDevice) {
@@ -341,12 +357,58 @@ final class ScrollRetention {
         return retainedRows >= bandRows
     }
 
+    // MARK: - Credit arithmetic
+
+    /// What a grid's sub-cell scroll offset becomes when Neovim reports that
+    /// its content moved `rowsDelta` rows. `nil` means the offset settled on
+    /// the cell grid and its entry should be dropped.
+    ///
+    /// Pure so it can be tested: the view owns the bookkeeping around it, but
+    /// the rule itself is the part that has been got wrong repeatedly.
+    ///
+    /// - `heldPx` is the compensation currently being held, already including
+    ///   any seed handed over when a bound window is first recognised.
+    /// - `bookedRows` is what the gesture asked for and has not yet been
+    ///   credited. Zero for a window the gesture merely drags along
+    ///   ('scrollbind'), which is why `bound` is passed separately: the driving
+    ///   window also runs its booking down to zero mid-gesture.
+    static func creditedOffsetPx(
+        heldPx: CGFloat,
+        bookedRows: Int,
+        rowsDelta: Int,
+        rowHeightPx: CGFloat,
+        stepRows: Int,
+        bound: Bool,
+        epsilonPx: CGFloat
+    ) -> CGFloat? {
+        let consumed = min(bookedRows, abs(rowsDelta))
+        let creditedRows = bookedRows > 0 ? (rowsDelta < 0 ? -consumed : consumed) : rowsDelta
+        var offset = heldPx + CGFloat(creditedRows) * rowHeightPx
+        let stepPx = rowHeightPx * CGFloat(max(1, stepRows))
+        if !bound {
+            // Handing back what is held may overshoot zero by one step — the
+            // allowance the lookahead runs on. A credit pushing AWAY from zero
+            // is not handing anything back, so it may not deepen an offset that
+            // already holds something.
+            let deepens = heldPx == 0 || (offset < 0) == (heldPx < 0)
+            let cap = deepens ? (heldPx == 0 ? stepPx : abs(heldPx)) : stepPx
+            if abs(offset) > cap { offset = offset < 0 ? -cap : cap }
+        } else if abs(offset) > stepPx {
+            // A bound window books nothing, so its report is the only account
+            // of how far it moved and must be allowed to deepen — bounded by
+            // what the finger can consume before the next report lands.
+            offset = offset < 0 ? -stepPx : stepPx
+        }
+        return abs(offset) < epsilonPx ? nil : offset
+    }
+
     // MARK: - Capture
 
-    /// Open a retention step: rows kept by earlier steps move `rowsDelta`
-    /// further out of view, and everything the ease can no longer show is
-    /// dropped — another grid's rows, rows past the clamp, and rows on the
-    /// opposite edge after a direction reversal. A step stages one or more
+    /// Open a retention step: this grid's rows kept by earlier steps move
+    /// `rowsDelta` further out of view, and the ones the ease can no longer
+    /// show are dropped — rows past the clamp, and rows on the opposite edge
+    /// after a direction reversal. Other grids are left alone; they lose their
+    /// rows only to the `maxRetainedGrids` cap below. A step stages one or more
     /// rows, which is why this is separate from `stage`: rows of the same step
     /// must not displace each other.
     func beginStep(gridId: Int64, rowsDelta: Int, pivotTargetRow: Int) {
@@ -358,6 +420,17 @@ final class ScrollRetention {
             stagedValid = true
             staged.removeAll(keepingCapacity: true)
             staged.append(contentsOf: published)
+            // Eviction takes a grid out of `staged` and out of the order, but
+            // its rows leave `published` only at a commit — so a bracket that
+            // aborts hands them back here for a grid the order no longer names,
+            // and nothing would ever evict it again. Re-admit whatever the seed
+            // brought, least-recent first (it is not being stepped now), and
+            // drop names that hold nothing so a live grid is never the victim
+            // in a ghost's place. In place on a list of at most a few entries.
+            stepOrder.removeAll { name in !staged.contains { $0.gridId == name } }
+            for row in staged where !stepOrder.contains(row.gridId) {
+                stepOrder.insert(row.gridId, at: 0)
+            }
         }
         // Hold the ring's sizing assumption. Rows are capped per grid but the
         // number of grids was not, and a `windo`/'scrollbind' group larger than
@@ -367,8 +440,14 @@ final class ScrollRetention {
         stepOrder.removeAll { $0 == gridId }
         stepOrder.append(gridId)
         while stepOrder.count > Self.maxRetainedGrids {
-            let evicted = stepOrder.removeFirst()
-            staged.removeAll { $0.gridId == evicted }
+            let dropped = stepOrder.removeFirst()
+            staged.removeAll { $0.gridId == dropped }
+            // Reported so the caller can forget it staged anything for this
+            // grid: the row-scroll fast path stands down for a grid the
+            // notification path already retained, and standing down for one
+            // whose rows were just thrown away leaves its band empty AND
+            // unretained.
+            if !evictedGrids.contains(dropped) { evictedGrids.append(dropped) }
         }
         // Grid-scoped: a step describes one grid's movement, and 'scrollbind'
         // (:vert diffsplit) scrolls two windows from one gesture, each needing
@@ -384,6 +463,15 @@ final class ScrollRetention {
                     || ($0.targetRow - pivotTargetRow) * rowsDelta > 0)
         }
         lock.unlock()
+    }
+
+    /// Take the grids the cap has dropped rows for, clearing the record.
+    /// Appends rather than replacing, so a caller can accumulate across steps.
+    func takeEvictedGrids(into out: inout [Int64]) {
+        lock.lock()
+        defer { lock.unlock() }
+        out.append(contentsOf: evictedGrids)
+        evictedGrids.removeAll(keepingCapacity: true)
     }
 
     /// Grab the next ring slot with at least `needed` bytes.

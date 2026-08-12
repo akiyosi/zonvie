@@ -1173,7 +1173,10 @@ pub const Viewport = struct {
     line_count: i64 = 0,
     scroll_delta: i64 = 0,
     /// Screen rows the view moved that no grid_scroll accounted for, summed
-    /// since the frontend last took them. win_viewport's scroll_delta counts
+    /// until the flush delivers them through on_grid_scroll and clears this.
+    /// (The frontend used to poll for them; it no longer can, since a poll
+    /// from inside a flush bracket would find grid_mu already held.)
+    /// win_viewport's scroll_delta counts
     /// screen rows, so under 'smoothscroll' — where Neovim repaints instead of
     /// emitting grid_scroll — this is the only signal that content moved.
     /// Normal scrolling makes the two agree and this stays at 0.
@@ -4989,7 +4992,7 @@ test "subgrid scroll keeps submitted vertex counts aligned with row slots" {
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
 }
 
-test "viewport metadata ignores unknown grids" {
+test "viewport metadata ignores unknown grids, except margins" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
 

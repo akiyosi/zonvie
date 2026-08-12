@@ -227,7 +227,10 @@ private enum ScrollRetentionTests {
         let retention = ScrollRetention(device: device)
         retention.setDepthRows(2)
         retention.beginFlush()
-        let grids: [Int64] = [2, 3, 4, 5, 6]
+        // One more grid than the cap allows, derived so raising the cap does
+        // not silently turn this into a test that never evicts anything.
+        let newest = Int64(ScrollRetention.maxRetainedGrids) + 2
+        let grids: [Int64] = Array(Int64(2)...newest)
         for grid in grids {
             retention.beginStep(gridId: grid, rowsDelta: 1, pivotTargetRow: 0)
             retention.stage(makeRow(retention, gridId: grid, targetRow: 0))
@@ -241,20 +244,190 @@ private enum ScrollRetentionTests {
             retention.publishedCount(gridId: 2), 0,
             "the least recently stepped grid is the one dropped"
         )
-        requireEqual(retention.publishedCount(gridId: 6), 1, "the newest grid keeps its rows")
+        requireEqual(retention.publishedCount(gridId: newest), 1, "the newest grid keeps its rows")
 
         // Stepping a grid again makes it the most recent, so it survives the
         // next eviction rather than being dropped for its original position.
         retention.beginFlush()
         retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
         retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
-        retention.beginStep(gridId: 7, rowsDelta: 1, pivotTargetRow: 0)
-        retention.stage(makeRow(retention, gridId: 7, targetRow: 0))
+        retention.beginStep(gridId: newest + 1, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: newest + 1, targetRow: 0))
         _ = retention.commit()
         // Rows carried over from the previous commit are re-seeded alongside
         // the new one, so what matters here is that any survive at all.
         require(retention.publishedCount(gridId: 3) > 0, "a re-stepped grid is not evicted")
         requireEqual(retention.publishedCount(gridId: 4), 0, "the next least recent goes instead")
+    }
+
+    /// The cap has to hold across brackets that abort. Eviction drops a grid
+    /// from `staged`, but its rows leave `published` only at a commit — so a
+    /// bracket that aborts leaves rows for a grid the order no longer names,
+    /// and the next bracket seeds them back in as a grid nothing will evict.
+    private static func verifyCapSurvivesAbortedBrackets(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(2)
+
+        func step(_ grids: [Int64]) {
+            for grid in grids {
+                retention.beginStep(gridId: grid, rowsDelta: 1, pivotTargetRow: 0)
+                retention.stage(makeRow(retention, gridId: grid, targetRow: 0))
+            }
+        }
+
+        // Two more grids than the cap allows, so the two least recent (2 and 3)
+        // are evicted. Derived from the cap for the reason above.
+        let last = Int64(ScrollRetention.maxRetainedGrids) + 3
+        retention.beginFlush()
+        step(Array(Int64(2)...last))
+        _ = retention.commit()
+
+        // Two brackets that stage and then abort (the next beginFlush is the
+        // abort), leaving 2 and 3 named by the order but holding nothing.
+        retention.beginFlush()
+        step([2, 3])
+        retention.beginFlush()
+        step([4, 5])
+        retention.beginFlush()
+        step([last + 1])
+        _ = retention.commit()
+
+        var held = 0
+        for grid in Int64(2)...(last + 1) where retention.publishedCount(gridId: grid) > 0 {
+            held += 1
+        }
+        require(
+            held <= ScrollRetention.maxRetainedGrids,
+            "grids holding rows after an aborted bracket: \(held), cap is \(ScrollRetention.maxRetainedGrids)"
+        )
+    }
+
+    /// The ring is the only thing keeping a retained buffer alive, so it must
+    /// be strictly larger than the buffers that can be live at once: the
+    /// published set, the set being staged, and one snapshot per in-flight
+    /// frame. External surfaces allow two frames.
+    private static func verifyRingOutlivesTheLiveSet() {
+        let perSet = ScrollRetention.maxRetainedGrids * ScrollRetention.maxDepthRows
+        let live = perSet * (1 /* published */ + 1 /* staging */ + ScrollRetention.maxInFlightFrames)
+        require(
+            ScrollRetention.ringSize > live,
+            "ringSize \(ScrollRetention.ringSize) must exceed the \(live) buffers that can be live at once"
+        )
+    }
+
+    /// The credit rule. Two kinds of grid, two rules — keyed on whether the
+    /// grid books scrolls, not on whether its booking happens to be empty.
+    private static func verifyCreditRule() {
+        let h: CGFloat = 40
+        let step = 3
+        let eps: CGFloat = 1
+
+        func credit(
+            _ held: CGFloat, booked: Int, delta: Int, bound: Bool = false
+        ) -> CGFloat? {
+            ScrollRetention.creditedOffsetPx(
+                heldPx: held, bookedRows: booked, rowsDelta: delta,
+                rowHeightPx: h, stepRows: step, bound: bound, epsilonPx: eps
+            )
+        }
+
+        // Driver: the booking bounds the credit, and settling drops the entry.
+        require(credit(120, booked: 3, delta: -3) == nil, "driver settles on the cell grid")
+        requireEqual(credit(30, booked: 3, delta: -3), -90, "driver keeps the finger's residue")
+        requireEqual(credit(120, booked: 3, delta: -1), 80, "driver at a buffer edge")
+        // The driver's booking also empties mid-gesture on a wrapped scroll —
+        // there the deepen rule is what stops the over-report running away.
+        requireEqual(credit(-45, booked: 0, delta: -12), -45, "driver's over-report may not deepen")
+
+        // Bound: the report is the only account, so it may deepen — capped.
+        requireEqual(credit(-5, booked: 0, delta: -3, bound: true), -120, "bound deepens from near zero")
+        requireEqual(credit(0, booked: 0, delta: -3, bound: true), -120, "bound from rest")
+        requireEqual(credit(-120, booked: 0, delta: -3, bound: true), -120, "bound holds at the ceiling")
+        requireEqual(credit(100, booked: 0, delta: -3, bound: true), -20, "bound crosses zero")
+        requireEqual(credit(0, booked: 0, delta: -12, bound: true), -120, "bound over-report bounded")
+
+        // The invariant the whole rule exists for: a bound window is never told
+        // its content moved and then left with the same compensation.
+        for heldTicks in -40...40 {
+            for delta in -12...12 where delta != 0 {
+                let held = CGFloat(heldTicks) * 5
+                guard let got = credit(held, booked: 0, delta: delta, bound: true) else { continue }
+                let ceiling = h * CGFloat(step)
+                require(
+                    got != held || abs(held) >= ceiling - 0.001,
+                    "bound window uncompensated at held \(held), delta \(delta)"
+                )
+            }
+        }
+    }
+
+    /// A bound window is only recognised once its first scroll shares a batch
+    /// with the driver's, by which time the finger has banked a round trip's
+    /// travel it was never paid. Starting it from zero leaves the two panes of
+    /// a diff a fraction of a row apart for the rest of the gesture, so the
+    /// banked value has to reach the credit — not just the dictionary.
+    private static func verifyBoundWindowStartsFromTheDriver() {
+        let h: CGFloat = 40
+        // The driver banked this much finger travel before the first arrival,
+        // and booked one wheel event for it.
+        let banked: CGFloat = 30
+
+        let driver = ScrollRetention.creditedOffsetPx(
+            heldPx: banked, bookedRows: 3, rowsDelta: -3,
+            rowHeightPx: h, stepRows: 3, bound: false, epsilonPx: 1
+        )
+        let seeded = ScrollRetention.creditedOffsetPx(
+            heldPx: banked, bookedRows: 0, rowsDelta: -3,
+            rowHeightPx: h, stepRows: 3, bound: true, epsilonPx: 1
+        )
+        let unseeded = ScrollRetention.creditedOffsetPx(
+            heldPx: 0, bookedRows: 0, rowsDelta: -3,
+            rowHeightPx: h, stepRows: 3, bound: true, epsilonPx: 1
+        )
+        require(
+            seeded != unseeded,
+            "seeding must change the credit (got \(String(describing: seeded)) either way)"
+        )
+        // The point of seeding: the two panes land in the same place.
+        requireEqual(seeded, driver, "a seeded bound window lands where the driver does")
+        require(
+            unseeded != driver,
+            "without the seed the panes would not have differed, so this test proves nothing"
+        )
+    }
+
+    /// Eviction has to be reported. The renderer stands the row-scroll fast
+    /// path down for a grid the notification path already retained; standing
+    /// down for one whose rows the cap has just thrown away would leave that
+    /// window with neither a retained row nor a fast-path capture.
+    private static func verifyEvictionIsReported(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(2)
+        retention.beginFlush()
+
+        var evicted: [Int64] = []
+        retention.takeEvictedGrids(into: &evicted)
+        require(evicted.isEmpty, "nothing evicted before the cap is reached")
+
+        // Exactly the cap, derived so raising it does not turn this into a test
+        // that never reaches an eviction at all.
+        let atCap = Int64(ScrollRetention.maxRetainedGrids) + 1
+        for grid in Int64(2)...atCap {
+            retention.beginStep(gridId: grid, rowsDelta: 1, pivotTargetRow: 0)
+            retention.stage(makeRow(retention, gridId: grid, targetRow: 0))
+        }
+        retention.takeEvictedGrids(into: &evicted)
+        require(evicted.isEmpty, "at the cap, still nothing evicted")
+
+        retention.beginStep(gridId: atCap + 1, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: atCap + 1, targetRow: 0))
+        retention.takeEvictedGrids(into: &evicted)
+        requireEqual(evicted, [2], "the grid whose rows were dropped is named")
+
+        // Taking clears the record.
+        evicted.removeAll()
+        retention.takeEvictedGrids(into: &evicted)
+        require(evicted.isEmpty, "the record is cleared by taking it")
     }
 
     /// A retained row is only meaningful while its grid is displaced.
@@ -288,6 +461,9 @@ private enum ScrollRetentionTests {
     static func main() {
         verifyPlan()
         verifyCoversBand()
+        verifyRingOutlivesTheLiveSet()
+        verifyCreditRule()
+        verifyBoundWindowStartsFromTheDriver()
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             // Headless CI without a GPU: the arithmetic above still ran.
@@ -299,6 +475,8 @@ private enum ScrollRetentionTests {
         verifyGridsAreIndependent(device: device)
         verifyStepLeavesOtherGridsInPlace(device: device)
         verifyGridCountIsCapped(device: device)
+        verifyCapSurvivesAbortedBrackets(device: device)
+        verifyEvictionIsReported(device: device)
         verifyPrune(device: device)
         verifyDepthClamp(device: device)
         print("ScrollRetentionTests: OK")

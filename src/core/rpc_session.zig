@@ -1436,11 +1436,16 @@ pub fn setupMouseScrollReporter(self: *Core) void {
 /// agree and the sub-cell model holds.
 ///
 /// The previous value is stashed in a window variable and restored from it, so
-/// a restore that arrives twice is harmless, and one that never arrives leaves
-/// the trace the next borrow over that window restores from. Windows without
-/// 'wrap' are skipped, where the option would do nothing — but 'wrap' is on by
-/// default, so this is not the common case: expect an OptionSet autocmd (which
-/// user config can observe) per gesture on a normally configured window.
+/// a restore that arrives twice is harmless. One that never arrives leaves the
+/// stash behind, and the borrow does NOT undo that by itself — the stash makes
+/// the next enable a no-op, so recovery takes a whole further gesture over that
+/// window, borrow and hand-back both.
+///
+/// Windows without 'wrap' are skipped, where the option would do nothing — but
+/// 'wrap' is on by default, so that is not the common case. Expect TWO
+/// OptionSet events per gesture on a normally configured window (the borrow and
+/// the restore are each a set, and Neovim fires OptionSet even when the value
+/// does not change), which user config can observe.
 ///
 /// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
 ///
@@ -1461,8 +1466,11 @@ pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
         break :blk vp.win;
     };
     if (win == 0) {
+        // Reported as done, not as busy. No window means the grid is gone —
+        // its window-local option and the stash went with it, so there is
+        // nothing left to restore and a caller retrying would do so forever.
         self.log.write("[ss_borrow] grid={d} enable={any} no window\n", .{ grid_id, enable });
-        return false;
+        return true;
     }
 
     const enable_lua =
