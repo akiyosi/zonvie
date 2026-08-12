@@ -189,7 +189,7 @@ atlas_size = 2048
 disable_on_activate = false
 disable_on_modechange = false
 option_as_meta = "both"  # "both", "none", "only_left", "only_right"
-preedit_mode = "overlay"  # "overlay" (floating overlay) or "extmark" (inline virt_text)
+preedit_mode = "overlay"  # "overlay" (floating overlay) or "inline" (inline virt_text)
 
 [input]
 swap_colon_semicolon = false  # swap the `:` and `;` keys (single keypresses only)
@@ -343,7 +343,7 @@ as a single live dialog rather than as messages — so the override exists for
 | `disable_on_activate` | Disable IME when app becomes active (true/false) |
 | `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
 | `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
-| `preedit_mode` | IME preedit display: "overlay" (floating overlay) or "extmark" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
+| `preedit_mode` | IME preedit display: "overlay" (floating overlay) or "inline" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
 
 #### [input]
 | Key | Description |

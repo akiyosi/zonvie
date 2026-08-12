@@ -19,7 +19,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var h = try Harness.init(alloc, .{});
     defer h.deinit();
 
-    // Enable extmark preedit mode (config.toml: ime.preedit_mode = "extmark").
+    // Enable extmark preedit mode (config.toml: ime.preedit_mode = "inline").
     h.core.msg_config.ime.preedit_mode = .extmark;
 
     // Outside insert mode the frontend must draw the overlay itself.

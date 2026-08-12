@@ -220,7 +220,7 @@ pub const Config = struct {
 
     /// How IME preedit (composition) text is displayed.
     /// overlay: frontend draws a floating overlay on top of the grid (default).
-    /// extmark: core inserts the preedit as an inline virt_text extmark in the
+    /// extmark (config value "inline"): core inserts the preedit as an inline virt_text extmark in the
     ///   buffer, so trailing text shifts right as it would after commit.
     ///   Falls back to overlay outside insert/replace modes (e.g. cmdline).
     pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
@@ -527,7 +527,7 @@ pub const Config = struct {
                 else if (std.mem.eql(u8, v, "only_right")) { self.ime.option_as_meta = .only_right; }
             }
             if (i.preedit_mode) |v| {
-                if (std.mem.eql(u8, v, "extmark")) { self.ime.preedit_mode = .extmark; }
+                if (std.mem.eql(u8, v, "inline")) { self.ime.preedit_mode = .extmark; }
                 else if (std.mem.eql(u8, v, "overlay")) { self.ime.preedit_mode = .overlay; }
             }
         }
