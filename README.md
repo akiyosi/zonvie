@@ -102,8 +102,24 @@ zonvie --connect-nvim=\\.\pipe\nvim.31920.0  # Windows: named pipe
 ## Configuration
 
 Configuration file location:
-- `~/.config/zonvie/config.toml`
-- Or `$XDG_CONFIG_HOME/zonvie/config.toml`
+
+macOS / Linux — a single path, chosen without looking at the filesystem:
+- `$XDG_CONFIG_HOME/zonvie/config.toml` whenever `XDG_CONFIG_HOME` is set and
+  non-empty. `~/.config` is then never consulted, even if the XDG-rooted file
+  does not exist.
+- `~/.config/zonvie/config.toml` otherwise.
+
+Windows — each candidate is tested for existence, and the first one that
+exists wins (`XDG_CONFIG_HOME` is not consulted):
+- `%APPDATA%\zonvie\config.toml`
+- `%USERPROFILE%\.config\zonvie\config.toml`
+
+`zonvie --install` writes a default config, and never overwrites an existing
+one. On macOS it writes to the same single path the app reads. On Windows it
+always writes to `%APPDATA%`, so running it while a config lives at the
+`%USERPROFILE%\.config` fallback will shadow that config. Windows also creates
+the default config automatically on first launch when neither candidate
+exists.
 
 ### Example Configuration
 
