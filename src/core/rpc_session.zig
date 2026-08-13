@@ -1142,9 +1142,10 @@ pub fn setupClipboard(self: *Core) void {
 /// a per-tabpage state and reports it via the zonvie_agent_status notification:
 ///   0=none  1=idle (agent present)  2=working/claude  3=working/braille(codex).
 /// Agent presence + kind are latched per buffer (claude is recognized by its
-/// '✳' U+2733 idle marker or "Claude" in the title; anything else with a Braille
-/// spinner is treated as codex/generic). The frontend renders/animates from the
-/// low 7 bits of the wire state.
+/// '✳' U+2733 idle marker, its U+25D0..U+25D3 rotating-circle working spinner,
+/// or "Claude" in the title; anything else with a Braille spinner is treated as
+/// codex/generic). The frontend renders/animates from the low 7 bits of the
+/// wire state.
 /// Bit 7 (0x80) of the wire state is a "fire the OS notification now" flag,
 /// only ever set together with base state 1 (finished) or 4 (needs input).
 /// Completion is edge-detected per BUFFER (prevb[]), not per tab, because a
@@ -1184,17 +1185,30 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    or t:find('to proceed') ~= nil or t:find('tell Claude') ~= nil
         \\    or t:find('%[y/n%]') ~= nil or t:find('Allow command') ~= nil
         \\end
-        \\local function spinning(title)
+        \\-- Leading marker of an agent's OSC title. Claude Code animates a
+        \\-- rotating circle (U+25D0..U+25D3) while working and shows the '✳'
+        \\-- U+2733 star when idle; codex and generic agents animate a Braille
+        \\-- spinner. While Claude works, the title body is its task summary --
+        \\-- the word "Claude" is absent -- so the circle is the only thing that
+        \\-- keeps the tab from looking like the agent exited.
+        \\local function marker(title)
         \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
-        \\  return cp >= 0x2800 and cp <= 0x28FF
+        \\  if cp >= 0x2800 and cp <= 0x28FF then return 'braille' end
+        \\  if cp >= 0x25D0 and cp <= 0x25D3 then return 'circle' end
+        \\  if cp == 0x2733 then return 'idle' end
+        \\  return nil
+        \\end
+        \\local function spinning(title)
+        \\  local m = marker(title)
+        \\  return m == 'braille' or m == 'circle'
         \\end
         \\-- classify returns 2/3 = working, 0 = gone, 1 = present-but-stopped
         \\-- (done OR waiting -- decided later by a deferred scrape, because the
         \\-- prompt box may not be in the buffer yet at the instant the spinner stops).
         \\local function classify(buf, title)
-        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
-        \\  local spin = cp >= 0x2800 and cp <= 0x28FF
-        \\  local claudeish = cp == 0x2733 or title:find('Claude') ~= nil
+        \\  local m = marker(title)
+        \\  local spin = m == 'braille' or m == 'circle'
+        \\  local claudeish = m == 'idle' or m == 'circle' or title:find('Claude') ~= nil
         \\  if claudeish then present[buf] = true; kind[buf] = 'claude' end
         \\  if spin then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
         \\  if spin then return (kind[buf] == 'claude') and 2 or 3 end
@@ -1318,8 +1332,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
         \\    if not body then return end
         \\    local s = classify(ev.buf, body)
-        \\    local cp0 = body ~= '' and vim.fn.char2nr(body) or 0
-        \\    local title = (cp0 == 0x2733 or (cp0 >= 0x2800 and cp0 <= 0x28FF)) and (body:gsub('^[^ ]+%s*', '')) or body
+        \\    local title = marker(body) and (body:gsub('^[^ ]+%s*', '')) or body
         \\    if s == 1 then
         \\      decide_stopped(ev.buf, title)
         \\    else
@@ -1355,8 +1368,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
         \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
         \\      t = (ok and t) or ''
-        \\      local cp = t ~= '' and vim.fn.char2nr(t) or 0
-        \\      local agentish = cp == 0x2733 or (cp >= 0x2800 and cp <= 0x28FF) or t:find('Claude') ~= nil
+        \\      local agentish = marker(t) ~= nil or t:find('Claude') ~= nil
         \\      -- Gone if the title is empty (zsh after exit), or a claude tab no
         \\      -- longer shows any agent marker (cmd.exe took the title over).
         \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
