@@ -2090,10 +2090,10 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .perf_hl_cache_size = @intCast(cfg.performance.hl_cache_size),
         .perf_shape_cache_size = @intCast(cfg.performance.shape_cache_size),
         .perf_atlas_size = @intCast(cfg.performance.atlas_size),
-        // ime
-        .ime_disable_on_activate = cfg.ime.disable_on_activate,
-        .ime_disable_on_modechange = cfg.ime.disable_on_modechange,
-        .ime_option_as_meta = @intFromEnum(cfg.ime.option_as_meta),
+        // ime (config surface lives in [input])
+        .ime_disable_on_activate = cfg.input.ime_disable_on_activate,
+        .ime_disable_on_modechange = cfg.input.ime_disable_on_modechange,
+        .ime_option_as_meta = @intFromEnum(cfg.input.option_as_meta),
         // shaders
         .shader_enabled = cfg.shaders.enabled,
         .shader_post_process = @intFromEnum(cfg.shaders.post_process),

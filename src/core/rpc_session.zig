@@ -1809,7 +1809,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Check IME off request (from mode_change event)
         if (self.grid.ime_off_requested) {
             self.grid.ime_off_requested = false;
-            if (self.msg_config.ime.disable_on_modechange) {
+            if (self.msg_config.input.ime_disable_on_modechange) {
                 if (self.cb.on_ime_off) |cb| {
                     cb(self.ctx);
                 }

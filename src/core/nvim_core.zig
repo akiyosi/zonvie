@@ -306,7 +306,7 @@ pub const Callbacks = struct {
     /// notification can stand for several scrolls.
     on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void = null,
 
-    /// Called when IME should be turned off (mode change with ime.disable_on_modechange,
+    /// Called when IME should be turned off (mode change with input.ime_disable_on_modechange,
     /// or RPC zonvie_ime_off notification).
     on_ime_off: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
@@ -5246,7 +5246,7 @@ pub const Core = struct {
     /// with ZonviePreeditTarget. When target_start >= target_end the whole
     /// preedit uses the normal ZonviePreedit group.
     pub fn setPreedit(self: *Core, text: []const u8, target_start: usize, target_end: usize) bool {
-        if (self.msg_config.ime.preedit_mode != .extmark) return false;
+        if (self.msg_config.input.ime_preedit_mode != .extmark) return false;
 
         // Read the current mode under grid_mu, but keep the critical section
         // tiny: never send RPC (alloc + write-queue lock + possible blocking
