@@ -870,45 +870,30 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
     _ = c.SetEvent(app.clipboard_event);
 }
 
-/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET)
-pub fn handleClipboardSetOnUIThread(app: *App) void {
-    app.clipboard_result = 0; // Failure by default
-
-    const data = app.clipboard_set_data orelse {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    };
-    const len = app.clipboard_set_len;
-
-    if (len == 0) {
-        app.clipboard_result = 1;
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+/// Put UTF-8 text on the Windows clipboard as CF_UNICODETEXT. Must run on the
+/// UI thread. An empty slice succeeds without touching the clipboard.
+pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
+    if (text.len == 0) return true;
 
     // Convert UTF-8 to UTF-16
     const wide_len = c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
-        @ptrCast(data),
-        @intCast(len),
+        @ptrCast(text.ptr),
+        @intCast(text.len),
         null,
         0,
     );
 
     if (wide_len <= 0) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: UTF-8 to UTF-16 conversion failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
-        return;
+        return false;
     }
 
-    const hwnd = app.hwnd orelse null;
-
     // Open clipboard
-    if (c.OpenClipboard(hwnd) == 0) {
+    if (c.OpenClipboard(owner_hwnd) == 0) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: OpenClipboard failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
-        return;
+        return false;
     }
     defer _ = c.CloseClipboard();
 
@@ -919,23 +904,21 @@ pub fn handleClipboardSetOnUIThread(app: *App) void {
     const hglobal = c.GlobalAlloc(c.GMEM_MOVEABLE, byte_size);
     if (hglobal == null) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: GlobalAlloc failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
-        return;
+        return false;
     }
 
     const dest_ptr = c.GlobalLock(hglobal);
     if (dest_ptr == null) {
         _ = c.GlobalFree(hglobal);
-        _ = c.SetEvent(app.clipboard_event);
-        return;
+        return false;
     }
 
     // Convert and copy
     _ = c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
-        @ptrCast(data),
-        @intCast(len),
+        @ptrCast(text.ptr),
+        @intCast(text.len),
         @ptrCast(@alignCast(dest_ptr)),
         wide_len,
     );
@@ -950,12 +933,26 @@ pub fn handleClipboardSetOnUIThread(app: *App) void {
     if (c.SetClipboardData(c.CF_UNICODETEXT, hglobal) == null) {
         _ = c.GlobalFree(hglobal);
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: SetClipboardData failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
-        return;
+        return false;
     }
 
-    if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: success len={d}\n", .{len});
-    app.clipboard_result = 1;
+    if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: success len={d}\n", .{text.len});
+    return true;
+}
+
+/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET)
+pub fn handleClipboardSetOnUIThread(app: *App) void {
+    app.clipboard_result = 0; // Failure by default
+
+    const data = app.clipboard_set_data orelse {
+        _ = c.SetEvent(app.clipboard_event);
+        return;
+    };
+    const len = app.clipboard_set_len;
+
+    if (setClipboardTextUtf8(app.hwnd orelse null, data[0..len])) {
+        app.clipboard_result = 1;
+    }
     _ = c.SetEvent(app.clipboard_event);
 }
 

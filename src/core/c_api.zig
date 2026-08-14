@@ -792,6 +792,33 @@ test "retry entry points reject work after stop is requested" {
     try std.testing.expectEqual(@as(u32, 0), state.callback_count);
 }
 
+test "grid text extraction trims blanks and reports the size a short buffer needs" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+
+    const gid = grid_mod.MESSAGE_GRID_ID;
+    try box.core.grid.resizeGrid(gid, 4, 8);
+    box.core.grid.clearGrid(gid);
+    // Row 0 "hi", row 1 blank, row 2 "ok" with trailing blanks, row 3 blank.
+    _ = box.core.grid.putCellGrid(gid, 0, 0, 'h', 0);
+    _ = box.core.grid.putCellGrid(gid, 0, 1, 'i', 0);
+    _ = box.core.grid.putCellGrid(gid, 2, 0, 'o', 0);
+    _ = box.core.grid.putCellGrid(gid, 2, 1, 'k', 0);
+
+    var buf: [32]u8 = undefined;
+    const needed = zonvie_core_try_get_grid_text(p, gid, &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 6), needed);
+    try std.testing.expectEqualStrings("hi\n\nok", buf[0..@intCast(needed)]);
+
+    // A buffer that cannot hold the whole text still reports the full size.
+    var short: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 6), zonvie_core_try_get_grid_text(p, gid, &short, short.len));
+
+    // An unknown grid is empty, not an error.
+    try std.testing.expectEqual(@as(isize, 0), zonvie_core_try_get_grid_text(p, 4242, &buf, buf.len));
+}
+
 test "current mode accessor returns a snapshot independent of core storage" {
     const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
     defer zonvie_core_destroy(p);
@@ -1942,8 +1969,10 @@ pub const zonvie_config_values = extern struct {
     scrollbar_delay: f32 = 1.0,
     // ext features
     cmdline_external: bool = false,
+    cmdline_copy_button: bool = true,
     popup_external: bool = false,
     messages_external: bool = false,
+    messages_copy_button: bool = true,
     messages_ext_float_pos: i32 = 0, // 0=window, 1=grid, 2=display
     messages_mini_pos: i32 = 1, // 0=window, 1=grid, 2=display
     tabline_external: bool = false,
@@ -2061,8 +2090,10 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .scrollbar_delay = cfg.scrollbar.delay,
         // ext features
         .cmdline_external = cfg.cmdline.external,
+        .cmdline_copy_button = cfg.cmdline.copy_button,
         .popup_external = cfg.popup.external,
         .messages_external = cfg.messages.external,
+        .messages_copy_button = cfg.messages.copy_button,
         .messages_ext_float_pos = msgPosToInt(cfg.messages.msg_pos.ext_float),
         .messages_mini_pos = msgPosToInt(cfg.messages.msg_pos.mini),
         .tabline_external = cfg.tabline.external,
@@ -2182,6 +2213,108 @@ pub export fn zonvie_core_try_cell_has_url(
     const hl_id = box.core.grid.getCellHLGrid(grid_id, @intCast(row), @intCast(col));
     const attr = box.core.hl.map.get(hl_id) orelse return 0;
     return if (attr.has_url) @as(i32, 1) else @as(i32, 0);
+}
+
+/// Truncating UTF-8 sink for zonvie_core_try_get_grid_text. `needed` keeps
+/// counting past `cap` so the caller learns the exact size to retry with.
+const GridTextSink = struct {
+    buf: ?[*]u8,
+    cap: usize,
+    needed: usize = 0,
+    written: usize = 0,
+
+    fn pushBytes(self: *GridTextSink, src: []const u8) void {
+        self.needed += src.len;
+        const buf = self.buf orelse return;
+        for (src) |ch| {
+            if (self.written >= self.cap) return;
+            buf[self.written] = ch;
+            self.written += 1;
+        }
+    }
+
+    fn pushCodepoint(self: *GridTextSink, cp: u32) void {
+        const cp21 = std.math.cast(u21, cp) orelse return;
+        var scratch: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp21, &scratch) catch return;
+        self.pushBytes(scratch[0..n]);
+    }
+};
+
+/// Non-blocking extraction of a grid's rendered text as UTF-8.
+///
+/// Rows are joined with '\n' and each row is trimmed of trailing blanks; a
+/// wide glyph's continuation cell (cp == 0) contributes nothing. Backs the
+/// frontends' "copy content" button on the decorated ext_cmdline /
+/// ext_messages surfaces, so it must never block the UI thread: the core
+/// thread holds `grid_mu` for the whole of handleRedraw and its callbacks
+/// can wait on the UI thread, so a blocking lock here would deadlock.
+///
+/// Returns the byte length the full text needs (NUL terminator excluded),
+/// or -1 when the grid lock is unavailable. When the return value is
+/// <= out_cap the buffer holds the complete text.
+pub export fn zonvie_core_try_get_grid_text(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    out_buf: ?[*]u8,
+    out_cap: usize,
+) callconv(.c) isize {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    if (!box.core.grid_mu.tryLock()) return -1;
+    defer box.core.grid_mu.unlock(clock.io());
+
+    const g = &box.core.grid;
+    var rows: u32 = 0;
+    var cols: u32 = 0;
+    if (grid_id == 1) {
+        rows = g.rows;
+        cols = g.cols;
+    } else if (g.sub_grids.getPtr(grid_id)) |sg| {
+        rows = sg.rows;
+        cols = sg.cols;
+    } else {
+        return 0;
+    }
+
+    // `needed` counts the full text; `written` only what fit in out_buf, so
+    // a caller with a too-small buffer learns the exact size to retry with.
+    var sink = GridTextSink{ .buf = out_buf, .cap = out_cap };
+
+    // Newlines are emitted lazily so a run of blank rows costs nothing until
+    // a row with content follows; trailing blank rows produce no newlines.
+    var pending_newlines: usize = 0;
+    var row: u32 = 0;
+    while (row < rows) : (row += 1) {
+        // Trim trailing blanks by locating the last meaningful cell first.
+        var last_non_blank: ?u32 = null;
+        var probe: u32 = 0;
+        while (probe < cols) : (probe += 1) {
+            const cell = g.getCellGrid(grid_id, row, probe);
+            if (cell.cp != 0 and cell.cp != ' ') last_non_blank = probe;
+        }
+        const end_col = if (last_non_blank) |lc| lc + 1 else 0;
+        if (end_col == 0) {
+            if (sink.needed > 0) pending_newlines += 1;
+            continue;
+        }
+        while (pending_newlines > 0) : (pending_newlines -= 1) sink.pushBytes("\n");
+        if (sink.needed > 0 and row > 0) sink.pushBytes("\n");
+
+        var col: u32 = 0;
+        while (col < end_col) : (col += 1) {
+            const cell = g.getCellGrid(grid_id, row, col);
+            // cp == 0 is a wide glyph's continuation cell: it has no text.
+            if (cell.cp == 0) continue;
+            sink.pushCodepoint(cell.cp);
+            if (g.getOverflow(grid_id, row, col)) |extras| {
+                for (extras) |extra_cp| sink.pushCodepoint(extra_cp);
+            }
+        }
+    }
+    const needed = sink.needed;
+
+    return std.math.cast(isize, needed) orelse std.math.maxInt(isize);
 }
 
 // Invalidate glyph cache, shape cache, and atlas state.

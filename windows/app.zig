@@ -346,6 +346,14 @@ pub const CMDLINE_SCREEN_MARGIN: u32 = 40; // Margin from screen edges (matching
 // --- Msg_show window styling constants ---
 pub const MSG_PADDING: u32 = 8; // Padding around content (pixels)
 
+// --- Copy-content button (decorated cmdline / message surfaces) ---
+// Unscaled base sizes; every consumer runs them through App.scalePx.
+pub const COPY_BUTTON_SIZE: u32 = 18; // Icon box / hit area (pixels)
+pub const COPY_BUTTON_MARGIN_LEFT: u32 = 4; // Gap from grid content (pixels)
+pub const COPY_BUTTON_MARGIN_RIGHT: u32 = 8; // Gap from trailing edge (pixels)
+/// Vertices addCopyIconVerts consumes (one SDF quad).
+pub const COPY_ICON_VERTS: usize = 6;
+
 // =========================================================================
 // Scrollbar throttle
 // =========================================================================
@@ -4650,6 +4658,62 @@ pub fn addSearchIconVerts(
     return idx;
 }
 
+/// Add a "copy" icon (two overlapping rounded squares) using SDF.
+/// Icon area: top-left (x, y), bottom-right (x + w, y - h).
+/// Consumes COPY_ICON_VERTS vertices (1 quad, rendered via shader SDF).
+pub fn addCopyIconVerts(
+    verts: []core.Vertex,
+    start_idx: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [4]f32,
+    grid_id: i64,
+) usize {
+    // Same margin percentage for both axes -> visually square on screen
+    const margin = 0.12;
+    const safe_x = x + w * margin;
+    const safe_y = y - h * margin;
+    const safe_w = w * (1.0 - 2.0 * margin);
+    const safe_h = h * (1.0 - 2.0 * margin);
+
+    var idx = start_idx;
+
+    // uv.x = -6.0 (ICON_COPY), uv.y = local_x, deco_phase = local_y
+    const copy_tex_x: f32 = -6.0;
+    const positions = [_][2]f32{
+        .{ safe_x, safe_y }, // top-left
+        .{ safe_x + safe_w, safe_y }, // top-right
+        .{ safe_x, safe_y - safe_h }, // bottom-left
+        .{ safe_x + safe_w, safe_y }, // top-right
+        .{ safe_x + safe_w, safe_y - safe_h }, // bottom-right
+        .{ safe_x, safe_y - safe_h }, // bottom-left
+    };
+    const local_uvs = [_][2]f32{
+        .{ 0.0, 0.0 }, // top-left
+        .{ 1.0, 0.0 }, // top-right
+        .{ 0.0, 1.0 }, // bottom-left
+        .{ 1.0, 0.0 }, // top-right
+        .{ 1.0, 1.0 }, // bottom-right
+        .{ 0.0, 1.0 }, // bottom-left
+    };
+
+    for (positions, local_uvs) |pos, luv| {
+        verts[idx] = .{
+            .position = pos,
+            .texCoord = .{ copy_tex_x, luv[0] }, // uv.y = local_x
+            .color = color,
+            .grid_id = grid_id,
+            .deco_flags = 0,
+            .deco_phase = luv[1], // local_y
+        };
+        idx += 1;
+    }
+
+    return idx;
+}
+
 /// Add chevron right icon (>) vertices using SDF
 /// Icon area: top-left (x, y), bottom-right (x+w, y-h)
 /// Returns 6 vertices (1 quad, rendered via shader SDF)
@@ -4780,7 +4844,11 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
             mi.cbSize = @sizeOf(c.MONITORINFO);
             if (c.GetMonitorInfoW(mon, &mi) != 0) {
                 const work_w: u32 = @intCast(@max(1, mi.rcWork.right - mi.rcWork.left));
-                const overhead: u32 = CMDLINE_PADDING * 2 + CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT + CMDLINE_SCREEN_MARGIN;
+                const copy_button_w: u32 = if (app.config.cmdline.copy_button)
+                    @intCast(@max(0, app.scalePx(@as(c_int, COPY_BUTTON_MARGIN_LEFT + COPY_BUTTON_SIZE + COPY_BUTTON_MARGIN_RIGHT))))
+                else
+                    0;
+                const overhead: u32 = CMDLINE_PADDING * 2 + CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT + copy_button_w + CMDLINE_SCREEN_MARGIN;
                 const available_w: u32 = if (work_w > overhead) work_w - overhead else 1;
                 const screen_cols: u32 = @max(40, available_w / cw);
                 core.zonvie_core_set_screen_cols(app.corep, screen_cols);

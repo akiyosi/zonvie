@@ -4019,6 +4019,27 @@ final class ZonvieCore {
     /// Cmdline icon view (for search/command icons)
     private var cmdlineIconView: NSImageView?
 
+    /// Copy-content button installed on decorated external windows
+    /// (ext_cmdline / ext_messages). Carries the grid it copies from so the
+    /// action needs no side table keyed by button identity.
+    final class CopyContentButton: NSButton {
+        let gridId: Int64
+
+        init(gridId: Int64) {
+            self.gridId = gridId
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        // These windows are borderless and never become key, so without this a
+        // click while the app is inactive would only raise the app.
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    }
+
     /// Delegate for external window resize handling
     private class ExternalWindowDelegate: NSObject, NSWindowDelegate {
         weak var core: ZonvieCore?
@@ -4490,7 +4511,7 @@ final class ZonvieCore {
 
             gridView.mainTerminalView = mainView  // Enable key event forwarding
 
-            self.attachExternalGridView(window: window, gridView: gridView, kind: specialKind, geometry: geometry)
+            self.attachExternalGridView(gridId: gridId, window: window, gridView: gridView, kind: specialKind, geometry: geometry)
 
             self.installExternalWindowDelegateIfNeeded(
                 gridId: gridId,
@@ -5386,6 +5407,29 @@ final class ZonvieCore {
         let windowFrame: NSRect
         let iconFrame: NSRect?
         let linkedMsgShowFrame: NSRect?
+        var copyButtonFrame: NSRect? = nil
+    }
+
+    /// Copy button position: trailing edge of the container. The single-row
+    /// cmdline centres it vertically; the multi-row message surfaces pin it to
+    /// the top so it does not drift to the middle of a tall history window.
+    private func copyButtonFrame(
+        containerWidth: CGFloat,
+        containerHeight: CGFloat,
+        alignTop: Bool
+    ) -> NSRect {
+        let size = ZonvieConfig.copyButtonSize
+        let centredY = (containerHeight - size) / 2
+        // AppKit's origin is bottom-left, so "top" is the larger y. The max()
+        // keeps a container too short for the inset from pushing the button
+        // above its own bounds.
+        let topY = containerHeight - size - ZonvieConfig.copyButtonMarginRight
+        return NSRect(
+            x: containerWidth - size - ZonvieConfig.copyButtonMarginRight,
+            y: alignTop ? max(topY, centredY) : centredY,
+            width: size,
+            height: size
+        )
     }
 
     private struct ExternalWindowGeometry {
@@ -5470,11 +5514,11 @@ final class ZonvieCore {
         let cmdlineIconTotalWidth: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
 
         if kind == .cmdline, let screen = NSScreen.main {
-            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
+            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - copyButtonReservedWidth(for: kind) - ZonvieConfig.cmdlineScreenMargin
             contentWidth = min(contentWidth, maxContentWidth)
         }
 
-        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2)
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + (popupmenuPadding * 2) + (msgPadding * 2) + copyButtonReservedWidth(for: kind)
         let containerHeight = contentHeight + (cmdlinePadding * 2) + (popupmenuPadding * 2) + (msgPadding * 2)
         let windowWidth = containerWidth + (shadowMargin * 2)
         let windowHeight = containerHeight + (shadowMargin * 2)
@@ -5499,6 +5543,7 @@ final class ZonvieCore {
     }
 
     private func attachExternalGridView(
+        gridId: Int64,
         window: NSWindow,
         gridView: ExternalGridView,
         kind: ExternalGridKind,
@@ -5506,6 +5551,7 @@ final class ZonvieCore {
     ) {
         if kind != .normal {
             self.installDecoratedExternalWindowShell(
+                gridId: gridId,
                 kind: kind,
                 window: window,
                 gridView: gridView,
@@ -6042,6 +6088,7 @@ final class ZonvieCore {
     }
 
     private func installDecoratedExternalWindowShell(
+        gridId: Int64,
         kind: ExternalGridKind,
         window: NSWindow,
         gridView: ExternalGridView,
@@ -6080,6 +6127,18 @@ final class ZonvieCore {
             self.updateCmdlineIcon()
         }
 
+        var copyButton: CopyContentButton? = nil
+        if copyButtonEnabled(for: kind) {
+            let button = makeCopyContentButton(gridId: gridId)
+            button.frame = copyButtonFrame(
+                containerWidth: containerWidth,
+                containerHeight: containerHeight,
+                alignTop: kind != .cmdline
+            )
+            containerView.addSubview(button)
+            copyButton = button
+        }
+
         gridView.frame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
         containerView.addSubview(gridView)
         // Re-stack the cmdline firstc icon above the MTKView so it is not
@@ -6089,6 +6148,11 @@ final class ZonvieCore {
         // composite through from underneath).
         if kind == .cmdline, let iconView = self.cmdlineIconView {
             containerView.addSubview(iconView, positioned: .above, relativeTo: gridView)
+        }
+        // Same reasoning for the copy button, which additionally has to stay
+        // hit-testable above the MTKView.
+        if let copyButton {
+            containerView.addSubview(copyButton, positioned: .above, relativeTo: gridView)
         }
         window.contentView = containerView
         window.backgroundColor = Self.transparentShadowedWindowBackground
@@ -6279,6 +6343,10 @@ final class ZonvieCore {
         if let iconFrame = layout.iconFrame, let iconView = self.cmdlineIconView {
             iconView.frame = iconFrame
         }
+        if let copyButtonFrame = layout.copyButtonFrame,
+           let button = context.containerView.subviews.compactMap({ $0 as? CopyContentButton }).first {
+            button.frame = copyButtonFrame
+        }
         context.window.setFrame(layout.windowFrame, display: true)
         if let linkedMsgShowFrame = layout.linkedMsgShowFrame,
            let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
@@ -6295,14 +6363,15 @@ final class ZonvieCore {
         let cellH = CGFloat(context.renderer.cellHeightPx)
         let cmdlinePadding = ZonvieConfig.cmdlinePadding
         let cmdlineIconTotalWidth = ZonvieConfig.cmdlineIconTotalWidth
+        let copyButtonWidth = copyButtonReservedWidth(for: .cmdline)
         var contentWidth = CGFloat(cols) * cellW / context.scale
         let contentHeight = CGFloat(rows) * cellH / context.scale
         if let screen = context.window.screen ?? NSScreen.main {
-            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - ZonvieConfig.cmdlineScreenMargin
+            let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - copyButtonWidth - ZonvieConfig.cmdlineScreenMargin
             contentWidth = min(contentWidth, maxContentWidth)
         }
 
-        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth
+        let containerWidth = contentWidth + (cmdlinePadding * 2) + cmdlineIconTotalWidth + copyButtonWidth
         let containerHeight = contentHeight + (cmdlinePadding * 2)
         let gridViewX = cmdlinePadding + cmdlineIconTotalWidth
         let iconFrame = NSRect(
@@ -6332,7 +6401,10 @@ final class ZonvieCore {
             gridFrame: NSRect(x: gridViewX, y: cmdlinePadding, width: contentWidth, height: contentHeight),
             windowFrame: NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight),
             iconFrame: iconFrame,
-            linkedMsgShowFrame: nil
+            linkedMsgShowFrame: nil,
+            copyButtonFrame: copyButtonWidth > 0
+                ? copyButtonFrame(containerWidth: containerWidth, containerHeight: containerHeight, alignTop: false)
+                : nil
         )
     }
 
@@ -6372,9 +6444,10 @@ final class ZonvieCore {
         let cellW = CGFloat(context.renderer.cellWidthPx)
         let cellH = CGFloat(context.renderer.cellHeightPx)
         let msgPadding: CGFloat = 8.0
+        let copyButtonWidth = copyButtonReservedWidth(for: kind)
         let contentWidth = CGFloat(cols) * cellW / context.scale
         let contentHeight = CGFloat(rows) * cellH / context.scale
-        let containerWidth = contentWidth + (msgPadding * 2)
+        let containerWidth = contentWidth + (msgPadding * 2) + copyButtonWidth
         let containerHeight = contentHeight + (msgPadding * 2)
 
         let targetFrame = self.getExtFloatTargetFrame()
@@ -6398,7 +6471,10 @@ final class ZonvieCore {
             gridFrame: NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight),
             windowFrame: NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight),
             iconFrame: nil,
-            linkedMsgShowFrame: linkedMsgShowFrame
+            linkedMsgShowFrame: linkedMsgShowFrame,
+            copyButtonFrame: copyButtonWidth > 0
+                ? copyButtonFrame(containerWidth: containerWidth, containerHeight: containerHeight, alignTop: true)
+                : nil
         )
     }
 
@@ -6670,6 +6746,101 @@ final class ZonvieCore {
         }
 
         ZonvieCore.appLog("[cmdline_icon] updated to '\(symbolName)' for firstc=\(fc)")
+    }
+
+    /// Whether the decorated surface of `kind` shows a copy-content button.
+    private func copyButtonEnabled(for kind: ExternalGridKind) -> Bool {
+        switch kind {
+        case .cmdline:
+            return ZonvieConfig.shared.cmdline.copyButton
+        case .msgShow, .msgHistory:
+            return ZonvieConfig.shared.messages.copyButton
+        case .popupmenu, .normal:
+            return false
+        }
+    }
+
+    /// Width the copy button reserves on the trailing edge of the container.
+    private func copyButtonReservedWidth(for kind: ExternalGridKind) -> CGFloat {
+        copyButtonEnabled(for: kind) ? ZonvieConfig.copyButtonTotalWidth : 0.0
+    }
+
+    private func makeCopyContentButton(gridId: Int64) -> CopyContentButton {
+        let button = CopyContentButton(gridId: gridId)
+        button.isBordered = false
+        button.bezelStyle = .regularSquare
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyUpOrDown
+        button.toolTip = "Copy contents"
+        button.target = self
+        button.action = #selector(copyDecoratedGridContent(_:))
+        applyCopyButtonImage(button, symbolName: "square.on.square")
+        return button
+    }
+
+    private func applyCopyButtonImage(_ button: CopyContentButton, symbolName: String) {
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Copy contents") else { return }
+        let sizeConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        let colorConfig = NSImage.SymbolConfiguration(hierarchicalColor: self.getCommentHighlightColor())
+        button.image = image.withSymbolConfiguration(sizeConfig.applying(colorConfig))
+    }
+
+    /// Copy the grid's rendered text to the pasteboard.
+    ///
+    /// The text is read straight from the core's grid, so what lands on the
+    /// pasteboard is exactly what the surface displays. The core lock is held
+    /// for the whole of handleRedraw, so the read is a try-lock: on contention
+    /// the click is retried a few times before being dropped rather than
+    /// blocking (and possibly deadlocking) the main thread.
+    @objc private func copyDecoratedGridContent(_ sender: CopyContentButton) {
+        copyDecoratedGridContent(gridId: sender.gridId, button: sender, attemptsLeft: 5)
+    }
+
+    private func copyDecoratedGridContent(gridId: Int64, button: CopyContentButton, attemptsLeft: Int) {
+        guard let corePtr = self.core else { return }
+
+        // Sized for a cmdline / notification; a longer :messages history falls
+        // back to a second call with the exact size the core reports.
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var needed = buffer.withUnsafeMutableBufferPointer {
+            zonvie_core_try_get_grid_text(corePtr, gridId, $0.baseAddress, $0.count)
+        }
+        if needed > buffer.count {
+            buffer = [UInt8](repeating: 0, count: needed)
+            needed = buffer.withUnsafeMutableBufferPointer {
+                zonvie_core_try_get_grid_text(corePtr, gridId, $0.baseAddress, $0.count)
+            }
+        }
+
+        if needed < 0 {
+            guard attemptsLeft > 1 else {
+                ZonvieCore.appLog("[copy_button] gridId=\(gridId) gave up: core grid lock unavailable")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak button] in
+                guard let self, let button else { return }
+                self.copyDecoratedGridContent(gridId: gridId, button: button, attemptsLeft: attemptsLeft - 1)
+            }
+            return
+        }
+
+        guard needed > 0,
+              let text = String(bytes: buffer[0..<Int(needed)], encoding: .utf8) else {
+            ZonvieCore.appLog("[copy_button] gridId=\(gridId) had no text to copy")
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        ZonvieCore.appLog("[copy_button] copied \(needed) bytes from gridId=\(gridId)")
+
+        // Brief acknowledgement so the click has visible feedback even though
+        // the window itself does not change.
+        applyCopyButtonImage(button, symbolName: "checkmark")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self, weak button] in
+            guard let self, let button else { return }
+            self.applyCopyButtonImage(button, symbolName: "square.on.square")
+        }
     }
 
     private func onCmdlinePos(pos: UInt32, level: UInt32) {

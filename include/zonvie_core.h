@@ -1546,8 +1546,10 @@ typedef struct zonvie_config_values {
     float scrollbar_delay;
     // ext features
     bool cmdline_external;
+    bool cmdline_copy_button;
     bool popup_external;
     bool messages_external;
+    bool messages_copy_button;
     int32_t messages_ext_float_pos; // 0=window, 1=grid, 2=display
     int32_t messages_mini_pos;      // 0=window, 1=grid, 2=display
     bool tabline_external;
@@ -1615,6 +1617,18 @@ ZONVIE_API const char* zonvie_config_get_shader_path(const zonvie_config* config
    Use from UI thread to avoid blocking when core is in handleRedraw. */
 ZONVIE_API int32_t zonvie_core_try_cell_has_url(
     zonvie_core *core, int64_t grid_id, int32_t row, int32_t col);
+
+/* Non-blocking extraction of a grid's rendered text as UTF-8 (no NUL is
+   written). Rows are joined with '\n', each row is trimmed of trailing
+   blanks, leading/trailing blank rows are dropped, and a wide glyph's
+   continuation cell contributes nothing.
+   Returns the byte length the full text needs, or -1 when the grid lock is
+   unavailable. When the return value is <= out_cap, out_buf holds the
+   complete text; otherwise retry with a buffer of the returned size.
+   Use from the UI thread: a blocking lock would deadlock against
+   handleRedraw callbacks that wait on the UI thread. */
+ZONVIE_API intptr_t zonvie_core_try_get_grid_text(
+    zonvie_core *core, int64_t grid_id, uint8_t *out_buf, size_t out_cap);
 
 /* Invalidate glyph cache, shape cache, and atlas state.
    Call when frontend font/scale parameters change outside of guifont flow.

@@ -1438,7 +1438,8 @@ final class MetalTerminalView: MTKView {
         if let screen = NSScreen.main {
             let scale = window?.backingScaleFactor ?? 2.0
             let cmdlinePad = ZonvieConfig.cmdlinePadding
-            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + ZonvieConfig.cmdlineScreenMargin
+            let copyButtonPt = ZonvieConfig.shared.cmdline.copyButton ? ZonvieConfig.copyButtonTotalWidth : 0.0
+            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + copyButtonPt + ZonvieConfig.cmdlineScreenMargin
             let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
             let availableWidthPx = availableWidthPt * scale
             screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))

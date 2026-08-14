@@ -151,12 +151,14 @@ delay = 1.0
 
 [cmdline]
 external = true
+copy_button = true   # "copy contents" button on the external cmdline window
 
 [popup]
 external = true
 
 [messages]
 external = true
+copy_button = true   # "copy contents" button on the ext-float message windows
 msg_pos = { ext-float = "window", mini = "grid" }  # display, window, or grid
 
 # Where each class of message goes. These retarget the built-in routes, so
@@ -267,6 +269,7 @@ paths = [
 | Key | Description |
 |-----|-------------|
 | `external` | Use external command line UI (true/false) |
+| `copy_button` | Show a "copy contents" button on the external cmdline window (true/false, default true) |
 
 #### [popup]
 | Key | Description |
@@ -277,6 +280,7 @@ paths = [
 | Key | Description |
 |-----|-------------|
 | `external` | Use external messages UI (true/false) |
+| `copy_button` | Show a "copy contents" button on the ext-float message windows (true/false, default true) |
 | `msg_pos` | Position anchor for message views: `{ ext-float = "...", mini = "..." }`. Values: "display", "window", "grid" |
 | `view` | View for ordinary messages (default "ext-float") |
 | `view_error` | View for errors: emsg, echoerr, lua_error, rpc_error (default "ext-float") |

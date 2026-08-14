@@ -151,6 +151,8 @@ pub const Config = struct {
 
     pub const CmdlineConfig = struct {
         external: bool = false,
+        /// Show a "copy content" button on the external cmdline window.
+        copy_button: bool = true,
     };
 
     pub const PopupConfig = struct {
@@ -164,6 +166,9 @@ pub const Config = struct {
 
     pub const MessagesConfig = struct {
         external: bool = false,
+        /// Show a "copy content" button on the ext-float message windows
+        /// (msg_show and msg_history).
+        copy_button: bool = true,
         msg_pos: MsgPosConfig = .{},
         /// User-declared routes only. They are consulted BEFORE the built-in
         /// defaults (msg_route.defaultRoutes) and never replace them, so an
@@ -363,6 +368,7 @@ pub const Config = struct {
 
         if (cfg.cmdline) |cmd| {
             if (cmd.external) |e| self.cmdline.external = e;
+            if (cmd.copy_button) |b| self.cmdline.copy_button = b;
         }
 
         if (cfg.popup) |p| {
@@ -371,6 +377,7 @@ pub const Config = struct {
 
         if (cfg.messages) |m| {
             if (m.external) |e| self.messages.external = e;
+            if (m.copy_button) |b| self.messages.copy_button = b;
 
             // Parse msg_pos
             if (m.msg_pos) |pos| {
@@ -790,6 +797,7 @@ const TomlScrollbar = struct {
 
 const TomlCmdline = struct {
     external: ?bool = null,
+    copy_button: ?bool = null,
 };
 
 const TomlPopup = struct {
@@ -803,6 +811,7 @@ const TomlMsgPos = struct {
 
 const TomlMessages = struct {
     external: ?bool = null,
+    copy_button: ?bool = null,
     msg_pos: ?TomlMsgPos = null,
     routes: ?[]const TomlRoute = null,
     // Named view settings; see msg_route.ViewSettings.

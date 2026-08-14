@@ -93,6 +93,8 @@ struct ZonvieConfig {
 
     struct CmdlineConfig {
         var external: Bool = false
+        /// Show a "copy content" button on the external cmdline window
+        var copyButton: Bool = true
     }
 
     struct PopupConfig {
@@ -101,6 +103,8 @@ struct ZonvieConfig {
 
     struct MessagesConfig {
         var external: Bool = false
+        /// Show a "copy content" button on the ext-float message windows
+        var copyButton: Bool = true
         /// Position for ext-float and mini views: screen, window, or grid
         var extFloatPos: MsgPosition = .window
         var miniPos: MsgPosition = .grid
@@ -277,8 +281,10 @@ struct ZonvieConfig {
 
         // Ext features
         config.cmdline.external = v.cmdline_external
+        config.cmdline.copyButton = v.cmdline_copy_button
         config.popup.external = v.popup_external
         config.messages.external = v.messages_external
+        config.messages.copyButton = v.messages_copy_button
         config.messages.extFloatPos = MsgPosition.from(int: v.messages_ext_float_pos)
         config.messages.miniPos = MsgPosition.from(int: v.messages_mini_pos)
         config.tabline.external = v.tabline_external
@@ -441,4 +447,13 @@ extension ZonvieConfig {
     static let cmdlineIconTotalWidth: CGFloat = cmdlineIconMarginLeft + cmdlineIconSize + cmdlineIconMarginRight
     /// Extra margin around the cmdline window for screen-width constraint.
     static let cmdlineScreenMargin: CGFloat = 40.0
+
+    /// Copy-content button size in points (decorated cmdline / message windows).
+    static let copyButtonSize: CGFloat = 18.0
+    /// Gap between the grid content and the copy button.
+    static let copyButtonMarginLeft: CGFloat = 4.0
+    /// Gap between the copy button and the window's trailing edge.
+    static let copyButtonMarginRight: CGFloat = 8.0
+    /// Total width the copy button reserves on the trailing edge.
+    static let copyButtonTotalWidth: CGFloat = copyButtonMarginLeft + copyButtonSize + copyButtonMarginRight
 }

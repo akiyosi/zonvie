@@ -47,6 +47,7 @@ SamplerState samp0 : register(s0);
 #define ICON_CHEVRON     (-3.0)
 #define ICON_HANDLE      (-4.0)
 #define TABLINE_TEXTURE  (-5.0)  // BGRA texture sampling mode
+#define ICON_COPY        (-6.0)
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -95,6 +96,12 @@ float sdOrientedBox(float2 p, float2 a, float2 b, float th) {
     q = float2(dot(q, float2(d.y, -d.x)), dot(q, d));
     q = abs(q) - float2(th, len) * 0.5;
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+}
+
+// SDF helper: rounded box centred on the origin
+float sdRoundBox(float2 p, float2 halfSize, float radius) {
+    float2 q = abs(p) - halfSize + radius;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
 }
 
 // Render icon with SDF + anti-aliasing
@@ -147,6 +154,20 @@ float4 PSMain(VSOut i) : SV_Target {
                 float thickness = 0.12;
                 float sdf = sdOrientedBox(localUV, start, endpt, thickness);
                 return renderIconSDF(i.col, sdf);
+            }
+            // Copy icon: two overlapping rounded squares, drawn as outlines
+            if (i.uv.x >= ICON_COPY - 0.1 && i.uv.x <= ICON_COPY + 0.1) {
+                float2 halfSize = float2(0.26, 0.26);
+                float radius = 0.09;
+                float stroke = 0.045;
+                float dBack = sdRoundBox(localUV - float2(0.62, 0.38), halfSize, radius);
+                float dFront = sdRoundBox(localUV - float2(0.38, 0.62), halfSize, radius);
+                // Clip the back square's outline where the front square covers
+                // it, so the overlap reads as one sheet stacked on another
+                // instead of a lattice of crossing strokes.
+                float outlineBack = max(abs(dBack) - stroke, -(dFront + stroke));
+                float outlineFront = abs(dFront) - stroke;
+                return renderIconSDF(i.col, min(outlineBack, outlineFront));
             }
         }
 

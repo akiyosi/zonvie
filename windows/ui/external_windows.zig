@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const scrollbar = @import("scrollbar.zig");
 const input = @import("../input.zig");
 const messages = @import("messages.zig");
+const dialogs = @import("dialogs.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const core = @import("zonvie_core");
@@ -36,6 +37,114 @@ fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
         app_mod.MSG_HISTORY_GRID_ID => .msg_history,
         else => .normal,
     };
+}
+
+/// Whether the decorated surface of `kind` shows a copy-content button.
+fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
+    return switch (kind) {
+        .cmdline => app.config.cmdline.copy_button,
+        .msg_show, .msg_history => app.config.messages.copy_button,
+        .popupmenu, .normal => false,
+    };
+}
+
+/// Width the copy-content button reserves on the trailing edge, in client
+/// pixels. Zero when the surface has no button.
+fn copyButtonReservedPx(app: *App, kind: ExternalSurfaceKind) c_int {
+    if (!copyButtonEnabled(app, kind)) return 0;
+    return app.scalePx(@as(c_int, app_mod.COPY_BUTTON_MARGIN_LEFT +
+        app_mod.COPY_BUTTON_SIZE + app_mod.COPY_BUTTON_MARGIN_RIGHT));
+}
+
+/// Copy-button box in client pixels, or null when the surface has no button.
+/// The cmdline is a single row so its button is centred vertically; the
+/// multi-row message surfaces pin it near the top instead.
+fn copyButtonRectPx(app: *App, kind: ExternalSurfaceKind, client_w: c_int, client_h: c_int) ?c.RECT {
+    if (!copyButtonEnabled(app, kind)) return null;
+    const size = app.scalePx(@as(c_int, app_mod.COPY_BUTTON_SIZE));
+    const margin_right = app.scalePx(@as(c_int, app_mod.COPY_BUTTON_MARGIN_RIGHT));
+    if (client_w <= size + margin_right or client_h < size) return null;
+
+    const left = client_w - size - margin_right;
+    const centred_top = @divTrunc(client_h - size, 2);
+    const top = if (kind == .cmdline) centred_top else @min(margin_right, centred_top);
+    return .{ .left = left, .top = top, .right = left + size, .bottom = top + size };
+}
+
+/// True when (x, y) in client coordinates falls on the copy-content button.
+fn hitTestCopyButton(hwnd: c.HWND, app: *App, grid_id: i64, x: i32, y: i32) bool {
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(hwnd, &client) == 0) return false;
+    const rect = copyButtonRectPx(
+        app,
+        classifyExternalSurface(grid_id),
+        client.right,
+        client.bottom,
+    ) orelse return false;
+    return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
+}
+
+/// Copy a decorated surface's rendered text to the clipboard.
+///
+/// The text comes straight from the core's grid, so what lands on the
+/// clipboard is exactly what the surface displays. The core holds its grid
+/// lock for the whole of handleRedraw, so the read is a try-lock and a
+/// contended click is simply dropped rather than stalling the UI thread.
+fn copyExternalSurfaceText(hwnd: c.HWND, app: *App, grid_id: i64) void {
+    // Sized for a cmdline / notification; a longer :messages history falls
+    // back to a heap buffer of the exact size the core reports.
+    var stack_buf: [4096]u8 = undefined;
+    const needed = core.zonvie_core_try_get_grid_text(app.corep, grid_id, &stack_buf, stack_buf.len);
+    if (needed < 0) {
+        if (applog.isEnabled()) applog.appLog("[win] copy_button: grid lock unavailable grid_id={d}\n", .{grid_id});
+        return;
+    }
+    if (needed == 0) return;
+
+    const len: usize = @intCast(needed);
+    if (len <= stack_buf.len) {
+        _ = dialogs.setClipboardTextUtf8(hwnd, stack_buf[0..len]);
+        return;
+    }
+
+    const heap_buf = app.alloc.alloc(u8, len) catch {
+        if (applog.isEnabled()) applog.appLog("[win] copy_button: allocation failed len={d}\n", .{len});
+        return;
+    };
+    defer app.alloc.free(heap_buf);
+    const second = core.zonvie_core_try_get_grid_text(app.corep, grid_id, heap_buf.ptr, heap_buf.len);
+    if (second <= 0) return;
+    _ = dialogs.setClipboardTextUtf8(hwnd, heap_buf[0..@min(len, @as(usize, @intCast(second)))]);
+}
+
+/// Append the copy-content icon at the surface's trailing edge. Returns the
+/// new vertex index, unchanged when the surface has no button. Reserve
+/// app_mod.COPY_ICON_VERTS in the scratch buffer before calling.
+fn appendCopyIconVerts(
+    app: *App,
+    kind: ExternalSurfaceKind,
+    grid_id: i64,
+    verts: []app_mod.Vertex,
+    idx: usize,
+    window_w: f32,
+    window_h: f32,
+    color: [4]f32,
+) usize {
+    const rect = copyButtonRectPx(
+        app,
+        kind,
+        @intFromFloat(window_w),
+        @intFromFloat(window_h),
+    ) orelse return idx;
+
+    const half_w = window_w / 2.0;
+    const half_h = window_h / 2.0;
+    const x_ndc: f32 = @as(f32, @floatFromInt(rect.left)) / half_w - 1.0;
+    const y_ndc: f32 = 1.0 - @as(f32, @floatFromInt(rect.top)) / half_h;
+    const w_ndc: f32 = @as(f32, @floatFromInt(rect.right - rect.left)) / half_w;
+    const h_ndc: f32 = @as(f32, @floatFromInt(rect.bottom - rect.top)) / half_h;
+
+    return app_mod.addCopyIconVerts(verts, idx, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id);
 }
 
 fn drawDecoratedExternalSurface(
@@ -90,7 +199,7 @@ fn drawDecoratedExternalSurface(
             const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
             const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
 
-            const extra_verts = 6 + 24 + 20;
+            const extra_verts = 6 + 24 + 20 + app_mod.COPY_ICON_VERTS;
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const cmdline_verts = scratch.items;
@@ -174,6 +283,8 @@ fn drawDecoratedExternalSurface(
                 extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
             }
 
+            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color);
+
             try g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
                 g.drawBloomFromVerts(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
@@ -224,6 +335,12 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
             const cell_w = app.cell_w_px;
             const cell_h = app.cell_h_px + app.linespace_px;
+            const icon_color: [4]f32 = .{
+                app.cmdline_icon_color[0],
+                app.cmdline_icon_color[1],
+                app.cmdline_icon_color[2],
+                1.0,
+            };
             app.mu.unlock(core.clock.io());
             if (content_rows == 0 or content_cols == 0) return;
 
@@ -246,7 +363,7 @@ fn drawDecoratedExternalSurface(
             const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
 
             scratch.clearRetainingCapacity();
-            try scratch.resize(app.alloc, vert_count + 6);
+            try scratch.resize(app.alloc, vert_count + 6 + app_mod.COPY_ICON_VERTS);
             const msg_verts = scratch.items;
 
             var orig_bg_r: f32 = 0.0;
@@ -300,7 +417,16 @@ fn drawDecoratedExternalSurface(
                 }
             }
 
-            const msg_total = bg_idx + vert_count;
+            const msg_total = appendCopyIconVerts(
+                app,
+                kind,
+                grid_id,
+                msg_verts,
+                bg_idx + vert_count,
+                window_w,
+                window_h,
+                icon_color,
+            );
             try g.draw(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
                 g.drawBloomFromVerts(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
@@ -1034,8 +1160,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
     const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
     const msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
+    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
     var client_w: c_int = @intCast(req.cols * cell_w);
-    client_w += cmdline_icon_w + cmdline_padding + msg_padding;
+    client_w += cmdline_icon_w + cmdline_padding + msg_padding + copy_button_w;
     const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + cmdline_padding + msg_padding;
 
     if (is_cmdline) {
@@ -1140,7 +1267,8 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // For msg_show/msg_history: add margin around content (DPI-scaled)
     const scaled_msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
 
-    var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding;
+    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
+    var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding + copy_button_w;
     const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
 
     // Clamp cmdline width to monitor work area minus margin (matching macOS cmdlineScreenMargin)
@@ -2288,6 +2416,9 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
+                    // Claim the press so the copy button's release is not
+                    // interpreted as a scrollbar or grid interaction.
+                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
                     if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
                         return 0;
                     }
@@ -2327,6 +2458,9 @@ pub export fn ExternalWndProc(
 
         c.WM_LBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
+                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
+                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
@@ -2341,6 +2475,10 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
+                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
+                        copyExternalSurfaceText(hwnd, app, grid_id.?);
+                        return 0;
+                    }
                     scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
                 }
             }
