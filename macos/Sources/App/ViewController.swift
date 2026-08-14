@@ -513,24 +513,16 @@ final class ViewController: NSViewController {
         core?.sendCommand("tabnew")
     }
 
+    /// `toIndex` is the drop insertion index in the pre-move tab list.
     private func moveTab(from fromIndex: Int, to toIndex: Int) {
-        // Neovim :tabmove uses 0-based position
-        // :tabmove 0 moves to first position
-        // :tabmove N moves after tab N
-        var newPos: Int
-        if toIndex == 0 {
-            newPos = 0
-        } else if toIndex >= currentTabs.count {
-            newPos = currentTabs.count
-        } else {
-            if toIndex > fromIndex {
-                newPos = toIndex - 1
-            } else {
-                newPos = toIndex - 1
-            }
-        }
+        guard fromIndex >= 0 && fromIndex < currentTabs.count else { return }
+        // `:tabmove N` moves the current tab to after tab page N, where N is
+        // counted in the list *before* the move (1-based, 0 = very front).
+        // That is exactly the insertion index, so no adjustment is needed.
+        let newPos = min(max(toIndex, 0), currentTabs.count)
+        // `:tabmove` acts on the current tab, so make the dragged tab current first.
         // Use nvim_command API so it works even in terminal mode
-        core?.sendCommand("tabmove \(newPos)")
+        core?.sendCommand("\(fromIndex + 1)tabnext | tabmove \(newPos)")
     }
 
     private func externalizeTab(handle: Int64, dropPoint: NSPoint) {
