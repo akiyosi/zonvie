@@ -6824,7 +6824,7 @@ pub export fn WndProc(
                     }
                 } else {
                     // App is being activated - disable IME if configured
-                    if (app.config.ime.disable_on_activate) {
+                    if (app.config.input.ime_disable_on_activate) {
                         input.setIMEOff(hwnd);
                     }
                     // App is being activated - show special external windows

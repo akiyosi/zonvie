@@ -755,7 +755,7 @@ typedef struct zonvie_callbacks {
 
     /* IME off notification callback.
        Called when IME should be turned off (e.g., on mode change when
-       ime.disable_on_modechange is enabled, or via RPC zonvie_ime_off). */
+       input.ime_disable_on_modechange is enabled, or via RPC zonvie_ime_off). */
     void (*on_ime_off)(void* ctx);
 
     /* Quit request callback (window close with unsaved check). */

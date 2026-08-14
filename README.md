@@ -102,8 +102,24 @@ zonvie --connect-nvim=\\.\pipe\nvim.31920.0  # Windows: named pipe
 ## Configuration
 
 Configuration file location:
-- `~/.config/zonvie/config.toml`
-- Or `$XDG_CONFIG_HOME/zonvie/config.toml`
+
+macOS / Linux — a single path, chosen without looking at the filesystem:
+- `$XDG_CONFIG_HOME/zonvie/config.toml` whenever `XDG_CONFIG_HOME` is set and
+  non-empty. `~/.config` is then never consulted, even if the XDG-rooted file
+  does not exist.
+- `~/.config/zonvie/config.toml` otherwise.
+
+Windows — each candidate is tested for existence, and the first one that
+exists wins (`XDG_CONFIG_HOME` is not consulted):
+- `%APPDATA%\zonvie\config.toml`
+- `%USERPROFILE%\.config\zonvie\config.toml`
+
+`zonvie --install` writes a default config, and never overwrites an existing
+one. On macOS it writes to the same single path the app reads. On Windows it
+always writes to `%APPDATA%`, so running it while a config lives at the
+`%USERPROFILE%\.config` fallback will shadow that config. Windows also creates
+the default config automatically on first launch when neither candidate
+exists.
 
 ### Example Configuration
 
@@ -185,14 +201,12 @@ hl_cache_size = 2048
 shape_cache_size = 4096
 atlas_size = 2048
 
-[ime]
-disable_on_activate = false
-disable_on_modechange = false
-option_as_meta = "both"  # "both", "none", "only_left", "only_right"
-preedit_mode = "overlay"  # "overlay" (floating overlay) or "extmark" (inline virt_text)
-
 [input]
 swap_colon_semicolon = false  # swap the `:` and `;` keys (single keypresses only)
+option_as_meta = "both"  # "both", "none", "only_left", "only_right"
+ime_disable_on_activate = false
+ime_disable_on_modechange = false
+ime_preedit_mode = "overlay"  # "overlay" (floating overlay) or "inline" (inline virt_text)
 
 [server]
 single_instance = false  # route `zonvie <file>` to a running instance (Windows only)
@@ -337,18 +351,14 @@ as a single live dialog rather than as messages — so the override exists for
 | `shape_cache_size` | Text shaping result cache size (range: 512-65536, default: 4096) |
 | `atlas_size` | Glyph atlas texture size in pixels (range: 1024-4096, default: 2048) |
 
-#### [ime]
-| Key | Description |
-|-----|-------------|
-| `disable_on_activate` | Disable IME when app becomes active (true/false) |
-| `disable_on_modechange` | Disable IME on Vim mode change (true/false) |
-| `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
-| `preedit_mode` | IME preedit display: "overlay" (floating overlay) or "extmark" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
-
 #### [input]
 | Key | Description |
 |-----|-------------|
 | `swap_colon_semicolon` | Swap the `:` and `;` keys (true/false). Applies to single keypresses only; pasted text and IME commits are unaffected |
+| `option_as_meta` | Map Option key as Meta: "both", "none", "only_left", "only_right" |
+| `ime_disable_on_activate` | Disable IME when app becomes active (true/false) |
+| `ime_disable_on_modechange` | Disable IME on Vim mode change (true/false) |
+| `ime_preedit_mode` | IME preedit display: "overlay" (floating overlay) or "inline" (inline virt_text that shifts following text; falls back to overlay outside insert/replace) |
 
 #### [server]
 | Key | Description |
@@ -407,7 +417,7 @@ vim.rpcnotify(vim.g.zonvie_channel, "zonvie_option_as_meta", "both")
 -- Values: "both", "none", "only_left", "only_right"
 ```
 
-This can also be set statically via the `[ime] option_as_meta` config key.
+This can also be set statically via the `[input] option_as_meta` config key.
 
 ### zonvie_ime_off (RPC notification)
 

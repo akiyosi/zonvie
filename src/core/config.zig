@@ -72,7 +72,6 @@ pub const Config = struct {
     windows: WindowsConfig = .{},
     log: LogConfig = .{},
     performance: PerformanceConfig = .{},
-    ime: IMEConfig = .{},
     shaders: ShaderConfig = .{},
     input: InputConfig = .{},
     server: ServerConfig = .{},
@@ -220,22 +219,19 @@ pub const Config = struct {
 
     /// How IME preedit (composition) text is displayed.
     /// overlay: frontend draws a floating overlay on top of the grid (default).
-    /// extmark: core inserts the preedit as an inline virt_text extmark in the
+    /// extmark (config value "inline"): core inserts the preedit as an inline virt_text extmark in the
     ///   buffer, so trailing text shifts right as it would after commit.
     ///   Falls back to overlay outside insert/replace modes (e.g. cmdline).
     pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
-
-    pub const IMEConfig = struct {
-        disable_on_activate: bool = false,
-        disable_on_modechange: bool = false,
-        option_as_meta: OptionAsMeta = .both,
-        preedit_mode: PreeditMode = .overlay,
-    };
 
     pub const InputConfig = struct {
         /// Swap the `:` and `;` keys at the frontend input layer. Applies to
         /// single keypresses only (paste/IME commits are unaffected).
         swap_colon_semicolon: bool = false,
+        option_as_meta: OptionAsMeta = .both,
+        ime_disable_on_activate: bool = false,
+        ime_disable_on_modechange: bool = false,
+        ime_preedit_mode: PreeditMode = .overlay,
     };
 
     pub const ShaderConfig = struct {
@@ -517,21 +513,6 @@ pub const Config = struct {
             if (p.atlas_size) |s| self.performance.atlas_size = @max(atlas_size_min, @min(atlas_size_max, s));
         }
 
-        if (cfg.ime) |i| {
-            if (i.disable_on_activate) |v| self.ime.disable_on_activate = v;
-            if (i.disable_on_modechange) |v| self.ime.disable_on_modechange = v;
-            if (i.option_as_meta) |v| {
-                if (std.mem.eql(u8, v, "both")) { self.ime.option_as_meta = .both; }
-                else if (std.mem.eql(u8, v, "none")) { self.ime.option_as_meta = .none; }
-                else if (std.mem.eql(u8, v, "only_left")) { self.ime.option_as_meta = .only_left; }
-                else if (std.mem.eql(u8, v, "only_right")) { self.ime.option_as_meta = .only_right; }
-            }
-            if (i.preedit_mode) |v| {
-                if (std.mem.eql(u8, v, "extmark")) { self.ime.preedit_mode = .extmark; }
-                else if (std.mem.eql(u8, v, "overlay")) { self.ime.preedit_mode = .overlay; }
-            }
-        }
-
         if (cfg.shaders) |s| {
             if (s.enabled) |e| self.shaders.enabled = e;
             if (s.preserve_alpha) |pa| self.shaders.preserve_alpha = pa;
@@ -576,6 +557,18 @@ pub const Config = struct {
 
         if (cfg.input) |i| {
             if (i.swap_colon_semicolon) |v| self.input.swap_colon_semicolon = v;
+            if (i.option_as_meta) |v| {
+                if (std.mem.eql(u8, v, "both")) { self.input.option_as_meta = .both; }
+                else if (std.mem.eql(u8, v, "none")) { self.input.option_as_meta = .none; }
+                else if (std.mem.eql(u8, v, "only_left")) { self.input.option_as_meta = .only_left; }
+                else if (std.mem.eql(u8, v, "only_right")) { self.input.option_as_meta = .only_right; }
+            }
+            if (i.ime_disable_on_activate) |v| self.input.ime_disable_on_activate = v;
+            if (i.ime_disable_on_modechange) |v| self.input.ime_disable_on_modechange = v;
+            if (i.ime_preedit_mode) |v| {
+                if (std.mem.eql(u8, v, "inline")) { self.input.ime_preedit_mode = .extmark; }
+                else if (std.mem.eql(u8, v, "overlay")) { self.input.ime_preedit_mode = .overlay; }
+            }
         }
 
         if (cfg.server) |s| {
@@ -761,7 +754,6 @@ const TomlConfig = struct {
     windows: ?TomlWindows = null,
     log: ?TomlLog = null,
     performance: ?TomlPerformance = null,
-    ime: ?TomlIME = null,
     shaders: ?TomlShaders = null,
     input: ?TomlInput = null,
     server: ?TomlServer = null,
@@ -862,13 +854,6 @@ const TomlPerformance = struct {
     atlas_size: ?u32 = null,
 };
 
-const TomlIME = struct {
-    disable_on_activate: ?bool = null,
-    disable_on_modechange: ?bool = null,
-    option_as_meta: ?[]const u8 = null,
-    preedit_mode: ?[]const u8 = null,
-};
-
 const TomlShaders = struct {
     enabled: ?bool = null,
     paths: ?[]const []const u8 = null,
@@ -878,6 +863,10 @@ const TomlShaders = struct {
 
 const TomlInput = struct {
     swap_colon_semicolon: ?bool = null,
+    option_as_meta: ?[]const u8 = null,
+    ime_disable_on_activate: ?bool = null,
+    ime_disable_on_modechange: ?bool = null,
+    ime_preedit_mode: ?[]const u8 = null,
 };
 
 const TomlServer = struct {

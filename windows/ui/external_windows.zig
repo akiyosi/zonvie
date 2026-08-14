@@ -2620,7 +2620,7 @@ pub export fn ExternalWndProc(
                 // it accepts it (extmark mode + insert/replace in the focused
                 // external window's buffer); otherwise fall back to the
                 // overlay. Mirrors the main window's WM_IME_COMPOSITION path so
-                // preedit_mode behaves the same across window types.
+                // ime_preedit_mode behaves the same across window types.
                 var handled = false;
                 if (app.corep) |corep| {
                     app.mu.lockUncancelable(core.clock.io());
