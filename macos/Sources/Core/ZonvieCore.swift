@@ -6266,6 +6266,13 @@ final class ZonvieCore {
         window.level = active ? .floating : .normal
     }
 
+    /// True while the command line is a separate window. The terminal view uses
+    /// this to know whether it is showing the command line itself (built-in
+    /// bottom row) or is purely the buffer.
+    var hasExternalCmdlineWindow: Bool {
+        self.externalWindows[ZonvieCore.cmdlineGridId] != nil
+    }
+
     private func classifyExternalGridKind(_ gridId: Int64) -> ExternalGridKind {
         switch gridId {
         case ZonvieCore.cmdlineGridId: return .cmdline

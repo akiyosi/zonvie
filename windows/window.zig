@@ -95,7 +95,17 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
     var cmd_buf: [32768]u8 = undefined;
     var pos: usize = 0;
 
+    // The drop target decides. `force_cmdline` comes from the external cmdline
+    // window itself. Otherwise this is the main window: when the command line
+    // has its own window the main window is purely the buffer and a drop here
+    // opens the file, so only the built-in bottom row ([cmdline]
+    // external = false) makes a drop mean "put the path here".
     const is_cmdline = force_cmdline or blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        const has_external_cmdline = app.external_windows.contains(CMDLINE_GRID_ID);
+        app.mu.unlock(core.clock.io());
+        if (has_external_cmdline) break :blk false;
+
         const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
         break :blk std.mem.startsWith(u8, std.mem.span(mode_ptr), "cmdline");
     };

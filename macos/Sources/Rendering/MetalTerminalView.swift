@@ -4032,18 +4032,28 @@ extension MetalTerminalView {
                                                       options: [.urlReadingFileURLsOnly: true]) else {
             return []
         }
-        // The dragged item has to predict what the drop does. performDragOperation
-        // below inserts the path while the command line is up (including the
-        // built-in one on the bottom row, when [cmdline] external = false) and
-        // runs :drop otherwise, so the item follows the same test. Setting it on
-        // every entry also restores the file icon after the external cmdline
-        // window swapped the item to text on its way past.
-        if core?.getCurrentMode().hasPrefix("cmdline") == true {
+        // The dragged item has to predict what the drop does, and both follow
+        // the same test (dropInsertsPath). Setting it on every entry also
+        // restores the file icon after the external cmdline window swapped the
+        // item to text on its way past.
+        if dropInsertsPath {
             FileDragFeedback.showPathText(sender, in: self)
         } else {
             FileDragFeedback.showFileIcon(sender, in: self)
         }
         return .copy
+    }
+
+    /// Whether a drop on THIS view inserts a path rather than opening the file.
+    ///
+    /// The drop target decides. When the command line is a separate window this
+    /// view is purely the buffer, so a drop here always opens — the command
+    /// line has its own drop target. Only when the command line is drawn in
+    /// this window's own bottom row ([cmdline] external = false) does dropping
+    /// while it is up mean "put the path here".
+    private var dropInsertsPath: Bool {
+        guard let core, !core.hasExternalCmdlineWindow else { return false }
+        return core.getCurrentMode().hasPrefix("cmdline")
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -4057,13 +4067,12 @@ extension MetalTerminalView {
         guard !urls.isEmpty, let core = core else { return false }
 
         let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
-        let mode = core.getCurrentMode()
 
-        if mode.hasPrefix("cmdline") {
-            // In command-line mode: insert paths at cursor position.
+        if dropInsertsPath {
+            // Built-in command line is up: insert paths at the cursor.
             core.sendInput(paths)
         } else {
-            // In normal/insert/visual mode: execute :drop immediately.
+            // Buffer drop: open the files.
             core.sendCommand("drop \(paths)")
         }
         return true
