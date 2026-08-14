@@ -72,7 +72,10 @@ pub const hlsl_sha256 = "{sha}";
 {format_bytes(ps_data, "ps_bytecode")}
 """
 
-    with open(out_path, 'w') as f:
+    # newline='\n' so the file is byte-identical whether it was generated on
+    # Windows (CI) or anywhere else; the default would translate to CRLF and
+    # every regeneration would rewrite the whole file.
+    with open(out_path, 'w', newline='\n') as f:
         f.write(output)
 
     print(f"Generated: {out_path}")
