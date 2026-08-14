@@ -1931,6 +1931,9 @@ pub const ExternalWindow = struct {
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // OLE drop target (cmdline surface only). See ui/drop_target.zig; opaque
+    // here so app.zig carries none of the COM plumbing.
+    drop_target: ?*anyopaque = null,
 
     // Scratch buffer for vertex copy during paint (avoids per-frame alloc).
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
@@ -4010,6 +4013,12 @@ pub const App = struct {
     clipboard_result: c_int = 0,
     clipboard_set_data: ?[*]const u8 = null,
     clipboard_set_len: usize = 0,
+
+    // OLE drop target for the main window (ui/drop_target.zig). Null when
+    // RegisterDragDrop failed, in which case WM_DROPFILES still delivers drops
+    // without the drag-cursor badge. Typed opaque to keep app.zig free of the
+    // COM plumbing.
+    main_drop_target: ?*anyopaque = null,
 
     // SSH auth prompt state (owned copy - core frees original after callback)
     ssh_prompt_owned: ?[]u8 = null,

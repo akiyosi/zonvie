@@ -17,6 +17,7 @@ const external_windows = @import("ui/external_windows.zig");
 const scrollbar = @import("ui/scrollbar.zig");
 const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
+const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
@@ -85,6 +86,27 @@ fn setExternalWindowTopmost(hwnd: c.HWND, topmost: bool) void {
 /// "put this path here" no matter what mode the editor reports. The main
 /// window leaves it false and keeps deciding by mode, so a drop while the
 /// built-in (non-external) command line is up still expands the path.
+/// Whether a drop on this target inserts a path rather than opening the file.
+///
+/// The drop target decides. `force_cmdline` comes from the external cmdline
+/// window itself. Otherwise this is the main window: when the command line has
+/// its own window the main window is purely the buffer and a drop here opens
+/// the file, so only the built-in bottom row ([cmdline] external = false) makes
+/// a drop mean "put the path here". The drag-time badge (ui/drop_target.zig)
+/// reads the same answer, so what the pointer promises is what the drop does.
+pub fn dropInsertsPath(app: *app_mod.App, force_cmdline: bool) bool {
+    if (force_cmdline) return true;
+    const corep = app.corep orelse return false;
+
+    app.mu.lockUncancelable(core.clock.io());
+    const has_external_cmdline = app.external_windows.contains(CMDLINE_GRID_ID);
+    app.mu.unlock(core.clock.io());
+    if (has_external_cmdline) return false;
+
+    const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
+    return std.mem.startsWith(u8, std.mem.span(mode_ptr), "cmdline");
+}
+
 pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool) void {
     const corep = app.corep orelse return;
     const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
@@ -95,20 +117,7 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
     var cmd_buf: [32768]u8 = undefined;
     var pos: usize = 0;
 
-    // The drop target decides. `force_cmdline` comes from the external cmdline
-    // window itself. Otherwise this is the main window: when the command line
-    // has its own window the main window is purely the buffer and a drop here
-    // opens the file, so only the built-in bottom row ([cmdline]
-    // external = false) makes a drop mean "put the path here".
-    const is_cmdline = force_cmdline or blk: {
-        app.mu.lockUncancelable(core.clock.io());
-        const has_external_cmdline = app.external_windows.contains(CMDLINE_GRID_ID);
-        app.mu.unlock(core.clock.io());
-        if (has_external_cmdline) break :blk false;
-
-        const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
-        break :blk std.mem.startsWith(u8, std.mem.span(mode_ptr), "cmdline");
-    };
+    const is_cmdline = dropInsertsPath(app, force_cmdline);
 
     if (!is_cmdline) {
         const prefix = "drop ";
@@ -1907,8 +1916,13 @@ pub export fn WndProc(
                     if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: initial dpi={d} scale={d:.2}\n", .{ initial_dpi, app.dpi_scale });
                 }
 
-                // Accept file drops via drag & drop
+                // Accept file drops via drag & drop. The OLE target is what
+                // makes the drag cursor reflect what the drop will do; it
+                // turns the legacy path off when it succeeds and leaves it on
+                // when it does not, so drops keep working either way.
                 c.DragAcceptFiles(hwnd, 1);
+                _ = c.OleInitialize(null);
+                app.main_drop_target = drop_target.register(app, hwnd, false);
 
                 // Add "About zonvie" to the window's system menu (title-bar
                 // right-click / Alt+Space). Handled in WM_SYSCOMMAND below.
@@ -6794,6 +6808,11 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 if (app.tray_icon) |*tray| {
                     tray.remove();
+                }
+                // Revoke before the HWND dies; OLE holds a reference until then.
+                if (app.main_drop_target) |target| {
+                    drop_target.revoke(hwnd, @ptrCast(@alignCast(target)));
+                    app.main_drop_target = null;
                 }
             }
             // Nvy style: PostQuitMessage(0). The actual exit code is

@@ -13,6 +13,8 @@ pub const c = @cImport({
     @cInclude("dwmapi.h"); // DWM for transparency
     @cInclude("imm.h"); // IME support
     @cInclude("wincred.h"); // CredUI for password dialogs
+    @cInclude("ole2.h"); // OleInitialize / RegisterDragDrop (file drop feedback)
+    @cInclude("objidl.h"); // IDataObject / FORMATETC / STGMEDIUM
     @cInclude("d2d1.h");
     @cInclude("d2d1_1.h"); // ID2D1Factory1, ID2D1Device, ID2D1DeviceContext
     @cInclude("dwrite.h");

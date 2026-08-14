@@ -9,6 +9,7 @@ const scrollbar = @import("scrollbar.zig");
 const input = @import("../input.zig");
 const messages = @import("messages.zig");
 const dialogs = @import("dialogs.zig");
+const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const core = @import("zonvie_core");
@@ -1774,6 +1775,14 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     app.mu.unlock(core.clock.io());
 
+    // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
+    // call and must not run with app.mu held. Registration is what makes the
+    // drag cursor show that a drop here inserts a path rather than opening the
+    // file; the DragAcceptFiles above stays as the fallback if it fails.
+    if (is_cmdline) {
+        ext_window_ptr.drop_target = drop_target.register(app, hwnd, true);
+    }
+
     // Now call SetWindowPos outside the lock to avoid deadlock
     if (deferred_setpos) |sp| {
         _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
@@ -1964,6 +1973,13 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
             }
         }
         app.mu.unlock(core.clock.io());
+
+        // Revoke before deinit's DestroyWindow: OLE holds a reference to the
+        // target for as long as the window is registered.
+        if (ext_win.drop_target) |target| {
+            drop_target.revoke(ext_win.hwnd, @ptrCast(@alignCast(target)));
+            ext_win.drop_target = null;
+        }
 
         // deinit handles DestroyWindow and resource cleanup
         ext_win.deinit(app.alloc, &app.row_vb_budget);
