@@ -2907,14 +2907,32 @@ pub export fn ExternalWndProc(
         c.WM_NCHITTEST => {
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());
-                defer app.mu.unlock(core.clock.io());
+                const is_cmdline_window = if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw|
+                    cw.hwnd == hwnd
+                else
+                    false;
+                app.mu.unlock(core.clock.io());
 
-                // Check if this is the cmdline window
-                if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw| {
-                    if (cw.hwnd == hwnd) {
-                        // Return HTCAPTION to make entire window draggable
-                        return c.HTCAPTION;
+                if (is_cmdline_window) {
+                    // HTCAPTION over the whole window would make every mouse
+                    // message arrive as its WM_NC* variant, so the copy button
+                    // would receive neither hover (WM_MOUSEMOVE) nor clicks
+                    // (WM_LBUTTON*) and a press on it would start a window
+                    // drag. Carve the button out as client area.
+                    // lParam is in SCREEN coordinates for WM_NCHITTEST, and
+                    // the coordinates are signed (multi-monitor).
+                    const lp: usize = @bitCast(lParam);
+                    var pt: c.POINT = .{
+                        .x = @as(i16, @bitCast(@as(u16, @truncate(lp)))),
+                        .y = @as(i16, @bitCast(@as(u16, @truncate(lp >> 16)))),
+                    };
+                    if (c.ScreenToClient(hwnd, &pt) != 0 and
+                        hitTestCopyButton(hwnd, app, app_mod.CMDLINE_GRID_ID, pt.x, pt.y))
+                    {
+                        return c.HTCLIENT;
                     }
+                    // Return HTCAPTION to make the rest of the window draggable
+                    return c.HTCAPTION;
                 }
             }
             // For other windows, use default behavior
