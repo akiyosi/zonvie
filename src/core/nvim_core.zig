@@ -3705,6 +3705,20 @@ pub const Core = struct {
         self.grid.screen_cols = cols;
     }
 
+    /// Set the cmdline's default width in cells. Same re-entrancy rules as
+    /// setScreenCols: the redraw thread already owns grid_mu.
+    pub fn setCmdlineDefaultCols(self: *Core, cols: u32) void {
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
+        if (redraw_tid != 0 and redraw_tid == current_tid) {
+            self.grid.cmdline_default_cols = cols;
+            return;
+        }
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
+        self.grid.cmdline_default_cols = cols;
+    }
+
     // ---- Key event encoding (OS trap -> Zig common encode) ----
     fn emitInputString(self: *Core, s: []const u8) void {
         if (s.len == 0) return;

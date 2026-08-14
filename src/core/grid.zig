@@ -1255,6 +1255,11 @@ pub const Grid = struct {
 
     // Screen width in cells (for cmdline max width). Set by frontend.
     screen_cols: u32 = 0,
+    // Cmdline width in cells before its content needs more (for cmdline min
+    // width). Only the frontend knows how much window chrome sits beside the
+    // cmdline grid, so it derives this from the main window width. 0 = fall
+    // back to the main grid's cols.
+    cmdline_default_cols: u32 = 0,
     // Dirty tracking (global grid only)
     dirty_all: bool = true,
     dirty_rows: std.DynamicBitSetUnmanaged = .{},

@@ -1434,15 +1434,29 @@ final class MetalTerminalView: MTKView {
         // TODO: Use window?.screen instead of NSScreen.main for multi-display correctness.
         //       All cmdline NSScreen.main usage (here and in ZonvieCore.swift) should be
         //       migrated to window?.screen in a coordinated change.
+        let scale = window?.backingScaleFactor ?? 2.0
+        // Chrome that sits beside the cmdline grid inside its own window.
+        let copyButtonPt = ZonvieConfig.shared.cmdline.copyButton ? ZonvieConfig.copyButtonTotalWidth : 0.0
+        let cmdlineChromePt = ZonvieConfig.cmdlinePadding * 2 + ZonvieConfig.cmdlineIconTotalWidth + copyButtonPt
+
         var screenCols: UInt32 = 0
         if let screen = NSScreen.main {
-            let scale = window?.backingScaleFactor ?? 2.0
-            let cmdlinePad = ZonvieConfig.cmdlinePadding
-            let copyButtonPt = ZonvieConfig.shared.cmdline.copyButton ? ZonvieConfig.copyButtonTotalWidth : 0.0
-            let cmdlineOverheadPt = cmdlinePad * 2 + ZonvieConfig.cmdlineIconTotalWidth + copyButtonPt + ZonvieConfig.cmdlineScreenMargin
+            let cmdlineOverheadPt = cmdlineChromePt + ZonvieConfig.cmdlineScreenMargin
             let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
             let availableWidthPx = availableWidthPt * scale
             screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))
+        }
+
+        // Default cmdline width: the cmdline WINDOW spans
+        // cmdlineDefaultWindowFraction of the main window, so the chrome comes
+        // off before converting to cells. Without this the core falls back to
+        // the main grid's cols, which makes the cmdline window wider than the
+        // main window by exactly the chrome.
+        var cmdlineDefaultCols: UInt32 = 0
+        if let mainWidthPt = window?.frame.width, mainWidthPt > 0 {
+            let targetPt = mainWidthPt * ZonvieConfig.cmdlineDefaultWindowFraction - cmdlineChromePt
+            let targetPx = targetPt * scale
+            cmdlineDefaultCols = UInt32(max(20, targetPx / CGFloat(cellWi)))
         }
 
         // Move rows/cols decision + suppression to Zig core (shared logic).
@@ -1469,7 +1483,8 @@ final class MetalTerminalView: MTKView {
             drawableH: UInt32(pxHi),
             cellW: UInt32(cellWi),
             cellH: UInt32(cellHi),
-            screenCols: screenCols
+            screenCols: screenCols,
+            cmdlineDefaultCols: cmdlineDefaultCols
         )
         if !acquired, !layoutResizeRetryScheduled {
             layoutResizeRetryScheduled = true
@@ -4016,6 +4031,17 @@ extension MetalTerminalView {
         guard sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self],
                                                       options: [.urlReadingFileURLsOnly: true]) else {
             return []
+        }
+        // The dragged item has to predict what the drop does. performDragOperation
+        // below inserts the path while the command line is up (including the
+        // built-in one on the bottom row, when [cmdline] external = false) and
+        // runs :drop otherwise, so the item follows the same test. Setting it on
+        // every entry also restores the file icon after the external cmdline
+        // window swapped the item to text on its way past.
+        if core?.getCurrentMode().hasPrefix("cmdline") == true {
+            FileDragFeedback.showPathText(sender, in: self)
+        } else {
+            FileDragFeedback.showFileIcon(sender, in: self)
         }
         return .copy
     }

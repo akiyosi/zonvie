@@ -1396,7 +1396,9 @@ ZONVIE_API void zonvie_core_update_layout_px(
 // keep the drawable-width-derived value, or a display-derived cell count to
 // override it (macOS cmdline max width). Calling the blocking
 // zonvie_core_set_screen_cols afterwards would re-acquire grid_mu and negate
-// the non-blocking guarantee.
+// the non-blocking guarantee. cmdline_default_cols folds
+// zonvie_core_set_cmdline_default_cols in for the same reason; 0 keeps the
+// current value.
 //
 // Safe to call from a redraw callback on the core thread: that path applies
 // the layout under the already-held grid_mu and skips the flush retry, which
@@ -1407,12 +1409,19 @@ ZONVIE_API bool zonvie_core_try_update_layout_px(
     uint32_t drawable_h_px,
     uint32_t cell_w_px,
     uint32_t cell_h_px,
-    uint32_t screen_cols
+    uint32_t screen_cols,
+    uint32_t cmdline_default_cols
 );
 
 // Set screen width in cells (for cmdline max width).
 // This should be called when screen size or cell size changes.
 ZONVIE_API void zonvie_core_set_screen_cols(zonvie_core *core, uint32_t cols);
+
+// Set the cmdline's default width in cells: the width it shows before its
+// content needs more, clamped up by zonvie_core_set_screen_cols. Only the
+// frontend knows the window chrome beside the cmdline grid, so it derives this
+// from the main window width. Pass 0 to fall back to the main grid's width.
+ZONVIE_API void zonvie_core_set_cmdline_default_cols(zonvie_core *core, uint32_t cols);
 
 // Get highlight colors by group name (e.g., "Search", "Normal").
 // Returns 1 if found, 0 if not found.

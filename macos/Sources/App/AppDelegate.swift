@@ -358,6 +358,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Resume cursor blinking now that we are frontmost.
             vc.core?.resetCursorBlink()
         }
+        setCmdlineWindowActiveForAllSessions(true)
+    }
+
+    /// The cmdline window no longer hides on deactivate, so its level is what
+    /// keeps it from hovering above other apps. That has to be applied to
+    /// EVERY session: `self.window` tracks only the last key window, and a
+    /// background session's cmdline would otherwise stay at .floating for as
+    /// long as it is open.
+    private func setCmdlineWindowActiveForAllSessions(_ active: Bool) {
+        for session in SessionManager.shared.sessions {
+            session.viewController?.core?.setCmdlineWindowActive(active)
+        }
     }
 
     func applicationWillResignActive(_ notification: Notification) {
@@ -367,6 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // not wake the CPU to redraw a window the user isn't looking at.
             vc.core?.stopCursorBlinking()
         }
+        setCmdlineWindowActiveForAllSessions(false)
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
@@ -485,4 +498,102 @@ func escapePathForNeovim(_ path: String) -> String {
         }
     }
     return result
+}
+
+/// Drag feedback shared by the terminal view and the external cmdline window.
+///
+/// The pointer shape during a drag belongs to AppKit and cannot be overridden
+/// by a destination, so the two drop targets are distinguished by swapping
+/// what is being dragged: over the command line the item becomes the path as
+/// text, because that is what the drop inserts; over the buffer it stays the
+/// file icon, because that drop opens the file. A destination's
+/// change persists for the rest of the session, so each side must set its own
+/// representation on entry rather than only overriding once.
+enum FileDragFeedback {
+    static func showPathText(_ sender: NSDraggingInfo, in view: NSView) {
+        forEachFileURL(sender, in: view) { item, url in
+            // The chip shows the path, because the path is what the drop
+            // inserts. pathTextImage truncates it in the middle so a deep
+            // path does not produce a screen-wide image.
+            let image = pathTextImage(url.path)
+            item.setDraggingFrame(recentred(item.draggingFrame, on: image.size), contents: image)
+        }
+    }
+
+    static func showFileIcon(_ sender: NSDraggingInfo, in view: NSView) {
+        forEachFileURL(sender, in: view) { item, url in
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            icon.size = NSSize(width: 32, height: 32)
+            item.setDraggingFrame(
+                recentred(item.draggingFrame, on: icon.size),
+                contents: icon
+            )
+        }
+    }
+
+    /// Keep the replacement image under the pointer. setDraggingFrame takes a
+    /// rect whose origin is its bottom-left (these views are unflipped), so
+    /// reusing the incoming origin with a different size shifts the image off
+    /// the cursor by the whole size difference — a wide text chip would hang
+    /// out to the upper right of the pointer.
+    private static func recentred(_ frame: NSRect, on size: NSSize) -> NSRect {
+        NSRect(
+            x: frame.midX - size.width / 2,
+            y: frame.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private static func forEachFileURL(
+        _ sender: NSDraggingInfo,
+        in view: NSView,
+        _ body: @escaping (NSDraggingItem, URL) -> Void
+    ) {
+        sender.enumerateDraggingItems(
+            options: [],
+            for: view,
+            classes: [NSURL.self],
+            searchOptions: [.urlReadingFileURLsOnly: true]
+        ) { item, _, _ in
+            guard let url = item.item as? URL else { return }
+            body(item, url)
+        }
+    }
+
+    /// A long name would make the dragged image span the screen, so it is
+    /// truncated in the middle where paths and names differ least.
+    private static func pathTextImage(_ text: String) -> NSImage {
+        let maxChars = 48
+        var label = text
+        if label.count > maxChars {
+            let keep = maxChars / 2 - 1
+            label = "\(label.prefix(keep))…\(label.suffix(keep))"
+        }
+
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let attributed = NSAttributedString(
+            string: label,
+            attributes: [.font: font, .foregroundColor: NSColor.white]
+        )
+        let textSize = attributed.size()
+        let padX: CGFloat = 10
+        let padY: CGFloat = 6
+        let size = NSSize(
+            width: ceil(textSize.width) + padX * 2,
+            height: ceil(textSize.height) + padY * 2
+        )
+
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.black.withAlphaComponent(0.78).setFill()
+        NSBezierPath(
+            roundedRect: NSRect(origin: .zero, size: size),
+            xRadius: 5,
+            yRadius: 5
+        ).fill()
+        attributed.draw(at: NSPoint(x: padX, y: padY))
+        image.unlockFocus()
+        return image
+    }
 }

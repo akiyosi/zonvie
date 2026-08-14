@@ -698,6 +698,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         buildShaderBuffers()
 
+        if gridId == ZonvieCore.cmdlineGridId {
+            registerForDraggedTypes([.fileURL])
+        }
+
         // Create background alpha buffer for shader
         if let buf = self.backgroundAlphaBuffer {
             var alpha = resolveSurfaceBackgroundAlpha(
@@ -4246,5 +4250,46 @@ extension ExternalGridView: NSTextInputClient {
             }
         }
         super.mouseMoved(with: event)
+    }
+}
+
+// MARK: - Drag & Drop (path expansion on the external cmdline)
+extension ExternalGridView {
+
+    /// Only the external cmdline accepts file drops; a drop there inserts the
+    /// path as text instead of opening the file. The other decorated surfaces
+    /// (popupmenu, messages) have nothing to insert into, so they decline and
+    /// the drag falls through.
+    var acceptsFileDrops: Bool { gridId == ZonvieCore.cmdlineGridId }
+
+    private func hasFileURLs(_ sender: NSDraggingInfo) -> Bool {
+        sender.draggingPasteboard.canReadObject(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        )
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard acceptsFileDrops, hasFileURLs(sender) else { return [] }
+        FileDragFeedback.showPathText(sender, in: self)
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard acceptsFileDrops,
+              let urls = sender.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+              ) as? [URL],
+              !urls.isEmpty,
+              let core = mainTerminalView?.core else {
+            return false
+        }
+
+        // Dropping on the command line means "put this path here", regardless
+        // of what mode the editor thinks it is in.
+        let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
+        core.sendInput(paths)
+        return true
     }
 }

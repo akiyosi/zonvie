@@ -7463,8 +7463,12 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             display_width += countDisplayWidth(special);
         }
 
-        // Grid width: start at global grid width, expand up to screen width, then scroll
-        const min_width: u32 = if (self.grid.cols > 0) self.grid.cols else 80;
+        // Grid width: start at the frontend's default width (a fraction of the
+        // main window, chrome already subtracted), expand up to screen width,
+        // then scroll. Without a frontend default, fall back to the main grid.
+        const min_width: u32 = if (self.grid.cmdline_default_cols > 0)
+            self.grid.cmdline_default_cols
+        else if (self.grid.cols > 0) self.grid.cols else 80;
         const max_width: u32 = if (self.grid.screen_cols > 0) self.grid.screen_cols else min_width;
         const content_width: u32 = display_width + 1; // +1 for cursor
         const width: u32 = @min(@max(content_width, min_width), max_width);
@@ -7725,8 +7729,13 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     const block_line_count: u32 = @intCast(block_lines.len);
 
     // Calculate total rows and max width
-    // Minimum width = global grid width; frontend constrains to screen width
-    const min_width: u32 = if (self.grid.cols > 0) self.grid.cols else 40;
+    // Minimum width = the frontend's default cmdline width (chrome already
+    // subtracted), falling back to the global grid width. Must match the
+    // single-line path in notifyCmdlineChanges, or the window snaps to a
+    // different width the moment a block becomes visible.
+    const min_width: u32 = if (self.grid.cmdline_default_cols > 0)
+        self.grid.cmdline_default_cols
+    else if (self.grid.cols > 0) self.grid.cols else 40;
     var max_width: u32 = min_width;
 
     // Calculate width from block lines (accounting for control characters)

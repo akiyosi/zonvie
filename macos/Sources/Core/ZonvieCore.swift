@@ -2566,9 +2566,18 @@ final class ZonvieCore {
     /// keep the drawable-width-derived value. Calling
     /// zonvie_core_set_screen_cols after this would take grid_mu a second time
     /// and block, defeating the purpose.
-    func tryUpdateLayoutPx(drawableW: UInt32, drawableH: UInt32, cellW: UInt32, cellH: UInt32, screenCols: UInt32) -> Bool {
+    func tryUpdateLayoutPx(
+        drawableW: UInt32,
+        drawableH: UInt32,
+        cellW: UInt32,
+        cellH: UInt32,
+        screenCols: UInt32,
+        cmdlineDefaultCols: UInt32
+    ) -> Bool {
         guard let core else { return true }
-        return zonvie_core_try_update_layout_px(core, drawableW, drawableH, cellW, cellH, screenCols)
+        return zonvie_core_try_update_layout_px(
+            core, drawableW, drawableH, cellW, cellH, screenCols, cmdlineDefaultCols
+        )
     }
 
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
@@ -4025,9 +4034,21 @@ final class ZonvieCore {
     final class CopyContentButton: NSButton {
         let gridId: Int64
 
+        /// Wash drawn behind the icon while the pointer is over the button.
+        /// Derived from the colorscheme rather than the system appearance, so
+        /// it stays visible on both dark and light themes.
+        var hoverBackgroundColor: NSColor = .clear {
+            didSet { updateHoverBackground() }
+        }
+        private var isHovered = false
+        private var hoverTrackingArea: NSTrackingArea?
+
         init(gridId: Int64) {
             self.gridId = gridId
             super.init(frame: .zero)
+            wantsLayer = true
+            layer?.cornerRadius = 4.0
+            layer?.cornerCurve = .continuous
         }
 
         @available(*, unavailable)
@@ -4035,9 +4056,59 @@ final class ZonvieCore {
             fatalError("init(coder:) has not been implemented")
         }
 
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let hoverTrackingArea {
+                removeTrackingArea(hoverTrackingArea)
+            }
+            // .activeAlways for the same reason as acceptsFirstMouse: these
+            // windows never become key, so .activeInKeyWindow would never fire.
+            let area = NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self
+            )
+            addTrackingArea(area)
+            hoverTrackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            isHovered = true
+            updateHoverBackground()
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            isHovered = false
+            updateHoverBackground()
+        }
+
+        private func updateHoverBackground() {
+            layer?.backgroundColor = isHovered ? hoverBackgroundColor.cgColor : nil
+        }
+
         // These windows are borderless and never become key, so without this a
         // click while the app is inactive would only raise the app.
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    }
+
+    /// Content view of the decorated cmdline window.
+    ///
+    /// AppKit resolves a drag destination by hit-testing and then walking UP
+    /// the superview chain — never to a sibling underneath. The firstc icon and
+    /// the copy button are stacked ABOVE the grid view, so a drop on the left
+    /// icon strip or the right button would skip the registered
+    /// ExternalGridView entirely and fall through to whatever is behind the
+    /// window. Registering the container catches those and forwards.
+    final class CmdlineDropContainerView: NSView {
+        weak var dropTarget: ExternalGridView?
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            dropTarget?.draggingEntered(sender) ?? []
+        }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            dropTarget?.performDragOperation(sender) ?? false
+        }
     }
 
     /// Delegate for external window resize handling
@@ -4192,7 +4263,9 @@ final class ZonvieCore {
 
     /// Called when a grid should be displayed in an external window.
     /// Reserved grid ID for cmdline (must match CMDLINE_GRID_ID in grid.zig)
-    private static let cmdlineGridId: Int64 = -100
+    // Not private: ExternalGridView checks it to decide whether a file drop
+    // should insert a path into the cmdline instead of opening the file.
+    static let cmdlineGridId: Int64 = -100
     /// Reserved grid ID for popupmenu (must match POPUPMENU_GRID_ID in grid.zig)
     private static let popupmenuGridId: Int64 = -101
     /// Reserved grid ID for messages (must match MESSAGE_GRID_ID in grid.zig)
@@ -5476,11 +5549,15 @@ final class ZonvieCore {
         switch kind {
         case .cmdline:
             window.hasShadow = true
-            window.level = .floating
             window.isOpaque = false
             window.backgroundColor = Self.transparentShadowedWindowBackground
             window.isMovableByWindowBackground = true
-            window.hidesOnDeactivate = true
+            // Stays visible while another app is frontmost, so a file can be
+            // dragged onto it from Finder. The level follows activation
+            // instead (see setCmdlineWindowActive) — a .floating window that
+            // never hides would sit above every other app's windows.
+            window.hidesOnDeactivate = false
+            window.level = NSApp.isActive ? .floating : .normal
 
         case .popupmenu, .msgShow, .msgHistory:
             window.hasShadow = true
@@ -6095,7 +6172,16 @@ final class ZonvieCore {
         containerWidth: CGFloat,
         containerHeight: CGFloat
     ) {
-        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight))
+        let containerFrame = NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight)
+        let containerView: NSView
+        if gridView.acceptsFileDrops {
+            let dropContainer = CmdlineDropContainerView(frame: containerFrame)
+            dropContainer.dropTarget = gridView
+            dropContainer.registerForDraggedTypes([.fileURL])
+            containerView = dropContainer
+        } else {
+            containerView = NSView(frame: containerFrame)
+        }
         containerView.wantsLayer = true
         containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
         containerView.layer?.cornerCurve = .continuous
@@ -6121,6 +6207,11 @@ final class ZonvieCore {
                 height: ZonvieConfig.cmdlineIconSize
             ))
             iconView.imageScaling = .scaleProportionallyUpOrDown
+            // NSImageView registers itself as a drag destination. Left alone it
+            // would win the hit test over the icon strip and refuse the drop,
+            // and AppKit stops searching at the first registered view rather
+            // than continuing up to CmdlineDropContainerView.
+            iconView.unregisterDraggedTypes()
             containerView.addSubview(iconView)
             self.cmdlineIconView = iconView
             ZonvieCore.appLog("[cmdline] window created, firstc=\(self.cmdlineFirstc), calling updateCmdlineIcon()")
@@ -6162,6 +6253,17 @@ final class ZonvieCore {
         if ZonvieConfig.shared.blurEnabled {
             ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
         }
+    }
+
+    /// Track app activation for the external cmdline window.
+    ///
+    /// It no longer hides on deactivate (a Finder drag has to be able to reach
+    /// it), so the window level carries that job: .floating while this app is
+    /// frontmost, .normal otherwise so it does not hover above whatever the
+    /// user switched to.
+    func setCmdlineWindowActive(_ active: Bool) {
+        guard let window = self.externalWindows[ZonvieCore.cmdlineGridId] else { return }
+        window.level = active ? .floating : .normal
     }
 
     private func classifyExternalGridKind(_ gridId: Int64) -> ExternalGridKind {
@@ -6770,19 +6872,71 @@ final class ZonvieCore {
         button.isBordered = false
         button.bezelStyle = .regularSquare
         button.imagePosition = .imageOnly
-        button.imageScaling = .scaleProportionallyUpOrDown
+        // The icon is deliberately smaller than the button so the hover wash
+        // has a margin; scaling up would fill that margin back in.
+        button.imageScaling = .scaleNone
         button.toolTip = "Copy contents"
         button.target = self
         button.action = #selector(copyDecoratedGridContent(_:))
-        applyCopyButtonImage(button, symbolName: "square.on.square")
+        applyCopyButtonImage(button, copied: false)
         return button
     }
 
-    private func applyCopyButtonImage(_ button: CopyContentButton, symbolName: String) {
-        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Copy contents") else { return }
+    private func applyCopyButtonImage(_ button: CopyContentButton, copied: Bool) {
+        let tint = self.getCommentHighlightColor()
+        button.hoverBackgroundColor = tint.withAlphaComponent(0.22)
+        guard copied else {
+            button.image = Self.makeCopyIconImage(size: ZonvieConfig.copyButtonIconSize, color: tint)
+            return
+        }
+        guard let image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Copied") else { return }
         let sizeConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
-        let colorConfig = NSImage.SymbolConfiguration(hierarchicalColor: self.getCommentHighlightColor())
+        let colorConfig = NSImage.SymbolConfiguration(hierarchicalColor: tint)
         button.image = image.withSymbolConfiguration(sizeConfig.applying(colorConfig))
+    }
+
+    /// Two overlapping rounded squares: the back one up and to the right, the
+    /// front one down and to the left, with the back outline clipped where the
+    /// front covers it. Drawn rather than taken from SF Symbols because
+    /// `square.on.square` stacks the other way round (back upper-LEFT), and the
+    /// icon has to match the Windows shader glyph (addCopyIconVerts/ICON_COPY).
+    private static func makeCopyIconImage(size: CGFloat, color: NSColor) -> NSImage {
+        NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            let stroke = max(1.0, rect.width / 12.0)
+            // The two squares span the box together, so a larger side means a
+            // smaller diagonal offset between them. At 18pt they need to share
+            // roughly two thirds of a side to read as a stack rather than as
+            // two squares touching at a corner.
+            let side = rect.width * 0.75
+            let radius = side * 0.24
+            // Stroke straddles the path, so inset by half of it to keep the
+            // outline inside the icon box.
+            let backRect = NSRect(x: rect.maxX - side, y: rect.maxY - side, width: side, height: side)
+                .insetBy(dx: stroke / 2, dy: stroke / 2)
+            let frontRect = NSRect(x: rect.minX, y: rect.minY, width: side, height: side)
+                .insetBy(dx: stroke / 2, dy: stroke / 2)
+
+            color.setStroke()
+
+            NSGraphicsContext.saveGraphicsState()
+            let clip = NSBezierPath(rect: rect)
+            clip.append(NSBezierPath(
+                roundedRect: frontRect.insetBy(dx: -stroke, dy: -stroke),
+                xRadius: radius,
+                yRadius: radius
+            ))
+            clip.windingRule = .evenOdd
+            clip.setClip()
+            let back = NSBezierPath(roundedRect: backRect, xRadius: radius, yRadius: radius)
+            back.lineWidth = stroke
+            back.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+
+            let front = NSBezierPath(roundedRect: frontRect, xRadius: radius, yRadius: radius)
+            front.lineWidth = stroke
+            front.stroke()
+            return true
+        }
     }
 
     /// Copy the grid's rendered text to the pasteboard.
@@ -6836,10 +6990,10 @@ final class ZonvieCore {
 
         // Brief acknowledgement so the click has visible feedback even though
         // the window itself does not change.
-        applyCopyButtonImage(button, symbolName: "checkmark")
+        applyCopyButtonImage(button, copied: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self, weak button] in
             guard let self, let button else { return }
-            self.applyCopyButtonImage(button, symbolName: "square.on.square")
+            self.applyCopyButtonImage(button, copied: false)
         }
     }
 

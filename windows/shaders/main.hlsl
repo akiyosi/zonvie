@@ -48,6 +48,7 @@ SamplerState samp0 : register(s0);
 #define ICON_HANDLE      (-4.0)
 #define TABLINE_TEXTURE  (-5.0)  // BGRA texture sampling mode
 #define ICON_COPY        (-6.0)
+#define ICON_ROUND_FILL  (-7.0)  // filled rounded rect (button hover wash)
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -157,17 +158,25 @@ float4 PSMain(VSOut i) : SV_Target {
             }
             // Copy icon: two overlapping rounded squares, drawn as outlines
             if (i.uv.x >= ICON_COPY - 0.1 && i.uv.x <= ICON_COPY + 0.1) {
-                float2 halfSize = float2(0.26, 0.26);
-                float radius = 0.09;
+                // Centres 0.20 apart against a 0.60 side: the squares share
+                // about two thirds of a side, matching makeCopyIconImage on
+                // macOS. A wider gap reads as two squares, not a stack.
+                float2 halfSize = float2(0.30, 0.30);
+                float radius = 0.10;
                 float stroke = 0.045;
-                float dBack = sdRoundBox(localUV - float2(0.62, 0.38), halfSize, radius);
-                float dFront = sdRoundBox(localUV - float2(0.38, 0.62), halfSize, radius);
+                float dBack = sdRoundBox(localUV - float2(0.60, 0.40), halfSize, radius);
+                float dFront = sdRoundBox(localUV - float2(0.40, 0.60), halfSize, radius);
                 // Clip the back square's outline where the front square covers
                 // it, so the overlap reads as one sheet stacked on another
                 // instead of a lattice of crossing strokes.
                 float outlineBack = max(abs(dBack) - stroke, -(dFront + stroke));
                 float outlineFront = abs(dFront) - stroke;
                 return renderIconSDF(i.col, min(outlineBack, outlineFront));
+            }
+            // Filled rounded rect spanning the quad (copy button hover wash)
+            if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {
+                float sdf = sdRoundBox(localUV - float2(0.5, 0.5), float2(0.5, 0.5), 0.18);
+                return renderIconSDF(i.col, sdf);
             }
         }
 

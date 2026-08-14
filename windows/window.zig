@@ -48,6 +48,128 @@ pub fn escapeNeovimByte(ch: u8) ?[]const u8 {
     };
 }
 
+/// HWND_TOPMOST / HWND_NOTOPMOST are ((HWND)-1) / ((HWND)-2); translate-c's
+/// cast to HWND ([*c]HWND__, align 4) trips Zig's pointer alignment check.
+/// Win32 USER handles are opaque values, never dereferenced, so redeclare
+/// SetWindowPos with an align-agnostic insert-after pointer (same approach as
+/// input.zig's IME overlay).
+const HWND_TOPMOST_PTR: *const anyopaque = @ptrFromInt(std.math.maxInt(usize));
+const HWND_NOTOPMOST_PTR: *const anyopaque = @ptrFromInt(std.math.maxInt(usize) - 1);
+extern "user32" fn SetWindowPos(
+    hWnd: c.HWND,
+    hWndInsertAfter: ?*const anyopaque,
+    X: c_int,
+    Y: c_int,
+    cx: c_int,
+    cy: c_int,
+    uFlags: c.UINT,
+) callconv(.winapi) c.BOOL;
+
+/// Add or remove WS_EX_TOPMOST on a decorated external window without moving,
+/// resizing or activating it.
+fn setExternalWindowTopmost(hwnd: c.HWND, topmost: bool) void {
+    _ = SetWindowPos(
+        hwnd,
+        if (topmost) HWND_TOPMOST_PTR else HWND_NOTOPMOST_PTR,
+        0,
+        0,
+        0,
+        0,
+        c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOACTIVATE,
+    );
+}
+
+/// Turn a shell file drop into editor input.
+///
+/// `force_cmdline` is set by the external cmdline window: a drop there means
+/// "put this path here" no matter what mode the editor reports. The main
+/// window leaves it false and keeps deciding by mode, so a drop while the
+/// built-in (non-external) command line is up still expands the path.
+pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool) void {
+    const corep = app.corep orelse return;
+    const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
+    if (file_count == 0) return;
+
+    // Build a single command buffer: "drop path1 path2 ..."
+    // or just "path1 path2 ..." for cmdline insertion.
+    var cmd_buf: [32768]u8 = undefined;
+    var pos: usize = 0;
+
+    const is_cmdline = force_cmdline or blk: {
+        const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
+        break :blk std.mem.startsWith(u8, std.mem.span(mode_ptr), "cmdline");
+    };
+
+    if (!is_cmdline) {
+        const prefix = "drop ";
+        @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
+    }
+
+    var i: c.UINT = 0;
+    while (i < file_count) : (i += 1) {
+        const required_len = c.DragQueryFileW(hDrop, i, null, 0);
+        if (required_len == 0) continue;
+
+        const buf_len = required_len + 1;
+        var stack_buf: [c.MAX_PATH + 1]c.WCHAR = undefined;
+        const heap_buf = if (buf_len > stack_buf.len)
+            std.heap.page_allocator.alloc(c.WCHAR, buf_len) catch continue
+        else
+            null;
+        defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+        const path_buf = if (heap_buf) |hb| hb.ptr else &stack_buf;
+        const len = c.DragQueryFileW(hDrop, i, path_buf, @intCast(buf_len));
+        if (len == 0) continue;
+
+        const wide_slice: []const u16 = @as([*]const u16, @ptrCast(path_buf))[0..len];
+
+        var utf8_stack: [c.MAX_PATH * 4]u8 = undefined;
+        const utf8_max = len * 4;
+        const utf8_heap = if (utf8_max > utf8_stack.len)
+            std.heap.page_allocator.alloc(u8, utf8_max) catch continue
+        else
+            null;
+        defer if (utf8_heap) |hb| std.heap.page_allocator.free(hb);
+
+        const utf8_dest = if (utf8_heap) |hb| hb else &utf8_stack;
+        const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
+        const utf8_path = utf8_dest[0..utf8_len];
+
+        // Add space separator between paths
+        if (i > 0 or (!is_cmdline and pos > 5)) {
+            if (pos < cmd_buf.len) {
+                cmd_buf[pos] = ' ';
+                pos += 1;
+            }
+        }
+
+        // Escape special characters for Neovim
+        for (utf8_path) |ch| {
+            if (pos + 2 > cmd_buf.len) break;
+            if (escapeNeovimByte(ch)) |esc| {
+                if (pos + esc.len <= cmd_buf.len) {
+                    @memcpy(cmd_buf[pos..][0..esc.len], esc);
+                    pos += esc.len;
+                }
+            } else {
+                cmd_buf[pos] = ch;
+                pos += 1;
+            }
+        }
+    }
+
+    if (pos == 0) return;
+    if (is_cmdline) {
+        // Insert paths at the cursor position.
+        app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
+    } else {
+        // Normal/insert/visual mode: execute :drop immediately.
+        app_mod.zonvie_core_send_command(corep, &cmd_buf, pos);
+    }
+}
+
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
 fn loadSystemCursor(id: usize) c.HCURSOR {
     const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
@@ -6537,92 +6659,7 @@ pub export fn WndProc(
         c.WM_DROPFILES => {
             const hDrop: c.HDROP = @ptrFromInt(@as(usize, wParam));
             defer c.DragFinish(hDrop);
-
-            if (getApp(hwnd)) |app| {
-                const corep = app.corep orelse return 0;
-                const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
-                if (file_count == 0) return 0;
-
-                // Build a single command buffer: "drop path1 path2 ..."
-                // or just "path1 path2 ..." for cmdline mode insertion.
-                var cmd_buf: [32768]u8 = undefined;
-                var pos: usize = 0;
-
-                // Check if Neovim is in command-line mode.
-                const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
-                const mode = std.mem.span(mode_ptr);
-                const is_cmdline = std.mem.startsWith(u8, mode, "cmdline");
-
-                if (!is_cmdline) {
-                    const prefix = "drop ";
-                    @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
-                    pos += prefix.len;
-                }
-
-                var i: c.UINT = 0;
-                while (i < file_count) : (i += 1) {
-                    const required_len = c.DragQueryFileW(hDrop, i, null, 0);
-                    if (required_len == 0) continue;
-
-                    const buf_len = required_len + 1;
-                    var stack_buf: [c.MAX_PATH + 1]c.WCHAR = undefined;
-                    const heap_buf = if (buf_len > stack_buf.len)
-                        std.heap.page_allocator.alloc(c.WCHAR, buf_len) catch continue
-                    else
-                        null;
-                    defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
-
-                    const path_buf = if (heap_buf) |hb| hb.ptr else &stack_buf;
-                    const len = c.DragQueryFileW(hDrop, i, path_buf, @intCast(buf_len));
-                    if (len == 0) continue;
-
-                    const wide_slice: []const u16 = @as([*]const u16, @ptrCast(path_buf))[0..len];
-
-                    var utf8_stack: [c.MAX_PATH * 4]u8 = undefined;
-                    const utf8_max = len * 4;
-                    const utf8_heap = if (utf8_max > utf8_stack.len)
-                        std.heap.page_allocator.alloc(u8, utf8_max) catch continue
-                    else
-                        null;
-                    defer if (utf8_heap) |hb| std.heap.page_allocator.free(hb);
-
-                    const utf8_dest = if (utf8_heap) |hb| hb else &utf8_stack;
-                    const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
-                    const utf8_path = utf8_dest[0..utf8_len];
-
-                    // Add space separator between paths
-                    if (i > 0 or (!is_cmdline and pos > 5)) {
-                        if (pos < cmd_buf.len) {
-                            cmd_buf[pos] = ' ';
-                            pos += 1;
-                        }
-                    }
-
-                    // Escape special characters for Neovim
-                    for (utf8_path) |ch| {
-                        if (pos + 2 > cmd_buf.len) break;
-                        if (escapeNeovimByte(ch)) |esc| {
-                            if (pos + esc.len <= cmd_buf.len) {
-                                @memcpy(cmd_buf[pos..][0..esc.len], esc);
-                                pos += esc.len;
-                            }
-                        } else {
-                            cmd_buf[pos] = ch;
-                            pos += 1;
-                        }
-                    }
-                }
-
-                if (pos > 0) {
-                    if (is_cmdline) {
-                        // In command-line mode: insert paths at cursor position.
-                        app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
-                    } else {
-                        // In normal/insert/visual mode: execute :drop immediately.
-                        app_mod.zonvie_core_send_command(corep, &cmd_buf, pos);
-                    }
-                }
-            }
+            if (getApp(hwnd)) |app| handleDroppedFiles(app, hDrop, false);
             return 0;
         },
 
@@ -6817,8 +6854,18 @@ pub export fn WndProc(
                     var ext_it = app.external_windows.iterator();
                     while (ext_it.next()) |entry| {
                         const grid_id = entry.key_ptr.*;
+                        if (grid_id == CMDLINE_GRID_ID) {
+                            // The cmdline stays visible so a file can be
+                            // dragged onto it from Explorer, which necessarily
+                            // deactivates this app. Drop WS_EX_TOPMOST instead
+                            // so it does not hover above whatever the user
+                            // switched to (mirrors the macOS .floating ->
+                            // .normal demotion in setCmdlineWindowActive).
+                            setExternalWindowTopmost(entry.value_ptr.*.hwnd, false);
+                            continue;
+                        }
                         // Only hide special windows
-                        if (grid_id == CMDLINE_GRID_ID or grid_id == POPUPMENU_GRID_ID or grid_id == MESSAGE_GRID_ID or grid_id == MSG_HISTORY_GRID_ID) {
+                        if (grid_id == POPUPMENU_GRID_ID or grid_id == MESSAGE_GRID_ID or grid_id == MSG_HISTORY_GRID_ID) {
                             _ = c.ShowWindow(entry.value_ptr.*.hwnd, c.SW_HIDE);
                         }
                     }
@@ -6833,7 +6880,13 @@ pub export fn WndProc(
                     var ext_it = app.external_windows.iterator();
                     while (ext_it.next()) |entry| {
                         const grid_id = entry.key_ptr.*;
-                        if (grid_id == CMDLINE_GRID_ID or grid_id == POPUPMENU_GRID_ID or grid_id == MESSAGE_GRID_ID or grid_id == MSG_HISTORY_GRID_ID) {
+                        if (grid_id == CMDLINE_GRID_ID) {
+                            // Never hidden on deactivate, so only the topmost
+                            // demotion has to be undone.
+                            setExternalWindowTopmost(entry.value_ptr.*.hwnd, true);
+                            continue;
+                        }
+                        if (grid_id == POPUPMENU_GRID_ID or grid_id == MESSAGE_GRID_ID or grid_id == MSG_HISTORY_GRID_ID) {
                             _ = c.ShowWindow(entry.value_ptr.*.hwnd, 8); // SW_SHOWNA
                         }
                     }

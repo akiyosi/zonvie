@@ -1073,7 +1073,9 @@ pub export fn zonvie_core_update_layout_px(
 /// section: pass 0 to keep the drawable-width-derived value that
 /// updateLayoutPxLocked computes, or a display-derived count to override it.
 /// Taking grid_mu a second time via the blocking set_screen_cols would negate
-/// the whole point of this entry point.
+/// the whole point of this entry point. `cmdline_default_cols` folds
+/// zonvie_core_set_cmdline_default_cols in for the same reason; 0 keeps the
+/// current value.
 pub export fn zonvie_core_try_update_layout_px(
     p: ?*zonvie_core,
     drawable_w_px: u32,
@@ -1081,6 +1083,7 @@ pub export fn zonvie_core_try_update_layout_px(
     cell_w_px: u32,
     cell_h_px: u32,
     screen_cols: u32,
+    cmdline_default_cols: u32,
 ) callconv(.c) bool {
     // A null handle is permanently unusable, not transiently busy. Returning
     // "busy" here would make a conforming caller retry forever.
@@ -1098,6 +1101,7 @@ pub export fn zonvie_core_try_update_layout_px(
         // thread already owns. Same reasoning as the blocking twin above.
         _ = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
         if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+        if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
         return true;
     }
 
@@ -1107,6 +1111,7 @@ pub export fn zonvie_core_try_update_layout_px(
     defer cp.grid_mu.unlock(clock.io());
     const changed = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
     if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+    if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
     if (changed) {
         // Standalone layout changes must publish main and external vertices
         // together, still holding the lock tryLock just acquired. Dropping it
@@ -1126,6 +1131,16 @@ pub export fn zonvie_core_set_screen_cols(p: ?*zonvie_core, cols: u32) callconv(
     if (p == null) return;
     const box = asBox(p.?);
     box.core.setScreenCols(cols);
+}
+
+/// Set the cmdline's default width in cells: the width it shows before its
+/// content needs more, clamped up by zonvie_core_set_screen_cols. Only the
+/// frontend knows the window chrome beside the cmdline grid, so it derives
+/// this from the main window width. 0 restores the main grid's width.
+pub export fn zonvie_core_set_cmdline_default_cols(p: ?*zonvie_core, cols: u32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.setCmdlineDefaultCols(cols);
 }
 
 pub export fn zonvie_core_set_log_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {

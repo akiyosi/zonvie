@@ -129,6 +129,7 @@ fn appendCopyIconVerts(
     window_w: f32,
     window_h: f32,
     color: [4]f32,
+    hovered: bool,
 ) usize {
     const rect = copyButtonRectPx(
         app,
@@ -144,7 +145,15 @@ fn appendCopyIconVerts(
     const w_ndc: f32 = @as(f32, @floatFromInt(rect.right - rect.left)) / half_w;
     const h_ndc: f32 = @as(f32, @floatFromInt(rect.bottom - rect.top)) / half_h;
 
-    return app_mod.addCopyIconVerts(verts, idx, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id);
+    var next = idx;
+    if (hovered) {
+        // Wash behind the icon, keyed off the icon colour so it stays visible
+        // on both dark and light colorschemes (mirrors CopyContentButton's
+        // hoverBackgroundColor on macOS).
+        const wash: [4]f32 = .{ color[0], color[1], color[2], 0.22 };
+        next = app_mod.addRoundFillVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, wash, grid_id);
+    }
+    return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id);
 }
 
 fn drawDecoratedExternalSurface(
@@ -168,6 +177,7 @@ fn drawDecoratedExternalSurface(
             const ext_win_relookup = app.external_windows.get(grid_id);
             const content_rows = if (ext_win_relookup) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
+            const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
             const cell_h = app.cell_h_px + app.linespace_px;
             const hide_cursor_for_ime = app.ime_composing;
@@ -283,7 +293,7 @@ fn drawDecoratedExternalSurface(
                 extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
             }
 
-            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color);
+            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color, copy_hover);
 
             try g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
@@ -333,6 +343,7 @@ fn drawDecoratedExternalSurface(
             const ext_win_relookup2 = app.external_windows.get(grid_id);
             const content_rows = if (ext_win_relookup2) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
+            const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
             const cell_h = app.cell_h_px + app.linespace_px;
             const icon_color: [4]f32 = .{
@@ -426,6 +437,7 @@ fn drawDecoratedExternalSurface(
                 window_w,
                 window_h,
                 icon_color,
+                copy_hover,
             );
             try g.draw(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
@@ -1543,6 +1555,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     }
 
+    // Only the cmdline accepts file drops; a drop there inserts the path as
+    // text instead of opening the file. The other decorated surfaces have
+    // nothing to insert into.
+    if (is_cmdline) {
+        c.DragAcceptFiles(hwnd, 1);
+    }
+
     // Apply the same acrylic backdrop as the main window so external float
     // windows and ext-cmdline/popupmenu/msg overlays get the frosted blur +
     // shadow (the backdrop is per-HWND on Windows).
@@ -2511,6 +2530,14 @@ pub export fn ExternalWndProc(
                         return 0;
                     }
 
+                    // Copy-button hover: repaint only on a state change so an
+                    // ordinary mouse move over the surface costs nothing.
+                    const copy_hover = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
+                    if (copy_hover != ext_win.copy_button_hover) {
+                        ext_win.copy_button_hover = copy_hover;
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
+
                     // Check for scrollbar hover
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
                         var client: c.RECT = undefined;
@@ -2541,6 +2568,15 @@ pub export fn ExternalWndProc(
             }
         },
 
+        c.WM_DROPFILES => {
+            // Only the cmdline window has DragAcceptFiles, so a drop here is
+            // always a path insertion, whatever mode the editor reports.
+            const hDrop: c.HDROP = @ptrFromInt(@as(usize, wParam));
+            defer c.DragFinish(hDrop);
+            if (app_mod.getApp(hwnd)) |app| window_mod.handleDroppedFiles(app, hDrop, true);
+            return 0;
+        },
+
         c.WM_MOUSELEAVE => {
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());
@@ -2555,6 +2591,10 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
+                    if (ext_win.copy_button_hover) {
+                        ext_win.copy_button_hover = false;
+                        _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                    }
                     ext_win.scrollbar_hover = false;
                     scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
                 }
