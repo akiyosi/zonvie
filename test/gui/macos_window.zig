@@ -250,6 +250,22 @@ fn axFindWindowBySize(app: *anyopaque, w: f64, h: f64) ?*anyopaque {
     return CFRetain(chosen);
 }
 
+/// Set the size of the app window currently sized (from_w, from_h).
+/// Used to leave a window at a height that is not a whole number of cells,
+/// which is what a user drag-resize produces.
+pub fn setWindowSizeBySize(pid: i32, from_w: f64, from_h: f64, to_w: f64, to_h: f64) bool {
+    if (!accessibilityTrusted()) return false;
+    const app = AXUIElementCreateApplication(pid) orelse return false;
+    defer CFRelease(app);
+    const win = axFindWindowBySize(app, from_w, from_h) orelse return false;
+    defer CFRelease(win);
+    const attr = axAttr(&ax_size_attr, "AXSize") orelse return false;
+    const size = CGSize{ .w = to_w, .h = to_h };
+    const v = AXValueCreate(kAXValueCGSizeType, &size) orelse return false;
+    defer CFRelease(v);
+    return AXUIElementSetAttributeValue(win, attr, v) == kAXErrorSuccess;
+}
+
 /// Move the app window currently sized (w, h) so its top-left corner sits
 /// at (x, y) in screen coordinates. A window whose resize corner lies off
 /// the bottom of the display cannot be grabbed, so scenarios that drag one
@@ -489,6 +505,131 @@ pub fn dragResizeWindowByMouse(
     }
     gui_io.sleepNs(100 * std.time.ns_per_ms);
     return true;
+}
+
+/// Trackpad-style pixel-precise scrolling, split so a caller can observe
+/// the surface WHILE the gesture is open.
+///
+/// A wheel notch and a trackpad glide are different events: the trackpad
+/// sends continuous, pixel-unit deltas carrying a phase (began / changed /
+/// ended), which is what drives the sub-cell smooth-scroll path. Wheel
+/// events never exercise it — and neither does a sequence of complete
+/// gestures, because everything settles between them. Anything that only
+/// happens mid-glide has to be sampled between `scrollStep` calls.
+///
+/// Same ownership rule as the drag above: the point is checked against the
+/// front-to-back window list first, and nothing is posted unless the app
+/// under test owns it. The cursor is warped onto the target because a
+/// scroll lands wherever the pointer is; `scrollEnd` puts it back.
+var scroll_restore_point: CGPoint = .{ .x = 0, .y = 0 };
+
+pub fn scrollBegin(pid: i32, win: MainWindow) bool {
+    const cx = win.bounds.x + win.bounds.w * 0.5;
+    const cy = win.bounds.y + win.bounds.h * 0.5;
+    if (ownerPidAtPoint(cx, cy) != pid) {
+        std.debug.print("[gui] scroll target point is not owned by the app; not scrolling\n", .{});
+        return false;
+    }
+    scroll_restore_point = cursorLocation();
+    _ = CGWarpMouseCursorPosition(.{ .x = cx, .y = cy });
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    postScroll(kCGScrollPhaseBegan, 0);
+    gui_io.sleepNs(16 * std.time.ns_per_ms);
+    return true;
+}
+
+pub fn scrollStep(dy_px: f64) void {
+    postScroll(kCGScrollPhaseChanged, dy_px);
+}
+
+pub fn scrollEnd() void {
+    postScroll(kCGScrollPhaseEnded, 0);
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    _ = CGWarpMouseCursorPosition(scroll_restore_point);
+}
+
+extern "c" fn CGEventCreateScrollWheelEvent2(
+    source: ?*anyopaque,
+    units: u32,
+    wheel_count: u32,
+    wheel1: i32,
+    wheel2: i32,
+    wheel3: i32,
+) ?*anyopaque;
+extern "c" fn CGEventSetDoubleValueField(event: *anyopaque, field: u32, value: f64) void;
+
+const kCGScrollEventUnitPixel: u32 = 0;
+const kCGScrollWheelEventIsContinuous: u32 = 88;
+const kCGScrollWheelEventScrollPhase: u32 = 99;
+const kCGScrollWheelEventPointDeltaAxis1: u32 = 96;
+const kCGScrollPhaseBegan: i64 = 1;
+const kCGScrollPhaseChanged: i64 = 2;
+const kCGScrollPhaseEnded: i64 = 4;
+/// kCGScrollWheelEventMomentumPhase. After the fingers leave the trackpad
+/// macOS keeps delivering deltas with scrollPhase = 0 and THIS field set
+/// instead. It is a different code path in the app (scrollMomentumRunning),
+/// and it is the phase the flicker was reported in — a gesture that only
+/// ever sends began/changed/ended never enters it.
+const kCGScrollWheelEventMomentumPhase: u32 = 123;
+const kCGMomentumPhaseNone: i64 = 0;
+const kCGMomentumPhaseBegin: i64 = 1;
+const kCGMomentumPhaseContinue: i64 = 2;
+const kCGMomentumPhaseEnded: i64 = 3;
+
+fn postScroll(phase: i64, dy: f64) void {
+    postScrollPhased(phase, kCGMomentumPhaseNone, dy);
+}
+
+fn postScrollPhased(scroll_phase: i64, momentum_phase: i64, dy: f64) void {
+    // wheel1 stays ZERO and the movement is carried only in the point-delta
+    // field. Putting it in wheel1 makes the event present a non-zero LINE
+    // delta, which the frontend reads as a wheel notch and turns into a full
+    // 'mousescroll' unit — a single 2px synthetic nudge scrolled Neovim by
+    // three lines that way, which is the opposite of the sub-row gesture
+    // this is meant to produce.
+    const e = CGEventCreateScrollWheelEvent2(
+        null,
+        kCGScrollEventUnitPixel,
+        1,
+        0,
+        0,
+        0,
+    ) orelse return;
+    defer CFRelease(e);
+    CGEventSetIntegerValueField(e, kCGScrollWheelEventIsContinuous, 1);
+    CGEventSetIntegerValueField(e, kCGScrollWheelEventScrollPhase, scroll_phase);
+    CGEventSetIntegerValueField(e, kCGScrollWheelEventMomentumPhase, momentum_phase);
+    CGEventSetDoubleValueField(e, kCGScrollWheelEventPointDeltaAxis1, dy);
+    CGEventPost(kCGHIDEventTap, e);
+}
+
+/// Lift the fingers and let the glide continue under its own inertia:
+/// scrollPhase goes to 0 and momentumPhase carries begin / continue / end,
+/// with the delta decaying. This is what the OS sends after a real flick,
+/// and it is a different path in the app from the finger-down phase.
+/// Split like the drag phase so a caller can observe BETWEEN momentum
+/// deltas — which is where the reported flicker lives.
+var momentum_dy: f64 = 0;
+
+pub fn scrollMomentumStart(start_dy_px: f64) void {
+    postScroll(kCGScrollPhaseEnded, 0);
+    gui_io.sleepNs(16 * std.time.ns_per_ms);
+    momentum_dy = start_dy_px;
+    postScrollPhased(0, kCGMomentumPhaseBegin, momentum_dy);
+    gui_io.sleepNs(16 * std.time.ns_per_ms);
+}
+
+pub fn scrollMomentumStep() void {
+    postScrollPhased(0, kCGMomentumPhaseContinue, momentum_dy);
+    // Decay slowly: the glide has to outlast the whole capture run, or the
+    // later frames observe a window that has already come to rest.
+    momentum_dy *= 0.9992;
+}
+
+pub fn scrollMomentumEnd() void {
+    postScrollPhased(0, kCGMomentumPhaseEnded, 0);
+    gui_io.sleepNs(50 * std.time.ns_per_ms);
+    _ = CGWarpMouseCursorPosition(scroll_restore_point);
 }
 
 /// No-op on macOS: moving another process's window needs the Accessibility

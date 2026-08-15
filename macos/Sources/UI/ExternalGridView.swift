@@ -1537,13 +1537,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         )
     }
 
+
     /// Copy the rows about to leave this window's scroll region into the
     /// retention, so the band the smooth-scroll offset opens shows them
     /// instead of the edge row's background stretched across it.
     ///
-    /// The whole row is copied: an external window owns its surface outright,
-    /// so unlike the main composite there is no other grid's content mixed
-    /// into it. Called from inside the flush bracket, before the slot remap.
+    /// Only the row's DECO_SCROLLABLE vertices are copied (shared filter with
+    /// the main renderer's grid_scroll capture — see
+    /// copyRetainedScrollableRow). An external window owns its surface
+    /// outright, so no OTHER grid mixes in, but its own rows still hold
+    /// non-scrollable cells: a float border's "│" columns. A whole-row copy
+    /// let those escape the offset shift and the content clip, landing them
+    /// on the margin rows. Called from inside the flush bracket, before the
+    /// slot remap.
     private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int) {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         guard ws.rowState.usingRowBuffers else { return }
@@ -1578,12 +1584,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 )
                 stepOpened = true
             }
-            let needed = vc * MemoryLayout<Vertex>.stride
-            guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
-            memcpy(dstBuf.contents(), srcBuf.contents(), needed)
+            guard let copied = copyRetainedScrollableRow(
+                retention: retention,
+                srcBuf: srcBuf,
+                vertexCount: vc,
+                gridId: gridId
+            ) else { continue }
             retention.stage(RetainedScrollRow(
-                buffer: dstBuf,
-                count: vc,
+                buffer: copied.buffer,
+                count: copied.count,
                 gridId: gridId,
                 sourceRow: sourceRow,
                 targetRow: outgoingRow - rowsDelta,
@@ -2830,7 +2839,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // back to the edge it left through; the shader then applies this
             // grid's scroll offset like any other row, and the existing
             // content clip discards the part outside the window.
-            let retainedRows = smoothScrolling ? retainedSnapshot : []
+            //
+            // Gated on hasScrollOffset, not smoothScrolling: both the offset
+            // shift and the content clip come from this grid's ScrollOffset
+            // entry, matched by grid_id in the vertex shader. On the settle's
+            // final frame the offset resolves to nil (smoothScrolling stays
+            // true via wasScrollOffsetActiveInLastPresentedFrame), so a
+            // retained row drawn then matches no entry and lands unshifted
+            // and UNCLIPPED at its targetRow — which sits in the margin rows
+            // above the content edge it left through. With no offset the band
+            // is closed and every real row is drawn on the cell grid, so
+            // there is nothing for a retained row to cover.
+            let retainedRows = hasScrollOffset ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
             let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
@@ -3058,7 +3078,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     if !nonZeroTranslations.isEmpty {
                         ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
                     }
-                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows)")
+                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPx.y)")
                 }
 
                 let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
@@ -3717,7 +3737,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 scrollOffset.pin_edges = 0
             }
 
-            ZonvieCore.appLog("[ExternalGridView] scroll offset: gridId=\(gridId) offsetPx=\(info.offsetYPx) marginTop=\(info.marginTop) marginBottom=\(info.marginBottom)")
+            ZonvieCore.appLog("[ExternalGridView] scroll offset: gridId=\(gridId) offsetPx=\(info.offsetYPx) marginTop=\(info.marginTop) marginBottom=\(info.marginBottom) ndc=\(scrollOffset.offset_y) top=\(scrollOffset.content_top_y) bot=\(scrollOffset.content_bottom_y) pin=\(scrollOffset.pin_edges) retained=\(retention.publishedCount(gridId: gridId)) gridTop=\(info.gridTopYNDC) cellNDC=\(cellHeightNDC) vpH=\(viewportHeight)")
 
             lock.lock()
             defer { lock.unlock() }

@@ -5583,31 +5583,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
         let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : row
 
-        // Content cells only. Counted before a ring slot is taken, because
-        // taking one advances the ring.
-        let scrollable = ZONVIE_DECO_SCROLLABLE
-        let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
-        var kept = 0
-        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
-            kept += 1
-        }
-        guard kept > 0 else { return }
-
         // Read before locking: the accessor takes `lock` itself, which is not
         // recursive.
         let capturedCellHeightPx = cellHeightPx
-        guard let dstBuf = retention.takeBuffer(needed: kept * MemoryLayout<Vertex>.stride) else { return }
-        let dstPtr = dstBuf.contents().bindMemory(to: Vertex.self, capacity: kept)
-        var w = 0
-        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
-            dstPtr[w] = src[i]
-            w += 1
-        }
+        // Content cells only — see copyRetainedScrollableRow.
+        guard let copied = copyRetainedScrollableRow(
+            retention: retention,
+            srcBuf: srcBuf,
+            vertexCount: vc,
+            gridId: gridId
+        ) else { return }
 
         bracketStagedGrids.insert(gridId)
         retention.stage(RetainedScrollRow(
-            buffer: dstBuf,
-            count: kept,
+            buffer: copied.buffer,
+            count: copied.count,
             gridId: gridId,
             sourceRow: sourceRow,
             targetRow: targetRow,
