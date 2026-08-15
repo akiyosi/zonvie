@@ -381,11 +381,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // main grid, so this must not be materially tighter than that cap.
     private let maxRowBuffers = 20000
 
+    /// Occlusion and window-move observers; see viewDidMoveToWindow.
+    private var occlusionObserver: NSObjectProtocol?
+    private var moveObservers: [NSObjectProtocol] = []
+
+    /// Last cursor box this view forwarded to the shared shader cursor
+    /// state, in this view's local NDC, so a window move can re-project it.
+    /// Nil while the cursor is not on this view's grid.
+    private var lastForwardedCursorNdc: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
+    private var lastForwardedCursorColor: (Float, Float, Float, Float)?
+
     // Active rendering mode: when new commits arrive, switch to isPaused=false
     // so MTKView draws at preferredFramesPerSecond (60fps). After idle, pause.
-    /// Occlusion observer for this view's window; see viewDidMoveToWindow.
-    private var occlusionObserver: NSObjectProtocol?
-
     private var activeDrawIdleFrames: Int = 0
     private let activeDrawIdleThreshold = 10  // Pause after N frames with no new commits
 
@@ -764,6 +771,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             NotificationCenter.default.removeObserver(observer)
             occlusionObserver = nil
         }
+        for observer in moveObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        moveObservers.removeAll()
 
         // Release Metal buffers held by all three SurfaceBufferSet objects.
         // Each set contains per-row MTLBuffer references that can total ~8MB.
@@ -835,26 +846,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     private func setupScrollbar() {
-        // draw() parks the loop while this window is invisible, so a window
-        // that becomes visible again with no Neovim traffic behind it would
-        // otherwise stay on its stale last frame.
-        if let previous = occlusionObserver {
-            NotificationCenter.default.removeObserver(previous)
-            occlusionObserver = nil
-        }
-        if let win = window {
-            occlusionObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didChangeOcclusionStateNotification,
-                object: win,
-                queue: .main
-            ) { [weak self] _ in
-                guard let self, self.window?.occlusionState.contains(.visible) == true else { return }
-                self.activateDrawLoop()
-                self.setNeedsDisplay(self.bounds)
-            }
-
-        }
-
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled else { return }
 
@@ -1806,6 +1797,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // window drawable px using the same screen-space
                 // parameters the shader uniforms use.
                 forwardExternalCursorToMainShader(ptr: validPtr, count: count)
+            } else {
+                // The cursor left this window: stop republishing its rect on
+                // window moves, or this view would keep overwriting whichever
+                // surface now owns the cursor.
+                lastForwardedCursorNdc = nil
             }
             return
         }
@@ -2037,16 +2033,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// popupmenu / a float window.
     private func forwardExternalCursorToMainShader(ptr: UnsafePointer<zonvie_vertex>, count: Int) {
         guard count > 0 else { return }
-        guard let mainView = mainTerminalView,
-              let renderer = mainView.renderer else { return }
-        // Same screen-space parameters the shader uniforms use, so the
-        // cursor rect lands in the same coordinate system the shader
-        // resolves against.
-        let (screenRes, windowOffset) = screenSpaceParameters(
-            mainView: mainView,
-            selfView: self
-        )
-        // Convert NDC bounding box to main drawable pixels.
         var minX: Float = ptr[0].position.0
         var maxX: Float = minX
         var minY: Float = ptr[0].position.1
@@ -2058,6 +2044,38 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if p.1 < minY { minY = p.1 }
             if p.1 > maxY { maxY = p.1 }
         }
+        let c = ptr[0].color
+        lastForwardedCursorNdc = (minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+        lastForwardedCursorColor = (c.0, c.1, c.2, c.3)
+        republishCursorShaderState()
+    }
+
+    /// Project the last forwarded cursor NDC box into the main window's
+    /// drawable pixels and publish it as the shader cursor rect.
+    ///
+    /// Split out from the forwarder because the projection depends on where
+    /// the two windows are, not only on the verts: `screenSpaceParameters`
+    /// measures this view's top-left relative to the main view's. Dragging
+    /// either window changes that offset without producing a single new
+    /// cursor vertex, which used to leave the cursor shader burning at the
+    /// float's pre-move position until the next cursor update.
+    private func republishCursorShaderState(reanchor: Bool = false) {
+        guard let ndc = lastForwardedCursorNdc,
+              let color = lastForwardedCursorColor else { return }
+        guard let mainView = mainTerminalView,
+              let renderer = mainView.renderer else { return }
+        // Same screen-space parameters the shader uniforms use, so the
+        // cursor rect lands in the same coordinate system the shader
+        // resolves against.
+        let (screenRes, windowOffset) = screenSpaceParameters(
+            mainView: mainView,
+            selfView: self
+        )
+        let minX = ndc.minX
+        let maxX = ndc.maxX
+        let minY = ndc.minY
+        let maxY = ndc.maxY
+        // Convert NDC bounding box to main drawable pixels.
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
         // Map the cursor's NDC center through the SAME viewport the grid is
@@ -2091,18 +2109,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let botPx = centerPxY + cellH * 0.5
         // Ghostty's cursor shaders treat iCurrentCursor.y as the
         // BOTTOM edge of the cursor rect (rect spans y-h..y).
-        let c0 = ptr[0].color
         // Tag the rect with this window's grid so the shader-cursor position
         // follows its smooth-scroll displacement the same way the main
         // window's does. Omitting it does not just leave this window
         // uncorrected: the cursor shader state is shared with the main view
         // (renderer is mainView.renderer), so a default of "no grid" would
         // switch the main window's correction off too.
-        renderer.setCursorShaderState(
-            rect: (leftPx, botPx, rightPx - leftPx, botPx - topPx),
-            color: (c0.0, c0.1, c0.2, c0.3),
-            gridId: gridId
-        )
+        let rect = (leftPx, botPx, rightPx - leftPx, botPx - topPx)
+        if reanchor {
+            // Window move: no commit will come to publish a staged value, and
+            // the cursor has not moved relative to its text.
+            renderer.reanchorCursorShaderState(rect: rect, gridId: gridId)
+        } else {
+            renderer.setCursorShaderState(rect: rect, color: color, gridId: gridId)
+        }
     }
 
     /// Allocate the two ping-pong textures used by multi-pass custom
@@ -4137,6 +4157,49 @@ extension ExternalGridView: NSTextInputClient {
         // Deactivate draw loop when removed from window
         if window == nil {
             deactivateDrawLoop()
+        }
+
+        // draw() parks the loop while this window is invisible, so a window
+        // that becomes visible again with no Neovim traffic behind it would
+        // otherwise stay on its stale last frame.
+        if let previous = occlusionObserver {
+            NotificationCenter.default.removeObserver(previous)
+            occlusionObserver = nil
+        }
+        for observer in moveObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        moveObservers.removeAll()
+
+        if let win = window {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: win,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.window?.occlusionState.contains(.visible) == true else { return }
+                self.activateDrawLoop()
+                self.setNeedsDisplay(self.bounds)
+            }
+
+            // The shader cursor rect is expressed in the MAIN window's
+            // drawable pixels, so it depends on the offset between the two
+            // windows — dragging either one invalidates it without producing
+            // a cursor update to recompute it from. Both are watched: this
+            // window is the one the user drags, and the main window moving
+            // shifts the same offset the other way.
+            let movedWindows = [win, mainTerminalView?.window].compactMap { $0 }
+            for moved in movedWindows {
+                moveObservers.append(NotificationCenter.default.addObserver(
+                    forName: NSWindow.didMoveNotification,
+                    object: moved,
+                    queue: .main
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.republishCursorShaderState(reanchor: true)
+                    self.mainTerminalView?.requestRedraw()
+                })
+            }
         }
 
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
