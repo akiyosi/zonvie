@@ -203,14 +203,14 @@ fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void
 
 /// Calculate the Neovim :tabmove position from a drop target index.
 /// Returns the value N for `:tabmove N`.
+///
+/// `to_idx` is the insertion index in the tab list *before* the move, and
+/// `:tabmove N` moves the current tab to after tab page N counted in that same
+/// pre-move list (1-based, 0 = very front). The two are the same number, so
+/// this only clamps. Subtracting one landed every reorder a slot short, and
+/// turned a one-slot rightward drag into "move after myself" — a no-op.
 fn calculateTabMovePosition(to_idx: usize, tab_count: usize) i32 {
-    if (to_idx == 0) {
-        return 0;
-    } else if (to_idx >= tab_count) {
-        return @intCast(tab_count);
-    } else {
-        return @intCast(to_idx - 1);
-    }
+    return @intCast(@min(to_idx, tab_count));
 }
 
 /// Calculate a drop target index from a mouse position along a uniform-sized item list.
@@ -1027,14 +1027,9 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
             if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: from_idx={d} to_idx={d} tab_count={d}\n", .{ from_idx, to_idx, app.tabline_state.tab_count });
 
-            // Only move if target is different
+            // Dropping onto your own slot, or just past it, inserts you where
+            // you already are.
             if (to_idx != from_idx and to_idx != from_idx + 1) {
-                // First, select the tab we're dragging (if not already selected)
-                // Then use :tabmove to reorder
-                // :tabmove N moves current tab to position after tab N (1-based in the result)
-                // :tabmove 0 moves to the beginning
-                // :tabmove $ or large number moves to end
-
                 const new_pos = calculateTabMovePosition(to_idx, app.tabline_state.tab_count);
 
                 if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: calculated new_pos={d}\n", .{new_pos});
