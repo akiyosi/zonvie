@@ -383,6 +383,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     // Active rendering mode: when new commits arrive, switch to isPaused=false
     // so MTKView draws at preferredFramesPerSecond (60fps). After idle, pause.
+    /// Occlusion observer for this view's window; see viewDidMoveToWindow.
+    private var occlusionObserver: NSObjectProtocol?
+
     private var activeDrawIdleFrames: Int = 0
     private let activeDrawIdleThreshold = 10  // Pause after N frames with no new commits
 
@@ -753,6 +756,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         scrollbarHideTimer?.invalidate()
         scrollbarHideTimer = nil
 
+        // viewDidMoveToWindow(nil) normally removes this on teardown, since
+        // every current close path clears contentView first. Dropping it here
+        // too keeps a future path that releases the view without detaching it
+        // from leaving a registration behind.
+        if let observer = occlusionObserver {
+            NotificationCenter.default.removeObserver(observer)
+            occlusionObserver = nil
+        }
+
         // Release Metal buffers held by all three SurfaceBufferSet objects.
         // Each set contains per-row MTLBuffer references that can total ~8MB.
         for bs in bufferSets {
@@ -823,6 +835,26 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     private func setupScrollbar() {
+        // draw() parks the loop while this window is invisible, so a window
+        // that becomes visible again with no Neovim traffic behind it would
+        // otherwise stay on its stale last frame.
+        if let previous = occlusionObserver {
+            NotificationCenter.default.removeObserver(previous)
+            occlusionObserver = nil
+        }
+        if let win = window {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: win,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.window?.occlusionState.contains(.visible) == true else { return }
+                self.activateDrawLoop()
+                self.setNeedsDisplay(self.bounds)
+            }
+
+        }
+
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled else { return }
 
@@ -2241,12 +2273,46 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 return
             }
 
+            // Nothing may be drawn while this window is not on screen.
+            //
+            // A window that is miniaturized or fully covered stops being
+            // composited, so its CAMetalLayer never gets its presented
+            // drawables back, and `currentDrawable` below then takes about
+            // a second to return one — measured at 993ms and 1002ms (see
+            // [perf] ext_acquire_drawable). It is a MAIN-thread call, so
+            // that freezes the whole app: the main window's shader
+            // animation, Neovim redraws and key event delivery all stop for
+            // a second at a time, once per frame this view attempts.
+            //
+            // It stayed hidden until a custom shader started animating.
+            // Before that, an idle external window parked its draw loop and
+            // never reached this line; the animation exception below makes
+            // it attempt a frame every vsync even with nothing to show,
+            // which is exactly when being invisible starts to cost a
+            // second. Re-armed by the occlusion observer in
+            // viewDidMoveToWindow, and by commitFlush on any new content.
+            //
+            // hasPresentedOnce gates it: occlusionState is published
+            // asynchronously by the window server, so a window that was
+            // just ordered in still reports "not visible" for a frame or
+            // two. Parking there would leave a brand-new cmdline or
+            // popupmenu panel empty until the notification lands — and a
+            // window with nothing on screen yet has no stale content worth
+            // protecting, so it is allowed to pay the acquire once.
+            if hasPresentedOnce, let win = view.window,
+               win.isMiniaturized || !win.occlusionState.contains(.visible) {
+                ZonvieCore.appLog("[ext_draw_skip] gridId=\(gridId) window not visible; skipping frame")
+                deactivateDrawLoop()
+                return
+            }
+
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
                 ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) early return: drawableSize invalid (\(view.drawableSize))")
                 return
             }
 
-            // Skip rendering for minimized windows.
+            // Skip rendering for minimized windows. Reached only before the
+            // first present, when the guard above stands down.
             // No frame-completion notification is needed here: unlike
             // MetalTerminalView (which uses redrawPending/didDrawFrame to
             // gate future redraws), ExternalGridView is driven directly
@@ -3277,7 +3343,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // --- Blit back buffer to drawable ---
-            guard let drawable = view.currentDrawable else {
+            // Timed, mirroring the main view's draw_acquire_drawable: this
+            // is a MAIN-thread call with no non-blocking variant, and it is
+            // where an invisible window used to cost ~1s per frame.
+            var tAcquire: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled { tAcquire = CFAbsoluteTimeGetCurrent() }
+            let acquired = view.currentDrawable
+            if ZonvieCore.appLogEnabled {
+                let us = (CFAbsoluteTimeGetCurrent() - tAcquire) * 1_000_000
+                ZonvieCore.appLogPerf("[perf] ext_acquire_drawable gridId=\(gridId) us=\(String(format: "%.1f", us)) got=\(acquired != nil)")
+            }
+            guard let drawable = acquired else {
                 // Capture semaphore and lock directly so the signal fires even
                 // if the view is deallocated before the GPU finishes.
                 let sem = inflightSemaphore

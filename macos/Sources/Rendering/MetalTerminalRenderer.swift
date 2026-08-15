@@ -2349,10 +2349,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
             (view as? MetalTerminalView)?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
         }
-        // Skip all rendering for minimized windows.
+        // Skip all rendering while this window is not on screen.
         // Metal's currentDrawable blocks/crashes when the window is in the
         // Dock, and onPreDraw accesses the Zig core (unnecessary CPU work).
-        if let window = view.window, window.isMiniaturized {
+        // A fully covered window has the same problem for the same reason —
+        // it stops being composited, so its layer never recovers the
+        // drawables it presented — and an animating custom shader keeps
+        // asking for a frame every vsync regardless of visibility.
+        // ExternalGridView.draw carries the same guard, where the block was
+        // first measured at ~1s per attempt.
+        if let window = view.window, window.isMiniaturized || !window.occlusionState.contains(.visible) {
+            // Drain the scroll clears anyway. They are appended from the core
+            // thread as grid_scroll arrives and are drained ONLY from inside
+            // draw(), so skipping the draw makes the queue append-only for as
+            // long as the window stays hidden. Being miniaturized is a short
+            // user-driven state; being covered is not, and a background
+            // :terminal producing scroll traffic for an hour would leave both
+            // an unbounded array and an O(external x N) scan to pay on the
+            // first frame after the window comes back. This is lock and
+            // dictionary work, not GPU work.
+            (view as? MetalTerminalView)?.processPendingScrollClears()
             (view as? MetalTerminalView)?.didDrawFrame()
             return
         }
