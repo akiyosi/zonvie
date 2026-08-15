@@ -153,6 +153,26 @@ pub fn field(line: []const u8, name: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, rest[0..end]) catch null;
 }
 
+/// Every line containing `marker` stamped at or after `since_ms`, joined
+/// with newlines. Caller owns the slice. Used by scenarios that check an
+/// invariant across a whole gesture rather than a single sample.
+pub fn linesSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, since_ms: f64) ![]u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, marker) == null) continue;
+        const ts = lineTimestampMs(line) orelse continue;
+        if (ts < since_ms) continue;
+        try out.appendSlice(alloc, line);
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Poll until `marker` shows up, so a scenario can wait for app-side
 /// state (e.g. "the custom shader finished loading") instead of sleeping.
 pub fn waitFor(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, timeout_ms: u64) !void {
