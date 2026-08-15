@@ -573,6 +573,7 @@ pub fn build(b: *std.Build) !void {
             gui_mod.linkFramework("CoreGraphics", .{});
             gui_mod.linkFramework("CoreFoundation", .{});
             gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
+            gui_mod.linkFramework("ApplicationServices", .{}); // AXUIElement (drag-resize emulation)
         } else {
             gui_mod.linkSystemLibrary("user32", .{});
             gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture

@@ -86,6 +86,17 @@ test "gui:mini_message_bulk" {
     }
 }
 
+test "gui:extfloat_resize_shader_stall" {
+    // macOS only: the animated-shader draw loop and the external-float
+    // window plumbing this exercises live in the macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_resize_shader_stall.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_message_position" {
     // macOS only: exercises the macOS frontend's ext-float anchoring
     // (getExtFloatTargetFrame); the Windows frontend has its own message UI.

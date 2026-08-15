@@ -1,0 +1,24 @@
+# Fixture for scenarios that need the renderer's animated-shader mode
+# (anyCustomShaderNeedsAnimation == true), which drives a frame every
+# vsync instead of only on Neovim flushes.
+#
+# [window] mirrors the field session the extfloat_resize_shader_stall
+# scenario is derived from (blur off, opaque-ish): with the macOS default
+# blur=true the renderer takes the 2-pass path instead, which is a
+# different draw path than the one the report came from.
+[window]
+blur = false
+opacity = 0.8
+blur_radius = 70
+
+# The path is relative to the app's working directory, which the GUI
+# driver leaves at the repository root.
+#
+# The fixture shader is committed so the scenario is self-contained. To
+# rerun it against the exact shader from the field report, point this at
+# tmp/ghostty-shaders/cursor_blaze.glsl (gitignored, hence not the
+# default). Verified 2026-08-15: it loads with needsAnimation=true and
+# produces the same every-vsync cadence as the probe shader.
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/animated_probe.glsl"]

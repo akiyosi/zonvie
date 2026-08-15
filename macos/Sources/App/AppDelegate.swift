@@ -392,6 +392,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             vc.core?.stopCursorBlinking()
         }
+
+        // Repaint on the way back, for the same reason windowDidDeminiaturize
+        // does: MetalTerminalRenderer.draw skips every frame while the window
+        // is invisible (currentDrawable blocks the main thread there), and it
+        // still clears redrawPending on the way out. A redraw that arrived
+        // while covered is therefore dropped, and with an idle Neovim behind
+        // it nothing would repaint the window once it is uncovered.
+        if win?.occlusionState.contains(.visible) == true {
+            vc.requestFullRedraw()
+        }
     }
 
     // MARK: - Open Files from Finder
