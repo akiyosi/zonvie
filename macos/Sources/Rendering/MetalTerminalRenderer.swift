@@ -1029,6 +1029,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorChangeTime: Float = 0
+    /// Last cursor rect handed to a shader, so the log fires on change only.
+    private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     /// The rect as the core measured it, and the grid it belongs to. Turned
     /// into the screen-space state above by `evaluateCursorShaderChange`, once
     /// the frame's displacement for that grid is known. Written under `lock`.
@@ -4482,6 +4484,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             defer { lock.unlock() }
             return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime)
         }()
+        // Log the value the shader actually receives, not the one some
+        // upstream stage computed — the two came apart once already, when a
+        // re-projected rect stayed in the staging slot. Emitted only when it
+        // changes, so this stays off the per-frame cost.
+        if ZonvieCore.appLogEnabled, cursorCur != lastLoggedShaderCursor {
+            lastLoggedShaderCursor = cursorCur
+            ZonvieCore.appLog(
+                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3)"
+            )
+        }
         uniforms.iCurrentCursor = cursorCur
         uniforms.iPreviousCursor = cursorPrev
         uniforms.iCurrentCursorColor = cursorCurColor
@@ -4548,6 +4560,50 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         stagedShaderCursor = (rect: rect, color: color, gridId: gridId)
         lock.unlock()
+    }
+
+    /// Re-anchor the shader cursor after the WINDOW that owns it moved.
+    ///
+    /// setCursorShaderState only stages: the value reaches the uniforms when
+    /// a surface commits. A window drag produces no commit, so a freshly
+    /// projected rect would sit in the staging slot and the shader would keep
+    /// burning at the pre-move position. This writes through instead.
+    ///
+    /// It also translates rather than replaces. The cursor did not move
+    /// relative to its text — the window did — so rotating previous/current
+    /// (what evaluateCursorShaderChange does for a real cursor move) would
+    /// fire the cursor-move animation and drag a trail across the screen from
+    /// where the window used to be. Both endpoints shift by the same delta and
+    /// iTimeCursorChange is left alone, so an in-flight trail keeps playing at
+    /// its new location.
+    ///
+    /// Ignored unless `gridId` still owns the shader cursor, so a window that
+    /// no longer has the cursor cannot hijack it by being dragged.
+    func reanchorCursorShaderState(rect: (Float, Float, Float, Float), gridId: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard shaderCursorGridId == gridId else { return }
+        let dx = rect.0 - shaderCursorRawRect.0
+        let dy = rect.1 - shaderCursorRawRect.1
+        guard dx != 0 || dy != 0 else { return }
+        shaderCursorRawRect = rect
+        shaderCursorCurrent = (
+            shaderCursorCurrent.0 + dx,
+            shaderCursorCurrent.1 + dy,
+            shaderCursorCurrent.2,
+            shaderCursorCurrent.3
+        )
+        shaderCursorPrevious = (
+            shaderCursorPrevious.0 + dx,
+            shaderCursorPrevious.1 + dy,
+            shaderCursorPrevious.2,
+            shaderCursorPrevious.3
+        )
+        // A cursor update that arrived during the drag is still waiting for a
+        // commit; move it too, or the commit would undo this re-anchor.
+        if let staged = stagedShaderCursor, staged.gridId == gridId {
+            stagedShaderCursor = (rect: rect, color: staged.color, gridId: staged.gridId)
+        }
     }
 
     /// Hand the staged cursor state to the shader uniforms, together with the

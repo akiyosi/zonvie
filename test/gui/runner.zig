@@ -86,6 +86,16 @@ test "gui:mini_message_bulk" {
     }
 }
 
+test "gui:extfloat_move_cursor_shader" {
+    // macOS only: the shader cursor plumbing lives in the macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_move_cursor_shader.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_resize_shader_stall" {
     // macOS only: the animated-shader draw loop and the external-float
     // window plumbing this exercises live in the macOS frontend.
