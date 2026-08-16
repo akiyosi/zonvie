@@ -96,6 +96,27 @@ test "gui:extfloat_margin_scroll_flicker" {
     }
 }
 
+test "gui:main_margin_scroll_flicker" {
+    // macOS only: drives the macOS frontend's main-window smooth-scroll path.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:main_float_margin_scroll_flicker" {
+    // macOS only: a bordered float composited into the main window is the
+    // one configuration with a real BOTTOM margin row there.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_float_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_move_cursor_shader" {
     // macOS only: the shader cursor plumbing lives in the macOS frontend.
     if (comptime builtin.os.tag == .macos) {

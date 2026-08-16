@@ -520,23 +520,27 @@ final class ScrollRetention {
 }
 
 /// Copy one outgoing row's retainable vertices into the retention ring:
-/// only the vertices of `gridId` that carry DECO_SCROLLABLE. Border and
-/// margin-column cells (a float border's "│", a separator) do not carry the
-/// flag, so the vertex shader neither shifts them by the scroll offset nor
-/// marks them for the fragment content clip — retained and translated to a
-/// targetRow they would land statically on a margin row and persist in the
-/// back buffer. Shared by MetalTerminalRenderer's grid_scroll capture and
-/// ExternalGridView's pending-scroll capture so both retain under the same
-/// invariant: a retained row holds scrollable cells of one grid, nothing
-/// else. Returns nil when the row has nothing retainable (the band then
-/// falls back to the edge stretch) or the ring has no buffer.
+/// only the vertices of `gridId` whose deco_flags carry `scrollableMask`
+/// (DECO_SCROLLABLE — passed in because this file is also compiled
+/// standalone by ScrollRetentionTests, without the C header that defines
+/// the constant). Border and margin-column cells (a float border's "│", a
+/// separator) do not carry the flag, so the vertex shader neither shifts
+/// them by the scroll offset nor marks them for the fragment content clip —
+/// retained and translated to a targetRow they would land statically on a
+/// margin row and persist in the back buffer. Shared by
+/// MetalTerminalRenderer's grid_scroll capture and ExternalGridView's
+/// pending-scroll capture so both retain under the same invariant: a
+/// retained row holds scrollable cells of one grid, nothing else. Returns
+/// nil when the row has nothing retainable (the band then falls back to
+/// the edge stretch) or the ring has no buffer.
 func copyRetainedScrollableRow(
     retention: ScrollRetention,
     srcBuf: MTLBuffer,
     vertexCount: Int,
-    gridId: Int64
+    gridId: Int64,
+    scrollableMask: UInt32
 ) -> (buffer: MTLBuffer, count: Int)? {
-    let scrollable = ZONVIE_DECO_SCROLLABLE
+    let scrollable = scrollableMask
     let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vertexCount)
     // Counted before a ring slot is taken, because taking one advances the
     // ring.
