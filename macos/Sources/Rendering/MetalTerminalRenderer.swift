@@ -2204,7 +2204,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
             let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
-            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(info.gridId) offsetYPx=\(info.offsetYPx) ndc=\(ndc) contentTop=\(contentTopY) contentBottom=\(contentBottomY)")
             scrollOffsetData.append(ScrollOffset(
                 grid_id: Int32(truncatingIfNeeded: info.gridId),
                 offset_y: ndc,
@@ -2219,6 +2218,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // (main, extract, and cursor) observes the same ordering contract.
         scrollOffsetData.sort { $0.grid_id < $1.grid_id }
 
+        // The parameter is shadowed by the pruning snapshot below; keep the
+        // input infos reachable for the per-entry log line.
+        let offsetInfos = offsets
         // A retained row is only meaningful while its grid is displaced: with
         // no offset it would be drawn one row above real content.
         let offsets = scrollOffsetData
@@ -2228,14 +2230,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
             let retained = retention.publishedCount(gridId: gid)
-            guard retained > 0, cellHeightNDC > 0 else { continue }
-            if ScrollRetention.coversBand(
+            if retained > 0, cellHeightNDC > 0, ScrollRetention.coversBand(
                 retainedRows: retained,
                 offsetNDC: scrollOffsetData[i].offset_y,
                 cellHeightNDC: cellHeightNDC
             ) {
                 scrollOffsetData[i].pin_edges = 0
             }
+            // Logged AFTER the pin decision so pin/retained carry the values
+            // a frame actually renders with — the GUI harness derives the
+            // margin band and asserts retained-row band coverage from these
+            // fields, mirroring the [ExternalGridView] scroll offset line.
+            let info = offsetInfos.first { $0.gridId == gid }
+            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(gid) offsetYPx=\(info?.offsetYPx ?? 0) marginTop=\(info?.marginTop ?? 0) marginBottom=\(info?.marginBottom ?? 0) ndc=\(scrollOffsetData[i].offset_y) top=\(scrollOffsetData[i].content_top_y) bot=\(scrollOffsetData[i].content_bottom_y) pin=\(scrollOffsetData[i].pin_edges) retained=\(retained) gridTop=\(info?.gridTopYNDC ?? 0) cellNDC=\(cellHeightNDC) vpH=\(drawableHeight)")
         }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
@@ -5417,14 +5424,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             if alreadyRetained { continue }
 
-            let needed = vc * MemoryLayout<Vertex>.stride
-            guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
-            memcpy(dstBuf.contents(), srcBuf.contents(), needed)
+            // Content cells only, same invariant as the grid_scroll capture
+            // (see copyRetainedScrollableRow). The rows this path can reach
+            // today — full-width, single-grid, no float anchored — happen to
+            // hold only scrollable cells, but that rests on what Neovim
+            // currently reports, not on a check: win_viewport_margins allows
+            // left/right margins on any window, and a margin column retained
+            // whole would land unshifted and unclipped on the margin rows,
+            // exactly the external-float border bug.
+            guard let copied = copyRetainedScrollableRow(
+                retention: retention,
+                srcBuf: srcBuf,
+                vertexCount: vc,
+                gridId: gid,
+                scrollableMask: ZONVIE_DECO_SCROLLABLE
+            ) else { continue }
 
             bracketStagedGrids.insert(gid)
             retention.stage(RetainedScrollRow(
-                buffer: dstBuf,
-                count: vc,
+                buffer: copied.buffer,
+                count: copied.count,
                 gridId: gid,
                 // Its place once this scroll is applied: just outside the
                 // region edge it left through.
@@ -5591,7 +5610,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             retention: retention,
             srcBuf: srcBuf,
             vertexCount: vc,
-            gridId: gridId
+            gridId: gridId,
+            scrollableMask: ZONVIE_DECO_SCROLLABLE
         ) else { return }
 
         bracketStagedGrids.insert(gridId)

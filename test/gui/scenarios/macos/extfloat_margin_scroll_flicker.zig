@@ -209,7 +209,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, lines) " ++
             "_G.e2e_float = vim.api.nvim_open_win(b, true, " ++
             "{external=true, width=" ++ std.fmt.comptimePrint("{d}", .{grid_cols}) ++
-            ", height=" ++ std.fmt.comptimePrint("{d}", .{grid_rows}) ++ ", border=\"single\"}) " ++
+            ", height=" ++ std.fmt.comptimePrint("{d}", .{grid_rows}) ++ ", border=\"single\", " ++
+            // A footer bakes text into the BOTTOM border row (nvim 0.10+),
+            // giving the bottom margin row glyphs the way the winbar gives
+            // the top one — a corruption there moves many more pixels than
+            // a bare border line would.
+            "footer=\"FOOTERBAR\", footer_pos=\"left\"}) " ++
             "vim.api.nvim_set_option_value(\"winbar\", \"WINBAR\", {win=_G.e2e_float}) " ++
             "vim.api.nvim_win_set_cursor(_G.e2e_float, {40, 0}) " ++
             "return 1 end)()')",
@@ -341,6 +346,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
     if (!band_known) return error.NoScrollOffsetLogged;
     if (shots < 20) return error.TooFewCaptures;
+    // Liveness control, ENFORCED (the header's promise): if the scrolling
+    // content never differed from the rest reference, the captures were not
+    // observing live frames and every band result above is vacuous.
+    if (body_diffs == 0) {
+        std.debug.print("[gui] scrolling content never changed — captures were not live\n", .{});
+        return error.CaptureNotLive;
+    }
 
     // Note on what "below Neovim's scroll unit" means here: the frontend
     // books a whole 'mousescroll' unit from any gesture and then works the
@@ -451,6 +463,127 @@ pub fn run(alloc: std.mem.Allocator) !void {
             );
             return error.ScrollBandUncovered;
         }
+    }
+
+    // Fourth phase: the same gestures UPWARD. Rows then leave through the
+    // BOTTOM edge, retained rows target the bottom margin row, and the band
+    // the offset opens presses against it — the side the downward phases
+    // never exercise. The whole-row capture bug corrupted this edge the
+    // same way (a "│" over the bottom border corner), so both margins are
+    // asserted against the same rest reference. The buffer sits ~100 lines
+    // deep after the downward phases, so there is room to scroll back up
+    // without hitting line 1 mid-gesture.
+    {
+        gui_io.sleepNs(500 * std.time.ns_per_ms);
+        var up_top: usize = 0;
+        var up_bottom: usize = 0;
+        var up_body: usize = 0;
+        var up_shots: usize = 0;
+        if (!platform.scrollBegin(g.app_pid, float_win)) return error.ScrollRefused;
+        var n: u32 = 0;
+        while (n < nudge_steps) : (n += 1) {
+            platform.scrollStep(-step_px);
+            gui_io.sleepNs(16 * std.time.ns_per_ms);
+        }
+        platform.scrollEnd();
+        var c: u32 = 0;
+        while (c < settle_cycles) : (c += 1) {
+            var shot = capture.captureWindow(alloc, float_win.number) catch continue;
+            up_shots += 1;
+            defer shot.deinit(alloc);
+            const b = base.?;
+            if (shot.w != b.w or shot.h != b.h) continue;
+            const cw = if (shot.w > scrollbar_exclude_px) shot.w - scrollbar_exclude_px else shot.w;
+            if (!bandsEqual(shot, b, band_top_start, band_top_end, cw)) up_top += 1;
+            if (!bandsEqual(shot, b, band_bot_start, band_bot_end, cw)) up_bottom += 1;
+            const stride = @as(usize, shot.w) * 4;
+            const mid = (shot.h / 2) * stride;
+            const cmp = @as(usize, cw) * 4;
+            if (!std.mem.eql(u8, shot.rgba[mid .. mid + cmp], b.rgba[mid .. mid + cmp])) up_body += 1;
+            if (c % 20 == 19) {
+                gui_io.sleepNs(400 * std.time.ns_per_ms);
+                if (platform.scrollBegin(g.app_pid, float_win)) {
+                    var n2: u32 = 0;
+                    while (n2 < nudge_steps) : (n2 += 1) {
+                        platform.scrollStep(-step_px);
+                        gui_io.sleepNs(16 * std.time.ns_per_ms);
+                    }
+                    platform.scrollEnd();
+                }
+            }
+        }
+        std.debug.print(
+            "[gui] up-glide margin bands changed: top={d} bottom={d} of {d}; body {d}/{d}\n",
+            .{ up_top, up_bottom, up_shots, up_body, up_shots },
+        );
+        if (up_shots < 20) return error.TooFewCaptures;
+        if (up_body == 0) {
+            std.debug.print("[gui] scrolling content never changed during the upward glide — captures were not live\n", .{});
+            return error.CaptureNotLive;
+        }
+        if (up_top > 0 or up_bottom > 0) {
+            std.debug.print(
+                "[gui] a margin row changed during the upward glide — margin rows do not scroll and must hold still\n",
+                .{},
+            );
+            return error.MarginRowChanged;
+        }
+
+        // Hard upward scroll and release: the band opens against the BOTTOM
+        // margin. The two content rows just above it are where the retained
+        // rows land, and the same shrink-gated coverage rule applies.
+        var blank_band: usize = 0;
+        var band_shots: usize = 0;
+        const up_t0 = try app_log.nowMs(alloc, log_path);
+        if (platform.scrollBegin(g.app_pid, float_win)) {
+            var k: u32 = 0;
+            while (k < 12) : (k += 1) {
+                platform.scrollStep(12);
+                gui_io.sleepNs(16 * std.time.ns_per_ms);
+            }
+            platform.scrollEnd();
+            while (k < 40) : (k += 1) {
+                var shot = capture.captureWindow(alloc, float_win.number) catch continue;
+                defer shot.deinit(alloc);
+                band_shots += 1;
+                const cw = if (shot.w > scrollbar_exclude_px) shot.w - scrollbar_exclude_px else shot.w;
+                const cell = (band_top_end - band_top_start) / 2;
+                if (cell > 0 and band_bot_start > cell * 2 and
+                    bandIsUniform(shot, band_bot_start - cell * 2, band_bot_start, cw)) blank_band += 1;
+                gui_io.sleepNs(16 * std.time.ns_per_ms);
+            }
+        }
+        std.debug.print("[gui] up frames with a blank scroll band: {d}/{d}\n", .{ blank_band, band_shots });
+        if (band_shots < 10) return error.TooFewCaptures;
+        if (blank_band > 0) return error.ScrollBandBlank;
+
+        const up_lines = try app_log.linesSince(alloc, log_path, scroll_marker, up_t0);
+        defer alloc.free(up_lines);
+        var up_uncovered: usize = 0;
+        var up_offset_frames: usize = 0;
+        var up_prev_ndc: ?f64 = null;
+        var up_it = std.mem.splitScalar(u8, up_lines, '\n');
+        while (up_it.next()) |line| {
+            if (line.len == 0) continue;
+            const ndc = app_log.field(line, "ndc") orelse continue;
+            const cell_ndc = app_log.field(line, "cellNDC") orelse continue;
+            const retained = app_log.field(line, "retained") orelse continue;
+            defer up_prev_ndc = ndc;
+            if (cell_ndc <= 0) continue;
+            const shrinking = if (up_prev_ndc) |p| @abs(ndc) < @abs(p) else false;
+            if (!shrinking) continue;
+            // Same rounding as ScrollRetention.coversBand.
+            const band_rows = std.math.ceil(@abs(ndc) / cell_ndc - 0.001);
+            if (band_rows < 1) continue;
+            up_offset_frames += 1;
+            if (retained < band_rows) up_uncovered += 1;
+        }
+        std.debug.print(
+            "[gui] up shrinking-offset frames with an uncovered scroll band: {d}/{d}\n",
+            .{ up_uncovered, up_offset_frames },
+        );
+        if (up_offset_frames < 3) return error.TooFewSettleFrames;
+        if (up_uncovered >= margin_hit_threshold) return error.ScrollBandUncovered;
     }
 
     if (top_blank > 0 or bottom_blank > 0) {

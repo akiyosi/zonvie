@@ -1588,7 +1588,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 retention: retention,
                 srcBuf: srcBuf,
                 vertexCount: vc,
-                gridId: gridId
+                gridId: gridId,
+                scrollableMask: ZONVIE_DECO_SCROLLABLE
             ) else { continue }
             retention.stage(RetainedScrollRow(
                 buffer: copied.buffer,
